@@ -43,8 +43,8 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::operations::control_flow::LinearConditionOperation;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext,
-        JvpTracer, LinearArrayOperation, ResidualFactor, ResidualizedOperation, TangentContext, jacrev,
+        ArrayBatch, BatchableOperation, CapturedFactor, DifferentiableDomainExtension, DifferentiableOperation,
+        DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualizedOperation, TangentContext, jacrev,
     };
     use crate::types::{Shape, Size, Typed};
 
@@ -1151,7 +1151,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
@@ -1197,7 +1197,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

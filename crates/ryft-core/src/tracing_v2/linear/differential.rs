@@ -227,7 +227,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
-            crate::tracing_v2::ResidualFactor<ArrayType, Tracer<TracingContext<'domain, Self>>>,
+            crate::tracing_v2::CapturedFactor<ArrayType, Tracer<TracingContext<'domain, Self>>>,
         >: ResidualizedOperation<TracingContext<'domain, Self>>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,

@@ -4,15 +4,15 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation};
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 
 impl<D> DifferentiableOperation<D> for SinOperation
 where
     D: DifferentiationContext,
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
-    LinearOperationOf<D>: From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
 {
     #[inline]
     fn jvp<'jvp>(

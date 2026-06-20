@@ -13,10 +13,11 @@ use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, Update
 use crate::operations::{Operation, OperationFormatter};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::CapturedFactor;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
-    NestedLinearization, ProgramLinearizableOperation, ResidualFactor, ResidualizedOperation, TangentContext,
+    NestedLinearization, ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::primitive::{LinearArrayOperation, render_factor_list};
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
@@ -25,7 +26,7 @@ use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 /// scan. The linear scan is the linear-program counterpart of
 /// [`ScanOperation`](crate::operations::control_flow::ScanOperation): its inputs are the carry and stacked-input
 /// tangents (or cotangents), its body is the scan body's residualized pushforward whose
-/// [`ResidualFactor::Reference`](crate::tracing_v2::ResidualFactor) factors are *scan-local* (reference `index` `i`
+/// [`CapturedFactor::Reference`](crate::tracing_v2::CapturedFactor) factors are *scan-local* (reference `index` `i`
 /// resolves to slice `lane` of `residual_stacks[i]` while iteration `lane` runs), and its `residual_stacks` are the
 /// stacked per-iteration residuals captured as factors of the enclosing linearization. Linear operation enums
 /// implement this trait so that the JVP rule of [`ScanOperation`](crate::operations::control_flow::ScanOperation)
@@ -103,7 +104,7 @@ where
         + From<ScanOperation<V, O, ArrayType>>
         + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>:
-        ResidualizedOperation<D> + SupportsLinearScan<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>,
+        ResidualizedOperation<D> + SupportsLinearScan<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -144,10 +145,10 @@ where
             residual_stack_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
         let body = pushforward_program.map_operations(|operation| {
             operation.try_map_factors(&mut |factor| match factor {
-                ResidualFactor::Reference { index, r#type } => {
-                    Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+                CapturedFactor::Reference { index, r#type } => {
+                    Ok(CapturedFactor::Reference { index: *index, r#type: r#type.clone() })
                 }
-                ResidualFactor::Constant(value) => {
+                CapturedFactor::Constant(value) => {
                     let value_type = value.r#type().into_owned();
                     if value_type.static_shape().is_none() {
                         return Err(TypeError {
@@ -167,7 +168,7 @@ where
                     check_count!("output", broadcasted, 1, ProgramError);
                     let scan_local_index = stack_factors.len();
                     stack_factors.push(context.factor(broadcasted.remove(0)));
-                    Ok(ResidualFactor::Reference { index: scan_local_index, r#type: value_type })
+                    Ok(CapturedFactor::Reference { index: scan_local_index, r#type: value_type })
                 }
             })
         })?;
@@ -408,7 +409,7 @@ where
 /// enclosing linearization.
 ///
 /// **Scan-local factor namespace.** The body's factor payloads are pinned to
-/// [`ResidualFactor<T, V>`](crate::tracing_v2::ResidualFactor) and form a namespace owned by this operation:
+/// [`CapturedFactor<T, V>`](crate::tracing_v2::CapturedFactor) and form a namespace owned by this operation:
 /// reference index `i` resolves to slice `lane` of `residual_stacks[i]` while iteration `lane` runs, so the body stays
 /// fully linear in its tangent inputs with every captured primal entering through a per-lane residual slice.
 #[derive(Clone, Debug)]
@@ -420,7 +421,7 @@ where
     F: Value<T>,
 {
     /// Residualized body pushforward with scan-local residual references.
-    body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>>>,
+    body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, CapturedFactor<T, V>, O>, Vec<V>, Vec<V>>>,
 
     /// Stacked per-iteration residual factors indexed by the body's scan-local residual references; each stack's
     /// leading dimension is the scan length.
@@ -451,7 +452,7 @@ where
     /// and the scan's static metadata.
     #[inline]
     pub fn new(
-        body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>>>,
+        body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, CapturedFactor<T, V>, O>, Vec<V>, Vec<V>>>,
         residual_stacks: Vec<F>,
         carry_count: usize,
         length: usize,
@@ -465,7 +466,7 @@ where
     #[inline]
     pub fn body(
         &self,
-    ) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, ResidualFactor<T, V>, O>, Vec<V>, Vec<V>> {
+    ) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, CapturedFactor<T, V>, O>, Vec<V>, Vec<V>> {
         self.body.as_ref()
     }
 
@@ -573,7 +574,7 @@ where
 /// signature with the same carry count. Flipping `reverse` pairs cotangent lane `i` with residual stack lane `i`
 /// exactly when the forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
 /// carry over verbatim. The body transpose recurses into [`Program::transpose`]; the body's operation type is this
-/// enum pinned to the scan-local [`ResidualFactor<ArrayType, V>`](crate::tracing_v2::ResidualFactor) factor namespace,
+/// enum pinned to the scan-local [`CapturedFactor<ArrayType, V>`](crate::tracing_v2::CapturedFactor) factor namespace,
 /// whose [`TransposableOperation`] obligation (on the enclosing enum itself) is the nested-factor fixed point that
 /// makes the recursion terminate.
 impl<V, C, Extension, F, O> TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
@@ -587,10 +588,10 @@ where
     LinearArrayOperation<ArrayType, V, C, Extension, F, O>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
-    LinearArrayOperation<ArrayType, V, C, Extension, ResidualFactor<ArrayType, V>, O>: TransposableOperation<
+    LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>: TransposableOperation<
             ArrayType,
             V,
-            LinearArrayOperation<ArrayType, V, C, Extension, ResidualFactor<ArrayType, V>, O>,
+            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
         > + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
 {
@@ -752,7 +753,7 @@ mod tests {
                 DomainTracer<TestArrayDomain>,
                 TestArray,
                 Infallible,
-                ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
+                CapturedFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
         >::new()));
         let mut context = TangentContext::new(&outer_context, linear_builder.clone());
@@ -805,7 +806,7 @@ mod tests {
         // residual stack scan-locally, which both transposes carry verbatim.
         type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
         type ScanBodyOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -814,7 +815,7 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScaleOperation::new(ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
+                ScaleOperation::new(CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];
@@ -953,7 +954,7 @@ mod tests {
         use crate::tracing_v2::{DefactorizedOperation, ResidualizedOperation, SupportsLinearWhile};
 
         type ScanBodyOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
@@ -964,13 +965,13 @@ mod tests {
         let tangent_carry = body_builder.add_input(scalar_f64.clone());
         let scaled_by_moved = body_builder
             .add_instruction(
-                ScaleOperation::new(ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
+                ScaleOperation::new(CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];
         let scaled_by_kept = body_builder
             .add_instruction(
-                ScaleOperation::new(ResidualFactor::Reference { index: 1, r#type: scalar_f64.clone() }),
+                ScaleOperation::new(CapturedFactor::Reference { index: 1, r#type: scalar_f64.clone() }),
                 vec![scaled_by_moved],
             )
             .unwrap()[0];
@@ -985,8 +986,8 @@ mod tests {
         let scan = ScanBodyOperation::Scan(LinearScanOperation::new(
             Box::new(body),
             vec![
-                ResidualFactor::Reference { index: 0, r#type: stacked_f64 },
-                ResidualFactor::Constant(TestArray::vector(vec![5.0, 7.0])),
+                CapturedFactor::Reference { index: 0, r#type: stacked_f64 },
+                CapturedFactor::Constant(TestArray::vector(vec![5.0, 7.0])),
             ],
             1,
             2,
@@ -1010,7 +1011,7 @@ mod tests {
         let rewritten_body = scan_operation.body();
         assert_eq!(scan_operation.unroll(), 2);
         assert_eq!(scan_operation.residual_stacks().len(), 1);
-        assert!(matches!(scan_operation.residual_stacks()[0], ResidualFactor::Constant(_)));
+        assert!(matches!(scan_operation.residual_stacks()[0], CapturedFactor::Constant(_)));
         assert_eq!(rewritten_body.input_types(), vec![scalar_f64.clone(), scalar_f64]);
         assert!(
             rewritten_body
@@ -1024,7 +1025,7 @@ mod tests {
                 instruction.operation(),
                 ScanBodyOperation::Scale(scale) if matches!(
                     scale.factor(),
-                    ResidualFactor::Reference { index: 0, .. },
+                    CapturedFactor::Reference { index: 0, .. },
                 ),
             )),
             "{rewritten_body}",
@@ -1052,7 +1053,7 @@ mod tests {
         // `[1, 2]` produce final carries `[c2, 2 * 24 + ...]` computed per batch lane.
         type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
         type ScanBodyOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
@@ -1060,7 +1061,7 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScaleOperation::new(ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
+                ScaleOperation::new(CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];

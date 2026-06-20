@@ -6,15 +6,15 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, DivOperation, Scale, ScaleOperation};
 use crate::operations::constants::OneLike;
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 
 impl<D> DifferentiableOperation<D> for DivOperation
 where
     D: DifferentiationContext,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
-    LinearOperationOf<D>: From<AddOperation> + From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<AddOperation> + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,

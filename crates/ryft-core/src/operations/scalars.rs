@@ -1,31 +1,31 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Display;
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use crate::macros::check_count;
+use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::domains::Domain;
 use crate::operations::arithmetic::{
-    ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    NEG_OPERATION_NAME, NegOperation, SCALE_OPERATION_NAME, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
-    SupportsAdd, SupportsDiv, SupportsMul, SupportsNeg, SupportsScale, SupportsSub,
+    AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
-use crate::operations::compare::{COMPARE_OPERATION_NAME, CompareOperation, ComparisonDirection, SupportsCompare};
+use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, ONE_LIKE_OPERATION_NAME, OneLikeOperation, OneOperation, SupportsConstant, SupportsOne,
-    SupportsOneLike, SupportsZero, SupportsZeroLike, ZERO_LIKE_OPERATION_NAME, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{SELECT_OPERATION_NAME, SelectOperation, SupportsSelect};
-use crate::operations::differentiation::{STOP_GRADIENT_OPERATION_NAME, StopGradientOperation, SupportsStopGradient};
-use crate::operations::trigonometric::{
-    COS_OPERATION_NAME, CosOperation, SIN_OPERATION_NAME, SinOperation, SupportsCos, SupportsSin,
-};
-use crate::operations::{Operation, OperationFormatter};
-use crate::programs::{Program, Value};
+use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
+use crate::operations::differentiation::StopGradientOperation;
+use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::{InterpretableOperation, Operation};
+use crate::parameters::Parameterized;
+use crate::programs::{ProgramError, Value};
+use crate::tracing::AbstractTracingContext;
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, SupportsCustomJvp, SupportsCustomVjp,
-    SupportsCustomVjpCall,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
 };
-use crate::tracing_v2::operations::select::SupportsLinearSelect;
-use crate::tracing_v2::rematerialization::{
-    MaybeRematerializationName, REMATERIALIZATION_NAME_OPERATION_NAME, RematerializationNameOperation,
-    SupportsRematerializationName,
+use crate::tracing_v2::operations::select::LinearSelectOperation;
+use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
+use crate::tracing_v2::{
+    CapturedFactor, DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation,
 };
 use crate::types::{DataType, TypeError};
 
@@ -38,62 +38,683 @@ use crate::types::{DataType, TypeError};
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug)]
 pub enum ScalarOperation<V: Value<DataType>> {
-    /// Typed scalar zero with no inputs and one output.
+    /// Typed scalar zero.
     Zero(ZeroOperation<DataType>),
 
-    /// Scalar exemplar-derived zero.
-    ZeroLike,
+    /// Exemplar-derived scalar zero.
+    ZeroLike(ZeroLikeOperation),
 
-    /// Typed scalar one with no inputs and one output.
+    /// Typed scalar one.
     One(OneOperation<DataType>),
 
-    /// Scalar exemplar-derived one.
-    OneLike,
+    /// Exemplar-derived scalar one.
+    OneLike(OneLikeOperation),
 
-    /// Typed scalar constant with no inputs and one output.
+    /// Typed scalar constant.
     Constant(ConstantOperation<DataType, V>),
 
     /// Scalar negation.
-    Neg,
+    Neg(NegOperation),
 
     /// Scalar addition.
-    Add,
+    Add(AddOperation),
 
     /// Scalar subtraction.
-    Sub,
+    Sub(SubOperation),
 
-    /// Scalar scaling by a captured factor.
-    Scale { factor: V },
+    /// Scaling by a captured scalar factor.
+    Scale(ScaleOperation<DataType, V>),
 
     /// Scalar multiplication.
-    Mul,
+    Mul(MulOperation),
 
     /// Scalar division.
-    Div,
+    Div(DivOperation),
 
     /// Scalar sine.
-    Sin,
+    Sin(SinOperation),
 
     /// Scalar cosine.
-    Cos,
+    Cos(CosOperation),
 
-    /// Scalar pairwise comparison with an in-band Boolean result.
-    Compare { direction: ComparisonDirection },
+    /// Scalar comparison.
+    Compare(CompareOperation),
 
-    /// Scalar selection between two values driven by a Boolean condition.
-    Select,
+    /// Scalar selection on a Boolean condition.
+    Select(SelectOperation),
 
-    /// Gradient-severing identity.
-    StopGradient,
+    /// Gradient barrier that passes its primal through unchanged.
+    StopGradient(StopGradientOperation),
 
-    /// Rematerialize-policy name-tagging identity.
+    /// Rematerialization tag attached to a scalar value.
     RematerializationName(RematerializationNameOperation),
 
-    /// Higher-order call pairing a primal program with a user-supplied JVP program.
-    CustomJvp(Box<CustomJvpOperation<V, ScalarOperation<V>, DataType>>),
+    /// User-supplied `custom_jvp` operation with a closed scalar body.
+    CustomJvp(Box<CustomJvpOperation<V, Self, DataType>>),
 
-    /// Higher-order call pairing a primal program with user-supplied forward/backward (VJP) programs.
-    CustomVjp(Box<CustomVjpOperation<V, ScalarOperation<V>, DataType>>),
+    /// User-supplied `custom_vjp` operation with a closed scalar body.
+    CustomVjp(Box<CustomVjpOperation<V, Self, DataType>>),
+}
+
+impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
+    // Several variant payloads (the elementwise arithmetic and trigonometric operations) implement
+    // [`Operation`](crate::operations::Operation) for both [`DataType`] and `ArrayType`, so plain method-call syntax
+    // cannot infer the type parameter here. The arms therefore disambiguate to `Operation<DataType>` explicitly.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Zero(operation) => <ZeroOperation<DataType> as Operation<DataType>>::name(operation),
+            Self::ZeroLike(operation) => <ZeroLikeOperation as Operation<DataType>>::name(operation),
+            Self::One(operation) => <OneOperation<DataType> as Operation<DataType>>::name(operation),
+            Self::OneLike(operation) => <OneLikeOperation as Operation<DataType>>::name(operation),
+            Self::Constant(operation) => <ConstantOperation<DataType, V> as Operation<DataType>>::name(operation),
+            Self::Neg(operation) => <NegOperation as Operation<DataType>>::name(operation),
+            Self::Add(operation) => <AddOperation as Operation<DataType>>::name(operation),
+            Self::Sub(operation) => <SubOperation as Operation<DataType>>::name(operation),
+            Self::Scale(operation) => <ScaleOperation<DataType, V> as Operation<DataType>>::name(operation),
+            Self::Mul(operation) => <MulOperation as Operation<DataType>>::name(operation),
+            Self::Div(operation) => <DivOperation as Operation<DataType>>::name(operation),
+            Self::Sin(operation) => <SinOperation as Operation<DataType>>::name(operation),
+            Self::Cos(operation) => <CosOperation as Operation<DataType>>::name(operation),
+            Self::Compare(operation) => <CompareOperation as Operation<DataType>>::name(operation),
+            Self::Select(operation) => <SelectOperation as Operation<DataType>>::name(operation),
+            Self::StopGradient(operation) => <StopGradientOperation as Operation<DataType>>::name(operation),
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as Operation<DataType>>::name(operation)
+            }
+            Self::CustomJvp(operation) => {
+                <CustomJvpOperation<V, Self, DataType> as Operation<DataType>>::name(&**operation)
+            }
+            Self::CustomVjp(operation) => {
+                <CustomVjpOperation<V, Self, DataType> as Operation<DataType>>::name(&**operation)
+            }
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<DataType> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::One(operation) => {
+                <OneOperation<DataType> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<DataType, V> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Add(operation) => <AddOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Sub(operation) => <SubOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Scale(operation) => {
+                <ScaleOperation<DataType, V> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Mul(operation) => <MulOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Div(operation) => <DivOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Sin(operation) => <SinOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Cos(operation) => <CosOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Compare(operation) => {
+                <CompareOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Select(operation) => {
+                <SelectOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::StopGradient(operation) => {
+                <StopGradientOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::CustomJvp(operation) => {
+                <CustomJvpOperation<V, Self, DataType> as Operation<DataType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+            Self::CustomVjp(operation) => {
+                <CustomVjpOperation<V, Self, DataType> as Operation<DataType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<DataType> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::One(operation) => {
+                <OneOperation<DataType> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<DataType, V> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Add(operation) => <AddOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Sub(operation) => <SubOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Scale(operation) => {
+                <ScaleOperation<DataType, V> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Mul(operation) => <MulOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Div(operation) => <DivOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Sin(operation) => <SinOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Cos(operation) => <CosOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Compare(operation) => {
+                <CompareOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Select(operation) => {
+                <SelectOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::StopGradient(operation) => {
+                <StopGradientOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::RematerializationName(operation) => {
+                <RematerializationNameOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::CustomJvp(operation) => <CustomJvpOperation<V, Self, DataType> as Operation<DataType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+            Self::CustomVjp(operation) => <CustomVjpOperation<V, Self, DataType> as Operation<DataType>>::render(
+                &**operation,
+                formatter,
+                indentation,
+            ),
+        }
+    }
+}
+
+impl<V: Value<DataType>> Display for ScalarOperation<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V: Value<DataType>> From<ZeroOperation<DataType>> for ScalarOperation<V> {
+    fn from(operation: ZeroOperation<DataType>) -> Self {
+        Self::Zero(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a ZeroOperation<DataType> {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Zero(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<ZeroLikeOperation> for ScalarOperation<V> {
+    fn from(operation: ZeroLikeOperation) -> Self {
+        Self::ZeroLike(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a ZeroLikeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::ZeroLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<OneOperation<DataType>> for ScalarOperation<V> {
+    fn from(operation: OneOperation<DataType>) -> Self {
+        Self::One(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a OneOperation<DataType> {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::One(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<OneLikeOperation> for ScalarOperation<V> {
+    fn from(operation: OneLikeOperation) -> Self {
+        Self::OneLike(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a OneLikeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::OneLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<ConstantOperation<DataType, V>> for ScalarOperation<V> {
+    fn from(operation: ConstantOperation<DataType, V>) -> Self {
+        Self::Constant(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a ConstantOperation<DataType, V> {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Constant(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<NegOperation> for ScalarOperation<V> {
+    fn from(operation: NegOperation) -> Self {
+        Self::Neg(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a NegOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Neg(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<AddOperation> for ScalarOperation<V> {
+    fn from(operation: AddOperation) -> Self {
+        Self::Add(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a AddOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Add(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<SubOperation> for ScalarOperation<V> {
+    fn from(operation: SubOperation) -> Self {
+        Self::Sub(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a SubOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Sub(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<ScaleOperation<DataType, V>> for ScalarOperation<V> {
+    fn from(operation: ScaleOperation<DataType, V>) -> Self {
+        Self::Scale(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a ScaleOperation<DataType, V> {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Scale(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<MulOperation> for ScalarOperation<V> {
+    fn from(operation: MulOperation) -> Self {
+        Self::Mul(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a MulOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Mul(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<DivOperation> for ScalarOperation<V> {
+    fn from(operation: DivOperation) -> Self {
+        Self::Div(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a DivOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Div(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<SinOperation> for ScalarOperation<V> {
+    fn from(operation: SinOperation) -> Self {
+        Self::Sin(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a SinOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Sin(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<CosOperation> for ScalarOperation<V> {
+    fn from(operation: CosOperation) -> Self {
+        Self::Cos(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a CosOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Cos(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<CompareOperation> for ScalarOperation<V> {
+    fn from(operation: CompareOperation) -> Self {
+        Self::Compare(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a CompareOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Compare(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<SelectOperation> for ScalarOperation<V> {
+    fn from(operation: SelectOperation) -> Self {
+        Self::Select(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a SelectOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::Select(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<StopGradientOperation> for ScalarOperation<V> {
+    fn from(operation: StopGradientOperation) -> Self {
+        Self::StopGradient(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a StopGradientOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::StopGradient(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<RematerializationNameOperation> for ScalarOperation<V> {
+    fn from(operation: RematerializationNameOperation) -> Self {
+        Self::RematerializationName(operation)
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>> for &'a RematerializationNameOperation {
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::RematerializationName(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<CustomJvpOperation<V, ScalarOperation<V>, DataType>> for ScalarOperation<V> {
+    fn from(operation: CustomJvpOperation<V, ScalarOperation<V>, DataType>) -> Self {
+        Self::CustomJvp(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>>
+    for &'a CustomJvpOperation<V, ScalarOperation<V>, DataType>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::CustomJvp(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>> From<CustomVjpOperation<V, ScalarOperation<V>, DataType>> for ScalarOperation<V> {
+    fn from(operation: CustomVjpOperation<V, ScalarOperation<V>, DataType>) -> Self {
+        Self::CustomVjp(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<DataType>> TryFrom<&'a ScalarOperation<V>>
+    for &'a CustomVjpOperation<V, ScalarOperation<V>, DataType>
+{
+    type Error = ();
+
+    fn try_from(value: &'a ScalarOperation<V>) -> Result<Self, ()> {
+        match value {
+            ScalarOperation::CustomVjp(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<DataType>, D> DifferentiableOperation<D> for ScalarOperation<V>
+where
+    ZeroOperation<DataType>: DifferentiableOperation<D>,
+    ZeroLikeOperation: DifferentiableOperation<D>,
+    OneOperation<DataType>: DifferentiableOperation<D>,
+    OneLikeOperation: DifferentiableOperation<D>,
+    ConstantOperation<DataType, V>: DifferentiableOperation<D>,
+    NegOperation: DifferentiableOperation<D>,
+    AddOperation: DifferentiableOperation<D>,
+    SubOperation: DifferentiableOperation<D>,
+    ScaleOperation<DataType, V>: DifferentiableOperation<D>,
+    MulOperation: DifferentiableOperation<D>,
+    DivOperation: DifferentiableOperation<D>,
+    SinOperation: DifferentiableOperation<D>,
+    CosOperation: DifferentiableOperation<D>,
+    CompareOperation: DifferentiableOperation<D>,
+    SelectOperation: DifferentiableOperation<D>,
+    StopGradientOperation: DifferentiableOperation<D>,
+    RematerializationNameOperation: DifferentiableOperation<D>,
+    D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = ScalarOperation<V>>,
+    D::Operation: From<ZeroOperation<DataType>> + From<OneOperation<DataType>>,
+    D::Value: crate::tracing_v2::rematerialization::RematerializationName,
+    D::Value: Add<Output = D::Value>
+        + Sub<Output = D::Value>
+        + Mul<Output = D::Value>
+        + Div<Output = D::Value>
+        + Neg<Output = D::Value>
+        + SupportsTrigonometricOperations
+        + ZeroLike
+        + OneLike
+        + Compare<Output = D::Value>
+        + SelectCondition
+        + Parameterized<D::Value>,
+    D::Value: Select<Condition = <D::Value as SelectCondition>::Condition>,
+    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
+    Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
+    ScalarOperation<V>: Clone + ProgramLinearizableOperation<D>,
+    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, CapturedFactor<DataType, D::Value>>
+        + From<LinearSelectOperation<CapturedFactor<DataType, D::Value>>>
+        + crate::tracing_v2::ResidualizedOperation<D>
+        + From<CustomVjpCallOperation<V, ScalarOperation<V>, CapturedFactor<DataType, D::Value>, DataType>>,
+    Vec<V>: Parameterized<
+            V,
+            Family: crate::parameters::ParameterizedFamily<D::Tangent>
+                        + crate::parameters::ParameterizedFamily<D::Value>,
+            To<D::Value> = Vec<D::Value>,
+            To<D::Tangent> = Vec<D::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+{
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        match self {
+            Self::Zero(operation) => operation.jvp(context, inputs),
+            Self::ZeroLike(operation) => operation.jvp(context, inputs),
+            Self::One(operation) => operation.jvp(context, inputs),
+            Self::OneLike(operation) => operation.jvp(context, inputs),
+            Self::Constant(operation) => operation.jvp(context, inputs),
+            Self::Neg(operation) => operation.jvp(context, inputs),
+            Self::Add(operation) => operation.jvp(context, inputs),
+            Self::Sub(operation) => operation.jvp(context, inputs),
+            Self::Scale(operation) => operation.jvp(context, inputs),
+            Self::Mul(operation) => operation.jvp(context, inputs),
+            Self::Div(operation) => operation.jvp(context, inputs),
+            Self::Sin(operation) => operation.jvp(context, inputs),
+            Self::Cos(operation) => operation.jvp(context, inputs),
+            Self::Compare(operation) => operation.jvp(context, inputs),
+            Self::Select(operation) => operation.jvp(context, inputs),
+            Self::StopGradient(operation) => operation.jvp(context, inputs),
+            Self::RematerializationName(operation) => operation.jvp(context, inputs),
+            Self::CustomJvp(operation) => <CustomJvpOperation<V, Self, DataType> as DifferentiableOperation<D>>::jvp(
+                &**operation,
+                context,
+                inputs,
+            ),
+            Self::CustomVjp(operation) => <CustomVjpOperation<V, Self, DataType> as DifferentiableOperation<D>>::jvp(
+                &**operation,
+                context,
+                inputs,
+            ),
+        }
+    }
+}
+
+impl<V: Value<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
+where
+    ZeroOperation<DataType>: InterpretableOperation<DataType, V>,
+    ZeroLikeOperation: InterpretableOperation<DataType, V>,
+    OneOperation<DataType>: InterpretableOperation<DataType, V>,
+    OneLikeOperation: InterpretableOperation<DataType, V>,
+    ConstantOperation<DataType, V>: InterpretableOperation<DataType, V>,
+    NegOperation: InterpretableOperation<DataType, V>,
+    AddOperation: InterpretableOperation<DataType, V>,
+    SubOperation: InterpretableOperation<DataType, V>,
+    ScaleOperation<DataType, V>: InterpretableOperation<DataType, V>,
+    MulOperation: InterpretableOperation<DataType, V>,
+    DivOperation: InterpretableOperation<DataType, V>,
+    SinOperation: InterpretableOperation<DataType, V>,
+    CosOperation: InterpretableOperation<DataType, V>,
+    CompareOperation: InterpretableOperation<DataType, V>,
+    SelectOperation: InterpretableOperation<DataType, V>,
+    StopGradientOperation: InterpretableOperation<DataType, V>,
+    RematerializationNameOperation: InterpretableOperation<DataType, V>,
+    V: Value<DataType>,
+    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        match self {
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::ZeroLike(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::OneLike(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => operation.interpret(context, inputs),
+            Self::Neg(operation) => operation.interpret(context, inputs),
+            Self::Add(operation) => operation.interpret(context, inputs),
+            Self::Sub(operation) => operation.interpret(context, inputs),
+            Self::Scale(operation) => operation.interpret(context, inputs),
+            Self::Mul(operation) => operation.interpret(context, inputs),
+            Self::Div(operation) => operation.interpret(context, inputs),
+            Self::Sin(operation) => operation.interpret(context, inputs),
+            Self::Cos(operation) => operation.interpret(context, inputs),
+            Self::Compare(operation) => operation.interpret(context, inputs),
+            Self::Select(operation) => operation.interpret(context, inputs),
+            Self::StopGradient(operation) => operation.interpret(context, inputs),
+            Self::RematerializationName(operation) => operation.interpret(context, inputs),
+            Self::CustomJvp(operation) => <CustomJvpOperation<V, Self, DataType> as InterpretableOperation<
+                DataType,
+                V,
+            >>::interpret(&**operation, context, inputs),
+            Self::CustomVjp(operation) => <CustomVjpOperation<V, Self, DataType> as InterpretableOperation<
+                DataType,
+                V,
+            >>::interpret(&**operation, context, inputs),
+        }
+    }
 }
 
 /// Closed scalar operation type for staged linear scalar programs.
@@ -103,253 +724,393 @@ pub enum ScalarOperation<V: Value<DataType>> {
 /// context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in its `LinearOperation` associated-type
 /// definition. It types the user-supplied backward programs captured by [`CustomVjpCall`](Self::CustomVjpCall),
 /// which are written over context constants rather than over the factor type `F`.
+///
+/// The variants mirror the linear scalar primitives: typed [`Zero`](Self::Zero)/[`One`](Self::One) and their
+/// exemplar-derived [`ZeroLike`](Self::ZeroLike)/[`OneLike`](Self::OneLike) maps, a typed
+/// [`Constant`](Self::Constant), [`Neg`](Self::Neg)/[`Add`](Self::Add)/[`Sub`](Self::Sub), scaling by a captured
+/// factor ([`Scale`](Self::Scale)), the captured-condition [`Select`](Self::Select)
+/// ([`LinearSelectOperation`]), and the opaque [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp`
+/// linearization (its transpose replays the user's backward program).
 #[derive(Clone, Debug)]
 pub enum LinearScalarOperation<C: Value<DataType>, F: Value<DataType> = C> {
-    /// Typed scalar zero with no inputs and one output.
+    /// Typed scalar zero.
     Zero(ZeroOperation<DataType>),
 
-    /// Scalar exemplar-derived zero map.
-    ZeroLike,
+    /// Exemplar-derived scalar zero.
+    ZeroLike(ZeroLikeOperation),
 
-    /// Typed scalar one with no inputs and one output.
+    /// Typed scalar one.
     One(OneOperation<DataType>),
 
-    /// Scalar exemplar-derived one map.
-    OneLike,
+    /// Exemplar-derived scalar one.
+    OneLike(OneLikeOperation),
 
-    /// Typed scalar constant with no inputs and one output.
+    /// Typed scalar constant carried as a factor.
     Constant(ConstantOperation<DataType, F>),
 
     /// Scalar negation.
-    Neg,
+    Neg(NegOperation),
 
     /// Scalar addition.
-    Add,
+    Add(AddOperation),
 
     /// Scalar subtraction.
-    Sub,
+    Sub(SubOperation),
 
-    /// Scalar scaling by a captured factor.
-    Scale { factor: F },
+    /// Scaling by a captured scalar factor.
+    Scale(ScaleOperation<DataType, F>),
 
-    /// Captured-condition select: linear map `(t, f) ↦ select(condition, t, f)`. Scalar counterpart of the `Select`
-    /// variant of [`LinearArrayOperation`](crate::tracing_v2::ArrayOperation) emitted by the JVP of
-    /// [`ScalarOperation::Select`]: the Boolean primal condition is captured as a factor (it has no tangent space, so
-    /// the map is linear in the two branch operands). Its transpose routes the output cotangent into the selected
-    /// branch: the `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
-    /// `select(condition, 0, cotangent)`.
-    Select {
-        /// Captured Boolean condition that drives the selection.
-        condition: F,
-    },
+    /// Selection on a captured Boolean condition.
+    Select(LinearSelectOperation<F>),
 
-    /// Opaque linear call staged by a `custom_vjp` linearization; its transpose replays the user's backward program.
+    /// Opaque `custom_vjp` call whose transpose replays the user's backward program.
     CustomVjpCall(Box<CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>>),
 }
 
-impl<V: Value<DataType>> SupportsAdd<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn add_operation() -> Self {
-        Self::Add
-    }
-}
-
-impl<V: Value<DataType>> SupportsSub<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn sub_operation() -> Self {
-        Self::Sub
-    }
-}
-
-impl<V: Value<DataType>> SupportsMul<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn mul_operation() -> Self {
-        Self::Mul
-    }
-}
-
-impl<V: Value<DataType>> SupportsDiv<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn div_operation() -> Self {
-        Self::Div
-    }
-}
-
-impl<V: Value<DataType>> SupportsNeg<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn neg_operation() -> Self {
-        Self::Neg
-    }
-}
-
-impl<V: Value<DataType>> SupportsSin<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn sin_operation() -> Self {
-        Self::Sin
-    }
-}
-
-impl<V: Value<DataType>> SupportsStopGradient<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn stop_gradient_operation() -> Self {
-        Self::StopGradient
-    }
-}
-
-impl<V: Value<DataType>> SupportsCos<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn cos_operation() -> Self {
-        Self::Cos
-    }
-}
-
-impl<V: Value<DataType>> SupportsCompare<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn compare_operation(direction: ComparisonDirection) -> Self {
-        Self::Compare { direction }
-    }
-}
-
-impl<V: Value<DataType>> SupportsSelect<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn select_operation() -> Self {
-        Self::Select
-    }
-}
-
-impl<V: Value<DataType>> SupportsZero<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn zero_operation(r#type: DataType) -> Self {
-        Self::Zero(ZeroOperation::new(r#type))
-    }
-
-    #[inline]
-    fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
+impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScalarOperation<C, F> {
+    // Several variant payloads (the elementwise arithmetic operations) implement
+    // [`Operation`](crate::operations::Operation) for both [`DataType`] and `ArrayType`, so plain method-call syntax
+    // cannot infer the type parameter here. The arms therefore disambiguate to `Operation<DataType>` explicitly.
+    fn name(&self) -> &'static str {
         match self {
-            Self::Zero(zero) => Some(zero),
-            _ => None,
+            Self::Zero(operation) => <ZeroOperation<DataType> as Operation<DataType>>::name(operation),
+            Self::ZeroLike(operation) => <ZeroLikeOperation as Operation<DataType>>::name(operation),
+            Self::One(operation) => <OneOperation<DataType> as Operation<DataType>>::name(operation),
+            Self::OneLike(operation) => <OneLikeOperation as Operation<DataType>>::name(operation),
+            Self::Constant(operation) => <ConstantOperation<DataType, F> as Operation<DataType>>::name(operation),
+            Self::Neg(operation) => <NegOperation as Operation<DataType>>::name(operation),
+            Self::Add(operation) => <AddOperation as Operation<DataType>>::name(operation),
+            Self::Sub(operation) => <SubOperation as Operation<DataType>>::name(operation),
+            Self::Scale(operation) => <ScaleOperation<DataType, F> as Operation<DataType>>::name(operation),
+            Self::Select(operation) => <LinearSelectOperation<F> as Operation<DataType>>::name(operation),
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as Operation<DataType>>::name(&**operation)
+            }
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<DataType> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::One(operation) => {
+                <OneOperation<DataType> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<DataType, F> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Add(operation) => <AddOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Sub(operation) => <SubOperation as Operation<DataType>>::infer_output_types(operation, input_types),
+            Self::Scale(operation) => {
+                <ScaleOperation<DataType, F> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::Select(operation) => {
+                <LinearSelectOperation<F> as Operation<DataType>>::infer_output_types(operation, input_types)
+            }
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as Operation<DataType>>::infer_output_types(
+                    &**operation,
+                    input_types,
+                )
+            }
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::Zero(operation) => {
+                <ZeroOperation<DataType> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::ZeroLike(operation) => {
+                <ZeroLikeOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::One(operation) => {
+                <OneOperation<DataType> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::OneLike(operation) => {
+                <OneLikeOperation as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Constant(operation) => {
+                <ConstantOperation<DataType, F> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Neg(operation) => <NegOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Add(operation) => <AddOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Sub(operation) => <SubOperation as Operation<DataType>>::render(operation, formatter, indentation),
+            Self::Scale(operation) => {
+                <ScaleOperation<DataType, F> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::Select(operation) => {
+                <LinearSelectOperation<F> as Operation<DataType>>::render(operation, formatter, indentation)
+            }
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as Operation<DataType>>::render(
+                    &**operation,
+                    formatter,
+                    indentation,
+                )
+            }
         }
     }
 }
 
-impl<V: Value<DataType>> SupportsOne<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn one_operation(r#type: DataType) -> Self {
-        Self::One(OneOperation::new(r#type))
+impl<C: Value<DataType>, F: Value<DataType>> Display for LinearScalarOperation<C, F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
     }
 }
 
-impl<V: Value<DataType>> SupportsZeroLike<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn zero_like_operation() -> Self {
-        Self::ZeroLike
+impl<C: Value<DataType>, F: Value<DataType>> From<ZeroOperation<DataType>> for LinearScalarOperation<C, F> {
+    fn from(operation: ZeroOperation<DataType>) -> Self {
+        Self::Zero(operation)
     }
 }
 
-impl<V: Value<DataType>> SupportsOneLike<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn one_like_operation() -> Self {
-        Self::OneLike
-    }
-}
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
+    for &'a ZeroOperation<DataType>
+{
+    type Error = ();
 
-impl<V: Value<DataType>> SupportsScale<DataType, V> for ScalarOperation<V> {
-    #[inline]
-    fn scale_operation(factor: V) -> Self {
-        Self::Scale { factor }
-    }
-}
-
-impl<V: Value<DataType>> SupportsConstant<DataType, V> for ScalarOperation<V> {
-    #[inline]
-    fn constant_operation(value: V) -> Self {
-        Self::Constant(ConstantOperation::new(value))
-    }
-
-    #[inline]
-    fn as_constant_operation(&self) -> Option<&ConstantOperation<DataType, V>> {
-        match self {
-            Self::Constant(constant) => Some(constant),
-            _ => None,
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Zero(operation) => Ok(operation),
+            _ => Err(()),
         }
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsAdd<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn add_operation() -> Self {
-        Self::Add
+impl<C: Value<DataType>, F: Value<DataType>> From<ZeroLikeOperation> for LinearScalarOperation<C, F> {
+    fn from(operation: ZeroLikeOperation) -> Self {
+        Self::ZeroLike(operation)
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsSub<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn sub_operation() -> Self {
-        Self::Sub
-    }
-}
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>> for &'a ZeroLikeOperation {
+    type Error = ();
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsZero<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn zero_operation(r#type: DataType) -> Self {
-        Self::Zero(ZeroOperation::new(r#type))
-    }
-
-    #[inline]
-    fn as_zero_operation(&self) -> Option<&ZeroOperation<DataType>> {
-        match self {
-            Self::Zero(zero) => Some(zero),
-            _ => None,
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::ZeroLike(operation) => Ok(operation),
+            _ => Err(()),
         }
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsOne<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn one_operation(r#type: DataType) -> Self {
-        Self::One(OneOperation::new(r#type))
+impl<C: Value<DataType>, F: Value<DataType>> From<OneOperation<DataType>> for LinearScalarOperation<C, F> {
+    fn from(operation: OneOperation<DataType>) -> Self {
+        Self::One(operation)
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsZeroLike<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn zero_like_operation() -> Self {
-        Self::ZeroLike
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
+    for &'a OneOperation<DataType>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::One(operation) => Ok(operation),
+            _ => Err(()),
+        }
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsOneLike<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn one_like_operation() -> Self {
-        Self::OneLike
+impl<C: Value<DataType>, F: Value<DataType>> From<OneLikeOperation> for LinearScalarOperation<C, F> {
+    fn from(operation: OneLikeOperation) -> Self {
+        Self::OneLike(operation)
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsNeg<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn neg_operation() -> Self {
-        Self::Neg
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>> for &'a OneLikeOperation {
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::OneLike(operation) => Ok(operation),
+            _ => Err(()),
+        }
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsScale<DataType, F> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn scale_operation(factor: F) -> Self {
-        Self::Scale { factor }
+impl<C: Value<DataType>, F: Value<DataType>> From<ConstantOperation<DataType, F>> for LinearScalarOperation<C, F> {
+    fn from(operation: ConstantOperation<DataType, F>) -> Self {
+        Self::Constant(operation)
     }
 }
 
-impl<C: Value<DataType>, F: Value<DataType>> SupportsLinearSelect<DataType, F> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn linear_select_operation(condition: F) -> Self {
-        Self::Select { condition }
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
+    for &'a ConstantOperation<DataType, F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Constant(operation) => Ok(operation),
+            _ => Err(()),
+        }
     }
 }
 
-impl<V: Value<DataType>> SupportsRematerializationName<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn rematerialization_name_operation(name: String) -> Self {
-        Self::RematerializationName(RematerializationNameOperation::new(name))
+impl<C: Value<DataType>, F: Value<DataType>> From<NegOperation> for LinearScalarOperation<C, F> {
+    fn from(operation: NegOperation) -> Self {
+        Self::Neg(operation)
+    }
+}
+
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>> for &'a NegOperation {
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Neg(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>> From<AddOperation> for LinearScalarOperation<C, F> {
+    fn from(operation: AddOperation) -> Self {
+        Self::Add(operation)
+    }
+}
+
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>> for &'a AddOperation {
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Add(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>> From<SubOperation> for LinearScalarOperation<C, F> {
+    fn from(operation: SubOperation) -> Self {
+        Self::Sub(operation)
+    }
+}
+
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>> for &'a SubOperation {
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Sub(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>> From<ScaleOperation<DataType, F>> for LinearScalarOperation<C, F> {
+    fn from(operation: ScaleOperation<DataType, F>) -> Self {
+        Self::Scale(operation)
+    }
+}
+
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
+    for &'a ScaleOperation<DataType, F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Scale(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>> From<LinearSelectOperation<F>> for LinearScalarOperation<C, F> {
+    fn from(operation: LinearSelectOperation<F>) -> Self {
+        Self::Select(operation)
+    }
+}
+
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
+    for &'a LinearSelectOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::Select(operation) => Ok(operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>> From<CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>>
+    for LinearScalarOperation<C, F>
+{
+    fn from(operation: CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>) -> Self {
+        Self::CustomVjpCall(Box::new(operation))
+    }
+}
+
+impl<'a, C: Value<DataType>, F: Value<DataType>> TryFrom<&'a LinearScalarOperation<C, F>>
+    for &'a CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearScalarOperation<C, F>) -> Result<Self, ()> {
+        match value {
+            LinearScalarOperation::CustomVjpCall(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<C: Value<DataType>, F: Value<DataType>, W, O> TransposableOperation<DataType, W, O> for LinearScalarOperation<C, F>
+where
+    ZeroOperation<DataType>: TransposableOperation<DataType, W, O>,
+    ZeroLikeOperation: TransposableOperation<DataType, W, O>,
+    OneOperation<DataType>: TransposableOperation<DataType, W, O>,
+    OneLikeOperation: TransposableOperation<DataType, W, O>,
+    ConstantOperation<DataType, F>: TransposableOperation<DataType, W, O>,
+    NegOperation: TransposableOperation<DataType, W, O>,
+    AddOperation: TransposableOperation<DataType, W, O>,
+    SubOperation: TransposableOperation<DataType, W, O>,
+    ScaleOperation<DataType, F>: TransposableOperation<DataType, W, O>,
+    LinearSelectOperation<F>: TransposableOperation<DataType, W, O>,
+    CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType>: TransposableOperation<DataType, W, O>,
+    W: Value<DataType>,
+    O: Operation<DataType>,
+    W: Add<Output = W> + Neg<Output = W> + ZeroLike + OneLike,
+    Vec<W>: Parameterized<W, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, DataType, W, O>,
+        input_types: &[&DataType],
+        output_cotangents: &[Cotangent<'transpose, DataType, W, O>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, W, O>>, ProgramError> {
+        match self {
+            Self::Zero(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::ZeroLike(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::One(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::OneLike(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Constant(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Neg(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Add(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Sub(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Scale(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::Select(operation) => operation.transpose(context, input_types, output_cotangents),
+            Self::CustomVjpCall(operation) => {
+                <CustomVjpCallOperation<C, ScalarOperation<C>, F, DataType> as TransposableOperation<
+                    DataType,
+                    W,
+                    O,
+                >>::transpose(&**operation, context, input_types, output_cotangents)
+            }
+        }
     }
 }
 
@@ -367,214 +1128,6 @@ impl<V: Value<DataType>> crate::tracing_v2::operations::dot::MaybeDot for Scalar
     #[inline]
     fn dot_dimensions(&self) -> Option<&crate::tracing_v2::operations::dot::DotDimensionNumbers> {
         None
-    }
-}
-
-impl<V: Value<DataType>> SupportsCustomJvp<DataType, V> for ScalarOperation<V> {
-    #[inline]
-    fn custom_jvp_operation(operation: CustomJvpOperation<V, Self, DataType>) -> Self {
-        Self::CustomJvp(Box::new(operation))
-    }
-}
-
-impl<V: Value<DataType>> SupportsCustomVjp<DataType, V> for ScalarOperation<V> {
-    #[inline]
-    fn custom_vjp_operation(operation: CustomVjpOperation<V, Self, DataType>) -> Self {
-        Self::CustomVjp(Box::new(operation))
-    }
-}
-
-impl<C: Value<DataType>, F: Value<DataType>> SupportsCustomVjpCall<DataType, C, ScalarOperation<C>, F>
-    for LinearScalarOperation<C, F>
-{
-    #[inline]
-    fn custom_vjp_call_operation(
-        backward: Program<DataType, C, ScalarOperation<C>, Vec<C>, Vec<C>>,
-        tangent: Option<Program<DataType, C, ScalarOperation<C>, Vec<C>, Vec<C>>>,
-        residuals: Vec<F>,
-        transposed: bool,
-        prevent_cse: bool,
-    ) -> Self {
-        Self::CustomVjpCall(Box::new(CustomVjpCallOperation::new(
-            backward,
-            tangent,
-            residuals,
-            transposed,
-            prevent_cse,
-        )))
-    }
-}
-
-impl<C: Value<DataType>, F: Value<DataType>> SupportsConstant<DataType, F> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn constant_operation(value: F) -> Self {
-        Self::Constant(ConstantOperation::new(value))
-    }
-
-    #[inline]
-    fn as_constant_operation(&self) -> Option<&ConstantOperation<DataType, F>> {
-        match self {
-            Self::Constant(constant) => Some(constant),
-            _ => None,
-        }
-    }
-}
-
-impl<V: Value<DataType>> ScalarOperation<V> {
-    #[inline]
-    fn operation_name(&self) -> &'static str {
-        match self {
-            Self::Zero(zero) => zero.name(),
-            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
-            Self::One(one) => one.name(),
-            Self::OneLike => ONE_LIKE_OPERATION_NAME,
-            Self::Constant(constant) => constant.name(),
-            Self::Neg => NEG_OPERATION_NAME,
-            Self::Add => ADD_OPERATION_NAME,
-            Self::Sub => SUB_OPERATION_NAME,
-            Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::Mul => MUL_OPERATION_NAME,
-            Self::Div => DIV_OPERATION_NAME,
-            Self::Sin => SIN_OPERATION_NAME,
-            Self::Cos => COS_OPERATION_NAME,
-            Self::Compare { .. } => COMPARE_OPERATION_NAME,
-            Self::Select => SELECT_OPERATION_NAME,
-            Self::StopGradient => STOP_GRADIENT_OPERATION_NAME,
-            Self::RematerializationName(_) => REMATERIALIZATION_NAME_OPERATION_NAME,
-            Self::CustomJvp(_) => "custom_jvp",
-            Self::CustomVjp(_) => "custom_vjp",
-        }
-    }
-}
-
-impl<C: Value<DataType>, F: Value<DataType>> LinearScalarOperation<C, F> {
-    #[inline]
-    fn operation_name(&self) -> &'static str {
-        match self {
-            Self::Zero(zero) => zero.name(),
-            Self::ZeroLike => ZERO_LIKE_OPERATION_NAME,
-            Self::One(one) => one.name(),
-            Self::OneLike => ONE_LIKE_OPERATION_NAME,
-            Self::Constant(constant) => constant.name(),
-            Self::Neg => NEG_OPERATION_NAME,
-            Self::Add => ADD_OPERATION_NAME,
-            Self::Sub => SUB_OPERATION_NAME,
-            Self::Scale { .. } => SCALE_OPERATION_NAME,
-            Self::Select { .. } => SELECT_OPERATION_NAME,
-            Self::CustomVjpCall(call) => {
-                if call.transposed() {
-                    "custom_vjp_backward"
-                } else {
-                    "custom_vjp_tangent"
-                }
-            }
-        }
-    }
-}
-
-impl<V: Value<DataType>> Display for ScalarOperation<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<C: Value<DataType>, F: Value<DataType>> Display for LinearScalarOperation<C, F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<V: Value<DataType>> Operation<DataType> for ScalarOperation<V> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.operation_name()
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        match self {
-            Self::Zero(zero) => zero.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::One(one) => one.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::Constant(constant) => constant.infer_output_types(input_types),
-            Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Add => AddOperation.infer_output_types(input_types),
-            Self::Sub => SubOperation.infer_output_types(input_types),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            Self::Mul => MulOperation.infer_output_types(input_types),
-            Self::Div => DivOperation.infer_output_types(input_types),
-            Self::Sin => SinOperation.infer_output_types(input_types),
-            Self::Cos => CosOperation.infer_output_types(input_types),
-            Self::Compare { direction } => CompareOperation::new(*direction).infer_output_types(input_types),
-            Self::Select => SelectOperation.infer_output_types(input_types),
-            Self::StopGradient => StopGradientOperation.infer_output_types(input_types),
-            Self::RematerializationName(operation) => operation.infer_output_types(input_types),
-            Self::CustomJvp(operation) => operation.infer_output_types(input_types),
-            Self::CustomVjp(operation) => operation.infer_output_types(input_types),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => zero.render(formatter, indentation),
-            Self::One(one) => one.render(formatter, indentation),
-            Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Compare { direction } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("direction", direction)),
-            _ => formatter.write_str(self.operation_name()),
-        }
-    }
-}
-
-impl<C: Value<DataType>, F: Value<DataType>> Operation<DataType> for LinearScalarOperation<C, F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        self.operation_name()
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        match self {
-            Self::Zero(zero) => zero.infer_output_types(input_types),
-            Self::ZeroLike => ZeroLikeOperation.infer_output_types(input_types),
-            Self::One(one) => one.infer_output_types(input_types),
-            Self::OneLike => OneLikeOperation.infer_output_types(input_types),
-            Self::Constant(constant) => constant.infer_output_types(input_types),
-            Self::Neg => NegOperation.infer_output_types(input_types),
-            Self::Add => AddOperation.infer_output_types(input_types),
-            Self::Sub => SubOperation.infer_output_types(input_types),
-            Self::Scale { factor } => ScaleOperation::new(factor.clone()).infer_output_types(input_types),
-            // The captured-condition select is linear in its two branch tangents, which share a type that is the
-            // output type. The Boolean primal condition is captured in band as an `f64` residual, so it is not
-            // revalidated here (the primal trace already typed it); only the branch tangents are checked.
-            Self::Select { .. } => {
-                check_count!("input", input_types, 2, TypeError);
-                if input_types[0] != input_types[1] {
-                    return Err(TypeError {
-                        message: format!(
-                            "select on_true data type {} differs from on_false data type {}",
-                            input_types[0], input_types[1],
-                        ),
-                    });
-                }
-                Ok(vec![input_types[0]])
-            }
-            Self::CustomVjpCall(call) => call.infer_output_types(input_types),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::Zero(zero) => zero.render(formatter, indentation),
-            Self::One(one) => one.render(formatter, indentation),
-            Self::Constant(constant) => constant.render(formatter, indentation),
-            Self::Scale { factor } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("factor", factor)),
-            Self::Select { condition } => OperationFormatter::new(formatter, indentation, self.operation_name())?
-                .bracketed(|operation| operation.field("condition", condition)),
-            _ => formatter.write_str(self.operation_name()),
-        }
     }
 }
 

@@ -27,9 +27,9 @@ mod tests {
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
     use crate::tracing_v2::differentiation::{
-        FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
+        FactorParameterizedOperation, JvpTracer, LinearOperationOf, TangentContext,
     };
-    use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+    use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
     use crate::types::{DataType, Typed};
 
     #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
@@ -447,7 +447,7 @@ mod tests {
         D: DifferentiationContext<Type = DataType>,
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
         LinearOperationOf<D>:
-            From<AddOperation> + From<ScaleOperation<DataType, ResidualFactor<DataType, <D as Domain>::Value>>>,
+            From<AddOperation> + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -535,7 +535,7 @@ mod tests {
         let linear_builder = Rc::new(RefCell::new(ProgramBuilder::<
             DataType,
             DomainTracer<ScalarDomain<f64>>,
-            LinearScalarOperation<f64, ResidualFactor<DataType, DomainTracer<ScalarDomain<f64>>>>,
+            LinearScalarOperation<f64, CapturedFactor<DataType, DomainTracer<ScalarDomain<f64>>>>,
         >::new()));
         let mut context = TangentContext::new(&outer_tracing_context, linear_builder.clone());
         let tangent_a = context.input(crate::types::DataType::F64);

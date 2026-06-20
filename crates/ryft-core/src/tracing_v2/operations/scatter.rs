@@ -16,9 +16,9 @@ use crate::operations::manipulation::{
 };
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_input_metadata};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::operations::slicing::batch_by_lane_expansion;
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Typed};
 
 /// JVP rule for [`ScatterOperation`]. For the [`Add`](ScatterReductionKind::Add) combiner the operation is jointly
@@ -30,7 +30,7 @@ impl<D> DifferentiableOperation<D> for ScatterOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Scatter,
-    LinearOperationOf<D>: From<LinearScatterAddOperation<ResidualFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>: From<LinearScatterAddOperation<CapturedFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,

@@ -9,18 +9,26 @@ use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectCondi
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::operations::primitive::transpose_captured_condition_select;
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, LinearOperationOf};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext, LinearOperationOf};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-/// Scalar captured-condition select operation: the linear map `(t, f) ↦ select(condition, t, f)` over two branch
-/// tangents (or cotangents) of equal type. It is the scalar counterpart of the `Select` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::ArrayOperation) emitted by the JVP of
-/// [`SelectOperation`](crate::operations::control_flow::SelectOperation): the Boolean primal condition is captured as
-/// the factor `condition` (it has no tangent space, so the map is linear in the two branch operands), while its
-/// transpose routes the output cotangent into the selected branch (the `on_true` cotangent is
-/// `select(condition, cotangent, 0)` and the `on_false` cotangent is `select(condition, 0, cotangent)`).
+/// Captured-condition select operation used in linear tangent and cotangent programs.
+///
+/// The ordinary [`SelectOperation`] is not the linear primitive because its operand list is
+/// `(condition, on_true, on_false)`, and the Boolean condition is a primal value with no tangent space. The linear map
+/// produced by the JVP of `select(condition, on_true, on_false)` instead fixes that primal condition as a captured
+/// factor and acts only on the two branch tangents (or cotangents):
+///
+/// ```text
+/// (on_true_tangent, on_false_tangent) -> select(condition, on_true_tangent, on_false_tangent)
+/// ```
+///
+/// This operation stores that captured `condition` factor in the operation payload, which lets residualized
+/// pushforwards remap or instantiate it like other captured factors. Its transpose routes the output cotangent into
+/// the selected branch: `select(condition, cotangent, 0)` for the `on_true` input and
+/// `select(condition, 0, cotangent)` for the `on_false` input.
 #[derive(Clone, Debug)]
 pub struct LinearSelectOperation<F> {
     /// Captured Boolean condition that drives the selection.
@@ -106,11 +114,12 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearSelectOperation<F> {
 /// Transpose rule for the captured-condition select, shared by the scalar
 /// [`LinearScalarOperation::Select`](crate::tracing_v2::LinearScalarOperation) and array
 /// [`LinearArrayOperation::Select`](crate::tracing_v2::LinearArrayOperation) variants. The forward linear map
-/// `(t, f) ↦ select(condition, t, f)` routes the output cotangent into the branch the captured condition selected: the
-/// `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
+/// `(t, f) ↦ select(condition, t, f)` routes the output cotangent into the branch the captured condition selected:
+/// the `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
 /// `select(condition, 0, cotangent)`. The transposed select reuses the same captured condition, reconstructed from
 /// `self` and staged via [`transpose_captured_condition_select`]. The impl is generic over the primary type `T` and
-/// applies wherever `LinearSelectOperation<F>` implements [`Operation`] for `T` (i.e., [`DataType`] and [`ArrayType`]).
+/// applies wherever `LinearSelectOperation<F>` implements [`Operation`] for `T` (i.e., [`DataType`] and
+/// [`ArrayType`]).
 impl<T: Type, V: Value<T>, O: Operation<T>, F: Clone> TransposableOperation<T, V, O> for LinearSelectOperation<F>
 where
     Self: Operation<T>,
@@ -159,7 +168,7 @@ where
     D: DifferentiationContext,
     SelectOperation: Operation<D::Type>,
     D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
-    LinearOperationOf<D>: From<LinearSelectOperation<ResidualFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<LinearSelectOperation<CapturedFactor<D::Type, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,

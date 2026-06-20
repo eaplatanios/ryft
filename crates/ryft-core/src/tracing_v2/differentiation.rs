@@ -6,7 +6,6 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::contexts::{Context, EagerContext, ProvidesContext, StagingContext};
@@ -15,13 +14,13 @@ use crate::domains::{AbstractDomain, Domain};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, ZeroOperation};
-use crate::operations::control_flow::SelectCondition;
 use crate::operations::scalars::LinearScalarOperation;
-use crate::operations::{BooleanLike, InterpretableOperation, Operation};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::scalars::ScalarDomain;
 use crate::tracing::{Tracer, TracerState, TracingContext};
+use crate::tracing_v2::operations::captures::CapturedFactor;
 use crate::types::{DataType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -45,114 +44,12 @@ pub enum DifferentiationError {
     Program(#[from] ProgramError),
 }
 
-/// Factor payload used inside residualized linear programs.
-#[derive(Clone, Debug, Parameter)]
-pub enum ResidualFactor<T: Type, V: Value<T>> {
-    /// Closed constant factor that is independent of primal inputs.
-    Constant(V),
-
-    /// Reference to a primal residual saved by the owning [`Pushforward`].
-    Reference {
-        /// Zero-based residual index inside the owning [`Pushforward`].
-        index: usize,
-
-        /// Type metadata for the residual value.
-        r#type: T,
-    },
-}
-
-impl<T: Type, V: Value<T>> ResidualFactor<T, V> {
-    /// Instantiates this factor into a concrete value using `residuals`.
-    pub(crate) fn instantiate(&self, residuals: &[V]) -> Result<V, ProgramError> {
-        match self {
-            Self::Constant(value) => Ok(value.clone()),
-            Self::Reference { index, .. } => {
-                residuals.get(*index).cloned().ok_or(ProgramError::UnboundAtomId { id: AtomId::new(*index) }.into())
-            }
-        }
-    }
-
-    /// Returns this factor's residual index, if it references one.
-    fn residual_index(&self) -> Option<usize> {
-        match self {
-            Self::Constant(_) => None,
-            Self::Reference { index, .. } => Some(*index),
-        }
-    }
-
-    /// Remaps this factor through a compacted residual-index table.
-    fn remap_residuals(&self, mapping: &[Option<usize>]) -> Result<Self, ProgramError> {
-        match self {
-            Self::Constant(value) => Ok(Self::Constant(value.clone())),
-            Self::Reference { index: old_index, r#type } => {
-                let Some(Some(index)) = mapping.get(*old_index) else {
-                    return Err(ProgramError::UnboundAtomId { id: AtomId::new(*old_index) }.into());
-                };
-                Ok(Self::Reference { index: *index, r#type: r#type.clone() })
-            }
-        }
-    }
-}
-
-impl<T: Type, V: Value<T>> Display for ResidualFactor<T, V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Constant(value) => Display::fmt(value, formatter),
-            Self::Reference { index, .. } => write!(formatter, "residual[{index}]"),
-        }
-    }
-}
-
-impl<T: Type, V: Value<T>> Typed<T> for ResidualFactor<T, V> {
-    #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
-        match self {
-            Self::Constant(value) => value.r#type(),
-            Self::Reference { r#type, .. } => Cow::Borrowed(r#type),
-        }
-    }
-}
-
-impl<T: Type, V: Value<T>> Value<T> for ResidualFactor<T, V> {
-    type InterpretationContext = V::InterpretationContext;
-
-    #[inline]
-    fn interpretation_context(&self) -> Option<V::InterpretationContext> {
-        match self {
-            Self::Constant(value) => value.interpretation_context(),
-            // References are residuals of the primal computation that carry no payload value to recover a context from;
-            // they are instantiated to concrete constants before any interpretation, and callers scan their other
-            // operands for one that yields a context (see the `SelectCondition`/`residual_value` impls, which reject
-            // references for the same reason).
-            Self::Reference { .. } => None,
-        }
-    }
-}
-
-// TODO(eaplatanios): Why do we need this? Also, we should move it to `select.rs`.
-/// Scalar captured-condition factors carry the [`SelectOperation`](crate::operations::control_flow::SelectOperation)
-/// condition as an in-band Boolean over a [`DataType`] value, so the linear select interprets them by decoding that
-/// Boolean. References are residuals of the primal computation and must be instantiated before interpretation, so the
-/// reference form errors here, matching [`CustomVjpResidual::residual_value`](crate::tracing_v2::operations::CustomVjpResidual).
-impl<V: Value<DataType> + BooleanLike> SelectCondition for ResidualFactor<DataType, V> {
-    type Condition = bool;
-
-    fn select_condition(&self) -> Result<bool, ProgramError> {
-        match self {
-            Self::Constant(value) => value.boolean(),
-            Self::Reference { .. } => Err(ProgramError::Concretization {
-                message: "captured select condition requires instantiated residuals".to_string(),
-            }),
-        }
-    }
-}
-
 /// Operation contract for mapping the factor payloads carried by a linear operation.
 ///
 /// A linear operation acts on values of some carrier `V` chosen by the surrounding [`Program`]. Some linear operations
 /// also carry coefficients from the primal computation, such as scale factors and product-rule factors. This trait is
 /// parameterized by that factor carrier `F` and provides the single hook needed to rewrite those carried factors.
-/// Residualized pushforwards use [`ResidualFactor`] as `F`; direct programs use the concrete primal value type as `F`.
+/// Residualized pushforwards use [`CapturedFactor`] as `F`; direct programs use the concrete primal value type as `F`.
 pub trait FactorParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation<T> {
     /// Operation type produced by replacing `F` payloads with `MappedFactor` payloads.
     type WithFactor<MappedFactor: Value<T>>: Clone + Operation<T>;
@@ -184,9 +81,9 @@ pub trait FactorParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation<
 pub trait ResidualizedOperation<D: DifferentiationContext>:
     FactorParameterizedOperation<
         D::Type,
-        ResidualFactor<D::Type, D::Value>,
+        CapturedFactor<D::Type, D::Value>,
         WithFactor<D::Value> = DirectLinearOperationOf<D>,
-        WithFactor<ResidualFactor<D::Type, D::Value>> = LinearOperationOf<D>,
+        WithFactor<CapturedFactor<D::Type, D::Value>> = LinearOperationOf<D>,
     > + From<ZeroOperation<D::Type>>
 {
     /// Appends residual indices referenced by this operation to `indices`.
@@ -216,9 +113,9 @@ where
     D: DifferentiationContext,
     O: FactorParameterizedOperation<
             D::Type,
-            ResidualFactor<D::Type, D::Value>,
+            CapturedFactor<D::Type, D::Value>,
             WithFactor<D::Value> = DirectLinearOperationOf<D>,
-            WithFactor<ResidualFactor<D::Type, D::Value>> = LinearOperationOf<D>,
+            WithFactor<CapturedFactor<D::Type, D::Value>> = LinearOperationOf<D>,
         > + From<ZeroOperation<D::Type>>,
 {
 }
@@ -226,7 +123,7 @@ where
 /// Residualized linear operation type selected by a [`DifferentiationContext`] implementation.
 pub type LinearOperationOf<E> = <E as DifferentiationContext>::LinearOperation<
     <E as DifferentiationContext>::Tangent,
-    ResidualFactor<<E as Domain>::Type, <E as Domain>::Value>,
+    CapturedFactor<<E as Domain>::Type, <E as Domain>::Value>,
 >;
 
 /// Directly executable linear operation type selected by a [`DifferentiationContext`] implementation.
@@ -1408,7 +1305,7 @@ pub type LinearizationContextOf<E, O> = LinearizationContext<
 ///     `i` of the original program remains output `i`, and residual index `j` becomes appended output
 ///     `original_output_count + j`.
 ///   - [`pushforward_program`](Self::pushforward_program) is the residualized linear map of the function at the
-///     primal point. Its [`ResidualFactor::Reference`] factors index into [`residual_types`](Self::residual_types)
+///     primal point. Its [`CapturedFactor::Reference`] factors index into [`residual_types`](Self::residual_types)
 ///     positionally, which by the contract above means reference `j` is satisfied by appended primal output
 ///     `original_output_count + j`. References are *not* baked into constants, so callers can rebind them against
 ///     any residual environment.
@@ -1436,7 +1333,7 @@ where
     pub primal_program: Program<E::Type, E::Constant, O, Input, Vec<E::Constant>>,
 
     /// Residualized pushforward program, expressed directly in the enclosing context's linear representation. Its
-    /// [`ResidualFactor::Reference`] factors index the residual outputs appended to
+    /// [`CapturedFactor::Reference`] factors index the residual outputs appended to
     /// [`primal_program`](Self::primal_program).
     // The `tangent_program` name is reserved for this field once the remaining `pushforward_program` consumers are
     // migrated; renaming now would break the `NestedLinearization` alias's field accesses.
@@ -1463,7 +1360,7 @@ where
     /// active trace. The flat interpreted outputs are split using [`residual_types`](Self::residual_types): the
     /// leading outputs are reassembled into the original structured output and the trailing
     /// `residual_types.len()` values are returned as the residual environment, aligned with the pushforward
-    /// program's [`ResidualFactor::Reference`] indices.
+    /// program's [`CapturedFactor::Reference`] indices.
     ///
     /// # Parameters
     ///
@@ -1604,7 +1501,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
 /// The returned [`Linearization`] preserves the program's `Input`/`Output` parameterizations and packages the
 /// residual-extended primal program, the residualized pushforward program, and the residual types; refer to the
 /// [`Linearization`] documentation for the exact program-shape contract. Factor payloads captured from program
-/// *constants* (which have no residual atom) are converted into closed [`ResidualFactor::Constant`] factors by
+/// *constants* (which have no residual atom) are converted into closed [`CapturedFactor::Constant`] factors by
 /// lifting the constant through `differentiable`.
 ///
 /// # Parameters
@@ -1629,8 +1526,8 @@ where
     LinearOperationOf<LinearizationContextOf<E, O>>: ResidualizedOperation<LinearizationContextOf<E, O>>
         + FactorParameterizedOperation<
             <E as Domain>::Type,
-            ResidualFactor<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
-            WithFactor<ResidualFactor<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
+            CapturedFactor<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
+            WithFactor<CapturedFactor<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
         >,
 {
     let nested_context = LinearizationContextOf::<E, O>::new();
@@ -1657,15 +1554,15 @@ where
     // nested program constants and are lifted through the enclosing context.
     let pushforward_program = pushforward.program().map_operations(|operation| {
         operation.try_map_factors(&mut |factor| match factor {
-            ResidualFactor::Reference { index, r#type } => {
-                Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+            CapturedFactor::Reference { index, r#type } => {
+                Ok(CapturedFactor::Reference { index: *index, r#type: r#type.clone() })
             }
-            ResidualFactor::Constant(tracer) => {
+            CapturedFactor::Constant(tracer) => {
                 let atom = tracer.atom_id()?;
                 let builder = nested_context.builder().borrow();
                 match builder.atoms().get(atom.index()) {
                     Some(Atom::Constant(constant)) => {
-                        Ok(ResidualFactor::Constant(differentiable.lift(constant.clone())?))
+                        Ok(CapturedFactor::Constant(differentiable.lift(constant.clone())?))
                     }
                     Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
                         "nested symbolic linearization captured non-constant primal atom {atom} as a closed factor",
@@ -1874,26 +1771,26 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     ///
     /// Higher-order JVP rules also use this to register primal values they computed themselves — for example, the
     /// residual outputs of a staged primal condition — in the active linearization residual environment, obtaining
-    /// [`ResidualFactor::Reference`] factors that reusable pushforwards instantiate later.
-    pub fn factor(&mut self, value: E::Value) -> ResidualFactor<E::Type, E::Value> {
+    /// [`CapturedFactor::Reference`] factors that reusable pushforwards instantiate later.
+    pub fn factor(&mut self, value: E::Value) -> CapturedFactor<E::Type, E::Value> {
         let r#type = value.r#type().into_owned();
         let mut residuals = self.residuals.borrow_mut();
         let index = residuals.len();
         residuals.push(value);
-        ResidualFactor::Reference { index, r#type }
+        CapturedFactor::Reference { index, r#type }
     }
 
     /// Captures `value` as a residual factor, deduplicating by `atom` when one is available.
-    fn factor_for_atom(&mut self, atom: AtomId, value: E::Value) -> ResidualFactor<E::Type, E::Value> {
+    fn factor_for_atom(&mut self, atom: AtomId, value: E::Value) -> CapturedFactor<E::Type, E::Value> {
         let r#type = value.r#type().into_owned();
         if let Some(index) = self.residual_atoms.borrow().get(&atom).copied() {
-            return ResidualFactor::Reference { index, r#type };
+            return CapturedFactor::Reference { index, r#type };
         }
         let mut residuals = self.residuals.borrow_mut();
         let index = residuals.len();
         residuals.push(value);
         self.residual_atoms.borrow_mut().insert(atom, index);
-        ResidualFactor::Reference { index, r#type }
+        CapturedFactor::Reference { index, r#type }
     }
 }
 
@@ -2077,10 +1974,10 @@ where
 
     /// Returns this tracer's primal value as a residual factor.
     #[inline]
-    pub fn factor(&self, context: &mut TangentContext<'domain, E>) -> ResidualFactor<E::Type, E::Value> {
+    pub fn factor(&self, context: &mut TangentContext<'domain, E>) -> CapturedFactor<E::Type, E::Value> {
         match self.residual_atom {
             Some(atom) => context.factor_for_atom(atom, self.primal.clone()),
-            None => ResidualFactor::Constant(self.primal.clone()),
+            None => CapturedFactor::Constant(self.primal.clone()),
         }
     }
 
@@ -2161,9 +2058,10 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
+    use crate::tracing_v2::CapturedFactor;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
-    use super::{DifferentiationContext, FactorParameterizedOperation, Pushforward, ResidualFactor};
+    use super::{DifferentiationContext, FactorParameterizedOperation, Pushforward};
 
     /// Minimal linear operation family used to test pushforward replay over symbolic-zero tangent values.
     #[derive(Clone)]
@@ -2289,7 +2187,7 @@ mod tests {
         let mut builder = ProgramBuilder::<
             DataType,
             Tangent<DataType, f64>,
-            SymbolicZeroLinearOperation<ResidualFactor<DataType, f64>>,
+            SymbolicZeroLinearOperation<CapturedFactor<DataType, f64>>,
         >::new();
         let input = builder.add_input(DataType::F64);
         let program = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();

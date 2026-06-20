@@ -20,7 +20,7 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation, ResidualFactor,
+    CapturedFactor, DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -183,12 +183,12 @@ where
     let residual_factors =
         pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
     let pushforward_program = pushforward.program().map_operations(|operation| {
-        operation.try_map_factors(&mut |factor: &ResidualFactor<D::Type, <D as Domain>::Value>| match factor {
-            ResidualFactor::Reference { index, .. } => residual_factors
+        operation.try_map_factors(&mut |factor: &CapturedFactor<D::Type, <D as Domain>::Value>| match factor {
+            CapturedFactor::Reference { index, .. } => residual_factors
                 .get(*index)
                 .cloned()
                 .ok_or(ProgramError::UnboundAtomId { id: crate::programs::AtomId::new(*index) }),
-            ResidualFactor::Constant(value) => Ok(ResidualFactor::Constant(value.clone())),
+            CapturedFactor::Constant(value) => Ok(CapturedFactor::Constant(value.clone())),
         })
     })?;
     let tangent_outputs = context.stage_program(&pushforward_program, tangent_seeds)?;
@@ -552,7 +552,7 @@ where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<<D as Domain>::Constant, O, ResidualFactor<D::Type, <D as Domain>::Value>, D::Type>>,
+        + From<CustomVjpCallOperation<<D as Domain>::Constant, O, CapturedFactor<D::Type, <D as Domain>::Value>, D::Type>>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -595,7 +595,7 @@ where
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<V, O, ResidualFactor<D::Type, <D as Domain>::Value>, D::Type>>,
+        + From<CustomVjpCallOperation<V, O, CapturedFactor<D::Type, <D as Domain>::Value>, D::Type>>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -670,7 +670,7 @@ where
 
 /// Access to a custom-VJP residual payload as a concrete value during pullback interpretation.
 ///
-/// Implemented by plain values (identity) and by [`ResidualFactor`] (whose `Constant` form yields its payload and
+/// Implemented by plain values (identity) and by [`CapturedFactor`] (whose `Constant` form yields its payload and
 /// whose `Reference` form errors, since references are only meaningful before residual instantiation).
 #[doc(hidden)]
 pub trait CustomVjpResidual<T: Type, V: Value<T>>: Value<T> {
@@ -685,11 +685,11 @@ impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for V {
     }
 }
 
-impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for ResidualFactor<T, V> {
+impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for CapturedFactor<T, V> {
     fn residual_value(&self) -> Result<V, ProgramError> {
         match self {
-            ResidualFactor::Constant(value) => Ok(value.clone()),
-            ResidualFactor::Reference { .. } => Err(TypeError {
+            CapturedFactor::Constant(value) => Ok(value.clone()),
+            CapturedFactor::Reference { .. } => Err(TypeError {
                 message: "custom_vjp pullback interpretation requires instantiated residuals".to_string(),
             }
             .into()),

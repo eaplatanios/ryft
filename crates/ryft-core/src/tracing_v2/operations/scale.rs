@@ -9,16 +9,14 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::DifferentiableOperation;
-use crate::tracing_v2::differentiation::{
-    DifferentiationContext, JvpTracer, LinearOperationOf, ResidualFactor, TangentContext,
-};
+use crate::tracing_v2::differentiation::{DifferentiationContext, JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation};
 use crate::types::Type;
 
 /// Transpose rule for [`ScaleOperation`]: scaling by a captured factor is self-adjoint, so the input cotangent is the
 /// output cotangent scaled by the same factor. The captured factor type `F` is independent of the cotangent value type
 /// `V` (they coincide only at the top level; inside a linear scan body the factor lives in the scan-local
-/// `ResidualFactor` namespace while the cotangent does not), so this impl is generic over both and stages the adjoint
+/// `CapturedFactor` namespace while the cotangent does not), so this impl is generic over both and stages the adjoint
 /// scale into `O` through the cotangent's own `Scale<F>` capability.
 impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T> + From<ScaleOperation<T, F>>> TransposableOperation<T, V, O>
     for ScaleOperation<T, F>
@@ -44,7 +42,7 @@ impl<T: Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
 where
     D: DifferentiationContext<Type = T>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: From<ScaleOperation<T, ResidualFactor<T, D::Value>>>,
+    LinearOperationOf<D>: From<ScaleOperation<T, CapturedFactor<T, D::Value>>>,
     ScaleOperation<T, D::Constant>: Operation<T>,
 {
     #[inline]
@@ -61,7 +59,7 @@ where
         let factor = context.differentiable().lift(self.factor().clone())?;
         Ok(vec![JvpTracer::new(
             factor.clone() * input.primal().clone(),
-            input.tangent().clone().scale(ResidualFactor::Constant(factor)),
+            input.tangent().clone().scale(CapturedFactor::Constant(factor)),
         )])
     }
 }

@@ -13,8 +13,8 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
@@ -695,8 +695,8 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Dot,
     LinearOperationOf<D>: From<AddOperation>
-        + From<LeftDotOperation<ResidualFactor<ArrayType, D::Value>>>
-        + From<RightDotOperation<ResidualFactor<ArrayType, D::Value>>>,
+        + From<LeftDotOperation<CapturedFactor<ArrayType, D::Value>>>
+        + From<RightDotOperation<CapturedFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,

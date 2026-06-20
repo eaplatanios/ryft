@@ -27,8 +27,8 @@ use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::tracing_v2::operations::scan::SupportsLinearScan;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
-    ResidualFactor, ResidualizedOperation, TangentContext,
+    CapturedFactor, DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer,
+    LinearOperationOf, ResidualizedOperation, TangentContext,
 };
 use crate::types::{ArrayType, DataType, Size, Type, TypeError, Typed};
 
@@ -139,7 +139,7 @@ pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Siz
     /// programs use them to materialize nested primal program constants.
     fn residual_operation(factor: F) -> Self;
 
-    /// Rewrites this operation's loop-varying [`ResidualFactor::Reference`] factors into operand form against
+    /// Rewrites this operation's loop-varying [`CapturedFactor::Reference`] factors into operand form against
     /// `residual_atoms`, where `residual_atoms[i]` is the fused-body atom carrying residual `i`.
     ///
     /// Captured-factor linear maps whose factor is recomputed in-loop become recomputed multi-operand primal
@@ -150,7 +150,7 @@ pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Siz
     /// recursively: a condition over a referenced predicate becomes an operand-form condition whose branches receive
     /// the union of their referenced residuals as forwarded trailing operands, and a linear scan whose residual
     /// stacks reference loop-varying residuals moves those stacks into extra scanned operands with its body
-    /// rewritten against the new trailing lane inputs. Operations carrying only closed [`ResidualFactor::Constant`]
+    /// rewritten against the new trailing lane inputs. Operations carrying only closed [`CapturedFactor::Constant`]
     /// factors pass through unchanged, and the remaining unsupported shapes (for example, custom VJP call residual
     /// references or a constant-predicate condition whose branches reference loop-varying residuals) are rejected
     /// with precise errors.
@@ -357,12 +357,12 @@ where
     program
 }
 
-/// Rewrites a branch pushforward's local [`ResidualFactor::Reference`]s onto the enclosing linearization residual
+/// Rewrites a branch pushforward's local [`CapturedFactor::Reference`]s onto the enclosing linearization residual
 /// environment using `factors`, where `factors[i]` is the enclosing factor registered for the branch's residual `i`.
-/// Closed [`ResidualFactor::Constant`] factors are carried over unchanged.
+/// Closed [`CapturedFactor::Constant`] factors are carried over unchanged.
 fn remap_branch_residual_factors<D>(
     program: &Program<ArrayType, D::Tangent, LinearOperationOf<D>, Vec<D::Tangent>, Vec<D::Tangent>>,
-    factors: &[ResidualFactor<ArrayType, D::Value>],
+    factors: &[CapturedFactor<ArrayType, D::Value>],
 ) -> Result<Program<ArrayType, D::Tangent, LinearOperationOf<D>, Vec<D::Tangent>, Vec<D::Tangent>>, ProgramError>
 where
     D: DifferentiationContext<Type = ArrayType>,
@@ -370,13 +370,13 @@ where
 {
     program.map_operations(|operation| {
         operation.try_map_factors(&mut |factor| match factor {
-            ResidualFactor::Reference { index, .. } => factors.get(*index).cloned().ok_or_else(|| {
+            CapturedFactor::Reference { index, .. } => factors.get(*index).cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "condition branch pushforward references residual {index} but only {} residuals were captured",
                     factors.len(),
                 ))
             }),
-            ResidualFactor::Constant(value) => Ok(ResidualFactor::Constant(value.clone())),
+            CapturedFactor::Constant(value) => Ok(CapturedFactor::Constant(value.clone())),
         })
     })
 }
@@ -403,7 +403,7 @@ where
     E: DifferentiationContext,
     O: Clone + Operation<<E as Domain>::Type>,
     LinearOperationOf<E>:
-        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ResidualFactor<<E as Domain>::Type, E::Value>, O>,
+        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, CapturedFactor<<E as Domain>::Type, E::Value>, O>,
 {
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
@@ -412,7 +412,7 @@ where
     }
     for (atom_index, atom) in program.atoms().iter().enumerate() {
         if let Atom::Constant(constant) = atom {
-            let factor = ResidualFactor::Constant(differentiable.lift(constant.clone())?);
+            let factor = CapturedFactor::Constant(differentiable.lift(constant.clone())?);
             let outputs = builder.add_instruction(LinearOperationOf::<E>::residual_operation(factor), vec![])?;
             check_count!("output", outputs, 1, ProgramError);
             atom_map[atom_index] = Some(outputs[0]);
@@ -438,7 +438,7 @@ where
 }
 
 /// Inlines a body pushforward `program` into the linear `builder`, mapping the program's tangent input atoms onto
-/// `input_atoms` and rewriting loop-varying [`ResidualFactor::Reference`] factors into operand form against
+/// `input_atoms` and rewriting loop-varying [`CapturedFactor::Reference`] factors into operand form against
 /// `residual_atoms` through [`SupportsLinearWhile::defactorize`]. Returns the builder atoms carrying the program
 /// outputs.
 fn inline_defactorized_pushforward_program<E>(
@@ -452,7 +452,7 @@ where
     LinearOperationOf<E>: SupportsLinearWhile<
             <E as Domain>::Type,
             E::Tangent,
-            ResidualFactor<<E as Domain>::Type, E::Value>,
+            CapturedFactor<<E as Domain>::Type, E::Value>,
             <E as Domain>::Operation,
         >,
 {
@@ -521,7 +521,7 @@ where
     E: DifferentiationContext + Domain<Operation = O>,
     O: Clone + Operation<<E as Domain>::Type>,
     LinearOperationOf<E>:
-        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ResidualFactor<<E as Domain>::Type, E::Value>, O>,
+        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, CapturedFactor<<E as Domain>::Type, E::Value>, O>,
 {
     let state_types = condition.input_types();
     let state_count = state_types.len();
@@ -759,7 +759,7 @@ where
         + From<ConditionOperation<V, O, ArrayType>>
         + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>:
-        ResidualizedOperation<D> + SupportsLinearCondition<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>,
+        ResidualizedOperation<D> + SupportsLinearCondition<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -912,7 +912,7 @@ where
 ///      `[primal_state..., tangent_state...]`. Its fused body interleaves primal recomputation with tangent
 ///      propagation: the residual-extended primal body program is inlined as recomputed primal operations over the
 ///      primal half, and the body pushforward is inlined over the tangent half with its loop-varying
-///      [`ResidualFactor::Reference`] factors *defactorized* into operand form against the recomputed residual
+///      [`CapturedFactor::Reference`] factors *defactorized* into operand form against the recomputed residual
 ///      atoms (a scale by a referenced residual becomes an elementwise product, the captured dot maps become
 ///      operand-form dots). Its condition recomputes the original loop predicate from the primal half and ignores
 ///      the tangent half.
@@ -943,9 +943,9 @@ where
         + From<BroadcastOperation>
         + From<DynamicUpdateSliceOperation>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + SupportsLinearWhile<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>, O>
-        + SupportsLinearScan<ArrayType, D::Tangent, ResidualFactor<ArrayType, D::Value>>
-        + From<LinearSelectOperation<ResidualFactor<ArrayType, D::Value>>>,
+        + SupportsLinearWhile<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>, O>
+        + SupportsLinearScan<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>
+        + From<LinearSelectOperation<CapturedFactor<ArrayType, D::Value>>>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
@@ -1025,7 +1025,7 @@ where
                     |_, tangent| context.lift(tangent.clone()),
                     |instruction, tangent_inputs| {
                         let operation = instruction.operation().try_map_factors(&mut |factor| match factor {
-                            ResidualFactor::Reference { index, .. } => {
+                            CapturedFactor::Reference { index, .. } => {
                                 residual_factors.get(*index).cloned().ok_or_else(|| {
                                     ProgramError::MalformedProgram(format!(
                                         "while body pushforward references residual {index} but only {} residuals \
@@ -1034,7 +1034,7 @@ where
                                     ))
                                 })
                             }
-                            ResidualFactor::Constant(value) => Ok(ResidualFactor::Constant(value.clone())),
+                            CapturedFactor::Constant(value) => Ok(CapturedFactor::Constant(value.clone())),
                         })?;
                         context.stage_operation(operation, tangent_inputs)
                     },
@@ -1088,10 +1088,10 @@ where
             let mut stack_factors = stack_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
             let pushforward_body = linearization.pushforward_program.map_operations(|operation| {
                 operation.try_map_factors(&mut |factor| match factor {
-                    ResidualFactor::Reference { index, r#type } => {
-                        Ok(ResidualFactor::Reference { index: *index, r#type: r#type.clone() })
+                    CapturedFactor::Reference { index, r#type } => {
+                        Ok(CapturedFactor::Reference { index: *index, r#type: r#type.clone() })
                     }
-                    ResidualFactor::Constant(value) => {
+                    CapturedFactor::Constant(value) => {
                         let value_type = value.r#type().into_owned();
                         if value_type.static_shape().is_none() {
                             return Err(TypeError {
@@ -1111,7 +1111,7 @@ where
                         check_count!("output", broadcasted, 1, ProgramError);
                         let scan_local_index = stack_factors.len();
                         stack_factors.push(context.factor(broadcasted.remove(0)));
-                        Ok(ResidualFactor::Reference { index: scan_local_index, r#type: value_type })
+                        Ok(CapturedFactor::Reference { index: scan_local_index, r#type: value_type })
                     }
                 })
             })?;
@@ -1124,9 +1124,9 @@ where
             stack_factors.push(context.factor(mask_value.clone()));
             let select_conditions = state_types
                 .iter()
-                .map(|state_type| -> Result<ResidualFactor<ArrayType, D::Value>, ProgramError> {
+                .map(|state_type| -> Result<CapturedFactor<ArrayType, D::Value>, ProgramError> {
                     if state_type.rank() == 0 {
-                        return Ok(ResidualFactor::Reference {
+                        return Ok(CapturedFactor::Reference {
                             index: mask_index,
                             r#type: boolean_scalar_type.clone(),
                         });
@@ -1140,7 +1140,7 @@ where
                     check_count!("output", broadcasted, 1, ProgramError);
                     let index = stack_factors.len();
                     stack_factors.push(context.factor(broadcasted.remove(0)));
-                    Ok(ResidualFactor::Reference { index, r#type: condition_type })
+                    Ok(CapturedFactor::Reference { index, r#type: condition_type })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -2395,19 +2395,19 @@ mod tests {
             factor: TestValue,
         },
         /// Captured-predicate condition staged by the [`ConditionOperation`] JVP rule. The predicate is stored as a
-        /// [`ResidualFactor`] but interpretation only supports closed [`ResidualFactor::Constant`] predicates: this
+        /// [`CapturedFactor`] but interpretation only supports closed [`CapturedFactor::Constant`] predicates: this
         /// test enum is factor-invariant (its `WithFactor` is `Self`), so residual references cannot be rebound.
         Condition {
-            predicate: ResidualFactor<ArrayType, TestValue>,
+            predicate: CapturedFactor<ArrayType, TestValue>,
             true_branch: Box<Program<ArrayType, TestValue, TestLinearOperation, Vec<TestValue>, Vec<TestValue>>>,
             false_branch: Box<Program<ArrayType, TestValue, TestLinearOperation, Vec<TestValue>, Vec<TestValue>>>,
         },
 
         /// Captured-factor residual injection staged by the [`WhileOperation`] JVP rule. Like `Condition`,
-        /// interpretation only supports closed [`ResidualFactor::Constant`] factors because this test enum is
+        /// interpretation only supports closed [`CapturedFactor::Constant`] factors because this test enum is
         /// factor-invariant.
         Residual {
-            factor: ResidualFactor<ArrayType, TestValue>,
+            factor: CapturedFactor<ArrayType, TestValue>,
         },
 
         /// Recomputed primal operation embedded in the fused linear while body.
@@ -2417,11 +2417,11 @@ mod tests {
         While(Box<WhileOperation<TestValue, TestLinearOperation, ArrayType>>),
 
         /// Captured-condition select required by the bounded staged while path's trait bounds. Like `Condition`,
-        /// interpretation only supports closed [`ResidualFactor::Constant`] conditions because this test enum is
+        /// interpretation only supports closed [`CapturedFactor::Constant`] conditions because this test enum is
         /// factor-invariant; the `TestValue`-based tests only build unbounded loops, so the bounded path never
         /// stages it.
         Select {
-            condition: ResidualFactor<ArrayType, TestValue>,
+            condition: CapturedFactor<ArrayType, TestValue>,
         },
     }
 
@@ -2493,7 +2493,7 @@ mod tests {
                     _ => Err(TypeError { message: ("linear scale expected numeric inputs").into() }.into()),
                 },
                 Self::Condition { predicate, true_branch, false_branch } => {
-                    let ResidualFactor::Constant(predicate) = predicate else {
+                    let CapturedFactor::Constant(predicate) = predicate else {
                         return Err(ProgramError::UnsupportedOperation {
                             message: "the test linear condition only interprets closed constant predicates".to_string(),
                         });
@@ -2502,7 +2502,7 @@ mod tests {
                     branch.interpret(inputs.to_vec())
                 }
                 Self::Residual { factor } => {
-                    let ResidualFactor::Constant(value) = factor else {
+                    let CapturedFactor::Constant(value) = factor else {
                         return Err(ProgramError::UnsupportedOperation {
                             message: "the test linear residual only interprets closed constant factors".to_string(),
                         });
@@ -2512,7 +2512,7 @@ mod tests {
                 Self::Recompute(operation) => operation.interpret(context, inputs),
                 Self::While(while_operation) => while_operation.interpret(context, inputs),
                 Self::Select { condition } => {
-                    let ResidualFactor::Constant(condition) = condition else {
+                    let CapturedFactor::Constant(condition) = condition else {
                         return Err(ProgramError::UnsupportedOperation {
                             message: "the test linear select only interprets closed constant conditions".to_string(),
                         });
@@ -2600,9 +2600,9 @@ mod tests {
         }
     }
 
-    impl SupportsLinearCondition<ArrayType, TestValue, ResidualFactor<ArrayType, TestValue>> for TestLinearOperation {
+    impl SupportsLinearCondition<ArrayType, TestValue, CapturedFactor<ArrayType, TestValue>> for TestLinearOperation {
         fn linear_condition_operation(
-            predicate: ResidualFactor<ArrayType, TestValue>,
+            predicate: CapturedFactor<ArrayType, TestValue>,
             true_branch: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
             false_branch: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
         ) -> Self {
@@ -2610,19 +2610,19 @@ mod tests {
         }
     }
 
-    impl From<LinearSelectOperation<ResidualFactor<ArrayType, TestValue>>> for TestLinearOperation {
-        fn from(operation: LinearSelectOperation<ResidualFactor<ArrayType, TestValue>>) -> Self {
+    impl From<LinearSelectOperation<CapturedFactor<ArrayType, TestValue>>> for TestLinearOperation {
+        fn from(operation: LinearSelectOperation<CapturedFactor<ArrayType, TestValue>>) -> Self {
             Self::Select { condition: operation.condition().clone() }
         }
     }
 
-    impl SupportsLinearScan<ArrayType, TestValue, ResidualFactor<ArrayType, TestValue>> for TestLinearOperation {
+    impl SupportsLinearScan<ArrayType, TestValue, CapturedFactor<ArrayType, TestValue>> for TestLinearOperation {
         /// Rejects linear-scan construction with a precise error. The bounded staged while path is the only caller,
         /// and scalar [`TestValue`]s cannot represent the stacked `[bound, …]` residuals it requires, so the tests
         /// below only build unbounded loops.
         fn linear_scan_operation(
             _body: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
-            _residual_stacks: Vec<ResidualFactor<ArrayType, TestValue>>,
+            _residual_stacks: Vec<CapturedFactor<ArrayType, TestValue>>,
             _carry_count: usize,
             _length: usize,
             _reverse: bool,
@@ -2634,14 +2634,14 @@ mod tests {
         }
     }
 
-    impl SupportsLinearWhile<ArrayType, TestValue, ResidualFactor<ArrayType, TestValue>, TestDifferentiableOperation>
+    impl SupportsLinearWhile<ArrayType, TestValue, CapturedFactor<ArrayType, TestValue>, TestDifferentiableOperation>
         for TestLinearOperation
     {
         fn recompute_operation(operation: TestDifferentiableOperation) -> Self {
             Self::Recompute(operation)
         }
 
-        fn residual_operation(factor: ResidualFactor<ArrayType, TestValue>) -> Self {
+        fn residual_operation(factor: CapturedFactor<ArrayType, TestValue>) -> Self {
             Self::Residual { factor }
         }
 
@@ -2653,7 +2653,7 @@ mod tests {
             // The test linear enum is factor-invariant, so the only residual references it can carry are the ones in
             // its own nullary residual injections; everything else passes through unchanged.
             match self {
-                Self::Residual { factor: ResidualFactor::Reference { index, .. } } => {
+                Self::Residual { factor: CapturedFactor::Reference { index, .. } } => {
                     let atom = residual_atoms
                         .get(*index)
                         .copied()
@@ -3213,7 +3213,7 @@ mod tests {
                 DomainTracer<TestArrayDomain>,
                 TestArray,
                 Infallible,
-                ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
+                CapturedFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
         >::new()));
         let mut context = TangentContext::new(&outer_context, linear_builder.clone());
@@ -3340,7 +3340,7 @@ mod tests {
                 DomainTracer<TestArrayDomain>,
                 TestArray,
                 Infallible,
-                ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
+                CapturedFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
         >::new()));
         let mut context = TangentContext::new(&outer_context, linear_builder.clone());
@@ -3366,7 +3366,7 @@ mod tests {
         // linear while whose fused condition and body consume `[primal_state, tangent_state]`.
         let linear_builder = linear_builder.borrow();
         assert_eq!(linear_builder.instructions().len(), 2);
-        assert_eq!(linear_builder.instructions()[0].operation().name(), "residual");
+        assert_eq!(linear_builder.instructions()[0].operation().name(), "materialize_captured_factor");
         let staged_linear = linear_builder.instructions()[1].operation();
         assert_eq!(staged_linear.name(), "while");
         let LinearArrayOperation::While(staged_linear_while) = staged_linear else {
@@ -3436,7 +3436,7 @@ mod tests {
                 DomainTracer<TestArrayDomain>,
                 TestArray,
                 Infallible,
-                ResidualFactor<ArrayType, DomainTracer<TestArrayDomain>>,
+                CapturedFactor<ArrayType, DomainTracer<TestArrayDomain>>,
             >,
         >::new()));
         let mut context = TangentContext::new(&outer_context, linear_builder.clone());
@@ -3458,8 +3458,8 @@ mod tests {
         // linear while whose fused body carries the defactorized product rule as recomputed `mul` instructions.
         let linear_builder = linear_builder.borrow();
         assert_eq!(linear_builder.instructions().len(), 3);
-        assert_eq!(linear_builder.instructions()[0].operation().name(), "residual");
-        assert_eq!(linear_builder.instructions()[1].operation().name(), "residual");
+        assert_eq!(linear_builder.instructions()[0].operation().name(), "materialize_captured_factor");
+        assert_eq!(linear_builder.instructions()[1].operation().name(), "materialize_captured_factor");
         let staged_linear = linear_builder.instructions()[2].operation();
         let LinearArrayOperation::While(staged_linear_while) = staged_linear else {
             panic!("expected the staged linear operation to be a while loop");
@@ -3521,7 +3521,7 @@ mod tests {
         AbstractTangentTracer,
         TestArray,
         Infallible,
-        ResidualFactor<ArrayType, AbstractTangentTracer>,
+        CapturedFactor<ArrayType, AbstractTangentTracer>,
     >;
 
     /// Eager interpreting domain over [`TestArray`] values that reports no support for primal concretization. Hybrid
@@ -3754,7 +3754,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>,
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

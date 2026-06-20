@@ -14,8 +14,8 @@ use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, align_batch_axis, apply_with_axes, batch_input_metadata,
 };
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 use super::control_flow::stage_cotangent;
@@ -243,7 +243,7 @@ impl<D> DifferentiableOperation<D> for DynamicSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicSlice,
-    LinearOperationOf<D>: From<LinearDynamicSliceOperation<ResidualFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>: From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -285,7 +285,7 @@ impl<D> DifferentiableOperation<D> for DynamicUpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicUpdateSlice,
-    LinearOperationOf<D>: From<LinearDynamicUpdateSliceOperation<ResidualFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>: From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -643,7 +643,7 @@ mod tests {
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{
-        ArrayOperation, DifferentiableDomainExtension, LinearArrayOperation, LinearizationTracer, ResidualFactor,
+        ArrayOperation, CapturedFactor, DifferentiableDomainExtension, LinearArrayOperation, LinearizationTracer,
         value_and_grad,
     };
     use crate::types::DataType;
@@ -1052,7 +1052,7 @@ mod tests {
 
         type TestArrayOperation = ArrayOperation<ArrayType, TestArray>;
         type TestLinearOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
 
         let index_type = ArrayType::scalar(DataType::I32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -1132,10 +1132,10 @@ mod tests {
         // interpretable pushforward.
         let tangent_program = tangent_program
             .map_operations(|operation| {
-                operation.try_map_factors::<TestArray, _>(&mut |factor: &ResidualFactor<ArrayType, TestArray>| {
+                operation.try_map_factors::<TestArray, _>(&mut |factor: &CapturedFactor<ArrayType, TestArray>| {
                     match factor {
-                        ResidualFactor::Constant(value) => Ok(value.clone()),
-                        ResidualFactor::Reference { .. } => Err(crate::programs::ProgramError::MalformedProgram(
+                        CapturedFactor::Constant(value) => Ok(value.clone()),
+                        CapturedFactor::Reference { .. } => Err(crate::programs::ProgramError::MalformedProgram(
                             "expected all loop-varying residual references to be closed into constants".to_string(),
                         )),
                     }
@@ -1151,12 +1151,12 @@ mod tests {
     #[test]
     fn test_dynamic_slicing_defactorize_splices_residual_start_indices() {
         type TestLinearOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, ResidualFactor<ArrayType, TestArray>>;
+            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
 
         // A loop-varying residual start index is rewritten into operand form: the residual atom is spliced into the
         // operand list and the operation becomes the recomputed primal dynamic slice.
         let operation = TestLinearOperation::DynamicSlice(LinearDynamicSliceOperation::new(
-            vec![ResidualFactor::Reference { index: 1, r#type: ArrayType::scalar(DataType::I32) }],
+            vec![CapturedFactor::Reference { index: 1, r#type: ArrayType::scalar(DataType::I32) }],
             vec![2],
         ));
         let residual_atoms = vec![AtomId::new(7), AtomId::new(9)];
@@ -1174,7 +1174,7 @@ mod tests {
 
         // The same rewrite applies to the captured-index dynamic update-slice.
         let operation = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
-            ResidualFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
+            CapturedFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
         ]));
         match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
@@ -1186,8 +1186,8 @@ mod tests {
 
         // Mixed constant/reference index lists are rejected precisely.
         let mixed = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
-            ResidualFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
-            ResidualFactor::Constant(index(0.0)),
+            CapturedFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
+            CapturedFactor::Constant(index(0.0)),
         ]));
         assert!(matches!(
             mixed.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]),
@@ -1198,7 +1198,7 @@ mod tests {
 
         // All-constant index lists pass through unchanged via the closed-factor catch-all.
         let constant = TestLinearOperation::DynamicSlice(LinearDynamicSliceOperation::new(
-            vec![ResidualFactor::Constant(index(1.0))],
+            vec![CapturedFactor::Constant(index(1.0))],
             vec![2],
         ));
         match constant.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {

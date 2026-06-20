@@ -10,8 +10,8 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
@@ -530,7 +530,7 @@ where
     D::Value: Reduce + Broadcast + crate::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
     LinearOperationOf<D>: From<ReduceOperation>
-        + From<crate::operations::arithmetic::ScaleOperation<ArrayType, ResidualFactor<ArrayType, D::Value>>>,
+        + From<crate::operations::arithmetic::ScaleOperation<ArrayType, CapturedFactor<ArrayType, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -1116,7 +1116,7 @@ mod tests {
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tests::{TestArray, TestArrayDomain};
-        use crate::tracing_v2::differentiation::{JvpTracer, ResidualFactor, TangentContext};
+        use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
         use crate::tracing_v2::{LinearArrayOperation, ResidualizedOperation};
 
         let domain = TestArrayDomain;
@@ -1128,7 +1128,7 @@ mod tests {
                 TestArray,
                 TestArray,
                 std::convert::Infallible,
-                ResidualFactor<ArrayType, TestArray>,
+                CapturedFactor<ArrayType, TestArray>,
             >,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));

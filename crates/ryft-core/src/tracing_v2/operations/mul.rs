@@ -6,8 +6,8 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, MulOperation, Scale, ScaleOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 use crate::types::ArrayType;
 
 impl<D> DifferentiableOperation<D> for MulOperation
@@ -15,7 +15,7 @@ where
     D: DifferentiationContext,
     MulOperation: Operation<D::Type>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: From<AddOperation> + From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<AddOperation> + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
 {
     fn jvp<'jvp>(
         &self,

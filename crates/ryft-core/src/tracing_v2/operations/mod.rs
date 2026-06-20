@@ -61,8 +61,8 @@ pub mod reduce;
 /// Reshaping primitive.
 pub mod reshape;
 
-/// Captured-factor residual injection linear operation.
-pub mod residual;
+/// Captured-factor payloads and materialization.
+pub mod captures;
 
 /// Factor-payload mapping for the scalar linear operation.
 pub mod scalars;
@@ -103,6 +103,7 @@ pub use bounds::{
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 pub use broadcasting::lift_broadcast;
+pub use captures::{CapturedFactor, MaterializeCapturedFactorOperation};
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
 pub use custom_derivatives::{
@@ -118,7 +119,6 @@ pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferTo
 pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
-pub use residual::LinearResidualOperation;
 pub use scan::SupportsLinearScan;
 pub use select::LinearSelectOperation;
 pub use transpose::lift_permutation;

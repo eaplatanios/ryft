@@ -6,15 +6,15 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::{NegOperation, Scale, ScaleOperation};
 use crate::operations::trigonometric::{Cos, CosOperation, Sin};
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, ResidualFactor, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
 
 impl<D> DifferentiableOperation<D> for CosOperation
 where
     D: DifferentiationContext,
     CosOperation: Operation<D::Type>,
     D::Value: Cos + Sin + Neg<Output = D::Value>,
-    LinearOperationOf<D>: From<NegOperation> + From<ScaleOperation<D::Type, ResidualFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<NegOperation> + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
 {
     #[inline]
     fn jvp<'jvp>(
