@@ -1309,7 +1309,7 @@ mod tests {
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin(_)))
             .count();
         assert_eq!(jit_call_count, 1, "inner compiled function should stage as one jit_call");
         assert_eq!(inlined_sin_count, 0, "inner function body should not be inlined into the outer trace");
@@ -1876,7 +1876,7 @@ mod tests {
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin(_)))
             .count();
         assert_eq!(jit_call_count, 2, "jvp(jit(f)) should stage separate primal and pushforward jit_call boundaries",);
         assert_eq!(inlined_sin_count, 0, "jvp(jit(f)) should not inline the callee body");
@@ -1965,7 +1965,7 @@ mod tests {
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin))
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::Sin(_)))
             .count();
         assert_eq!(jit_call_count, 1, "batch(jit(f)) should stage one batched jit_call boundary");
         assert_eq!(inlined_sin_count, 0, "batch(jit(f)) should not inline the callee body");

@@ -40,7 +40,7 @@ use crate::types::{ArrayType, Type, TypeError, Typed};
 /// differentiation. Value-level batching (used by dense Jacobian materialization, where the custom rule has already
 /// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
-pub struct CustomJvpOperation<V, O, T = ArrayType>
+pub struct CustomJvpOperation<T, V, O>
 where
     T: Type,
     V: Value<T>,
@@ -52,7 +52,7 @@ where
     jvp: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<T, V, O> {
     /// Creates a custom-JVP operation after validating that the JVP program's signature matches the primal
     /// program's: its inputs must be the primal inputs followed by their tangents (same types), and its outputs the
     /// primal outputs followed by their tangents.
@@ -94,7 +94,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> CustomJvpOperation<V, O, T> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for CustomJvpOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for CustomJvpOperation<T, V, O>
 where
     Self: Operation<T>,
 {
@@ -103,7 +103,7 @@ where
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomJvpOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomJvpOperation<T, V, O> {
     #[inline]
     fn name(&self) -> &'static str {
         "custom_jvp"
@@ -115,7 +115,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomJvpOperation<
     }
 }
 
-impl<T, V, O> InterpretableOperation<T, V> for CustomJvpOperation<V, O, T>
+impl<T, V, O> InterpretableOperation<T, V> for CustomJvpOperation<T, V, O>
 where
     T: Type,
     V: Value<T>,
@@ -140,7 +140,7 @@ where
 /// seeds its pushforward with `(0, t̂)` so that only the user-defined — and therefore necessarily linear — tangent
 /// map survives in the staged linear program.
 pub(crate) fn custom_jvp_rule<'jvp, D, O>(
-    operation: &CustomJvpOperation<<D as Domain>::Constant, O, D::Type>,
+    operation: &CustomJvpOperation<D::Type, <D as Domain>::Constant, O>,
     context: &mut TangentContext<'jvp, D>,
     inputs: &[JvpTracer<'jvp, D>],
 ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
@@ -201,7 +201,7 @@ where
 }
 
 /// Differentiates a `custom_jvp` call by running its forward-derivative rule; see [`custom_jvp_rule`].
-impl<V, O, D> DifferentiableOperation<D> for CustomJvpOperation<V, O, D::Type>
+impl<V, O, D> DifferentiableOperation<D> for CustomJvpOperation<D::Type, V, O>
 where
     V: Value<D::Type>,
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
@@ -230,7 +230,7 @@ where
 
 /// Value-level batching for [`CustomJvpOperation`]: inlines the primal program through the per-operation batching
 /// rules. The custom derivative does not survive this inlining; see the type-level documentation.
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for CustomJvpOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for CustomJvpOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     O: Operation<ArrayType> + BatchableOperation<V, EagerContext<ArrayType, V, O>>,
@@ -308,13 +308,13 @@ fn batch_rewrapped_program<V: Value<ArrayType>, O: ProgramBatchableOperation<V>>
 
 /// Traced batching for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see [`stage_rewrapped_custom_call`].
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomJvpOperation<C::Constant, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomJvpOperation<ArrayType, C::Constant, O>
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
     O: Clone
         + Operation<ArrayType>
-        + From<CustomJvpOperation<C::Constant, O, ArrayType>>
+        + From<CustomJvpOperation<ArrayType, C::Constant, O>>
         + ProgramBatchableOperation<C::Constant>,
     Tracer<C>: Broadcast + Transpose,
 {
@@ -368,7 +368,7 @@ where
 /// materialization, where the custom rule has already been consumed by linearization) inlines the primal program
 /// through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
-pub struct CustomVjpOperation<V, O, T = ArrayType>
+pub struct CustomVjpOperation<T, V, O>
 where
     T: Type,
     V: Value<T>,
@@ -393,7 +393,7 @@ where
     prevent_cse: bool,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<T, V, O> {
     /// Creates a custom-VJP operation after validating the forward/backward program signatures against the primal
     /// program's: `forward` must consume the primal inputs and produce the primal outputs followed by the residuals,
     /// and `backward` must consume those residuals followed by one cotangent per primal output and produce one
@@ -498,7 +498,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<V, O, T> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for CustomVjpOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for CustomVjpOperation<T, V, O>
 where
     Self: Operation<T>,
 {
@@ -507,7 +507,7 @@ where
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomVjpOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomVjpOperation<T, V, O> {
     #[inline]
     fn name(&self) -> &'static str {
         "custom_vjp"
@@ -519,7 +519,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomVjpOperation<
     }
 }
 
-impl<T, V, O> InterpretableOperation<T, V> for CustomVjpOperation<V, O, T>
+impl<T, V, O> InterpretableOperation<T, V> for CustomVjpOperation<T, V, O>
 where
     T: Type,
     V: Value<T>,
@@ -544,7 +544,7 @@ where
 /// outputs as factors, and stages one opaque [`CustomVjpCallOperation`] mapping the input tangents to the output
 /// tangents. The staged call rejects forward-mode interpretation; its transpose replays the user's backward program.
 pub(crate) fn custom_vjp_rule<'jvp, D, O>(
-    operation: &CustomVjpOperation<<D as Domain>::Constant, O, D::Type>,
+    operation: &CustomVjpOperation<D::Type, <D as Domain>::Constant, O>,
     context: &mut TangentContext<'jvp, D>,
     inputs: &[JvpTracer<'jvp, D>],
 ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
@@ -552,7 +552,7 @@ where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<<D as Domain>::Constant, O, CapturedFactor<D::Type, <D as Domain>::Value>, D::Type>>,
+        + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -589,13 +589,13 @@ where
 }
 
 /// Differentiates a `custom_vjp` call by running its forward-derivative rule; see [`custom_vjp_rule`].
-impl<V, O, D> DifferentiableOperation<D> for CustomVjpOperation<V, O, D::Type>
+impl<V, O, D> DifferentiableOperation<D> for CustomVjpOperation<D::Type, V, O>
 where
     V: Value<D::Type>,
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<V, O, CapturedFactor<D::Type, <D as Domain>::Value>, D::Type>>,
+        + From<CustomVjpCallOperation<D::Type, V, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -618,7 +618,7 @@ where
 
 /// Value-level batching for [`CustomVjpOperation`]: inlines the primal program; see [`CustomJvpOperation`]'s
 /// batching documentation for the custom-derivative caveat.
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for CustomVjpOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for CustomVjpOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     O: Operation<ArrayType> + BatchableOperation<V, EagerContext<ArrayType, V, O>>,
@@ -635,13 +635,13 @@ where
 /// Traced batching for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward (and
 /// tangent, when present) programs so the custom derivative — and any rematerialization structure — survives
 /// `batch`; see [`stage_rewrapped_custom_call`].
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomVjpOperation<C::Constant, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomVjpOperation<ArrayType, C::Constant, O>
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
     O: Clone
         + Operation<ArrayType>
-        + From<CustomVjpOperation<C::Constant, O, ArrayType>>
+        + From<CustomVjpOperation<ArrayType, C::Constant, O>>
         + ProgramBatchableOperation<C::Constant>,
     Tracer<C>: Broadcast + Transpose,
 {
@@ -704,7 +704,7 @@ impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for CapturedFactor<T, V> {
 /// transposed form, whose interpretation replays the user's backward program on the captured residuals and the
 /// incoming output cotangents.
 #[derive(Clone, Debug)]
-pub struct CustomVjpCallOperation<V, O, F, T = ArrayType>
+pub struct CustomVjpCallOperation<T, V, O, F>
 where
     T: Type,
     V: Value<T>,
@@ -728,7 +728,7 @@ where
     prevent_cse: bool,
 }
 
-impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V, O, F, T> {
+impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<T, V, O, F> {
     /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true`
     /// for the executable pullback form. `prevent_cse` carries the owning [`CustomVjpOperation`]'s lowering hint;
     /// see [`CustomVjpOperation::with_prevent_cse`].
@@ -778,7 +778,7 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V, O, F, T> {
     pub fn map_factors<MappedFactor: Value<T>, MapFactorFn>(
         &self,
         map_factor: &mut MapFactorFn,
-    ) -> Result<CustomVjpCallOperation<V, O, MappedFactor, T>, ProgramError>
+    ) -> Result<CustomVjpCallOperation<T, V, O, MappedFactor>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
         V: Clone,
@@ -794,14 +794,14 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<V, O, F, T> {
     }
 }
 
-impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> CustomVjpCallOperation<V, O, F, T> {
+impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> CustomVjpCallOperation<T, V, O, F> {
     /// Returns the cotangent types flowing *into* the backward program (one per primal output).
     fn cotangent_types(&self) -> Vec<T> {
         self.backward.input_types().split_off(self.residuals.len())
     }
 }
 
-impl<T: Type, V: Value<T>, F: Value<T>, O> Display for CustomVjpCallOperation<V, O, F, T> {
+impl<T: Type, V: Value<T>, F: Value<T>, O> Display for CustomVjpCallOperation<T, V, O, F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.transposed {
             formatter.write_str("custom_vjp_backward")
@@ -811,7 +811,7 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> Display for CustomVjpCallOperation<V,
     }
 }
 
-impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for CustomVjpCallOperation<V, O, F, T> {
+impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for CustomVjpCallOperation<T, V, O, F> {
     #[inline]
     fn name(&self) -> &'static str {
         if self.transposed { "custom_vjp_backward" } else { "custom_vjp_tangent" }
@@ -831,7 +831,7 @@ impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for Custom
     }
 }
 
-impl<T, V, O, F> InterpretableOperation<T, V> for CustomVjpCallOperation<V, O, F, T>
+impl<T, V, O, F> InterpretableOperation<T, V> for CustomVjpCallOperation<T, V, O, F>
 where
     T: Type,
     V: Value<T>,
@@ -862,7 +862,7 @@ where
     }
 }
 
-impl<T, V, O, S> CustomVjpCallOperation<V, O, Tracer<S>, T>
+impl<T, V, O, S> CustomVjpCallOperation<T, V, O, Tracer<S>>
 where
     T: Type,
     V: Value<T>,
@@ -914,14 +914,14 @@ where
 /// that map requires the derived tangent program, so the second transposition is only supported for
 /// rematerialization-derived calls; user-authored custom VJPs (with no tangent program) keep rejecting it, matching
 /// JAX's behavior for second-order reverse mode through `custom_vjp`.
-impl<T, V, O, F, W, OLinear> TransposableOperation<T, W, OLinear> for CustomVjpCallOperation<V, O, F, T>
+impl<T, V, O, F, W, OLinear> TransposableOperation<T, W, OLinear> for CustomVjpCallOperation<T, V, O, F>
 where
     T: Type,
     V: Value<T>,
     F: Value<T>,
     W: Value<T>,
     O: Clone + Operation<T>,
-    OLinear: Operation<T> + From<ZeroOperation<T>> + From<CustomVjpCallOperation<V, O, F, T>>,
+    OLinear: Operation<T> + From<ZeroOperation<T>> + From<CustomVjpCallOperation<T, V, O, F>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -962,7 +962,7 @@ where
 /// per-operation batching rules with the captured residuals as lane-uniform values. Used when a pullback containing
 /// custom-VJP calls is interpreted with batched cotangents (e.g., by `jacrev`). The un-transposed form rejects
 /// batching just as it rejects interpretation.
-impl<V, O, F> BatchableOperation<V, EagerContext<ArrayType, V, O>> for CustomVjpCallOperation<V, O, F, ArrayType>
+impl<V, O, F> BatchableOperation<V, EagerContext<ArrayType, V, O>> for CustomVjpCallOperation<ArrayType, V, O, F>
 where
     V: Value<ArrayType>,
     F: CustomVjpResidual<ArrayType, V>,
@@ -1050,7 +1050,7 @@ where
     D: Domain<Type: PartialEq> + 'd,
     P: Fn(IT) -> Result<OT, ProgramError>,
     J: Fn(IT, IT) -> Result<(OT, OT), ProgramError>,
-    D::Operation: Clone + Operation<D::Type> + From<CustomJvpOperation<D::Constant, D::Operation, D::Type>>,
+    D::Operation: Clone + Operation<D::Type> + From<CustomJvpOperation<D::Type, D::Constant, D::Operation>>,
     IT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
     OT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
     IT::To<D::Type>: Clone
@@ -1161,7 +1161,7 @@ where
     P: Fn(IT) -> Result<OT, ProgramError>,
     F: Fn(IT) -> Result<(OT, RT), ProgramError>,
     B: Fn(RT, OT) -> Result<IT, ProgramError>,
-    D::Operation: Clone + Operation<D::Type> + From<CustomVjpOperation<D::Constant, D::Operation, D::Type>>,
+    D::Operation: Clone + Operation<D::Type> + From<CustomVjpOperation<D::Type, D::Constant, D::Operation>>,
     IT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
     OT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
     RT: Parameterized<DomainTracer<'d, D>, Family: ParameterizedFamily<D::Type> + ParameterizedFamily<D::Constant>>,
@@ -1393,7 +1393,7 @@ mod tests {
         // The staged linear call refuses interpretation in its un-transposed (pushforward) form, which is exactly
         // the operation `jvp` would need to execute; reverse mode transposes it first and replays `backward`.
         let scalar = test_type(&[]);
-        let call = CustomVjpCallOperation::<TestArray, ArrayOperation<ArrayType, TestArray>, TestArray>::new(
+        let call = CustomVjpCallOperation::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>, TestArray>::new(
             tripled_sin_backward_program(&scalar),
             None,
             vec![TestArray::scalar(2.0f64.cos())],

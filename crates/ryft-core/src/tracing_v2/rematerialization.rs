@@ -744,7 +744,7 @@ where
 /// custom-VJP operation, and the structure of the body's output tree.
 type CachedDerivation<'d, D, OT> = (
     Vec<<D as Domain>::Type>,
-    CustomVjpOperation<<D as Domain>::Constant, <D as Domain>::Operation, <D as Domain>::Type>,
+    CustomVjpOperation<<D as Domain>::Type, <D as Domain>::Constant, <D as Domain>::Operation>,
     <OT as Parameterized<DomainTracer<'d, D>>>::ParameterStructure,
 );
 
@@ -834,7 +834,7 @@ where
     <D as Domain>::Operation: Clone
         + MaybeDot
         + MaybeRematerializationName
-        + From<CustomVjpOperation<<D as Domain>::Constant, <D as Domain>::Operation, D::Type>>
+        + From<CustomVjpOperation<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>
         + From<ZeroOperation<D::Type>>
         + From<OneOperation<D::Type>>
         + DifferentiableOperation<TracingContext<'d, D>>

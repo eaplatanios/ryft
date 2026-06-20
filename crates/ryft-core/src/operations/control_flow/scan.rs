@@ -43,7 +43,7 @@ pub const SCAN_OPERATION_NAME: &'static str = "scan";
 ///
 /// [`WhileOperation`]: crate::operations::control_flow::WhileOperation
 #[derive(Clone, Debug)]
-pub struct ScanOperation<V, O, T>
+pub struct ScanOperation<T, V, O>
 where
     T: Type,
     V: Value<T>,
@@ -128,7 +128,7 @@ pub(crate) fn scan_output_types(
     Ok(output_types)
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> ScanOperation<V, O, ArrayType> {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> ScanOperation<ArrayType, V, O> {
     /// Creates a new [`ScanOperation`] with the provided body program, carry count, and static trip count, visiting
     /// the stacked slices in increasing order (use [`Self::with_reverse`] to flip the visit order).
     ///
@@ -211,7 +211,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ScanOperation<V, O, ArrayType
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> ScanOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> {
     /// Returns the body [`Program`] of this [`ScanOperation`] that computes one iteration.
     #[inline]
     pub fn body(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -244,7 +244,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ScanOperation<V, O, T> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for ScanOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for ScanOperation<T, V, O>
 where
     Self: Operation<T>,
 {
@@ -253,7 +253,7 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> Operation<ArrayType> for ScanOperation<V, O, ArrayType> {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> Operation<ArrayType> for ScanOperation<ArrayType, V, O> {
     #[inline]
     fn name(&self) -> &'static str {
         SCAN_OPERATION_NAME
@@ -389,7 +389,7 @@ where
     Ok(carries)
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for ScanOperation<V, O, ArrayType>
+impl<V, O> InterpretableOperation<ArrayType, V> for ScanOperation<ArrayType, V, O>
 where
     V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
     O: InterpretableOperation<ArrayType, V>,
@@ -633,7 +633,7 @@ mod tests {
 
         // Program rendering uses the canonical operation name and includes the nested body program.
         let mut builder =
-            ProgramBuilder::<ArrayType, TestArray, ScanOperation<TestArray, TestOperation, ArrayType>>::new();
+            ProgramBuilder::<ArrayType, TestArray, ScanOperation<ArrayType, TestArray, TestOperation>>::new();
         let program_carry = builder.add_input(scalar_f64);
         let program_xs = builder.add_input(stacked_f64);
         let program_outputs = builder.add_instruction(operation, vec![program_carry, program_xs]).unwrap().to_vec();

@@ -7,15 +7,16 @@ use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
-use ryft_core::operations::constants::SupportsZero;
+use ryft_core::operations::constants::ZeroOperation;
 use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{AtomId, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
 use ryft_core::tracing::{AbstractTracer, AbstractTracingContext, DomainTracer, Tracer, TracingContext};
-use ryft_core::tracing_v2::differentiation::{JvpTracer, ResidualFactor};
+use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, LinearOperationOf, ResidualizedOperation, TangentContext,
+    CapturedFactor, DifferentiableOperation, DifferentiationContext, LinearOperationOf, ResidualizedOperation,
+    TangentContext,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
@@ -408,28 +409,28 @@ fn complete_shard_map_jvp<'jvp, E, PrimalValue, TangentValue>(
     inputs: &[JvpTracer<'jvp, E>],
     primal_outputs: Vec<PrimalValue>,
     output_count: usize,
-    linear_operation: LinearShardMapOperation<TangentValue, ResidualFactor<ArrayType, PrimalValue>>,
+    linear_operation: LinearShardMapOperation<TangentValue, CapturedFactor<ArrayType, PrimalValue>>,
 ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
 where
     PrimalValue: Value<ArrayType>,
     TangentValue: Value<ArrayType>,
     E: DifferentiationContext<
             Tangent = TangentValue,
-            LinearOperation<TangentValue, ResidualFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
+            LinearOperation<TangentValue, CapturedFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
                 TangentValue,
                 XlaConstant,
-                ResidualFactor<ArrayType, PrimalValue>,
+                CapturedFactor<ArrayType, PrimalValue>,
             >,
         > + Domain<Type = ArrayType, Value = PrimalValue>
         + 'jvp,
-    LinearOperationOf<E>: SupportsZero<ArrayType>,
+    LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
 {
     check_count!("output", primal_outputs, output_count, ProgramError);
     let tangent_inputs = inputs
         .iter()
         .map(|input| context.materialize_tangent(input.tangent().clone()))
         .collect::<Result<Vec<_>, _>>()?;
-    let operation: LinearXlaOperation<TangentValue, XlaConstant, ResidualFactor<ArrayType, PrimalValue>> =
+    let operation: LinearXlaOperation<TangentValue, XlaConstant, CapturedFactor<ArrayType, PrimalValue>> =
         LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation)));
     let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
@@ -456,14 +457,14 @@ impl<LeafV> ShardMapOperation<LeafV> {
             + DifferentiationContext<
                 LinearOperation<
                     <E as DifferentiationContext>::Tangent,
-                    ResidualFactor<ArrayType, Tracer<E>>,
+                    CapturedFactor<ArrayType, Tracer<E>>,
                 > = LinearXlaOperation<
                     <E as DifferentiationContext>::Tangent,
                     XlaConstant,
-                    ResidualFactor<ArrayType, Tracer<E>>,
+                    CapturedFactor<ArrayType, Tracer<E>>,
                 >,
             > + 'jvp,
-        LinearOperationOf<E>: SupportsZero<ArrayType>,
+        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.bind_primal(
@@ -505,13 +506,13 @@ impl ShardMapOperation<ShardMapTracer> {
             + Domain<Type = ArrayType>
             + DifferentiationContext<
                 Tangent = ShardMapTracer,
-                LinearOperation<ShardMapTracer, ResidualFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
+                LinearOperation<ShardMapTracer, CapturedFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
                     ShardMapTracer,
                     XlaConstant,
-                    ResidualFactor<ArrayType, ShardMapTracer>,
+                    CapturedFactor<ArrayType, ShardMapTracer>,
                 >,
             > + 'jvp,
-        LinearOperationOf<D>: SupportsZero<ArrayType>,
+        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -537,14 +538,14 @@ impl LinearShardMapOperation<XlaConstant> {
             + DifferentiationContext<
                 LinearOperation<
                     <E as DifferentiationContext>::Tangent,
-                    ResidualFactor<ArrayType, Tracer<E>>,
+                    CapturedFactor<ArrayType, Tracer<E>>,
                 > = LinearXlaOperation<
                     <E as DifferentiationContext>::Tangent,
                     XlaConstant,
-                    ResidualFactor<ArrayType, Tracer<E>>,
+                    CapturedFactor<ArrayType, Tracer<E>>,
                 >,
             > + 'jvp,
-        LinearOperationOf<E>: SupportsZero<ArrayType>,
+        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.bind_primal(
@@ -738,7 +739,7 @@ fn materialize_cotangent<'transpose, V: Value<ArrayType>, O>(
     output_type: &ArrayType,
 ) -> AbstractTracer<'transpose, ArrayType, V, O>
 where
-    O: Operation<ArrayType> + SupportsZero<ArrayType>,
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
 {
     match cotangent {
         Cotangent::Staged(cotangent) => return cotangent.clone(),
@@ -748,7 +749,7 @@ where
     let mut builder_borrow = builder.borrow_mut();
     let output = builder_borrow.add_variable(output_type.clone());
     builder_borrow.add_instruction_unchecked(ryft_core::programs::Instruction::new(
-        O::zero_operation(output_type.clone()),
+        O::from(ZeroOperation::new(output_type.clone())),
         vec![],
         vec![output],
     ));
@@ -757,7 +758,11 @@ where
 }
 
 impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTracer> {
-    fn interpret(&self, inputs: &[ShardMapTracer]) -> Result<Vec<ShardMapTracer>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<ShardMapTracer as Value<ArrayType>>::InterpretationContext,
+        inputs: &[ShardMapTracer],
+    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
         let tracing_builder = match inputs.first() {
             Some(input) => input.builder().clone(),
             None if self.output_types.is_empty() => return Ok(Vec::new()),
@@ -772,7 +777,11 @@ impl<'domain, 'o, D> InterpretableOperation<ArrayType, DomainTracer<'domain, D>>
 where
     D: Domain<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
 {
-    fn interpret(&self, inputs: &[DomainTracer<'domain, D>]) -> Result<Vec<DomainTracer<'domain, D>>, ProgramError> {
+    fn interpret(
+        &self,
+        _context: &<DomainTracer<'domain, D> as Value<ArrayType>>::InterpretationContext,
+        inputs: &[DomainTracer<'domain, D>],
+    ) -> Result<Vec<DomainTracer<'domain, D>>, ProgramError> {
         let exemplar = match inputs.first() {
             Some(input) => input,
             None if self.output_types.is_empty() => return Ok(Vec::new()),
@@ -791,10 +800,10 @@ where
         + Domain<Type = ArrayType>
         + DifferentiationContext<
             Tangent = ShardMapTracer,
-            LinearOperation<ShardMapTracer, ResidualFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
+            LinearOperation<ShardMapTracer, CapturedFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
                 ShardMapTracer,
                 XlaConstant,
-                ResidualFactor<ArrayType, ShardMapTracer>,
+                CapturedFactor<ArrayType, ShardMapTracer>,
             >,
         >,
 {
@@ -1013,7 +1022,11 @@ fn factorize_transpose_shard_map_body(
         )
     })?;
     let transposed = apply_context.transpose(&direct)?;
-    let input_cotangents = transposed.interpret(output_cotangents.clone())?;
+    let interpretation_context = output_cotangents
+        .iter()
+        .find_map(|cotangent| cotangent.interpretation_context())
+        .ok_or_else(missing_traced_shard_map_staging_context)?;
+    let input_cotangents = transposed.interpret_in_context(&interpretation_context, output_cotangents.clone())?;
     check_count!("output", input_cotangents, local_input_count, ProgramError);
 
     // Record where each input cotangent comes from. The transpose materializes structural-zero cotangents as `zero`
@@ -1034,13 +1047,16 @@ fn factorize_transpose_shard_map_body(
         }
     }
 
-    // Release every other holder of the apply builder before unwrapping it to build the apply body program.
+    // Release every other holder of the apply builder before unwrapping it to build the apply body program. The
+    // recovered interpretation context is a clone of the apply staging context and therefore holds a strong reference
+    // to the apply builder, so it must be released here as well.
     drop(apply_context);
     drop(transposed);
     drop(direct);
     drop(output_cotangents);
     drop(residual_inputs);
     drop(input_cotangents);
+    drop(interpretation_context);
     let apply_body_program = build_traced_xla_program(
         apply_builder,
         apply_output_tracers,
@@ -1239,7 +1255,7 @@ fn trace_pushforward_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMa
             },
             local_primals,
         )?;
-        pushforward.apply(local_tangents)?
+        pushforward.apply(&pushforward_compiled_context, local_tangents)?
     };
     drop(pushforward_compiled_context);
     let pushforward_compiled = build_traced_xla_program(
@@ -1317,7 +1333,11 @@ fn trace_pullback_body(body: &FlatTracedShardMap) -> Result<FlatTracedShardMap, 
         )?;
         let pushforward_program = pushforward.instantiate_program()?;
         let pullback_program = pullback_compiled_context.transpose(&pushforward_program)?;
-        pullback_program.interpret(local_output_cotangents)?
+        let interpretation_context = local_output_cotangents
+            .iter()
+            .find_map(|cotangent| cotangent.interpretation_context())
+            .ok_or_else(missing_traced_shard_map_staging_context)?;
+        pullback_program.interpret_in_context(&interpretation_context, local_output_cotangents)?
     };
     drop(pullback_compiled_context);
     let pullback_compiled = build_traced_xla_program(
@@ -1556,11 +1576,13 @@ mod tests {
 
     use ryft_core::contexts::StagingContext;
     use ryft_core::domains::AbstractDomain;
+    use ryft_core::operations::arithmetic::MulOperation;
+    use ryft_core::operations::trigonometric::SinOperation;
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::{AtomId, ProgramBuilder, Value};
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::{AbstractTracingContext, TracingContext};
-    use ryft_core::tracing_v2::differentiation::{JvpTracer, ResidualFactor};
+    use ryft_core::tracing_v2::differentiation::JvpTracer;
     use ryft_core::tracing_v2::{DifferentiableOperation, TangentContext};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
@@ -1642,7 +1664,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let output = builder
-            .add_instruction(XlaOperation::Sin, vec![input])
+            .add_instruction(SinOperation, vec![input])
             .expect("simple shard_map body should stage one sine op")
             .into_iter()
             .copied()
@@ -1665,7 +1687,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let left = builder.add_input(array_type.clone());
         let right = builder.add_input(array_type.clone());
-        let output = builder.add_instruction(XlaOperation::Mul, vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(MulOperation, vec![left, right]).unwrap()[0];
         FlatTracedShardMap::from_parts(
             two_input_test_shard_map(),
             vec![array_type.clone(), array_type.clone()],
@@ -1686,7 +1708,7 @@ mod tests {
         let array_type = replicated_test_array_type();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
-        let output = builder.add_instruction(XlaOperation::Sin, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
         FlatTracedShardMap::from_parts(
             test_shard_map(),
             vec![array_type.clone()],
@@ -1704,7 +1726,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let used = builder.add_input(array_type.clone());
         builder.add_input(array_type.clone());
-        let output = builder.add_instruction(XlaOperation::Sin, vec![used]).unwrap()[0];
+        let output = builder.add_instruction(SinOperation, vec![used]).unwrap()[0];
         FlatTracedShardMap::from_parts(
             two_input_test_shard_map(),
             vec![array_type.clone(), array_type.clone()],
@@ -1909,7 +1931,7 @@ mod tests {
         let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             XlaTracer<'_, '_>,
-            LinearXlaOperation<XlaTracer<'_, '_>, XlaConstant, ResidualFactor<ArrayType, XlaTracer<'_, '_>>>,
+            LinearXlaOperation<XlaTracer<'_, '_>, XlaConstant, CapturedFactor<ArrayType, XlaTracer<'_, '_>>>,
         >::new()));
         let mut context = TangentContext::new(&tracing_context, tangent_builder.clone());
         let primal_input = tracing_context.input(test_array_type());

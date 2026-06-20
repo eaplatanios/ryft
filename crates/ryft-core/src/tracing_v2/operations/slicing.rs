@@ -1089,7 +1089,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let while_operation = WhileOperation::<TestArray, TestArrayOperation, ArrayType>::new(condition, body).unwrap();
+        let while_operation = WhileOperation::<ArrayType, TestArray, TestArrayOperation>::new(condition, body).unwrap();
 
         // Differentiate through the staged path: the body pushforward stages captured-index dynamic slicing
         // operations whose start indices reference the loop-varying counter residual, and the fused linear while

@@ -7,7 +7,7 @@ use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 
 use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
-use ryft_core::contexts::Context;
+use ryft_core::contexts::{Context, EagerContext, ProvidesContext};
 use ryft_core::domains::Domain;
 use ryft_core::operations::Operation;
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
@@ -259,7 +259,12 @@ impl<'c> Context for XlaDomain<'c> {
     /// XLA has no host interpreter for arbitrary operations, so eager [`bind`](Context::bind) supports only the
     /// nullary additive/multiplicative identities, which it materializes through the runtime client (the same path the
     /// removed `zero`/`one` methods used). Any other operation is rejected.
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         let (identity, array_type) = eager_identity_operation(&operation, inputs.len())?;
         validate_identity_synthesis(identity, &array_type)?;
         let kind = if identity == ZERO_OPERATION_NAME { ConstantKind::Zero } else { ConstantKind::One };
@@ -274,6 +279,12 @@ impl<'c> DifferentiationContext for XlaDomain<'c> {
 
     fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
+    }
+}
+
+impl<'c> ProvidesContext<<ArrayType as Value<ArrayType>>::InterpretationContext> for XlaDomain<'c> {
+    fn context(&self) -> <ArrayType as Value<ArrayType>>::InterpretationContext {
+        EagerContext::new()
     }
 }
 
@@ -304,7 +315,12 @@ impl Context for LinearXlaDomain {
 
     /// Mirrors [`XlaDomain`]'s eager [`bind`](Context::bind): only the nullary identity operations are supported,
     /// and they resolve to the normalized identity metadata (this linear domain's "values" are [`ArrayType`]s).
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
         let (identity, array_type) = eager_identity_operation(&operation, inputs.len())?;
         Ok(vec![xla_identity_metadata(identity, &array_type)?])
     }
@@ -1127,11 +1143,11 @@ mod tests {
 
     #[test]
     fn test_domain_identity_synthesis_rejects_unsupported_constant_type() {
-        use ryft_core::operations::constants::SupportsOne;
+        use ryft_core::operations::constants::OneOperation;
         let array_type = ArrayType::scalar(DataType::C64);
 
         assert!(matches!(
-            XlaDomain::token().bind(SupportsOne::one_operation(array_type.clone()), &[]),
+            XlaDomain::token().bind(OneOperation::new(array_type.clone()), &[]),
             Err(ProgramError::Type(error))
                 if error.message == "xla domain cannot synthesize one value for element type c64"
         ));
@@ -1139,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_linear_domain_one_metadata_normalizes_varying_manual_axes() {
-        use ryft_core::operations::constants::SupportsOne;
+        use ryft_core::operations::constants::OneOperation;
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::with_manual_axes(
             mesh,
@@ -1152,11 +1168,7 @@ mod tests {
         let array_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
 
-        let one_type = LinearXlaDomain::new()
-            .bind(SupportsOne::one_operation(array_type.clone()), &[])
-            .unwrap()
-            .pop()
-            .unwrap();
+        let one_type = LinearXlaDomain::new().bind(OneOperation::new(array_type.clone()), &[]).unwrap().pop().unwrap();
 
         assert_eq!(one_type.shape(), array_type.shape());
         assert_eq!(

@@ -94,14 +94,14 @@ pub trait SupportsLinearScan<T: Type, V: Value<T>, F: Value<T>>: Sized {
 /// processed. Transposing the linear scan flips `reverse` (and transposes the body program), which pairs cotangent
 /// lane `i` with residual lane `i` in the opposite visit order — making reverse-mode differentiation through `scan`
 /// total, with no array-reversal operation anywhere.
-impl<V, D, O> DifferentiableOperation<D> for ScanOperation<V, O, ArrayType>
+impl<V, D, O> DifferentiableOperation<D> for ScanOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
         + From<BroadcastOperation>
-        + From<ScanOperation<V, O, ArrayType>>
+        + From<ScanOperation<ArrayType, V, O>>
         + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>:
         ResidualizedOperation<D> + SupportsLinearScan<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
@@ -337,7 +337,7 @@ where
     Ok(outputs)
 }
 
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ScanOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ScanOperation<ArrayType, V, O>
 where
     V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
     O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
@@ -366,7 +366,7 @@ where
     }
 }
 
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ScanOperation<C::Constant, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ScanOperation<ArrayType, C::Constant, O>
 where
     C: StagingContext<Type = ArrayType>,
     C::Constant: Value<ArrayType>,
@@ -413,7 +413,7 @@ where
 /// reference index `i` resolves to slice `lane` of `residual_stacks[i]` while iteration `lane` runs, so the body stays
 /// fully linear in its tangent inputs with every captured primal entering through a per-lane residual slice.
 #[derive(Clone, Debug)]
-pub struct LinearScanOperation<V, C, T, Extension, F, O>
+pub struct LinearScanOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -441,7 +441,7 @@ where
     unroll: usize,
 }
 
-impl<V, C, T, Extension, F, O> LinearScanOperation<V, C, T, Extension, F, O>
+impl<V, C, T, Extension, F, O> LinearScanOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -501,7 +501,7 @@ where
     }
 }
 
-impl<V, C, T, Extension, F, O> Display for LinearScanOperation<V, C, T, Extension, F, O>
+impl<V, C, T, Extension, F, O> Display for LinearScanOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -516,7 +516,7 @@ where
     }
 }
 
-impl<V, C, Extension, F, O> Operation<ArrayType> for LinearScanOperation<V, C, ArrayType, Extension, F, O>
+impl<V, C, Extension, F, O> Operation<ArrayType> for LinearScanOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -578,7 +578,7 @@ where
 /// whose [`TransposableOperation`] obligation (on the enclosing enum itself) is the nested-factor fixed point that
 /// makes the recursion terminate.
 impl<V, C, Extension, F, O> TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
-    for LinearScanOperation<V, C, ArrayType, Extension, F, O>
+    for LinearScanOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -680,7 +680,7 @@ mod tests {
     }
 
     /// Builds the cumulative-product [`ScanOperation`] over three lanes used by the differentiation tests.
-    fn product_scan() -> ScanOperation<TestArray, TestOperation, ArrayType> {
+    fn product_scan() -> ScanOperation<ArrayType, TestArray, TestOperation> {
         ScanOperation::new(product_body(), 1, 3).unwrap()
     }
 

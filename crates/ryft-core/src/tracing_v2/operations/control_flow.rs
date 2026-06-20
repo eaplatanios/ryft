@@ -749,14 +749,14 @@ where
 /// The predicate is the first operand and its tangent is ignored (Boolean predicates have no tangent space).
 /// Reverse mode composes through the total linear-condition transpose rule, which transposes both branch programs
 /// and carries the predicate factor verbatim.
-impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<V, O, ArrayType>
+impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<V, O, ArrayType>>
+        + From<ConditionOperation<ArrayType, V, O>>
         + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>:
         ResidualizedOperation<D> + SupportsLinearCondition<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
@@ -831,7 +831,7 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<V, O, ArrayType>
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<ArrayType, V, O>
 where
     O: Operation<ArrayType>,
 {
@@ -927,14 +927,14 @@ where
 /// loop therefore requires an iteration bound (the masked-scan pushforward above transposes totally). Concretizing
 /// domains are unaffected: their pushforwards are straight-line and contain no loop to transpose, so eager reverse
 /// mode works even for unbounded loops.
-impl<V, D, O> DifferentiableOperation<D> for WhileOperation<V, O, ArrayType>
+impl<V, D, O> DifferentiableOperation<D> for WhileOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
     D::Value: BooleanLike,
     O: Clone
         + Operation<ArrayType>
-        + From<WhileOperation<V, O, ArrayType>>
+        + From<WhileOperation<ArrayType, V, O>>
         + DifferentiableOperation<D>
         + ProgramLinearizableOperation<D>
         + From<ZeroOperation<ArrayType>>
@@ -1287,7 +1287,7 @@ where
     }
 }
 
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ConditionOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ConditionOperation<ArrayType, V, O>
 where
     V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
     O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
@@ -1322,7 +1322,7 @@ where
 ///   - **Lane-varying predicate.** Both branches are interpreted over the operand inputs and merged per lane via
 ///     [`Select`](crate::operations::control_flow::Select), exactly like the value-level rule: every per-lane
 ///     primitive stages through the tracers, so the multi-operation rewrite composes under tracing already.
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperation<C::Constant, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for ConditionOperation<ArrayType, C::Constant, O>
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType> + BooleanLike,
@@ -1331,7 +1331,7 @@ where
         + ProgramBatchableOperation<C::Constant>
         + From<TransposeOperation>
         + From<BroadcastOperation>
-        + From<ConditionOperation<C::Constant, O, ArrayType>>,
+        + From<ConditionOperation<ArrayType, C::Constant, O>>,
 {
     fn batch(
         &self,
@@ -1409,7 +1409,7 @@ where
 }
 
 pub(crate) fn batch_while_with_interpreter<VOperation, V, O, F>(
-    while_operation: &WhileOperation<VOperation, O, ArrayType>,
+    while_operation: &WhileOperation<ArrayType, VOperation, O>,
     inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
@@ -1462,7 +1462,7 @@ where
     )
 }
 
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for WhileOperation<V, O, ArrayType>
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for WhileOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>
         + BooleanLike
@@ -1512,7 +1512,7 @@ where
 ///      it into the mask. The initial mask is the batched condition staged once over the initial state in the
 ///      parent context, and the iteration bound is preserved (lanes share masked iterations, so capping the staged
 ///      loop matches per-lane truncation exactly, like the operational rule).
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<C::Constant, O, ArrayType>
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for WhileOperation<ArrayType, C::Constant, O>
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType> + BooleanLike,
@@ -1524,7 +1524,7 @@ where
         + From<ReduceOperation>
         + From<SelectOperation>
         + From<AndOperation>
-        + From<WhileOperation<C::Constant, O, ArrayType>>,
+        + From<WhileOperation<ArrayType, C::Constant, O>>,
 {
     fn batch(
         &self,
@@ -1895,7 +1895,7 @@ where
 /// primal computation rather than a linear operand, it receives no cotangent and is carried verbatim through
 /// transposition.
 #[derive(Clone, Debug)]
-pub struct LinearConditionOperation<V, C, T, Extension, F, O>
+pub struct LinearConditionOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -1912,7 +1912,7 @@ where
     false_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
 }
 
-impl<V, C, T, Extension, F, O> LinearConditionOperation<V, C, T, Extension, F, O>
+impl<V, C, T, Extension, F, O> LinearConditionOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -1948,7 +1948,7 @@ where
     }
 }
 
-impl<V, C, T, Extension, F, O> Display for LinearConditionOperation<V, C, T, Extension, F, O>
+impl<V, C, T, Extension, F, O> Display for LinearConditionOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -1963,7 +1963,7 @@ where
     }
 }
 
-impl<V, C, Extension, F, O> Operation<ArrayType> for LinearConditionOperation<V, C, ArrayType, Extension, F, O>
+impl<V, C, Extension, F, O> Operation<ArrayType> for LinearConditionOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -2004,7 +2004,7 @@ where
 /// [`LinearArrayOperation`] itself, whose [`TransposableOperation`] obligation (on the enclosing enum itself) closes
 /// the body-check fixed point that makes this recursion terminate.
 impl<V, C, Extension, F, O> TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
-    for LinearConditionOperation<V, C, ArrayType, Extension, F, O>
+    for LinearConditionOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -2056,7 +2056,7 @@ where
 /// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
 /// transposition, which is only reachable behind the while transpose error.
 #[derive(Clone, Debug)]
-pub struct LinearOperandConditionOperation<V, C, T, Extension, F, O>
+pub struct LinearOperandConditionOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -2070,7 +2070,7 @@ where
     false_branch: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, F, O>, Vec<V>, Vec<V>>>,
 }
 
-impl<V, C, T, Extension, F, O> LinearOperandConditionOperation<V, C, T, Extension, F, O>
+impl<V, C, T, Extension, F, O> LinearOperandConditionOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -2099,7 +2099,7 @@ where
     }
 }
 
-impl<V, C, T, Extension, F, O> Display for LinearOperandConditionOperation<V, C, T, Extension, F, O>
+impl<V, C, T, Extension, F, O> Display for LinearOperandConditionOperation<T, V, C, Extension, F, O>
 where
     T: Type,
     V: Value<T>,
@@ -2114,7 +2114,7 @@ where
     }
 }
 
-impl<V, C, Extension, F, O> Operation<ArrayType> for LinearOperandConditionOperation<V, C, ArrayType, Extension, F, O>
+impl<V, C, Extension, F, O> Operation<ArrayType> for LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -2155,7 +2155,7 @@ where
 /// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
 /// transposition; this rule is only reachable behind the while transpose error, which fires first.
 impl<V, C, Extension, F, O, OLinear: Operation<ArrayType>> TransposableOperation<ArrayType, V, OLinear>
-    for LinearOperandConditionOperation<V, C, ArrayType, Extension, F, O>
+    for LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -2315,8 +2315,8 @@ mod tests {
         Add,
         Sub,
         IsPositive,
-        Condition(Box<ConditionOperation<TestValue, TestOperation, ArrayType>>),
-        While(Box<WhileOperation<TestValue, TestOperation, ArrayType>>),
+        Condition(Box<ConditionOperation<ArrayType, TestValue, TestOperation>>),
+        While(Box<WhileOperation<ArrayType, TestValue, TestOperation>>),
     }
 
     impl Display for TestOperation {
@@ -2414,7 +2414,7 @@ mod tests {
         Recompute(TestDifferentiableOperation),
 
         /// Fused doubled-state while loop staged by the [`WhileOperation`] JVP rule.
-        While(Box<WhileOperation<TestValue, TestLinearOperation, ArrayType>>),
+        While(Box<WhileOperation<ArrayType, TestValue, TestLinearOperation>>),
 
         /// Captured-condition select required by the bounded staged while path's trait bounds. Like `Condition`,
         /// interpretation only supports closed [`CapturedFactor::Constant`] conditions because this test enum is
@@ -2686,18 +2686,18 @@ mod tests {
         Scale { factor: TestValue },
         Broadcast { output_type: ArrayType },
         DynamicUpdateSlice,
-        Condition(Box<ConditionOperation<TestValue, TestDifferentiableOperation, ArrayType>>),
-        While(Box<WhileOperation<TestValue, TestDifferentiableOperation, ArrayType>>),
+        Condition(Box<ConditionOperation<ArrayType, TestValue, TestDifferentiableOperation>>),
+        While(Box<WhileOperation<ArrayType, TestValue, TestDifferentiableOperation>>),
     }
 
-    impl From<ConditionOperation<TestValue, TestDifferentiableOperation, ArrayType>> for TestDifferentiableOperation {
-        fn from(operation: ConditionOperation<TestValue, TestDifferentiableOperation, ArrayType>) -> Self {
+    impl From<ConditionOperation<ArrayType, TestValue, TestDifferentiableOperation>> for TestDifferentiableOperation {
+        fn from(operation: ConditionOperation<ArrayType, TestValue, TestDifferentiableOperation>) -> Self {
             Self::Condition(Box::new(operation))
         }
     }
 
-    impl From<WhileOperation<TestValue, TestDifferentiableOperation, ArrayType>> for TestDifferentiableOperation {
-        fn from(operation: WhileOperation<TestValue, TestDifferentiableOperation, ArrayType>) -> Self {
+    impl From<WhileOperation<ArrayType, TestValue, TestDifferentiableOperation>> for TestDifferentiableOperation {
+        fn from(operation: WhileOperation<ArrayType, TestValue, TestDifferentiableOperation>) -> Self {
             Self::While(Box::new(operation))
         }
     }
@@ -3325,7 +3325,7 @@ mod tests {
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let while_operation = WhileOperation::<TestArray, TestArrayOp, ArrayType>::new(condition, body).unwrap();
+        let while_operation = WhileOperation::<ArrayType, TestArray, TestArrayOp>::new(condition, body).unwrap();
 
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new()));
         let state_input = outer_builder.borrow_mut().add_input(scalar_f64.clone());
@@ -3419,7 +3419,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let while_operation = WhileOperation::<TestArray, TestArrayOp, ArrayType>::new(condition, body).unwrap();
+        let while_operation = WhileOperation::<ArrayType, TestArray, TestArrayOp>::new(condition, body).unwrap();
 
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestArrayOp>::new()));
         let counter_input = outer_builder.borrow_mut().add_input(scalar_f64.clone());
@@ -3587,7 +3587,7 @@ mod tests {
     }
 
     /// Builds the `while (x < 10) { x = select(x < 4, 3 * x, 2 * x) }` loop whose select condition is loop-varying.
-    fn select_while_operation() -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    fn select_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
@@ -3608,7 +3608,7 @@ mod tests {
 
     /// Builds the `while (x < 100) { x = if (x < 10) { x * x } else { 2 * x } }` loop whose nested condition has a
     /// loop-varying predicate and whose true branch references the loop-varying residual `x`.
-    fn condition_while_operation() -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    fn condition_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut square_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let square_input = square_builder.add_input(scalar_f64.clone());
@@ -3644,7 +3644,7 @@ mod tests {
     fn bounded_doubling_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    ) -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
@@ -3665,7 +3665,7 @@ mod tests {
     fn bounded_squaring_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    ) -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
@@ -3681,7 +3681,7 @@ mod tests {
 
     /// Builds the `while (x < 50) { x = scan(cumulative product over xs = [2, 3], init = x) }` loop whose body
     /// stages a scan; the scan JVP's residual stacks reference the while-body residual environment.
-    fn scan_while_operation() -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    fn scan_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut scan_body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let carry = scan_body_builder.add_input(scalar_f64.clone());
@@ -3707,8 +3707,8 @@ mod tests {
     /// Stages the while JVP rule under abstract tracing (tracer-valued primals) for one scalar state element and
     /// returns the staged doubled-state linear while for structural assertions.
     fn staged_linear_while_under_abstract_tracing(
-        while_operation: WhileOperation<TestArray, TestArrayOperation, ArrayType>,
-    ) -> WhileOperation<AbstractTangentTracer, AbstractLinearOperation, ArrayType> {
+        while_operation: WhileOperation<ArrayType, TestArray, TestArrayOperation>,
+    ) -> WhileOperation<ArrayType, AbstractTangentTracer, AbstractLinearOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new()));
         let state_input = outer_builder.borrow_mut().add_input(scalar_f64.clone());
@@ -3738,7 +3738,7 @@ mod tests {
     /// [`StagedDispatchTestArrayDomain`] and returns the concrete primal output together with the directly
     /// interpretable pushforward program over one scalar tangent input.
     fn staged_while_pushforward(
-        while_operation: WhileOperation<TestArray, TestArrayOperation, ArrayType>,
+        while_operation: WhileOperation<ArrayType, TestArray, TestArrayOperation>,
         state: f64,
     ) -> (
         TestArray,
@@ -3788,7 +3788,7 @@ mod tests {
     /// Runs the eager-domain jvp of `while_operation` over one scalar state element at `(state, tangent)`,
     /// interpreting the staged fused linear loop immediately.
     fn eager_while_jvp(
-        while_operation: WhileOperation<TestArray, TestArrayOperation, ArrayType>,
+        while_operation: WhileOperation<ArrayType, TestArray, TestArrayOperation>,
         state: f64,
         tangent: f64,
     ) -> (TestArray, TestArray) {
@@ -4179,7 +4179,7 @@ mod tests {
     }
 
     /// Builds the per-lane countdown loop `while (x > 0) { x = x - 1 }` over one scalar state element.
-    fn countdown_while_operation() -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    fn countdown_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
@@ -4203,7 +4203,7 @@ mod tests {
     /// Stages `while_operation` over one batched lane (mapped at axis 0 with `lane_count` lanes) under tracing and
     /// returns the staged batched program for structural and numeric assertions.
     fn batch_while_under_tracing(
-        while_operation: WhileOperation<TestArray, TestArrayOperation, ArrayType>,
+        while_operation: WhileOperation<ArrayType, TestArray, TestArrayOperation>,
         lane_count: usize,
     ) -> Program<ArrayType, TestArray, TestArrayOperation, TestArray, TestArray> {
         use crate::tracing_v2::batching::BatchContext;
@@ -4260,7 +4260,7 @@ mod tests {
 
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate
     /// depends only on the counter state element.
-    fn counter_doubling_while_operation() -> WhileOperation<TestArray, TestArrayOperation, ArrayType> {
+    fn counter_doubling_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
         let condition_counter = condition_builder.add_input(scalar_f64.clone());

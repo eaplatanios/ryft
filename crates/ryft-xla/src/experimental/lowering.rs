@@ -14,17 +14,16 @@ use ryft_ndarray::Array as NdArrayValue;
 
 use ryft_core::macros::check_count;
 use ryft_core::operations::Operation;
-use ryft_core::operations::arithmetic::SupportsMul;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::constants::{ConstantOperation, FillOperation};
-use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SupportsSelect, WhileOperation};
-use ryft_core::operations::manipulation::ReshapeOperation;
-use ryft_core::operations::manipulation::{BroadcastOperation, TransposeOperation};
-use ryft_core::operations::manipulation::{GatherOperation, GatherScatterMode, ScatterOperation, ScatterReductionKind};
-use ryft_core::operations::manipulation::{SupportsConcatenate, SupportsDynamicSlice, SupportsDynamicUpdateSlice};
+use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
+use ryft_core::operations::manipulation::{
+    BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
+    GatherScatterMode, ReshapeOperation, ScatterOperation, ScatterReductionKind, TransposeOperation,
+};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -32,7 +31,7 @@ use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::{
-    ArrayOperation, DefactorizedOperation, LinearArrayOperation, ResidualFactor, SupportsDot, SupportsLinearWhile,
+    ArrayOperation, CapturedFactor, DefactorizedOperation, LinearArrayOperation, SupportsLinearWhile,
 };
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
@@ -184,7 +183,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested condition operation inside this lowering context.
     pub(crate) fn lower_condition<V: MlirLowerableValue, O>(
         &mut self,
-        condition_op: &ConditionOperation<V, O, ArrayType>,
+        condition_op: &ConditionOperation<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -203,7 +202,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested while operation inside this lowering context.
     pub(crate) fn lower_while<V: MlirLowerableValue, O>(
         &mut self,
-        while_op: &WhileOperation<V, O, ArrayType>,
+        while_op: &WhileOperation<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -222,7 +221,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested scan operation inside this lowering context.
     pub(crate) fn lower_scan<V: MlirLowerableValue, O>(
         &mut self,
-        scan_op: &ScanOperation<V, O, ArrayType>,
+        scan_op: &ScanOperation<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -771,7 +770,7 @@ impl LowerableXlaOperation<XlaConstant> for XlaOperationExtension<XlaConstant> {
     }
 }
 
-impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ConditionOperation<V, O, ArrayType>
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ConditionOperation<ArrayType, V, O>
 where
     O: LowerableXlaOperation<V>,
 {
@@ -786,7 +785,7 @@ where
     }
 }
 
-impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for WhileOperation<V, O, ArrayType>
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for WhileOperation<ArrayType, V, O>
 where
     O: LowerableXlaOperation<V>,
 {
@@ -801,7 +800,7 @@ where
     }
 }
 
-impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ScanOperation<V, O, ArrayType>
+impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ScanOperation<ArrayType, V, O>
 where
     O: LowerableXlaOperation<V>,
 {
@@ -835,7 +834,7 @@ fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
 }
 
-impl<V, Extension> LowerableXlaOperation<V> for ArrayOperation<V, ArrayType, Extension>
+impl<V, Extension> LowerableXlaOperation<V> for ArrayOperation<ArrayType, V, Extension>
 where
     V: MlirLowerableValue,
     Extension: LowerableXlaOperation<V>,
@@ -876,50 +875,50 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &AddOperation,
+            ArrayOperation::Add(operation) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Sub => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &SubOperation,
+            ArrayOperation::Sub(operation) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Mul => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &MulOperation,
+            ArrayOperation::Mul(operation) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Div => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &DivOperation,
+            ArrayOperation::Div(operation) => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Neg => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &NegOperation,
+            ArrayOperation::Neg(operation) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Sin => <SinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &SinOperation,
+            ArrayOperation::Sin(operation) => <SinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Cos => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &CosOperation,
+            ArrayOperation::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
@@ -927,7 +926,7 @@ where
             ),
             // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
             // forward the operand without emitting any MLIR operation (matching JAX's lowering).
-            ArrayOperation::StopGradient => {
+            ArrayOperation::StopGradient(_) => {
                 if input_values.len() != 1 {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
                 }
@@ -968,7 +967,7 @@ where
                 false,
                 lowerer.nested_functions.as_ref(),
             ),
-            ArrayOperation::ZeroLike => lower_like_constant(
+            ArrayOperation::ZeroLike(_) => lower_like_constant(
                 input_values,
                 output_types,
                 0,
@@ -976,7 +975,7 @@ where
                 lowerer.context,
                 lowerer.location,
             ),
-            ArrayOperation::OneLike => lower_like_constant(
+            ArrayOperation::OneLike(_) => lower_like_constant(
                 input_values,
                 output_types,
                 1,
@@ -984,57 +983,54 @@ where
                 lowerer.context,
                 lowerer.location,
             ),
-            ArrayOperation::Transpose { permutation } => {
-                <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &TransposeOperation::new(permutation.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            ArrayOperation::Dot { dimensions, output_sharding } => {
-                <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            ArrayOperation::Scale { factor } => {
-                <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ScaleOperation::new(factor.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            ArrayOperation::Reshape { output_shape } => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &ReshapeOperation::new(output_shape.clone()),
+            ArrayOperation::Transpose(operation) => <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Reshard { sharding } | ArrayOperation::ShardingConstraint { sharding } => {
-                lower_sharding_constraint(input_values, sharding, &mut lowerer.block, lowerer.location)
-            }
-            ArrayOperation::Broadcast { output_type, output_axes } => {
-                <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastOperation::new(output_type.clone(), output_axes.clone()),
+            ArrayOperation::Dot(operation) => <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Scale(operation) => {
+                <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            ArrayOperation::Reduce { axes, kind, .. } => {
+            ArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Reshard(operation) => {
+                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
+            }
+            ArrayOperation::ShardingConstraint(operation) => {
+                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
+            }
+            ArrayOperation::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Reduce(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 let value = lower_reduce_to_mlir(
-                    *kind,
-                    axes.as_slice(),
+                    operation.kind(),
+                    operation.axes(),
                     input_values[0],
                     &output_types[0],
                     &mut lowerer.block,
@@ -1043,9 +1039,9 @@ where
                 )?;
                 Ok(vec![value])
             }
-            ArrayOperation::Compare { direction } => {
+            ArrayOperation::Compare(operation) => {
                 let value = lower_compare_to_mlir(
-                    *direction,
+                    operation.direction(),
                     input_values[0],
                     input_values[1],
                     &mut lowerer.block,
@@ -1053,11 +1049,11 @@ where
                 )?;
                 Ok(vec![value])
             }
-            ArrayOperation::Not => {
+            ArrayOperation::Not(_) => {
                 let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
                 Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
             }
-            ArrayOperation::And => {
+            ArrayOperation::And(_) => {
                 let result = lowerer.block.append_operation(stable_hlo::and(
                     input_values[0],
                     input_values[1],
@@ -1065,7 +1061,7 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
             }
-            ArrayOperation::Or => {
+            ArrayOperation::Or(_) => {
                 let result = lowerer.block.append_operation(stable_hlo::or(
                     input_values[0],
                     input_values[1],
@@ -1073,7 +1069,7 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
             }
-            ArrayOperation::Xor => {
+            ArrayOperation::Xor(_) => {
                 let result = lowerer.block.append_operation(stable_hlo::xor(
                     input_values[0],
                     input_values[1],
@@ -1081,7 +1077,7 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
             }
-            ArrayOperation::Collective { .. } => {
+            ArrayOperation::Collective(_) => {
                 // Collectives are per-lane identity at the operation type level (the named axis
                 // only exists physically inside a matching `BatchingContext`). When the named-axis
                 // `batch` consumes the collective, the batching rule produces either a `Reduce`
@@ -1092,7 +1088,7 @@ where
                 check_count!("input", input_values, 1, ProgramError);
                 Ok(vec![input_values[0]])
             }
-            ArrayOperation::Select => {
+            ArrayOperation::Select(_) => {
                 let result = lowerer.block.append_operation(stable_hlo::select(
                     input_values[0],
                     input_values[1],
@@ -1101,19 +1097,19 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
             }
-            ArrayOperation::Slice { start_indices, limit_indices, strides } => {
+            ArrayOperation::Slice(operation) => {
                 let result = lowerer.block.append_operation(stable_hlo::slice(
                     input_values[0],
-                    start_indices.as_slice(),
-                    limit_indices.as_slice(),
-                    strides.as_slice(),
+                    operation.start_indices(),
+                    operation.limit_indices(),
+                    operation.strides(),
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
             }
-            ArrayOperation::UpdateSlice { start_indices } => {
+            ArrayOperation::UpdateSlice(operation) => {
                 let index_values = lower_static_index_constants(
-                    start_indices.as_slice(),
+                    operation.start_indices(),
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
@@ -1126,16 +1122,16 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
-            ArrayOperation::DynamicSlice { sizes } => {
+            ArrayOperation::DynamicSlice(operation) => {
                 let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
                     input_values[0],
                     &input_values[1..],
-                    sizes.as_slice(),
+                    operation.sizes(),
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
             }
-            ArrayOperation::DynamicUpdateSlice => {
+            ArrayOperation::DynamicUpdateSlice(_) => {
                 let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
                     input_values[0],
                     input_values[1],
@@ -1144,23 +1140,28 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
-            ArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                let edge_padding_low: Vec<i64> = edge_padding_low.iter().map(|&padding| padding as i64).collect();
-                let edge_padding_high: Vec<i64> = edge_padding_high.iter().map(|&padding| padding as i64).collect();
+            ArrayOperation::Pad(operation) => {
+                let edge_padding_low: Vec<i64> =
+                    operation.edge_padding_low().iter().map(|&padding| padding as i64).collect();
+                let edge_padding_high: Vec<i64> =
+                    operation.edge_padding_high().iter().map(|&padding| padding as i64).collect();
                 let result = lowerer.block.append_operation(stable_hlo::pad(
                     input_values[0],
                     input_values[1],
                     edge_padding_low.as_slice(),
                     edge_padding_high.as_slice(),
-                    interior_padding.as_slice(),
+                    operation.interior_padding(),
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
-            ArrayOperation::Concatenate { axis } => {
+            ArrayOperation::Concatenate(operation) => {
                 reject_dynamic_concatenate_output(output_types)?;
-                let result =
-                    lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
+                let result = lowerer.block.append_operation(stable_hlo::concatenate(
+                    input_values,
+                    operation.axis(),
+                    lowerer.location,
+                )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
             }
             ArrayOperation::Gather(operation) => lower_gather_to_mlir(
@@ -1189,19 +1190,19 @@ where
     }
 }
 
-impl<V, C, Extension, O> LowerableXlaOperation<V> for LinearArrayOperation<V, C, ArrayType, Extension, V, O>
+impl<V, C, Extension, O> LowerableXlaOperation<V> for LinearArrayOperation<ArrayType, V, C, Extension, V, O>
 where
     V: MlirLowerableValue,
     C: MlirLowerableValue,
     Extension: Clone + LowerableXlaOperation<V>,
     O: Clone
         + LowerableXlaOperation<C>
-        + SupportsMul<ArrayType>
-        + SupportsDot<ArrayType>
-        + SupportsSelect<ArrayType>
-        + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>
-        + SupportsConcatenate<ArrayType>,
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ConcatenateOperation>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1273,7 +1274,7 @@ where
                     lowerer,
                 )
             }
-            LinearArrayOperation::ZeroLike => lower_like_constant(
+            LinearArrayOperation::ZeroLike(_) => lower_like_constant(
                 input_values,
                 output_types,
                 0,
@@ -1281,7 +1282,7 @@ where
                 lowerer.context,
                 lowerer.location,
             ),
-            LinearArrayOperation::OneLike => lower_like_constant(
+            LinearArrayOperation::OneLike(_) => lower_like_constant(
                 input_values,
                 output_types,
                 1,
@@ -1289,105 +1290,106 @@ where
                 lowerer.context,
                 lowerer.location,
             ),
-            LinearArrayOperation::Add => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            LinearArrayOperation::Add(_) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &AddOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            LinearArrayOperation::Sub => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            LinearArrayOperation::Sub(_) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &SubOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            LinearArrayOperation::Neg => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            LinearArrayOperation::Neg(_) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &NegOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            LinearArrayOperation::Transpose { permutation } => {
+            LinearArrayOperation::Transpose(operation) => {
                 <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &TransposeOperation::new(permutation.clone()),
+                    &TransposeOperation::new(operation.permutation().to_vec()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::Scale { factor } => {
+            LinearArrayOperation::Scale(operation) => {
                 <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ScaleOperation::new(factor.clone()),
+                    &ScaleOperation::new(operation.factor().clone()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::Mul => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            LinearArrayOperation::Mul(_) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &MulOperation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            LinearArrayOperation::TransferToMemory { destination } => lower_transfer_to_memory(
-                *destination,
+            LinearArrayOperation::TransferToMemory(operation) => lower_transfer_to_memory(
+                operation.destination(),
                 input_values,
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
             ),
-            LinearArrayOperation::LeftDot { factor, dimensions, output_sharding } => {
+            LinearArrayOperation::LeftDot(operation) => {
                 <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &LeftDotOperation::new(factor.clone(), dimensions.clone())
-                        .with_output_sharding(output_sharding.clone()),
+                    &LeftDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                        .with_output_sharding(operation.output_sharding().cloned()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::RightDot { factor, dimensions, output_sharding } => {
+            LinearArrayOperation::RightDot(operation) => {
                 <RightDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &RightDotOperation::new(factor.clone(), dimensions.clone())
-                        .with_output_sharding(output_sharding.clone()),
+                    &RightDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                        .with_output_sharding(operation.output_sharding().cloned()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::Reshape { output_shape } => {
-                <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ReshapeOperation::new(output_shape.clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
+            LinearArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                &ReshapeOperation::new(operation.output_shape().clone()),
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            LinearArrayOperation::Reshard(operation) => {
+                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
-            LinearArrayOperation::Reshard { sharding } | LinearArrayOperation::ShardingConstraint { sharding } => {
-                lower_sharding_constraint(input_values, sharding, &mut lowerer.block, lowerer.location)
+            LinearArrayOperation::ShardingConstraint(operation) => {
+                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
-            LinearArrayOperation::Broadcast { output_type, output_axes } => {
+            LinearArrayOperation::Broadcast(operation) => {
                 <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastOperation::new(output_type.clone(), output_axes.clone()),
+                    &BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec()),
                     input_values,
                     output_types,
                     mode,
                     lowerer,
                 )
             }
-            LinearArrayOperation::Reduce { axes, kind, .. } => {
+            LinearArrayOperation::Reduce(operation) => {
                 check_count!("output", output_types, 1, ProgramError);
                 let value = lower_reduce_to_mlir(
-                    *kind,
-                    axes.as_slice(),
+                    operation.kind(),
+                    operation.axes(),
                     input_values[0],
                     &output_types[0],
                     &mut lowerer.block,
@@ -1396,38 +1398,43 @@ where
                 )?;
                 Ok(vec![value])
             }
-            LinearArrayOperation::Slice { start_indices, limit_indices, strides } => {
+            LinearArrayOperation::Slice(operation) => {
                 let result = lowerer.block.append_operation(stable_hlo::slice(
                     input_values[0],
-                    start_indices.as_slice(),
-                    limit_indices.as_slice(),
-                    strides.as_slice(),
+                    operation.start_indices(),
+                    operation.limit_indices(),
+                    operation.strides(),
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
             }
-            LinearArrayOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-                let edge_padding_low: Vec<i64> = edge_padding_low.iter().map(|&padding| padding as i64).collect();
-                let edge_padding_high: Vec<i64> = edge_padding_high.iter().map(|&padding| padding as i64).collect();
+            LinearArrayOperation::Pad(operation) => {
+                let edge_padding_low: Vec<i64> =
+                    operation.edge_padding_low().iter().map(|&padding| padding as i64).collect();
+                let edge_padding_high: Vec<i64> =
+                    operation.edge_padding_high().iter().map(|&padding| padding as i64).collect();
                 let result = lowerer.block.append_operation(stable_hlo::pad(
                     input_values[0],
                     input_values[1],
                     edge_padding_low.as_slice(),
                     edge_padding_high.as_slice(),
-                    interior_padding.as_slice(),
+                    operation.interior_padding(),
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
-            LinearArrayOperation::Concatenate { axis } => {
+            LinearArrayOperation::Concatenate(operation) => {
                 reject_dynamic_concatenate_output(output_types)?;
-                let result =
-                    lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
+                let result = lowerer.block.append_operation(stable_hlo::concatenate(
+                    input_values,
+                    operation.axis(),
+                    lowerer.location,
+                )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
             }
-            LinearArrayOperation::UpdateSlice { start_indices } => {
+            LinearArrayOperation::UpdateSlice(operation) => {
                 let index_values = lower_static_index_constants(
-                    start_indices.as_slice(),
+                    operation.start_indices(),
                     &mut lowerer.block,
                     lowerer.context,
                     lowerer.location,
@@ -1440,23 +1447,25 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
-            LinearArrayOperation::DynamicSlice { start_indices, sizes } => {
+            LinearArrayOperation::DynamicSlice(operation) => {
                 check_count!("input", input_values, 1, ProgramError);
-                let index_values = start_indices
+                let index_values = operation
+                    .start_indices()
                     .iter()
                     .map(|index| lowerer.lower_literal_value(index))
                     .collect::<Result<Vec<_>, _>>()?;
                 let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
                     input_values[0],
                     index_values.as_slice(),
-                    sizes.as_slice(),
+                    operation.sizes(),
                     lowerer.location,
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
             }
-            LinearArrayOperation::DynamicUpdateSlice { start_indices } => {
+            LinearArrayOperation::DynamicUpdateSlice(operation) => {
                 check_count!("input", input_values, 2, ProgramError);
-                let index_values = start_indices
+                let index_values = operation
+                    .start_indices()
                     .iter()
                     .map(|index| lowerer.lower_literal_value(index))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1468,13 +1477,13 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
-            LinearArrayOperation::Gather { operation, indices } => {
+            LinearArrayOperation::Gather(operation) => {
                 // The captured index operand is materialized as a literal, then the tangent operand and the indices
                 // flow into the same gather lowering as the primal operation.
                 check_count!("input", input_values, 1, ProgramError);
-                let index_value = lowerer.lower_literal_value(indices)?;
+                let index_value = lowerer.lower_literal_value(operation.indices())?;
                 lower_gather_to_mlir(
-                    operation,
+                    operation.operation(),
                     &[input_values[0], index_value],
                     output_types,
                     &mut lowerer.block,
@@ -1482,13 +1491,13 @@ where
                     lowerer.location,
                 )
             }
-            LinearArrayOperation::ScatterAdd { operation, indices } => {
+            LinearArrayOperation::ScatterAdd(operation) => {
                 // The captured index operand is materialized as a literal, then the operand and update tangents flow
                 // into the same scatter lowering as the primal operation (the combiner is always `Add`).
                 check_count!("input", input_values, 2, ProgramError);
-                let index_value = lowerer.lower_literal_value(indices)?;
+                let index_value = lowerer.lower_literal_value(operation.indices())?;
                 lower_scatter_to_mlir(
-                    operation,
+                    operation.operation(),
                     &[input_values[0], index_value, input_values[1]],
                     output_types,
                     &mut lowerer.block,
@@ -1496,9 +1505,9 @@ where
                     lowerer.location,
                 )
             }
-            LinearArrayOperation::Select { condition } => {
+            LinearArrayOperation::Select(operation) => {
                 check_count!("input", input_values, 2, ProgramError);
-                let condition_value = lowerer.lower_literal_value(condition)?;
+                let condition_value = lowerer.lower_literal_value(operation.condition())?;
                 let result = lowerer.block.append_operation(stable_hlo::select(
                     condition_value,
                     input_values[0],
@@ -1507,18 +1516,20 @@ where
                 )?)?;
                 Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
             }
-            LinearArrayOperation::Residual { factor } => {
+            LinearArrayOperation::Residual(operation) => {
                 if !input_values.is_empty() {
                     return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                 }
-                Ok(vec![lowerer.lower_literal_value(factor)?])
+                Ok(vec![lowerer.lower_literal_value(operation.factor())?])
             }
             LinearArrayOperation::Recompute(operation) => {
                 operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
-            LinearArrayOperation::Condition { predicate, true_branch, false_branch } => {
+            LinearArrayOperation::Condition(operation) => {
+                let true_branch = operation.true_branch();
+                let false_branch = operation.false_branch();
                 check_count!("input", input_values, true_branch.input_types().len(), ProgramError);
-                let predicate_value = lowerer.lower_literal_value(predicate)?;
+                let predicate_value = lowerer.lower_literal_value(operation.predicate())?;
                 let true_branch_region = lower_control_flow_region(
                     true_branch,
                     input_values,
@@ -1545,10 +1556,12 @@ where
                     })
                     .collect())
             }
-            LinearArrayOperation::OperandCondition { true_branch, false_branch } => {
+            LinearArrayOperation::OperandCondition(operation) => {
                 // The operand-form condition mirrors the factor-form lowering above with the predicate taken from
                 // operand 0 instead of a materialized factor literal; the remaining operands (including any
                 // forwarded loop-varying residuals appended by defactorization) flow into both branch regions.
+                let true_branch = operation.true_branch();
+                let false_branch = operation.false_branch();
                 check_count!("input", input_values, 1 + true_branch.input_types().len(), ProgramError);
                 let branch_inputs = &input_values[1..];
                 let true_branch_region = lower_control_flow_region(
@@ -1580,23 +1593,24 @@ where
             LinearArrayOperation::While(operation) => {
                 operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
-            LinearArrayOperation::Scan { body, residual_stacks, carry_count, length, reverse, unroll } => {
+            LinearArrayOperation::Scan(operation) => {
                 // Materialize the residual stacks after the operand stacks and rewrite the body into operand form
                 // so each lane's residual slices enter as extra scanned inputs, mirroring how fused while bodies
                 // defactorize loop-varying residual references.
+                let residual_stacks = operation.residual_stacks();
                 let mut full_inputs = input_values.to_vec();
                 let mut residual_slice_types = Vec::with_capacity(residual_stacks.len());
                 for stack in residual_stacks {
                     full_inputs.push(lowerer.lower_literal_value(stack)?);
                     residual_slice_types.push(stack.r#type().without_dimension(0).map_err(ProgramError::from)?.0);
                 }
-                let operand_form_body = operand_form_scan_body(body.as_ref(), residual_slice_types.as_slice())?;
+                let operand_form_body = operand_form_scan_body(operation.body(), residual_slice_types.as_slice())?;
                 lower_scan_to_while(
                     &operand_form_body,
-                    *carry_count,
-                    *length,
-                    *reverse,
-                    *unroll,
+                    operation.carry_count(),
+                    operation.length(),
+                    operation.reverse(),
+                    operation.unroll(),
                     full_inputs.as_slice(),
                     &mut lowerer.block,
                     lowerer.context,
@@ -1705,7 +1719,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested condition operation inside this lowering context.
     pub(crate) fn lower_condition<V: MlirLowerableValue, O>(
         &mut self,
-        condition_op: &ConditionOperation<V, O, ArrayType>,
+        condition_op: &ConditionOperation<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -1724,7 +1738,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested while operation inside this lowering context.
     pub(crate) fn lower_while<V: MlirLowerableValue, O>(
         &mut self,
-        while_op: &WhileOperation<V, O, ArrayType>,
+        while_op: &WhileOperation<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -1743,7 +1757,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     /// Lowers one nested scan operation inside this lowering context.
     pub(crate) fn lower_scan<V: MlirLowerableValue, O>(
         &mut self,
-        scan_op: &ScanOperation<V, O, ArrayType>,
+        scan_op: &ScanOperation<ArrayType, V, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -2262,10 +2276,16 @@ where
             XlaOperation::Scan(scan_op) => {
                 mesh = collect_nested_sharding_mesh(scan_op.body(), mesh)?;
             }
-            XlaOperation::Reshard { sharding } | XlaOperation::ShardingConstraint { sharding } => {
+            XlaOperation::Reshard(operation) => {
                 mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
-                    None => sharding.mesh().clone(),
+                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, operation.sharding().mesh())?,
+                    None => operation.sharding().mesh().clone(),
+                });
+            }
+            XlaOperation::ShardingConstraint(operation) => {
+                mesh = Some(match mesh.take() {
+                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, operation.sharding().mesh())?,
+                    None => operation.sharding().mesh().clone(),
                 });
             }
             _ => {}
@@ -2373,7 +2393,7 @@ where
 }
 
 fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V, O>(
-    condition_op: &ConditionOperation<V, O, ArrayType>,
+    condition_op: &ConditionOperation<ArrayType, V, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2407,7 +2427,7 @@ where
 }
 
 fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
-    while_op: &WhileOperation<V, O, ArrayType>,
+    while_op: &WhileOperation<ArrayType, V, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
@@ -2858,26 +2878,26 @@ fn operand_form_scan_body<V, C, Extension, O>(
     body: &Program<
         ArrayType,
         V,
-        LinearArrayOperation<V, C, ArrayType, Extension, ResidualFactor<ArrayType, V>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
         Vec<V>,
         Vec<V>,
     >,
     residual_slice_types: &[ArrayType],
-) -> Result<Program<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, V, O>, Vec<V>, Vec<V>>, LoweringError>
+) -> Result<Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, V, O>, Vec<V>, Vec<V>>, LoweringError>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     O: Clone
         + Operation<ArrayType>
-        + SupportsMul<ArrayType>
-        + SupportsDot<ArrayType>
-        + SupportsSelect<ArrayType>
-        + SupportsDynamicSlice<ArrayType>
-        + SupportsDynamicUpdateSlice<ArrayType>
-        + SupportsConcatenate<ArrayType>,
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ConcatenateOperation>,
 {
-    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, ArrayType, Extension, V, O>>::new();
+    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, V, O>>::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
     let body_input_types = body.input_types();
     for (body_atom, input_type) in body.input_ids().iter().zip(body_input_types.iter()) {
@@ -2905,8 +2925,8 @@ where
             DefactorizedOperation::Operation { operation, inputs } => {
                 let operation = operation
                     .try_map_factors_preserving_extensions(&mut |factor| match factor {
-                        ResidualFactor::Constant(value) => Ok(value.clone()),
-                        ResidualFactor::Reference { index, .. } => Err(ProgramError::MalformedProgram(format!(
+                        CapturedFactor::Constant(value) => Ok(value.clone()),
+                        CapturedFactor::Reference { index, .. } => Err(ProgramError::MalformedProgram(format!(
                             "scan body defactorization left residual reference {index} in operand form",
                         ))),
                     })
@@ -3695,14 +3715,14 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             let constant_value = lower_captured_constant(constant.value(), captured_values)?;
             Ok(vec![constant_value])
         }
-        XlaOperation::Add => {
+        XlaOperation::Add(_) => {
             let result =
                 lowerer
                     .block
                     .append_operation(stable_hlo::add(input_values[0], input_values[1], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.add should return one result").as_ref()])
         }
-        XlaOperation::Sub => {
+        XlaOperation::Sub(_) => {
             let result = lowerer.block.append_operation(stable_hlo::subtract(
                 input_values[0],
                 input_values[1],
@@ -3710,7 +3730,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.subtract should return one result").as_ref()])
         }
-        XlaOperation::Mul => {
+        XlaOperation::Mul(_) => {
             let result = lowerer.block.append_operation(stable_hlo::multiply(
                 input_values[0],
                 input_values[1],
@@ -3718,7 +3738,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
-        XlaOperation::Div => {
+        XlaOperation::Div(_) => {
             let result = lowerer.block.append_operation(stable_hlo::divide(
                 input_values[0],
                 input_values[1],
@@ -3726,11 +3746,11 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.divide should return one result").as_ref()])
         }
-        XlaOperation::Neg => {
+        XlaOperation::Neg(_) => {
             let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
         }
-        XlaOperation::Sin => {
+        XlaOperation::Sin(_) => {
             let result = lowerer.block.append_operation(stable_hlo::sine(
                 input_values[0],
                 Accuracy::Default,
@@ -3738,7 +3758,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
         }
-        XlaOperation::Cos => {
+        XlaOperation::Cos(_) => {
             let result = lowerer.block.append_operation(stable_hlo::cosine(
                 input_values[0],
                 Accuracy::Default,
@@ -3748,7 +3768,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         }
         // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
         // forward the operand without emitting any MLIR operation (matching JAX's lowering).
-        XlaOperation::StopGradient => {
+        XlaOperation::StopGradient(_) => {
             if input_values.len() != 1 {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             }
@@ -3788,14 +3808,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             false,
             lowerer.nested_functions.as_ref(),
         ),
-        XlaOperation::ZeroLike => {
+        XlaOperation::ZeroLike(_) => {
             lower_like_constant(input_values, output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
         }
-        XlaOperation::OneLike => {
+        XlaOperation::OneLike(_) => {
             lower_like_constant(input_values, output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
         }
-        XlaOperation::Dot { dimensions, .. } => {
+        XlaOperation::Dot(operation) => {
             // The requested output sharding has already been folded into `output_types[0]` by type inference.
+            let dimensions = operation.dimensions();
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let dimensions_attribute = lowerer.context.stable_hlo_dot_dimensions(
                 dimensions.lhs_batching_dimensions(),
@@ -3814,15 +3835,16 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
         }
-        XlaOperation::Transpose { permutation } => {
+        XlaOperation::Transpose(operation) => {
             let result = lowerer.block.append_operation(stable_hlo::transpose(
                 input_values[0],
-                permutation.as_slice(),
+                operation.permutation(),
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
         }
-        XlaOperation::Scale { factor } => {
+        XlaOperation::Scale(operation) => {
+            let factor = operation.factor();
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let factor_value = lower_constant(
                 AtomId::new(0),
@@ -3865,7 +3887,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?;
             Ok(vec![constant_value])
         }
-        XlaOperation::Reshape { .. } => {
+        XlaOperation::Reshape(_) => {
             check_count!("output", output_types, 1, ProgramError);
             let output_type = &output_types[0];
             let output_shape = static_dimensions(output_type)?;
@@ -3876,25 +3898,28 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.reshape should return one result").as_ref()])
         }
-        XlaOperation::Reshard { sharding } | XlaOperation::ShardingConstraint { sharding } => {
-            lower_sharding_constraint(input_values, sharding, &mut lowerer.block, lowerer.location)
+        XlaOperation::Reshard(operation) => {
+            lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
         }
-        XlaOperation::Broadcast { output_axes, .. } => {
+        XlaOperation::ShardingConstraint(operation) => {
+            lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
+        }
+        XlaOperation::Broadcast(operation) => {
             check_count!("output", output_types, 1, ProgramError);
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
             let result = lowerer.block.append_operation(stable_hlo::broadcast(
                 input_values[0],
                 output_tensor_type,
-                output_axes.as_slice(),
+                operation.output_axes(),
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref()])
         }
-        XlaOperation::Reduce { axes, kind, .. } => {
+        XlaOperation::Reduce(operation) => {
             check_count!("output", output_types, 1, ProgramError);
             let value = lower_reduce_to_mlir(
-                *kind,
-                axes.as_slice(),
+                operation.kind(),
+                operation.axes(),
                 input_values[0],
                 &output_types[0],
                 &mut lowerer.block,
@@ -3903,9 +3928,9 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?;
             Ok(vec![value])
         }
-        XlaOperation::Compare { direction } => {
+        XlaOperation::Compare(operation) => {
             let value = lower_compare_to_mlir(
-                *direction,
+                operation.direction(),
                 input_values[0],
                 input_values[1],
                 &mut lowerer.block,
@@ -3913,36 +3938,36 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?;
             Ok(vec![value])
         }
-        XlaOperation::Not => {
+        XlaOperation::Not(_) => {
             let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
         }
-        XlaOperation::And => {
+        XlaOperation::And(_) => {
             let result =
                 lowerer
                     .block
                     .append_operation(stable_hlo::and(input_values[0], input_values[1], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
         }
-        XlaOperation::Or => {
+        XlaOperation::Or(_) => {
             let result =
                 lowerer
                     .block
                     .append_operation(stable_hlo::or(input_values[0], input_values[1], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
         }
-        XlaOperation::Xor => {
+        XlaOperation::Xor(_) => {
             let result =
                 lowerer
                     .block
                     .append_operation(stable_hlo::xor(input_values[0], input_values[1], lowerer.location)?)?;
             Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
         }
-        XlaOperation::Collective { .. } => {
+        XlaOperation::Collective(_) => {
             check_count!("input", input_values, 1, ProgramError);
             Ok(vec![input_values[0]])
         }
-        XlaOperation::Select => {
+        XlaOperation::Select(_) => {
             let result = lowerer.block.append_operation(stable_hlo::select(
                 input_values[0],
                 input_values[1],
@@ -3951,19 +3976,19 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
         }
-        XlaOperation::Slice { start_indices, limit_indices, strides } => {
+        XlaOperation::Slice(operation) => {
             let result = lowerer.block.append_operation(stable_hlo::slice(
                 input_values[0],
-                start_indices.as_slice(),
-                limit_indices.as_slice(),
-                strides.as_slice(),
+                operation.start_indices(),
+                operation.limit_indices(),
+                operation.strides(),
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
         }
-        XlaOperation::UpdateSlice { start_indices } => {
+        XlaOperation::UpdateSlice(operation) => {
             let index_values = lower_static_index_constants(
-                start_indices.as_slice(),
+                operation.start_indices(),
                 &mut lowerer.block,
                 lowerer.context,
                 lowerer.location,
@@ -3976,16 +4001,16 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
         }
-        XlaOperation::DynamicSlice { sizes } => {
+        XlaOperation::DynamicSlice(operation) => {
             let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
                 input_values[0],
                 &input_values[1..],
-                sizes.as_slice(),
+                operation.sizes(),
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
         }
-        XlaOperation::DynamicUpdateSlice => {
+        XlaOperation::DynamicUpdateSlice(_) => {
             let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
                 input_values[0],
                 input_values[1],
@@ -3994,23 +4019,28 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
         }
-        XlaOperation::Pad { edge_padding_low, edge_padding_high, interior_padding } => {
-            let edge_padding_low: Vec<i64> = edge_padding_low.iter().map(|&padding| padding as i64).collect();
-            let edge_padding_high: Vec<i64> = edge_padding_high.iter().map(|&padding| padding as i64).collect();
+        XlaOperation::Pad(operation) => {
+            let edge_padding_low: Vec<i64> =
+                operation.edge_padding_low().iter().map(|&padding| padding as i64).collect();
+            let edge_padding_high: Vec<i64> =
+                operation.edge_padding_high().iter().map(|&padding| padding as i64).collect();
             let result = lowerer.block.append_operation(stable_hlo::pad(
                 input_values[0],
                 input_values[1],
                 edge_padding_low.as_slice(),
                 edge_padding_high.as_slice(),
-                interior_padding.as_slice(),
+                operation.interior_padding(),
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
         }
-        XlaOperation::Concatenate { axis } => {
+        XlaOperation::Concatenate(operation) => {
             reject_dynamic_concatenate_output(output_types)?;
-            let result =
-                lowerer.block.append_operation(stable_hlo::concatenate(input_values, *axis, lowerer.location)?)?;
+            let result = lowerer.block.append_operation(stable_hlo::concatenate(
+                input_values,
+                operation.axis(),
+                lowerer.location,
+            )?)?;
             Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
         }
         XlaOperation::Gather(operation) => lower_gather_to_mlir(
@@ -4729,15 +4759,22 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::operations::constants::{OneLike, OneOperation, ZeroLike};
-    use ryft_core::operations::manipulation::Transpose;
+    use ryft_core::operations::compare::CompareOperation;
+    use ryft_core::operations::constants::{OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation};
+    use ryft_core::operations::manipulation::{
+        ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, PadOperation, SliceOperation,
+        Transpose, UpdateSliceOperation,
+    };
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tests::{TestArray, TestArrayDomain};
     use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::DifferentiationContext;
+    use ryft_core::tracing_v2::operations::captures::MaterializeCapturedFactorOperation;
+    use ryft_core::tracing_v2::operations::control_flow::LinearOperandConditionOperation;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+    use ryft_core::tracing_v2::operations::scan::LinearScanOperation;
     use ryft_core::types::{Shape, Size};
     #[cfg(feature = "ndarray")]
     use ryft_ndarray::{Array as NdArrayValue, NdArrayDomain};
@@ -4810,7 +4847,7 @@ mod tests {
     fn xla_neg_branch(input_type: ArrayType) -> FlatXlaProgram {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(XlaOperation::Neg, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(NegOperation, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -4827,7 +4864,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
         let capture = builder.add_constant(XlaConstant::new(0, array_type.clone()));
-        let output = builder.add_instruction(XlaOperation::Add, vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![input, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -4857,7 +4894,7 @@ mod tests {
     fn xla_add_self_callee(input_type: ArrayType) -> std::rc::Rc<FlatXlaProgram> {
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let output = builder.add_instruction(XlaOperation::Add, vec![input, input]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![input, input]).unwrap()[0];
         std::rc::Rc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
@@ -4879,7 +4916,7 @@ mod tests {
             let call_output = builder.add_instruction(xla_jit_call(callee), vec![input]).unwrap()[0];
             accumulator = Some(match accumulator {
                 None => call_output,
-                Some(previous) => builder.add_instruction(XlaOperation::Add, vec![previous, call_output]).unwrap()[0],
+                Some(previous) => builder.add_instruction(AddOperation, vec![previous, call_output]).unwrap()[0],
             });
         }
         let program = builder
@@ -5255,8 +5292,8 @@ mod tests {
         // body.
         use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
         use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
-        type CoreTestOperation = CoreArrayOperation<TestArray, ArrayType>;
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type CoreTestOperation = CoreArrayOperation<ArrayType, TestArray>;
+        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         // Extended condition over the doubled state `[primal, tangent]`: recomputes `primal > 0` from the primal
@@ -5266,13 +5303,16 @@ mod tests {
         let condition_primal = condition_builder.add_input(scalar_f64.clone());
         let _condition_tangent = condition_builder.add_input(scalar_f64.clone());
         let condition_zero = condition_builder
-            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::ZeroLike), vec![condition_primal])
+            .add_instruction(
+                DirectLinearOperation::Recompute(CoreTestOperation::ZeroLike(ZeroLikeOperation)),
+                vec![condition_primal],
+            )
             .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::Compare {
-                    direction: ComparisonDirection::GreaterThan,
-                }),
+                DirectLinearOperation::Recompute(CoreTestOperation::Compare(CompareOperation::new(
+                    ComparisonDirection::GreaterThan,
+                ))),
                 vec![condition_primal, condition_zero],
             )
             .unwrap()[0];
@@ -5286,13 +5326,22 @@ mod tests {
         let body_primal = body_builder.add_input(scalar_f64.clone());
         let body_tangent = body_builder.add_input(scalar_f64.clone());
         let one = body_builder
-            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::OneLike), vec![body_primal])
+            .add_instruction(
+                DirectLinearOperation::Recompute(CoreTestOperation::OneLike(OneLikeOperation)),
+                vec![body_primal],
+            )
             .unwrap()[0];
         let next_primal = body_builder
-            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::Sub), vec![body_primal, one])
+            .add_instruction(
+                DirectLinearOperation::Recompute(CoreTestOperation::Sub(SubOperation)),
+                vec![body_primal, one],
+            )
             .unwrap()[0];
         let next_tangent = body_builder
-            .add_instruction(DirectLinearOperation::Recompute(CoreTestOperation::Mul), vec![body_primal, body_tangent])
+            .add_instruction(
+                DirectLinearOperation::Recompute(CoreTestOperation::Mul(MulOperation)),
+                vec![body_primal, body_tangent],
+            )
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
@@ -5302,14 +5351,14 @@ mod tests {
             )
             .unwrap();
         let fused_while =
-            CoreWhileOperation::<TestArray, DirectLinearOperation, ArrayType>::new(condition, body).unwrap();
+            CoreWhileOperation::<ArrayType, TestArray, DirectLinearOperation>::new(condition, body).unwrap();
 
         // Tangent program: a nullary residual injection feeds the loop-entry primal state and the fused loop runs
         // over `[primal, tangent]`, returning the final tangent half.
         let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
         let tangent_input = builder.add_input(scalar_f64.clone());
         let primal_entry = builder
-            .add_instruction(DirectLinearOperation::Residual { factor: TestArray::scalar(2.0) }, vec![])
+            .add_instruction(MaterializeCapturedFactorOperation::new(TestArray::scalar(2.0)), vec![])
             .unwrap()[0];
         let while_outputs = builder
             .add_instruction(DirectLinearOperation::While(Box::new(fused_while)), vec![primal_entry, tangent_input])
@@ -5334,8 +5383,8 @@ mod tests {
         // operand with the branch programs inlined as regions, mirroring the factor-form lowering minus the
         // materialized predicate literal.
         use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
-        type CoreTestOperation = CoreArrayOperation<TestArray, ArrayType>;
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type CoreTestOperation = CoreArrayOperation<ArrayType, TestArray>;
+        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
 
         let scalar_boolean = ArrayType::scalar(DataType::Boolean);
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -5347,7 +5396,7 @@ mod tests {
         let true_forwarded = true_builder.add_input(scalar_f64.clone());
         let product = true_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::Mul),
+                DirectLinearOperation::Recompute(CoreTestOperation::Mul(MulOperation)),
                 vec![true_forwarded, true_tangent],
             )
             .unwrap()[0];
@@ -5359,7 +5408,7 @@ mod tests {
         let false_tangent = false_builder.add_input(scalar_f64.clone());
         let _false_forwarded = false_builder.add_input(scalar_f64.clone());
         let doubled = false_builder
-            .add_instruction(DirectLinearOperation::Scale { factor: TestArray::scalar(2.0) }, vec![false_tangent])
+            .add_instruction(ScaleOperation::new(TestArray::scalar(2.0)), vec![false_tangent])
             .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -5371,10 +5420,7 @@ mod tests {
         let forwarded = builder.add_input(scalar_f64);
         let output = builder
             .add_instruction(
-                DirectLinearOperation::OperandCondition {
-                    true_branch: Box::new(true_branch),
-                    false_branch: Box::new(false_branch),
-                },
+                LinearOperandConditionOperation::new(Box::new(true_branch), Box::new(false_branch)),
                 vec![predicate, tangent, forwarded],
             )
             .unwrap()[0];
@@ -5404,7 +5450,7 @@ mod tests {
         let mut body_builder = XlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
-        let product = body_builder.add_instruction(XlaOperation::Mul, vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
@@ -5447,7 +5493,7 @@ mod tests {
         let mut body_builder = XlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
-        let product = body_builder.add_instruction(XlaOperation::Mul, vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
@@ -5490,7 +5536,7 @@ mod tests {
         let mut body_builder = XlaProgramBuilder::new();
         let carry = body_builder.add_input(scalar_f32.clone());
         let x = body_builder.add_input(scalar_f32.clone());
-        let product = body_builder.add_instruction(XlaOperation::Mul, vec![carry, x]).unwrap()[0];
+        let product = body_builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
@@ -5531,14 +5577,14 @@ mod tests {
         use std::convert::Infallible;
 
         use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, ArrayType>;
+        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
         type ScanBodyOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
             ArrayType,
+            TestArray,
+            TestArray,
             Infallible,
-            ResidualFactor<ArrayType, TestArray>,
-            CoreArrayOperation<TestArray, ArrayType>,
+            CapturedFactor<ArrayType, TestArray>,
+            CoreArrayOperation<ArrayType, TestArray>,
         >;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -5548,11 +5594,11 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScanBodyOperation::Scale { factor: ResidualFactor::Reference { index: 0, r#type: scalar_f64.clone() } },
+                ScaleOperation::new(CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
                 vec![tangent_carry],
             )
             .unwrap()[0];
-        let summed = body_builder.add_instruction(ScanBodyOperation::Add, vec![scaled, tangent_x]).unwrap()[0];
+        let summed = body_builder.add_instruction(AddOperation, vec![scaled, tangent_x]).unwrap()[0];
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(
                 vec![summed, summed],
@@ -5566,14 +5612,7 @@ mod tests {
         let tangent_xs = builder.add_input(stacked_f64);
         let outputs = builder
             .add_instruction(
-                DirectLinearOperation::Scan {
-                    body: Box::new(body),
-                    residual_stacks: vec![TestArray::vector(vec![2.0, 3.0, 4.0])],
-                    carry_count: 1,
-                    length: 3,
-                    reverse: true,
-                    unroll: 1,
-                },
+                LinearScanOperation::new(Box::new(body), vec![TestArray::vector(vec![2.0, 3.0, 4.0])], 1, 3, true, 1),
                 vec![tangent_init, tangent_xs],
             )
             .unwrap()
@@ -5627,7 +5666,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                ryft_core::tracing_v2::ArrayOperation<ArrayType, TestArray>,
                 (TestArray, TestArray),
                 TestArray,
             >,
@@ -5661,7 +5700,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                ryft_core::tracing_v2::ArrayOperation<ArrayType, TestArray>,
                 TestArray,
                 TestArray,
             >,
@@ -5701,20 +5740,14 @@ mod tests {
         let index_0 = builder.add_input(index_type.clone());
         let index_1 = builder.add_input(index_type);
         let sliced = builder
-            .add_instruction(
-                XlaOperation::Slice { start_indices: vec![1, 1], limit_indices: vec![2, 3], strides: vec![1, 1] },
-                vec![input],
-            )
+            .add_instruction(SliceOperation::new(vec![1, 1], vec![2, 3]).with_strides(vec![1, 1]).unwrap(), vec![input])
             .unwrap()[0];
-        let updated = builder
-            .add_instruction(XlaOperation::UpdateSlice { start_indices: vec![0, 1] }, vec![input, update])
-            .unwrap()[0];
+        let updated = builder.add_instruction(UpdateSliceOperation::new(vec![0, 1]), vec![input, update]).unwrap()[0];
         let dynamic_sliced = builder
-            .add_instruction(XlaOperation::DynamicSlice { sizes: vec![1, 2] }, vec![input, index_0, index_1])
+            .add_instruction(DynamicSliceOperation::new(vec![1, 2]), vec![input, index_0, index_1])
             .unwrap()[0];
-        let dynamic_updated = builder
-            .add_instruction(XlaOperation::DynamicUpdateSlice, vec![input, update, index_0, index_1])
-            .unwrap()[0];
+        let dynamic_updated =
+            builder.add_instruction(DynamicUpdateSliceOperation, vec![input, update, index_0, index_1]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![sliced, updated, dynamic_sliced, dynamic_updated],
@@ -5750,7 +5783,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let first = builder.add_input(first_type);
         let second = builder.add_input(second_type);
-        let joined = builder.add_instruction(XlaOperation::Concatenate { axis: 0 }, vec![first, second]).unwrap()[0];
+        let joined = builder.add_instruction(ConcatenateOperation::new(0), vec![first, second]).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, XlaConstant>(vec![joined], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
@@ -5778,16 +5811,10 @@ mod tests {
         let pad_input = builder.add_input(pad_input_type);
         let padding_value = builder.add_input(padding_value_type);
         let strided = builder
-            .add_instruction(
-                XlaOperation::Slice { start_indices: vec![1], limit_indices: vec![6], strides: vec![2] },
-                vec![vector],
-            )
+            .add_instruction(SliceOperation::new(vec![1], vec![6]).with_strides(vec![2]).unwrap(), vec![vector])
             .unwrap()[0];
         let padded = builder
-            .add_instruction(
-                XlaOperation::Pad { edge_padding_low: vec![1], edge_padding_high: vec![2], interior_padding: vec![1] },
-                vec![pad_input, padding_value],
-            )
+            .add_instruction(PadOperation::new(vec![1], vec![2], vec![1]).unwrap(), vec![pad_input, padding_value])
             .unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -5820,13 +5847,15 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
             TestArray,
             TestArray,
         >;
 
         // The static slice pullback writes the cotangent into a zero array at the static offsets via the
         // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
+        // The structural-zero destination is emitted as a `ZeroOperation` instruction in the pullback, which lowers
+        // through the canonical zero path to a scalar constant broadcast to the array shape.
         let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
             .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
@@ -5836,10 +5865,11 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2xf64>) -> tensor<4xf64> {
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<4xf64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
                     %c = stablehlo.constant dense<1> : tensor<i64>
-                    %0 = stablehlo.dynamic_update_slice %cst, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i64>) -> tensor<4xf64>
-                    return %0 : tensor<4xf64>
+                    %1 = stablehlo.dynamic_update_slice %0, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i64>) -> tensor<4xf64>
+                    return %1 : tensor<4xf64>
                   }
                 }
             "#}
@@ -5869,7 +5899,7 @@ mod tests {
         type TestPadPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
             TestArray,
             (TestArray, TestArray),
         >;
@@ -5917,10 +5947,11 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2xf64>) -> tensor<4xf64> {
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<4xf64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
                     %c = stablehlo.constant dense<1> : tensor<i32>
-                    %0 = stablehlo.dynamic_update_slice %cst, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
-                    return %0 : tensor<4xf64>
+                    %1 = stablehlo.dynamic_update_slice %0, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
+                    return %1 : tensor<4xf64>
                   }
                 }
             "#}
@@ -5935,7 +5966,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+                ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
                 TestArray,
                 (TestArray, TestArray),
             >,
@@ -5959,7 +5990,7 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
             TestArray,
             TestArray,
         >;
@@ -6041,7 +6072,7 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, ArrayType>,
+            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
             TestArray,
             TestArray,
         >;
@@ -6065,7 +6096,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::ArrayOperation<TestArray, ArrayType>,
+                ryft_core::tracing_v2::ArrayOperation<ArrayType, TestArray>,
                 (TestArray, TestArray),
                 (TestArray, TestArray),
             >,
@@ -6101,7 +6132,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 NdArrayValue<f64>,
-                ryft_core::tracing_v2::LinearArrayOperation<NdArrayValue<f64>, NdArrayValue<f64>, ArrayType>,
+                ryft_core::tracing_v2::LinearArrayOperation<ArrayType, NdArrayValue<f64>, NdArrayValue<f64>>,
                 NdArrayValue<f64>,
                 (NdArrayValue<f64>, NdArrayValue<f64>),
             >,

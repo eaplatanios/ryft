@@ -11,7 +11,6 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 
 // TODO(eaplatanios): Review from here onwards.
 
-// TODO(eaplatanios): Re-order generic parameters to `T, V, O` here and elsewhere.
 /// [`Operation`] that evaluates one of two nested branch [`Program`]s depending on a Boolean predicate that is always
 /// supplied as the first operation input (a scalar Boolean operand). The remaining operation inputs are forwarded to
 /// the selected branch, and so both branches must consume the same input types and produce the same output types.
@@ -27,7 +26,7 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 /// helpers) and reconstructed later as needed. The operation itself only needs the ordered parameter signature for
 /// type checking, interpretation, batching, differentiation, transposition, and other transforms.
 #[derive(Clone, Debug)]
-pub struct ConditionOperation<V: Value<T>, O, T: Type> {
+pub struct ConditionOperation<T: Type, V: Value<T>, O> {
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     pub(crate) true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
 
@@ -35,7 +34,7 @@ pub struct ConditionOperation<V: Value<T>, O, T: Type> {
     pub(crate) false_branch: Program<T, V, O, Vec<V>, Vec<V>>,
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, ArrayType> {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<ArrayType, V, O> {
     /// Creates a new [`ConditionOperation`] whose predicate is supplied as the first operation input. The predicate
     /// input is not described by the operation itself: it must simply be a scalar Boolean type, which
     /// [`Operation::infer_output_types`] validates structurally against the actual first operand type.
@@ -57,7 +56,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, O, Arra
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> ConditionOperation<T, V, O> {
     /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     #[inline]
     pub fn true_branch(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -77,7 +76,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ConditionOperation<V, O, T> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for ConditionOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for ConditionOperation<T, V, O>
 where
     Self: Operation<T>,
 {
@@ -86,7 +85,7 @@ where
     }
 }
 
-impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<V, O, T> {
+impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<T, V, O> {
     #[inline]
     fn name(&self) -> &'static str {
         CONDITION_OPERATION_NAME
@@ -112,7 +111,7 @@ impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for Condi
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<V, O, ArrayType>
+impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, V, O>
 where
     V: Value<ArrayType> + BooleanLike,
     O: InterpretableOperation<ArrayType, V>,

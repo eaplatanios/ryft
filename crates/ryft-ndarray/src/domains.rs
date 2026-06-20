@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
-use ryft_core::contexts::Context;
+use ryft_core::EagerContext;
+use ryft_core::contexts::{Context, ProvidesContext};
 use ryft_core::domains::Domain;
 use ryft_core::operations::InterpretableOperation;
 use ryft_core::programs::{ProgramError, Value};
@@ -42,8 +43,13 @@ impl<T: NdArrayElement> Context for NdArrayDomain<T> {
         Ok(constant)
     }
 
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-        operation.interpret(inputs)
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
+        operation.interpret(&EagerContext::new(), inputs)
     }
 }
 
@@ -54,6 +60,13 @@ impl<T: NdArrayElement> DifferentiationContext for NdArrayDomain<T> {
     #[inline]
     fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
         Array::zeros(array_type).map_err(array_error_to_tracing_error)
+    }
+}
+
+impl<T: NdArrayElement> ProvidesContext<<Array<T> as Value<ArrayType>>::InterpretationContext> for NdArrayDomain<T> {
+    #[inline]
+    fn context(&self) -> <Array<T> as Value<ArrayType>>::InterpretationContext {
+        EagerContext::new()
     }
 }
 
@@ -85,8 +98,13 @@ impl<T: NdArrayElement> Context for NdArrayLinearDomain<T> {
         Ok(constant)
     }
 
-    fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> Result<Vec<Self::Value>, ProgramError> {
-        operation.interpret(inputs)
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        let operation = operation.into();
+        operation.interpret(&EagerContext::new(), inputs)
     }
 }
 
@@ -101,7 +119,7 @@ mod tests {
     use ryft_core::contexts::Context;
     use ryft_core::operations::Operation;
     use ryft_core::operations::arithmetic::ADD_OPERATION_NAME;
-    use ryft_core::operations::constants::{SupportsOne, SupportsZero};
+    use ryft_core::operations::constants::{OneOperation, ZeroOperation};
     use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::tracing_v2::{DifferentiableDomainExtension, DifferentiationContext, DifferentiationError, Sin};
@@ -117,8 +135,8 @@ mod tests {
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]));
         let scalar_type = ArrayType::new(DataType::F64, Shape::new(vec![]));
 
-        let zero = domain.bind(SupportsZero::zero_operation(array_type), &[]).unwrap().into_iter().next().unwrap();
-        let one = domain.bind(SupportsOne::one_operation(scalar_type), &[]).unwrap().into_iter().next().unwrap();
+        let zero = domain.bind(ZeroOperation::new(array_type), &[]).unwrap().into_iter().next().unwrap();
+        let one = domain.bind(OneOperation::new(scalar_type), &[]).unwrap().into_iter().next().unwrap();
 
         assert_eq!(zero.as_ndarray().iter().copied().collect::<Vec<_>>(), vec![0.0, 0.0, 0.0, 0.0]);
         assert_eq!(one.as_ndarray().iter().copied().collect::<Vec<_>>(), vec![1.0]);
@@ -129,7 +147,7 @@ mod tests {
         let domain = NdArrayDomain::<f64>::new();
         let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
 
-        let error = domain.bind(SupportsZero::zero_operation(array_type), &[]).unwrap_err();
+        let error = domain.bind(ZeroOperation::new(array_type), &[]).unwrap_err();
 
         assert_eq!(error.to_string(), "ndarray backend requires static shape dimensions, but dimension #0 is *");
     }

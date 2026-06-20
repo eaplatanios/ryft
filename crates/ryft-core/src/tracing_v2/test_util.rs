@@ -132,7 +132,7 @@ mod tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![body_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let while_op = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+        let while_op = WhileOperation::<ArrayType, TestArray, TestOp>::new(condition, body).unwrap();
         let context = EagerContext::<ArrayType, TestArray, TestOp>::new();
 
         let initial_state = ArrayBatch::mapped(TestArray::vector(vec![3.0, 1.0, 2.0]), 0).unwrap();
@@ -735,7 +735,7 @@ mod tests {
 
     /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests.
     fn doubling_while_operation()
-    -> crate::operations::control_flow::WhileOperation<TestArray, ArrayOperation<ArrayType, TestArray>, ArrayType> {
+    -> crate::operations::control_flow::WhileOperation<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>> {
         use crate::operations::compare::ComparisonDirection;
         type TestOp = ArrayOperation<ArrayType, TestArray>;
 
@@ -850,7 +850,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let while_operation = WhileOperation::<TestArray, TestOp, ArrayType>::new(condition, body).unwrap();
+        let while_operation = WhileOperation::<ArrayType, TestArray, TestOp>::new(condition, body).unwrap();
 
         let ((counter_primal, value_primal), pushforward) = TestArrayDomain
             .linearize(
@@ -988,7 +988,7 @@ mod tests {
     /// used by the scan differentiation tests, optionally visiting the lanes in reverse order.
     fn product_scan_operation(
         reverse: bool,
-    ) -> crate::operations::control_flow::ScanOperation<TestArray, ArrayOperation<ArrayType, TestArray>, ArrayType>
+    ) -> crate::operations::control_flow::ScanOperation<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>
     {
         type TestOp = ArrayOperation<ArrayType, TestArray>;
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();

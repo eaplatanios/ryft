@@ -1,15 +1,17 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
+use ryft_core::EagerContext;
 use ryft_core::operations::BooleanLike;
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use ryft_core::operations::control_flow::Select;
+use ryft_core::operations::control_flow::{Select, SelectCondition};
 use ryft_core::operations::manipulation::{
     Broadcast, Concatenate, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice,
     DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter, ScatterOperation,
@@ -433,7 +435,14 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Value<ArrayType> for Array<T> {}
+impl<T: NdArrayElement> Value<ArrayType> for Array<T> {
+    type InterpretationContext = EagerContext<ArrayType, Self, Infallible>;
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+        Some(EagerContext::new())
+    }
+}
 
 impl<T: NdArrayElement> ryft_core::tracing_v2::RematerializationName for Array<T> {
     #[inline]
@@ -727,11 +736,23 @@ impl<T: NdArrayElement> Select for Array<T> {
     }
 }
 
+impl<T: NdArrayElement> SelectCondition for Array<T> {
+    // The condition is a same-typed array whose elements are interpreted as in-band Booleans, so it is its own
+    // [`Select`] condition (matching `Condition = Self` above).
+    type Condition = Self;
+
+    #[inline]
+    fn select_condition(&self) -> Result<Self, ProgramError> {
+        Ok(self.clone())
+    }
+}
+
 impl<T: NdArrayElement> Transpose for Array<T> {
-    fn transpose(&self, permutation: Vec<usize>) -> Result<Self, ProgramError> {
+    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         // Validate the permutation via the type-level rule before indexing the payload, so an out-of-range or
         // duplicated axis is a clean error rather than an out-of-bounds panic.
-        self.r#type().transpose(permutation.clone())?;
+        let permutation = permutation.as_ref();
+        self.r#type().transpose(permutation)?;
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
@@ -919,8 +940,7 @@ impl<T: NdArrayElement> Pad for Array<T> {
     ) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let padding_value_type = padding_value.r#type().into_owned();
-        let output_type =
-            input_type.pad(&padding_value_type, edge_padding_low, edge_padding_high, interior_padding)?;
+        let output_type = input_type.pad(&padding_value_type, edge_padding_low, edge_padding_high, interior_padding)?;
         let input_shape = StaticShape::new(self.values.shape().to_vec());
         let output_shape = static_shape(output_type.shape()).map_err(array_error_to_tracing_error)?;
         let output_strides = StaticShape::new(output_shape.clone()).row_major_strides();
@@ -1180,12 +1200,8 @@ impl<T: NdArrayElement> DynamicSlice for Array<T> {
         let index_types = vec![ArrayType::scalar(DataType::I64); start_indices.len()];
         self.r#type().dynamic_slice(&index_types, sizes)?;
         let input_shape = self.values.shape().to_vec();
-        let starts = Self::clamped_start_indices(
-            DYNAMIC_SLICE_OPERATION_NAME,
-            start_indices,
-            input_shape.as_slice(),
-            sizes,
-        )?;
+        let starts =
+            Self::clamped_start_indices(DYNAMIC_SLICE_OPERATION_NAME, start_indices, input_shape.as_slice(), sizes)?;
         let unit_strides = vec![1; sizes.len()];
         Ok(self.copy_block(starts.as_slice(), unit_strides.as_slice(), sizes))
     }
@@ -1424,9 +1440,7 @@ mod tests {
     use ryft_core::differentiation::{Cotangent, TransposableOperation};
     use ryft_core::domains::AbstractDomain;
     use ryft_core::operations::BooleanLike;
-    use ryft_core::operations::manipulation::Reshape;
-    use ryft_core::operations::manipulation::ReshapeOperation;
-    use ryft_core::operations::manipulation::Transpose;
+    use ryft_core::operations::manipulation::{Reshape, ReshapeOperation, Transpose};
     use ryft_core::parameters::Placeholder;
     use ryft_core::programs::ProgramBuilder;
     use ryft_core::tracing::{AbstractTracingContext, TracingContext};
@@ -1584,11 +1598,9 @@ mod tests {
 
         // Dynamic slicing extracts in-band scalar start indices and clamps out-of-bounds values per StableHLO
         // semantics.
-        let dynamic_sliced =
-            input.dynamic_slice(&[Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
+        let dynamic_sliced = input.dynamic_slice(&[Array::scalar(5.0), Array::scalar(-2.0)], &[1, 2]).unwrap();
         assert_eq!(dynamic_sliced.as_ndarray(), &arr2(&[[4.0, 5.0]]).into_dyn());
-        let dynamic_updated =
-            input.dynamic_update_slice(&update, &[Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
+        let dynamic_updated = input.dynamic_update_slice(&update, &[Array::scalar(0.0), Array::scalar(1.0)]).unwrap();
         assert_eq!(dynamic_updated.as_ndarray(), &arr2(&[[1.0, 8.0, 9.0], [4.0, 5.0, 6.0]]).into_dyn());
 
         // Kernel validation surfaces the canonical error messages.
@@ -1625,7 +1637,10 @@ mod tests {
 
         // Kernel validation surfaces the canonical error messages.
         assert_eq!(
-            input.pad(&Array::from_shape_vec([1], vec![0.0]).unwrap(), &[1], &[2], &[1]).unwrap_err().to_string(),
+            input
+                .pad(&Array::from_shape_vec([1], vec![0.0]).unwrap(), &[1], &[2], &[1])
+                .unwrap_err()
+                .to_string(),
             "pad padding value must be a scalar but has type f64[1]",
         );
     }

@@ -43,7 +43,7 @@ pub const WHILE_OPERATION_NAME: &'static str = "while";
 ///     stack exists, so the rule stages a doubled-state linear loop that recomputes its residuals forward; that loop
 ///     rejects transposition, exactly like JAX's `while_loop`.
 #[derive(Clone, Debug)]
-pub struct WhileOperation<V, O, T>
+pub struct WhileOperation<T, V, O>
 where
     T: Type,
     V: Value<T>,
@@ -60,7 +60,7 @@ where
     pub(crate) iteration_bound: Option<usize>,
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayType> {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<ArrayType, V, O> {
     /// Creates a new [`WhileOperation`] with the provided condition and body programs.
     ///
     /// # Parameters
@@ -97,7 +97,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<V, O, ArrayTyp
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O> {
     /// Returns the condition [`Program`] of this [`WhileOperation`] that is evaluated before each loop iteration.
     #[inline]
     pub fn condition(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -143,7 +143,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<V, O, T> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for WhileOperation<V, O, T>
+impl<T: Type, V: Value<T>, O> Display for WhileOperation<T, V, O>
 where
     Self: Operation<T>,
 {
@@ -152,7 +152,7 @@ where
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O, T> {
+impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<T, V, O> {
     #[inline]
     fn name(&self) -> &'static str {
         WHILE_OPERATION_NAME
@@ -176,7 +176,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<V, O
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<V, O, ArrayType>
+impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<ArrayType, V, O>
 where
     V: Value<ArrayType> + BooleanLike,
     O: InterpretableOperation<ArrayType, V>,

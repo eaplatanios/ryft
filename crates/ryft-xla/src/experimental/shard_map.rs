@@ -11,9 +11,10 @@ use ryft_mlir::dialects::shardy::{
 use thiserror::Error;
 
 use ryft_core::contexts::StagingContext;
+use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
-use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError, merge_axis_sets};
+use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use ryft_core::tracing::{Tracer, TracingContext};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
@@ -439,7 +440,9 @@ where
     Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
-    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| XlaOperation::Reshard { sharding })
+    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
+        XlaOperation::Reshard(ReshardOperation::new(sharding))
+    })
 }
 
 /// Records sharding-propagation hints on one traced XLA value tree over the mesh's
@@ -463,8 +466,8 @@ where
     Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
-    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| XlaOperation::ShardingConstraint {
-        sharding,
+    stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
+        XlaOperation::ShardingConstraint(ShardingConstraintOperation::new(sharding))
     })
 }
 
@@ -1223,10 +1226,10 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
             let global_shape = static_dimensions(&global_input_type, "input", input_index)?;
             let local_shape = shard_map.local_input_shape(input_index, &global_shape)?;
             let local_sharding = shard_map.in_shardings()[input_index].clone();
-            let local_varying_axes = merge_axis_sets(
-                &varying_axes(global_input_type.sharding()),
-                &spec_varying_axes(&local_sharding, &manual_axis_names),
-            );
+            let local_varying_axes = varying_axes(global_input_type.sharding())
+                .union(&spec_varying_axes(&local_sharding, &manual_axis_names))
+                .cloned()
+                .collect();
             Ok::<ArrayType, ShardMapTraceError>(
                 ArrayType::new(
                     global_input_type.data_type(),
@@ -1292,13 +1295,17 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
             let local_shape = static_dimensions(&local_output_type, "output", output_index)?;
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
-            let effective_local_varying_axes =
-                merge_axis_sets(&varying_axes(local_output_type.sharding()), &expected_current_varying_axes);
+            let effective_local_varying_axes: BTreeSet<String> = varying_axes(local_output_type.sharding())
+                .union(&expected_current_varying_axes)
+                .cloned()
+                .collect();
             if shard_map.check_vma() {
                 let local_unreduced_axes =
                     local_output_type.sharding().map(|sharding| sharding.unreduced_axes().clone()).unwrap_or_default();
-                let effective_local_unreduced_axes =
-                    merge_axis_sets(&local_unreduced_axes, output_sharding.unreduced_axes());
+                let effective_local_unreduced_axes = local_unreduced_axes
+                    .union(output_sharding.unreduced_axes())
+                    .cloned()
+                    .collect();
                 if !axes_match(&effective_local_unreduced_axes, output_sharding.unreduced_axes()) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",

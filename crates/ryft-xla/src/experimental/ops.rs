@@ -8,22 +8,29 @@ use ryft_core::contexts::StagingContext;
 use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
-use ryft_core::operations::constants::SupportsZero;
+use ryft_core::operations::constants::ZeroOperation;
 use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::Placeholder;
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
 use ryft_core::tracing_v2::{
-    ArrayOperation, DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer,
-    LinearArrayOperation, LinearOperationOf, ResidualFactor, TangentContext,
+    ArrayOperation, CapturedFactor, DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation,
+    JvpTracer, LinearArrayOperation, LinearOperationOf, TangentContext,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation};
 
-/// Backend-owned ordinary operations that extend the reusable core array operation set.
+/// Backend-owned ordinary operations that extend the reusable core array operation set: a call to a jitted XLA
+/// sub-program ([`JitCall`](Self::JitCall)), an XLA `shard_map` ([`ShardMap`](Self::ShardMap)), and an XLA
+/// `linear_shard_map` staged in ordinary traced programs ([`LinearShardMap`](Self::LinearShardMap)).
+///
+/// The [`Operation`]/[`Display`] and per-variant [`From`]/[`TryFrom`] impls below are uniform per-variant delegations
+/// to the backing operation structs. The backend-specific interpretation, batching, and differentiation rules are
+/// bespoke (per-variant exemplar extraction, an erroring `shard_map` batching rule, and distinct `jvp` entry points),
+/// so they are hand-written individually further below.
 #[derive(Clone, Debug)]
 pub enum XlaOperationExtension<V: Value<ArrayType>> {
     /// Call to a jitted XLA sub-program.
@@ -34,6 +41,89 @@ pub enum XlaOperationExtension<V: Value<ArrayType>> {
 
     /// XLA-specific `linear_shard_map` staged in ordinary traced programs.
     LinearShardMap(Box<LinearShardMapOperation<V>>),
+}
+
+impl<V: Value<ArrayType>> Operation<ArrayType> for XlaOperationExtension<V> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::JitCall(operation) => operation.name(),
+            Self::ShardMap(operation) => operation.name(),
+            Self::LinearShardMap(operation) => operation.name(),
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        match self {
+            Self::JitCall(operation) => operation.infer_output_types(input_types),
+            Self::ShardMap(operation) => operation.infer_output_types(input_types),
+            Self::LinearShardMap(operation) => operation.infer_output_types(input_types),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::JitCall(operation) => operation.render(formatter, indentation),
+            Self::ShardMap(operation) => operation.render(formatter, indentation),
+            Self::LinearShardMap(operation) => operation.render(formatter, indentation),
+        }
+    }
+}
+
+impl<V: Value<ArrayType>> Display for XlaOperationExtension<V> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V: Value<ArrayType>> From<JitCallOperation> for XlaOperationExtension<V> {
+    fn from(operation: JitCallOperation) -> Self {
+        Self::JitCall(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<ArrayType>> TryFrom<&'a XlaOperationExtension<V>> for &'a JitCallOperation {
+    type Error = ();
+
+    fn try_from(value: &'a XlaOperationExtension<V>) -> Result<Self, ()> {
+        match value {
+            XlaOperationExtension::JitCall(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<ArrayType>> From<ShardMapOperation<V>> for XlaOperationExtension<V> {
+    fn from(operation: ShardMapOperation<V>) -> Self {
+        Self::ShardMap(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<ArrayType>> TryFrom<&'a XlaOperationExtension<V>> for &'a ShardMapOperation<V> {
+    type Error = ();
+
+    fn try_from(value: &'a XlaOperationExtension<V>) -> Result<Self, ()> {
+        match value {
+            XlaOperationExtension::ShardMap(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<ArrayType>> From<LinearShardMapOperation<V>> for XlaOperationExtension<V> {
+    fn from(operation: LinearShardMapOperation<V>) -> Self {
+        Self::LinearShardMap(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<ArrayType>> TryFrom<&'a XlaOperationExtension<V>> for &'a LinearShardMapOperation<V> {
+    type Error = ();
+
+    fn try_from(value: &'a XlaOperationExtension<V>) -> Result<Self, ()> {
+        match value {
+            XlaOperationExtension::LinearShardMap(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
 }
 
 /// Lifetime-free reference to a concrete XLA value captured by a compiled program.
@@ -58,7 +148,7 @@ impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRemater
     }
 }
 
-pub type XlaOperation = ArrayOperation<XlaConstant, ArrayType, XlaOperationExtension<XlaConstant>>;
+pub type XlaOperation = ArrayOperation<ArrayType, XlaConstant, XlaOperationExtension<XlaConstant>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub type XlaProgram<Input, Output> = Program<ArrayType, XlaConstant, XlaOperation, Input, Output>;
@@ -69,15 +159,22 @@ pub type XlaProgramBuilder = ProgramBuilder<ArrayType, XlaConstant, XlaOperation
 /// Flat XLA program payload used by staged call operations.
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
-/// Backend-owned linear operations that extend the reusable core linear array operation set.
+/// Backend-owned linear operations that extend the reusable core linear array operation set: a linearized call to
+/// a jitted XLA sub-program ([`LinearJitCall`](Self::LinearJitCall)) and an XLA linear `shard_map`
+/// ([`LinearShardMap`](Self::LinearShardMap)).
 ///
 /// The enum is parameterized by the tangent carrier `V` *and* the factor carrier `F` of the linear program it is
 /// staged in, mirroring [`LinearArrayOperation`]'s factor parameter: captured primal payloads (the prefix inputs of
 /// a linear jitted call and the captured global primals of a linear shard-map) are stored as `F` factors, so they
 /// participate in the residual-factor machinery ([`FactorParameterizedOperation`] and everything built on it, such
 /// as residual compaction, rebasing onto an enclosing linearization context, and instantiation into a directly
-/// executable program). Residualized pushforwards use [`ResidualFactor`] as `F`; direct (instantiated) programs use
+/// executable program). Residualized pushforwards use [`CapturedFactor`] as `F`; direct (instantiated) programs use
 /// the concrete value type, in which case `F` defaults to `V`.
+///
+/// The [`Operation`]/[`Display`], per-variant [`From`]/[`TryFrom`], and the per-variant interpretation delegation below
+/// are uniform per-variant delegations to the backing operation structs. Transposition (which targets the factor-split
+/// linear universe) and factor mapping are bespoke and hand-written further below, since neither is a uniform
+/// per-variant delegation.
 #[derive(Clone, Debug)]
 pub enum LinearXlaOperationExtension<V: Value<ArrayType>, F: Value<ArrayType> = V> {
     /// Linearized call to a jitted XLA sub-program.
@@ -87,21 +184,110 @@ pub enum LinearXlaOperationExtension<V: Value<ArrayType>, F: Value<ArrayType> = 
     LinearShardMap(Box<LinearShardMapOperation<V, F>>),
 }
 
+impl<V: Value<ArrayType>, F: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V, F> {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::LinearJitCall(operation) => operation.name(),
+            Self::LinearShardMap(operation) => operation.name(),
+        }
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        match self {
+            Self::LinearJitCall(operation) => operation.infer_output_types(input_types),
+            Self::LinearShardMap(operation) => operation.infer_output_types(input_types),
+        }
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        match self {
+            Self::LinearJitCall(operation) => operation.render(formatter, indentation),
+            Self::LinearShardMap(operation) => operation.render(formatter, indentation),
+        }
+    }
+}
+
+impl<V: Value<ArrayType>, F: Value<ArrayType>> Display for LinearXlaOperationExtension<V, F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<V: Value<ArrayType>, F: Value<ArrayType>> From<LinearJitCallOperation<F>> for LinearXlaOperationExtension<V, F> {
+    fn from(operation: LinearJitCallOperation<F>) -> Self {
+        Self::LinearJitCall(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<ArrayType>, F: Value<ArrayType>> TryFrom<&'a LinearXlaOperationExtension<V, F>>
+    for &'a LinearJitCallOperation<F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearXlaOperationExtension<V, F>) -> Result<Self, ()> {
+        match value {
+            LinearXlaOperationExtension::LinearJitCall(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+impl<V: Value<ArrayType>, F: Value<ArrayType>> From<LinearShardMapOperation<V, F>>
+    for LinearXlaOperationExtension<V, F>
+{
+    fn from(operation: LinearShardMapOperation<V, F>) -> Self {
+        Self::LinearShardMap(Box::new(operation))
+    }
+}
+
+impl<'a, V: Value<ArrayType>, F: Value<ArrayType>> TryFrom<&'a LinearXlaOperationExtension<V, F>>
+    for &'a LinearShardMapOperation<V, F>
+{
+    type Error = ();
+
+    fn try_from(value: &'a LinearXlaOperationExtension<V, F>) -> Result<Self, ()> {
+        match value {
+            LinearXlaOperationExtension::LinearShardMap(operation) => Ok(&**operation),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Per-variant interpretation delegation. Each backing operation interprets over the tangent carrier `V` only when the
+/// factor carrier `F` equals `V` (concrete values rather than residual factors); the per-variant bounds capture that.
+impl<V: Value<ArrayType>, F: Value<ArrayType>> InterpretableOperation<ArrayType, V>
+    for LinearXlaOperationExtension<V, F>
+where
+    LinearJitCallOperation<F>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, F>: InterpretableOperation<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        match self {
+            Self::LinearJitCall(operation) => operation.interpret(context, inputs),
+            Self::LinearShardMap(operation) => operation.interpret(context, inputs),
+        }
+    }
+}
+
 /// Linear staged-op universe owned by the XLA backend.
 pub type LinearXlaOperation<V, C = V, Factor = V> =
-    LinearArrayOperation<V, C, ArrayType, LinearXlaOperationExtension<V, Factor>, Factor, XlaOperation>;
+    LinearArrayOperation<ArrayType, V, C, LinearXlaOperationExtension<V, Factor>, Factor, XlaOperation>;
 
 /// [`LinearXlaOperation`] with the extension's factor carrier decoupled from the universe's factor carrier.
 ///
-/// Scan bodies pin their factor payloads to the scan-local `ResidualFactor` namespace while extension captures stay
+/// Scan bodies pin their factor payloads to the scan-local `CapturedFactor` namespace while extension captures stay
 /// in the enclosing factor space, so transposing an extension operation inside a scan body targets a universe whose
 /// factor (`UniverseFactor`) differs from the extension's own (`Factor`). The XLA transposition rules are
 /// implemented against this split form; [`LinearXlaOperation`] is the aligned special case
 /// `UniverseFactor = Factor`.
 pub(crate) type FactorSplitLinearXlaOperation<V, Factor, UniverseFactor> = LinearArrayOperation<
+    ArrayType,
     V,
     XlaConstant,
-    ArrayType,
     LinearXlaOperationExtension<V, Factor>,
     UniverseFactor,
     XlaOperation,
@@ -138,7 +324,7 @@ impl JitCallOperation {
 /// Linearized jitted call used inside tangent and cotangent programs.
 ///
 /// The captured primal prefix inputs are stored as factors of the linear program's factor carrier `F`
-/// ([`ResidualFactor`] references in residualized pushforwards, concrete values in instantiated direct programs),
+/// ([`CapturedFactor`] references in residualized pushforwards, concrete values in instantiated direct programs),
 /// so they flow through residual compaction, rebasing, and instantiation like every other captured primal factor.
 #[derive(Clone, Debug)]
 pub struct LinearJitCallOperation<F: Value<ArrayType>> {
@@ -257,7 +443,7 @@ fn build_jvp_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgram, Pr
                 },
                 primals,
             )?;
-            pushforward.apply(tangents)
+            pushforward.apply(&context, tangents)
         },
         signature,
     )?;
@@ -284,7 +470,11 @@ fn build_pullback_call_program(program: &FlatXlaProgram) -> Result<FlatXlaProgra
                 },
                 primals,
             )?;
-            pullback.interpret(cotangents)
+            let interpretation_context = cotangents
+                .iter()
+                .find_map(|cotangent| cotangent.interpretation_context())
+                .ok_or_else(missing_traced_input)?;
+            pullback.interpret_in_context(&interpretation_context, cotangents)
         },
         signature,
     )?;
@@ -412,14 +602,14 @@ impl JitCallOperation {
         TangentValue: Value<ArrayType>,
         E: DifferentiationContext<
                 Tangent = TangentValue,
-                LinearOperation<TangentValue, ResidualFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
+                LinearOperation<TangentValue, CapturedFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
                     TangentValue,
                     XlaConstant,
-                    ResidualFactor<ArrayType, PrimalValue>,
+                    CapturedFactor<ArrayType, PrimalValue>,
                 >,
             > + Domain<Type = ArrayType, Value = PrimalValue>
             + 'jvp,
-        LinearOperationOf<E>: SupportsZero<ArrayType>,
+        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let tangent_inputs = inputs
@@ -427,7 +617,7 @@ impl JitCallOperation {
             .map(|input| context.materialize_tangent(input.tangent().clone()))
             .collect::<Result<Vec<_>, _>>()?;
         let linear_operation = self.linear_call_operation(captured_inputs)?;
-        let operation: LinearXlaOperation<TangentValue, XlaConstant, ResidualFactor<ArrayType, PrimalValue>> =
+        let operation: LinearXlaOperation<TangentValue, XlaConstant, CapturedFactor<ArrayType, PrimalValue>> =
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation)));
         let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
         check_count!("output", tangent_outputs, primal_outputs.len(), ProgramError);
@@ -490,11 +680,11 @@ where
         + DifferentiationContext<
             LinearOperation<
                 <E as DifferentiationContext>::Tangent,
-                ResidualFactor<ArrayType, Tracer<E>>,
+                CapturedFactor<ArrayType, Tracer<E>>,
             > = LinearXlaOperation<
                 <E as DifferentiationContext>::Tangent,
                 XlaConstant,
-                ResidualFactor<ArrayType, Tracer<E>>,
+                CapturedFactor<ArrayType, Tracer<E>>,
             >,
         >,
 {
@@ -505,7 +695,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
-        LinearOperationOf<E>: SupportsZero<ArrayType>,
+        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -541,7 +731,7 @@ impl<C> InterpretableOperation<ArrayType, Tracer<C>> for LinearJitCallOperation<
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
 {
-    fn interpret(&self, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
         let context = self
             .captured_inputs
             .first()
@@ -563,7 +753,7 @@ impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayT
     TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
     for LinearJitCallOperation<Factor>
 where
-    FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>: SupportsZero<ArrayType>,
+    FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>: From<ZeroOperation<ArrayType>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -591,7 +781,9 @@ where
                 Cotangent::Staged(cotangent) => cotangent_inputs.push(cotangent.clone()),
                 Cotangent::Zero => {
                     let zero_outputs = context.stage_operation(
-                        FactorSplitLinearXlaOperation::<V, Factor, UniverseFactor>::zero_operation(output_type.clone()),
+                        FactorSplitLinearXlaOperation::<V, Factor, UniverseFactor>::from(ZeroOperation::new(
+                            output_type.clone(),
+                        )),
                         &[] as &[ryft_core::tracing::AbstractTracer<
                             'transpose,
                             ArrayType,
@@ -619,30 +811,10 @@ where
     }
 }
 
-impl Display for XlaOperationExtension<XlaConstant> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl Operation<ArrayType> for XlaOperationExtension<XlaConstant> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap], |op| op.name())
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap], |op| { op.infer_output_types(input_types) })
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        delegate_extension!(self, [JitCall, ShardMap, LinearShardMap], |op| { op.render(formatter, indentation) })
-    }
-}
-
 impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<XlaConstant> {
     fn interpret(
         &self,
+        _context: &<XlaTracer<'static, 'static> as Value<ArrayType>>::InterpretationContext,
         inputs: &[XlaTracer<'static, 'static>],
     ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
         match self {
@@ -697,11 +869,11 @@ where
         + DifferentiationContext<
             LinearOperation<
                 <E as DifferentiationContext>::Tangent,
-                ResidualFactor<ArrayType, Tracer<E>>,
+                CapturedFactor<ArrayType, Tracer<E>>,
             > = LinearXlaOperation<
                 <E as DifferentiationContext>::Tangent,
                 XlaConstant,
-                ResidualFactor<ArrayType, Tracer<E>>,
+                CapturedFactor<ArrayType, Tracer<E>>,
             >,
         >,
 {
@@ -712,44 +884,13 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
-        LinearOperationOf<E>: SupportsZero<ArrayType>,
+        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         match self {
             Self::JitCall(op) => op.jvp(context, inputs),
             Self::ShardMap(op) => op.jvp_with_staging_context(context, inputs),
             Self::LinearShardMap(op) => op.jvp_with_staging_context(context, inputs),
         }
-    }
-}
-
-impl<V: Value<ArrayType>, F: Value<ArrayType>> Display for LinearXlaOperationExtension<V, F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl<V: Value<ArrayType>, F: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V, F> {
-    #[inline]
-    fn name(&self) -> &'static str {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| op.name())
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| { op.infer_output_types(input_types) })
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| { op.render(formatter, indentation) })
-    }
-}
-
-impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for LinearXlaOperationExtension<V, V>
-where
-    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
-{
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| op.interpret(inputs))
     }
 }
 

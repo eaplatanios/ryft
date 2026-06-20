@@ -2,6 +2,7 @@ use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use ryft_core::ProvidesContext;
 use ryft_core::operations::constants::ZeroLike;
 use ryft_core::operations::trigonometric::Sin;
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -290,8 +291,9 @@ fn run_scalar_pushforward_apply(
 ) -> Result<TransformBenchmarkRecord, Box<dyn std::error::Error>> {
     let domain = ryft_core::scalars::ScalarDomain::<f64>::new();
     let (_, pushforward) = domain.linearize(|x| Ok(quartic_plus_sin(x)), 2.0)?;
+    let tangent_context = domain.context();
     measure("scalar_pushforward_apply", "scalar", "pushforward_apply", iterations, warmup, || {
-        Ok(scalar_checksum(pushforward.apply(black_box(1.0))?))
+        Ok(scalar_checksum(pushforward.apply(&tangent_context, black_box(1.0))?))
     })
 }
 
