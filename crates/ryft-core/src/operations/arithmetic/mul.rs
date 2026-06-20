@@ -39,18 +39,25 @@ impl Operation<DataType> for MulOperation {
     }
 }
 
-impl ElementwiseOperation for MulOperation {
+impl Operation<ArrayType> for MulOperation {
     #[inline]
     fn name(&self) -> &'static str {
         MUL_OPERATION_NAME
     }
 
     #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for MulOperation {
+    #[inline]
     fn input_count(&self) -> usize {
         2
     }
 
-    // TODO(eaplatanios): Review this function. Also, test.
+    // TODO(eaplatanios): Review this function.
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
         // state by the bilinear rule (JAX's `_mul_ur_rule`) rather than the congruent rule that generic elementwise
@@ -91,7 +98,7 @@ impl ElementwiseOperation for MulOperation {
     }
 }
 
-// TODO(eaplatanios): Review this function. Also, test.
+// TODO(eaplatanios): Review this function. Also, tests.
 /// Returns the `(unreduced, reduced)` axis sets of an [`ArrayType`]'s [`Sharding`], or empty sets when it has none.
 fn reduction_state(input_type: &ArrayType) -> (BTreeSet<String>, BTreeSet<String>) {
     match input_type.sharding() {
@@ -100,7 +107,7 @@ fn reduction_state(input_type: &ArrayType) -> (BTreeSet<String>, BTreeSet<String
     }
 }
 
-// TODO(eaplatanios): Review this function. Also, test.
+// TODO(eaplatanios): Review this function. Also, tests.
 /// Returns a copy of `input_type` whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while
 /// its per-dimension placement and varying-manual axes are preserved, so the shared elementwise broadcast does not
 /// reject operands that disagree on their reduction state (which the bilinear rule combines separately).
@@ -119,7 +126,7 @@ fn strip_reduction_state(input_type: &ArrayType) -> ArrayType {
     input_type.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
 }
 
-// TODO(eaplatanios): Review this function. Also, test.
+// TODO(eaplatanios): Review this function. Also, tests.
 /// Combines two operands' `(unreduced, reduced)` reduction-state axis sets under the bilinear rule (JAX's
 /// `_mul_ur_rule`): the operands cannot both be unreduced; an operand unreduced over a set of axes requires the
 /// other to be reduced over exactly those axes and yields an unreduced result over them; reduced axes otherwise

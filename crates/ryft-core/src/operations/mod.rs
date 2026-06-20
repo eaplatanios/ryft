@@ -10,7 +10,7 @@ use crate::macros::check_count;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 // TODO(eaplatanios): Review this file.
 
@@ -177,20 +177,22 @@ pub trait Operation<T: Type> {
 }
 
 /// [`InterpretableOperation`]s are [`Operation`]s that can be interpreted (i.e., executed) given concrete input values.
-pub trait InterpretableOperation<T: Type, V: Typed<T>>: Operation<T> {
-    /// Interprets this [`Operation`] given the provided input values and returns the resulting output values.
-    fn interpret(&self, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
+pub trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
+    /// Interprets this [`Operation`] given the provided input values and returns the resulting output values. The
+    /// provided `context` is the [`InterpretationContext`](Value::InterpretationContext) required to produce values
+    /// of type `V`. For concrete (i.e., **eager**) values it is set to [`EagerContext`](crate::EagerContext) which
+    /// does nothing. For [`Tracer`] values it is set to the surrounding [`StagingContext`](crate::StagingContext),
+    /// which enables nullary operations (e.g., [`ZeroOperation`]) to stage themselves into that context rather than
+    /// failing for lack of an operand from which to recover the context.
+    fn interpret(&self, context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
 }
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
 /// [`ElementwiseOperation`] captures the shared type inference behavior of elementwise array operations:
-/// implementations declare their fixed input count and operation name, while the default type inference implementation
-/// checks the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
+/// implementations declare their fixed input count, while the default type inference implementation checks
+/// the input count, broadcasts all input [`ArrayType`]s while tolerating shardings that differ only by
 /// [`Sharding::varying_manual_axes`](crate::Sharding::varying_manual_axes).
-pub trait ElementwiseOperation {
-    /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
-    fn name(&self) -> &'static str;
-
+pub trait ElementwiseOperation: Operation<ArrayType> {
     /// Returns the number of input arrays consumed by this elementwise [`Operation`].
     fn input_count(&self) -> usize;
 
@@ -236,36 +238,6 @@ pub trait ElementwiseOperation {
                 Ok(output)
             }
         }
-    }
-
-    // TODO(eaplatanios): Review this function.
-    /// Renders this elementwise [`Operation`] as part of an [`Instruction`](crate::Instruction). The default
-    /// implementation writes [`ElementwiseOperation::name`]; operations carrying semantic metadata (e.g.,
-    /// [`ScaleOperation`](crate::operations::arithmetic::ScaleOperation)'s captured factor) override this and use
-    /// [`OperationFormatter`] for consistent bracketed formatting, mirroring how their [`Operation::render`] over
-    /// scalar [`DataType`] metadata renders the same fields.
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        let _ = indentation;
-        formatter.write_str(ElementwiseOperation::name(self))
-    }
-}
-
-impl<O: ElementwiseOperation> Operation<ArrayType> for O {
-    #[inline]
-    fn name(&self) -> &'static str {
-        ElementwiseOperation::name(self)
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[inline]
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        ElementwiseOperation::render(self, formatter, indentation)
     }
 }
 
@@ -396,7 +368,7 @@ mod tests {
 
     use crate::macros::check_count;
     use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder, ProgramError};
+    use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -418,7 +390,11 @@ mod tests {
     }
 
     impl InterpretableOperation<DataType, f64> for IdentityOperation {
-        fn interpret(&self, inputs: &[f64]) -> Result<Vec<f64>, ProgramError> {
+        fn interpret(
+            &self,
+            _context: &<f64 as Value<DataType>>::InterpretationContext,
+            inputs: &[f64],
+        ) -> Result<Vec<f64>, ProgramError> {
             check_count!("input", inputs, 1, ProgramError);
             Ok(vec![inputs[0]])
         }
@@ -529,8 +505,11 @@ mod tests {
             operation.infer_output_types(&[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() })
         );
-        assert_eq!(operation.interpret(&[3.0f64]), Ok(vec![3.0f64]));
-        assert_eq!(operation.interpret(&[]), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }));
+        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[3.0f64]), Ok(vec![3.0f64]));
+        assert_eq!(
+            operation.interpret(&crate::EagerContext::new(), &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
     }
 
     #[test]
@@ -580,12 +559,19 @@ mod tests {
             input_count: usize,
         }
 
-        impl ElementwiseOperation for TestElementwiseArrayOperation {
+        impl Operation<ArrayType> for TestElementwiseArrayOperation {
             #[inline]
             fn name(&self) -> &'static str {
                 "elementwise_test"
             }
 
+            #[inline]
+            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+                ElementwiseOperation::infer_output_types(self, input_types)
+            }
+        }
+
+        impl ElementwiseOperation for TestElementwiseArrayOperation {
             #[inline]
             fn input_count(&self) -> usize {
                 self.input_count

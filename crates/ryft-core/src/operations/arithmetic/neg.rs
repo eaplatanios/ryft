@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`NegOperation`].
 pub const NEG_OPERATION_NAME: &'static str = "neg";
@@ -35,12 +35,19 @@ impl Operation<DataType> for NegOperation {
     }
 }
 
-impl ElementwiseOperation for NegOperation {
+impl Operation<ArrayType> for NegOperation {
     #[inline]
     fn name(&self) -> &'static str {
         NEG_OPERATION_NAME
     }
 
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for NegOperation {
     #[inline]
     fn input_count(&self) -> usize {
         1

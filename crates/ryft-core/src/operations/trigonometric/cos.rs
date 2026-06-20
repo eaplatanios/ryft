@@ -7,7 +7,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`CosOperation`].
 pub const COS_OPERATION_NAME: &'static str = "cos";
@@ -35,12 +35,19 @@ impl Operation<DataType> for CosOperation {
     }
 }
 
-impl ElementwiseOperation for CosOperation {
+impl Operation<ArrayType> for CosOperation {
     #[inline]
     fn name(&self) -> &'static str {
         COS_OPERATION_NAME
     }
 
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for CosOperation {
     #[inline]
     fn input_count(&self) -> usize {
         1
@@ -110,6 +117,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -133,11 +141,15 @@ mod tests {
         assert_eq!(format!("{operation}"), COS_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[0.5]),
-            Ok(vec![0.5f64.cos()])
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[0.5]),
+            Ok(vec![0.5f64.cos()]),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[TestArray::scalar(0.5)]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[TestArray::scalar(0.5)],
+            ),
             Ok(vec![TestArray::scalar(0.5f64.cos())]),
         );
 
@@ -175,11 +187,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &mut (), &[]),
+            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

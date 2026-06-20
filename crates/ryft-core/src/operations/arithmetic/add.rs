@@ -8,7 +8,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`AddOperation`].
 pub const ADD_OPERATION_NAME: &'static str = "add";
@@ -38,12 +38,19 @@ impl Operation<DataType> for AddOperation {
     }
 }
 
-impl ElementwiseOperation for AddOperation {
+impl Operation<ArrayType> for AddOperation {
     #[inline]
     fn name(&self) -> &'static str {
         ADD_OPERATION_NAME
     }
 
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for AddOperation {
     #[inline]
     fn input_count(&self) -> usize {
         2

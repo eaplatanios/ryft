@@ -69,21 +69,28 @@ impl<V: Display + Typed<DataType>> Operation<DataType> for ScaleOperation<DataTy
     }
 }
 
-impl<V: Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<ArrayType, V> {
+impl<V: Display + Typed<ArrayType>> Operation<ArrayType> for ScaleOperation<ArrayType, V> {
     #[inline]
     fn name(&self) -> &'static str {
         SCALE_OPERATION_NAME
     }
 
     #[inline]
-    fn input_count(&self) -> usize {
-        1
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
     }
 
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, ElementwiseOperation::name(self))?
+        OperationFormatter::new(formatter, indentation, Operation::<ArrayType>::name(self))?
             .bracketed(|operation| operation.field("factor", &self.factor))
+    }
+}
+
+impl<V: Display + Typed<ArrayType>> ElementwiseOperation for ScaleOperation<ArrayType, V> {
+    #[inline]
+    fn input_count(&self) -> usize {
+        1
     }
 }
 

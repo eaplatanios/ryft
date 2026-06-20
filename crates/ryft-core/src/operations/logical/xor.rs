@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::ArrayType;
+use crate::types::{ArrayType, TypeError};
 
 /// Canonical operation name for [`XorOperation`].
 pub const XOR_OPERATION_NAME: &'static str = "xor";
@@ -24,12 +24,19 @@ impl Display for XorOperation {
     }
 }
 
-impl ElementwiseOperation for XorOperation {
+impl Operation<ArrayType> for XorOperation {
     #[inline]
     fn name(&self) -> &'static str {
         XOR_OPERATION_NAME
     }
 
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for XorOperation {
     #[inline]
     fn input_count(&self) -> usize {
         2

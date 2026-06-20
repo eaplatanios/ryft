@@ -6,7 +6,7 @@ use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::ArrayType;
+use crate::types::{ArrayType, TypeError};
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &'static str = "not";
@@ -24,12 +24,19 @@ impl Display for NotOperation {
     }
 }
 
-impl ElementwiseOperation for NotOperation {
+impl Operation<ArrayType> for NotOperation {
     #[inline]
     fn name(&self) -> &'static str {
         NOT_OPERATION_NAME
     }
 
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        ElementwiseOperation::infer_output_types(self, input_types)
+    }
+}
+
+impl ElementwiseOperation for NotOperation {
     #[inline]
     fn input_count(&self) -> usize {
         1
