@@ -9,7 +9,8 @@ use crate::programs::{ProgramError, Value};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
-use crate::tracing_v2::operations::primitive::render_factor_list;
+use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
+use crate::tracing_v2::operations::scan::render_factor_list;
 use crate::tracing_v2::operations::slicing::static_update_sizes;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
@@ -1015,6 +1016,23 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearDynamicSliceOperation<F
     }
 }
 
+impl<V, F> InterpretableOperation<ArrayType, V> for LinearDynamicSliceOperation<F>
+where
+    V: Value<ArrayType> + DynamicSlice,
+    F: CustomVjpResidual<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let start_indices =
+            self.start_indices().iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+        Ok(vec![inputs[0].dynamic_slice(start_indices.as_slice(), self.sizes())?])
+    }
+}
+
 /// Transpose rule for the captured-index dynamic slice (the `DynamicSlice` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The forward linear map
 /// `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by scattering the output cotangent back into a zero array
@@ -1102,6 +1120,23 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearDynamicUpdateSliceOpera
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("start_indices", format_args!("{}", render_factor_list(&self.start_indices)))
         })
+    }
+}
+
+impl<V, F> InterpretableOperation<ArrayType, V> for LinearDynamicUpdateSliceOperation<F>
+where
+    V: Value<ArrayType> + DynamicUpdateSlice,
+    F: CustomVjpResidual<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let start_indices =
+            self.start_indices().iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+        Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], start_indices.as_slice())?])
     }
 }
 

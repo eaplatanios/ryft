@@ -1,5 +1,4 @@
 use std::fmt::{Debug, Display};
-use std::ops::Mul;
 
 use crate::batching::BatchingError;
 use crate::contexts::{EagerContext, StagingContext};
@@ -8,11 +7,12 @@ use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{MaybeZeroOperation, Zero, ZeroOperation};
-use crate::operations::control_flow::scan::{scan_output_types, stacked_scan_type, validate_scan_unroll};
+use crate::operations::control_flow::scan::{
+    interpret_scan_lanes, read_scan_lane, scan_output_types, stacked_scan_type, validate_scan_unroll,
+};
 use crate::operations::control_flow::{SCAN_OPERATION_NAME, ScanOperation};
-use crate::operations::manipulation::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, UpdateSlice};
-use crate::operations::sharding::{ConstrainSharding, Reshard};
-use crate::operations::{Operation, OperationFormatter};
+use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, UpdateSlice};
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::CapturedFactor;
@@ -21,9 +21,7 @@ use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
     NestedLinearization, ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
 };
-use crate::tracing_v2::operations::dot::Dot;
-use crate::tracing_v2::operations::primitive::{LinearArrayOperation, render_factor_list};
-use crate::tracing_v2::operations::reshape::ReshapeValue;
+use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents linear [`Operation`](crate::operations::Operation) types that support/include the linear
@@ -85,6 +83,95 @@ pub trait LinearScanBodyTransposable<V: Value<ArrayType>>:
     ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
     where
         Self: Sized;
+}
+
+/// Represents scan-local linear array operation families that can interpret the lane body captured by a
+/// [`LinearScanOperation`].
+///
+/// A linear scan body is a recursive fixed point: nested control flow inside the body is expressed over the same
+/// operation family as the body itself. This trait names that fixed point for interpretation without requiring the
+/// whole operation enum's [`InterpretableOperation`] implementation to already be available.
+pub trait LinearScanBodyInterpretable<V: Value<ArrayType>>: Operation<ArrayType> {
+    /// Interprets one instruction in a scan-local body program.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Value interpretation context used for replay.
+    ///   - `inputs`: Already interpreted instruction inputs.
+    fn interpret_linear_scan_body_instruction(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError>;
+
+    /// Interprets a scan-local body program.
+    ///
+    /// # Parameters
+    ///
+    ///   - `body`: Scan-local linear body program to interpret.
+    ///   - `context`: Value interpretation context used for replay.
+    ///   - `inputs`: Flat input values aligned with `body`'s input signature.
+    fn interpret_linear_scan_body(
+        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        context: &V::InterpretationContext,
+        inputs: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        Self: Sized,
+    {
+        let input_types = body.input_types();
+        check_count!("input", inputs, input_types.len(), ProgramError);
+        for (input, declared) in inputs.iter().zip(input_types.iter()) {
+            let actual = input.r#type();
+            if !declared.is_refined_by(actual.as_ref()) {
+                return Err(TypeError {
+                    message: format!(
+                        "encountered input type {actual} which is incompatible with the program's declared type \
+                         {declared}",
+                    ),
+                }
+                .into());
+            }
+        }
+        body.interpret_with::<V, ProgramError, _, _>(
+            inputs,
+            |_, constant| Ok(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret_linear_scan_body_instruction(context, inputs),
+        )
+    }
+}
+
+/// Represents scan-local body operation families whose [`CapturedFactor`] payloads can be instantiated into concrete
+/// lane values.
+///
+/// The body stored in a [`LinearScanOperation`] uses a scan-local residual-reference namespace. Before interpreting a
+/// lane, the operation family maps those references to the residual slice values for that lane. This trait keeps that
+/// operation-family-specific mapping out of [`LinearScanOperation`], so backend/user linear operation enums can choose
+/// how their own payloads participate.
+pub trait LinearScanBodyInstantiable<V: Value<ArrayType>>: Operation<ArrayType> {
+    /// Operation type produced after replacing scan-local captured factors with concrete lane values.
+    type Instantiated: Clone + Operation<ArrayType>;
+
+    /// Instantiates this operation's scan-local captured factors using `residuals`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `residuals`: Residual values for the current scan lane, indexed by
+    ///     [`CapturedFactor::Reference`](crate::tracing_v2::CapturedFactor::Reference).
+    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError>;
+}
+
+/// Renders a factor list as a bracketed, comma-separated sequence of `Display` renderings.
+pub(crate) fn render_factor_list<F: Display>(factors: &[F]) -> String {
+    let mut rendered = String::from("[");
+    for (index, factor) in factors.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&factor.to_string());
+    }
+    rendered.push(']');
+    rendered
 }
 
 /// JVP rule for [`ScanOperation`] with full JAX
@@ -423,28 +510,22 @@ where
 /// Statically counted linear scan operation: a higher-order scan restricted to a residualized linear body, staged by
 /// the JVP rule of [`ScanOperation`](crate::operations::control_flow::ScanOperation).
 ///
-/// It is the counterpart of the `Scan` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation). The body is the scan body's residualized
-/// pushforward, mapping `[tangent_carry..., tangent_x_slice...]` to `[tangent_carry..., tangent_y_slice...]`, and
-/// `residual_stacks` are the stacked per-iteration residuals of the extended primal scan, captured as factors of the
-/// enclosing linearization.
+/// The body is the scan body's residualized pushforward, mapping `[tangent_carry..., tangent_x_slice...]` to
+/// `[tangent_carry..., tangent_y_slice...]`, and `residual_stacks` are the stacked per-iteration residuals of the
+/// extended primal scan, captured as factors of the enclosing linearization.
 ///
 /// **Scan-local factor namespace.** The body's factor payloads are pinned to
 /// [`CapturedFactor<T, V>`](crate::tracing_v2::CapturedFactor) and form a namespace owned by this operation:
 /// reference index `i` resolves to slice `lane` of `residual_stacks[i]` while iteration `lane` runs, so the body stays
 /// fully linear in its tangent inputs with every captured primal entering through a per-lane residual slice.
 #[derive(Clone, Debug)]
-pub struct LinearScanOperation<V, C, Extension, F, P>
+pub struct LinearScanOperation<V, F, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
     F: Value<ArrayType>,
-    P: Operation<ArrayType>,
 {
     /// Residualized body pushforward with scan-local residual references.
-    body: Box<
-        Program<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>, Vec<V>, Vec<V>>,
-    >,
+    body: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
 
     /// Stacked per-iteration residual factors indexed by the body's scan-local residual references; each stack's
     /// leading dimension is the scan length.
@@ -464,26 +545,16 @@ where
     unroll: usize,
 }
 
-impl<V, C, Extension, F, P> LinearScanOperation<V, C, Extension, F, P>
+impl<V, F, O> LinearScanOperation<V, F, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
     F: Value<ArrayType>,
-    P: Operation<ArrayType>,
 {
     /// Creates a new [`LinearScanOperation`] from the residualized body pushforward, the stacked residual factors,
     /// and the scan's static metadata.
     #[inline]
     pub fn new(
-        body: Box<
-            Program<
-                ArrayType,
-                V,
-                LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>,
-                Vec<V>,
-                Vec<V>,
-            >,
-        >,
+        body: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
         residual_stacks: Vec<F>,
         carry_count: usize,
         length: usize,
@@ -495,10 +566,7 @@ where
 
     /// Returns the residualized body pushforward with scan-local residual references.
     #[inline]
-    pub fn body(
-        &self,
-    ) -> &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>, Vec<V>, Vec<V>>
-    {
+    pub fn body(&self) -> &Program<ArrayType, V, O, Vec<V>, Vec<V>> {
         self.body.as_ref()
     }
 
@@ -533,13 +601,11 @@ where
     }
 }
 
-impl<V, C, Extension, F, P> Display for LinearScanOperation<V, C, Extension, F, P>
+impl<V, F, O> Display for LinearScanOperation<V, F, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
     F: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
     Self: Operation<ArrayType>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -547,13 +613,11 @@ where
     }
 }
 
-impl<V, C, Extension, F, P> Operation<ArrayType> for LinearScanOperation<V, C, Extension, F, P>
+impl<V, F, O> Operation<ArrayType> for LinearScanOperation<V, F, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
     F: Value<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -598,52 +662,66 @@ where
     }
 }
 
-impl<V, C, Extension, P> LinearScanBodyTransposable<V>
-    for LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>
+impl<V, F, O> InterpretableOperation<ArrayType, V> for LinearScanOperation<V, F, O>
 where
-    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-    C: Value<ArrayType>,
-    Extension: Operation<ArrayType>
-        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>>,
-    P: Clone + Operation<ArrayType>,
+    V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
+    F: CustomVjpResidual<ArrayType, V>,
+    O: Clone + LinearScanBodyInstantiable<V>,
+    O::Instantiated: LinearScanBodyInterpretable<V>,
 {
-    #[inline]
-    fn transpose_linear_scan_body(
-        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        body.transpose()
+    fn interpret(&self, context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let stack_values = self
+            .residual_stacks()
+            .iter()
+            .map(CustomVjpResidual::residual_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let body = self.body();
+        let carry_count = self.carry_count();
+        let y_slice_types = body.output_types().split_off(carry_count);
+        interpret_scan_lanes(
+            carry_count,
+            self.length(),
+            self.reverse(),
+            y_slice_types.as_slice(),
+            inputs,
+            |stacked_type| V::zero(stacked_type),
+            |lane, lane_inputs| {
+                let lane_residuals =
+                    stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
+                let lane_body =
+                    body.map_operations(|operation| operation.instantiate_linear_scan_body_factors(&lane_residuals))?;
+                <O::Instantiated as LinearScanBodyInterpretable<V>>::interpret_linear_scan_body(
+                    &lane_body,
+                    context,
+                    lane_inputs,
+                )
+            },
+        )
     }
 }
 
-/// Transpose rule for the linear scan (the `Scan` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Linear-scan transposition is total: the body
-/// pushforward maps `[carry..., x_slice...]` to `[carry..., y_slice...]`, so its program transpose maps
+/// Transpose rule for the linear scan. Linear-scan transposition is total: the body pushforward maps
+/// `[carry..., x_slice...]` to `[carry..., y_slice...]`, so its program transpose maps
 /// `[carry_cotangent..., y_slice_cotangent...]` to `[carry_cotangent..., x_slice_cotangent...]` — the same scan-body
 /// signature with the same carry count. Flipping `reverse` pairs cotangent lane `i` with residual stack lane `i`
 /// exactly when the forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
 /// carry over verbatim. The body transpose recurses through [`LinearScanBodyTransposable`], keeping the scan-local
 /// fixed point owned by the operation family.
-impl<V, C, Extension, F, P> TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
-    for LinearScanOperation<V, C, Extension, F, P>
+impl<V, F, O, Target> TransposableOperation<ArrayType, V, Target> for LinearScanOperation<V, F, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
     F: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: From<ZeroOperation<ArrayType>>,
-    LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>: LinearScanBodyTransposable<V>,
+    O: Clone + LinearScanBodyTransposable<V>,
+    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearScanOperation<V, F, O>>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, Target>,
         input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, Target>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, Target>>, ProgramError> {
         // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
         if output_cotangents.iter().all(Cotangent::is_zero) {
             return Ok(vec![Cotangent::Zero; input_types.len()]);
@@ -651,11 +729,8 @@ where
         let body = self.body();
         let carry_count = self.carry_count();
         let length = self.length();
-        let transposed = LinearArrayOperation::Scan(LinearScanOperation::new(
-            Box::new(
-                <LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P> as
-                    LinearScanBodyTransposable<V>>::transpose_linear_scan_body(body)?,
-            ),
+        let transposed = Target::from(LinearScanOperation::new(
+            Box::new(<O as LinearScanBodyTransposable<V>>::transpose_linear_scan_body(body)?),
             self.residual_stacks().to_vec(),
             carry_count,
             length,

@@ -15,7 +15,7 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
 use crate::operations::sharding::{ConstrainSharding, Reshard};
-use crate::operations::{BooleanLike, Operation, OperationFormatter};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
@@ -24,6 +24,7 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched, move_axis_permutation,
 };
 use crate::tracing_v2::differentiation::{NestedLinearization, ProgramLinearizableOperation};
+use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::dot::Dot;
 use crate::tracing_v2::operations::primitive::LinearArrayOperation;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
@@ -2005,11 +2006,35 @@ where
     }
 }
 
+impl<V, C, Extension, F, P> InterpretableOperation<ArrayType, V> for LinearConditionOperation<V, C, Extension, F, P>
+where
+    V: Value<ArrayType> + BooleanLike,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    F: CustomVjpResidual<ArrayType, V>,
+    P: Operation<ArrayType>,
+    LinearArrayOperation<V, C, Extension, F, P>: InterpretableOperation<ArrayType, V>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let branch =
+            if self.predicate().residual_value()?.boolean()? { self.true_branch() } else { self.false_branch() };
+        branch.interpret_in_context(context, inputs.to_vec())
+    }
+}
+
 impl<V, C, Extension, F, P> LinearConditionBranchTransposable<V> for LinearArrayOperation<V, C, Extension, F, P>
 where
     V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
     C: Value<ArrayType>,
-    Extension: Operation<ArrayType>
+    Extension: Clone
+        + Operation<ArrayType>
         + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
         + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>>,
     F: Value<ArrayType>,
@@ -2177,6 +2202,29 @@ where
             operation.program("true_branch", self.true_branch.as_ref())?;
             operation.program("false_branch", self.false_branch.as_ref())
         })
+    }
+}
+
+impl<V, C, Extension, F, P> InterpretableOperation<ArrayType, V>
+    for LinearOperandConditionOperation<V, C, Extension, F, P>
+where
+    V: Value<ArrayType> + BooleanLike,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    F: Value<ArrayType>,
+    P: Operation<ArrayType>,
+    LinearArrayOperation<V, C, Extension, F, P>: InterpretableOperation<ArrayType, V>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let branch = if inputs[0].boolean()? { self.true_branch() } else { self.false_branch() };
+        branch.interpret_in_context(context, inputs[1..].to_vec())
     }
 }
 

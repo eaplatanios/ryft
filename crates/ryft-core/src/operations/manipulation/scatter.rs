@@ -8,6 +8,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Size, TypeError};
 
 // TODO(eaplatanios): Review this module.
@@ -725,6 +726,21 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let _ = indentation;
         formatter.write_str(self.name())
+    }
+}
+
+impl<V, F> InterpretableOperation<ArrayType, V> for LinearScatterAddOperation<F>
+where
+    V: Value<ArrayType> + Scatter,
+    F: CustomVjpResidual<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![inputs[0].scatter(&self.indices().residual_value()?, &inputs[1], self.operation())?])
     }
 }
 

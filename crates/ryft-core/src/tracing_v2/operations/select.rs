@@ -111,6 +111,36 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearSelectOperation<F> {
     }
 }
 
+impl<V, F> InterpretableOperation<DataType, V> for LinearSelectOperation<F>
+where
+    V: Value<DataType> + Select<Condition = <F as SelectCondition>::Condition>,
+    F: Display + SelectCondition,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![V::select(&self.condition().select_condition()?, &inputs[0], &inputs[1])?])
+    }
+}
+
+impl<V, F> InterpretableOperation<ArrayType, V> for LinearSelectOperation<F>
+where
+    V: Value<ArrayType> + Select<Condition = V>,
+    F: crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![V::select(&self.condition().residual_value()?, &inputs[0], &inputs[1])?])
+    }
+}
+
 /// Transpose rule for the captured-condition select, shared by the scalar
 /// [`LinearScalarOperation::Select`](crate::tracing_v2::LinearScalarOperation) and array
 /// [`LinearArrayOperation::Select`](crate::tracing_v2::LinearArrayOperation) variants. The forward linear map

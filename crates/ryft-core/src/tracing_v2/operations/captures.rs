@@ -6,7 +6,7 @@ use ryft_macros::Parameter;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::control_flow::SelectCondition;
-use crate::operations::{BooleanLike, Operation, OperationFormatter};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameter;
 use crate::programs::{AtomId, ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
@@ -181,6 +181,21 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for MaterializeCapturedFactorOper
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("factor", &self.factor))
+    }
+}
+
+impl<V, F> InterpretableOperation<ArrayType, V> for MaterializeCapturedFactorOperation<F>
+where
+    V: Value<ArrayType>,
+    F: crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 0, ProgramError);
+        Ok(vec![self.factor().residual_value()?])
     }
 }
 

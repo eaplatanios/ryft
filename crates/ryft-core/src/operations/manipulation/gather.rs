@@ -10,6 +10,7 @@ use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
+use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::primitive::gather_to_scatter_operation;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
@@ -830,6 +831,21 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         let _ = indentation;
         formatter.write_str(self.name())
+    }
+}
+
+impl<V, F> InterpretableOperation<ArrayType, V> for LinearGatherOperation<F>
+where
+    V: Value<ArrayType> + Gather,
+    F: CustomVjpResidual<ArrayType, V>,
+{
+    fn interpret(
+        &self,
+        _context: &<V as Value<ArrayType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].gather(&self.indices().residual_value()?, self.operation())?])
     }
 }
 
