@@ -2,19 +2,19 @@
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
-use syn::visit_mut::VisitMut;
 
 use crate::helpers::attributes::Attribute;
 use crate::helpers::generics::GenericsHelpers;
 use crate::helpers::hygiene::const_block;
-use crate::helpers::idents::IdentHelpers;
 use crate::helpers::receivers::replace_self_type;
 use crate::helpers::symbols::Symbol;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
-const TYPE_ATTRIBUTE: Symbol = Symbol::new("type");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, TYPE_ATTRIBUTE];
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
+const TRANSPOSABLE_OPERATION_ATTRIBUTE: Symbol = Symbol::new("transposable_operation");
+const BOUNDS_ATTRIBUTE: Symbol = Symbol::new("bounds");
+const VALID_TRANSPOSABLE_OPERATION_CONTAINER_ATTRIBUTES: [Symbol; 1] = [BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("crate");
 const DEFAULT_OPERATION_TYPE: Symbol = Symbol::new("__OperationType");
@@ -30,6 +30,9 @@ pub(crate) struct CodeGenerator {
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: syn::Type,
+
+    /// Extra where-predicates for the generated `TransposableOperation` implementation.
+    transposition_bounds: Vec<syn::WherePredicate>,
 
     /// Errors accumulated while validating and generating the derive output.
     errors: Vec<syn::Error>,
@@ -61,6 +64,7 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
+            transposition_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -69,6 +73,33 @@ impl CodeGenerator {
         }
 
         let code = generator.generate(&input);
+        if let Some(error) = generator.compile_error() {
+            return error.into();
+        }
+        code.into()
+    }
+
+    /// Generates the implementation for `#[derive(TransposableOperation)]`.
+    pub(crate) fn generate_transposable_operation_impl(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+        let mut input = syn::parse_macro_input!(input as syn::DeriveInput);
+        replace_self_type(&mut input);
+
+        let mut generator = CodeGenerator {
+            ryft_crate: DEFAULT_RYFT_CRATE.into(),
+            operation_type: syn::Type::Path(syn::TypePath {
+                qself: None,
+                path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
+            }),
+            transposition_bounds: Vec::new(),
+            errors: Vec::new(),
+        };
+        generator.extract_attributes(&input);
+        generator.extract_transposable_operation_attributes(&input);
+        if let Some(error) = generator.compile_error() {
+            return error.into();
+        }
+
+        let code = generator.generate_transposable_operation(&input);
         if let Some(error) = generator.compile_error() {
             return error.into();
         }
@@ -93,11 +124,9 @@ impl CodeGenerator {
     /// Extracts supported top-level `#[ryft(...)]` attributes.
     fn extract_attributes(&mut self, input: &syn::DeriveInput) {
         let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
-        let mut operation_type = Attribute::new(TYPE_ATTRIBUTE);
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
-                path if path == &TYPE_ATTRIBUTE => operation_type.set(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
@@ -110,10 +139,37 @@ impl CodeGenerator {
         if let Some(ryft_crate) = ryft_crate.get() {
             self.ryft_crate = ryft_crate;
         }
-        if let Some(operation_type) = operation_type.get() {
-            self.operation_type = operation_type;
-        } else {
-            self.add_error(&input.ident, "missing required '#[ryft(type = \"...\")]' attribute");
+        let inferred_types = unique_value_bound_arguments(&input.generics);
+        match inferred_types.as_slice() {
+            [operation_type] => self.operation_type = operation_type.clone(),
+            [] => self.add_error(
+                &input.ident,
+                "could not infer an operation type because no generic parameter is bounded by 'Value<T>'",
+            ),
+            _ => self.add_error(
+                &input.generics,
+                "could not infer a unique operation type because multiple distinct 'Value<T>' bounds are present",
+            ),
+        }
+    }
+
+    /// Extracts supported top-level `#[transposable_operation(...)]` attributes.
+    fn extract_transposable_operation_attributes(&mut self, input: &syn::DeriveInput) {
+        let mut bounds = Attribute::<Vec<syn::WherePredicate>>::new(BOUNDS_ATTRIBUTE);
+        input.attrs.iter().filter(|attr| attr.path() == &TRANSPOSABLE_OPERATION_ATTRIBUTE).for_each(|attr| {
+            attr.parse_nested_meta(|meta| match &meta.path {
+                path if path == &BOUNDS_ATTRIBUTE => bounds.set(&meta),
+                _ => Err(meta.error(format_args!(
+                    "invalid '#[transposable_operation(...)]' attribute: '{}'; these are the attributes that are \
+                        supported here: {:?}",
+                    meta.path.to_token_stream().to_string().replace(' ', ""),
+                    VALID_TRANSPOSABLE_OPERATION_CONTAINER_ATTRIBUTES,
+                ))),
+            })
+            .unwrap_or_else(|error| self.errors.push(error));
+        });
+        if let Some(bounds) = bounds.get() {
+            self.transposition_bounds.extend(bounds);
         }
     }
 
@@ -128,17 +184,16 @@ impl CodeGenerator {
         let conversion_generics = input.generics.without_defaults();
         let (_, conversion_ty_generics, _) = conversion_generics.split_for_impl();
         let conversion_self_type: syn::Type = syn::parse_quote!(#enum_name #conversion_ty_generics);
-        let pinned_parameter = self.pinned_parameter(&input.generics);
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
 
-        let operation_self_type = self.pinned_type(&conversion_self_type, pinned_parameter.as_ref());
-        let operation_generics = self.operation_generics(&input.generics, pinned_parameter.as_ref(), &variants);
+        let operation_self_type = conversion_self_type.clone();
+        let operation_generics = self.operation_generics(&input.generics, &variants);
         let (operation_impl_generics, _, operation_where_clause) = operation_generics.split_for_impl();
 
         let name_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = self.pinned_type(&variant.operation_type, pinned_parameter.as_ref());
+            let payload_operation_type = &variant.operation_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -148,7 +203,7 @@ impl CodeGenerator {
         });
         let infer_output_type_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = self.pinned_type(&variant.operation_type, pinned_parameter.as_ref());
+            let payload_operation_type = &variant.operation_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -161,7 +216,7 @@ impl CodeGenerator {
         });
         let render_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = self.pinned_type(&variant.operation_type, pinned_parameter.as_ref());
+            let payload_operation_type = &variant.operation_type;
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -222,6 +277,106 @@ impl CodeGenerator {
         })
     }
 
+    /// Generates the `TransposableOperation` derive output.
+    fn generate_transposable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
+        let variants = self.extract_variants(input);
+        if self.compile_error().is_some() {
+            return TokenStream::new();
+        }
+
+        let enum_name = &input.ident;
+        let conversion_generics = input.generics.without_defaults();
+        let (_, conversion_ty_generics, _) = conversion_generics.split_for_impl();
+        let conversion_self_type: syn::Type = syn::parse_quote!(#enum_name #conversion_ty_generics);
+        let ryft = &self.ryft_crate;
+        let primary_type = &self.operation_type;
+
+        let operation_self_type = conversion_self_type.clone();
+        let mut transposition_generics = self.operation_generics(&input.generics, &variants);
+        let Some(transposed_value_type) = transposed_value_type(&transposition_generics, primary_type) else {
+            self.add_error(
+                &input.generics,
+                format_args!(
+                    "could not infer the transposed value type for '#[derive(TransposableOperation)]'; expected a \
+                    generic type parameter bounded by 'Value<{}>'",
+                    primary_type.to_token_stream().to_string().replace(' ', ""),
+                ),
+            );
+            return TokenStream::new();
+        };
+
+        let transpose_bounds = variants.iter().filter_map(|variant| {
+            if bare_generic_parameter(&variant.operation_type, &input.generics).is_none() {
+                return None;
+            }
+            let operation_type = &variant.operation_type;
+            let predicate: syn::WherePredicate = syn::parse_quote! {
+                #operation_type: #ryft::TransposableOperation<#primary_type, #transposed_value_type, #operation_self_type>
+            };
+            Some(predicate)
+        });
+        let where_clause = transposition_generics.make_where_clause();
+        where_clause
+            .predicates
+            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
+        where_clause.predicates.extend(transpose_bounds);
+        where_clause.predicates.extend(self.transposition_bounds.iter().cloned());
+
+        let (transposition_impl_generics, _, transposition_where_clause) = transposition_generics.split_for_impl();
+        let transpose_arms = variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let operation_type = &variant.operation_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#operation_type as #ryft::TransposableOperation<
+                        #primary_type,
+                        #transposed_value_type,
+                        #operation_self_type,
+                    >>::transpose(#receiver, context, input_types, output_cotangents)
+                },
+            }
+        });
+
+        const_block(quote! {
+            #[automatically_derived]
+            impl #transposition_impl_generics
+                #ryft::TransposableOperation<#primary_type, #transposed_value_type, #operation_self_type>
+                for #operation_self_type
+            #transposition_where_clause
+            {
+                fn transpose<'__transpose>(
+                    &self,
+                    context: &mut #ryft::AbstractTracingContext<
+                        '__transpose,
+                        #primary_type,
+                        #transposed_value_type,
+                        #operation_self_type,
+                    >,
+                    input_types: &[&#primary_type],
+                    output_cotangents: &[#ryft::Cotangent<
+                        '__transpose,
+                        #primary_type,
+                        #transposed_value_type,
+                        #operation_self_type,
+                    >],
+                ) -> ::std::result::Result<
+                    ::std::vec::Vec<#ryft::Cotangent<
+                        '__transpose,
+                        #primary_type,
+                        #transposed_value_type,
+                        #operation_self_type,
+                    >>,
+                    #ryft::ProgramError,
+                > {
+                    match self {
+                        #(#transpose_arms)*
+                    }
+                }
+            }
+        })
+    }
+
     /// Extracts operation variants from an enum input.
     fn extract_variants(&mut self, input: &syn::DeriveInput) -> Vec<OperationVariant> {
         let syn::Data::Enum(data) = &input.data else {
@@ -263,70 +418,19 @@ impl CodeGenerator {
             .for_each(|attr| self.add_error(attr, NESTED_ATTRIBUTE_ERROR));
     }
 
-    /// Returns the enum generic type parameter that should be pinned to the operation type, if any.
-    fn pinned_parameter(&mut self, generics: &syn::Generics) -> Option<syn::Ident> {
-        let mut pinned_parameter = None;
-        for argument in value_bound_arguments(generics) {
-            let Some(parameter) = bare_generic_parameter(&argument, generics) else {
-                continue;
-            };
-            if type_is_ident(&self.operation_type, &parameter) {
-                continue;
-            }
-            match &pinned_parameter {
-                Some(existing) if existing != &parameter => {
-                    self.add_error(
-                        generics,
-                        "found multiple generic type parameters in 'Value<...>' bounds; the operation type pin is \
-                        ambiguous",
-                    );
-                    return None;
-                }
-                Some(_) => {}
-                None => pinned_parameter = Some(parameter),
-            }
-        }
-        pinned_parameter
-    }
-
     /// Builds the generics used by the generated `Operation` and `Display` impls.
-    fn operation_generics(
-        &self,
-        generics: &syn::Generics,
-        pinned_parameter: Option<&syn::Ident>,
-        variants: &[OperationVariant],
-    ) -> syn::Generics {
+    fn operation_generics(&self, generics: &syn::Generics, variants: &[OperationVariant]) -> syn::Generics {
         let mut generics = generics.without_defaults();
-        if let Some(pinned_parameter) = pinned_parameter {
-            generics.params = generics
-                .params
-                .iter()
-                .filter(|parameter| parameter.ident() != Some(pinned_parameter))
-                .cloned()
-                .collect();
-            TypeParameterSubstitution { parameter: pinned_parameter.clone(), concrete: self.operation_type.clone() }
-                .visit_generics_mut(&mut generics);
-        }
 
         let ryft = &self.ryft_crate;
         let primary_type = &self.operation_type;
         let generic_operation_bounds = variants.iter().filter(|variant| variant.skip_conversions).map(|variant| {
-            let operation_type = self.pinned_type(&variant.operation_type, pinned_parameter);
+            let operation_type = &variant.operation_type;
             let predicate: syn::WherePredicate = syn::parse_quote!(#operation_type: #ryft::Operation<#primary_type>);
             predicate
         });
         generics.make_where_clause().predicates.extend(generic_operation_bounds);
         generics
-    }
-
-    /// Applies the operation type pin to `ty`, if needed.
-    fn pinned_type(&self, ty: &syn::Type, pinned_parameter: Option<&syn::Ident>) -> syn::Type {
-        let mut ty = ty.clone();
-        if let Some(pinned_parameter) = pinned_parameter {
-            TypeParameterSubstitution { parameter: pinned_parameter.clone(), concrete: self.operation_type.clone() }
-                .visit_type_mut(&mut ty);
-        }
-        ty
     }
 
     /// Generates `From` and borrowed `TryFrom` impls for one conversion-enabled variant.
@@ -446,6 +550,43 @@ fn enum_type_ident(ty: &syn::Type) -> Option<&syn::Ident> {
     type_path.path.segments.first().map(|segment| &segment.ident)
 }
 
+/// Infers the value type parameter used by generated transposition.
+fn transposed_value_type(generics: &syn::Generics, operation_type: &syn::Type) -> Option<syn::Ident> {
+    generics
+        .type_params()
+        .find(|parameter| {
+            parameter.bounds.iter().any(|bound| {
+                value_bound_argument(bound).is_some_and(|argument| type_tokens_equal(&argument, operation_type))
+            }) || generics.where_clause.iter().any(|where_clause| {
+                where_clause.predicates.iter().any(|predicate| match predicate {
+                    syn::WherePredicate::Type(predicate) if type_is_ident(&predicate.bounded_ty, &parameter.ident) => {
+                        predicate.bounds.iter().any(|bound| {
+                            value_bound_argument(bound)
+                                .is_some_and(|argument| type_tokens_equal(&argument, operation_type))
+                        })
+                    }
+                    _ => false,
+                })
+            })
+        })
+        .map(|parameter| parameter.ident.clone())
+}
+
+/// Returns whether two types have the same token representation.
+fn type_tokens_equal(left: &syn::Type, right: &syn::Type) -> bool {
+    left.to_token_stream().to_string().replace(' ', "") == right.to_token_stream().to_string().replace(' ', "")
+}
+
+/// Extracts distinct `Value<T>` bound arguments from `generics`, preserving their first-seen order.
+fn unique_value_bound_arguments(generics: &syn::Generics) -> Vec<syn::Type> {
+    value_bound_arguments(generics).into_iter().fold(Vec::new(), |mut arguments, argument| {
+        if arguments.iter().all(|existing_argument| !type_tokens_equal(existing_argument, &argument)) {
+            arguments.push(argument);
+        }
+        arguments
+    })
+}
+
 /// Extracts all `Value<T>` bound arguments from `generics`.
 fn value_bound_arguments(generics: &syn::Generics) -> Vec<syn::Type> {
     let parameter_bounds = generics.type_params().flat_map(|parameter| parameter.bounds.iter());
@@ -480,30 +621,11 @@ fn value_bound_argument(bound: &syn::TypeParamBound) -> Option<syn::Type> {
     }
 }
 
-/// Rewrites one generic type parameter to a concrete type.
-struct TypeParameterSubstitution {
-    /// Generic type parameter to replace.
-    parameter: syn::Ident,
-
-    /// Concrete type to substitute.
-    concrete: syn::Type,
-}
-
-impl VisitMut for TypeParameterSubstitution {
-    fn visit_type_mut(&mut self, ty: &mut syn::Type) {
-        if type_is_ident(ty, &self.parameter) {
-            *ty = self.concrete.clone();
-            return;
-        }
-        syn::visit_mut::visit_type_mut(self, ty);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use quote::ToTokens;
 
-    use super::{bare_generic_parameter, boxed_inner_type, value_bound_arguments};
+    use super::{bare_generic_parameter, boxed_inner_type, unique_value_bound_arguments, value_bound_arguments};
 
     #[test]
     fn test_boxed_inner_type() {
@@ -540,6 +662,21 @@ mod tests {
         let arguments = value_bound_arguments(&input.generics);
         assert_eq!(arguments.len(), 2);
         assert_eq!(arguments[0].to_token_stream().to_string(), "T");
+        assert_eq!(arguments[1].to_token_stream().to_string(), "DataType");
+    }
+
+    #[test]
+    fn test_unique_value_bound_arguments() {
+        let input: syn::DeriveInput = syn::parse_quote! {
+            enum Operation<V: Value<ArrayType>, C, F>
+            where
+                C: Value<ArrayType>,
+                F: Value<DataType>,
+            {}
+        };
+        let arguments = unique_value_bound_arguments(&input.generics);
+        assert_eq!(arguments.len(), 2);
+        assert_eq!(arguments[0].to_token_stream().to_string(), "ArrayType");
         assert_eq!(arguments[1].to_token_stream().to_string(), "DataType");
     }
 }

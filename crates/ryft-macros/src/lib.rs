@@ -19,9 +19,23 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
     CodeGenerator::generate_parameterized_impl(input)
 }
 
-/// Generates an [`Operation`] implementation for an enum whose variants wrap operation payloads, along with a bunch
-/// of other implementations related to that [`Operation`] and the transformations that it supports.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Generates an operation enum dispatcher.
+///
+/// See the `ryft-core` documentation for the `Operation` trait for the full derive contract, including operation-type
+/// inference from `Value<T>` bounds, generated conversions, boxed payload handling, and supported `#[ryft(...)]`
+/// attributes.
 #[proc_macro_derive(Operation, attributes(ryft))]
 pub fn derive_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_operation_impl(input)
+}
+
+/// Generates a transposition dispatcher for a linear operation enum.
+///
+/// See the `ryft-core` documentation for the `TransposableOperation` trait for the full derive contract, including
+/// operation-type inference, generic extension bounds, and supported `#[transposable_operation(...)]` attributes.
+#[proc_macro_derive(TransposableOperation, attributes(ryft, transposable_operation))]
+pub fn derive_transposable_operation(input: TokenStream) -> TokenStream {
+    OperationCodeGenerator::generate_transposable_operation_impl(input)
 }
