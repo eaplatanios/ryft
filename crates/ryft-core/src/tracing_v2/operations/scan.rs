@@ -173,12 +173,9 @@ where
             })
         })?;
 
-        // Stage one linear scan over the materialized operand tangents and pair its outputs with the primal
-        // outputs of the residual-extended scan.
-        let tangent_operands = inputs
-            .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Stage one linear scan over the operand tangents and pair its outputs with the primal outputs of the
+        // residual-extended scan.
+        let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let linear_scan =
             LinearOperationOf::<D>::linear_scan_operation(body, stack_factors, carry_count, length, reverse, unroll)?;
         let tangent_outputs = context.stage_operation(linear_scan, tangent_operands.as_slice())?;
@@ -387,10 +384,9 @@ where
             y_slice_types.as_slice(),
             inputs,
             |stacked_type| {
-                let mut outputs = context.parent_context().stage_operation(
-                    C::Operation::from(ZeroOperation::new(stacked_type.clone())),
-                    &[] as &[Tracer<C>],
-                )?;
+                let mut outputs = context
+                    .parent_context()
+                    .stage_nullary_operation(C::Operation::from(ZeroOperation::new(stacked_type.clone())))?;
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(outputs.remove(0))
             },

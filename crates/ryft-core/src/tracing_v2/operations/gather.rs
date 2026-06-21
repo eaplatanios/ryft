@@ -7,7 +7,7 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, LinearGatherOperation, Reshape, Slice, Transpose,
     UpdateSlice,
@@ -26,7 +26,9 @@ impl<D> DifferentiableOperation<D> for GatherOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Gather,
-    LinearOperationOf<D>: From<LinearGatherOperation<CapturedFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>:
+        From<LinearGatherOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -35,20 +37,20 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [operand, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
         let primal = operand.primal().gather(indices.primal(), self)?;
-        if operand.tangent().is_zero() {
+        if context.is_zero(operand.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
         let indices_factor = indices.factor(context);
-        let operand_tangent = context.materialize_tangent(operand.tangent().clone())?;
         let mut outputs =
-            context.stage_operation(LinearGatherOperation::new(self.clone(), indices_factor), &[operand_tangent])?;
+            context.stage_operation(LinearGatherOperation::new(self.clone(), indices_factor), &[operand.tangent()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
     }

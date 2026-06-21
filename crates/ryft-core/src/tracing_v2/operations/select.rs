@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectCondition, SelectOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -159,8 +159,8 @@ where
 /// [`jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html): the primal output is
 /// `select(condition, on_true, on_false)` over the input primals, and the tangent is
 /// `select(condition, on_true_tangent, on_false_tangent)` with the same primal condition. The condition is Boolean,
-/// so its own tangent is identically zero and is ignored. When both branch tangents are symbolic
-/// [`Tangent::Zero`]s, the output tangent is a symbolic zero of the output type and no linear operation is staged;
+/// so its own tangent is identically zero and is ignored. When both branch tangents are canonical staged zeros, the
+/// output tangent is a canonical staged zero of the output type and no linear operation is staged;
 /// otherwise the rule captures the condition as a residual factor and stages the captured-condition select provided
 /// by [`LinearSelectOperation`].
 impl<D> DifferentiableOperation<D> for SelectOperation
@@ -168,7 +168,8 @@ where
     D: DifferentiationContext,
     SelectOperation: Operation<D::Type>,
     D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
-    LinearOperationOf<D>: From<LinearSelectOperation<CapturedFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<LinearSelectOperation<CapturedFactor<D::Type, D::Value>>> + From<ZeroOperation<D::Type>>,
+    LinearOperationOf<D>: HasZeroOperation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,
@@ -177,22 +178,21 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
     {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
         let on_true = &inputs[1];
         let on_false = &inputs[2];
         let primal = D::Value::select(&condition.primal().select_condition()?, on_true.primal(), on_false.primal())?;
-        if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
+        if context.is_zero(on_true.tangent())? && context.is_zero(on_false.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
         let condition_factor = condition.factor(context);
-        let on_true_tangent = context.materialize_tangent(on_true.tangent().clone())?;
-        let on_false_tangent = context.materialize_tangent(on_false.tangent().clone())?;
         let mut outputs = context
-            .stage_operation(LinearSelectOperation::new(condition_factor), &[on_true_tangent, on_false_tangent])?;
+            .stage_operation(LinearSelectOperation::new(condition_factor), &[on_true.tangent(), on_false.tangent()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
     }

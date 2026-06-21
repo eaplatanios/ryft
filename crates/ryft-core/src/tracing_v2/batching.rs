@@ -10,7 +10,7 @@ use crate::batching::BatchingError;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, ProvidesContext, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
-use crate::macros::check_count;
+use crate::macros::{check_builders, check_count};
 use crate::operations::manipulation::{Broadcast, Transpose, TransposeOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
@@ -253,13 +253,9 @@ impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {
 ///     common input axis. For axis-arg operations, the output axis follows from the lifted
 ///     axis arguments (see the per-op helpers in `tracing_v2::operations` — `lift_dot_dimensions`,
 ///     `lift_permutation`, `lift_reshape_shapes`).
-///   - **Symbolic-zero short-circuit.** When `V` is
-///     [`Tangent<ArrayType, V'>`](crate::differentiation::Tangent), the rule on
-///     [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) materializes `Tangent::Zero` once via
-///     `V::zero` and dispatches to
-///     the underlying V-level rule. Tangent's V-trait impls (`Add`, `Sub`, `Scale`, `Neg`,
-///     `LeftDot`, `RightDot`, `Reshape`, `Transpose`) propagate `Zero` correctly, so the
-///     short-circuit happens automatically.
+///   - **Zero propagation.** Linear batching rules preserve zero tangent payloads through the operation-specific
+///     semantics of [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation); canonical staged zeros are
+///     handled before batching reaches concrete value-level interpretation.
 ///   - **Missing rule.** Variants without a defined batching rule (for example, a while-loop
 ///     whose loop predicate varies across lanes) return [`BatchingError::UnsupportedOperation`]
 ///     with a human-readable message that points at a likely fix.
@@ -982,9 +978,8 @@ where
         inputs: &[I],
     ) -> Result<Vec<Tracer<Self>>, ProgramError> {
         let operation = operation.into();
-        if inputs.iter().any(|input| !Rc::ptr_eq(self.builder(), input.borrow().context().builder())) {
-            return Err(self.error(ProgramError::MismatchedProgramBuilders));
-        }
+        check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
+            .map_err(|error| self.error(error))?;
         if self.builder().borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
@@ -1000,7 +995,7 @@ where
         // input list and surface the resulting parent atoms as lane-uniform tracers (no entry in
         // `axis_table`).
         if inputs.is_empty() {
-            let parent_outputs = self.parent_context.stage_operation::<_, &Tracer<C>>(operation, &[])?;
+            let parent_outputs = self.parent_context.stage_nullary_operation(operation)?;
             return Ok(parent_outputs
                 .into_iter()
                 .map(|parent_tracer| -> Result<Tracer<Self>, ProgramError> {
@@ -1065,19 +1060,8 @@ where
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = C::LinearOperation<V, F>;
 
     #[inline]
-    fn zero_tangent(&self, type_: &ArrayType) -> Result<Tracer<BatchingContext<C>>, ProgramError> {
-        let value = self.parent_context.zero_tangent(type_)?;
-        let atom = value.atom_id()?;
-        Ok(self.tracer(atom, Some(type_.clone())))
-    }
-
-    #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
-        if Rc::ptr_eq(self.builder(), primal.context().builder()) {
-            Ok(())
-        } else {
-            Err(self.error(ProgramError::MismatchedProgramBuilders))
-        }
+        check_builders!(self.builder(), primal.context().builder()).map_err(|error| self.error(error))
     }
 
     /// Differentiation through a batching context is only available when the parent context is itself a staging
@@ -1517,7 +1501,6 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
-    use crate::differentiation::Tangent;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::constants::OneLike;
     use crate::operations::control_flow::ConditionOperation;
@@ -1584,27 +1567,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
-    }
-
-    #[test]
-    fn test_apply_with_axes_uses_batching_context_for_symbolic_zero_tangents() {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-        let parent_context = TracingContext::new(&TestArrayDomain, builder);
-        let batching_context = BatchingContext::new(parent_context, 3);
-        let physical_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let zero_value: Tangent<ArrayType, Tracer<TracingContext<'_, TestArrayDomain>>> =
-            Tangent::zero(physical_type.clone());
-        let zero_input = ArrayBatch::new(physical_type.clone(), zero_value, Some(0)).unwrap();
-        let interpretation_context = batching_context.parent_context().clone();
-
-        let outputs =
-            apply_with_axes(&interpretation_context, &AddOperation, &[zero_input.clone(), zero_input], &[Some(0)])
-                .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert_eq!(outputs[0].r#type().into_owned(), physical_type);
-        assert!(outputs[0].value().is_zero());
     }
 
     #[test]
@@ -2189,8 +2151,7 @@ mod tests {
                     let zero_op = ArrayOperation::<ArrayType, TestArray>::Zero(
                         crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
                     );
-                    let no_inputs: &[&BatchingTracer<'_, _>] = &[];
-                    let zero = x.context().stage_operation(zero_op, no_inputs)?.into_iter().next().unwrap();
+                    let zero = x.context().stage_nullary_operation(zero_op)?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),

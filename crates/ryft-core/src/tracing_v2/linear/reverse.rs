@@ -3,12 +3,12 @@ use std::fmt::Debug;
 use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationTracer, ProgramLinearizableOperation, ResidualizedOperation,
 };
-use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, ProvidesContext, Type, Typed, Value};
+use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, ProvidesContext, Type, Typed, Value, Zero};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -45,8 +45,8 @@ where
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
+    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D> + HasZeroOperation<<D as Domain>::Type>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
     // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
@@ -95,8 +95,8 @@ where
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
+    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D> + HasZeroOperation<<D as Domain>::Type>,
 {
     value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
 }
@@ -140,14 +140,15 @@ where
         > + 'domain,
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
-    D::Tangent: One<<D as Domain>::Type>,
+    D::Tangent: One<<D as Domain>::Type> + Zero<<D as Domain>::Type>,
     <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
+    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
+    LinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -161,7 +162,7 @@ where
     let context = domain.context();
     let aux_zeros = aux
         .parameters()
-        .map(|value| domain.zero_tangent(value.r#type().as_ref()))
+        .map(|value| D::Tangent::zero(value.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let aux_cotangent =
         <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)
@@ -207,14 +208,15 @@ where
         > + 'domain,
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
-    D::Tangent: One<<D as Domain>::Type>,
+    D::Tangent: One<<D as Domain>::Type> + Zero<<D as Domain>::Type>,
     <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    for<'a> &'a ZeroOperation<<D as Domain>::Type>: TryFrom<&'a DirectLinearOperationOf<D>>,
+    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
+    LinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -341,7 +343,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
-        Zero(TestType),
+        Zero(ZeroOperation<TestType>),
         Add,
         Neg,
         Scale { factor: TestValue },
@@ -416,7 +418,7 @@ mod tests {
     where
         D: DifferentiationContext<Type = TestType, Constant = TestValue> + Domain<Operation = TestDomainOperation>,
         D::Value: Add<Output = D::Value>,
-        LinearOperationOf<D>: From<AddOperation>,
+        LinearOperationOf<D>: From<AddOperation> + From<ZeroOperation<TestType>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -431,7 +433,9 @@ mod tests {
                     check_count!("input", inputs, 0, ProgramError);
                     let mut primals = context.bind_primal(Self::Zero(r#type.clone()), &[])?;
                     check_count!("output", primals, 1, ProgramError);
-                    Ok(vec![JvpTracer::from_zero_tangent(primals.pop().expect("checked above"), r#type.clone())])
+                    let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(r#type.clone()))?;
+                    check_count!("output", tangent_outputs, 1, ProgramError);
+                    Ok(vec![JvpTracer::new(primals.pop().expect("checked above"), tangent_outputs.remove(0))])
                 }
                 Self::Add => {
                     check_count!("input", inputs, 2, ProgramError);
@@ -495,7 +499,18 @@ mod tests {
 
     impl From<ZeroOperation<TestType>> for TestLinearOperation {
         fn from(operation: ZeroOperation<TestType>) -> Self {
-            Self::Zero(operation.r#type().clone())
+            Self::Zero(operation)
+        }
+    }
+
+    impl<'operation> TryFrom<&'operation TestLinearOperation> for &'operation ZeroOperation<TestType> {
+        type Error = ();
+
+        fn try_from(value: &'operation TestLinearOperation) -> Result<Self, ()> {
+            match value {
+                TestLinearOperation::Zero(operation) => Ok(operation),
+                _ => Err(()),
+            }
         }
     }
 
@@ -585,12 +600,6 @@ mod tests {
     impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
         type LinearOperation<V: Value<TestType>, F: Value<TestType>> = TestLinearOperation;
-
-        fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
-            let mut outputs = self.bind(ZeroOperation::new(type_.clone()), &[])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs.pop().expect("zero operation produces exactly one output"))
-        }
     }
 
     impl ProvidesContext<<TestValue as Value<TestType>>::InterpretationContext> for TestDomain {

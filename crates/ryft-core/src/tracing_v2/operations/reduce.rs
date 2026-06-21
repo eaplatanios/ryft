@@ -108,34 +108,6 @@ where
     }
 }
 
-/// Symbolic-zero-aware reduce: `Zero[type].reduce(axes, kind) -> Zero[reduced_type]`.
-///
-/// Sum/Max/Min/Mean of symbolic zero are zero; Any/All of symbolic zero are unsupported on the
-/// tangent space and are not produced by autodiff in practice. We preserve the symbolic-zero
-/// metadata uniformly here and rely on type inference for the reduced shape. The output-sharding variant forwards
-/// through the symbolic-zero match so the requested sharding reaches the wrapped value instead of being dropped.
-impl<V: Value<ArrayType> + Reduce> Reduce for crate::differentiation::Tangent<ArrayType, V> {
-    fn reduce(&self, axes: &[usize], kind: ReductionKind) -> Self {
-        match self {
-            Self::Zero(r#type) => match reduce_abstract(r#type, axes, kind, "reduce") {
-                Ok(reduced_type) => Self::Zero(reduced_type),
-                Err(_) => Self::Zero(r#type.clone()),
-            },
-            Self::Value(value) => Self::Value(value.reduce(axes, kind)),
-        }
-    }
-
-    fn reduce_with_output_sharding(&self, axes: &[usize], kind: ReductionKind, output_sharding: &Sharding) -> Self {
-        match self {
-            Self::Zero(r#type) => match reduce_abstract(r#type, axes, kind, "reduce") {
-                Ok(reduced_type) => Self::Zero(reduced_type),
-                Err(_) => Self::Zero(r#type.clone()),
-            },
-            Self::Value(value) => Self::Value(value.reduce_with_output_sharding(axes, kind, output_sharding)),
-        }
-    }
-}
-
 /// Returns the output [`ArrayType`] produced by reducing `input` along `axes` with `kind`.
 ///
 /// Validates that:
@@ -1112,7 +1084,6 @@ mod tests {
         use std::collections::HashMap;
         use std::rc::Rc;
 
-        use crate::differentiation::Tangent;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tests::{TestArray, TestArrayDomain};
@@ -1146,10 +1117,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outputs[0].primal().values(), expected_primal);
-        let tangent_atom = match outputs[0].tangent() {
-            Tangent::Value(tracer) => tracer.atom_id().unwrap(),
-            Tangent::Zero(_) => panic!("max/min jvp should produce a concrete tangent"),
-        };
+        let tangent_atom = outputs[0].tangent().atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();

@@ -1,8 +1,9 @@
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
+use crate::operations::constants::ZeroOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
 use crate::types::ArrayType;
 
@@ -11,16 +12,18 @@ impl<D> ZeroTangentOperation<D> for NotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Not<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`NotOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
 impl<D> DifferentiableOperation<D> for NotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Not<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -40,16 +43,18 @@ impl<D> ZeroTangentOperation<D> for AndOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitAnd<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`AndOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
 impl<D> DifferentiableOperation<D> for AndOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitAnd<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -69,16 +74,18 @@ impl<D> ZeroTangentOperation<D> for OrOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitOr<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`OrOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
 impl<D> DifferentiableOperation<D> for OrOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitOr<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -98,16 +105,18 @@ impl<D> ZeroTangentOperation<D> for XorOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitXor<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`XorOperation`]: the Boolean primal output is computed from the input primals and paired
-/// with a symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
+/// with a canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
 impl<D> DifferentiableOperation<D> for XorOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitXor<Output = D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(

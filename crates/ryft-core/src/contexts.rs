@@ -3,6 +3,8 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::domains::Domain;
+use crate::macros::check_builders;
+use crate::operations::constants::HasZeroOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -18,7 +20,7 @@ use crate::types::{Type, Typed};
 ///   [`Context::bind`] interprets the operation immediately and there is no [`ProgramBuilder`] involved anywhere.
 ///   Eager backends implement [`Context`] directly. An eager context is also where interpreters and program transforms
 ///   synthesize a type's additive or multiplicative identity from metadata alone, via `bind(ZeroOperation, &[])` or
-///   `bind(OneOperation, &[])`.
+///   `bind(OneOperation, &[])`).
 /// - [**Staging**](StagingContext) contexts, whose flowing [`Domain::Value`] is a [`Tracer`] into an active
 ///   [`ProgramBuilder`]. [`Context::bind`] records the operation as a program instruction. Ordinary tracing appends
 ///   the operation to a program. Transform contexts such as batching or linearization intercept the same bind, update
@@ -160,6 +162,39 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         error
     }
 
+    /// Returns `true` if the provided [`Tracer`] is produced by a nullary
+    /// [`ZeroOperation`](crate::operations::constants::ZeroOperation) in this [`StagingContext`].
+    /// Structural zero recognition is intentionally narrow: inputs, constants, non-zero operations, and malformed
+    /// non-nullary zero operations are not treated as **canonical** zeros. Callers that need broader algebraic
+    /// simplification should perform it in [`Operation`]-owned rules rather than weakening this definition.
+    fn is_zero(&self, tracer: &Tracer<Self>) -> Result<bool, ProgramError>
+    where
+        Self::Operation: HasZeroOperation<Self::Type>,
+    {
+        check_builders!(self.builder(), tracer.context().builder()).map_err(|error| self.error(error))?;
+        let atom = tracer.atom_id()?;
+        let builder = self.builder().borrow();
+        if builder.atoms().get(atom.index()).is_none() {
+            return Err(ProgramError::UnboundAtomId { id: atom });
+        }
+        for instruction in builder.instructions() {
+            if instruction.outputs().contains(&atom) {
+                return Ok(instruction.inputs().is_empty() && instruction.operation().zero_operation().is_some());
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stages an application of the provided **nullary** [`Operation`] (i.e., an operation with no inputs) in this
+    /// [`StagingContext`] and returns [`Tracer`]s for its outputs.
+    #[inline]
+    fn stage_nullary_operation<O: Into<Self::Operation>>(
+        &self,
+        operation: O,
+    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        self.stage_operation::<O, Tracer<Self>>(operation, &[])
+    }
+
     /// Stages an application of the provided [`Operation`] in this context and returns [`Tracer`]s for its outputs.
     fn stage_operation<O: Into<Self::Operation>, I: std::borrow::Borrow<Tracer<Self>>>(
         &self,
@@ -167,9 +202,8 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         inputs: &[I],
     ) -> Result<Vec<Tracer<Self>>, ProgramError> {
         let operation = operation.into();
-        if inputs.iter().any(|input| !Rc::ptr_eq(self.builder(), input.borrow().context().builder())) {
-            return Err(self.error(ProgramError::MismatchedProgramBuilders));
-        }
+        check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
+            .map_err(|error| self.error(error))?;
         if self.builder().borrow().error.is_some() {
             let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
             let output_types = operation.infer_output_types(input_types.as_slice())?;
@@ -223,4 +257,213 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
     }
 }
 
-// TODO(eaplatanios): Add unit tests.
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use pretty_assertions::assert_eq;
+
+    use crate::operations::arithmetic::{AddOperation, NegOperation};
+    use crate::operations::constants::{HasZeroOperation, OneOperation, ZeroOperation};
+    use crate::operations::scalars::ScalarOperation;
+    use crate::parameters::Placeholder;
+    use crate::programs::{Atom, AtomId, Instruction, ProgramBuilder, ProgramError};
+    use crate::scalars::ScalarDomain;
+    use crate::tracing::{TracerState, TracingContext};
+    use crate::types::{DataType, Typed};
+
+    use super::{Context, EagerContext, StagingContext};
+
+    #[test]
+    fn test_eager_context_binds_and_lifts_values() {
+        let context = EagerContext::<DataType, f64, ScalarOperation<f64>>::new();
+        let default_context = EagerContext::<DataType, f64, ScalarOperation<f64>>::default();
+        let copied_context = context;
+        let cloned_context = copied_context.clone();
+
+        assert_eq!(format!("{context:?}"), "EagerContext");
+        assert_eq!(format!("{default_context:?}"), "EagerContext");
+        assert_eq!(format!("{cloned_context:?}"), "EagerContext");
+        assert_eq!(context.lift(2.5), Ok(2.5));
+        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0]));
+        assert_eq!(context.bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0]));
+        assert_eq!(context.bind(AddOperation, &[2.0, 3.5]), Ok(vec![5.5]));
+    }
+
+    #[test]
+    fn test_staging_context_creates_inputs_constants_and_tracers() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+
+        let input = context.input(DataType::F64);
+        let constant = context.constant(2.5);
+        let builder_typed = context.tracer(AtomId::new(0), None);
+        let cached_typed = context.tracer(AtomId::new(0), Some(DataType::F64));
+
+        assert_eq!(input.atom_id(), Ok(AtomId::new(0)));
+        assert_eq!(constant.atom_id(), Ok(AtomId::new(1)));
+        assert_eq!(input.r#type().into_owned(), DataType::F64);
+        assert_eq!(constant.r#type().into_owned(), DataType::F64);
+        assert!(matches!(builder_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+        assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
+
+        let builder = builder.borrow();
+        assert_eq!(builder.input_ids(), &[AtomId::new(0)]);
+        assert!(builder.instructions().is_empty());
+        assert!(matches!(&builder.atoms()[0], Atom::Variable(r#type) if *r#type == DataType::F64));
+        assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == 2.5));
+    }
+
+    #[test]
+    fn test_staging_context_stages_nullary_and_regular_operations() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+
+        let mut nullary_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
+        assert_eq!(nullary_outputs.len(), 1);
+        let zero = nullary_outputs.remove(0);
+        assert_eq!(zero.atom_id(), Ok(AtomId::new(0)));
+        assert_eq!(zero.r#type().into_owned(), DataType::F64);
+
+        let lhs = context.input(DataType::F64);
+        let rhs = context.input(DataType::F64);
+        let mut add_outputs = context.stage_operation(AddOperation, &[&lhs, &rhs]).unwrap();
+        assert_eq!(add_outputs.len(), 1);
+        let sum = add_outputs.remove(0);
+        assert_eq!(sum.atom_id(), Ok(AtomId::new(3)));
+        assert_eq!(sum.r#type().into_owned(), DataType::F64);
+
+        {
+            let builder = builder.borrow();
+            assert_eq!(builder.instructions().len(), 2);
+            assert_eq!(builder.instructions()[0].inputs(), &[]);
+            assert_eq!(builder.instructions()[0].outputs(), &[AtomId::new(0)]);
+            assert!(builder.instructions()[0].operation().zero_operation().is_some());
+            assert_eq!(builder.instructions()[1].inputs(), &[AtomId::new(1), AtomId::new(2)]);
+            assert_eq!(builder.instructions()[1].outputs(), &[AtomId::new(3)]);
+        }
+
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(f64, f64), f64>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret((2.0, 3.5)), Ok(5.5));
+    }
+
+    #[test]
+    fn test_staging_context_records_errors_and_returns_poisoned_outputs_after_failure() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let input = context.input(DataType::F64);
+
+        let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
+        assert_eq!(context.error(first_error.clone()), first_error);
+        assert_eq!(context.error(second_error.clone()), second_error);
+        assert_eq!(builder.borrow().error().cloned(), Some(first_error.clone()));
+
+        let mut outputs = context.stage_operation(NegOperation, &[&input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.remove(0);
+        assert_eq!(output.state(), &TracerState::Poison);
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+        assert_eq!(builder.borrow().error().cloned(), Some(first_error));
+
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let input = context.input(DataType::F64);
+        let foreign_context = TracingContext::new(&domain, foreign_builder);
+        let foreign_input = foreign_context.input(DataType::F64);
+
+        assert!(matches!(
+            context.stage_operation(AddOperation, &[&input, &foreign_input]),
+            Err(ProgramError::MismatchedProgramBuilders),
+        ));
+        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_staging_context_stages_programs_by_lifting_constants_and_replaying_instructions() {
+        let mut source_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let source_input = source_builder.add_input(DataType::F64);
+        let source_constant = source_builder.add_constant(4.0);
+        let source_output =
+            source_builder.add_instruction(AddOperation, vec![source_input, source_constant]).unwrap()[0];
+        let source_program = source_builder.build::<f64, f64>(vec![source_output], Placeholder, Placeholder).unwrap();
+
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let input = context.input(DataType::F64);
+        let mut outputs = context.stage_program(&source_program, vec![input]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.remove(0);
+        assert_eq!(output.atom_id(), Ok(AtomId::new(2)));
+        assert_eq!(output.r#type().into_owned(), DataType::F64);
+
+        {
+            let builder = builder.borrow();
+            assert_eq!(builder.atoms().len(), 3);
+            assert_eq!(builder.instructions().len(), 1);
+            assert!(matches!(&builder.atoms()[1], Atom::Constant(value) if *value == 4.0));
+            assert_eq!(builder.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(1)]);
+            assert_eq!(builder.instructions()[0].outputs(), &[AtomId::new(2)]);
+        }
+
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<f64, f64>(vec![output.atom_id().unwrap()], Placeholder, Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret(3.0), Ok(7.0));
+    }
+
+    #[test]
+    fn test_staging_context_is_zero_recognizes_only_nullary_zero_operations_in_the_same_builder() {
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let input = context.input(DataType::F64);
+        let constant = context.constant(1.0);
+        let mut zero_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
+        let zero = zero_outputs.remove(0);
+        let mut add_outputs = context.stage_operation(AddOperation, &[&input, &zero]).unwrap();
+        let add_output = add_outputs.remove(0);
+        let malformed_zero_output = {
+            let mut builder = builder.borrow_mut();
+            let output = builder.add_variable(DataType::F64);
+            builder.add_instruction_unchecked(Instruction::new(
+                ScalarOperation::from(ZeroOperation::new(DataType::F64)),
+                vec![input.atom_id().unwrap()],
+                vec![output],
+            ));
+            output
+        };
+        let malformed_zero = context.tracer(malformed_zero_output, None);
+
+        assert!(!context.is_zero(&input).unwrap());
+        assert!(!context.is_zero(&constant).unwrap());
+        assert!(context.is_zero(&zero).unwrap());
+        assert!(!context.is_zero(&add_output).unwrap());
+        assert!(!context.is_zero(&malformed_zero).unwrap());
+        assert_eq!(
+            context.is_zero(&context.tracer(AtomId::new(999), Some(DataType::F64))),
+            Err(ProgramError::UnboundAtomId { id: AtomId::new(999) }),
+        );
+        assert_eq!(builder.borrow().error(), None);
+
+        let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let foreign_context = TracingContext::new(&domain, foreign_builder);
+        let foreign_input = foreign_context.input(DataType::F64);
+        assert_eq!(context.is_zero(&foreign_input), Err(ProgramError::MismatchedProgramBuilders));
+        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+}

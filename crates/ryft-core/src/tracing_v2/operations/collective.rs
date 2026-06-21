@@ -238,7 +238,7 @@ where
             inputs[0]
                 .value()
                 .context()
-                .stage_operation::<_, &Tracer<C>>(FillOperation::new(factor_type, inverse_axis_size), &[])?
+                .stage_nullary_operation(FillOperation::new(factor_type, inverse_axis_size))?
                 .into_iter()
                 .next()
                 .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }.into())

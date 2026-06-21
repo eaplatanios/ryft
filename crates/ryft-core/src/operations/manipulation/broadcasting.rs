@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -257,15 +256,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> B
             .stage_operation(BroadcastOperation::new(output_type, output_axes.to_vec()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-impl<V: Value<ArrayType> + Broadcast> Broadcast for Tangent<ArrayType, V> {
-    fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        match self {
-            Self::Zero(r#type) => Ok(Self::Zero(r#type.broadcast(output_type, output_axes)?)),
-            Self::Value(value) => Ok(Self::Value(value.broadcast(output_type, output_axes)?)),
-        }
     }
 }
 

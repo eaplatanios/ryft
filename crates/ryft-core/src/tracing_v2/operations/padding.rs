@@ -2,7 +2,7 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::SubOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, Pad, PadOperation, Reshape, Slice, SliceOperation, Transpose, UpdateSlice,
 };
@@ -121,14 +121,14 @@ where
 
 /// JVP rule for [`PadOperation`]: the operation is jointly linear in its input and padding-value operands, so the
 /// tangent is the pad of the input tangent that uses the padding-value tangent as its padding value, at the same
-/// padding geometry. When both operand tangents are symbolic
-/// [`Tangent::Zero`](crate::differentiation::Tangent::Zero)s, the output tangent is a symbolic zero of the output
-/// type and no linear operation is staged.
+/// padding geometry. When both operand tangents are canonical staged zeros, the output tangent is a canonical staged
+/// zero of the output type and no linear operation is staged.
 impl<D> DifferentiableOperation<D> for PadOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Pad,
-    LinearOperationOf<D>: From<PadOperation>,
+    LinearOperationOf<D>: From<PadOperation> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -137,7 +137,6 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
@@ -148,19 +147,19 @@ where
             self.edge_padding_high(),
             self.interior_padding(),
         )?;
-        if input.tangent().is_zero() && padding_value.tangent().is_zero() {
+        if context.is_zero(input.tangent())? && context.is_zero(padding_value.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
-        let input_tangent = context.materialize_tangent(input.tangent().clone())?;
-        let padding_value_tangent = context.materialize_tangent(padding_value.tangent().clone())?;
         let mut outputs = context.stage_operation(
             PadOperation::new(
                 self.edge_padding_low().to_vec(),
                 self.edge_padding_high().to_vec(),
                 self.interior_padding().to_vec(),
             )?,
-            &[input_tangent, padding_value_tangent],
+            &[input.tangent(), padding_value.tangent()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])

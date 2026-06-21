@@ -4,7 +4,6 @@ use std::marker::PhantomData;
 use half::{bf16, f16};
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -152,18 +151,6 @@ impl<C: StagingContext<Operation: From<ScaleOperation<C::Type, F>>>, F: Value<C:
     #[inline]
     fn scale(&self, factor: F) -> Self::Output {
         self.unary(ScaleOperation::new(factor))
-    }
-}
-
-impl<T: Type, V: Value<T> + Scale<Factor, Output = V>, Factor> Scale<Factor> for Tangent<T, V> {
-    type Output = Self;
-
-    #[inline]
-    fn scale(&self, factor: Factor) -> Self::Output {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type.clone()),
-            Self::Value(value) => Self::Value(value.scale(factor)),
-        }
     }
 }
 

@@ -2,11 +2,12 @@ use std::fmt::Display;
 
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
 use crate::types::{ArrayType, TypeError};
 
@@ -93,6 +94,8 @@ impl<D: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<Arra
 
 impl<D: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, D::Value>>
     DifferentiableOperation<D> for RecomputeOperation<O>
+where
+    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -144,14 +147,13 @@ mod tests {
     use std::rc::Rc;
 
     use crate::contexts::StagingContext;
-    use crate::differentiation::Tangent;
     use crate::domains::AbstractDomain;
     use crate::operations::arithmetic::AddOperation;
     use crate::programs::ProgramBuilder;
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::LinearOperationOf;
     use crate::tracing_v2::operations::{ArrayOperation, LinearArrayOperation};
-    use crate::types::DataType;
+    use crate::types::{DataType, Typed};
 
     use super::*;
 
@@ -177,8 +179,9 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &TestArray::scalar(5.0));
-        assert!(matches!(outputs[0].tangent(), Tangent::Zero(r#type) if r#type == &scalar_type));
-        assert!(builder.borrow().instructions().is_empty());
+        assert_eq!(outputs[0].tangent().r#type().into_owned(), scalar_type);
+        assert!(context.is_zero(outputs[0].tangent()).unwrap());
+        assert_eq!(builder.borrow().instructions().len(), 1);
     }
 
     #[test]

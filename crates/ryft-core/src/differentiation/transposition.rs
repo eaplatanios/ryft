@@ -4,10 +4,10 @@ use std::rc::Rc;
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{Cotangent, DifferentiableType};
 use crate::domains::AbstractDomain;
-use crate::macros::check_count;
+use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
@@ -46,7 +46,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 impl<
     T: DifferentiableType,
     V: Value<T>,
-    O: TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: TransposableOperation<T, V, O> + HasZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
@@ -97,6 +97,7 @@ impl<'context, C: Context<Type: DifferentiableType, Operation: From<ZeroOperatio
         Input: Parameterized<DomainTracer<'context, C>>,
         Output: Parameterized<DomainTracer<'context, C>>,
         O: TransposableOperation<C::Type, DomainTracer<'context, C>, O>
+            + HasZeroOperation<C::Type>
             + From<ZeroOperation<C::Type>>
             + From<AddOperation>,
     >(
@@ -114,7 +115,7 @@ impl<
     'domain,
     T: 'domain + Type + DifferentiableType,
     V: 'domain + Value<T>,
-    O: 'domain + TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: 'domain + TransposableOperation<T, V, O> + HasZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
 > TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
@@ -221,12 +222,13 @@ impl<
             // structural zeros so transpose rules can distinguish unused outputs without staging zero operations.
             instruction_output_cotangents.clear();
             for output in instruction.outputs().iter().copied() {
-                instruction_output_cotangents.push(
-                    match adjoints.get(output.index()).copied().ok_or(ProgramError::UnboundAtomId { id: output })? {
-                        Some(atom) => Cotangent::staged(self.tracer(atom, None)),
-                        None => Cotangent::Zero,
-                    },
-                );
+                let cotangent = adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
+                let cotangent = cotangent.map(|atom| self.tracer(atom, None));
+                instruction_output_cotangents.push(match cotangent {
+                    Some(cotangent) if self.is_zero(&cotangent)? => Cotangent::Zero,
+                    Some(cotangent) => Cotangent::staged(cotangent),
+                    None => Cotangent::Zero,
+                });
             }
 
             // Apply the primitive transpose rule and require exactly one cotangent contribution per primal input. This
@@ -252,10 +254,8 @@ impl<
             check_count!("input", input_cotangents, instruction.inputs().len(), ProgramError);
             for (input, contribution) in instruction.inputs().iter().copied().zip(input_cotangents) {
                 if let Some(contribution) = contribution.as_staged() {
-                    // Staged contributions must belong to this pullback builder before their atom IDs can be accumulated.
-                    if !Rc::ptr_eq(&builder, contribution.builder()) {
-                        return Err(ProgramError::MismatchedProgramBuilders);
-                    }
+                    // Staged contributions must belong to this builder before their atom IDs can be accumulated.
+                    check_builders!(&builder, contribution.builder())?;
                     accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution.atom_id()?)?;
                 }
             }

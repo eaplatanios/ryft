@@ -1,20 +1,24 @@
 use std::ops::{Div, Mul, Neg};
 
-use crate::differentiation::Tangent;
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, DivOperation, Scale, ScaleOperation};
-use crate::operations::constants::OneLike;
+use crate::operations::constants::{HasZeroOperation, OneLike, ZeroOperation};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::types::Typed;
 
 impl<D> DifferentiableOperation<D> for DivOperation
 where
     D: DifferentiationContext,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
-    LinearOperationOf<D>: From<AddOperation> + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: HasZeroOperation<D::Type>
+        + From<AddOperation>
+        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>
+        + From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -27,17 +31,30 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
+        let primal = left.primal().clone() / right.primal().clone();
         let left_factor = right.primal().one_like() / right.primal().clone();
         let right_factor = -(left.primal().clone() / (right.primal().clone() * right.primal().clone()));
-        let left_term = match left.tangent().clone() {
-            Tangent::Zero(r#type) => Tangent::Zero(r#type),
-            Tangent::Value(tangent) => Tangent::Value(tangent.scale(context.factor(left_factor))),
+        let left_term = if context.is_zero(left.tangent())? {
+            None
+        } else {
+            Some(left.tangent().clone().scale(context.factor(left_factor)))
         };
-        let right_term = match right.tangent().clone() {
-            Tangent::Zero(r#type) => Tangent::Zero(r#type),
-            Tangent::Value(tangent) => Tangent::Value(tangent.scale(context.factor(right_factor))),
+        let right_term = if context.is_zero(right.tangent())? {
+            None
+        } else {
+            Some(right.tangent().clone().scale(context.factor(right_factor)))
         };
-        Ok(vec![JvpTracer::new(left.primal().clone() / right.primal().clone(), left_term + right_term)])
+        let tangent = match (left_term, right_term) {
+            (Some(left_term), Some(right_term)) => left_term + right_term,
+            (Some(term), None) | (None, Some(term)) => term,
+            (None, None) => {
+                let mut tangent_outputs =
+                    context.stage_nullary_operation(ZeroOperation::new(primal.r#type().into_owned()))?;
+                check_count!("output", tangent_outputs, 1, ProgramError);
+                tangent_outputs.remove(0)
+            }
+        };
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 

@@ -1,9 +1,7 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::constants::Zero;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
@@ -261,44 +259,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<PadOperation>>> Pad for
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-impl<V: Value<ArrayType> + Pad + Zero<ArrayType>> Pad for Tangent<ArrayType, V> {
-    fn pad(
-        &self,
-        padding_value: &Self,
-        edge_padding_low: &[usize],
-        edge_padding_high: &[usize],
-        interior_padding: &[usize],
-    ) -> Result<Self, ProgramError> {
-        match (self, padding_value) {
-            (Self::Zero(input_type), Self::Zero(padding_value_type)) => {
-                // Padding a symbolic zero with a symbolic zero stays symbolically zero; the type-level capability
-                // still validates the padding geometry.
-                Ok(Self::Zero(input_type.pad(
-                    padding_value_type,
-                    edge_padding_low,
-                    edge_padding_high,
-                    interior_padding,
-                )?))
-            }
-            (Self::Zero(input_type), Self::Value(padding_value)) => Ok(Self::Value(V::zero(input_type)?.pad(
-                padding_value,
-                edge_padding_low,
-                edge_padding_high,
-                interior_padding,
-            )?)),
-            (Self::Value(input), Self::Zero(padding_value_type)) => Ok(Self::Value(input.pad(
-                &V::zero(padding_value_type)?,
-                edge_padding_low,
-                edge_padding_high,
-                interior_padding,
-            )?)),
-            (Self::Value(input), Self::Value(padding_value)) => {
-                Ok(Self::Value(input.pad(padding_value, edge_padding_low, edge_padding_high, interior_padding)?))
-            }
-        }
     }
 }
 

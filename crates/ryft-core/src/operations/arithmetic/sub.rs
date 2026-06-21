@@ -1,9 +1,8 @@
 use std::fmt::Display;
-use std::ops::{Neg, Sub};
+use std::ops::Sub;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
@@ -78,20 +77,6 @@ impl<C: StagingContext<Operation: From<SubOperation>>> Sub for Tracer<C> {
     #[inline]
     fn sub(self, rhs: Self) -> Self::Output {
         self.binary(&rhs, SubOperation)
-    }
-}
-
-impl<T: Type, V: Value<T> + Sub<Output = V> + Neg<Output = V>> Sub for Tangent<T, V> {
-    type Output = Self;
-
-    #[inline]
-    fn sub(self, rhs: Self) -> Self::Output {
-        match (self, rhs) {
-            (Self::Zero(r#type), Self::Zero(_)) => Self::Zero(r#type),
-            (other, Self::Zero(_)) => other,
-            (Self::Zero(_), Self::Value(right)) => Self::Value(-right),
-            (Self::Value(left), Self::Value(right)) => Self::Value(left - right),
-        }
     }
 }
 

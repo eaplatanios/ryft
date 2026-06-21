@@ -426,10 +426,7 @@ where
     LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
 {
     check_count!("output", primal_outputs, output_count, ProgramError);
-    let tangent_inputs = inputs
-        .iter()
-        .map(|input| context.materialize_tangent(input.tangent().clone()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
     let operation: LinearXlaOperation<TangentValue, XlaConstant, CapturedFactor<ArrayType, PrimalValue>> =
         LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation)));
     let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
@@ -1944,13 +1941,7 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal().r#type().into_owned(), test_array_type());
 
-        let output_atoms = outputs
-            .into_iter()
-            .map(|output| match output.tangent() {
-                ryft_core::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
-                ryft_core::differentiation::Tangent::Zero(_) => panic!("expected materialized tangent"),
-            })
-            .collect::<Vec<_>>();
+        let output_atoms = outputs.into_iter().map(|output| output.tangent().atom_id().unwrap()).collect::<Vec<_>>();
         drop(context);
         let tangent_builder = Rc::try_unwrap(tangent_builder)
             .expect("traced shard_map jvp should not leak linear terms")

@@ -36,7 +36,7 @@ mod tests {
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
     use crate::operations::compare::CompareOperation;
-    use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
+    use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation, ZeroOperation};
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
@@ -69,14 +69,10 @@ mod tests {
 
     #[test]
     fn test_reduce_sum_jvp_linearizes_to_itself() {
-        // Verify the JVP rule for `ReduceOperation::Sum`: the tangent of `sum(x)` is `sum(Δx)`.
-        // We exercise the rule directly on a `Tangent::Value` over a TestArray vector. Result
-        // should match summing the values directly.
-        use crate::differentiation::Tangent;
+        // Verify the linear reduce rule directly over a concrete tangent value.
         use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
         let primal = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let tangent_value = TestArray::vector(vec![0.5, 0.5, 0.5, 0.5]);
-        let tangent: Tangent<ArrayType, TestArray> = Tangent::Value(tangent_value);
 
         let operation = ReduceOperation::new(vec![0], ReductionKind::Sum);
 
@@ -91,12 +87,10 @@ mod tests {
 
         // Tangent: linearizes to itself (Sum is linear), so the tangent of the reduce is the
         // reduce of the tangent.
-        let tangent_outputs = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&tangent)).unwrap();
+        let tangent_outputs =
+            operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&tangent_value)).unwrap();
         let tangent_output = tangent_outputs.into_iter().next().unwrap();
-        match tangent_output {
-            Tangent::Value(value) => assert_eq!(value.values(), &[2.0]),
-            Tangent::Zero(_) => panic!("expected non-zero tangent output"),
-        }
+        assert_eq!(tangent_output.values(), &[2.0]);
     }
 
     #[test]
@@ -317,13 +311,11 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_condition_batches_through_symbolic_zero_path() {
-        use crate::differentiation::Tangent;
+    fn test_linear_condition_batches_through_zero_values() {
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
         // Build a LinearArrayOperation::Condition with a captured `true` predicate factor and a linear
-        // scale branch. Pass an all-`Tangent::Zero` batched input and verify the symbolic-zero
-        // short-circuit fires (no concrete arithmetic, output is Tangent::Zero).
+        // scale branch. Pass an all-zero batched input and verify the selected linear branch preserves zeros.
         let mut builder =
             ProgramBuilder::<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -337,25 +329,16 @@ mod tests {
             ));
 
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let zero_input =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type), Some(0))
-                .unwrap();
-        let context = EagerContext::<
-            ArrayType,
-            Tangent<ArrayType, TestArray>,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
-        >::new();
+        let zero_input = ArrayBatch::new(batched_type, TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
+        let context =
+            EagerContext::<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>::new();
         let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-            EagerContext<
-                ArrayType,
-                Tangent<ArrayType, TestArray>,
-                LinearArrayOperation<ArrayType, TestArray, TestArray>,
-            >,
+            TestArray,
+            EagerContext<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>,
         >>::batch(&operation, &context, &[zero_input])
         .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero linear condition inputs");
+        assert_eq!(outputs[0].value().values, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     fn linear_scalar_scale_branch(
@@ -588,13 +571,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tangent_condition_captured_predicate_materializes_and_dispatches() {
-        use crate::differentiation::Tangent;
+    fn test_linear_condition_captured_predicate_dispatches() {
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        // Tangent + Condition with a captured `true` predicate factor: materialize-then-dispatch routes through the
-        // V-level Condition rule, which prepends the lane-uniform predicate and interprets the selected branch over
-        // the batched operand. Per-lane output is `[1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]`.
+        // Linear condition with a captured `true` predicate factor dispatches to the selected branch over the batched
+        // operand. Per-lane output is `[1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]`.
         let operation: LinearArrayOperation<ArrayType, TestArray, TestArray> =
             LinearArrayOperation::Condition(LinearConditionOperation::new(
                 TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
@@ -603,43 +584,26 @@ mod tests {
             ));
 
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let operand_batch = ArrayBatch::new(
-            operand_type,
-            Tangent::<ArrayType, TestArray>::Value(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])),
-            Some(0),
-        )
-        .unwrap();
+        let operand_batch =
+            ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
-        let context = EagerContext::<
-            ArrayType,
-            Tangent<ArrayType, TestArray>,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
-        >::new();
+        let context =
+            EagerContext::<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>::new();
         let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-            EagerContext<
-                ArrayType,
-                Tangent<ArrayType, TestArray>,
-                LinearArrayOperation<ArrayType, TestArray, TestArray>,
-            >,
+            TestArray,
+            EagerContext<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>,
         >>::batch(&operation, &context, &[operand_batch])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
-        match outputs[0].value() {
-            Tangent::Value(v) => assert_eq!(v.values, vec![2.0, 4.0, 6.0, 8.0]),
-            Tangent::Zero(_) => panic!("expected a Tangent::Value output from a non-zero operand"),
-        }
+        assert_eq!(outputs[0].value().values, vec![2.0, 4.0, 6.0, 8.0]);
     }
 
     #[test]
-    fn test_tangent_condition_with_all_zero_tangents_materializes_correctly() {
-        use crate::differentiation::Tangent;
+    fn test_linear_condition_with_all_zero_tangents_materializes_correctly() {
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
-        // Tangent + Condition with a captured predicate factor and an all-zero tangent operand: the linear-operation
-        // tangent batching rule short-circuits all-zero inputs, using the V-level Condition rule only to lift the
-        // output types and axes, so the result stays a symbolic zero (a `Tangent::Value(zero)` is also accepted).
+        // Linear condition with a captured predicate factor and an all-zero tangent operand preserves the zero payload.
         let operation: LinearArrayOperation<ArrayType, TestArray, TestArray> =
             LinearArrayOperation::Condition(LinearConditionOperation::new(
                 TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
@@ -649,32 +613,18 @@ mod tests {
 
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let zero_operand_batch =
-            ArrayBatch::new(operand_type.clone(), Tangent::<ArrayType, TestArray>::zero(operand_type), Some(0))
-                .unwrap();
+            ArrayBatch::new(operand_type, TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
 
-        let context = EagerContext::<
-            ArrayType,
-            Tangent<ArrayType, TestArray>,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
-        >::new();
+        let context =
+            EagerContext::<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>::new();
         let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-            EagerContext<
-                ArrayType,
-                Tangent<ArrayType, TestArray>,
-                LinearArrayOperation<ArrayType, TestArray, TestArray>,
-            >,
+            TestArray,
+            EagerContext<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>,
         >>::batch(&operation, &context, &[zero_operand_batch])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
-        match outputs[0].value() {
-            Tangent::Value(v) => assert_eq!(v.values, vec![0.0, 0.0, 0.0, 0.0]),
-            Tangent::Zero(_) => {
-                // The all-zero short-circuit reports a symbolic-zero output. Either representation is correct
-                // for downstream consumers — accept both.
-            }
-        }
+        assert_eq!(outputs[0].value().values, vec![0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1158,21 +1108,19 @@ mod tests {
         let mut context =
             TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
-        let predicate = JvpTracer::from_zero_tangent(
+        let mut predicate_tangents =
+            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))).unwrap();
+        assert_eq!(predicate_tangents.len(), 1);
+        let predicate = JvpTracer::from_value(
             TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-            ArrayType::scalar(DataType::Boolean),
+            predicate_tangents.remove(0),
         );
         let outputs = condition
             .jvp(&mut context, &[predicate, JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal().values[0], 8.0);
-        let tangent_output = match outputs[0].tangent().clone() {
-            crate::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
-            crate::differentiation::Tangent::Zero(_) => {
-                panic!("expected a concrete tangent output for the captured branch")
-            }
-        };
+        let tangent_output = outputs[0].tangent().atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
@@ -1204,21 +1152,19 @@ mod tests {
         let mut context =
             TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
-        let predicate = JvpTracer::from_zero_tangent(
+        let mut predicate_tangents =
+            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))).unwrap();
+        assert_eq!(predicate_tangents.len(), 1);
+        let predicate = JvpTracer::from_value(
             TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]),
-            ArrayType::scalar(DataType::Boolean),
+            predicate_tangents.remove(0),
         );
         let outputs = condition
             .jvp(&mut context, &[predicate, JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal().values[0], 12.0);
-        let tangent_output = match outputs[0].tangent().clone() {
-            crate::differentiation::Tangent::Value(tracer) => tracer.atom_id().unwrap(),
-            crate::differentiation::Tangent::Zero(_) => {
-                panic!("expected a concrete tangent output for the captured branch")
-            }
-        };
+        let tangent_output = outputs[0].tangent().atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();

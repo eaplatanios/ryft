@@ -1295,17 +1295,13 @@ pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
             let local_shape = static_dimensions(&local_output_type, "output", output_index)?;
             let output_sharding = &shard_map.out_shardings()[output_index];
             let expected_current_varying_axes = spec_varying_axes(output_sharding, &manual_axis_names);
-            let effective_local_varying_axes: BTreeSet<String> = varying_axes(local_output_type.sharding())
-                .union(&expected_current_varying_axes)
-                .cloned()
-                .collect();
+            let effective_local_varying_axes: BTreeSet<String> =
+                varying_axes(local_output_type.sharding()).union(&expected_current_varying_axes).cloned().collect();
             if shard_map.check_vma() {
                 let local_unreduced_axes =
                     local_output_type.sharding().map(|sharding| sharding.unreduced_axes().clone()).unwrap_or_default();
-                let effective_local_unreduced_axes = local_unreduced_axes
-                    .union(output_sharding.unreduced_axes())
-                    .cloned()
-                    .collect();
+                let effective_local_unreduced_axes =
+                    local_unreduced_axes.union(output_sharding.unreduced_axes()).cloned().collect();
                 if !axes_match(&effective_local_unreduced_axes, output_sharding.unreduced_axes()) {
                     return Err(ShardMapTraceError::ShardingStateMismatch {
                         value_kind: "output",

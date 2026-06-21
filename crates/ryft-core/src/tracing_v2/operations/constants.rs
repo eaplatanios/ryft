@@ -1,5 +1,6 @@
 use std::fmt::Display;
 
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::{
@@ -129,6 +130,7 @@ impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
     D: DifferentiationContext,
     D::Operation: From<ZeroOperation<D::Type>>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
     ZeroOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -143,7 +145,9 @@ where
         let operation = D::Operation::from(ZeroOperation::new(self.r#type().clone()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
-        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(self.r#type().clone()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        Ok(vec![JvpTracer::new(primals.pop().unwrap(), tangent_outputs.remove(0))])
     }
 }
 
@@ -163,6 +167,7 @@ impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
     D: DifferentiationContext,
     D::Operation: From<OneOperation<D::Type>>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
     OneOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -177,7 +182,9 @@ where
         let operation = D::Operation::from(OneOperation::new(self.r#type().clone()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
-        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(self.r#type().clone()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        Ok(vec![JvpTracer::new(primals.pop().unwrap(), tangent_outputs.remove(0))])
     }
 }
 
@@ -203,6 +210,7 @@ impl<D> DifferentiableOperation<D> for ConstantOperation<D::Type, D::Constant>
 where
     D: DifferentiationContext,
     D::Constant: Clone + Typed<D::Type>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
     ConstantOperation<D::Type, D::Constant>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -216,7 +224,9 @@ where
         check_count!("input", inputs, 0, ProgramError);
         let output_type = self.value().r#type().into_owned();
         let primal = context.differentiable().lift(self.value().clone())?;
-        Ok(vec![JvpTracer::from_zero_tangent(primal, output_type)])
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(output_type))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))])
     }
 }
 
@@ -237,18 +247,22 @@ where
     D: DifferentiationContext,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
-    LinearOperationOf<D>: From<ZeroLikeOperation>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![JvpTracer::new(inputs[0].primal().zero_like(), inputs[0].tangent().zero_like())])
+        let primal = inputs[0].primal().zero_like();
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(primal.r#type().into_owned()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        let tangent = tangent_outputs.remove(0);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -269,18 +283,22 @@ where
     D: DifferentiationContext,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
-    LinearOperationOf<D>: From<ZeroLikeOperation>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![JvpTracer::new(inputs[0].primal().one_like(), inputs[0].tangent().zero_like())])
+        let primal = inputs[0].primal().one_like();
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(primal.r#type().into_owned()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        let tangent = tangent_outputs.remove(0);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -306,6 +324,7 @@ impl<D> DifferentiableOperation<D> for FillOperation<D::Type, f64>
 where
     D: DifferentiationContext,
     D::Operation: From<FillOperation<D::Type, f64>>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
     FillOperation<D::Type, f64>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -320,7 +339,9 @@ where
         let operation = D::Operation::from(FillOperation::new(self.r#type().clone(), *self.value()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
-        Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), self.r#type().clone())])
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(self.r#type().clone()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        Ok(vec![JvpTracer::new(primals.pop().unwrap(), tangent_outputs.remove(0))])
     }
 }
 

@@ -3,14 +3,15 @@ use std::fmt::Display;
 use half::{bf16, f16};
 
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
-use crate::types::{ArrayType, Memory, TypeError};
+use crate::types::{ArrayType, Memory, TypeError, Typed};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
 pub const TRANSFER_TO_MEMORY_OPERATION_NAME: &'static str = "transfer_to_memory";
@@ -123,19 +124,20 @@ impl<C: StagingContext<Operation: From<TransferToMemoryOperation>>> TransferToMe
 }
 
 /// JVP rule for [`TransferToMemoryOperation`]: derivatives move along with the value, so the primal and the tangent
-/// are both transferred to the destination (mirroring the JVP of `jax.device_put`). Symbolic zero tangents stay
-/// symbolic with their types re-placed, so no transfer is staged for them. The staged linear transfer transposes
+/// are both transferred to the destination (mirroring the JVP of `jax.device_put`). Canonical staged zero tangents
+/// stay canonical with their types re-placed, so no transfer is staged for them. The staged linear transfer transposes
 /// into a transfer that moves the cotangent back to the operand's source memory.
 impl<D> DifferentiableOperation<D> for TransferToMemoryOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: TransferToMemory,
-    LinearOperationOf<D>: From<TransferToMemoryOperation>,
+    LinearOperationOf<D>: From<TransferToMemoryOperation> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
@@ -143,11 +145,17 @@ where
     {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
-        let tangent = match input.tangent().clone() {
-            Tangent::Zero(r#type) => Tangent::Zero(r#type.with_memory(self.destination)),
-            Tangent::Value(tangent) => Tangent::Value(tangent.transfer_to_memory(self.destination)),
+        let primal = input.primal().transfer_to_memory(self.destination);
+        let tangent = if context.is_zero(input.tangent())? {
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(
+                input.tangent().r#type().into_owned().with_memory(self.destination),
+            ))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            tangent_outputs.remove(0)
+        } else {
+            input.tangent().transfer_to_memory(self.destination)
         };
-        Ok(vec![JvpTracer::new(input.primal().transfer_to_memory(self.destination), tangent)])
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 

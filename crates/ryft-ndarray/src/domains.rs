@@ -6,7 +6,7 @@ use ryft_core::domains::Domain;
 use ryft_core::operations::InterpretableOperation;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::DifferentiationContext;
-use ryft_core::types::{ArrayType, TypeError};
+use ryft_core::types::ArrayType;
 
 use crate::arrays::{Array, NdArrayElement};
 use crate::operations::{LinearNdarrayOperation, NdarrayOperation};
@@ -56,11 +56,6 @@ impl<T: NdArrayElement> Context for NdArrayDomain<T> {
 impl<T: NdArrayElement> DifferentiationContext for NdArrayDomain<T> {
     type Tangent = Array<T>;
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearNdarrayOperation<V, Array<T>, F>;
-
-    #[inline]
-    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
-        Array::zeros(array_type).map_err(array_error_to_tracing_error)
-    }
 }
 
 impl<T: NdArrayElement> ProvidesContext<<Array<T> as Value<ArrayType>>::InterpretationContext> for NdArrayDomain<T> {
@@ -106,10 +101,6 @@ impl<T: NdArrayElement> Context for NdArrayLinearDomain<T> {
         let operation = operation.into();
         operation.interpret(&EagerContext::new(), inputs)
     }
-}
-
-fn array_error_to_tracing_error(error: crate::arrays::ArrayError) -> ProgramError {
-    TypeError { message: error.to_string() }.into()
 }
 
 #[cfg(test)]

@@ -78,4 +78,37 @@ macro_rules! check_sharding {
     }};
 }
 
-pub use crate::{check_count, check_sharding, check_types};
+/// Checks that [`ProgramBuilder`](crate::ProgramBuilder) handles refer to the same builder and returns a
+/// [`ProgramError::MismatchedProgramBuilders`](crate::ProgramError::MismatchedProgramBuilders) if they do not.
+///
+/// # Parameters
+///
+///   - `$reference`: Expression evaluating to the reference [`ProgramBuilder`](crate::ProgramBuilder) handle.
+///   - `$other`: Expression evaluating to a single [`ProgramBuilder`](crate::ProgramBuilder) handle, or bracketed
+///     syntax `[$others]` where `$others` evaluates to an iterable of [`ProgramBuilder`](crate::ProgramBuilder)
+///     handles.
+#[macro_export]
+macro_rules! check_builders {
+    ($reference:expr, [$others:expr] $(,)?) => {{
+        let reference = $reference;
+        let mut result = Ok(());
+        for other in $others {
+            if !std::rc::Rc::ptr_eq(reference, other) {
+                result = Err($crate::ProgramError::MismatchedProgramBuilders);
+                break;
+            }
+        }
+        result
+    }};
+    ($reference:expr, $other:expr $(,)?) => {{
+        let reference = $reference;
+        let other = $other;
+        if std::rc::Rc::ptr_eq(reference, other) {
+            Ok(())
+        } else {
+            Err($crate::ProgramError::MismatchedProgramBuilders)
+        }
+    }};
+}
+
+pub use crate::{check_builders, check_count, check_sharding, check_types};

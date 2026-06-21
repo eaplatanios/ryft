@@ -10,8 +10,8 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
 use ryft_core::contexts::{Context, EagerContext, ProvidesContext};
 use ryft_core::domains::Domain;
-use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::operations::Operation;
+use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::{DeviceMesh, Sharding};
@@ -277,10 +277,6 @@ impl<'c> Context for XlaDomain<'c> {
 impl<'c> DifferentiationContext for XlaDomain<'c> {
     type Tangent = ArrayType;
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, XlaConstant, F>;
-
-    fn zero_tangent(&self, array_type: &ArrayType) -> Result<Self::Tangent, ProgramError> {
-        xla_identity_metadata(ZERO_OPERATION_NAME, array_type)
-    }
 }
 
 impl<'c> ProvidesContext<EagerContext<ArrayType, Array<'c>, Infallible>> for XlaDomain<'c> {
@@ -1082,13 +1078,13 @@ fn execute_pjrt<'c>(
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use ryft_core::Sharding;
     use ryft_core::sharding::{Device, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::types::{Shape, Size, StaticShape};
-    use ryft_core::Sharding;
-    use ryft_pjrt::{load_cpu_plugin, ClientOptions, CpuClientOptions};
+    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::tests::values_from_bytes;
     use crate::FromPjrt;
+    use crate::tests::values_from_bytes;
 
     use super::*;
 
@@ -1198,7 +1194,7 @@ mod tests {
     #[test]
     fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use ryft_core::compilation::{compile_with_options, CompilationOptions as CoreCompilationOptions};
+        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, compile_with_options};
         use ryft_core::operations::trigonometric::Sin;
 
         let plugin = load_cpu_plugin().unwrap();

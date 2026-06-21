@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
@@ -416,15 +416,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<SliceOperation>>> Slice
     }
 }
 
-impl<V: Value<ArrayType> + Slice> Slice for Tangent<ArrayType, V> {
-    fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
-        match self {
-            Self::Zero(r#type) => Ok(Self::Zero((&r#type).slice(start_indices, limit_indices, strides)?)),
-            Self::Value(value) => Ok(Self::Value(value.slice(start_indices, limit_indices, strides)?)),
-        }
-    }
-}
-
 /// [`Operation`] that overwrites a contiguous sub-array of its first operand with its second operand at static start
 /// indices. Refer to the documentation of [`UpdateSlice`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -601,27 +592,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<UpdateSliceOperation>>>
             self.context().stage_operation(UpdateSliceOperation::new(start_indices.to_vec()), &[self, update])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-impl<V: Value<ArrayType> + UpdateSlice + crate::operations::constants::Zero<ArrayType>> UpdateSlice
-    for Tangent<ArrayType, V>
-{
-    fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        match (self, update) {
-            (Self::Zero(input_type), Self::Zero(update_type)) => {
-                // Writing a symbolic zero into a symbolic zero stays symbolically zero; the type-level capability
-                // still validates the update window.
-                Ok(Self::Zero(input_type.update_slice(update_type, start_indices)?))
-            }
-            (Self::Zero(input_type), Self::Value(update)) => {
-                Ok(Self::Value(V::zero(input_type)?.update_slice(update, start_indices)?))
-            }
-            (Self::Value(input), Self::Zero(update_type)) => {
-                Ok(Self::Value(input.update_slice(&V::zero(update_type)?, start_indices)?))
-            }
-            (Self::Value(input), Self::Value(update)) => Ok(Self::Value(input.update_slice(update, start_indices)?)),
-        }
     }
 }
 

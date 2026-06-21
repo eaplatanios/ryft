@@ -18,7 +18,7 @@ mod tests {
     use crate::operations::arithmetic::{
         AddOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
     };
-    use crate::operations::constants::{One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
+    use crate::operations::constants::{HasZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
@@ -448,6 +448,7 @@ mod tests {
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
         LinearOperationOf<D>:
             From<AddOperation> + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>>>,
+        LinearOperationOf<D>: HasZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
             &self,
@@ -508,10 +509,6 @@ mod tests {
     impl DifferentiationContext for DistinctPrimalDomain {
         type Tangent = DistinctTangent;
         type LinearOperation<V: Value<DataType>, F: Value<DataType>> = DistinctLinearOperation<F>;
-
-        fn zero_tangent(&self, type_: &DataType) -> Result<Self::Tangent, ProgramError> {
-            DistinctTangent::zero(type_)
-        }
     }
 
     impl ProvidesContext<<DistinctPrimal as Value<DataType>>::InterpretationContext> for DistinctPrimalDomain {

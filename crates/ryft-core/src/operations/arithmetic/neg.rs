@@ -2,7 +2,6 @@ use std::fmt::Display;
 use std::ops::Neg;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
@@ -75,18 +74,6 @@ impl<C: StagingContext<Operation: From<NegOperation>>> Neg for Tracer<C> {
     #[inline]
     fn neg(self) -> Self::Output {
         self.unary(NegOperation)
-    }
-}
-
-impl<T: Type, V: Value<T> + Neg<Output = V>> Neg for Tangent<T, V> {
-    type Output = Self;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type),
-            Self::Value(value) => Self::Value(-value),
-        }
     }
 }
 

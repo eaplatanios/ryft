@@ -2,7 +2,7 @@ use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{ZeroLike, ZeroOperation};
+use crate::operations::constants::{HasZeroOperation, ZeroLike, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
     LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, PadOperation, Reshape, Slice, SliceOperation,
@@ -196,13 +196,14 @@ where
 
 /// JVP rule for [`UpdateSliceOperation`]: the operation is jointly linear in its input and update operands, so the
 /// tangent is the update-slice of the two operand tangents at the same static offsets. When both operand tangents
-/// are symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero)s, the output tangent is a symbolic zero of
-/// the output type and no linear operation is staged.
+/// are canonical staged zeros, the output tangent is a canonical staged zero of the output type and no linear
+/// operation is staged.
 impl<D> DifferentiableOperation<D> for UpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: UpdateSlice,
-    LinearOperationOf<D>: From<UpdateSliceOperation>,
+    LinearOperationOf<D>: From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -211,21 +212,20 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
         let update = &inputs[1];
         let primal = input.primal().update_slice(update.primal(), self.start_indices())?;
-        if input.tangent().is_zero() && update.tangent().is_zero() {
+        if context.is_zero(input.tangent())? && context.is_zero(update.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
-        let input_tangent = context.materialize_tangent(input.tangent().clone())?;
-        let update_tangent = context.materialize_tangent(update.tangent().clone())?;
         let mut outputs = context.stage_operation(
             UpdateSliceOperation::new(self.start_indices().to_vec()),
-            &[input_tangent, update_tangent],
+            &[input.tangent(), update.tangent()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
@@ -236,14 +236,15 @@ where
 /// start indices have no tangent space (their tangents are structural zeros and are ignored). The primal output is
 /// the dynamic slice of the input primal at the index primals, and the tangent is a captured-index dynamic slice of
 /// the input tangent whose start indices are the index primals captured as residual factors (the
-/// [`LinearDynamicSliceOperation`] form). When the input tangent is a symbolic
-/// [`Tangent::Zero`](crate::differentiation::Tangent::Zero), the output tangent is a symbolic zero of the output
-/// type and no linear operation is staged.
+/// [`LinearDynamicSliceOperation`] form). When the input tangent is a canonical staged zero, the output tangent is a
+/// canonical staged zero of the output type and no linear operation is staged.
 impl<D> DifferentiableOperation<D> for DynamicSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicSlice,
-    LinearOperationOf<D>: From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>:
+        From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -252,22 +253,22 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 });
         };
         let index_primals: Vec<D::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
         let primal = input.primal().dynamic_slice(&index_primals, self.sizes())?;
-        if input.tangent().is_zero() {
+        if context.is_zero(input.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
         let index_factors: Vec<_> = start_indices.iter().map(|index| index.factor(context)).collect();
-        let input_tangent = context.materialize_tangent(input.tangent().clone())?;
         let mut outputs = context.stage_operation(
             LinearDynamicSliceOperation::new(index_factors, self.sizes().to_vec()),
-            &[input_tangent],
+            &[input.tangent()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
@@ -279,13 +280,15 @@ where
 /// ignored). The primal output is the dynamic update-slice of the operand primals at the index primals, and the
 /// tangent is a captured-index dynamic update-slice of the operand tangents whose start indices are the index
 /// primals captured as residual factors (the [`LinearDynamicUpdateSliceOperation`] form). When both operand tangents
-/// are symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero)s, the output tangent is a symbolic zero of
-/// the output type and no linear operation is staged.
+/// are canonical staged zeros, the output tangent is a canonical staged zero of the output type and no linear
+/// operation is staged.
 impl<D> DifferentiableOperation<D> for DynamicUpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicUpdateSlice,
-    LinearOperationOf<D>: From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>:
+        From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -294,22 +297,23 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
         let index_primals: Vec<D::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
         let primal = input.primal().dynamic_update_slice(update.primal(), &index_primals)?;
-        if input.tangent().is_zero() && update.tangent().is_zero() {
+        if context.is_zero(input.tangent())? && context.is_zero(update.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
         let index_factors: Vec<_> = start_indices.iter().map(|index| index.factor(context)).collect();
-        let input_tangent = context.materialize_tangent(input.tangent().clone())?;
-        let update_tangent = context.materialize_tangent(update.tangent().clone())?;
-        let mut outputs = context
-            .stage_operation(LinearDynamicUpdateSliceOperation::new(index_factors), &[input_tangent, update_tangent])?;
+        let mut outputs = context.stage_operation(
+            LinearDynamicUpdateSliceOperation::new(index_factors),
+            &[input.tangent(), update.tangent()],
+        )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
     }
@@ -635,7 +639,6 @@ mod tests {
     use crate::ProvidesContext;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::compare::CompareOperation;
-    use crate::operations::constants::Zero;
     use crate::operations::manipulation::{LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation};
     use crate::programs::AtomId;
     use crate::tests::{TestArray, TestArrayDomain};
@@ -697,10 +700,6 @@ mod tests {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
             LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
-
-        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
-            TestArray::zero(type_)
-        }
 
         fn supports_primal_concretization(&self) -> bool {
             false
@@ -1043,7 +1042,6 @@ mod tests {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        use crate::differentiation::Tangent;
         use crate::operations::compare::ComparisonDirection;
         use crate::operations::control_flow::WhileOperation;
         use crate::parameters::Placeholder;
@@ -1099,13 +1097,13 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new()));
         let mut context = TangentContext::new(&StagedDispatchTestArrayDomain, builder.clone());
         let vector_tangent = context.input(vector_type.clone());
+        let mut counter_tangents = context.stage_nullary_operation(ZeroOperation::new(index_type)).unwrap();
+        assert_eq!(counter_tangents.len(), 1);
+        let counter = JvpTracer::new(index(0.0), counter_tangents.remove(0));
         let outputs = while_operation
             .jvp(
                 &mut context,
-                &[
-                    JvpTracer::from_zero_tangent(index(0.0), index_type),
-                    JvpTracer::from_value(TestArray::vector(vec![3.0, 4.0, 5.0]), vector_tangent),
-                ],
+                &[counter, JvpTracer::from_value(TestArray::vector(vec![3.0, 4.0, 5.0]), vector_tangent)],
             )
             .unwrap();
 
@@ -1116,11 +1114,7 @@ mod tests {
 
         // Replaying the staged pushforward doubles the first two tangent lanes through the defactorized linear
         // slicing operations recomputed inside the fused loop.
-        let Tangent::Value(vector_tangent_output) = outputs[1].tangent().clone() else {
-            panic!("expected a staged tangent for the vector state");
-        };
-        let tangent_output = vector_tangent_output.atom_id().unwrap();
-        drop(vector_tangent_output);
+        let tangent_output = outputs[1].tangent().atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();

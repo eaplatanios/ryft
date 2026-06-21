@@ -1,8 +1,9 @@
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation};
+use crate::operations::constants::ZeroOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
 use crate::types::ArrayType;
 
@@ -30,11 +31,11 @@ impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> ZeroTangentOp
 }
 
 /// JVP rule for [`CompareOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// symbolic [`Tangent::Zero`](crate::differentiation::Tangent::Zero). Refer to the documentation of
-/// [`ZeroTangentOperation`] for why this is sound.
+/// canonical staged zero tangent. Refer to the documentation of [`ZeroTangentOperation`] for why this is sound.
 impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> DifferentiableOperation<D> for CompareOperation
 where
     Self: Operation<D::Type> + InterpretableOperation<D::Type, D::Value>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
 {
     #[inline]
     fn jvp<'jvp>(

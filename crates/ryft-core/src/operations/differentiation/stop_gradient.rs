@@ -13,12 +13,12 @@ use crate::types::{ArrayType, DataType, Type, TypeError};
 pub const STOP_GRADIENT_OPERATION_NAME: &'static str = "stop_gradient";
 
 // TODO(eaplatanios): Link to [`Pushforward`].
-/// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. Interpretation, batching,
-/// and backend lowering all treat this operation as the identity function, but differentiation does not. The
-/// Jacobian-Vector Product (JVP) rule of this operation passes the primal through unchanged and replaces the tangent
-/// with a symbolic [`Tangent::Zero`](crate::Tangent::Zero) value, so that no derivative flows through the marked value
-/// in either forward or reverse automatic differentiation mode. Because the rule never stages a linear operation,
-/// `stop_gradient` cannot appear in pushforward programs and therefore needs no (and has no)
+/// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. Interpretation,
+/// batching, and backend lowering all treat this operation as the identity function, but differentiation does not.
+/// The Jacobian-Vector Product (JVP) rule of this operation passes the primal through unchanged and replaces the
+/// tangent with a canonical staged [`ZeroOperation`](crate::ZeroOperation), so that no derivative flows through the
+/// marked value in either forward or reverse automatic differentiation. Because the rule stages only that canonical
+/// zero tangent, `stop_gradient` cannot appear in pushforward programs and therefore needs no (and has no)
 /// [`TransposableOperation`](crate::TransposableOperation) implementation.
 #[derive(Clone, Debug, Default)]
 pub struct StopGradientOperation;

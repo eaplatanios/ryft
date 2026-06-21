@@ -20,7 +20,7 @@ use ryft_macros::Operation;
 
 use crate::batching::BatchingError;
 use crate::contexts::{EagerContext, StagingContext};
-use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
@@ -28,7 +28,7 @@ use crate::operations::arithmetic::{
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
+    ConstantOperation, Fill, FillOperation, HasZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
@@ -38,13 +38,11 @@ use crate::operations::control_flow::{
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConcatenateOperation, DYNAMIC_SLICE_OPERATION_NAME,
-    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation,
-    LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation,
-    PadOperation, ReshapeOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
-    ScatterReductionKind, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
-    inverse_permutation,
+    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    DynamicUpdateSliceOperation, Gather, GatherDimensionNumbers, GatherOperation, LinearDynamicSliceOperation,
+    LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation, PadOperation,
+    ReshapeOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+    Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
@@ -52,7 +50,6 @@ use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingContext,
@@ -66,7 +63,7 @@ use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
-use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
+use crate::tracing_v2::operations::dot::{LeftDotOperation, MaybeDot, RightDotOperation};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
@@ -355,6 +352,7 @@ where
             CapturedFactor<ArrayType, D::Value>,
             ArrayOperation<ArrayType, V, Extension>,
         > + SupportsLinearScan<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
     ArrayOperation<ArrayType, V, Extension>: Clone + ProgramLinearizableOperation<D>,
 {
     fn jvp<'jvp>(
@@ -1321,214 +1319,6 @@ pub(crate) fn render_factor_list<F: Display>(factors: &[F]) -> String {
     format!("[{}]", factors.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "))
 }
 
-fn symbolic_zero_one_error<T: Type>(r#type: &T) -> TypeError {
-    TypeError { message: format!("zero tangent space has no one value for {type}", type = r#type) }
-}
-
-fn infer_tangent_value_output_types<T: Type, V: Value<T>, O: Operation<T>>(
-    operation: &O,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<T>, ProgramError> {
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    Ok(operation.infer_output_types(input_types.as_slice())?)
-}
-
-fn symbolic_zero_tangent_value_outputs<T: Type, V: Value<T>>(output_types: Vec<T>) -> Vec<Tangent<T, V>> {
-    output_types.into_iter().map(Tangent::Zero).collect()
-}
-
-fn interpret_materialized_tangent_value_operation<T: Type, V: Value<T> + Zero<T>, O: InterpretableOperation<T, V>>(
-    context: &<V as Value<T>>::InterpretationContext,
-    operation: &O,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError> {
-    let materialized_inputs = inputs
-        .iter()
-        .map(|input| match input {
-            Tangent::Zero(r#type) => V::zero(r#type),
-            Tangent::Value(value) => Ok(value.clone()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(operation
-        .interpret(context, materialized_inputs.as_slice())?
-        .into_iter()
-        .map(Tangent::Value)
-        .collect())
-}
-
-fn tangent_value_type_matches<T: Type, V: Value<T>>(value: &V, output_type: &T) -> bool {
-    value.r#type().as_ref() == output_type
-}
-
-/// Extracts concrete values from captured tangent-wrapped start index factors, rejecting symbolic zeros: integer
-/// start indices are residuals of the primal computation and must always be concrete at interpretation time. The
-/// `operation_name` parameter selects the reported operation name because this helper serves both captured-index
-/// dynamic slicing operations.
-fn concrete_tangent_factor_indices<T: Type, V: Value<T>>(
-    operation_name: &'static str,
-    start_indices: &[Tangent<T, V>],
-) -> Result<Vec<V>, ProgramError> {
-    start_indices
-        .iter()
-        .map(|index| match index {
-            Tangent::Value(value) => Ok(value.clone()),
-            Tangent::Zero(_) => {
-                Err(TypeError { message: format!("captured {operation_name} start indices must be concrete values") }
-                    .into())
-            }
-        })
-        .collect()
-}
-
-fn interpret_tangent_value_add<T: Type, V: Value<T> + Add<Output = V> + Zero<T>>(
-    context: &<V as Value<T>>::InterpretationContext,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    AddOperation: InterpretableOperation<T, V>,
-{
-    let output_types = infer_tangent_value_output_types(&AddOperation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    if inputs.iter().all(Tangent::is_zero) {
-        return Ok(symbolic_zero_tangent_value_outputs(output_types));
-    }
-    let output_type = &output_types[0];
-    match inputs {
-        [Tangent::Value(value), Tangent::Zero(_)] if tangent_value_type_matches(value, output_type) => {
-            Ok(vec![Tangent::Value(value.clone())])
-        }
-        [Tangent::Zero(_), Tangent::Value(value)] if tangent_value_type_matches(value, output_type) => {
-            Ok(vec![Tangent::Value(value.clone())])
-        }
-        _ => interpret_materialized_tangent_value_operation(context, &AddOperation, inputs),
-    }
-}
-
-fn interpret_tangent_value_mul<T: Type, V: Value<T> + Mul<Output = V> + Zero<T>>(
-    context: &<V as Value<T>>::InterpretationContext,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    MulOperation: InterpretableOperation<T, V>,
-{
-    let output_types = infer_tangent_value_output_types(&MulOperation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    // If either operand is symbolic zero, the product is zero (this is the linear-side rule that
-    // multiplying by a zero constant yields zero).
-    if inputs.iter().any(Tangent::is_zero) {
-        return Ok(symbolic_zero_tangent_value_outputs(output_types));
-    }
-    interpret_materialized_tangent_value_operation(context, &MulOperation, inputs)
-}
-
-fn interpret_tangent_value_sub<T: Type, V: Value<T> + Neg<Output = V> + Sub<Output = V> + Zero<T>>(
-    context: &<V as Value<T>>::InterpretationContext,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    SubOperation: InterpretableOperation<T, V>,
-{
-    let output_types = infer_tangent_value_output_types(&SubOperation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    if inputs.iter().all(Tangent::is_zero) {
-        return Ok(symbolic_zero_tangent_value_outputs(output_types));
-    }
-    let output_type = &output_types[0];
-    match inputs {
-        [Tangent::Value(value), Tangent::Zero(_)] if tangent_value_type_matches(value, output_type) => {
-            Ok(vec![Tangent::Value(value.clone())])
-        }
-        [Tangent::Zero(_), Tangent::Value(value)] if tangent_value_type_matches(value, output_type) => {
-            Ok(vec![Tangent::Value(-value.clone())])
-        }
-        _ => interpret_materialized_tangent_value_operation(context, &SubOperation, inputs),
-    }
-}
-
-fn interpret_tangent_value_neg<T: Type, V: Value<T> + Neg<Output = V>>(
-    context: &<V as Value<T>>::InterpretationContext,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    NegOperation: InterpretableOperation<T, V>,
-{
-    let output_types = infer_tangent_value_output_types(&NegOperation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    match inputs {
-        [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::Value(value)] => Ok(NegOperation
-            .interpret(context, std::slice::from_ref(value))?
-            .into_iter()
-            .map(Tangent::Value)
-            .collect()),
-        _ => unreachable!("neg output type inference validates the input count"),
-    }
-}
-
-fn interpret_tangent_value_zero_like<T: Type, V: Value<T>, O: Operation<T>>(
-    operation: &O,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError> {
-    Ok(symbolic_zero_tangent_value_outputs(infer_tangent_value_output_types(operation, inputs)?))
-}
-
-fn interpret_tangent_value_constant<T, V>(
-    operation: &ConstantOperation<T, Tangent<T, V>>,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    T: Type,
-    V: Value<T>,
-{
-    check_count!("input", inputs, 0, ProgramError);
-    Ok(vec![operation.value().clone()])
-}
-
-fn interpret_tangent_value_one_like<T: Type, V: Value<T> + OneLike>(
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    OneLikeOperation: Operation<T>,
-{
-    let output_types = infer_tangent_value_output_types(&OneLikeOperation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    match inputs {
-        [Tangent::Zero(r#type)] => Err(symbolic_zero_one_error(r#type).into()),
-        [Tangent::Value(value)] => Ok(vec![Tangent::Value(value.one_like())]),
-        _ => unreachable!("one_like output type inference validates the input count"),
-    }
-}
-
-fn interpret_tangent_value_scale<T, V, O>(
-    context: &<V as Value<T>>::InterpretationContext,
-    operation: &O,
-    factor: &Tangent<T, V>,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    T: Type,
-    V: Value<T> + Scale<Output = V>,
-    O: Operation<T>,
-    ScaleOperation<T, V>: InterpretableOperation<T, V>,
-{
-    let output_types = infer_tangent_value_output_types(operation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    match inputs {
-        [input] if factor.is_zero() || input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::Value(input)] => {
-            let Tangent::Value(factor) = factor else {
-                unreachable!("zero factors are handled before concrete scale interpretation")
-            };
-            Ok(ScaleOperation::new(factor.clone())
-                .interpret(context, std::slice::from_ref(input))?
-                .into_iter()
-                .map(Tangent::Value)
-                .collect())
-        }
-        _ => unreachable!("scale output type inference validates the input count"),
-    }
-}
-
 /// Transposes a captured-condition select (the `Select` variant of [`LinearArrayOperation`] and the scalar
 /// [`LinearSelectOperation`](crate::tracing_v2::operations::select::LinearSelectOperation)).
 ///
@@ -1808,31 +1598,6 @@ where
                 Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
             ])
         }
-    }
-}
-
-fn interpret_tangent_value_unary_value_or_zero<T, V, MetadataOperation, ConcreteOperation>(
-    context: &<V as Value<T>>::InterpretationContext,
-    metadata_operation: &MetadataOperation,
-    concrete_operation: &ConcreteOperation,
-    inputs: &[Tangent<T, V>],
-) -> Result<Vec<Tangent<T, V>>, ProgramError>
-where
-    T: Type,
-    V: Value<T>,
-    MetadataOperation: Operation<T>,
-    ConcreteOperation: InterpretableOperation<T, V>,
-{
-    let output_types = infer_tangent_value_output_types(metadata_operation, inputs)?;
-    check_count!("output", output_types, 1, ProgramError);
-    match inputs {
-        [Tangent::Zero(_)] => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-        [Tangent::Value(input)] => Ok(concrete_operation
-            .interpret(context, std::slice::from_ref(input))?
-            .into_iter()
-            .map(Tangent::Value)
-            .collect()),
-        _ => unreachable!("unary output type inference validates the input count"),
     }
 }
 
@@ -2143,49 +1908,6 @@ where
     }
 }
 
-impl<V: Value<DataType>> InterpretableOperation<DataType, Tangent<DataType, V>>
-    for LinearScalarOperation<V, Tangent<DataType, V>>
-where
-    V: SupportsLinearArithmeticOperations + BooleanLike + Zero<DataType> + One<DataType> + OneLike,
-    V: Select<Condition = bool>,
-{
-    fn interpret(
-        &self,
-        context: &<Tangent<DataType, V> as Value<DataType>>::InterpretationContext,
-        inputs: &[Tangent<DataType, V>],
-    ) -> Result<Vec<Tangent<DataType, V>>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
-            }
-            .into()),
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => interpret_tangent_value_scale(context, operation, operation.factor(), inputs),
-            Self::Select(operation) => {
-                check_count!("input", inputs, 2, ProgramError);
-                let output_types = infer_tangent_value_output_types(operation, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                let boolean = operation.condition().select_condition()?;
-                if inputs[0].is_zero() && inputs[1].is_zero() {
-                    return Ok(vec![Tangent::Zero(output_types.into_iter().next().unwrap())]);
-                }
-                let materialize = |tangent: &Tangent<DataType, V>| match tangent {
-                    Tangent::Zero(r#type) => V::zero(r#type),
-                    Tangent::Value(value) => Ok(value.clone()),
-                };
-                Ok(vec![Tangent::Value(V::select(&boolean, &materialize(&inputs[0])?, &materialize(&inputs[1])?)?)])
-            }
-        }
-    }
-}
-
 impl<V: Value<DataType>, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, F>
 where
     V: SupportsLinearArithmeticOperations
@@ -2239,9 +1961,7 @@ where
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
             Self::CustomVjpCall(operation) => operation.interpret_over_tracers(inputs),
-            Self::Zero(operation) => {
-                context.stage_operation(ZeroOperation::new(*operation.r#type()), &[] as &[Tracer<S>])
-            }
+            Self::Zero(operation) => context.stage_nullary_operation(ZeroOperation::new(*operation.r#type())),
             Self::One(operation) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
@@ -2360,440 +2080,6 @@ where
 {
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         context.stage_operation(self.clone(), inputs)
-    }
-}
-
-impl<V, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>> for ArrayOperation<ArrayType, V, Extension>
-where
-    V: Value<ArrayType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + Zero<ArrayType>
-        + One<ArrayType>
-        + Fill<ArrayType, f64>
-        + OneLike,
-    Extension: Operation<ArrayType>,
-    AddOperation: InterpretableOperation<ArrayType, V>,
-    SubOperation: InterpretableOperation<ArrayType, V>,
-    MulOperation: InterpretableOperation<ArrayType, V>,
-    NegOperation: InterpretableOperation<ArrayType, V>,
-{
-    fn interpret(
-        &self,
-        context: &<Tangent<ArrayType, V> as Value<ArrayType>>::InterpretationContext,
-        inputs: &[Tangent<ArrayType, V>],
-    ) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
-        match self {
-            Self::Zero(operation) => {
-                check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![Tangent::Zero(operation.r#type().clone())])
-            }
-            Self::ZeroLike(operation) => interpret_tangent_value_zero_like(operation, inputs),
-            Self::One(operation) => {
-                check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![Tangent::Value(V::one(operation.r#type())?)])
-            }
-            Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
-            Self::Constant(operation) => {
-                check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![Tangent::Value(operation.value().clone())])
-            }
-            Self::Fill(operation) if *operation.value() == 0.0 => {
-                check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![Tangent::Zero(operation.r#type().clone())])
-            }
-            Self::Fill(operation) => {
-                check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![Tangent::Value(V::fill(operation.r#type(), *operation.value())?)])
-            }
-            Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
-            Self::Add(_) => interpret_tangent_value_add(context, inputs),
-            Self::Sub(_) => interpret_tangent_value_sub(context, inputs),
-            Self::Mul(_) => interpret_tangent_value_mul(context, inputs),
-            Self::Div(_)
-            | Self::Sin(_)
-            | Self::Cos(_)
-            | Self::StopGradient(_)
-            | Self::RematerializationName(_)
-            | Self::Scale(_)
-            | Self::TransferToMemory(_)
-            | Self::Dot(_)
-            | Self::Transpose(_)
-            | Self::Reshape(_)
-            | Self::Reshard(_)
-            | Self::ShardingConstraint(_)
-            | Self::Broadcast(_)
-            | Self::Slice(_)
-            | Self::UpdateSlice(_)
-            | Self::DynamicSlice(_)
-            | Self::DynamicUpdateSlice(_)
-            | Self::Pad(_)
-            | Self::Concatenate(_)
-            | Self::Gather(_)
-            | Self::Scatter(_)
-            | Self::Reduce(_)
-            | Self::Compare(_)
-            | Self::Not(_)
-            | Self::And(_)
-            | Self::Or(_)
-            | Self::Xor(_)
-            | Self::Collective(_)
-            | Self::Select(_)
-            | Self::Condition(_)
-            | Self::While(_)
-            | Self::Scan(_)
-            | Self::CustomJvp(_)
-            | Self::CustomVjp(_)
-            | Self::Extension(_) => Err(ProgramError::UnsupportedOperation {
-                message: format!("array operation {} does not support tangent-wrapped interpretation", self.name()),
-            }),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension, O> InterpretableOperation<ArrayType, Tangent<ArrayType, V>>
-    for LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>
-where
-    V: Parameter
-        + SupportsLinearArithmeticOperations
-        + Zero<ArrayType>
-        + One<ArrayType>
-        + Fill<ArrayType, f64>
-        + OneLike
-        + SupportsLinearAlgebraOperations
-        + SupportsManipulationOperations
-        + Select<Condition = V>
-        + BooleanLike
-        + TransferToMemory,
-    Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
-    O: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>> + Operation<ArrayType>,
-{
-    fn interpret(
-        &self,
-        context: &<Tangent<ArrayType, V> as Value<ArrayType>>::InterpretationContext,
-        inputs: &[Tangent<ArrayType, V>],
-    ) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
-            }
-            .into()),
-            Self::TransferToMemory(operation) => {
-                let destination = operation.destination();
-                check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![match &inputs[0] {
-                    Tangent::Zero(r#type) => Tangent::Zero(r#type.clone().with_memory(destination)),
-                    Tangent::Value(value) => Tangent::Value(value.transfer_to_memory(destination)),
-                }])
-            }
-            Self::Zero(operation) => Ok(vec![Tangent::Zero(operation.r#type().clone())]),
-            Self::One(operation) => Ok(vec![Tangent::Value(V::one(operation.r#type())?)]),
-            Self::Constant(operation) => interpret_tangent_value_constant(operation, inputs),
-            Self::Fill(operation) if *operation.value() == 0.0 => Ok(vec![Tangent::Zero(operation.r#type().clone())]),
-            Self::Fill(operation) => Ok(vec![Tangent::Value(V::fill(operation.r#type(), *operation.value())?)]),
-            Self::ZeroLike(_) => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
-            Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
-            Self::Add(_) => interpret_tangent_value_add(context, inputs),
-            Self::Sub(_) => interpret_tangent_value_sub(context, inputs),
-            Self::Mul(_) => interpret_tangent_value_mul(context, inputs),
-            Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
-            Self::Transpose(operation) => {
-                let operation = TransposeOperation::new(operation.permutation().to_vec());
-                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
-            }
-            Self::Scale(operation) => interpret_tangent_value_scale(context, self, operation.factor(), inputs),
-            Self::LeftDot(operation) => {
-                let factor = operation.factor();
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                match inputs {
-                    [input] if factor.is_zero() || input.is_zero() => {
-                        Ok(symbolic_zero_tangent_value_outputs(output_types))
-                    }
-                    [Tangent::Value(input)] => {
-                        let Tangent::Value(factor) = factor else {
-                            unreachable!("zero factors are handled before concrete left_dot interpretation")
-                        };
-                        Ok(LeftDotOperation::new(factor.clone(), operation.dimensions().clone())
-                            .with_output_sharding(operation.output_sharding().cloned())
-                            .interpret(context, std::slice::from_ref(input))?
-                            .into_iter()
-                            .map(Tangent::Value)
-                            .collect())
-                    }
-                    _ => unreachable!("left_dot output type inference validates the input count"),
-                }
-            }
-            Self::RightDot(operation) => {
-                let factor = operation.factor();
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                match inputs {
-                    [input] if factor.is_zero() || input.is_zero() => {
-                        Ok(symbolic_zero_tangent_value_outputs(output_types))
-                    }
-                    [Tangent::Value(input)] => {
-                        let Tangent::Value(factor) = factor else {
-                            unreachable!("zero factors are handled before concrete right_dot interpretation")
-                        };
-                        Ok(RightDotOperation::new(factor.clone(), operation.dimensions().clone())
-                            .with_output_sharding(operation.output_sharding().cloned())
-                            .interpret(context, std::slice::from_ref(input))?
-                            .into_iter()
-                            .map(Tangent::Value)
-                            .collect())
-                    }
-                    _ => unreachable!("right_dot output type inference validates the input count"),
-                }
-            }
-            Self::Reshape(operation) => interpret_tangent_value_unary_value_or_zero(
-                context,
-                &ReshapeOperation::new(operation.output_shape().clone()),
-                &ReshapeOperation::new(operation.output_shape().clone()),
-                inputs,
-            ),
-            Self::Reshard(operation) => interpret_tangent_value_unary_value_or_zero(
-                context,
-                &ReshardOperation::new(operation.sharding().clone()),
-                &ReshardOperation::new(operation.sharding().clone()),
-                inputs,
-            ),
-            Self::ShardingConstraint(operation) => interpret_tangent_value_unary_value_or_zero(
-                context,
-                &ShardingConstraintOperation::new(operation.sharding().clone()),
-                &ShardingConstraintOperation::new(operation.sharding().clone()),
-                inputs,
-            ),
-            Self::Broadcast(operation) => {
-                let operation =
-                    BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec());
-                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
-            }
-            Self::Slice(operation) => {
-                let operation =
-                    SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
-                        .with_strides(operation.strides().to_vec())?;
-                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
-            }
-            Self::UpdateSlice(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                interpret_materialized_tangent_value_operation(
-                    context,
-                    &UpdateSliceOperation::new(operation.start_indices().to_vec()),
-                    inputs,
-                )
-            }
-            Self::DynamicSlice(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                match inputs {
-                    [input] if input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-                    [Tangent::Value(input)] => {
-                        let index_values =
-                            concrete_tangent_factor_indices(DYNAMIC_SLICE_OPERATION_NAME, operation.start_indices())?;
-                        Ok(vec![Tangent::Value(input.dynamic_slice(&index_values, operation.sizes())?)])
-                    }
-                    _ => unreachable!("dynamic_slice output type inference validates the input count"),
-                }
-            }
-            Self::DynamicUpdateSlice(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                check_count!("input", inputs, 2, ProgramError);
-                let index_values =
-                    concrete_tangent_factor_indices(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, operation.start_indices())?;
-                let materialize = |tangent: &Tangent<ArrayType, V>| match tangent {
-                    Tangent::Zero(r#type) => V::zero(r#type),
-                    Tangent::Value(value) => Ok(value.clone()),
-                };
-                Ok(vec![Tangent::Value(
-                    materialize(&inputs[0])?.dynamic_update_slice(&materialize(&inputs[1])?, &index_values)?,
-                )])
-            }
-            Self::Gather(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                match inputs {
-                    [input] if input.is_zero() => Ok(symbolic_zero_tangent_value_outputs(output_types)),
-                    [Tangent::Value(operand)] => {
-                        let index_value = concrete_tangent_factor_indices(
-                            GATHER_OPERATION_NAME,
-                            std::slice::from_ref(operation.indices()),
-                        )?
-                        .into_iter()
-                        .next()
-                        .expect("gather captures exactly one index factor");
-                        Ok(vec![Tangent::Value(operand.gather(&index_value, operation.operation())?)])
-                    }
-                    _ => unreachable!("gather output type inference validates the input count"),
-                }
-            }
-            Self::ScatterAdd(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                check_count!("input", inputs, 2, ProgramError);
-                let index_value =
-                    concrete_tangent_factor_indices(SCATTER_OPERATION_NAME, std::slice::from_ref(operation.indices()))?
-                        .into_iter()
-                        .next()
-                        .expect("scatter captures exactly one index factor");
-                let materialize = |tangent: &Tangent<ArrayType, V>| match tangent {
-                    Tangent::Zero(r#type) => V::zero(r#type),
-                    Tangent::Value(value) => Ok(value.clone()),
-                };
-                Ok(vec![Tangent::Value(materialize(&inputs[0])?.scatter(
-                    &index_value,
-                    &materialize(&inputs[1])?,
-                    operation.operation(),
-                )?)])
-            }
-            Self::Pad(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                interpret_materialized_tangent_value_operation(
-                    context,
-                    &PadOperation::new(
-                        operation.edge_padding_low().to_vec(),
-                        operation.edge_padding_high().to_vec(),
-                        operation.interior_padding().to_vec(),
-                    )?,
-                    inputs,
-                )
-            }
-            Self::Concatenate(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                interpret_materialized_tangent_value_operation(
-                    context,
-                    &ConcatenateOperation::new(operation.axis()),
-                    inputs,
-                )
-            }
-            Self::Reduce(operation) => {
-                let operation = ReduceOperation::new(operation.axes().to_vec(), operation.kind())
-                    .with_output_sharding(operation.output_sharding().cloned());
-                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
-            }
-            Self::Select(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                let Tangent::Value(condition) = operation.condition() else {
-                    return Err(TypeError {
-                        message: format!("captured select condition for {} must be a concrete value", output_types[0],),
-                    }
-                    .into());
-                };
-                Ok(vec![Tangent::select(condition, &inputs[0], &inputs[1])?])
-            }
-            Self::Residual(operation) => {
-                check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![operation.factor().clone()])
-            }
-            Self::Recompute(operation) => operation.interpret(context, inputs),
-            Self::Condition(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let Tangent::Value(predicate) = operation.predicate() else {
-                    return Err(TypeError {
-                        message: "captured condition predicate must be a concrete value".to_string(),
-                    }
-                    .into());
-                };
-                let branch = if predicate.boolean()? { operation.true_branch() } else { operation.false_branch() };
-                let outputs = branch.interpret_in_context(context, inputs.to_vec())?;
-                check_count!("output", outputs, output_types.len(), ProgramError);
-                Ok(outputs)
-            }
-            Self::OperandCondition(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let Tangent::Value(predicate) = &inputs[0] else {
-                    return Err(TypeError {
-                        message: "operand-form condition predicate must be a concrete value".to_string(),
-                    }
-                    .into());
-                };
-                let branch = if predicate.boolean()? { operation.true_branch() } else { operation.false_branch() };
-                let outputs = branch.interpret_in_context(context, inputs[1..].to_vec())?;
-                check_count!("output", outputs, output_types.len(), ProgramError);
-                Ok(outputs)
-            }
-            Self::While(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let mut state = inputs.to_vec();
-                let mut completed_iterations = 0;
-                loop {
-                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                        check_count!("output", state, output_types.len(), ProgramError);
-                        return Ok(state);
-                    }
-                    let condition_outputs = operation.condition().interpret_in_context(context, state.clone())?;
-                    check_count!("output", condition_outputs, 1, ProgramError);
-                    let predicate = match &condition_outputs[0] {
-                        Tangent::Zero(_) => {
-                            return Err(ProgramError::UnsupportedOperation {
-                                message: "mixed symbolic-zero while predicate interpretation is not supported"
-                                    .to_string(),
-                            });
-                        }
-                        Tangent::Value(predicate) => predicate.boolean()?,
-                    };
-                    if !predicate {
-                        check_count!("output", state, output_types.len(), ProgramError);
-                        return Ok(state);
-                    }
-                    state = operation.body().interpret_in_context(context, state)?;
-                    check_count!("output", state, operation.state_types().len(), ProgramError);
-                    completed_iterations += 1;
-                }
-            }
-            Self::Scan(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                let body = operation.body();
-                let carry_count = operation.carry_count();
-                let y_slice_types = body.output_types().split_off(carry_count);
-                let residual_stacks = operation.residual_stacks();
-                let outputs = interpret_scan_lanes(
-                    carry_count,
-                    operation.length(),
-                    operation.reverse(),
-                    y_slice_types.as_slice(),
-                    inputs,
-                    |stacked_type| Ok(Tangent::Zero(stacked_type.clone())),
-                    |lane, lane_inputs| {
-                        let lane_residuals = residual_stacks
-                            .iter()
-                            .map(|stack| read_scan_lane(stack, lane))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors_preserving_extensions(&mut |factor| {
-                                factor.instantiate(lane_residuals.as_slice())
-                            })
-                        })?;
-                        lane_body.interpret_in_context(context, lane_inputs)
-                    },
-                )?;
-                check_count!("output", outputs, output_types.len(), ProgramError);
-                Ok(outputs)
-            }
-            Self::Extension(extension) => extension.interpret(context, inputs),
-        }
     }
 }
 
@@ -3030,9 +2316,7 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].transfer_to_memory(operation.destination())])
             }
-            Self::Zero(operation) => {
-                context.stage_operation(ZeroOperation::new(operation.r#type().clone()), &[] as &[Tracer<S>])
-            }
+            Self::Zero(operation) => context.stage_nullary_operation(ZeroOperation::new(operation.r#type().clone())),
             Self::One(operation) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
@@ -3169,7 +2453,7 @@ where
                     inputs,
                     |stacked_type| {
                         let mut outputs = staging_context
-                            .stage_operation(O::from(ZeroOperation::new(stacked_type.clone())), &[] as &[Tracer<S>])?;
+                            .stage_nullary_operation(O::from(ZeroOperation::new(stacked_type.clone())))?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
@@ -3188,391 +2472,6 @@ where
                 )
             }
             Self::Extension(extension) => extension.interpret(context, inputs),
-        }
-    }
-}
-
-impl<V: Value<DataType>>
-    TransposableOperation<DataType, Tangent<DataType, V>, LinearScalarOperation<V, Tangent<DataType, V>>>
-    for LinearScalarOperation<V, Tangent<DataType, V>>
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            DataType,
-            Tangent<DataType, V>,
-            LinearScalarOperation<V, Tangent<DataType, V>>,
-        >,
-        input_types: &[&DataType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            DataType,
-            Tangent<DataType, V>,
-            LinearScalarOperation<V, Tangent<DataType, V>>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, DataType, Tangent<DataType, V>, LinearScalarOperation<V, Tangent<DataType, V>>>>,
-        ProgramError,
-    > {
-        match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback transposition over tangent-wrapped values is not supported".to_string(),
-            }
-            .into()),
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike(_) => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike(_) => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
-            }
-            Self::Sub(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-                }
-            }
-            Self::Neg(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Scale(operation) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context.stage_operation(
-                            Self::Scale(ScaleOperation::new(operation.factor().clone())),
-                            std::slice::from_ref(cotangent),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Select(operation) => transpose_captured_condition_select(
-                || Self::Select(LinearSelectOperation::new(operation.condition().clone())),
-                context,
-                input_types,
-                output_cotangents,
-            ),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, Extension, O>
-    TransposableOperation<
-        ArrayType,
-        Tangent<ArrayType, V>,
-        LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
-    > for LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>
-where
-    V: crate::tracing_v2::operations::dot::DotOps + Scale<f64, Output = V> + Reshard + ConstrainSharding,
-    Extension: TransposableOperation<
-            ArrayType,
-            Tangent<ArrayType, V>,
-            LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
-        >,
-    O: Operation<ArrayType>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            Tangent<ArrayType, V>,
-            LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
-        >,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            Tangent<ArrayType, V>,
-            LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
-        >],
-    ) -> Result<
-        Vec<
-            Cotangent<
-                'transpose,
-                ArrayType,
-                Tangent<ArrayType, V>,
-                LinearArrayOperation<ArrayType, Tangent<ArrayType, V>, V, Extension, Tangent<ArrayType, V>, O>,
-            >,
-        >,
-        ProgramError,
-    > {
-        match self {
-            Self::CustomVjpCall(_) => Err(crate::types::TypeError {
-                message: "custom_vjp pullback transposition over tangent-wrapped values is not supported".to_string(),
-            }
-            .into()),
-            Self::Zero(zero) => zero.transpose(context, input_types, output_cotangents),
-            Self::One(one) => one.transpose(context, input_types, output_cotangents),
-            Self::Constant(constant) => constant.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike(_) => ZeroLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::OneLike(_) => OneLikeOperation.transpose(context, input_types, output_cotangents),
-            Self::Add(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
-            }
-            Self::Sub(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-                }
-            }
-            Self::Mul(_) => {
-                // `LinearArrayOperation::Mul` is emitted only when one operand is the staged
-                // output of a constant-producing op (e.g., [`Self::Fill`]). Transposing
-                // it requires knowing which operand is the constant, which is not recoverable from
-                // the op alone — defer to a higher-level pass that rewrites mul-by-constant into
-                // [`Self::Scale`] before transposition.
-                Err(ProgramError::UnsupportedOperation {
-                    message: "linear `Mul` transpose is not supported (rewrite to `Scale` before transposition)"
-                        .to_string(),
-                })
-            }
-            Self::Neg(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::TransferToMemory(_) => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context.stage_operation(
-                            Self::TransferToMemory(TransferToMemoryOperation::new(input_types[0].memory())),
-                            std::slice::from_ref(cotangent),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Transpose(operation) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                let inverse = inverse_permutation(operation.permutation());
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.transpose(inverse)?)]),
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Scale(operation) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let outputs = context.stage_operation(
-                            Self::Scale(ScaleOperation::new(operation.factor().clone())),
-                            std::slice::from_ref(cotangent),
-                        )?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Fill(fill) => fill.transpose(context, input_types, output_cotangents),
-            Self::LeftDot(operation) => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                let factor = operation.factor();
-                let Tangent::Value(_) = factor else {
-                    return Ok(vec![Cotangent::Zero]);
-                };
-                let factor_rank = factor.r#type().as_ref().rank();
-                let adjoint = crate::tracing_v2::operations::dot::adjoint_dimensions_for_left_dot(
-                    operation.dimensions(),
-                    factor_rank,
-                );
-                // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the cotangent dual
-                // of the input's sharding instead of being re-derived.
-                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let contribution = match &adjoint_output_sharding {
-                            Some(output_sharding) => {
-                                cotangent.left_dot_with_output_sharding(factor.clone(), &adjoint, output_sharding)
-                            }
-                            None => cotangent.left_dot(factor.clone(), &adjoint),
-                        };
-                        Ok(vec![Cotangent::Staged(contribution)])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::RightDot(operation) => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                let factor = operation.factor();
-                let dimensions = operation.dimensions();
-                let Tangent::Value(_) = factor else {
-                    return Ok(vec![Cotangent::Zero]);
-                };
-                let factor_rank = factor.r#type().as_ref().rank();
-                let cotangent_rank = match &output_cotangents[0] {
-                    Cotangent::Staged(value) => value.r#type().as_ref().rank(),
-                    Cotangent::Zero => return Ok(vec![Cotangent::Zero]),
-                };
-                let t_rank = cotangent_rank + factor_rank
-                    - 2 * dimensions.rhs_contracting_dimensions().len()
-                    - dimensions.rhs_batching_dimensions().len();
-                let adjoint = crate::tracing_v2::operations::dot::adjoint_dimensions_for_right_dot(
-                    dimensions,
-                    factor_rank,
-                    t_rank,
-                );
-                // The adjoint's output *is* the input's cotangent, so its sharding is pinned to the cotangent dual
-                // of the input's sharding instead of being re-derived.
-                let adjoint_output_sharding = input_types[0].sharding().map(Sharding::cotangent);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        let contribution = match &adjoint_output_sharding {
-                            Some(output_sharding) => {
-                                cotangent.right_dot_with_output_sharding(factor.clone(), &adjoint, output_sharding)
-                            }
-                            None => cotangent.right_dot(factor.clone(), &adjoint),
-                        };
-                        Ok(vec![Cotangent::Staged(contribution)])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Reshape(_) => {
-                check_count!("input", input_types, 1, ProgramError);
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => {
-                        Ok(vec![Cotangent::Staged(cotangent.reshape(input_types[0].shape().clone())?)])
-                    }
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                }
-            }
-            Self::Reshard(operation) => {
-                ReshardOperation::new(operation.sharding().clone()).transpose(context, input_types, output_cotangents)
-            }
-            Self::ShardingConstraint(operation) => ShardingConstraintOperation::new(operation.sharding().clone())
-                .transpose(context, input_types, output_cotangents),
-            Self::Broadcast(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
-                        message: "broadcast transpose is not supported (would need reduce-sum)".to_string(),
-                    }),
-                }
-            }
-            Self::Reduce(_) => {
-                check_count!("output", output_cotangents, 1, ProgramError);
-                match &output_cotangents[0] {
-                    Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-                    Cotangent::Staged(_) => Err(ProgramError::UnsupportedOperation {
-                        message: "reduce transpose is not supported (would need broadcast-back with stored input \
-                                  shape)"
-                            .to_string(),
-                    }),
-                }
-            }
-            Self::Slice(operation) => {
-                SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
-                    .with_strides(operation.strides().to_vec())?
-                    .transpose(context, input_types, output_cotangents)
-            }
-            Self::UpdateSlice(operation) => UpdateSliceOperation::new(operation.start_indices().to_vec()).transpose(
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::Pad(operation) => PadOperation::new(
-                operation.edge_padding_low().to_vec(),
-                operation.edge_padding_high().to_vec(),
-                operation.interior_padding().to_vec(),
-            )?
-            .transpose(context, input_types, output_cotangents),
-            Self::Concatenate(operation) => {
-                ConcatenateOperation::new(operation.axis()).transpose(context, input_types, output_cotangents)
-            }
-            Self::DynamicSlice(operation) => transpose_captured_index_dynamic_slice(
-                || Self::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(operation.start_indices().to_vec())),
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::DynamicUpdateSlice(operation) => transpose_captured_index_dynamic_update_slice(
-                || Self::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(operation.start_indices().to_vec())),
-                |sizes| Self::DynamicSlice(LinearDynamicSliceOperation::new(operation.start_indices().to_vec(), sizes)),
-                context,
-                input_types,
-                output_cotangents,
-            ),
-            Self::Gather(operation) => {
-                let scatter_operation = gather_to_scatter_operation(operation.operation());
-                let indices = operation.indices().clone();
-                transpose_captured_index_dynamic_slice(
-                    move || {
-                        Self::ScatterAdd(LinearScatterAddOperation::new(scatter_operation.clone(), indices.clone()))
-                    },
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::ScatterAdd(operation) => {
-                check_count!("input", input_types, 2, ProgramError);
-                let gather_operation =
-                    scatter_add_to_gather_operation(operation.operation(), input_types[0], input_types[1])?;
-                let indices = operation.indices().clone();
-                transpose_captured_index_scatter_add(
-                    move || Self::Gather(LinearGatherOperation::new(gather_operation.clone(), indices.clone())),
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::Select(operation) => {
-                let condition = operation.condition().clone();
-                transpose_captured_condition_select(
-                    || Self::Select(LinearSelectOperation::new(condition.clone())),
-                    context,
-                    input_types,
-                    output_cotangents,
-                )
-            }
-            Self::Residual(_) => Err(ProgramError::UnsupportedOperation {
-                message: "residual is not a linear map and does not support transposition".to_string(),
-            }),
-            Self::Recompute(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Condition(operation) => transpose_linear_condition(
-                operation.predicate(),
-                operation.true_branch(),
-                operation.false_branch(),
-                context,
-                output_cotangents,
-            ),
-            Self::OperandCondition(_) => Err(ProgramError::UnsupportedOperation {
-                message: "operand-form condition inside a fused while body does not support transposition".to_string(),
-            }),
-            Self::While(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Scan(_) => Err(ProgramError::UnsupportedOperation {
-                message: "scan transposition over tangent-wrapped values is not supported".to_string(),
-            }),
-            Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
 }
@@ -3865,7 +2764,7 @@ where
             ArrayType,
             CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             WithFactor<CapturedFactor<ArrayType, E::Value>> = LinearOperationOf<E>,
-        >,
+        > + HasZeroOperation<ArrayType>,
 {
     fn linearize_program(
         differentiable: &E,
@@ -3901,7 +2800,7 @@ where
             DataType,
             CapturedFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>,
             WithFactor<CapturedFactor<DataType, E::Value>> = LinearOperationOf<E>,
-        >,
+        > + HasZeroOperation<DataType>,
 {
     fn linearize_program(
         differentiable: &E,
@@ -4304,10 +3203,9 @@ where
                     y_slice_types.as_slice(),
                     inputs,
                     |stacked_type| {
-                        let mut outputs = context.parent_context().stage_operation(
-                            C::Operation::from(ZeroOperation::new(stacked_type.clone())),
-                            &[] as &[Tracer<C>],
-                        )?;
+                        let mut outputs = context
+                            .parent_context()
+                            .stage_nullary_operation(C::Operation::from(ZeroOperation::new(stacked_type.clone())))?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
@@ -4348,106 +3246,6 @@ where
     }
 }
 
-impl<V, E>
-    BatchableOperation<
-        Tangent<ArrayType, V>,
-        EagerContext<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<ArrayType, V, V, E>>,
-    > for LinearArrayOperation<ArrayType, V, V, E>
-where
-    ArrayOperation<ArrayType, V, E>: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>>,
-    LinearArrayOperation<ArrayType, V, V, E>:
-        BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>,
-    V::InterpretationContext: Default,
-    V: Value<ArrayType>
-        + SupportsLinearArithmeticOperations
-        + SupportsConstantOperations<ArrayType>
-        + SupportsLinearAlgebraOperations
-        + SupportsManipulationOperations
-        + BitAnd<Output = V>
-        + Select<Condition = V>
-        + BooleanLike,
-    E: Clone
-        + BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>
-        + BatchableOperation<
-            Tangent<ArrayType, V>,
-            EagerContext<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<ArrayType, V, V, E>>,
-        >,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-{
-    fn batch(
-        &self,
-        _context: &EagerContext<ArrayType, Tangent<ArrayType, V>, LinearArrayOperation<ArrayType, V, V, E>>,
-        inputs: &[ArrayBatch<Tangent<ArrayType, V>>],
-    ) -> Result<Vec<ArrayBatch<Tangent<ArrayType, V>>>, ProgramError> {
-        // First-order linear ops over tangent values: materialize `Tangent::Zero` to `V::zero`
-        // once, dispatch to the V-level batching rule, and re-wrap as `Tangent::Value`. Symbolic
-        // zero propagates through every Tangent V-trait impl (`Add`, `Sub`, `Neg`, `Scale`,
-        // `LeftDot`, `RightDot`, `Reshape`, `Transpose`), so dispatching through `apply_with_axes`
-        // on `lifted_op.interpret(tangent_values)` would also work — but the materialize-then-
-        // dispatch path lets us reuse the V-level rule unchanged, which keeps the rule defined in
-        // exactly one place.
-        //
-        // `Residual` is nullary, so the all-zero shortcut would fire vacuously and zero out the materialized
-        // factor; `While` runs its loop during the V-level dispatch, so lifting output types from a zero-state run
-        // would execute the loop at a primal point it was never staged for. Both always take the materialize path.
-        let always_materialize = matches!(
-            self,
-            LinearArrayOperation::ZeroLike(_)
-                | LinearArrayOperation::OneLike(_)
-                | LinearArrayOperation::Residual(_)
-                | LinearArrayOperation::While(_),
-        );
-        if !always_materialize && inputs.iter().all(|input| input.value().is_zero()) {
-            // Use the V-level rule purely for the lifted output types/axes; the value-level
-            // interpret would have nothing to do for symbolic zeros.
-            let materialized_zero_inputs = inputs
-                .iter()
-                .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
-                    ArrayBatch::new(input.r#type().into_owned(), V::zero(&input.r#type())?, input.batch_axis())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let context = EagerContext::<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>::new();
-            let v_outputs = <LinearArrayOperation<ArrayType, V, V, E> as BatchableOperation<
-                V,
-                EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>,
-            >>::batch(self, &context, materialized_zero_inputs.as_slice())?;
-            return v_outputs
-                .into_iter()
-                .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
-                    let output_type = v_batch.r#type().into_owned();
-                    let output_axis = v_batch.batch_axis();
-                    ArrayBatch::new(output_type.clone(), Tangent::zero(output_type), output_axis)
-                })
-                .collect();
-        }
-
-        let materialized = inputs
-            .iter()
-            .map(|input| -> Result<ArrayBatch<V>, ProgramError> {
-                let materialized_value = match input.value() {
-                    Tangent::Zero(zero_type) => V::zero(zero_type)?,
-                    Tangent::Value(value) => value.clone(),
-                };
-                ArrayBatch::new(input.r#type().into_owned(), materialized_value, input.batch_axis())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let context = EagerContext::<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>::new();
-        let v_outputs = <LinearArrayOperation<ArrayType, V, V, E> as BatchableOperation<
-            V,
-            EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>,
-        >>::batch(self, &context, materialized.as_slice())?;
-        v_outputs
-            .into_iter()
-            .map(|v_batch| -> Result<ArrayBatch<Tangent<ArrayType, V>>, ProgramError> {
-                let output_type = v_batch.r#type().into_owned();
-                let output_batch_axis = v_batch.batch_axis();
-                let output_value = v_batch.into_value();
-                ArrayBatch::new(output_type, Tangent::Value(output_value), output_batch_axis)
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -4455,24 +3253,12 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
     use crate::domains::AbstractDomain;
-    use crate::operations::InterpretableOperation as _;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
-    use crate::types::{Shape, Size};
 
     use super::*;
-
-    type MixedScalar = Tangent<DataType, f64>;
-    type MixedScalarOperation = LinearScalarOperation<f64, MixedScalar>;
-    type MixedArray = Tangent<ArrayType, TestArray>;
-    type MixedArrayOperation = LinearArrayOperation<ArrayType, MixedArray, TestArray>;
-
-    fn f64_array_type(dimensions: &[usize]) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(dimensions.iter().copied().map(Size::Static).collect()))
-    }
 
     #[test]
     fn test_linear_condition_transpose_supports_runtime_predicates() {
@@ -4522,219 +3308,5 @@ mod tests {
             .unwrap();
         let outputs = pullback.interpret(vec![TestArray::scalar(5.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![10.0]);
-    }
-
-    #[test]
-    fn test_linear_scalar_tangent_value_interpretation_mixes_value_and_zero() {
-        let value = MixedScalar::value(3.0);
-        let zero = MixedScalar::zero(DataType::F64);
-
-        assert_eq!(
-            MixedScalarOperation::Add(AddOperation)
-                .interpret(&crate::EagerContext::new(), &[value.clone(), zero.clone()]),
-            Ok(vec![value.clone()])
-        );
-        assert_eq!(
-            MixedScalarOperation::Add(AddOperation)
-                .interpret(&crate::EagerContext::new(), &[zero.clone(), value.clone()]),
-            Ok(vec![value.clone()])
-        );
-        assert_eq!(
-            MixedScalarOperation::Sub(SubOperation)
-                .interpret(&crate::EagerContext::new(), &[zero.clone(), value.clone()]),
-            Ok(vec![MixedScalar::value(-3.0)])
-        );
-        assert_eq!(
-            (MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::zero(DataType::F64))))
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&value)),
-            Ok(vec![zero.clone()])
-        );
-        assert_eq!(
-            (MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::value(2.0))))
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&zero)),
-            Ok(vec![zero.clone()])
-        );
-        assert_eq!(
-            (MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::value(2.0))))
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&value)),
-            Ok(vec![MixedScalar::value(6.0)])
-        );
-        assert_eq!(
-            MixedScalarOperation::ZeroLike(ZeroLikeOperation)
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&value)),
-            Ok(vec![zero.clone()])
-        );
-        assert_eq!(
-            MixedScalarOperation::One(OneOperation::new(DataType::F64)).interpret(&crate::EagerContext::new(), &[]),
-            Ok(vec![MixedScalar::value(1.0)])
-        );
-        assert_eq!(
-            MixedScalarOperation::OneLike(OneLikeOperation)
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&zero))
-                .unwrap_err()
-                .to_string(),
-            "zero tangent space has no one value for f64"
-        );
-    }
-
-    #[test]
-    fn test_linear_array_tangent_value_interpretation_preserves_symbolic_zero_metadata() {
-        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let input_zero = MixedArray::zero(input.r#type().into_owned());
-
-        assert_eq!(
-            MixedArrayOperation::Add(AddOperation)
-                .interpret(&crate::EagerContext::new(), &[MixedArray::value(input.clone()), input_zero.clone()]),
-            Ok(vec![MixedArray::value(input.clone())])
-        );
-        assert_eq!(
-            MixedArrayOperation::Neg(NegOperation)
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input_zero)),
-            Ok(vec![input_zero.clone()])
-        );
-
-        let reshaped_type = f64_array_type(&[3, 2]);
-        assert_eq!(
-            (MixedArrayOperation::Reshape(ReshapeOperation::new(reshaped_type.shape().clone())))
-                .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input_zero)),
-            Ok(vec![MixedArray::zero(reshaped_type.clone())])
-        );
-
-        use crate::tracing_v2::operations::dot::DotDimensionNumbers;
-
-        let left_factor_type = f64_array_type(&[4, 2]);
-        assert_eq!(
-            (MixedArrayOperation::LeftDot(LeftDotOperation::new(
-                MixedArray::zero(left_factor_type),
-                DotDimensionNumbers::matmul(),
-            )))
-            .interpret(&crate::EagerContext::new(), &[MixedArray::value(input)]),
-            Ok(vec![MixedArray::zero(f64_array_type(&[4, 3]))])
-        );
-
-        let right_factor = TestArray::matrix(3, 4, vec![0.0; 12]);
-        assert_eq!(
-            (MixedArrayOperation::RightDot(RightDotOperation::new(
-                MixedArray::value(right_factor),
-                DotDimensionNumbers::matmul(),
-            )))
-            .interpret(&crate::EagerContext::new(), std::slice::from_ref(&input_zero)),
-            Ok(vec![MixedArray::zero(f64_array_type(&[2, 4]))])
-        );
-
-        // A captured-predicate condition over the general tangent representation must reject a symbolic-zero
-        // predicate: the predicate is a primal residual and can never be a symbolic zero at interpretation time.
-        let state_type = f64_array_type(&[2, 3]);
-        let identity_branch = || {
-            let mut builder = ProgramBuilder::<ArrayType, MixedArray, MixedArrayOperation>::new();
-            let branch_input = builder.add_input(state_type.clone());
-            builder
-                .build::<Vec<MixedArray>, Vec<MixedArray>>(vec![branch_input], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let condition = MixedArrayOperation::Condition(LinearConditionOperation::new(
-            MixedArray::zero(ArrayType::scalar(DataType::Boolean)),
-            Box::new(identity_branch()),
-            Box::new(identity_branch()),
-        ));
-        assert_eq!(
-            condition
-                .interpret(&crate::EagerContext::new(), &[MixedArray::zero(state_type)])
-                .unwrap_err()
-                .to_string(),
-            "captured condition predicate must be a concrete value"
-        );
-    }
-
-    #[test]
-    fn test_linear_scalar_tangent_value_program_supports_nested_structured_parameters() {
-        let mut builder = ProgramBuilder::<DataType, MixedScalar, MixedScalarOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let sum = builder.add_instruction(MixedScalarOperation::Add(AddOperation), vec![left, right]).unwrap()[0];
-        let difference =
-            builder.add_instruction(MixedScalarOperation::Sub(SubOperation), vec![right, left]).unwrap()[0];
-        let scaled = builder
-            .add_instruction(
-                MixedScalarOperation::Scale(ScaleOperation::new(MixedScalar::zero(DataType::F64))),
-                vec![sum],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<(MixedScalar, MixedScalar), (MixedScalar, (MixedScalar, MixedScalar))>(
-                vec![sum, difference, scaled],
-                (Placeholder, Placeholder),
-                (Placeholder, (Placeholder, Placeholder)),
-            )
-            .unwrap();
-
-        assert_eq!(
-            program.interpret((MixedScalar::value(2.0), MixedScalar::zero(DataType::F64))),
-            Ok((MixedScalar::value(2.0), (MixedScalar::value(-2.0), MixedScalar::zero(DataType::F64))))
-        );
-    }
-
-    #[test]
-    fn test_batched_linear_operation_short_circuits_all_zero_inputs() {
-        // Build an Add over two all-zero batched Tangent inputs and confirm the result is also
-        // structurally zero — i.e., Tangent::Zero — without going through the underlying V::add.
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let zero_input =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
-                .unwrap();
-
-        let op: LinearArrayOperation<ArrayType, TestArray, TestArray> = LinearArrayOperation::Add(AddOperation);
-        let context = EagerContext::<
-            ArrayType,
-            Tangent<ArrayType, TestArray>,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
-        >::new();
-        let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-            EagerContext<
-                ArrayType,
-                Tangent<ArrayType, TestArray>,
-                LinearArrayOperation<ArrayType, TestArray, TestArray>,
-            >,
-        >>::batch(&op, &context, &[zero_input.clone(), zero_input])
-        .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
-
-        // Sanity-check that the same input type used through op.infer_output_types matches the
-        // type reported on the symbolic-zero output.
-        let expected_output_type = op.infer_output_types(&[batched_type.clone(), batched_type]).unwrap()[0].clone();
-        assert_eq!(outputs[0].r#type().into_owned(), expected_output_type);
-    }
-
-    #[test]
-    fn test_batched_linear_operation_short_circuit_uses_later_batched_input_axis() {
-        let unbatched_type = ArrayType::scalar(DataType::F64);
-        let unbatched_zero = ArrayBatch::unbatched(Tangent::<ArrayType, TestArray>::zero(unbatched_type));
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let batched_zero =
-            ArrayBatch::new(batched_type.clone(), Tangent::<ArrayType, TestArray>::zero(batched_type.clone()), Some(0))
-                .unwrap();
-
-        let operation: LinearArrayOperation<ArrayType, TestArray, TestArray> = LinearArrayOperation::Add(AddOperation);
-        let context = EagerContext::<
-            ArrayType,
-            Tangent<ArrayType, TestArray>,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
-        >::new();
-        let outputs = <LinearArrayOperation<ArrayType, TestArray, TestArray> as BatchableOperation<
-            Tangent<ArrayType, TestArray>,
-            EagerContext<
-                ArrayType,
-                Tangent<ArrayType, TestArray>,
-                LinearArrayOperation<ArrayType, TestArray, TestArray>,
-            >,
-        >>::batch(&operation, &context, &[unbatched_zero, batched_zero])
-        .unwrap();
-
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert_eq!(outputs[0].r#type().into_owned(), batched_type);
-        assert!(outputs[0].value().is_zero(), "expected symbolic-zero output from all-zero Add inputs");
     }
 }

@@ -1,24 +1,25 @@
-use crate::differentiation::Tangent;
+use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
+use crate::operations::constants::ZeroOperation;
 use crate::operations::stop_gradient::StopGradientOperation;
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::Typed;
 
 /// JVP rule for [`StopGradientOperation`]: the primal passes through unchanged and the tangent is
-/// replaced with a symbolic [`Tangent::Zero`], severing derivative flow in both forward and
-/// reverse mode. The rule stages no linear operation, so `stop_gradient` never appears in a
-/// pushforward program and needs no transpose rule.
+/// replaced with a canonical staged zero, severing derivative flow in both forward and reverse
+/// mode.
 impl<D: DifferentiationContext> DifferentiableOperation<D> for StopGradientOperation
 where
     StopGradientOperation: Operation<D::Type>,
+    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
+        context: &mut TangentContext<'jvp, D>,
         inputs: &[JvpTracer<'jvp, D>],
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
@@ -26,7 +27,9 @@ where
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone();
-        let tangent = Tangent::Zero(primal.r#type().into_owned());
+        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(primal.r#type().into_owned()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        let tangent = tangent_outputs.remove(0);
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }

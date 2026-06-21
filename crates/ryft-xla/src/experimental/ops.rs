@@ -612,10 +612,7 @@ impl JitCallOperation {
         LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
-        let tangent_inputs = inputs
-            .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let linear_operation = self.linear_call_operation(captured_inputs)?;
         let operation: LinearXlaOperation<TangentValue, XlaConstant, CapturedFactor<ArrayType, PrimalValue>> =
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation)));

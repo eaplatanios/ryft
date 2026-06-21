@@ -1,7 +1,7 @@
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Concatenate, ConcatenateOperation, SliceOperation, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
@@ -92,14 +92,14 @@ where
 }
 
 /// JVP rule for [`ConcatenateOperation`]: concatenation is jointly linear in all of its operands, so the tangent is
-/// the concatenation of the operand tangents along the same axis. When every operand tangent is a symbolic
-/// [`Tangent::Zero`](crate::differentiation::Tangent::Zero), the output tangent is a symbolic zero of the output
-/// type and no linear operation is staged.
+/// the concatenation of the operand tangents along the same axis. When every operand tangent is a canonical staged
+/// zero, the output tangent is a canonical staged zero of the output type and no linear operation is staged.
 impl<D> DifferentiableOperation<D> for ConcatenateOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Concatenate,
-    LinearOperationOf<D>: From<ConcatenateOperation>,
+    LinearOperationOf<D>: From<ConcatenateOperation> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -108,7 +108,6 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         if inputs.is_empty() {
             return Err(
@@ -117,15 +116,16 @@ where
         }
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = Concatenate::concatenate(&primal_operands, self.axis())?;
-        if inputs.iter().all(|input| input.tangent().is_zero()) {
-            let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
-        }
-        let operand_tangents = inputs
+        if inputs
             .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let operand_tangent_references = operand_tangents.iter().collect::<Vec<_>>();
+            .try_fold(true, |all_zero, input| Ok::<_, ProgramError>(all_zero && context.is_zero(input.tangent())?))?
+        {
+            let tangent_type = primal.r#type().into_owned();
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
+        }
+        let operand_tangent_references = inputs.iter().map(JvpTracer::tangent).collect::<Vec<_>>();
         let mut outputs =
             context.stage_operation(ConcatenateOperation::new(self.axis()), operand_tangent_references.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);

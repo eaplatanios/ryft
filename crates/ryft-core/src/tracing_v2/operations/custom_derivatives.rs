@@ -2,10 +2,10 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::contexts::{EagerContext, StagingContext};
-use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{ZeroLike, ZeroOperation};
+use crate::operations::constants::{HasZeroOperation, ZeroLike, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -149,6 +149,7 @@ where
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
+    LinearOperationOf<D>: HasZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -169,10 +170,13 @@ where
     // tangent slots, so only the user-defined (linear) tangent map survives.
     let mut tangent_seeds = Vec::with_capacity(2 * inputs.len());
     for input in inputs.iter() {
-        tangent_seeds.push(context.materialize_tangent(Tangent::Zero(input.primal().r#type().into_owned()))?);
+        let mut tangent_outputs =
+            context.stage_nullary_operation(ZeroOperation::new(input.primal().r#type().into_owned()))?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        tangent_seeds.push(tangent_outputs.remove(0));
     }
     for input in inputs.iter() {
-        tangent_seeds.push(context.materialize_tangent(input.tangent().clone())?);
+        tangent_seeds.push(input.tangent().clone());
     }
     let (jvp_primal_outputs, pushforward) =
         context.differentiable().linearize_program(operation.jvp_program(), jvp_primal_inputs)?;
@@ -208,6 +212,7 @@ where
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
+    LinearOperationOf<D>: HasZeroOperation<D::Type>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -553,6 +558,7 @@ where
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
+    LinearOperationOf<D>: HasZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -564,10 +570,7 @@ where
     let output_count = operation.output_types().len();
     check_count!("input", inputs, operation.input_types().len(), ProgramError);
     let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    let tangent_operands = inputs
-        .iter()
-        .map(|input| context.materialize_tangent(input.tangent().clone()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
     let (mut forward_values, _pushforward) =
         context.differentiable().linearize_program(&operation.forward, primal_operands)?;
     let residuals = forward_values.split_off(output_count);
@@ -596,6 +599,7 @@ where
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, V, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
+    LinearOperationOf<D>: HasZeroOperation<D::Type>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,

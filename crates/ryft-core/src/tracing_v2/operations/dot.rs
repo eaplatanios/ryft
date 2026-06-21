@@ -5,9 +5,10 @@ use half::{bf16, f16};
 
 use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, Tangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::manipulation::Transpose;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -696,7 +697,9 @@ where
     D::Value: Dot,
     LinearOperationOf<D>: From<AddOperation>
         + From<LeftDotOperation<CapturedFactor<ArrayType, D::Value>>>
-        + From<RightDotOperation<CapturedFactor<ArrayType, D::Value>>>,
+        + From<RightDotOperation<CapturedFactor<ArrayType, D::Value>>>
+        + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -717,25 +720,40 @@ where
             }
             None => left.primal().dot(right.primal(), &self.dimensions),
         };
-        let left_term = match left.tangent().clone() {
-            Tangent::Zero(r#type) => Tangent::Zero(r#type),
-            Tangent::Value(tangent) => Tangent::Value(match &self.output_sharding {
-                Some(output_sharding) => {
-                    tangent.right_dot_with_output_sharding(right.factor(context), &self.dimensions, output_sharding)
-                }
-                None => tangent.right_dot(right.factor(context), &self.dimensions),
-            }),
+        let left_term = if context.is_zero(left.tangent())? {
+            None
+        } else {
+            Some(match &self.output_sharding {
+                Some(output_sharding) => left.tangent().clone().right_dot_with_output_sharding(
+                    right.factor(context),
+                    &self.dimensions,
+                    output_sharding,
+                ),
+                None => left.tangent().clone().right_dot(right.factor(context), &self.dimensions),
+            })
         };
-        let right_term = match right.tangent().clone() {
-            Tangent::Zero(r#type) => Tangent::Zero(r#type),
-            Tangent::Value(tangent) => Tangent::Value(match &self.output_sharding {
-                Some(output_sharding) => {
-                    tangent.left_dot_with_output_sharding(left.factor(context), &self.dimensions, output_sharding)
-                }
-                None => tangent.left_dot(left.factor(context), &self.dimensions),
-            }),
+        let right_term = if context.is_zero(right.tangent())? {
+            None
+        } else {
+            Some(match &self.output_sharding {
+                Some(output_sharding) => right.tangent().clone().left_dot_with_output_sharding(
+                    left.factor(context),
+                    &self.dimensions,
+                    output_sharding,
+                ),
+                None => right.tangent().clone().left_dot(left.factor(context), &self.dimensions),
+            })
         };
-        let tangent = left_term + right_term;
+        let tangent = match (left_term, right_term) {
+            (Some(left_term), Some(right_term)) => left_term + right_term,
+            (Some(term), None) | (None, Some(term)) => term,
+            (None, None) => {
+                let mut tangent_outputs =
+                    context.stage_nullary_operation(ZeroOperation::new(primal.r#type().into_owned()))?;
+                check_count!("output", tangent_outputs, 1, ProgramError);
+                tangent_outputs.remove(0)
+            }
+        };
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
@@ -825,66 +843,6 @@ where
         output_sharding: &Sharding,
     ) -> Self {
         self.unary(RightDotOperation::new(factor, dimensions.clone()).with_output_sharding(output_sharding.clone()))
-    }
-}
-
-/// Symbolic-zero-aware tangent left dot. `Zero.left_dot(_, _) -> Zero`. The output-sharding variant is overridden so
-/// that the requested sharding reaches the wrapped value instead of being dropped by the provided default.
-impl<T, V, F> LeftDot<F> for crate::differentiation::Tangent<T, V>
-where
-    T: crate::types::Type,
-    V: crate::programs::Value<T> + LeftDot<F>,
-{
-    #[inline]
-    fn left_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type.clone()),
-            Self::Value(value) => Self::Value(value.left_dot(factor, dimensions)),
-        }
-    }
-
-    #[inline]
-    fn left_dot_with_output_sharding(
-        &self,
-        factor: F,
-        dimensions: &DotDimensionNumbers,
-        output_sharding: &Sharding,
-    ) -> Self {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type.clone()),
-            Self::Value(value) => Self::Value(value.left_dot_with_output_sharding(factor, dimensions, output_sharding)),
-        }
-    }
-}
-
-/// Symbolic-zero-aware tangent right dot. `Zero.right_dot(_, _) -> Zero`. The output-sharding variant is overridden
-/// so that the requested sharding reaches the wrapped value instead of being dropped by the provided default.
-impl<T, V, F> RightDot<F> for crate::differentiation::Tangent<T, V>
-where
-    T: crate::types::Type,
-    V: crate::programs::Value<T> + RightDot<F>,
-{
-    #[inline]
-    fn right_dot(&self, factor: F, dimensions: &DotDimensionNumbers) -> Self {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type.clone()),
-            Self::Value(value) => Self::Value(value.right_dot(factor, dimensions)),
-        }
-    }
-
-    #[inline]
-    fn right_dot_with_output_sharding(
-        &self,
-        factor: F,
-        dimensions: &DotDimensionNumbers,
-        output_sharding: &Sharding,
-    ) -> Self {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type.clone()),
-            Self::Value(value) => {
-                Self::Value(value.right_dot_with_output_sharding(factor, dimensions, output_sharding))
-            }
-        }
     }
 }
 

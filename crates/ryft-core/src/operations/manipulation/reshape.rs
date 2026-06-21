@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -267,15 +266,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<ReshapeOperation>>> Res
             self.context().stage_operation(ReshapeOperation::new(output_type.shape().clone()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-impl<V: Value<ArrayType> + Reshape> Reshape for Tangent<ArrayType, V> {
-    fn reshape(&self, shape: Shape) -> Result<Self, ProgramError> {
-        match self {
-            Self::Zero(r#type) => Ok(Self::Zero(r#type.reshape(shape)?)),
-            Self::Value(value) => Ok(Self::Value(value.reshape(shape)?)),
-        }
     }
 }
 

@@ -9,7 +9,7 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{HasZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, LinearScatterAddOperation, Reshape, SCATTER_OPERATION_NAME, Scatter, ScatterOperation,
     ScatterReductionKind, Slice, Transpose, UpdateSlice,
@@ -30,7 +30,9 @@ impl<D> DifferentiableOperation<D> for ScatterOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Scatter,
-    LinearOperationOf<D>: From<LinearScatterAddOperation<CapturedFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>:
+        From<LinearScatterAddOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
+    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -39,15 +41,16 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
     where
         D: 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
     {
         let [operand, indices, updates] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() });
         };
         let primal = operand.primal().scatter(indices.primal(), updates.primal(), self)?;
-        if operand.tangent().is_zero() && updates.tangent().is_zero() {
+        if context.is_zero(operand.tangent())? && context.is_zero(updates.tangent())? {
             let tangent_type = primal.r#type().into_owned();
-            return Ok(vec![JvpTracer::from_zero_tangent(primal, tangent_type)]);
+            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
         }
         if self.kind() != ScatterReductionKind::Add {
             return Err(ProgramError::UnsupportedOperation {
@@ -59,11 +62,9 @@ where
             });
         }
         let indices_factor = indices.factor(context);
-        let operand_tangent = context.materialize_tangent(operand.tangent().clone())?;
-        let updates_tangent = context.materialize_tangent(updates.tangent().clone())?;
         let mut outputs = context.stage_operation(
             LinearScatterAddOperation::new(self.clone(), indices_factor),
-            &[operand_tangent, updates_tangent],
+            &[operand.tangent(), updates.tangent()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])

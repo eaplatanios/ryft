@@ -86,16 +86,16 @@ pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized
     /// [`EagerContext`](crate::EagerContext) to make the absence of backend-owned runtime state explicit. On the other
     /// hand, [`Tracer`](crate::Tracer) values use the [`StagingContext`](crate::StagingContext) that owns them so that
     /// nullary operations (e.g., [`ZeroOperation`](crate::ZeroOperation)) can stage themselves into the surrounding
-    /// trace instead of failing for lack of an operand from which to recover that context. Wrapper value types (e.g.,
-    /// [`Tangent`](crate::Tangent)) delegate to their payload's context.
+    /// trace instead of failing for lack of an operand from which to recover that context. Wrapper value types delegate
+    /// to their payload's context when they carry one.
     type InterpretationContext: Context<Type = T>;
 
     /// Recovers the [`InterpretationContext`](Self::InterpretationContext) carried by this value, or `None` when this
     /// value does not have a payload (e.g., when it represents a symbolic zero value) and therefore carries no context
     /// to recover. Concrete (i.e., **eager**) values return a zero-sized [`EagerContext`](crate::EagerContext). On the
     /// other hand, [`Tracer`](crate::Tracer) values return clones of the [`StagingContext`](crate::StagingContext) that
-    /// owns them, and wrapper value types delegate to their payload's context, returning `None` for their payload-less
-    /// variants (e.g., for [`Tangent::Zero`](crate::Tangent::Zero)).
+    /// owns them, and wrapper value types delegate to their payload's context, returning `None` for payload-less
+    /// variants.
     ///
     /// This function lets generic helpers that interpret operand-bearing [`Operation`]s recover the context from one of
     /// their input values instead of requiring callers to thread one in. Because a single operand can sometimes be a

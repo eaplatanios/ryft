@@ -3,13 +3,11 @@ use std::fmt::Display;
 use half::{bf16, f16};
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
-use crate::operations::constants::Zero;
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, TypeError, Typed};
+use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`SelectOperation`].
 pub const SELECT_OPERATION_NAME: &'static str = "select";
@@ -237,40 +235,6 @@ impl<C: StagingContext<Operation: From<SelectOperation>>> SelectCondition for Tr
     }
 }
 
-impl<V: Value<ArrayType> + Zero<ArrayType> + Select<Condition = V>> Select for Tangent<ArrayType, V> {
-    type Condition = V;
-
-    fn select(condition: &V, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let output_types = SelectOperation.infer_output_types(&[
-            condition.r#type().into_owned(),
-            on_true.r#type().into_owned(),
-            on_false.r#type().into_owned(),
-        ])?;
-        check_count!("output", output_types, 1, ProgramError);
-        if on_true.is_zero() && on_false.is_zero() {
-            return Ok(Self::Zero(output_types.into_iter().next().unwrap()));
-        }
-        let materialize = |tangent: &Self| match tangent {
-            Self::Zero(r#type) => V::zero(r#type),
-            Self::Value(value) => Ok(value.clone()),
-        };
-        Ok(Self::Value(V::select(condition, &materialize(on_true)?, &materialize(on_false)?)?))
-    }
-}
-
-impl<V: Value<DataType> + BooleanLike> SelectCondition for Tangent<DataType, V> {
-    type Condition = bool;
-
-    fn select_condition(&self) -> Result<bool, ProgramError> {
-        match self {
-            Self::Value(value) => value.boolean(),
-            Self::Zero(r#type) => Err(ProgramError::Concretization {
-                message: format!("cannot extract a concrete boolean from a symbolic zero tangent of type {type}"),
-            }),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -279,7 +243,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
-    use crate::types::{Shape, Size};
+    use crate::types::{Shape, Size, Typed};
 
     use super::*;
 

@@ -22,7 +22,7 @@
 //!   transposition (the same hint is applied to the cotangent) and is materialized only at lowering, where it steers
 //!   the compiler's (e.g. [GSPMD](https://arxiv.org/abs/2105.04663) / [Shardy](https://openxla.org/shardy))
 //!   sharding propagation. It rejects requests whose [`Sharded`](crate::sharding::ShardingDimension::Sharded) entries
-//!   name non-[`Auto`](crate::sharding::MeshAxisType::Auto) axes (use a [`ReshardOperation`] for those).
+//!   name non-[`Auto`](MeshAxisType::Auto) axes (use a [`ReshardOperation`] for those).
 //!
 //! Both lower to the same backend sharding-constraint operation (the [`Shardy`](https://openxla.org/shardy)
 //! `sdy.sharding_constraint` in the XLA backend); the only difference at the boundary is whether the type system
@@ -32,7 +32,6 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -179,21 +178,6 @@ where
     }
 }
 
-/// Symbolic-zero-aware reshard: a structural zero stays a zero, re-typed to the resharded type so the cotangent and
-/// tangent shardings stay consistent.
-impl<V: Value<ArrayType> + Reshard> Reshard for Tangent<ArrayType, V> {
-    #[inline]
-    fn reshard(&self, sharding: &Sharding) -> Self {
-        match self {
-            Self::Zero(r#type) => match ReshardOperation::new(sharding.clone()).infer_output_types(&[r#type.clone()]) {
-                Ok(mut output_types) => Self::Zero(output_types.remove(0)),
-                Err(_) => Self::Zero(r#type.clone()),
-            },
-            Self::Value(value) => Self::Value(value.reshard(sharding)),
-        }
-    }
-}
-
 impl<V: Value<ArrayType> + Reshard> InterpretableOperation<ArrayType, V> for ReshardOperation {
     fn interpret(
         &self,
@@ -307,18 +291,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<ShardingConstraintOpera
     #[inline]
     fn constrain_sharding(&self, sharding: &Sharding) -> Self {
         self.unary(ShardingConstraintOperation::new(sharding.clone()))
-    }
-}
-
-/// Symbolic-zero-aware sharding constraint: a structural zero stays a zero of the same type (the hint does not change
-/// the type), so the constraint is a structural identity on zeros.
-impl<V: Value<ArrayType> + ConstrainSharding> ConstrainSharding for Tangent<ArrayType, V> {
-    #[inline]
-    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
-        match self {
-            Self::Zero(r#type) => Self::Zero(r#type.clone()),
-            Self::Value(value) => Self::Value(value.constrain_sharding(sharding)),
-        }
     }
 }
 

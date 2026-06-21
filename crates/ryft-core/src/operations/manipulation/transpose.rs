@@ -1,7 +1,6 @@
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -171,18 +170,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> T
             return Ok(self.clone());
         }
         Ok(self.unary(TransposeOperation::new(permutation.to_vec())))
-    }
-}
-
-impl<V: Value<ArrayType> + Transpose> Transpose for Tangent<ArrayType, V> {
-    #[inline]
-    fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
-        match self {
-            // The zero tangent carries the transposed type; validation and sharding propagation reuse the type-level
-            // rule on the borrowed type.
-            Self::Zero(r#type) => Ok(Self::Zero(r#type.transpose(permutation)?)),
-            Self::Value(value) => Ok(Self::Value(value.transpose(permutation)?)),
-        }
     }
 }
 

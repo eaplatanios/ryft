@@ -814,10 +814,7 @@ where
 
         // Stage one linear condition over the operand tangents, capturing the predicate primal as a residual factor.
         let predicate_factor = predicate.factor(context);
-        let tangent_operands = operands
-            .iter()
-            .map(|input| context.materialize_tangent(input.tangent().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let tangent_operands = operands.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let tangent_outputs = context.stage_operation(
             LinearOperationOf::<D>::linear_condition_operation(predicate_factor, true_branch, false_branch),
             tangent_operands.as_slice(),
@@ -976,12 +973,7 @@ where
         // active linear builder so the accumulated tangent program stays straight-line (and therefore transposable).
         if context.differentiable().supports_primal_concretization() {
             let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            // Materialize symbolic-zero state tangents into concrete tangent atoms at loop entry so each body
-            // pushforward can be staged over them.
-            let mut state_tangents = inputs
-                .iter()
-                .map(|input| context.materialize_tangent(input.tangent().clone()))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut state_tangents = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
             let mut completed_iterations = 0;
             loop {
                 // A semantic iteration bound truncates the unrolled loop even while the condition still produces
@@ -1169,10 +1161,7 @@ where
                 .collect::<Vec<_>>();
             scan_body.output_ids = masked_outputs;
             scan_body.output_structure = vec![Placeholder; state_count];
-            let tangent_operands = inputs
-                .iter()
-                .map(|input| context.materialize_tangent(input.tangent().clone()))
-                .collect::<Result<Vec<_>, _>>()?;
+            let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
             let linear_scan =
                 LinearOperationOf::<D>::linear_scan_operation(scan_body, stack_factors, state_count, bound, false, 1)?;
             let tangent_outputs = context.stage_operation(linear_scan, tangent_operands.as_slice())?;
@@ -1201,15 +1190,12 @@ where
         let mut linear_inputs = Vec::with_capacity(2 * state_count);
         for input in inputs {
             let factor = input.factor(context);
-            let mut outputs = context.stage_operation(
-                LinearOperationOf::<D>::residual_operation(factor),
-                &[] as &[Tracer<TangentContext<'jvp, D>>],
-            )?;
+            let mut outputs = context.stage_nullary_operation(LinearOperationOf::<D>::residual_operation(factor))?;
             check_count!("output", outputs, 1, ProgramError);
             linear_inputs.push(outputs.remove(0));
         }
         for input in inputs {
-            linear_inputs.push(context.materialize_tangent(input.tangent().clone())?);
+            linear_inputs.push(input.tangent().clone());
         }
 
         let linear_while = LinearOperationOf::<D>::linear_while_operation(extended_condition, fused_body)?;
@@ -2191,7 +2177,6 @@ mod tests {
 
     use crate::contexts::ProvidesContext;
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::Tangent;
     use crate::domains::Domain;
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
@@ -2389,6 +2374,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
+        Zero(ZeroOperation<ArrayType>),
         Add,
         Neg,
         Scale {
@@ -2435,6 +2421,7 @@ mod tests {
         #[inline]
         fn name(&self) -> &'static str {
             match self {
+                Self::Zero(operation) => operation.name(),
                 Self::Add => "linear_add",
                 Self::Neg => "linear_neg",
                 Self::Scale { .. } => "linear_scale",
@@ -2448,6 +2435,7 @@ mod tests {
 
         fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
             match self {
+                Self::Zero(operation) => operation.infer_output_types(input_types),
                 Self::Add | Self::Select { .. } => {
                     check_count!("input", input_types, 2, TypeError);
                     check_types!(self.name(), &input_types[..1], &input_types[1..]);
@@ -2478,6 +2466,7 @@ mod tests {
             inputs: &[TestValue],
         ) -> Result<Vec<TestValue>, ProgramError> {
             match self {
+                Self::Zero(operation) => operation.interpret(context, inputs),
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),
                     _ => Err(TypeError { message: ("linear add expected numeric inputs").into() }.into()),
@@ -2531,6 +2520,10 @@ mod tests {
             output_cotangents: &[Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>],
         ) -> Result<Vec<Cotangent<'transpose, ArrayType, TestValue, TestLinearOperation>>, ProgramError> {
             match self {
+                Self::Zero(_) => {
+                    check_count!("output", output_cotangents, 1, ProgramError);
+                    Ok(vec![])
+                }
                 Self::Add => {
                     check_count!("output", output_cotangents, 1, ProgramError);
                     Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
@@ -2581,10 +2574,19 @@ mod tests {
     }
 
     impl From<ZeroOperation<ArrayType>> for TestLinearOperation {
-        fn from(_operation: ZeroOperation<ArrayType>) -> Self {
-            // The test linear operation enum doesn't include a Zero variant; the tests below never disconnect
-            // primal inputs, so this constructor is unreachable in practice.
-            Self::Scale { factor: TestValue::Number(0.0) }
+        fn from(operation: ZeroOperation<ArrayType>) -> Self {
+            Self::Zero(operation)
+        }
+    }
+
+    impl<'operation> TryFrom<&'operation TestLinearOperation> for &'operation ZeroOperation<ArrayType> {
+        type Error = ();
+
+        fn try_from(value: &'operation TestLinearOperation) -> Result<Self, ()> {
+            match value {
+                TestLinearOperation::Zero(operation) => Ok(operation),
+                _ => Err(()),
+            }
         }
     }
 
@@ -2873,12 +2875,6 @@ mod tests {
     impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = TestLinearOperation;
-
-        fn zero_tangent(&self, type_: &Self::Type) -> Result<Self::Tangent, ProgramError> {
-            let mut outputs = self.bind(ZeroOperation::new(type_.clone()), &[])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs.pop().expect("zero operation produces exactly one output"))
-        }
     }
 
     impl ProvidesContext<<TestValue as Value<ArrayType>>::InterpretationContext> for TestDomain {
@@ -2913,7 +2909,10 @@ mod tests {
                     check_count!("input", inputs, 0, ProgramError);
                     let mut primals = context.bind_primal(Self::Zero(value_type.clone()), &[])?;
                     check_count!("output", primals, 1, ProgramError);
-                    Ok(vec![JvpTracer::from_zero_tangent(primals.pop().unwrap(), value_type.clone())])
+                    let mut tangent_outputs =
+                        context.stage_nullary_operation(ZeroOperation::new(value_type.clone()))?;
+                    check_count!("output", tangent_outputs, 1, ProgramError);
+                    Ok(vec![JvpTracer::new(primals.pop().unwrap(), tangent_outputs.remove(0))])
                 }
                 Self::One(_)
                 | Self::Add
@@ -2934,10 +2933,9 @@ mod tests {
                     check_count!("input", inputs, 1, ProgramError);
                     let mut primals = context.bind_primal(self.clone(), &[inputs[0].primal().clone()])?;
                     check_count!("output", primals, 1, ProgramError);
-                    let materialized_tangent = context.materialize_tangent(inputs[0].tangent().clone())?;
                     let tangent_outputs = context.stage_operation(
                         LinearOperationOf::<D>::from(ScaleOperation::new(factor.clone())),
-                        &[materialized_tangent],
+                        &[inputs[0].tangent()],
                     )?;
                     check_count!("output", tangent_outputs, 1, ProgramError);
                     Ok(vec![JvpTracer::from_value(primals.pop().unwrap(), tangent_outputs[0].clone())])
@@ -3143,15 +3141,6 @@ mod tests {
         );
     }
 
-    fn expect_tangent_value<'jvp, T: crate::types::Type, V: crate::programs::Value<T>>(tangent: &Tangent<T, V>) -> V {
-        match tangent {
-            Tangent::Value(value) => value.clone(),
-            Tangent::Zero(_) => {
-                panic!("expected a concrete tangent value, not a symbolic zero")
-            }
-        }
-    }
-
     #[test]
     fn test_generic_condition_jvp_uses_custom_operations() {
         let condition = ConditionOperation::new(custom_scale_branch(2.0), custom_scale_branch(3.0)).unwrap();
@@ -3159,13 +3148,16 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestLinearOperation>::new()));
         let mut context = TangentContext::new(&domain, builder.clone());
         let tangent_input = context.input(ArrayType::scalar(DataType::F64));
-        let predicate = JvpTracer::from_zero_tangent(TestValue::Bool(true), ArrayType::scalar(DataType::Boolean));
+        let mut predicate_tangents =
+            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))).unwrap();
+        assert_eq!(predicate_tangents.len(), 1);
+        let predicate = JvpTracer::from_value(TestValue::Bool(true), predicate_tangents.remove(0));
         let outputs = condition
             .jvp(&mut context, &[predicate, JvpTracer::from_value(TestValue::Number(4.0), tangent_input)])
             .unwrap();
 
         assert_eq!(outputs[0].primal(), &TestValue::Number(8.0));
-        let tangent_output = expect_tangent_value(outputs[0].tangent()).atom_id().unwrap();
+        let tangent_output = outputs[0].tangent().atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
@@ -3218,15 +3210,13 @@ mod tests {
         >::new()));
         let mut context = TangentContext::new(&outer_context, linear_builder.clone());
         let tangent_operand = context.input(ArrayType::scalar(DataType::F64));
+        let mut predicate_tangents =
+            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))).unwrap();
+        assert_eq!(predicate_tangents.len(), 1);
+        let predicate = JvpTracer::from_value(primal_predicate, predicate_tangents.remove(0));
 
         let outputs = condition
-            .jvp(
-                &mut context,
-                &[
-                    JvpTracer::from_zero_tangent(primal_predicate, ArrayType::scalar(DataType::Boolean)),
-                    JvpTracer::from_value(primal_operand, tangent_operand),
-                ],
-            )
+            .jvp(&mut context, &[predicate, JvpTracer::from_value(primal_operand, tangent_operand)])
             .expect("the condition JVP rule should stage condition structure instead of concretizing the predicate");
         assert_eq!(outputs.len(), 1);
 
@@ -3242,10 +3232,11 @@ mod tests {
         assert_eq!(staged_condition.true_branch().output_ids().len(), 2);
         assert_eq!(staged_condition.false_branch().output_ids().len(), 2);
 
-        // The linear trace gained exactly one captured-predicate linear condition over the operand tangent.
+        // The linear trace gained the predicate's canonical zero tangent followed by one captured-predicate linear
+        // condition over the operand tangent.
         let linear_builder = linear_builder.borrow();
-        assert_eq!(linear_builder.instructions().len(), 1);
-        let staged_linear = linear_builder.instructions()[0].operation();
+        assert_eq!(linear_builder.instructions().len(), 2);
+        let staged_linear = linear_builder.instructions()[1].operation();
         assert_eq!(staged_linear.name(), "condition");
         assert!(matches!(staged_linear, LinearArrayOperation::Condition { .. }));
     }
@@ -3272,10 +3263,7 @@ mod tests {
             outputs.iter().map(|output| output.primal().clone()).collect::<Vec<_>>(),
             vec![TestValue::Number(0.0), TestValue::Number(40.0)],
         );
-        let tangent_outputs = outputs
-            .iter()
-            .map(|output| expect_tangent_value(output.tangent()).atom_id().unwrap())
-            .collect::<Vec<_>>();
+        let tangent_outputs = outputs.iter().map(|output| output.tangent().atom_id().unwrap()).collect::<Vec<_>>();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();
@@ -3558,10 +3546,6 @@ mod tests {
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
             LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
 
-        fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
-            TestArray::zero(type_)
-        }
-
         fn supports_primal_concretization(&self) -> bool {
             false
         }
@@ -3766,7 +3750,7 @@ mod tests {
             .expect("the while JVP rule should defactorize the staged fused loop instead of rejecting it");
         assert_eq!(outputs.len(), 1);
         let primal = outputs[0].primal().clone();
-        let tangent_output = expect_tangent_value(outputs[0].tangent()).atom_id().unwrap();
+        let tangent_output = outputs[0].tangent().atom_id().unwrap();
         drop(outputs);
         drop(context);
         let builder = Rc::try_unwrap(builder).unwrap().into_inner();

@@ -2,13 +2,11 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::contexts::StagingContext;
-use crate::differentiation::Tangent;
-use crate::operations::constants::Zero;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -271,27 +269,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<ConcatenateOperation>>>
         let mut outputs = first.context().stage_operation(ConcatenateOperation::new(axis), inputs.as_slice())?;
         crate::macros::check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-impl<V: Value<ArrayType> + Concatenate + Zero<ArrayType>> Concatenate for Tangent<ArrayType, V> {
-    fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
-        // Concatenating symbolic zeros stays a symbolic zero of the concatenated output type; the type-level
-        // capability validates the geometry over the operand types. Any non-zero operand forces materialization,
-        // so the remaining symbolic zeros become concrete zeros of their own types.
-        let operand_types = operands.iter().map(|operand| operand.r#type().into_owned()).collect::<Vec<_>>();
-        let output_type = ArrayType::concatenate(&operand_types, axis)?;
-        if operands.iter().all(Self::is_zero) {
-            return Ok(Self::Zero(output_type));
-        }
-        let values = operands
-            .iter()
-            .map(|operand| match operand {
-                Self::Zero(r#type) => V::zero(r#type),
-                Self::Value(value) => Ok(value.clone()),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::Value(Concatenate::concatenate(&values, axis)?))
     }
 }
 

@@ -992,10 +992,6 @@ impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
         LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
-
-    fn zero_tangent(&self, type_: &ArrayType) -> Result<Self::Tangent, ProgramError> {
-        TestArray::zero(type_)
-    }
 }
 
 impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for TestArrayDomain {
