@@ -1643,7 +1643,7 @@ mod tests {
         program: &crate::programs::Program<
             ArrayType,
             TestArray,
-            ArrayOperation<ArrayType, TestArray>,
+            ArrayOperation<TestArray>,
             Vec<TestArray>,
             Vec<TestArray>,
         >,

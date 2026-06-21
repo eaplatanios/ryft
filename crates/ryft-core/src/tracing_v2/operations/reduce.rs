@@ -841,8 +841,7 @@ mod tests {
 
         // Staging `reduce_with_output_sharding` on a tracer must carry the requested sharding through the capability,
         // the staged `ReduceOperation`, and the `ArrayOperation::Reduce` variant into the built program.
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, ArrayOperation<ArrayType, ArrayType>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, ArrayOperation<ArrayType>>::new()));
         let input_atom = builder.borrow_mut().add_input(input_type);
         let domain = AbstractDomain::new();
         let context = AbstractTracingContext::new(&domain, builder.clone());
@@ -1020,28 +1019,14 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                ArrayType,
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<ArrayType, TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                ArrayType,
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<ArrayType, TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         >::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
@@ -1112,12 +1097,11 @@ mod tests {
             ArrayType,
             TestArray,
             LinearArrayOperation<
-                ArrayType,
                 TestArray,
                 TestArray,
                 std::convert::Infallible,
                 CapturedFactor<ArrayType, TestArray>,
-                ArrayOperation<ArrayType, TestArray>,
+                ArrayOperation<TestArray>,
             >,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));

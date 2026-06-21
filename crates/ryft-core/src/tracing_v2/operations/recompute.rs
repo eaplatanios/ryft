@@ -166,7 +166,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, LinearOperation>::new()));
         let mut context = TangentContext::new(&TestArrayDomain, builder.clone());
         let tangent = context.input(scalar_type.clone());
-        let operation = RecomputeOperation::new(ArrayOperation::<ArrayType, TestArray>::Add(AddOperation));
+        let operation = RecomputeOperation::new(ArrayOperation::<TestArray>::Add(AddOperation));
 
         let outputs = operation
             .jvp(
@@ -187,20 +187,14 @@ mod tests {
 
     #[test]
     fn test_recompute_transpose_returns_zero_input_cotangents() {
-        type LinearOperation = LinearArrayOperation<
-            ArrayType,
-            TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<ArrayType, TestArray>,
-        >;
+        type LinearOperation =
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
 
         let scalar_type = ArrayType::scalar(DataType::F64);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, LinearOperation>::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
-        let operation = RecomputeOperation::new(ArrayOperation::<ArrayType, TestArray>::Add(AddOperation));
+        let operation = RecomputeOperation::new(ArrayOperation::<TestArray>::Add(AddOperation));
 
         let cotangents = operation.transpose(&mut context, &[&scalar_type, &scalar_type], &[Cotangent::Zero]).unwrap();
 

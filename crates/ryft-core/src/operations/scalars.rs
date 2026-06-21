@@ -1,9 +1,9 @@
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-use ryft_macros::Operation;
+use ryft_macros::{Operation, TransposableOperation};
 
-use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
+use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -15,10 +15,8 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
 use crate::tracing_v2::operations::custom_derivatives::{
@@ -39,63 +37,25 @@ use crate::types::DataType;
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug, Operation)]
-#[ryft(type = "DataType")]
 pub enum ScalarOperation<V: Value<DataType>> {
-    /// Typed scalar zero.
     Zero(ZeroOperation<DataType>),
-
-    /// Exemplar-derived scalar zero.
     ZeroLike(ZeroLikeOperation),
-
-    /// Typed scalar one.
     One(OneOperation<DataType>),
-
-    /// Exemplar-derived scalar one.
     OneLike(OneLikeOperation),
-
-    /// Typed scalar constant.
     Constant(ConstantOperation<DataType, V>),
-
-    /// Scalar negation.
     Neg(NegOperation),
-
-    /// Scalar addition.
     Add(AddOperation),
-
-    /// Scalar subtraction.
     Sub(SubOperation),
-
-    /// Scaling by a captured scalar factor.
     Scale(ScaleOperation<DataType, V>),
-
-    /// Scalar multiplication.
     Mul(MulOperation),
-
-    /// Scalar division.
     Div(DivOperation),
-
-    /// Scalar sine.
     Sin(SinOperation),
-
-    /// Scalar cosine.
     Cos(CosOperation),
-
-    /// Scalar comparison.
     Compare(CompareOperation),
-
-    /// Scalar selection on a Boolean condition.
     Select(SelectOperation),
-
-    /// Gradient barrier that passes its primal through unchanged.
     StopGradient(StopGradientOperation),
-
-    /// Rematerialization tag attached to a scalar value.
     RematerializationName(RematerializationNameOperation),
-
-    /// User-supplied `custom_jvp` operation with a closed scalar body.
     CustomJvp(Box<CustomJvpOperation<DataType, V, Self>>),
-
-    /// User-supplied `custom_vjp` operation with a closed scalar body.
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
@@ -235,11 +195,12 @@ where
 
 /// Closed scalar operation type for staged linear scalar programs.
 ///
-/// The `C` parameter is the constant type of the
+/// The `V` parameter is the scalar tangent/cotangent value type carried by the linear program. The `C` parameter is
+/// the constant type of the
 /// [`DifferentiationContext`](crate::tracing_v2::DifferentiationContext) that stages the linear program: every
 /// context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in its `LinearOperation` associated-type
 /// definition. It types the user-supplied backward programs captured by [`CustomVjpCall`](Self::CustomVjpCall),
-/// which are written over context constants rather than over the factor type `F`.
+/// which are written over context constants rather than over the linear value type `V` or captured-factor type `F`.
 ///
 /// The variants mirror the linear scalar primitives: typed [`Zero`](Self::Zero)/[`One`](Self::One) and their
 /// exemplar-derived [`ZeroLike`](Self::ZeroLike)/[`OneLike`](Self::OneLike) maps, a typed
@@ -247,81 +208,19 @@ where
 /// factor ([`Scale`](Self::Scale)), the captured-condition [`Select`](Self::Select)
 /// ([`LinearSelectOperation`]), and the opaque [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp`
 /// linearization (its transpose replays the user's backward program).
-#[derive(Clone, Debug, Operation)]
-#[ryft(type = "DataType")]
-pub enum LinearScalarOperation<C: Value<DataType>, F: Value<DataType> = C> {
-    /// Typed scalar zero.
+#[derive(Clone, Debug, Operation, TransposableOperation)]
+pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Value<DataType> = C> {
     Zero(ZeroOperation<DataType>),
-
-    /// Exemplar-derived scalar zero.
     ZeroLike(ZeroLikeOperation),
-
-    /// Typed scalar one.
     One(OneOperation<DataType>),
-
-    /// Exemplar-derived scalar one.
     OneLike(OneLikeOperation),
-
-    /// Typed scalar constant carried as a factor.
-    Constant(ConstantOperation<DataType, F>),
-
-    /// Scalar negation.
+    Constant(ConstantOperation<DataType, V>),
     Neg(NegOperation),
-
-    /// Scalar addition.
     Add(AddOperation),
-
-    /// Scalar subtraction.
     Sub(SubOperation),
-
-    /// Scaling by a captured scalar factor.
     Scale(ScaleOperation<DataType, F>),
-
-    /// Selection on a captured Boolean condition.
     Select(LinearSelectOperation<F>),
-
-    /// Opaque `custom_vjp` call whose transpose replays the user's backward program.
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
-}
-
-impl<C: Value<DataType>, F: Value<DataType>, W, O> TransposableOperation<DataType, W, O> for LinearScalarOperation<C, F>
-where
-    ZeroOperation<DataType>: TransposableOperation<DataType, W, O>,
-    ZeroLikeOperation: TransposableOperation<DataType, W, O>,
-    OneOperation<DataType>: TransposableOperation<DataType, W, O>,
-    OneLikeOperation: TransposableOperation<DataType, W, O>,
-    ConstantOperation<DataType, F>: TransposableOperation<DataType, W, O>,
-    NegOperation: TransposableOperation<DataType, W, O>,
-    AddOperation: TransposableOperation<DataType, W, O>,
-    SubOperation: TransposableOperation<DataType, W, O>,
-    ScaleOperation<DataType, F>: TransposableOperation<DataType, W, O>,
-    LinearSelectOperation<F>: TransposableOperation<DataType, W, O>,
-    CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>: TransposableOperation<DataType, W, O>,
-    W: Value<DataType>,
-    O: Operation<DataType>,
-    W: Add<Output = W> + Neg<Output = W> + ZeroLike + OneLike,
-    Vec<W>: Parameterized<W, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<'transpose, DataType, W, O>,
-        input_types: &[&DataType],
-        output_cotangents: &[Cotangent<'transpose, DataType, W, O>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, W, O>>, ProgramError> {
-        match self {
-            Self::Zero(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::ZeroLike(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::One(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::OneLike(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Constant(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Neg(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Add(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Sub(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Scale(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::Select(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::CustomVjpCall(operation) => operation.transpose(context, input_types, output_cotangents),
-        }
-    }
 }
 
 impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {

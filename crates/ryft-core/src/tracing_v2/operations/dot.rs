@@ -1955,8 +1955,7 @@ mod tests {
 
         // Batch the operation over tracer inputs, which is how program batching applies lifted operations: the
         // staged batched dot must carry the lifted output sharding instead of dropping it.
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, ArrayOperation<ArrayType, ArrayType>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, ArrayType, ArrayOperation<ArrayType>>::new()));
         let lhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 4, 8]));
         let rhs_atom = builder.borrow_mut().add_input(plain_array(&[2, 8, 16]));
         let domain = AbstractDomain::new();

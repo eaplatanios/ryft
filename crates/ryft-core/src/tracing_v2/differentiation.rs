@@ -1963,7 +1963,7 @@ where
         >,
 {
     type Tangent = S;
-    type LinearOperation<V: Value<DataType>, F: Value<DataType>> = LinearScalarOperation<S, F>;
+    type LinearOperation<V: Value<DataType>, F: Value<DataType>> = LinearScalarOperation<V, S, F>;
 }
 
 impl<S: Value<DataType>> ProvidesContext<<S as Value<DataType>>::InterpretationContext> for ScalarDomain<S>
@@ -2185,8 +2185,7 @@ mod tests {
         )
         .unwrap();
 
-        let builder =
-            Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new()));
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
         let context = TracingContext::new(&domain, builder.clone());
         let x = context.input(ArrayType::scalar(DataType::F64));
         let linearization = program.linearize(&context).unwrap();

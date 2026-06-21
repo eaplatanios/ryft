@@ -409,16 +409,17 @@ where
 /// reference index `i` resolves to slice `lane` of `residual_stacks[i]` while iteration `lane` runs, so the body stays
 /// fully linear in its tangent inputs with every captured primal entering through a per-lane residual slice.
 #[derive(Clone, Debug)]
-pub struct LinearScanOperation<T, V, C, Extension, F, P>
+pub struct LinearScanOperation<V, C, Extension, F, P>
 where
-    T: Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-    P: Operation<T>,
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Operation<ArrayType>,
 {
     /// Residualized body pushforward with scan-local residual references.
-    body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, CapturedFactor<T, V>, P>, Vec<V>, Vec<V>>>,
+    body: Box<
+        Program<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>, Vec<V>, Vec<V>>,
+    >,
 
     /// Stacked per-iteration residual factors indexed by the body's scan-local residual references; each stack's
     /// leading dimension is the scan length.
@@ -438,19 +439,26 @@ where
     unroll: usize,
 }
 
-impl<V, C, T, Extension, F, P> LinearScanOperation<T, V, C, Extension, F, P>
+impl<V, C, Extension, F, P> LinearScanOperation<V, C, Extension, F, P>
 where
-    T: Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-    P: Operation<T>,
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Operation<ArrayType>,
 {
     /// Creates a new [`LinearScanOperation`] from the residualized body pushforward, the stacked residual factors,
     /// and the scan's static metadata.
     #[inline]
     pub fn new(
-        body: Box<Program<T, V, LinearArrayOperation<T, V, C, Extension, CapturedFactor<T, V>, P>, Vec<V>, Vec<V>>>,
+        body: Box<
+            Program<
+                ArrayType,
+                V,
+                LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>,
+                Vec<V>,
+                Vec<V>,
+            >,
+        >,
         residual_stacks: Vec<F>,
         carry_count: usize,
         length: usize,
@@ -464,7 +472,8 @@ where
     #[inline]
     pub fn body(
         &self,
-    ) -> &Program<T, V, LinearArrayOperation<T, V, C, Extension, CapturedFactor<T, V>, P>, Vec<V>, Vec<V>> {
+    ) -> &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>, Vec<V>, Vec<V>>
+    {
         self.body.as_ref()
     }
 
@@ -499,22 +508,21 @@ where
     }
 }
 
-impl<V, C, T, Extension, F, P> Display for LinearScanOperation<T, V, C, Extension, F, P>
+impl<V, C, Extension, F, P> Display for LinearScanOperation<V, C, Extension, F, P>
 where
-    T: Type,
-    V: Value<T>,
-    C: Value<T>,
-    F: Value<T>,
-    Extension: Operation<T>,
-    P: Operation<T>,
-    Self: Operation<T>,
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    Extension: Operation<ArrayType>,
+    P: Operation<ArrayType>,
+    Self: Operation<ArrayType>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<V, C, Extension, F, P> Operation<ArrayType> for LinearScanOperation<ArrayType, V, C, Extension, F, P>
+impl<V, C, Extension, F, P> Operation<ArrayType> for LinearScanOperation<V, C, Extension, F, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -575,43 +583,26 @@ where
 /// enum pinned to the scan-local [`CapturedFactor<ArrayType, V>`](crate::tracing_v2::CapturedFactor) factor namespace,
 /// whose [`TransposableOperation`] obligation (on the enclosing enum itself) is the nested-factor fixed point that
 /// makes the recursion terminate.
-impl<V, C, Extension, F, P> TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>
-    for LinearScanOperation<ArrayType, V, C, Extension, F, P>
+impl<V, C, Extension, F, P> TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
+    for LinearScanOperation<V, C, Extension, F, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     Extension: Operation<ArrayType>,
     P: Operation<ArrayType>,
-    LinearArrayOperation<ArrayType, V, C, Extension, F, P>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>
+    LinearArrayOperation<V, C, Extension, F, P>: From<ZeroOperation<ArrayType>> + From<AddOperation>,
+    LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>>
         + From<ZeroOperation<ArrayType>>
-        + From<AddOperation>,
-    LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, P>: TransposableOperation<
-            ArrayType,
-            V,
-            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, P>,
-        > + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            V,
-            LinearArrayOperation<ArrayType, V, C, Extension, F, P>,
-        >,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>,
         input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            V,
-            LinearArrayOperation<ArrayType, V, C, Extension, F, P>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>>,
-        ProgramError,
-    > {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>>, ProgramError>
+    {
         // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
         if output_cotangents.iter().all(Cotangent::is_zero) {
             return Ok(vec![Cotangent::Zero; input_types.len()]);
@@ -663,7 +654,7 @@ mod tests {
 
     use super::*;
 
-    type TestOperation = ArrayOperation<ArrayType, TestArray>;
+    type TestOperation = ArrayOperation<TestArray>;
     type TestEagerContext = EagerContext<ArrayType, TestArray, TestOperation>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`.
@@ -747,7 +738,6 @@ mod tests {
             ArrayType,
             DomainTracer<TestArrayDomain>,
             LinearArrayOperation<
-                ArrayType,
                 DomainTracer<TestArrayDomain>,
                 TestArray,
                 Infallible,
@@ -803,21 +793,14 @@ mod tests {
         // Transposing a linear scan flips `reverse` and transposes the body, so transposing twice restores the
         // original direction and the original linear map. The body `carry' = r[lane] * carry + x` references its
         // residual stack scan-locally, which both transposes carry verbatim.
-        type DirectLinearOperation = LinearArrayOperation<
-            ArrayType,
-            TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<ArrayType, TestArray>,
-        >;
+        type DirectLinearOperation =
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
         type ScanBodyOperation = LinearArrayOperation<
-            ArrayType,
             TestArray,
             TestArray,
             Infallible,
             CapturedFactor<ArrayType, TestArray>,
-            ArrayOperation<ArrayType, TestArray>,
+            ArrayOperation<TestArray>,
         >;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -966,12 +949,11 @@ mod tests {
         use crate::tracing_v2::{DefactorizedOperation, ResidualizedOperation, SupportsLinearWhile};
 
         type ScanBodyOperation = LinearArrayOperation<
-            ArrayType,
             TestArray,
             TestArray,
             Infallible,
             CapturedFactor<ArrayType, TestArray>,
-            ArrayOperation<ArrayType, TestArray>,
+            ArrayOperation<TestArray>,
         >;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -1069,21 +1051,14 @@ mod tests {
         // stacks are lane-uniform across *batch* lanes but vary across *scan* lanes) and reuses the shared scan
         // batching loop: with `r = [2, 3, 4]` and body `carry' = r[lane] * carry + x`, batched tangent carries
         // `[1, 2]` produce final carries `[c2, 2 * 24 + ...]` computed per batch lane.
-        type DirectLinearOperation = LinearArrayOperation<
-            ArrayType,
-            TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<ArrayType, TestArray>,
-        >;
+        type DirectLinearOperation =
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
         type ScanBodyOperation = LinearArrayOperation<
-            ArrayType,
             TestArray,
             TestArray,
             Infallible,
             CapturedFactor<ArrayType, TestArray>,
-            ArrayOperation<ArrayType, TestArray>,
+            ArrayOperation<TestArray>,
         >;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);

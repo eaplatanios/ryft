@@ -317,9 +317,8 @@ mod tests {
     fn test_transfer_to_memory_batching_preserves_the_operation_and_the_memory() {
         // Value-level batching is the identity and preserves the lane axis.
         let input = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0; 6]), 0).unwrap();
-        let operation =
-            ArrayOperation::<ArrayType, TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new();
+        let operation = ArrayOperation::<TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let outputs = operation.batch(&context, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));

@@ -1,5 +1,5 @@
-error: invalid '#[ryft(...)]' attribute: 'bounds'; these are the attributes that are supported here: [Symbol("crate"), Symbol("type")]
- --> tests/operations/error_bounds_attribute.rs:4:27
+error: invalid '#[ryft(...)]' attribute: 'bounds'; these are the attributes that are supported here: [Symbol("crate")]
+ --> tests/operations/error_bounds_attribute.rs:8:8
   |
-4 | #[ryft(type = "DataType", bounds = "T: Operation<DataType>")]
-  |                           ^^^^^^
+8 | #[ryft(bounds = "T: Operation<DataType>")]
+  |        ^^^^^^

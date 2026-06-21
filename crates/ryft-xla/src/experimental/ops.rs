@@ -148,7 +148,7 @@ impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRemater
     }
 }
 
-pub type XlaOperation = ArrayOperation<ArrayType, XlaConstant, XlaOperationExtension<XlaConstant>>;
+pub type XlaOperation = ArrayOperation<XlaConstant, XlaOperationExtension<XlaConstant>>;
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub type XlaProgram<Input, Output> = Program<ArrayType, XlaConstant, XlaOperation, Input, Output>;
@@ -275,7 +275,7 @@ where
 
 /// Linear staged-op universe owned by the XLA backend.
 pub type LinearXlaOperation<V, C = V, Factor = V> =
-    LinearArrayOperation<ArrayType, V, C, LinearXlaOperationExtension<V, Factor>, Factor, XlaOperation>;
+    LinearArrayOperation<V, C, LinearXlaOperationExtension<V, Factor>, Factor, XlaOperation>;
 
 /// [`LinearXlaOperation`] with the extension's factor carrier decoupled from the universe's factor carrier.
 ///
@@ -284,14 +284,8 @@ pub type LinearXlaOperation<V, C = V, Factor = V> =
 /// factor (`UniverseFactor`) differs from the extension's own (`Factor`). The XLA transposition rules are
 /// implemented against this split form; [`LinearXlaOperation`] is the aligned special case
 /// `UniverseFactor = Factor`.
-pub(crate) type FactorSplitLinearXlaOperation<V, Factor, UniverseFactor> = LinearArrayOperation<
-    ArrayType,
-    V,
-    XlaConstant,
-    LinearXlaOperationExtension<V, Factor>,
-    UniverseFactor,
-    XlaOperation,
->;
+pub(crate) type FactorSplitLinearXlaOperation<V, Factor, UniverseFactor> =
+    LinearArrayOperation<V, XlaConstant, LinearXlaOperationExtension<V, Factor>, UniverseFactor, XlaOperation>;
 
 /// Staged call to a flat jitted XLA program.
 #[derive(Clone, Debug)]

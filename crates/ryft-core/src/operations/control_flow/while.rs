@@ -225,12 +225,10 @@ mod tests {
 
     use super::*;
 
-    /// Test [`Operation`] type used for the nested condition and body programs.
-    type TestOperation = ArrayOperation<ArrayType, TestArray>;
-
     /// Builds a condition program that maps a scalar `f64` state to the scalar Boolean predicate `state > 0`.
-    fn greater_than_zero_condition() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+    fn greater_than_zero_condition()
+    -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let zero = builder.add_instruction(ZeroLikeOperation, vec![state]).unwrap()[0];
         let predicate = builder
@@ -240,8 +238,8 @@ mod tests {
     }
 
     /// Builds a body program that maps a scalar `f64` state to `state - 1`.
-    fn subtract_one_body() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+    fn subtract_one_body() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_instruction(OneLikeOperation, vec![state]).unwrap()[0];
         let next_state = builder.add_instruction(SubOperation, vec![state, one]).unwrap()[0];
@@ -294,7 +292,7 @@ mod tests {
 
         // Construction rejects mismatched condition/body state signatures, non-scalar-Boolean condition outputs,
         // multi-output conditions, and body outputs that do not match the state signature.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let state = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
         let zero = builder.add_instruction(ZeroLikeOperation, vec![state]).unwrap()[0];
         let vector_body = builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
@@ -311,7 +309,7 @@ mod tests {
                 message: "while condition output type must be a scalar boolean, but got f64[]".to_string(),
             }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let multi_output_condition =
             builder.build(vec![state, state], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
@@ -387,10 +385,10 @@ mod tests {
         assert_eq!(outputs[0].values, vec![0.0]);
 
         // Program rendering uses the canonical operation name and includes the nested condition and body programs.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let program_state = builder.add_input(state_type);
         let program_output =
-            builder.add_instruction(TestOperation::While(Box::new(operation)), vec![program_state]).unwrap()[0];
+            builder.add_instruction(ArrayOperation::While(Box::new(operation)), vec![program_state]).unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![program_output], vec![Placeholder], vec![Placeholder])
             .unwrap();

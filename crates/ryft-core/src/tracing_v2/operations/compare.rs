@@ -66,7 +66,7 @@ mod tests {
         C: crate::contexts::StagingContext<
                 Type = crate::types::ArrayType,
                 Constant = TestArray,
-                Operation = crate::tracing_v2::ArrayOperation<crate::types::ArrayType, TestArray>,
+                Operation = crate::tracing_v2::ArrayOperation<TestArray>,
             >,
     {
         let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);

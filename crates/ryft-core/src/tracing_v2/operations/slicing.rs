@@ -678,7 +678,7 @@ mod tests {
         type Type = ArrayType;
         type Value = TestArray;
         type Constant = TestArray;
-        type Operation = ArrayOperation<ArrayType, TestArray>;
+        type Operation = ArrayOperation<TestArray>;
     }
 
     impl crate::contexts::Context for StagedDispatchTestArrayDomain {
@@ -699,7 +699,7 @@ mod tests {
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<ArrayType, V, TestArray, Infallible, F, ArrayOperation<ArrayType, TestArray>>;
+            LinearArrayOperation<V, TestArray, Infallible, F, ArrayOperation<TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {
             false
@@ -1048,14 +1048,13 @@ mod tests {
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::{DifferentiableOperation, FactorParameterizedOperation};
 
-        type TestArrayOperation = ArrayOperation<ArrayType, TestArray>;
+        type TestArrayOperation = ArrayOperation<TestArray>;
         type TestLinearOperation = LinearArrayOperation<
-            ArrayType,
             TestArray,
             TestArray,
             Infallible,
             CapturedFactor<ArrayType, TestArray>,
-            ArrayOperation<ArrayType, TestArray>,
+            ArrayOperation<TestArray>,
         >;
 
         let index_type = ArrayType::scalar(DataType::I32);
@@ -1151,12 +1150,11 @@ mod tests {
     #[test]
     fn test_dynamic_slicing_defactorize_splices_residual_start_indices() {
         type TestLinearOperation = LinearArrayOperation<
-            ArrayType,
             TestArray,
             TestArray,
             Infallible,
             CapturedFactor<ArrayType, TestArray>,
-            ArrayOperation<ArrayType, TestArray>,
+            ArrayOperation<TestArray>,
         >;
 
         // A loop-varying residual start index is rewritten into operand form: the residual atom is spliced into the

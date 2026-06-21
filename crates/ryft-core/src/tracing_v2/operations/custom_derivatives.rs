@@ -1249,7 +1249,7 @@ mod tests {
     /// Builds `f(x) = sin(x)` over one input of the provided type.
     fn sin_program(
         r#type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(r#type.clone());
         let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
@@ -1260,7 +1260,7 @@ mod tests {
     /// true derivative so tests can prove the custom rule is used.
     fn doubled_sin_jvp_program(
         r#type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let dx = builder.add_input(r#type.clone());
@@ -1277,7 +1277,7 @@ mod tests {
     /// Builds the forward rule `forward(x) = (sin(x), cos(x))`, with the cosine as the residual.
     fn sin_forward_program(
         r#type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let x = builder.add_input(r#type.clone());
         let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
@@ -1289,7 +1289,7 @@ mod tests {
     /// different from the true gradient so tests can prove the custom rule is used.
     fn tripled_sin_backward_program(
         r#type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         let mut builder = ProgramBuilder::new();
         let residual = builder.add_input(r#type.clone());
         let cotangent = builder.add_input(r#type.clone());
@@ -1299,13 +1299,13 @@ mod tests {
         builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn custom_jvp_sin(r#type: &ArrayType) -> ArrayOperation<ArrayType, TestArray> {
+    fn custom_jvp_sin(r#type: &ArrayType) -> ArrayOperation<TestArray> {
         ArrayOperation::CustomJvp(Box::new(
             CustomJvpOperation::new(sin_program(r#type), doubled_sin_jvp_program(r#type)).unwrap(),
         ))
     }
 
-    fn custom_vjp_sin(r#type: &ArrayType) -> ArrayOperation<ArrayType, TestArray> {
+    fn custom_vjp_sin(r#type: &ArrayType) -> ArrayOperation<TestArray> {
         ArrayOperation::CustomVjp(Box::new(
             CustomVjpOperation::new(
                 sin_program(r#type),
@@ -1397,7 +1397,7 @@ mod tests {
         // The staged linear call refuses interpretation in its un-transposed (pushforward) form, which is exactly
         // the operation `jvp` would need to execute; reverse mode transposes it first and replays `backward`.
         let scalar = test_type(&[]);
-        let call = CustomVjpCallOperation::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>, TestArray>::new(
+        let call = CustomVjpCallOperation::<ArrayType, TestArray, ArrayOperation<TestArray>, TestArray>::new(
             tripled_sin_backward_program(&scalar),
             None,
             vec![TestArray::scalar(2.0f64.cos())],

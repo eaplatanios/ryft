@@ -431,13 +431,10 @@ mod tests {
 
     use super::*;
 
-    /// Test [`Operation`] type used for the nested body programs.
-    type TestOperation = ArrayOperation<ArrayType, TestArray>;
-
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`: the new carry is
     /// the running product and each iteration also emits that product as a stacked output slice.
-    fn product_body() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+    fn product_body() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
@@ -447,8 +444,8 @@ mod tests {
     }
 
     /// Builds a carry-only body program that maps `[carry]` to `[carry + carry]` with no stacked inputs or outputs.
-    fn doubling_body() -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+    fn doubling_body() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -548,7 +545,7 @@ mod tests {
             ScanOperation::new(product_body(), 3, 3).map(|_| ()),
             Err(TypeError { message: "scan carry count 3 exceeds the body input count 2".to_string() }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(scalar_f64.clone());
         let x = builder.add_input(scalar_f64.clone());
         let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
@@ -559,7 +556,7 @@ mod tests {
             ScanOperation::new(no_output_body, 2, 3).map(|_| ()),
             Err(TypeError { message: "scan carry count 2 exceeds the body output count 1".to_string() }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
         let mismatched_output = builder.add_instruction(ZeroLikeOperation, vec![mismatched_carry]).unwrap()[0];
         let mismatched_output = builder
@@ -577,7 +574,7 @@ mod tests {
                 message: "scan body carry type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
             }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         let dynamic_carry = builder.add_input(dynamic_type);
         let dynamic_body = builder
@@ -632,8 +629,11 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the nested body program.
-        let mut builder =
-            ProgramBuilder::<ArrayType, TestArray, ScanOperation<ArrayType, TestArray, TestOperation>>::new();
+        let mut builder = ProgramBuilder::<
+            ArrayType,
+            TestArray,
+            ScanOperation<ArrayType, TestArray, ArrayOperation<TestArray>>,
+        >::new();
         let program_carry = builder.add_input(scalar_f64);
         let program_xs = builder.add_input(stacked_f64);
         let program_outputs = builder.add_instruction(operation, vec![program_carry, program_xs]).unwrap().to_vec();

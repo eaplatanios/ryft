@@ -37,7 +37,7 @@ use crate::operations::manipulation::{
 };
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::Value;
-use crate::types::Type;
+use crate::types::{ArrayType, Type};
 
 use super::dot::{DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation};
 use super::reduce::{Reduce, ReduceOperation};
@@ -197,8 +197,8 @@ where
 /// [`From<LinearDynamicSliceOperation>`](crate::operations::manipulation::LinearDynamicSliceOperation) and
 /// [`From<LinearDynamicUpdateSliceOperation>`](crate::operations::manipulation::LinearDynamicUpdateSliceOperation)
 /// inline, mirroring [`From<LinearSelectOperation>`](crate::tracing_v2::operations::select::LinearSelectOperation).
-pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
-    SupportsLinearScalarOperation<T, F>
+pub trait SupportsLinearArrayOperation<F: Value<ArrayType>>:
+    SupportsLinearScalarOperation<ArrayType, F>
     + From<LeftDotOperation<F>>
     + From<RightDotOperation<F>>
     + From<TransposeOperation>
@@ -213,11 +213,10 @@ pub trait SupportsLinearArrayOperation<T: Type, F: Value<T>>:
 {
 }
 
-impl<T, F, C> SupportsLinearArrayOperation<T, F> for C
+impl<F, C> SupportsLinearArrayOperation<F> for C
 where
-    T: Type,
-    F: Value<T>,
-    C: SupportsLinearScalarOperation<T, F>
+    F: Value<ArrayType>,
+    C: SupportsLinearScalarOperation<ArrayType, F>
         + From<LeftDotOperation<F>>
         + From<RightDotOperation<F>>
         + From<TransposeOperation>

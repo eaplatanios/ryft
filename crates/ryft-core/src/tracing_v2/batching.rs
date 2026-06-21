@@ -1752,9 +1752,8 @@ mod tests {
         // so the sum is `2.0` for every element after realignment.
         let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
         let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
-        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new();
-        let outputs =
-            ArrayOperation::<ArrayType, TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let outputs = ArrayOperation::<TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
@@ -1763,7 +1762,7 @@ mod tests {
     #[test]
     fn test_lift_elementwise_binary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<ArrayType, TestArray>::Add(AddOperation);
+        let op = ArrayOperation::<TestArray>::Add(AddOperation);
         let (lifted_op, output_axes) =
             lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(0)], 5).unwrap();
         assert!(matches!(lifted_op, ArrayOperation::Add(_)));
@@ -1773,7 +1772,7 @@ mod tests {
     #[test]
     fn test_lift_elementwise_unary_op() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<ArrayType, TestArray>::Sin(SinOperation);
+        let op = ArrayOperation::<TestArray>::Sin(SinOperation);
         let (lifted_op, output_axes) = lift_elementwise(&op, &[scalar], &[Some(0)], 7).unwrap();
         assert!(matches!(lifted_op, ArrayOperation::Sin(_)));
         assert_eq!(output_axes, vec![Some(0)]);
@@ -1782,7 +1781,7 @@ mod tests {
     #[test]
     fn test_lift_elementwise_rejects_misaligned_input_axes() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<ArrayType, TestArray>::Add(AddOperation);
+        let op = ArrayOperation::<TestArray>::Add(AddOperation);
         let err = lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(1)], 5).unwrap_err();
         // `lift_elementwise` is an operation-level batching helper, so its `BatchingError` rides up as a
         // `ProgramError::Custom` payload; recover the concrete error with `downcast_custom`.
@@ -1792,7 +1791,7 @@ mod tests {
     #[test]
     fn test_lift_elementwise_passes_through_lane_uniform_inputs() {
         let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<ArrayType, TestArray>::Add(AddOperation);
+        let op = ArrayOperation::<TestArray>::Add(AddOperation);
         let (lifted_op, output_axes) = lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), None], 5).unwrap();
         assert!(matches!(lifted_op, ArrayOperation::Add(_)));
         assert_eq!(output_axes, vec![Some(0)]);
@@ -2064,7 +2063,7 @@ mod tests {
         // true branch scales the batched operand per lane (axis 0) while the false branch returns a lane-uniform
         // constant (no lane axis). The staged rule normalizes the false branch by appending a broadcast at its
         // tail, so the staged condition stays well-typed and both predicate values interpret correctly per lane.
-        let mut constant_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<ArrayType, TestArray>>::new();
+        let mut constant_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         constant_builder.add_input(ArrayType::scalar(DataType::F64));
         let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
         let constant_branch = constant_builder
@@ -2148,9 +2147,9 @@ mod tests {
         let output: TestArray = TestArrayDomain
             .batch(
                 |x| {
-                    let zero_op = ArrayOperation::<ArrayType, TestArray>::Zero(
-                        crate::operations::constants::ZeroOperation::new(ArrayType::scalar(DataType::F64)),
-                    );
+                    let zero_op = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(
+                        ArrayType::scalar(DataType::F64),
+                    ));
                     let zero = x.context().stage_nullary_operation(zero_op)?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },

@@ -145,16 +145,13 @@ mod tests {
 
     use super::*;
 
-    /// Test [`Operation`] type used for the nested branch programs.
-    type TestOperation = ArrayOperation<ArrayType, TestArray>;
-
     /// Builds a single-input flat program that maps its scalar `f64` input through `operation`.
     fn scalar_branch(
-        operation: TestOperation,
-    ) -> Program<ArrayType, TestArray, TestOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        operation: ArrayOperation<TestArray>,
+    ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let inputs = if matches!(operation, TestOperation::Add(_)) { vec![input, input] } else { vec![input] };
+        let inputs = if matches!(operation, ArrayOperation::Add(_)) { vec![input, input] } else { vec![input] };
         let output = builder.add_instruction(operation, inputs).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -164,8 +161,8 @@ mod tests {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::scalar(DataType::F64);
         let operation = ConditionOperation::new(
-            scalar_branch(TestOperation::Add(AddOperation)),
-            scalar_branch(TestOperation::ZeroLike(ZeroLikeOperation)),
+            scalar_branch(ArrayOperation::Add(AddOperation)),
+            scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation)),
         )
         .unwrap();
 
@@ -227,7 +224,7 @@ mod tests {
         );
 
         // Construction rejects mismatched branch signatures.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let zero = builder.add_instruction(ZeroLikeOperation, vec![input]).unwrap()[0];
         let boolean_output = builder
@@ -235,7 +232,7 @@ mod tests {
             .unwrap()[0];
         let boolean_branch = builder.build(vec![boolean_output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            ConditionOperation::new(scalar_branch(TestOperation::Add(AddOperation)), boolean_branch).map(|_| ()),
+            ConditionOperation::new(scalar_branch(ArrayOperation::Add(AddOperation)), boolean_branch).map(|_| ()),
             Err(TypeError {
                 message: "condition branch output type signature mismatch: expected [f64[]] but got [bool[]]"
                     .to_string(),
@@ -256,11 +253,11 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the nested branch programs.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let program_predicate = builder.add_input(predicate_type);
         let program_operand = builder.add_input(operand_type);
         let program_output = builder
-            .add_instruction(TestOperation::Condition(Box::new(operation)), vec![program_predicate, program_operand])
+            .add_instruction(ArrayOperation::Condition(Box::new(operation)), vec![program_predicate, program_operand])
             .unwrap()[0];
         let program = builder
             .build::<Vec<TestArray>, Vec<TestArray>>(

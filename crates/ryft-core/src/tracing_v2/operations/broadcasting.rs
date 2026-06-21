@@ -190,28 +190,14 @@ mod tests {
     ) -> Program<
         ArrayType,
         TestArray,
-        LinearArrayOperation<
-            ArrayType,
-            TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<ArrayType, TestArray>,
-        >,
+        LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         TestArray,
         TestArray,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                ArrayType,
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<ArrayType, TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
         let domain = AbstractDomain::new();
@@ -305,14 +291,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                ArrayType,
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<ArrayType, TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
