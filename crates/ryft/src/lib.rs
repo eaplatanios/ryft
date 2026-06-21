@@ -20,4 +20,4 @@ pub use ryft_core::{
     ProgramError, Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization, Size, StridedLayout, Tile,
     TileDimension, TiledLayout, Type, Value, check_count, check_sharding,
 };
-pub use ryft_macros::{Operation, Parameter, Parameterized};
+pub use ryft_macros::{Operation, Parameter, Parameterized, TransposableOperation};
