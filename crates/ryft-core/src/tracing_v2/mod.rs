@@ -56,7 +56,7 @@ pub use operations::dot::{
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::SupportsLinearScan;
 pub use operations::select::LinearSelectOperation;
-pub use operations::{ArrayOperation, LinearArrayOperation};
+pub use operations::{ArrayOperation, LinearArrayOperation, RecomputeOperation};
 pub use rematerialization::{
     MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,
     RematerializationName, RematerializationNameOperation, RematerializationPolicy, RematerializationVerdict,

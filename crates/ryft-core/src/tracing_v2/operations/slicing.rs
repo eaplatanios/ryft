@@ -1162,11 +1162,13 @@ mod tests {
         let residual_atoms = vec![AtomId::new(7), AtomId::new(9)];
         match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
-                assert!(matches!(
-                    operation,
-                    TestLinearOperation::Recompute(ArrayOperation::DynamicSlice(ref operation))
-                        if operation.sizes() == [2],
-                ));
+                let TestLinearOperation::Recompute(recompute) = operation else {
+                    panic!("expected a recomputed dynamic slice");
+                };
+                let ArrayOperation::DynamicSlice(operation) = recompute.operation() else {
+                    panic!("expected a recomputed dynamic slice");
+                };
+                assert_eq!(operation.sizes(), [2]);
                 assert_eq!(inputs, vec![AtomId::new(3), AtomId::new(9)]);
             }
             DefactorizedOperation::Forward { .. } => panic!("expected an operand-form defactorized operation"),
@@ -1178,7 +1180,10 @@ mod tests {
         ]));
         match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
-                assert!(matches!(operation, TestLinearOperation::Recompute(ArrayOperation::DynamicUpdateSlice(_))));
+                let TestLinearOperation::Recompute(recompute) = operation else {
+                    panic!("expected a recomputed dynamic update slice");
+                };
+                assert!(matches!(recompute.operation(), ArrayOperation::DynamicUpdateSlice(_)));
                 assert_eq!(inputs, vec![AtomId::new(3), AtomId::new(4), AtomId::new(7)]);
             }
             DefactorizedOperation::Forward { .. } => panic!("expected an operand-form defactorized operation"),

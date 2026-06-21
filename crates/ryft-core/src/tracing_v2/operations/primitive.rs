@@ -43,7 +43,7 @@ use crate::operations::manipulation::{
     DynamicUpdateSliceOperation, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation,
     LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation,
     PadOperation, ReshapeOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation,
-    ScatterReductionKind, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSliceOperation,
+    ScatterReductionKind, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
     inverse_permutation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
@@ -53,7 +53,7 @@ use crate::operations::{BooleanLike, InterpretableOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::Sharding;
-use crate::tracing::{AbstractTracingContext, Tracer, TracingContext};
+use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingContext,
     ProgramBatchingOutputAxes,
@@ -68,6 +68,7 @@ use crate::tracing_v2::operations::custom_derivatives::{
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
+use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
@@ -452,7 +453,7 @@ where
 /// value type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold
 /// concrete constants).
 #[derive(Clone, Debug, Operation)]
-#[ryft(type = "ArrayType")]
+#[ryft(type = "ArrayType", bounds = "O: Operation<ArrayType>")]
 pub enum LinearArrayOperation<
     T: Type,
     V: Value<T>,
@@ -552,7 +553,7 @@ pub enum LinearArrayOperation<
     Residual(MaterializeCapturedFactorOperation<F>),
 
     /// Recomputed primal operation.
-    Recompute(O),
+    Recompute(RecomputeOperation<O>),
 
     /// Linear conditional with two captured-factor branch programs.
     Condition(LinearConditionOperation<T, V, C, Extension, F, O>),
@@ -578,8 +579,7 @@ pub enum LinearArrayOperation<
 // `F`; the `Scan` and `Condition` recursions instead re-instantiate this impl at the scan-local factor
 // `CapturedFactor<ArrayType, V>`, and the `While` recursion resolves against this impl's assumed
 // `Self: TransposableOperation<ArrayType, V, Self>`. The remaining where-clause spells the leaf value capabilities
-// the per-variant rules read off `V`, plus the recompute-primal, custom-VJP, and extension obligations at the
-// scan-local fixed point.
+// the per-variant rules read off `V`, plus the custom-VJP and extension obligations at the scan-local fixed point.
 impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
     TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
     for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
@@ -629,7 +629,6 @@ where
         TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
     MaterializeCapturedFactorOperation<F>:
         TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    O: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
     LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O>:
         TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
     CustomVjpCallOperation<ArrayType, C, O, F>:
@@ -643,12 +642,7 @@ where
         + DotOps
         + SupportsManipulationOperations
         + BooleanLike,
-    O: Clone
-        + TransposableOperation<
-            ArrayType,
-            V,
-            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
-        >,
+    O: Clone,
     Extension: TransposableOperation<
             ArrayType,
             V,
@@ -709,19 +703,9 @@ where
             Self::Recompute(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::Condition(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::OperandCondition(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::While(operation) => <WhileOperation<ArrayType, V, Self> as TransposableOperation<
-                ArrayType,
-                V,
-                LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
-            >>::transpose(&**operation, context, input_types, output_cotangents),
+            Self::While(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::Scan(operation) => operation.transpose(context, input_types, output_cotangents),
-            Self::CustomVjpCall(operation) => {
-                <CustomVjpCallOperation<ArrayType, C, O, F> as TransposableOperation<
-                    ArrayType,
-                    V,
-                    LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
-                >>::transpose(&**operation, context, input_types, output_cotangents)
-            }
+            Self::CustomVjpCall(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
     }
@@ -1034,7 +1018,7 @@ where
 {
     #[inline]
     fn recompute_operation(operation: O) -> Self {
-        LinearArrayOperation::Recompute(operation)
+        LinearArrayOperation::Recompute(RecomputeOperation::new(operation))
     }
 
     #[inline]
@@ -1064,7 +1048,7 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::from(MulOperation)),
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(MulOperation))),
                     inputs,
                 })
             }
@@ -1072,10 +1056,10 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::from(
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
                         DotOperation::new(operation.dimensions().clone())
                             .with_output_sharding(operation.output_sharding().cloned()),
-                    )),
+                    ))),
                     inputs,
                 })
             }
@@ -1083,10 +1067,10 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.push(resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::from(
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
                         DotOperation::new(operation.dimensions().clone())
                             .with_output_sharding(operation.output_sharding().cloned()),
-                    )),
+                    ))),
                     inputs,
                 })
             }
@@ -1108,8 +1092,8 @@ where
                     inputs.push(resolve_residual_atom(*index)?);
                 }
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::from(DynamicSliceOperation::new(
-                        operation.sizes().to_vec(),
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
+                        DynamicSliceOperation::new(operation.sizes().to_vec()),
                     ))),
                     inputs,
                 })
@@ -1128,7 +1112,9 @@ where
                     inputs.push(resolve_residual_atom(*index)?);
                 }
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::from(DynamicUpdateSliceOperation)),
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
+                        DynamicUpdateSliceOperation,
+                    ))),
                     inputs,
                 })
             }
@@ -1144,7 +1130,7 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.condition() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(O::from(SelectOperation)),
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(SelectOperation))),
                     inputs,
                 })
             }
@@ -2173,21 +2159,18 @@ where
                 message: "custom_vjp pullback interpretation over tangent-wrapped values is not supported".to_string(),
             }
             .into()),
-            Self::Zero(zero) => Ok(vec![Tangent::Zero(*zero.r#type())]),
-            Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
-            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
-            Self::ZeroLike(_) => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => operation.interpret(context, inputs),
+            Self::ZeroLike(operation) => operation.interpret(context, inputs),
             Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
-            Self::Add(_) => interpret_tangent_value_add(context, inputs),
-            Self::Sub(_) => interpret_tangent_value_sub(context, inputs),
-            Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
-            Self::Scale(operation) => interpret_tangent_value_scale(context, self, operation.factor(), inputs),
-            // The captured-condition select over tangents decodes the in-band Boolean condition and selects between
-            // the two branch tangents, materializing symbolic zeros to concrete values first (and collapsing to a
-            // symbolic zero when both branches are zero).
+            Self::Add(operation) => operation.interpret(context, inputs),
+            Self::Sub(operation) => operation.interpret(context, inputs),
+            Self::Neg(operation) => operation.interpret(context, inputs),
+            Self::Scale(operation) => interpret_tangent_value_scale(context, operation, operation.factor(), inputs),
             Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                let output_types = infer_tangent_value_output_types(operation, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
                 let boolean = operation.condition().select_condition()?;
                 if inputs[0].is_zero() && inputs[1].is_zero() {
@@ -2221,22 +2204,16 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomVjpCall(call) => call.interpret(context, inputs),
-            Self::Zero(zero) => zero.interpret(context, inputs),
-            Self::One(one) => one.interpret(context, inputs),
-            Self::Constant(constant) => constant.interpret(context, inputs),
-            Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
-            Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
-            Self::Add(_) => {
-                <AddOperation as InterpretableOperation<DataType, V>>::interpret(&AddOperation, context, inputs)
-            }
-            Self::Sub(_) => {
-                <SubOperation as InterpretableOperation<DataType, V>>::interpret(&SubOperation, context, inputs)
-            }
-            Self::Neg(_) => {
-                <NegOperation as InterpretableOperation<DataType, V>>::interpret(&NegOperation, context, inputs)
-            }
-            Self::Scale(operation) => ScaleOperation::new(operation.factor().clone()).interpret(context, inputs),
+            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => operation.interpret(context, inputs),
+            Self::ZeroLike(operation) => operation.interpret(context, inputs),
+            Self::OneLike(operation) => operation.interpret(context, inputs),
+            Self::Add(operation) => operation.interpret(context, inputs),
+            Self::Sub(operation) => operation.interpret(context, inputs),
+            Self::Neg(operation) => operation.interpret(context, inputs),
+            Self::Scale(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![V::select(&operation.condition().select_condition()?, &inputs[0], &inputs[1])?])
@@ -2261,33 +2238,29 @@ where
 {
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
-            Self::Zero(zero) => context.stage_operation(ZeroOperation::new(zero.r#type().clone()), &[] as &[Tracer<S>]),
-            Self::One(one) => Err(TypeError {
+            Self::CustomVjpCall(operation) => operation.interpret_over_tracers(inputs),
+            Self::Zero(operation) => {
+                context.stage_operation(ZeroOperation::new(*operation.r#type()), &[] as &[Tracer<S>])
+            }
+            Self::One(operation) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    one.r#type()
+                    operation.r#type()
                 ),
             }
             .into()),
-            Self::Constant(constant) => Err(TypeError {
+            Self::Constant(operation) => Err(TypeError {
                 message: format!(
                     "linear constant operation over tracer values was not materialized before interpretation for {}",
-                    constant.value().r#type()
+                    operation.value().r#type()
                 ),
             }
             .into()),
-            Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
-            Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
-            Self::Add(_) => {
-                <AddOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&AddOperation, context, inputs)
-            }
-            Self::Sub(_) => {
-                <SubOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&SubOperation, context, inputs)
-            }
-            Self::Neg(_) => {
-                <NegOperation as InterpretableOperation<DataType, Tracer<S>>>::interpret(&NegOperation, context, inputs)
-            }
+            Self::ZeroLike(operation) => operation.interpret(context, inputs),
+            Self::OneLike(operation) => operation.interpret(context, inputs),
+            Self::Add(operation) => operation.interpret(context, inputs),
+            Self::Sub(operation) => operation.interpret(context, inputs),
+            Self::Neg(operation) => operation.interpret(context, inputs),
             Self::Scale(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![operation.factor().clone() * inputs[0].clone()])
@@ -2379,21 +2352,103 @@ where
     }
 }
 
-impl<'domain, D, C, V, Extension> InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>
-    for ArrayOperation<ArrayType, V, Extension>
+impl<S, V, Extension> InterpretableOperation<ArrayType, Tracer<S>> for ArrayOperation<ArrayType, V, Extension>
 where
-    D: Domain<Type = ArrayType, Value = V, Operation = ArrayOperation<ArrayType, V, Extension>>,
+    S: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<ArrayType, V, Extension>>,
     V: Value<ArrayType>,
-    Extension: Clone + InterpretableOperation<ArrayType, Tracer<TracingContext<'domain, D, C>>>,
+    Extension: Clone + Operation<ArrayType>,
+{
+    fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
+        context.stage_operation(self.clone(), inputs)
+    }
+}
+
+impl<V, Extension> InterpretableOperation<ArrayType, Tangent<ArrayType, V>> for ArrayOperation<ArrayType, V, Extension>
+where
+    V: Value<ArrayType>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Mul<Output = V>
+        + Neg<Output = V>
+        + Zero<ArrayType>
+        + One<ArrayType>
+        + Fill<ArrayType, f64>
+        + OneLike,
+    Extension: Operation<ArrayType>,
+    AddOperation: InterpretableOperation<ArrayType, V>,
+    SubOperation: InterpretableOperation<ArrayType, V>,
+    MulOperation: InterpretableOperation<ArrayType, V>,
+    NegOperation: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(
         &self,
-        context: &TracingContext<'domain, D, C>,
-        inputs: &[Tracer<TracingContext<'domain, D, C>>],
-    ) -> Result<Vec<Tracer<TracingContext<'domain, D, C>>>, ProgramError> {
+        context: &<Tangent<ArrayType, V> as Value<ArrayType>>::InterpretationContext,
+        inputs: &[Tangent<ArrayType, V>],
+    ) -> Result<Vec<Tangent<ArrayType, V>>, ProgramError> {
         match self {
-            Self::Extension(extension) => extension.interpret(context, inputs),
-            _ => context.stage_operation(self.clone(), inputs),
+            Self::Zero(operation) => {
+                check_count!("input", inputs, 0, ProgramError);
+                Ok(vec![Tangent::Zero(operation.r#type().clone())])
+            }
+            Self::ZeroLike(operation) => interpret_tangent_value_zero_like(operation, inputs),
+            Self::One(operation) => {
+                check_count!("input", inputs, 0, ProgramError);
+                Ok(vec![Tangent::Value(V::one(operation.r#type())?)])
+            }
+            Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
+            Self::Constant(operation) => {
+                check_count!("input", inputs, 0, ProgramError);
+                Ok(vec![Tangent::Value(operation.value().clone())])
+            }
+            Self::Fill(operation) if *operation.value() == 0.0 => {
+                check_count!("input", inputs, 0, ProgramError);
+                Ok(vec![Tangent::Zero(operation.r#type().clone())])
+            }
+            Self::Fill(operation) => {
+                check_count!("input", inputs, 0, ProgramError);
+                Ok(vec![Tangent::Value(V::fill(operation.r#type(), *operation.value())?)])
+            }
+            Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
+            Self::Add(_) => interpret_tangent_value_add(context, inputs),
+            Self::Sub(_) => interpret_tangent_value_sub(context, inputs),
+            Self::Mul(_) => interpret_tangent_value_mul(context, inputs),
+            Self::Div(_)
+            | Self::Sin(_)
+            | Self::Cos(_)
+            | Self::StopGradient(_)
+            | Self::RematerializationName(_)
+            | Self::Scale(_)
+            | Self::TransferToMemory(_)
+            | Self::Dot(_)
+            | Self::Transpose(_)
+            | Self::Reshape(_)
+            | Self::Reshard(_)
+            | Self::ShardingConstraint(_)
+            | Self::Broadcast(_)
+            | Self::Slice(_)
+            | Self::UpdateSlice(_)
+            | Self::DynamicSlice(_)
+            | Self::DynamicUpdateSlice(_)
+            | Self::Pad(_)
+            | Self::Concatenate(_)
+            | Self::Gather(_)
+            | Self::Scatter(_)
+            | Self::Reduce(_)
+            | Self::Compare(_)
+            | Self::Not(_)
+            | Self::And(_)
+            | Self::Or(_)
+            | Self::Xor(_)
+            | Self::Collective(_)
+            | Self::Select(_)
+            | Self::Condition(_)
+            | Self::While(_)
+            | Self::Scan(_)
+            | Self::CustomJvp(_)
+            | Self::CustomVjp(_)
+            | Self::Extension(_) => Err(ProgramError::UnsupportedOperation {
+                message: format!("array operation {} does not support tangent-wrapped interpretation", self.name()),
+            }),
         }
     }
 }
@@ -2413,7 +2468,7 @@ where
         + BooleanLike
         + TransferToMemory,
     Extension: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>>,
-    O: Clone + Operation<ArrayType>,
+    O: Clone + InterpretableOperation<ArrayType, Tangent<ArrayType, V>> + Operation<ArrayType>,
 {
     fn interpret(
         &self,
@@ -2433,11 +2488,11 @@ where
                     Tangent::Value(value) => Tangent::Value(value.transfer_to_memory(destination)),
                 }])
             }
-            Self::Zero(zero) => Ok(vec![Tangent::Zero(zero.r#type().clone())]),
-            Self::One(one) => Ok(vec![Tangent::Value(V::one(one.r#type())?)]),
-            Self::Constant(constant) => interpret_tangent_value_constant(constant, inputs),
-            Self::Fill(fill) if *fill.value() == 0.0 => Ok(vec![Tangent::Zero(fill.r#type().clone())]),
-            Self::Fill(fill) => Ok(vec![Tangent::Value(V::fill(fill.r#type(), *fill.value())?)]),
+            Self::Zero(operation) => Ok(vec![Tangent::Zero(operation.r#type().clone())]),
+            Self::One(operation) => Ok(vec![Tangent::Value(V::one(operation.r#type())?)]),
+            Self::Constant(operation) => interpret_tangent_value_constant(operation, inputs),
+            Self::Fill(operation) if *operation.value() == 0.0 => Ok(vec![Tangent::Zero(operation.r#type().clone())]),
+            Self::Fill(operation) => Ok(vec![Tangent::Value(V::fill(operation.r#type(), *operation.value())?)]),
             Self::ZeroLike(_) => interpret_tangent_value_zero_like(&ZeroLikeOperation, inputs),
             Self::OneLike(_) => interpret_tangent_value_one_like(inputs),
             Self::Add(_) => interpret_tangent_value_add(context, inputs),
@@ -2445,14 +2500,10 @@ where
             Self::Mul(_) => interpret_tangent_value_mul(context, inputs),
             Self::Neg(_) => interpret_tangent_value_neg(context, inputs),
             Self::Transpose(operation) => {
-                let op = TransposeOperation::new(operation.permutation().to_vec());
-                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
+                let operation = TransposeOperation::new(operation.permutation().to_vec());
+                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
             }
             Self::Scale(operation) => interpret_tangent_value_scale(context, self, operation.factor(), inputs),
-            Self::Broadcast(operation) => {
-                let op = BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec());
-                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
-            }
             Self::LeftDot(operation) => {
                 let factor = operation.factor();
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
@@ -2465,7 +2516,8 @@ where
                         let Tangent::Value(factor) = factor else {
                             unreachable!("zero factors are handled before concrete left_dot interpretation")
                         };
-                        Ok(super::dot::LeftDotOperation::new(factor.clone(), operation.dimensions().clone())
+                        Ok(LeftDotOperation::new(factor.clone(), operation.dimensions().clone())
+                            .with_output_sharding(operation.output_sharding().cloned())
                             .interpret(context, std::slice::from_ref(input))?
                             .into_iter()
                             .map(Tangent::Value)
@@ -2486,7 +2538,8 @@ where
                         let Tangent::Value(factor) = factor else {
                             unreachable!("zero factors are handled before concrete right_dot interpretation")
                         };
-                        Ok(super::dot::RightDotOperation::new(factor.clone(), operation.dimensions().clone())
+                        Ok(RightDotOperation::new(factor.clone(), operation.dimensions().clone())
+                            .with_output_sharding(operation.output_sharding().cloned())
                             .interpret(context, std::slice::from_ref(input))?
                             .into_iter()
                             .map(Tangent::Value)
@@ -2513,15 +2566,16 @@ where
                 &ShardingConstraintOperation::new(operation.sharding().clone()),
                 inputs,
             ),
-            Self::Reduce(operation) => {
-                let op = ReduceOperation::new(operation.axes().to_vec(), operation.kind())
-                    .with_output_sharding(operation.output_sharding().cloned());
-                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
+            Self::Broadcast(operation) => {
+                let operation =
+                    BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec());
+                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
             }
             Self::Slice(operation) => {
-                let op = SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
-                    .with_strides(operation.strides().to_vec())?;
-                interpret_tangent_value_unary_value_or_zero(context, &op, &op, inputs)
+                let operation =
+                    SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
+                        .with_strides(operation.strides().to_vec())?;
+                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
             }
             Self::UpdateSlice(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
@@ -2532,34 +2586,6 @@ where
                 interpret_materialized_tangent_value_operation(
                     context,
                     &UpdateSliceOperation::new(operation.start_indices().to_vec()),
-                    inputs,
-                )
-            }
-            Self::Pad(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                interpret_materialized_tangent_value_operation(
-                    context,
-                    &PadOperation::new(
-                        operation.edge_padding_low().to_vec(),
-                        operation.edge_padding_high().to_vec(),
-                        operation.interior_padding().to_vec(),
-                    )?,
-                    inputs,
-                )
-            }
-            Self::Concatenate(operation) => {
-                let output_types = infer_tangent_value_output_types(self, inputs)?;
-                check_count!("output", output_types, 1, ProgramError);
-                if inputs.iter().all(Tangent::is_zero) {
-                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
-                }
-                interpret_materialized_tangent_value_operation(
-                    context,
-                    &ConcatenateOperation::new(operation.axis()),
                     inputs,
                 )
             }
@@ -2633,6 +2659,39 @@ where
                     operation.operation(),
                 )?)])
             }
+            Self::Pad(operation) => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                if inputs.iter().all(Tangent::is_zero) {
+                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
+                }
+                interpret_materialized_tangent_value_operation(
+                    context,
+                    &PadOperation::new(
+                        operation.edge_padding_low().to_vec(),
+                        operation.edge_padding_high().to_vec(),
+                        operation.interior_padding().to_vec(),
+                    )?,
+                    inputs,
+                )
+            }
+            Self::Concatenate(operation) => {
+                let output_types = infer_tangent_value_output_types(self, inputs)?;
+                check_count!("output", output_types, 1, ProgramError);
+                if inputs.iter().all(Tangent::is_zero) {
+                    return Ok(symbolic_zero_tangent_value_outputs(output_types));
+                }
+                interpret_materialized_tangent_value_operation(
+                    context,
+                    &ConcatenateOperation::new(operation.axis()),
+                    inputs,
+                )
+            }
+            Self::Reduce(operation) => {
+                let operation = ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+                    .with_output_sharding(operation.output_sharding().cloned());
+                interpret_tangent_value_unary_value_or_zero(context, &operation, &operation, inputs)
+            }
             Self::Select(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 check_count!("output", output_types, 1, ProgramError);
@@ -2648,12 +2707,7 @@ where
                 check_count!("input", inputs, 0, ProgramError);
                 Ok(vec![operation.factor().clone()])
             }
-            Self::Recompute(_) => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "recomputed primal operation {} does not support tangent-wrapped interpretation",
-                    self.name(),
-                ),
-            }),
+            Self::Recompute(operation) => operation.interpret(context, inputs),
             Self::Condition(operation) => {
                 let output_types = infer_tangent_value_output_types(self, inputs)?;
                 let Tangent::Value(predicate) = operation.predicate() else {
@@ -2685,8 +2739,6 @@ where
                 let mut state = inputs.to_vec();
                 let mut completed_iterations = 0;
                 loop {
-                    // A semantic iteration bound truncates the loop even while the condition still produces true,
-                    // mirroring `WhileOperation`'s own interpretation.
                     if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
                         check_count!("output", state, output_types.len(), ProgramError);
                         return Ok(state);
@@ -2725,8 +2777,6 @@ where
                     inputs,
                     |stacked_type| Ok(Tangent::Zero(stacked_type.clone())),
                     |lane, lane_inputs| {
-                        // Bind the body's scan-local residual references against this lane's residual slices and
-                        // interpret the resulting direct body.
                         let lane_residuals = residual_stacks
                             .iter()
                             .map(|stack| read_scan_lane(stack, lane))
@@ -2776,15 +2826,15 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         match self {
-            Self::CustomVjpCall(call) => call.interpret(context, inputs),
+            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
             Self::TransferToMemory(_) => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].clone()])
             }
-            Self::Zero(zero) => zero.interpret(context, inputs),
-            Self::One(one) => one.interpret(context, inputs),
-            Self::Constant(constant) => constant.interpret(context, inputs),
-            Self::Fill(fill) => fill.interpret(context, inputs),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => operation.interpret(context, inputs),
+            Self::Fill(operation) => operation.interpret(context, inputs),
             Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
             Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
             Self::Add(_) => AddOperation.interpret(context, inputs),
@@ -2796,12 +2846,12 @@ where
             }
             Self::Scale(operation) => ScaleOperation::new(operation.factor().clone()).interpret(context, inputs),
             Self::LeftDot(operation) => {
-                super::dot::LeftDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                LeftDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
                     .with_output_sharding(operation.output_sharding().cloned())
                     .interpret(context, inputs)
             }
             Self::RightDot(operation) => {
-                super::dot::RightDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
+                RightDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
                     .with_output_sharding(operation.output_sharding().cloned())
                     .interpret(context, inputs)
             }
@@ -2816,9 +2866,6 @@ where
                 BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec())
                     .interpret(context, inputs)
             }
-            Self::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
-                .with_output_sharding(operation.output_sharding().cloned())
-                .interpret(context, inputs),
             Self::Slice(operation) => {
                 SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
                     .with_strides(operation.strides().to_vec())?
@@ -2827,13 +2874,6 @@ where
             Self::UpdateSlice(operation) => {
                 UpdateSliceOperation::new(operation.start_indices().to_vec()).interpret(context, inputs)
             }
-            Self::Pad(operation) => PadOperation::new(
-                operation.edge_padding_low().to_vec(),
-                operation.edge_padding_high().to_vec(),
-                operation.interior_padding().to_vec(),
-            )?
-            .interpret(context, inputs),
-            Self::Concatenate(operation) => ConcatenateOperation::new(operation.axis()).interpret(context, inputs),
             Self::DynamicSlice(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 let index_values = operation
@@ -2864,6 +2904,16 @@ where
                     operation.operation(),
                 )?])
             }
+            Self::Pad(operation) => PadOperation::new(
+                operation.edge_padding_low().to_vec(),
+                operation.edge_padding_high().to_vec(),
+                operation.interior_padding().to_vec(),
+            )?
+            .interpret(context, inputs),
+            Self::Concatenate(operation) => ConcatenateOperation::new(operation.axis()).interpret(context, inputs),
+            Self::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .interpret(context, inputs),
             Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![V::select(&operation.condition().residual_value()?, &inputs[0], &inputs[1])?])
@@ -2909,8 +2959,6 @@ where
                     inputs,
                     |stacked_type| V::zero(stacked_type),
                     |lane, lane_inputs| {
-                        // Bind the body's scan-local residual references against this lane's residual slices and
-                        // interpret the resulting direct body.
                         let lane_residuals = stack_values
                             .iter()
                             .map(|stack| read_scan_lane(stack, lane))
@@ -2946,7 +2994,16 @@ where
         + crate::tracing_v2::operations::reshape::ReshapeOps
         + Broadcast
         + crate::tracing_v2::operations::reduce::Reduce
-        + BooleanLike,
+        + BooleanLike
+        + TransferToMemory
+        + Slice
+        + UpdateSlice
+        + Reshape
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Select<Condition = Tracer<S>>,
     Vec<Tracer<S>>:
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
     O: Clone
@@ -2963,58 +3020,46 @@ where
         + From<ScatterOperation>
         + From<ConcatenateOperation>
         + From<ReshardOperation>
-        + From<ShardingConstraintOperation>,
+        + From<ShardingConstraintOperation>
+        + InterpretableOperation<ArrayType, Tracer<S>>,
 {
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(call) => call.interpret_over_tracers(inputs),
+            Self::CustomVjpCall(operation) => operation.interpret_over_tracers(inputs),
             Self::TransferToMemory(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].transfer_to_memory(operation.destination())])
             }
-            Self::Zero(zero) => context.stage_operation(ZeroOperation::new(zero.r#type().clone()), &[] as &[Tracer<S>]),
-            Self::One(one) => Err(TypeError {
+            Self::Zero(operation) => {
+                context.stage_operation(ZeroOperation::new(operation.r#type().clone()), &[] as &[Tracer<S>])
+            }
+            Self::One(operation) => Err(TypeError {
                 message: format!(
                     "linear one operation over tracer values was not materialized before interpretation for {}",
-                    one.r#type()
+                    operation.r#type()
                 ),
             }
             .into()),
-            Self::Constant(constant) => Err(TypeError {
+            Self::Constant(operation) => Err(TypeError {
                 message: format!(
                     "linear constant operation over tracer values was not materialized before interpretation for {}",
-                    constant.value().r#type()
+                    operation.value().r#type()
                 ),
             }
             .into()),
-            Self::Fill(fill) => Err(TypeError {
+            Self::Fill(operation) => Err(TypeError {
                 message: format!(
                     "linear fill operation over tracer values was not materialized before interpretation for {}",
-                    fill.r#type()
+                    operation.r#type()
                 ),
             }
             .into()),
             Self::ZeroLike(_) => ZeroLikeOperation.interpret(context, inputs),
             Self::OneLike(_) => OneLikeOperation.interpret(context, inputs),
-            Self::Add(_) => <AddOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(
-                &AddOperation,
-                context,
-                inputs,
-            ),
-            Self::Sub(_) => <SubOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(
-                &SubOperation,
-                context,
-                inputs,
-            ),
-            Self::Mul(_) => {
-                check_count!("input", inputs, 2, ProgramError);
-                Ok(vec![inputs[0].clone() * inputs[1].clone()])
-            }
-            Self::Neg(_) => <NegOperation as InterpretableOperation<ArrayType, Tracer<S>>>::interpret(
-                &NegOperation,
-                context,
-                inputs,
-            ),
+            Self::Add(_) => AddOperation.interpret(context, inputs),
+            Self::Sub(_) => SubOperation.interpret(context, inputs),
+            Self::Mul(operation) => operation.interpret(context, inputs),
+            Self::Neg(_) => NegOperation.interpret(context, inputs),
             Self::Transpose(operation) => {
                 TransposeOperation::new(operation.permutation().to_vec()).interpret(context, inputs)
             }
@@ -3024,11 +3069,13 @@ where
             }
             Self::LeftDot(operation) => {
                 use crate::tracing_v2::operations::dot::Dot;
+
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![operation.factor().dot(&inputs[0], operation.dimensions())])
             }
             Self::RightDot(operation) => {
                 use crate::tracing_v2::operations::dot::Dot;
+
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].dot(operation.factor(), operation.dimensions())])
             }
@@ -3043,9 +3090,6 @@ where
                 BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec())
                     .interpret(context, inputs)
             }
-            Self::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
-                .with_output_sharding(operation.output_sharding().cloned())
-                .interpret(context, inputs),
             Self::Slice(operation) => {
                 SliceOperation::new(operation.start_indices().to_vec(), operation.limit_indices().to_vec())
                     .with_strides(operation.strides().to_vec())?
@@ -3054,13 +3098,6 @@ where
             Self::UpdateSlice(operation) => {
                 UpdateSliceOperation::new(operation.start_indices().to_vec()).interpret(context, inputs)
             }
-            Self::Pad(operation) => PadOperation::new(
-                operation.edge_padding_low().to_vec(),
-                operation.edge_padding_high().to_vec(),
-                operation.interior_padding().to_vec(),
-            )?
-            .interpret(context, inputs),
-            Self::Concatenate(operation) => ConcatenateOperation::new(operation.axis()).interpret(context, inputs),
             Self::DynamicSlice(operation) => {
                 check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].dynamic_slice(operation.start_indices(), operation.sizes())?])
@@ -3077,6 +3114,16 @@ where
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].scatter(operation.indices(), &inputs[1], operation.operation())?])
             }
+            Self::Pad(operation) => PadOperation::new(
+                operation.edge_padding_low().to_vec(),
+                operation.edge_padding_high().to_vec(),
+                operation.interior_padding().to_vec(),
+            )?
+            .interpret(context, inputs),
+            Self::Concatenate(operation) => ConcatenateOperation::new(operation.axis()).interpret(context, inputs),
+            Self::Reduce(operation) => ReduceOperation::new(operation.axes().to_vec(), operation.kind())
+                .with_output_sharding(operation.output_sharding().cloned())
+                .interpret(context, inputs),
             Self::Select(operation) => {
                 check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![Tracer::select(operation.condition(), &inputs[0], &inputs[1])?])
@@ -3085,51 +3132,30 @@ where
                 check_count!("input", inputs, 0, ProgramError);
                 Ok(vec![operation.factor().clone()])
             }
-            Self::Recompute(operation) => {
-                // Recomputed primal operations replay over tracers by staging the wrapped primal operation into the
-                // tracers' own staging context, which the operands provide; nullary recomputed operations carry no
-                // operand and therefore no context to stage into.
-                let Some(input) = inputs.first() else {
-                    return Err(TypeError {
-                        message: format!(
-                            "nullary recomputed primal operation {} over tracer values was not materialized before \
-                             interpretation",
-                            operation.name(),
-                        ),
-                    }
-                    .into());
-                };
-                input.context().stage_operation(operation.clone(), inputs)
-            }
+            Self::Recompute(operation) => operation.interpret(context, inputs),
             Self::Condition(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                self.infer_output_types(input_types.as_slice())?;
+                operation.infer_output_types(input_types.as_slice())?;
                 let branch =
                     if operation.predicate().boolean()? { operation.true_branch() } else { operation.false_branch() };
                 branch.interpret_in_context(context, inputs.to_vec())
             }
             Self::OperandCondition(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                self.infer_output_types(input_types.as_slice())?;
+                operation.infer_output_types(input_types.as_slice())?;
                 let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
                 branch.interpret_in_context(context, inputs[1..].to_vec())
             }
             Self::While(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => {
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                self.infer_output_types(input_types.as_slice())?;
-                // Replaying a linear scan over tracers unrolls the statically counted loop: each lane's body
-                // pushforward is bound against that lane's residual slices and inlined into the tracers' staging
-                // context, mirroring how the linear condition inlines its captured branch. Stacked output
-                // accumulators are staged as typed zero operations because tracer values cannot materialize
-                // constants directly.
+                operation.infer_output_types(input_types.as_slice())?;
                 let body = operation.body();
                 let residual_stacks = operation.residual_stacks();
                 let carry_count = operation.carry_count();
                 let Some(exemplar) = inputs.first().or_else(|| residual_stacks.first()) else {
                     return Err(ProgramError::UnsupportedOperation {
-                        message: "cannot replay a linear scan with no inputs and no residual stacks over tracer \
-                                  values"
+                        message: "cannot replay a linear scan with no inputs and no residual stacks over tracer values"
                             .to_string(),
                     });
                 };
@@ -3531,12 +3557,7 @@ where
             Self::Residual(_) => Err(ProgramError::UnsupportedOperation {
                 message: "residual is not a linear map and does not support transposition".to_string(),
             }),
-            Self::Recompute(operation) => Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "recomputed primal operation {} is not a linear map and does not support transposition",
-                    operation.name(),
-                ),
-            }),
+            Self::Recompute(operation) => operation.transpose(context, input_types, output_cotangents),
             Self::Condition(operation) => transpose_linear_condition(
                 operation.predicate(),
                 operation.true_branch(),
@@ -3553,35 +3574,6 @@ where
             }),
             Self::Extension(extension) => extension.transpose(context, input_types, output_cotangents),
         }
-    }
-}
-
-/// Transpose rule for a recomputed primal operation (the `Recompute` variant of [`LinearArrayOperation`], whose payload
-/// is the primal [`ArrayOperation`]). A recomputed primal is replayed forward to reconstruct a residual rather than
-/// participating in the linear map, so it is not a linear map and rejects transposition. The cotangent value type
-/// (`CotangentValue`) is independent of the primal operation's own value type, and the staged linear operation type
-/// (`LinearOperation`) is generic, so this single impl backs the `Recompute` delegation for every linear operation set.
-impl<CotangentValue, PrimalValue, Extension, LinearOperation>
-    TransposableOperation<ArrayType, CotangentValue, LinearOperation>
-    for ArrayOperation<ArrayType, PrimalValue, Extension>
-where
-    CotangentValue: Value<ArrayType>,
-    PrimalValue: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    LinearOperation: Operation<ArrayType>,
-{
-    fn transpose<'transpose>(
-        &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, CotangentValue, LinearOperation>,
-        _input_types: &[&ArrayType],
-        _output_cotangents: &[Cotangent<'transpose, ArrayType, CotangentValue, LinearOperation>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, CotangentValue, LinearOperation>>, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "recomputed primal operation {} is not a linear map and does not support transposition",
-                self.name(),
-            ),
-        })
     }
 }
 

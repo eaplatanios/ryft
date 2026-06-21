@@ -1523,7 +1523,7 @@ where
                 Ok(vec![lowerer.lower_literal_value(operation.factor())?])
             }
             LinearArrayOperation::Recompute(operation) => {
-                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
+                operation.operation().lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             LinearArrayOperation::Condition(operation) => {
                 let true_branch = operation.true_branch();
@@ -5291,7 +5291,7 @@ mod tests {
         // becomes `stablehlo.while`, and the recomputed product rule becomes `stablehlo.multiply` inside the loop
         // body.
         use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
-        use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
+        use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
         type CoreTestOperation = CoreArrayOperation<ArrayType, TestArray>;
         type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
 
@@ -5304,14 +5304,16 @@ mod tests {
         let _condition_tangent = condition_builder.add_input(scalar_f64.clone());
         let condition_zero = condition_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::ZeroLike(ZeroLikeOperation)),
+                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::ZeroLike(
+                    ZeroLikeOperation,
+                ))),
                 vec![condition_primal],
             )
             .unwrap()[0];
         let predicate = condition_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::Compare(CompareOperation::new(
-                    ComparisonDirection::GreaterThan,
+                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Compare(
+                    CompareOperation::new(ComparisonDirection::GreaterThan),
                 ))),
                 vec![condition_primal, condition_zero],
             )
@@ -5327,19 +5329,19 @@ mod tests {
         let body_tangent = body_builder.add_input(scalar_f64.clone());
         let one = body_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::OneLike(OneLikeOperation)),
+                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::OneLike(OneLikeOperation))),
                 vec![body_primal],
             )
             .unwrap()[0];
         let next_primal = body_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::Sub(SubOperation)),
+                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Sub(SubOperation))),
                 vec![body_primal, one],
             )
             .unwrap()[0];
         let next_tangent = body_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::Mul(MulOperation)),
+                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Mul(MulOperation))),
                 vec![body_primal, body_tangent],
             )
             .unwrap()[0];
@@ -5382,7 +5384,7 @@ mod tests {
         // flow into both branch regions. The operand-form condition lowers to `stablehlo.if` over the predicate
         // operand with the branch programs inlined as regions, mirroring the factor-form lowering minus the
         // materialized predicate literal.
-        use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
+        use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
         type CoreTestOperation = CoreArrayOperation<ArrayType, TestArray>;
         type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
 
@@ -5396,7 +5398,7 @@ mod tests {
         let true_forwarded = true_builder.add_input(scalar_f64.clone());
         let product = true_builder
             .add_instruction(
-                DirectLinearOperation::Recompute(CoreTestOperation::Mul(MulOperation)),
+                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Mul(MulOperation))),
                 vec![true_forwarded, true_tangent],
             )
             .unwrap()[0];

@@ -58,6 +58,9 @@ pub mod primitive;
 /// Axis-collapsing reduction primitive.
 pub mod reduce;
 
+/// Recomputed primal operation payload used inside linear programs.
+pub mod recompute;
+
 /// Reshaping primitive.
 pub mod reshape;
 
@@ -117,6 +120,7 @@ pub use dot::{
 };
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use primitive::{ArrayOperation, LinearArrayOperation};
+pub use recompute::RecomputeOperation;
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
 pub use scan::SupportsLinearScan;
