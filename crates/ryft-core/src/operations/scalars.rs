@@ -9,7 +9,7 @@ use crate::operations::arithmetic::{
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, HasZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
+    ConstantOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
     ZeroOperation,
 };
 use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
@@ -140,7 +140,7 @@ where
         + From<LinearSelectOperation<CapturedFactor<DataType, D::Value>>>
         + crate::tracing_v2::ResidualizedOperation<D>
         + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, CapturedFactor<DataType, D::Value>>>,
-    LinearOperationOf<D>: HasZeroOperation<DataType>,
+    LinearOperationOf<D>: MaybeZeroOperation<DataType>,
     Vec<V>: Parameterized<
             V,
             Family: crate::parameters::ParameterizedFamily<D::Tangent>

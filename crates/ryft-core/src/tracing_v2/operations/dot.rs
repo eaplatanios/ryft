@@ -8,7 +8,7 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::manipulation::Transpose;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -699,7 +699,7 @@ where
         + From<LeftDotOperation<CapturedFactor<ArrayType, D::Value>>>
         + From<RightDotOperation<CapturedFactor<ArrayType, D::Value>>>
         + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

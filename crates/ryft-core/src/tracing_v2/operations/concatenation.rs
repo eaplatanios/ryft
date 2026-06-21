@@ -1,7 +1,7 @@
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Concatenate, ConcatenateOperation, SliceOperation, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
@@ -99,7 +99,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Concatenate,
     LinearOperationOf<D>: From<ConcatenateOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

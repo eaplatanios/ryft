@@ -5,7 +5,7 @@ use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, MulOperation, Scale, ScaleOperation};
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
@@ -20,7 +20,7 @@ where
     LinearOperationOf<D>: From<AddOperation>
         + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>
         + From<ZeroOperation<D::Type>>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,

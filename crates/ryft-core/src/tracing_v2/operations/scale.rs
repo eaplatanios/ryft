@@ -67,6 +67,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::convert::Infallible;
     use std::rc::Rc;
 
     use super::*;
@@ -76,17 +77,52 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
     use crate::tracing::AbstractTracingContext;
-    use crate::tracing_v2::LinearArrayOperation;
+    use crate::tracing_v2::{ArrayOperation, LinearArrayOperation};
     use crate::types::{ArrayType, DataType};
     use pretty_assertions::assert_eq;
 
     fn test_transposition_context<'transpose>(
-        domain: &'transpose AbstractDomain<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>,
-        builder: Rc<
-            RefCell<ProgramBuilder<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>>,
+        domain: &'transpose AbstractDomain<
+            ArrayType,
+            TestArray,
+            LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
         >,
-    ) -> AbstractTracingContext<'transpose, ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>>
-    {
+        builder: Rc<
+            RefCell<
+                ProgramBuilder<
+                    ArrayType,
+                    TestArray,
+                    LinearArrayOperation<
+                        ArrayType,
+                        TestArray,
+                        TestArray,
+                        Infallible,
+                        TestArray,
+                        ArrayOperation<ArrayType, TestArray>,
+                    >,
+                >,
+            >,
+        >,
+    ) -> AbstractTracingContext<
+        'transpose,
+        ArrayType,
+        TestArray,
+        LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >,
+    > {
         AbstractTracingContext::new(domain, builder)
     }
 
@@ -100,7 +136,14 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let domain = AbstractDomain::new();

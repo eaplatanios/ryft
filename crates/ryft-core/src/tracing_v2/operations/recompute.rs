@@ -144,6 +144,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::convert::Infallible;
     use std::rc::Rc;
 
     use crate::contexts::StagingContext;
@@ -186,7 +187,14 @@ mod tests {
 
     #[test]
     fn test_recompute_transpose_returns_zero_input_cotangents() {
-        type LinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
+        type LinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
 
         let scalar_type = ArrayType::scalar(DataType::F64);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, LinearOperation>::new()));

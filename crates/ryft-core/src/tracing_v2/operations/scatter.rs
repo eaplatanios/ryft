@@ -9,7 +9,7 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, LinearScatterAddOperation, Reshape, SCATTER_OPERATION_NAME, Scatter, ScatterOperation,
     ScatterReductionKind, Slice, Transpose, UpdateSlice,
@@ -32,7 +32,7 @@ where
     D::Value: Scatter,
     LinearOperationOf<D>:
         From<LinearScatterAddOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

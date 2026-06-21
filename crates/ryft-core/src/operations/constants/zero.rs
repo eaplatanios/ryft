@@ -70,17 +70,17 @@ impl<T: Type, V: Value<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperat
     }
 }
 
-/// Represents [`Operation`]s that can represent/expose [`ZeroOperation`] payloads. This trait is intentionally narrower
+/// Represents [`Operation`]s that may be carrying [`ZeroOperation`] payloads. This trait is intentionally narrower
 /// than [`From<ZeroOperation<T>>`](From). `From` says that an operation type can stage a new zero operation, while
-/// [`HasZeroOperation`] says that a borrowed operation value can be inspected to determine whether it already is a
+/// [`MaybeZeroOperation`] says that a borrowed operation value can be inspected to determine whether it already is a
 /// zero operation. Structural-zero analyses use this borrowed form so that they can recognize existing staged zeros
 /// without cloning, moving, allocating, or manufacturing placeholder operations.
-pub trait HasZeroOperation<T: Type> {
+pub trait MaybeZeroOperation<T: Type> {
     /// Returns the borrowed [`ZeroOperation`] payload when `self` is a zero operation.
     fn zero_operation(&self) -> Option<&ZeroOperation<T>>;
 }
 
-impl<T: Type, O> HasZeroOperation<T> for O
+impl<T: Type, O> MaybeZeroOperation<T> for O
 where
     for<'operation> &'operation ZeroOperation<T>: TryFrom<&'operation O>,
 {

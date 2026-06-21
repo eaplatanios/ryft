@@ -5,7 +5,7 @@ use crate::contexts::{EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::{HasZeroOperation, ZeroLike, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroLike, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
@@ -149,7 +149,7 @@ where
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -212,7 +212,7 @@ where
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -558,7 +558,7 @@ where
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -599,7 +599,7 @@ where
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, V, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,

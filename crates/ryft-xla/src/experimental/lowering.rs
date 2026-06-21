@@ -1190,12 +1190,13 @@ where
     }
 }
 
-impl<V, C, Extension, O> LowerableXlaOperation<V> for LinearArrayOperation<ArrayType, V, C, Extension, V, O>
+impl<V, C, Extension, P> LowerableXlaOperation<V> for LinearArrayOperation<ArrayType, V, C, Extension, V, P>
 where
     V: MlirLowerableValue,
     C: MlirLowerableValue,
     Extension: Clone + LowerableXlaOperation<V>,
-    O: Clone
+    P: Clone
+        + Operation<ArrayType>
         + LowerableXlaOperation<C>
         + From<MulOperation>
         + From<DotOperation>
@@ -2874,21 +2875,21 @@ where
 /// [`SupportsLinearWhile::defactorize`] (a scale by a referenced residual becomes a recomputed elementwise product,
 /// exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads, so the result
 /// lowers through the ordinary direct linear operation path.
-fn operand_form_scan_body<V, C, Extension, O>(
+fn operand_form_scan_body<V, C, Extension, P>(
     body: &Program<
         ArrayType,
         V,
-        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, P>,
         Vec<V>,
         Vec<V>,
     >,
     residual_slice_types: &[ArrayType],
-) -> Result<Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, V, O>, Vec<V>, Vec<V>>, LoweringError>
+) -> Result<Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, V, P>, Vec<V>, Vec<V>>, LoweringError>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
-    O: Clone
+    P: Clone
         + Operation<ArrayType>
         + From<MulOperation>
         + From<DotOperation>
@@ -2897,7 +2898,7 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ConcatenateOperation>,
 {
-    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, V, O>>::new();
+    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, V, P>>::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
     let body_input_types = body.input_types();
     for (body_atom, input_type) in body.input_ids().iter().zip(body_input_types.iter()) {
@@ -5293,7 +5294,14 @@ mod tests {
         use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
         use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
         type CoreTestOperation = CoreArrayOperation<ArrayType, TestArray>;
-        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
+        type DirectLinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         // Extended condition over the doubled state `[primal, tangent]`: recomputes `primal > 0` from the primal
@@ -5386,7 +5394,14 @@ mod tests {
         // materialized predicate literal.
         use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
         type CoreTestOperation = CoreArrayOperation<ArrayType, TestArray>;
-        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
+        type DirectLinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
 
         let scalar_boolean = ArrayType::scalar(DataType::Boolean);
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -5579,7 +5594,14 @@ mod tests {
         use std::convert::Infallible;
 
         use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
-        type DirectLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
+        type DirectLinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
         type ScanBodyOperation = LinearArrayOperation<
             ArrayType,
             TestArray,
@@ -5849,7 +5871,14 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            ryft_core::tracing_v2::LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
             TestArray,
             TestArray,
         >;
@@ -5901,7 +5930,14 @@ mod tests {
         type TestPadPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            ryft_core::tracing_v2::LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
             TestArray,
             (TestArray, TestArray),
         >;
@@ -5968,7 +6004,14 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
+                ryft_core::tracing_v2::LinearArrayOperation<
+                    ArrayType,
+                    TestArray,
+                    TestArray,
+                    Infallible,
+                    TestArray,
+                    ArrayOperation<ArrayType, TestArray>,
+                >,
                 TestArray,
                 (TestArray, TestArray),
             >,
@@ -5992,7 +6035,14 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            ryft_core::tracing_v2::LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
             TestArray,
             TestArray,
         >;
@@ -6074,7 +6124,14 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            ryft_core::tracing_v2::LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
             TestArray,
             TestArray,
         >;
@@ -6134,7 +6191,14 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 NdArrayValue<f64>,
-                ryft_core::tracing_v2::LinearArrayOperation<ArrayType, NdArrayValue<f64>, NdArrayValue<f64>>,
+                ryft_core::tracing_v2::LinearArrayOperation<
+                    ArrayType,
+                    NdArrayValue<f64>,
+                    NdArrayValue<f64>,
+                    Infallible,
+                    NdArrayValue<f64>,
+                    ArrayOperation<ArrayType, NdArrayValue<f64>>,
+                >,
                 NdArrayValue<f64>,
                 (NdArrayValue<f64>, NdArrayValue<f64>),
             >,

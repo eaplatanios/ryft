@@ -4,7 +4,8 @@
 //! optional statically typed backend extension slot. A backend that needs additional operations should define an
 //! ordinary extension enum, define a linear extension enum when it has linear-only operations, implement the standard
 //! operation traits for those enums, and select `ArrayOperation<Type, Value, Extension>` and
-//! `LinearArrayOperation<LinearExtension, Tangent, Type>` as its tracing operation types.
+//! `LinearArrayOperation<T, Tangent, Constant, LinearExtension, Factor, PrimalOperation>` as its tracing operation
+//! types.
 //!
 //! `ryft-core` intentionally does not expose a universal dynamic custom-operation primitive. Backend-specific or
 //! user-defined operations should be represented by a backend extension variant, so transform, interpretation, and
@@ -28,8 +29,8 @@ use crate::operations::arithmetic::{
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, HasZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero,
+    ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
 use crate::operations::control_flow::{
@@ -352,7 +353,7 @@ where
             CapturedFactor<ArrayType, D::Value>,
             ArrayOperation<ArrayType, V, Extension>,
         > + SupportsLinearScan<ArrayType, D::Tangent, CapturedFactor<ArrayType, D::Value>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<ArrayType, V, Extension>: Clone + ProgramLinearizableOperation<D>,
 {
     fn jvp<'jvp>(
@@ -451,15 +452,8 @@ where
 /// value type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold
 /// concrete constants).
 #[derive(Clone, Debug, Operation)]
-#[ryft(type = "ArrayType", bounds = "O: Operation<ArrayType>")]
-pub enum LinearArrayOperation<
-    T: Type,
-    V: Value<T>,
-    C: Value<T>,
-    Extension = Infallible,
-    F: Value<T> = V,
-    O = ArrayOperation<T, C, Extension>,
-> {
+#[ryft(type = "ArrayType")]
+pub enum LinearArrayOperation<T: Type, V: Value<T>, C: Value<T>, Extension, F: Value<T>, P: Operation<T>> {
     /// Typed array zero.
     Zero(ZeroOperation<T>),
 
@@ -551,22 +545,22 @@ pub enum LinearArrayOperation<
     Residual(MaterializeCapturedFactorOperation<F>),
 
     /// Recomputed primal operation.
-    Recompute(RecomputeOperation<O>),
+    Recompute(RecomputeOperation<P>),
 
     /// Linear conditional with two captured-factor branch programs.
-    Condition(LinearConditionOperation<T, V, C, Extension, F, O>),
+    Condition(LinearConditionOperation<T, V, C, Extension, F, P>),
 
     /// Linear conditional whose predicate is an operand rather than a captured factor.
-    OperandCondition(LinearOperandConditionOperation<T, V, C, Extension, F, O>),
+    OperandCondition(LinearOperandConditionOperation<T, V, C, Extension, F, P>),
 
     /// While loop with condition and body programs.
     While(Box<WhileOperation<T, V, Self>>),
 
     /// Linear scan over a leading axis with a body program.
-    Scan(LinearScanOperation<T, V, C, Extension, F, O>),
+    Scan(LinearScanOperation<T, V, C, Extension, F, P>),
 
     /// Opaque `custom_vjp` call whose transpose replays the user's backward program.
-    CustomVjpCall(Box<CustomVjpCallOperation<T, C, O, F>>),
+    CustomVjpCall(Box<CustomVjpCallOperation<T, C, P, F>>),
 
     /// Backend extension operation.
     Extension(Extension),
@@ -578,60 +572,60 @@ pub enum LinearArrayOperation<
 // `CapturedFactor<ArrayType, V>`, and the `While` recursion resolves against this impl's assumed
 // `Self: TransposableOperation<ArrayType, V, Self>`. The remaining where-clause spells the leaf value capabilities
 // the per-variant rules read off `V`, plus the custom-VJP and extension obligations at the scan-local fixed point.
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
-    for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, P>
+    TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>
+    for LinearArrayOperation<ArrayType, V, C, Extension, F, P>
 where
     Extension: Operation<ArrayType>,
-    O: Operation<ArrayType>,
+    P: Operation<ArrayType>,
     ZeroOperation<ArrayType>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    ZeroLikeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    ZeroLikeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     OneOperation<ArrayType>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    OneLikeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    OneLikeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     ConstantOperation<ArrayType, V>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     FillOperation<ArrayType, f64>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    NegOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    AddOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    SubOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    NegOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    AddOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    SubOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     ScaleOperation<ArrayType, F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    MulOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    MulOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     TransferToMemoryOperation:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    TransposeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    LeftDotOperation<F>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    RightDotOperation<F>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    ReshapeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    ReshardOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    TransposeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    LeftDotOperation<F>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    RightDotOperation<F>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    ReshapeOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    ReshardOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     ShardingConstraintOperation:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    BroadcastOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    SliceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    UpdateSliceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    BroadcastOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    SliceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    UpdateSliceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     LinearDynamicSliceOperation<F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     LinearDynamicUpdateSliceOperation<F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     LinearGatherOperation<F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     LinearScatterAddOperation<F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    PadOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    ConcatenateOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    ReduceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    PadOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    ConcatenateOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    ReduceOperation: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     LinearSelectOperation<F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     MaterializeCapturedFactorOperation<F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    LinearOperandConditionOperation<ArrayType, V, C, Extension, F, O>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    CustomVjpCallOperation<ArrayType, C, O, F>:
-        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
-    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>,
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    LinearOperandConditionOperation<ArrayType, V, C, Extension, F, P>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    CustomVjpCallOperation<ArrayType, C, P, F>:
+        TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
+    Extension: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>,
     V: Add<Output = V>
         + Neg<Output = V>
         + Mul<Output = V>
@@ -640,11 +634,11 @@ where
         + DotOps
         + SupportsManipulationOperations
         + BooleanLike,
-    O: Clone,
+    P: Clone,
     Extension: TransposableOperation<
             ArrayType,
             V,
-            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, O>,
+            LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, V>, P>,
         >,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -654,17 +648,17 @@ where
             'transpose,
             ArrayType,
             V,
-            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, P>,
         >,
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<
             'transpose,
             ArrayType,
             V,
-            LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+            LinearArrayOperation<ArrayType, V, C, Extension, F, P>,
         >],
     ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>>,
+        Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>>,
         ProgramError,
     > {
         match self {
@@ -729,18 +723,13 @@ impl<T: Type, V: Value<T>> InterpretableOperation<T, V> for Infallible {
     }
 }
 
-impl<T, V, O> TransposableOperation<T, V, O> for Infallible
-where
-    T: Type,
-    V: Value<T>,
-    O: Operation<T>,
-{
+impl<T: Type, V: Value<T>, P: Operation<T>> TransposableOperation<T, V, P> for Infallible {
     fn transpose<'transpose>(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, T, V, P>,
         _input_types: &[&T],
-        _output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
+        _output_cotangents: &[Cotangent<'transpose, T, V, P>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, P>>, ProgramError> {
         match *self {}
     }
 }
@@ -772,11 +761,8 @@ impl<T: Type, F: Value<T>> FactorParameterizedOperation<T, F> for Infallible {
     }
 }
 
-impl<T, V, Extension> MaybeRematerializationName for ArrayOperation<T, V, Extension>
-where
-    T: Type,
-    V: Value<T>,
-    Extension: MaybeRematerializationName,
+impl<T: Type, V: Value<T>, Extension: MaybeRematerializationName> MaybeRematerializationName
+    for ArrayOperation<T, V, Extension>
 {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
@@ -818,8 +804,10 @@ impl MaybeDot for Infallible {
     }
 }
 
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, O>
-    SupportsLinearCondition<ArrayType, V, F> for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, P>
+    SupportsLinearCondition<ArrayType, V, F> for LinearArrayOperation<ArrayType, V, C, Extension, F, P>
+where
+    P: Operation<ArrayType>,
 {
     #[inline]
     fn linear_condition_operation(
@@ -864,11 +852,11 @@ enum NestedResidualDisposition {
 ///   - Instructions referencing both kinds are rejected, mirroring the mixed constant/reference index rejection of
 ///     the dynamic-slicing defactorization arms (defactorization stages exactly one instruction per source
 ///     instruction).
-fn defactorize_nested_linear_program<V, C, Extension, R, O>(
+fn defactorize_nested_linear_program<V, C, Extension, R, P>(
     program: &Program<
         ArrayType,
         V,
-        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, P>,
         Vec<V>,
         Vec<V>,
     >,
@@ -878,7 +866,7 @@ fn defactorize_nested_linear_program<V, C, Extension, R, O>(
     Program<
         ArrayType,
         V,
-        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, P>,
         Vec<V>,
         Vec<V>,
     >,
@@ -889,7 +877,7 @@ where
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     R: Value<ArrayType>,
-    O: Clone
+    P: Clone
         + Operation<ArrayType>
         + From<MulOperation>
         + From<DotOperation>
@@ -901,7 +889,7 @@ where
     let mut builder = ProgramBuilder::<
         ArrayType,
         V,
-        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, P>,
     >::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
     for (program_atom, input_type) in program.input_ids().iter().zip(program.input_types().into_iter()) {
@@ -998,14 +986,14 @@ where
     builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
-impl<V, C, Extension, R, O> SupportsLinearWhile<ArrayType, V, CapturedFactor<ArrayType, R>, O>
-    for LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>
+impl<V, C, Extension, R, P> SupportsLinearWhile<ArrayType, V, CapturedFactor<ArrayType, R>, P>
+    for LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     R: Value<ArrayType>,
-    O: Clone
+    P: Clone
         + Operation<ArrayType>
         + From<MulOperation>
         + From<DotOperation>
@@ -1015,7 +1003,7 @@ where
         + From<ConcatenateOperation>,
 {
     #[inline]
-    fn recompute_operation(operation: O) -> Self {
+    fn recompute_operation(operation: P) -> Self {
         LinearArrayOperation::Recompute(RecomputeOperation::new(operation))
     }
 
@@ -1046,7 +1034,7 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(MulOperation))),
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(MulOperation))),
                     inputs,
                 })
             }
@@ -1054,7 +1042,7 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
                         DotOperation::new(operation.dimensions().clone())
                             .with_output_sharding(operation.output_sharding().cloned()),
                     ))),
@@ -1065,7 +1053,7 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.factor() else { unreachable!() };
                 inputs.push(resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
                         DotOperation::new(operation.dimensions().clone())
                             .with_output_sharding(operation.output_sharding().cloned()),
                     ))),
@@ -1090,7 +1078,7 @@ where
                     inputs.push(resolve_residual_atom(*index)?);
                 }
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
                         DynamicSliceOperation::new(operation.sizes().to_vec()),
                     ))),
                     inputs,
@@ -1110,7 +1098,7 @@ where
                     inputs.push(resolve_residual_atom(*index)?);
                 }
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
                         DynamicUpdateSliceOperation,
                     ))),
                     inputs,
@@ -1128,7 +1116,7 @@ where
                 let CapturedFactor::Reference { index, .. } = operation.condition() else { unreachable!() };
                 inputs.insert(0, resolve_residual_atom(*index)?);
                 Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(O::from(SelectOperation))),
+                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(SelectOperation))),
                     inputs,
                 })
             }
@@ -1268,14 +1256,14 @@ where
     }
 }
 
-impl<V, C, Extension, R, O> SupportsLinearScan<ArrayType, V, CapturedFactor<ArrayType, R>>
-    for LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, O>
+impl<V, C, Extension, R, P> SupportsLinearScan<ArrayType, V, CapturedFactor<ArrayType, R>>
+    for LinearArrayOperation<ArrayType, V, C, Extension, CapturedFactor<ArrayType, R>, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     R: Value<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    P: Clone + Operation<ArrayType>,
 {
     fn linear_scan_operation(
         body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
@@ -1327,17 +1315,17 @@ pub(crate) fn render_factor_list<F: Display>(factors: &[F]) -> String {
 /// `on_false` cotangent is `select(condition, 0, cotangent)`. The zero operand is staged as a typed `Zero` operation
 /// via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent), and `make_operation`
 /// rebuilds the captured-condition select for staging into the transpose builder.
-pub(crate) fn transpose_captured_condition_select<'transpose, T, V, O, MakeOperationFn>(
+pub(crate) fn transpose_captured_condition_select<'transpose, T, V, P, MakeOperationFn>(
     make_operation: MakeOperationFn,
-    context: &mut AbstractTracingContext<'transpose, T, V, O>,
+    context: &mut AbstractTracingContext<'transpose, T, V, P>,
     input_types: &[&T],
-    output_cotangents: &[Cotangent<'transpose, T, V, O>],
-) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>
+    output_cotangents: &[Cotangent<'transpose, T, V, P>],
+) -> Result<Vec<Cotangent<'transpose, T, V, P>>, ProgramError>
 where
     T: Type,
     V: Value<T>,
-    O: Operation<T> + From<ZeroOperation<T>>,
-    MakeOperationFn: Fn() -> O,
+    P: Operation<T> + From<ZeroOperation<T>>,
+    MakeOperationFn: Fn() -> P,
 {
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_cotangents, 1, ProgramError);
@@ -1367,26 +1355,27 @@ where
 /// predicate. Output cotangents are materialized via
 /// [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent) because the staged transposed
 /// condition consumes all output cotangents jointly.
-pub(crate) fn transpose_linear_condition<'transpose, V, C, Extension, F, O>(
+pub(crate) fn transpose_linear_condition<'transpose, V, C, Extension, F, P>(
     predicate: &F,
-    true_branch: &Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>, Vec<V>, Vec<V>>,
-    false_branch: &Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>, Vec<V>, Vec<V>>,
+    true_branch: &Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>, Vec<V>, Vec<V>>,
+    false_branch: &Program<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>, Vec<V>, Vec<V>>,
     context: &mut AbstractTracingContext<
         'transpose,
         ArrayType,
         V,
-        LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+        LinearArrayOperation<ArrayType, V, C, Extension, F, P>,
     >,
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>],
+    output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>],
 ) -> Result<
-    Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>>,
+    Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>>,
     ProgramError,
 >
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
-    LinearArrayOperation<ArrayType, V, C, Extension, F, O>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, O>>
+    P: Operation<ArrayType>,
+    LinearArrayOperation<ArrayType, V, C, Extension, F, P>: TransposableOperation<ArrayType, V, LinearArrayOperation<ArrayType, V, C, Extension, F, P>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
 {
@@ -1420,17 +1409,17 @@ where
 /// typed `Zero` operation via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent),
 /// and `make_dynamic_update_slice` rebuilds the captured-index dynamic update-slice for staging into the transpose
 /// builder. Symbolic-zero cotangents propagate unchanged.
-pub(crate) fn transpose_captured_index_dynamic_slice<'transpose, T, V, O, MakeOperationFn>(
+pub(crate) fn transpose_captured_index_dynamic_slice<'transpose, T, V, P, MakeOperationFn>(
     make_dynamic_update_slice: MakeOperationFn,
-    context: &mut AbstractTracingContext<'transpose, T, V, O>,
+    context: &mut AbstractTracingContext<'transpose, T, V, P>,
     input_types: &[&T],
-    output_cotangents: &[Cotangent<'transpose, T, V, O>],
-) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>
+    output_cotangents: &[Cotangent<'transpose, T, V, P>],
+) -> Result<Vec<Cotangent<'transpose, T, V, P>>, ProgramError>
 where
     T: Type,
     V: Value<T>,
-    O: Operation<T> + From<ZeroOperation<T>>,
-    MakeOperationFn: Fn() -> O,
+    P: Operation<T> + From<ZeroOperation<T>>,
+    MakeOperationFn: Fn() -> P,
 {
     check_count!("input", input_types, 1, ProgramError);
     check_count!("output", output_cotangents, 1, ProgramError);
@@ -1459,21 +1448,21 @@ where
 pub(crate) fn transpose_captured_index_dynamic_update_slice<
     'transpose,
     V,
-    O,
+    P,
     MakeUpdateOperationFn,
     MakeSliceOperationFn,
 >(
     make_dynamic_update_slice: MakeUpdateOperationFn,
     make_dynamic_slice: MakeSliceOperationFn,
-    context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+    context: &mut AbstractTracingContext<'transpose, ArrayType, V, P>,
     input_types: &[&ArrayType],
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError>
+    output_cotangents: &[Cotangent<'transpose, ArrayType, V, P>],
+) -> Result<Vec<Cotangent<'transpose, ArrayType, V, P>>, ProgramError>
 where
     V: Value<ArrayType>,
-    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
-    MakeUpdateOperationFn: Fn() -> O,
-    MakeSliceOperationFn: Fn(Vec<usize>) -> O,
+    P: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
+    MakeUpdateOperationFn: Fn() -> P,
+    MakeSliceOperationFn: Fn(Vec<usize>) -> P,
 {
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_cotangents, 1, ProgramError);
@@ -1575,16 +1564,16 @@ pub(crate) fn scatter_add_to_gather_operation(
 /// operand (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output
 /// cotangent unchanged; the update cotangent gathers the output cotangent at the scattered windows via the mirrored
 /// gather rebuilt by `make_gather`. Symbolic-zero cotangents propagate unchanged.
-pub(crate) fn transpose_captured_index_scatter_add<'transpose, V, O, MakeGatherOperationFn>(
+pub(crate) fn transpose_captured_index_scatter_add<'transpose, V, P, MakeGatherOperationFn>(
     make_gather: MakeGatherOperationFn,
-    context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+    context: &mut AbstractTracingContext<'transpose, ArrayType, V, P>,
     input_types: &[&ArrayType],
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError>
+    output_cotangents: &[Cotangent<'transpose, ArrayType, V, P>],
+) -> Result<Vec<Cotangent<'transpose, ArrayType, V, P>>, ProgramError>
 where
     V: Value<ArrayType>,
-    O: Operation<ArrayType>,
-    MakeGatherOperationFn: Fn() -> O,
+    P: Operation<ArrayType>,
+    MakeGatherOperationFn: Fn() -> P,
 {
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_cotangents, 1, ProgramError);
@@ -1707,17 +1696,17 @@ fn clone_factor<F: Clone>(factor: &F) -> Result<F, ProgramError> {
 /// Shared payload-mapping core behind [`FactorParameterizedOperation::try_map_factors`] for
 /// [`LinearArrayOperation`], parameterized by an [`ExtensionFactorMapping`] strategy that decides how backend
 /// extension payloads are rewritten (recursed into for enclosing-space passes, cloned for body-local passes).
-fn map_linear_array_operation_factors<V, C, Extension, F, MappedFactor, O, MapFactorFn, Strategy>(
-    operation: &LinearArrayOperation<ArrayType, V, C, Extension, F, O>,
+fn map_linear_array_operation_factors<V, C, Extension, F, MappedFactor, P, MapFactorFn, Strategy>(
+    operation: &LinearArrayOperation<ArrayType, V, C, Extension, F, P>,
     map_factor: &mut MapFactorFn,
-) -> Result<LinearArrayOperation<ArrayType, V, C, Strategy::MappedExtension, MappedFactor, O>, ProgramError>
+) -> Result<LinearArrayOperation<ArrayType, V, C, Strategy::MappedExtension, MappedFactor, P>, ProgramError>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    P: Clone + Operation<ArrayType>,
     MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     Strategy: ExtensionFactorMapping<Extension, F, MappedFactor>,
 {
@@ -1858,17 +1847,17 @@ where
     }
 }
 
-impl<V, C, Extension, F, O> FactorParameterizedOperation<ArrayType, F>
-    for LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+impl<V, C, Extension, F, P> FactorParameterizedOperation<ArrayType, F>
+    for LinearArrayOperation<ArrayType, V, C, Extension, F, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: FactorParameterizedOperation<ArrayType, F>,
     F: Value<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    P: Clone + Operation<ArrayType>,
 {
     type WithFactor<MappedFactor: Value<ArrayType>> =
-        LinearArrayOperation<ArrayType, V, C, Extension::WithFactor<MappedFactor>, MappedFactor, O>;
+        LinearArrayOperation<ArrayType, V, C, Extension::WithFactor<MappedFactor>, MappedFactor, P>;
 
     fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -1881,13 +1870,13 @@ where
     }
 }
 
-impl<V, C, Extension, F, O> LinearArrayOperation<ArrayType, V, C, Extension, F, O>
+impl<V, C, Extension, F, P> LinearArrayOperation<ArrayType, V, C, Extension, F, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     Extension: Clone + Operation<ArrayType>,
     F: Value<ArrayType>,
-    O: Clone + Operation<ArrayType>,
+    P: Clone + Operation<ArrayType>,
 {
     /// Maps this operation's factor payloads through `map_factor` while cloning backend extension payloads
     /// unchanged.
@@ -1900,7 +1889,7 @@ where
     pub fn try_map_factors_preserving_extensions<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
         map_factor: &mut MapFactorFn,
-    ) -> Result<LinearArrayOperation<ArrayType, V, C, Extension, MappedFactor, O>, ProgramError>
+    ) -> Result<LinearArrayOperation<ArrayType, V, C, Extension, MappedFactor, P>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
@@ -2083,8 +2072,8 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>, O> InterpretableOperation<ArrayType, V>
-    for LinearArrayOperation<ArrayType, V, V, Extension, F, O>
+impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>, P> InterpretableOperation<ArrayType, V>
+    for LinearArrayOperation<ArrayType, V, V, Extension, F, P>
 where
     V: Parameter
         + SupportsLinearArithmeticOperations
@@ -2104,7 +2093,7 @@ where
     ArrayOperation<ArrayType, V, Extension>: InterpretableOperation<ArrayType, V>,
     F: CustomVjpResidual<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Clone + InterpretableOperation<ArrayType, V>,
+    P: Clone + InterpretableOperation<ArrayType, V>,
 {
     fn interpret(
         &self,
@@ -2263,11 +2252,11 @@ where
     }
 }
 
-impl<C, S, Extension, O> InterpretableOperation<ArrayType, Tracer<S>>
-    for LinearArrayOperation<ArrayType, Tracer<S>, C, Extension, Tracer<S>, O>
+impl<C, S, Extension, P> InterpretableOperation<ArrayType, Tracer<S>>
+    for LinearArrayOperation<ArrayType, Tracer<S>, C, Extension, Tracer<S>, P>
 where
     C: Value<ArrayType>,
-    S: StagingContext<Type = ArrayType, Constant = C, Operation = O>,
+    S: StagingContext<Type = ArrayType, Constant = C, Operation = P>,
     S::Operation: From<DotOperation>,
     Extension: Clone + InterpretableOperation<ArrayType, Tracer<S>>,
     Tracer<S>: Add<Output = Tracer<S>>
@@ -2292,7 +2281,7 @@ where
         + Select<Condition = Tracer<S>>,
     Vec<Tracer<S>>:
         Parameterized<Tracer<S>, To<Tracer<S>> = Vec<Tracer<S>>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    O: Clone
+    P: Clone
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
         + From<TransferToMemoryOperation>
@@ -2453,7 +2442,7 @@ where
                     inputs,
                     |stacked_type| {
                         let mut outputs = staging_context
-                            .stage_nullary_operation(O::from(ZeroOperation::new(stacked_type.clone())))?;
+                            .stage_nullary_operation(P::from(ZeroOperation::new(stacked_type.clone())))?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))
                     },
@@ -2764,7 +2753,7 @@ where
             ArrayType,
             CapturedFactor<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             WithFactor<CapturedFactor<ArrayType, E::Value>> = LinearOperationOf<E>,
-        > + HasZeroOperation<ArrayType>,
+        > + MaybeZeroOperation<ArrayType>,
 {
     fn linearize_program(
         differentiable: &E,
@@ -2800,7 +2789,7 @@ where
             DataType,
             CapturedFactor<DataType, Tracer<LinearizationContextOf<E, Self>>>,
             WithFactor<CapturedFactor<DataType, E::Value>> = LinearOperationOf<E>,
-        > + HasZeroOperation<DataType>,
+        > + MaybeZeroOperation<DataType>,
 {
     fn linearize_program(
         differentiable: &E,
@@ -2812,13 +2801,14 @@ where
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
 fn batch_linear_non_control_operation<F, C, V, E>(
-    operation: &LinearArrayOperation<ArrayType, F, C, E>,
+    operation: &LinearArrayOperation<ArrayType, F, C, E, F, ArrayOperation<ArrayType, C, E>>,
     context: &V::InterpretationContext,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
     F: Value<ArrayType>,
     C: Value<ArrayType>,
+    E: Operation<ArrayType>,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations<F>
         + ZeroLike
@@ -2911,8 +2901,11 @@ where
 }
 
 /// Blanket value-level batching impl for the [`LinearArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>
-    for LinearArrayOperation<ArrayType, V, V, E>
+impl<V, E>
+    BatchableOperation<
+        V,
+        EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E, V, ArrayOperation<ArrayType, V, E>>>,
+    > for LinearArrayOperation<ArrayType, V, V, E, V, ArrayOperation<ArrayType, V, E>>
 where
     ArrayOperation<ArrayType, V, E>: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<ArrayType, V, E>>>,
     V::InterpretationContext: Default,
@@ -2926,12 +2919,21 @@ where
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
-    E: Clone + BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>>,
+    E: Clone
+        + Operation<ArrayType>
+        + BatchableOperation<
+            V,
+            EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E, V, ArrayOperation<ArrayType, V, E>>>,
+        >,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
         &self,
-        context: &EagerContext<ArrayType, V, LinearArrayOperation<ArrayType, V, V, E>>,
+        context: &EagerContext<
+            ArrayType,
+            V,
+            LinearArrayOperation<ArrayType, V, V, E, V, ArrayOperation<ArrayType, V, E>>,
+        >,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let interpretation_context = V::InterpretationContext::default();
@@ -3081,7 +3083,14 @@ where
 
 /// Blanket active batching impl for the [`LinearArrayOperation`] sum type.
 impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
-    for LinearArrayOperation<ArrayType, C::Constant, C::Constant, E>
+    for LinearArrayOperation<
+        ArrayType,
+        C::Constant,
+        C::Constant,
+        E,
+        C::Constant,
+        ArrayOperation<ArrayType, C::Constant, E>,
+    >
 where
     ArrayOperation<ArrayType, C::Constant, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>,
@@ -3096,7 +3105,7 @@ where
         + Select<Condition = Tracer<C>>
         + BooleanLike
         + TransferToMemory,
-    E: Clone + BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    E: Clone + Operation<ArrayType> + BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
@@ -3266,7 +3275,14 @@ mod tests {
         // computation rather than a linear operand, so it is carried verbatim into one staged transposed condition
         // over the transposed branch programs. Runtime (factor) predicates used to be rejected with an
         // `UnsupportedOperation` error.
-        type TestLinearOperation = LinearArrayOperation<ArrayType, TestArray, TestArray>;
+        type TestLinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
         let scale_branch = |factor: f64| {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));

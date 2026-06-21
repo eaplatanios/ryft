@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
     LinearizationTracer, ProgramLinearizableOperation, ResidualizedOperation,
@@ -45,8 +45,8 @@ where
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + HasZeroOperation<<D as Domain>::Type>,
+    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
     // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
@@ -95,8 +95,8 @@ where
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + HasZeroOperation<<D as Domain>::Type>,
+    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
 {
     value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
 }
@@ -146,9 +146,9 @@ where
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
+    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -214,9 +214,9 @@ where
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>,
-    DirectLinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
+    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: HasZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {

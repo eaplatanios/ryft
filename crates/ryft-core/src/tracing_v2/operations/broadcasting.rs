@@ -162,6 +162,7 @@ impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableO
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::convert::Infallible;
     use std::rc::Rc;
 
     use indoc::indoc;
@@ -174,9 +175,9 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing::AbstractTracingContext;
-    use crate::tracing_v2::LinearArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
+    use crate::tracing_v2::{ArrayOperation, LinearArrayOperation};
     use crate::types::{DataType, Typed};
 
     use super::*;
@@ -186,12 +187,31 @@ mod tests {
     fn transposed_broadcast_program(
         operation: &BroadcastOperation,
         input_type: &ArrayType,
-    ) -> Program<ArrayType, TestArray, LinearArrayOperation<ArrayType, TestArray, TestArray>, TestArray, TestArray>
-    {
+    ) -> Program<
+        ArrayType,
+        TestArray,
+        LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            TestArray,
+            ArrayOperation<ArrayType, TestArray>,
+        >,
+        TestArray,
+        TestArray,
+    > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
         >::new()));
         let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
         let domain = AbstractDomain::new();
@@ -285,7 +305,14 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<ArrayType, TestArray, TestArray>,
+            LinearArrayOperation<
+                ArrayType,
+                TestArray,
+                TestArray,
+                Infallible,
+                TestArray,
+                ArrayOperation<ArrayType, TestArray>,
+            >,
         >::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);

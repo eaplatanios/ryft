@@ -4,7 +4,7 @@ use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{AddOperation, DivOperation, Scale, ScaleOperation};
-use crate::operations::constants::{HasZeroOperation, OneLike, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, OneLike, ZeroOperation};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
@@ -15,7 +15,7 @@ where
     D: DifferentiationContext,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>
         + From<AddOperation>
         + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>
         + From<ZeroOperation<D::Type>>,

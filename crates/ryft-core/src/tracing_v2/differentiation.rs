@@ -13,7 +13,7 @@ use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{HasZeroOperation, OneOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
 use crate::operations::scalars::LinearScalarOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -545,7 +545,7 @@ pub trait DifferentiationContext:
                 Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
     {
         let (program, input_structure, output_structure, input_values) =
             self.trace_into_primal_program::<F, Input, TracedOutput>(function, primals)?;
@@ -591,7 +591,7 @@ pub trait DifferentiationContext:
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self>,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> TracedOutput,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -648,7 +648,7 @@ pub trait DifferentiationContext:
         O: TransposableOperation<<Self as Domain>::Type, Self::Tangent, O>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>
-            + HasZeroOperation<<Self as Domain>::Type>,
+            + MaybeZeroOperation<<Self as Domain>::Type>,
         Input: Parameterized<Self::Tangent>,
         Output: Parameterized<Self::Tangent>,
     {
@@ -682,9 +682,9 @@ pub trait DifferentiationContext:
         DirectLinearOperationOf<Self>: TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>,
-        DirectLinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        DirectLinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -722,9 +722,9 @@ pub trait DifferentiationContext:
             + TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>,
-        DirectLinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        DirectLinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -766,9 +766,9 @@ pub trait DifferentiationContext:
             + TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>,
-        DirectLinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        DirectLinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -821,7 +821,7 @@ pub trait DifferentiationContext:
                 Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
     {
         // Concretizing contexts replay through the value-level JVP loop so data-dependent higher-order rules (the
         // `while` rule in particular) take their eager, transposable strategy; staging contexts fall back to the
@@ -872,7 +872,7 @@ where
             Family: ParameterizedFamily<<E as Domain>::Value> + ParameterizedFamily<E::Tangent>,
         >,
     LinearOperationOf<E>: ResidualizedOperation<E>,
-    LinearOperationOf<E>: HasZeroOperation<<E as Domain>::Type>,
+    LinearOperationOf<E>: MaybeZeroOperation<<E as Domain>::Type>,
 {
     fn tangent_for_atom<'jvp, D>(
         context: &TangentContext<'jvp, D>,
@@ -1520,7 +1520,7 @@ where
             <E as Domain>::Type,
             CapturedFactor<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
             WithFactor<CapturedFactor<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
-        > + HasZeroOperation<<E as Domain>::Type>,
+        > + MaybeZeroOperation<<E as Domain>::Type>,
 {
     let nested_context = LinearizationContextOf::<E, O>::new();
     let input_tracers = program

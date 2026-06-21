@@ -9,7 +9,7 @@ use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{
-    FillOperation, HasZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    FillOperation, MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
@@ -144,7 +144,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 EagerContext<ArrayType, Self::Tangent, DirectLinearOperationOf<Self>>,
             >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: HasZeroOperation<ArrayType>,
+        LinearOperationOf<Self>: MaybeZeroOperation<ArrayType>,
         <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default,
     {
         let input_structure = primal.parameter_structure();
@@ -226,7 +226,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
             crate::tracing_v2::CapturedFactor<ArrayType, Tracer<TracingContext<'domain, Self>>>,
-        >: ResidualizedOperation<TracingContext<'domain, Self>> + HasZeroOperation<ArrayType>,
+        >: ResidualizedOperation<TracingContext<'domain, Self>> + MaybeZeroOperation<ArrayType>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
             Tracer<TracingContext<'domain, Self>>,
@@ -240,10 +240,10 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 >,
             > + From<ZeroOperation<ArrayType>>
             + From<AddOperation>
-            + HasZeroOperation<ArrayType>,
+            + MaybeZeroOperation<ArrayType>,
         <<Self as Domain>::Value as Value<<Self as Domain>::Type>>::InterpretationContext: Default,
         <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default,
-        LinearOperationOf<Self>: HasZeroOperation<ArrayType>,
+        LinearOperationOf<Self>: MaybeZeroOperation<ArrayType>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -870,9 +870,9 @@ where
         + TransposableOperation<ArrayType, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
-    DirectLinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    DirectLinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     <D::Tangent as Value<ArrayType>>::InterpretationContext: Default,
 {
     let input_structure = primals.parameter_structure();

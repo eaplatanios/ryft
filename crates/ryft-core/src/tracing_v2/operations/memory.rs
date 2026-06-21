@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
@@ -132,7 +132,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: TransferToMemory,
     LinearOperationOf<D>: From<TransferToMemoryOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     #[inline]
     fn jvp<'jvp>(

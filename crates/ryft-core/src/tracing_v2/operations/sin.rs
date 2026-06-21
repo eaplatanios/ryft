@@ -2,7 +2,7 @@ use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{Scale, ScaleOperation};
-use crate::operations::constants::HasZeroOperation;
+use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
@@ -14,7 +14,7 @@ where
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
     LinearOperationOf<D>: From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
     #[inline]
     fn jvp<'jvp>(

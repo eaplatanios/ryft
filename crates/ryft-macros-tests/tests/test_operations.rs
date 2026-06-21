@@ -196,6 +196,21 @@ impl<T: Clone + Type, V, O> Operation<T> for WhileOperation<T, V, O> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct RecomputeOperation<O> {
+    operation: O,
+}
+
+impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
+    fn name(&self) -> &'static str {
+        self.operation.name()
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        self.operation.infer_output_types(input_types)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct CustomVjpCallOperation<T: Type, C, O, F> {
     marker: PhantomData<(T, C, O, F)>,
 }
@@ -218,13 +233,13 @@ enum LinearArrayOperation<
     C: Value<T>,
     Extension = NoExtension,
     F: Value<T> = V,
-    O = ArrayOperation<T, C, Extension>,
+    P: Operation<T> = ArrayOperation<T, C, Extension>,
 > {
     Zero(ZeroOperation<T>),
     Scale(ScaleOperation<T, F>),
-    Recompute(O),
+    Recompute(RecomputeOperation<P>),
     While(Box<WhileOperation<T, V, Self>>),
-    CustomVjpCall(Box<CustomVjpCallOperation<T, C, O, F>>),
+    CustomVjpCall(Box<CustomVjpCallOperation<T, C, P, F>>),
     Extension(Extension),
 }
 
@@ -257,6 +272,8 @@ fn test_linear_array_operation_shape() {
 
     let zero = Linear::from(ZeroOperation { r#type: ArrayType });
     let scale = Linear::from(ScaleOperation { factor: Factor(13), marker: PhantomData });
+    let recompute =
+        Linear::from(RecomputeOperation { operation: ArrayOperation::<ArrayType, Factor>::from(DotOperation) });
     let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
     let custom_vjp_call = Linear::from(CustomVjpCallOperation::<
         ArrayType,
@@ -269,10 +286,17 @@ fn test_linear_array_operation_shape() {
 
     assert_eq!(zero.name(), "zero");
     assert_eq!(scale.name(), "scale");
+    assert_eq!(recompute.name(), "dot");
     assert_eq!(while_operation.name(), "while");
     assert_eq!(custom_vjp_call.name(), "custom_vjp_call");
     assert_eq!(while_operation.infer_output_types(&[ArrayType]), Ok(vec![ArrayType]));
+    assert_eq!(recompute.infer_output_types(&[ArrayType]), Ok(vec![ArrayType]));
 
+    assert_eq!(recompute, Linear::Recompute(RecomputeOperation { operation: ArrayOperation::from(DotOperation) }));
+    assert_eq!(
+        <&RecomputeOperation<ArrayOperation<ArrayType, Factor, NoExtension>>>::try_from(&recompute),
+        Ok(&RecomputeOperation { operation: ArrayOperation::from(DotOperation) }),
+    );
     assert_eq!(
         <&WhileOperation<ArrayType, Factor, Linear>>::try_from(&while_operation),
         Ok(&WhileOperation { marker: PhantomData }),
@@ -285,8 +309,8 @@ fn test_linear_array_operation_shape() {
     );
     assert_eq!(<&ZeroOperation<ArrayType>>::try_from(&while_operation), Err(()));
 
-    // `Recompute(O)` and `Extension(Extension)` are bare generic payloads. This test target compiling proves those
-    // conversions were skipped automatically, while boxed payloads still expose unboxed conversions.
+    // `Extension(Extension)` is a bare generic payload, so its conversion is skipped automatically, while the
+    // recompute wrapper and boxed payloads still expose conversions.
 }
 
 #[test]
@@ -294,4 +318,5 @@ fn test_errors() {
     let test_cases = trybuild::TestCases::new();
     test_cases.compile_fail("tests/operations/error_missing_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
+    test_cases.compile_fail("tests/operations/error_bounds_attribute.rs");
 }

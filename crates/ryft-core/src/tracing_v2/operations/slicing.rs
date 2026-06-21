@@ -2,7 +2,7 @@ use crate::batching::BatchingError;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{HasZeroOperation, ZeroLike, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroLike, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
     LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, PadOperation, Reshape, Slice, SliceOperation,
@@ -203,7 +203,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: UpdateSlice,
     LinearOperationOf<D>: From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -244,7 +244,7 @@ where
     D::Value: DynamicSlice,
     LinearOperationOf<D>:
         From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -288,7 +288,7 @@ where
     D::Value: DynamicUpdateSlice,
     LinearOperationOf<D>:
         From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -699,7 +699,7 @@ mod tests {
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<ArrayType, V, TestArray, Infallible, F>;
+            LinearArrayOperation<ArrayType, V, TestArray, Infallible, F, ArrayOperation<ArrayType, TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {
             false
@@ -1049,8 +1049,14 @@ mod tests {
         use crate::tracing_v2::{DifferentiableOperation, FactorParameterizedOperation};
 
         type TestArrayOperation = ArrayOperation<ArrayType, TestArray>;
-        type TestLinearOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
+        type TestLinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            CapturedFactor<ArrayType, TestArray>,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
 
         let index_type = ArrayType::scalar(DataType::I32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -1144,8 +1150,14 @@ mod tests {
 
     #[test]
     fn test_dynamic_slicing_defactorize_splices_residual_start_indices() {
-        type TestLinearOperation =
-            LinearArrayOperation<ArrayType, TestArray, TestArray, Infallible, CapturedFactor<ArrayType, TestArray>>;
+        type TestLinearOperation = LinearArrayOperation<
+            ArrayType,
+            TestArray,
+            TestArray,
+            Infallible,
+            CapturedFactor<ArrayType, TestArray>,
+            ArrayOperation<ArrayType, TestArray>,
+        >;
 
         // A loop-varying residual start index is rewritten into operand form: the residual atom is spliced into the
         // operand list and the operation becomes the recomputed primal dynamic slice.

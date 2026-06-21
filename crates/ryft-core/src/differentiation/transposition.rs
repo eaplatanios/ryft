@@ -7,7 +7,7 @@ use crate::domains::AbstractDomain;
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
@@ -46,7 +46,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 impl<
     T: DifferentiableType,
     V: Value<T>,
-    O: TransposableOperation<T, V, O> + HasZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<T, V, O, Input, Output>
@@ -97,7 +97,7 @@ impl<'context, C: Context<Type: DifferentiableType, Operation: From<ZeroOperatio
         Input: Parameterized<DomainTracer<'context, C>>,
         Output: Parameterized<DomainTracer<'context, C>>,
         O: TransposableOperation<C::Type, DomainTracer<'context, C>, O>
-            + HasZeroOperation<C::Type>
+            + MaybeZeroOperation<C::Type>
             + From<ZeroOperation<C::Type>>
             + From<AddOperation>,
     >(
@@ -115,7 +115,7 @@ impl<
     'domain,
     T: 'domain + Type + DifferentiableType,
     V: 'domain + Value<T>,
-    O: 'domain + TransposableOperation<T, V, O> + HasZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: 'domain + TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
 > TracingContext<'domain, AbstractDomain<T, V, O>>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the

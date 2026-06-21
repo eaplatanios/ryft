@@ -7,7 +7,7 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::InterpretableOperation;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::manipulation::{
     Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, LinearGatherOperation, Reshape, Slice, Transpose,
     UpdateSlice,
@@ -28,7 +28,7 @@ where
     D::Value: Gather,
     LinearOperationOf<D>:
         From<LinearGatherOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: HasZeroOperation<ArrayType>,
+    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

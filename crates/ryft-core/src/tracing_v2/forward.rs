@@ -18,7 +18,7 @@ mod tests {
     use crate::operations::arithmetic::{
         AddOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
     };
-    use crate::operations::constants::{HasZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
+    use crate::operations::constants::{MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
@@ -448,7 +448,7 @@ mod tests {
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
         LinearOperationOf<D>:
             From<AddOperation> + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>>>,
-        LinearOperationOf<D>: HasZeroOperation<DataType>,
+        LinearOperationOf<D>: MaybeZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
             &self,

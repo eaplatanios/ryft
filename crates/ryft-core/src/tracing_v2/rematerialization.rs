@@ -28,7 +28,7 @@ use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{HasZeroOperation, OneOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
@@ -840,12 +840,12 @@ where
         + DifferentiableOperation<TracingContext<'d, D>>
         + ProgramLinearizableOperation<TracingContext<'d, D>>,
     LinearOperationOf<TracingContext<'d, D>>: ResidualizedOperation<TracingContext<'d, D>>,
-    LinearOperationOf<TracingContext<'d, D>>: HasZeroOperation<D::Type>,
+    LinearOperationOf<TracingContext<'d, D>>: MaybeZeroOperation<D::Type>,
     DirectLinearOperationOf<TracingContext<'d, D>>: TransposableOperation<D::Type, DomainTracer<'d, D>, DirectLinearOperationOf<TracingContext<'d, D>>>
         + From<ZeroOperation<D::Type>>
         + From<AddOperation>
         + InterpretableOperation<D::Type, DomainTracer<'d, D>>,
-    DirectLinearOperationOf<TracingContext<'d, D>>: HasZeroOperation<D::Type>,
+    DirectLinearOperationOf<TracingContext<'d, D>>: MaybeZeroOperation<D::Type>,
     Vec<D::Type>: Parameterized<
             D::Type,
             Family: ParameterizedFamily<<D as Domain>::Constant> + ParameterizedFamily<DomainTracer<'d, D>>,

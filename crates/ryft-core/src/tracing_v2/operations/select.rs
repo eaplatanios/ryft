@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::{HasZeroOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectCondition, SelectOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -169,7 +169,7 @@ where
     SelectOperation: Operation<D::Type>,
     D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
     LinearOperationOf<D>: From<LinearSelectOperation<CapturedFactor<D::Type, D::Value>>> + From<ZeroOperation<D::Type>>,
-    LinearOperationOf<D>: HasZeroOperation<D::Type>,
+    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,

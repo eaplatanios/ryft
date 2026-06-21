@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::domains::Domain;
 use crate::macros::check_builders;
-use crate::operations::constants::HasZeroOperation;
+use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -169,7 +169,7 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
     /// simplification should perform it in [`Operation`]-owned rules rather than weakening this definition.
     fn is_zero(&self, tracer: &Tracer<Self>) -> Result<bool, ProgramError>
     where
-        Self::Operation: HasZeroOperation<Self::Type>,
+        Self::Operation: MaybeZeroOperation<Self::Type>,
     {
         check_builders!(self.builder(), tracer.context().builder()).map_err(|error| self.error(error))?;
         let atom = tracer.atom_id()?;
@@ -266,7 +266,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::arithmetic::{AddOperation, NegOperation};
-    use crate::operations::constants::{HasZeroOperation, OneOperation, ZeroOperation};
+    use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, Instruction, ProgramBuilder, ProgramError};
