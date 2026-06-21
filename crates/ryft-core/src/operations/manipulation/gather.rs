@@ -9,7 +9,8 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::operations::primitive::{gather_to_scatter_operation, transpose_captured_index_dynamic_slice};
+use crate::tracing_v2::operations::control_flow::stage_cotangent;
+use crate::tracing_v2::operations::primitive::gather_to_scatter_operation;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 use super::scatter::LinearScatterAddOperation;
@@ -847,14 +848,23 @@ where
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        let scatter_operation = gather_to_scatter_operation(self.operation());
-        let indices = self.indices().clone();
-        transpose_captured_index_dynamic_slice(
-            move || LinearScatterAddOperation::new(scatter_operation.clone(), indices.clone()).into(),
-            context,
-            input_types,
-            output_cotangents,
-        )
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_cotangents, 1, ProgramError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+            Cotangent::Staged(cotangent) => {
+                let zeros = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+                let outputs = context.stage_operation(
+                    LinearScatterAddOperation::new(
+                        gather_to_scatter_operation(self.operation()),
+                        self.indices().clone(),
+                    ),
+                    &[zeros, cotangent.clone()],
+                )?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
+            }
+        }
     }
 }
 

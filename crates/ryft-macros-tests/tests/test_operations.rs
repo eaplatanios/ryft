@@ -77,6 +77,10 @@ struct Factor(i64);
 impl Value<DataType> for Factor {}
 impl Value<ArrayType> for Factor {}
 
+trait SpecialTransposableValue {}
+
+impl SpecialTransposableValue for Factor {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ZeroOperation<T: Type> {
     r#type: T,
@@ -292,6 +296,40 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> TransposableOperation<ArrayTy
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SpecialOperation;
+
+impl Operation<ArrayType> for SpecialOperation {
+    fn name(&self) -> &'static str {
+        "special"
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V, O> TransposableOperation<ArrayType, V, O> for SpecialOperation
+where
+    V: Value<ArrayType> + SpecialTransposableValue,
+    O: Operation<ArrayType>,
+{
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        Ok(vec![transposed("special")])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+enum SpecialLinearOperation<V: Value<ArrayType>> {
+    Special(SpecialOperation),
+    Constant(ConstantOperation<ArrayType, V>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 enum InferredArrayOperation<V: Value<ArrayType>, C: Value<ArrayType> = V> {
     Zero(ZeroOperation<ArrayType>),
@@ -350,6 +388,46 @@ impl<T: Clone + Type, V: Value<T>, O: Operation<T>, W, P> TransposableOperation<
         Ok(vec![transposed("while")])
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecursiveOperation<V, O> {
+    marker: PhantomData<(V, O)>,
+}
+
+impl<V, O> Operation<ArrayType> for RecursiveOperation<V, O> {
+    fn name(&self) -> &'static str {
+        "recursive"
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V, O> TransposableOperation<ArrayType, V, O> for RecursiveOperation<V, O>
+where
+    V: Value<ArrayType>,
+    O: RecursiveOperationTransposable<V>,
+{
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _input_types: &[&ArrayType],
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        Ok(vec![transposed("recursive")])
+    }
+}
+
+trait RecursiveOperationTransposable<V: Value<ArrayType>>: Operation<ArrayType> {}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+enum RecursiveLinearOperation<V: Value<ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    Recursive(RecursiveOperation<V, Self>),
+}
+
+impl<V: Value<ArrayType>> RecursiveOperationTransposable<V> for RecursiveLinearOperation<V> {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RecomputeOperation<O> {
@@ -522,6 +600,32 @@ fn test_transposable_operation_forwards_to_variant_payloads() {
     assert_eq!(
         custom_vjp_call.transpose(&mut context, &[&ArrayType], &[]).unwrap(),
         vec![transposed::<ArrayType, Factor, Linear>("custom_vjp_call")],
+    );
+}
+
+#[test]
+fn test_transposable_operation_generates_concrete_payload_bounds() {
+    type Linear = SpecialLinearOperation<Factor>;
+
+    let mut context = AbstractTracingContext::<ArrayType, Factor, Linear> { marker: PhantomData };
+    let operation = Linear::from(SpecialOperation);
+
+    assert_eq!(
+        operation.transpose(&mut context, &[&ArrayType], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("special")],
+    );
+}
+
+#[test]
+fn test_transposable_operation_supports_recursive_payload_helpers() {
+    type Linear = RecursiveLinearOperation<Factor>;
+
+    let mut context = AbstractTracingContext::<ArrayType, Factor, Linear> { marker: PhantomData };
+    let operation = Linear::from(RecursiveOperation::<Factor, Linear> { marker: PhantomData });
+
+    assert_eq!(
+        operation.transpose(&mut context, &[&ArrayType], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("recursive")],
     );
 }
 

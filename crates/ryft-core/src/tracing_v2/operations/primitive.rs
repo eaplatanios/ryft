@@ -39,10 +39,10 @@ use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, Gather, GatherDimensionNumbers, GatherOperation, LinearDynamicSliceOperation,
+    DynamicUpdateSliceOperation, Gather, GatherOperation, LinearDynamicSliceOperation,
     LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation, PadOperation,
-    ReshapeOperation, SCATTER_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
-    Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    ReshapeOperation, Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Slice, SliceOperation,
+    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
@@ -85,7 +85,6 @@ use super::control_flow::{
 };
 use super::dot::DotOps;
 use super::scan::{LinearScanOperation, SupportsLinearScan};
-use super::slicing::static_update_sizes;
 use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -347,22 +346,6 @@ where
 /// value type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold
 /// concrete constants).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
-// TODO(eaplatanios): Do we really need this attribute? Is there no easier/simpler/nicer way to expose it?
-#[transposable_operation(bounds = "
-    Extension: TransposableOperation<
-        ArrayType,
-        V,
-        LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>,
-    >,
-    V: Mul<Output = V>
-        + crate::tracing_v2::operations::dot::Dot
-        + crate::tracing_v2::operations::reshape::ReshapeValue
-        + Broadcast
-        + Transpose
-        + Reshard
-        + ConstrainSharding,
-    P: Clone,
-")]
 pub enum LinearArrayOperation<
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -1042,137 +1025,6 @@ where
     }
 }
 
-/// Transposes a linear condition (the `Condition` variant of [`LinearArrayOperation`]).
-///
-/// The forward linear map runs the linear branch program selected by the captured predicate factor over the branch
-/// operands. The predicate is a residual of the primal computation rather than a linear operand, so it has no
-/// cotangent and is carried verbatim into the transposed condition, which makes linear-condition transposition total
-/// over all predicates: the transpose stages one condition over the transposed branch programs, selected by the same
-/// predicate. Output cotangents are materialized via
-/// [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent) because the staged transposed
-/// condition consumes all output cotangents jointly.
-pub(crate) fn transpose_linear_condition<'transpose, V, C, Extension, F, P>(
-    predicate: &F,
-    true_branch: &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>,
-    false_branch: &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>,
-    context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>,
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>],
-) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>>, ProgramError>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
-        + From<ZeroOperation<ArrayType>>
-        + From<AddOperation>,
-{
-    // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
-    // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
-    if output_cotangents.iter().all(Cotangent::is_zero) {
-        return Ok(vec![Cotangent::Zero; true_branch.input_types().len()]);
-    }
-    let transposed_condition = LinearArrayOperation::Condition(LinearConditionOperation::new(
-        predicate.clone(),
-        Box::new(true_branch.transpose()?),
-        Box::new(false_branch.transpose()?),
-    ));
-    let materialized = output_cotangents
-        .iter()
-        .zip(true_branch.output_types())
-        .map(|(cotangent, output_type)| {
-            crate::tracing_v2::operations::control_flow::stage_cotangent(context, cotangent, &output_type)
-        })
-        .collect::<Vec<_>>();
-    let cotangents = context.stage_operation(transposed_condition, materialized.as_slice())?;
-    check_count!("output", cotangents, true_branch.input_types().len(), ProgramError);
-    Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
-}
-
-/// Transposes a captured-index dynamic slice (the `DynamicSlice` variant of [`LinearArrayOperation`]).
-///
-/// The forward linear map is `t ↦ dynamic_slice(t, start_indices, sizes)`. Its transpose scatters the output
-/// cotangent into a zero array of the input type at the same captured indices:
-/// `cotangent ↦ dynamic_update_slice(zeros(input_type), cotangent, start_indices)`. The zero array is staged as a
-/// typed `Zero` operation via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent),
-/// and `make_dynamic_update_slice` rebuilds the captured-index dynamic update-slice for staging into the transpose
-/// builder. Symbolic-zero cotangents propagate unchanged.
-pub(crate) fn transpose_captured_index_dynamic_slice<'transpose, T, V, P, MakeOperationFn>(
-    make_dynamic_update_slice: MakeOperationFn,
-    context: &mut AbstractTracingContext<'transpose, T, V, P>,
-    input_types: &[&T],
-    output_cotangents: &[Cotangent<'transpose, T, V, P>],
-) -> Result<Vec<Cotangent<'transpose, T, V, P>>, ProgramError>
-where
-    T: Type,
-    V: Value<T>,
-    P: Operation<T> + From<ZeroOperation<T>>,
-    MakeOperationFn: Fn() -> P,
-{
-    check_count!("input", input_types, 1, ProgramError);
-    check_count!("output", output_cotangents, 1, ProgramError);
-    match &output_cotangents[0] {
-        Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-        Cotangent::Staged(cotangent) => {
-            let zeros =
-                crate::tracing_v2::operations::control_flow::stage_cotangent(context, &Cotangent::Zero, input_types[0]);
-            let outputs = context.stage_operation(make_dynamic_update_slice(), &[zeros, cotangent.clone()])?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
-        }
-    }
-}
-
-/// Transposes a captured-index dynamic update-slice (the `DynamicUpdateSlice` variant of [`LinearArrayOperation`]).
-///
-/// The forward linear map is `(t, u) ↦ dynamic_update_slice(t, u, start_indices)`. Its transpose splits the output
-/// cotangent into two contributions at the same captured indices: the input cotangent is the cotangent with the
-/// update window zeroed (`dynamic_update_slice(cotangent, zeros(update_type), start_indices)`) and the update
-/// cotangent is the dynamic slice of the cotangent at the update window
-/// (`dynamic_slice(cotangent, start_indices, update_shape)`). The zero update is staged as a typed `Zero` operation
-/// via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent), and the two closures
-/// rebuild the captured-index operations for staging into the transpose builder. Symbolic-zero cotangents propagate
-/// unchanged.
-pub(crate) fn transpose_captured_index_dynamic_update_slice<
-    'transpose,
-    V,
-    P,
-    MakeUpdateOperationFn,
-    MakeSliceOperationFn,
->(
-    make_dynamic_update_slice: MakeUpdateOperationFn,
-    make_dynamic_slice: MakeSliceOperationFn,
-    context: &mut AbstractTracingContext<'transpose, ArrayType, V, P>,
-    input_types: &[&ArrayType],
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, P>],
-) -> Result<Vec<Cotangent<'transpose, ArrayType, V, P>>, ProgramError>
-where
-    V: Value<ArrayType>,
-    P: Operation<ArrayType> + From<ZeroOperation<ArrayType>>,
-    MakeUpdateOperationFn: Fn() -> P,
-    MakeSliceOperationFn: Fn(Vec<usize>) -> P,
-{
-    check_count!("input", input_types, 2, ProgramError);
-    check_count!("output", output_cotangents, 1, ProgramError);
-    match &output_cotangents[0] {
-        Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-        Cotangent::Staged(cotangent) => {
-            let update_sizes = static_update_sizes("dynamic_update_slice transpose", input_types[1])?;
-            let zeros =
-                crate::tracing_v2::operations::control_flow::stage_cotangent(context, &Cotangent::Zero, input_types[1]);
-            let input_cotangents = context.stage_operation(make_dynamic_update_slice(), &[cotangent.clone(), zeros])?;
-            check_count!("output", input_cotangents, 1, ProgramError);
-            let update_cotangents =
-                context.stage_operation(make_dynamic_slice(update_sizes), std::slice::from_ref(cotangent))?;
-            check_count!("output", update_cotangents, 1, ProgramError);
-            Ok(vec![
-                Cotangent::Staged(input_cotangents.into_iter().next().unwrap()),
-                Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
-            ])
-        }
-    }
-}
-
 /// Builds the scatter-add operation that is the transpose dual of a captured-index gather. The forward gather
 /// `t ↦ gather(t, indices, ...)` has adjoint `cotangent ↦ scatter_add(zeros, indices, cotangent, ...)`, so the scatter
 /// dimension numbers mirror the gather's axis-for-axis (offset↔update-window, collapsed↔inserted-window,
@@ -1194,88 +1046,6 @@ pub(crate) fn gather_to_scatter_operation(operation: &GatherOperation) -> Scatte
         .with_mode(operation.mode())
         .with_indices_are_sorted(operation.indices_are_sorted())
         .with_unique_indices(operation.unique_indices())
-}
-
-/// Builds the gather operation that recovers the update cotangent in the transpose of a captured-index scatter-add.
-/// The forward scatter-add `(t, u) ↦ scatter_add(t, indices, u, ...)` has, for its update operand, adjoint
-/// `cotangent ↦ gather(cotangent, indices, ...)`: the gather dimension numbers mirror the scatter's axis-for-axis and
-/// the slice sizes recover the per-axis update window extent (size 1 on the inserted-window and operand-batching axes,
-/// the update window extent elsewhere). The update shape must be static so the slice sizes are known.
-pub(crate) fn scatter_add_to_gather_operation(
-    operation: &ScatterOperation,
-    operand_type: &ArrayType,
-    updates_type: &ArrayType,
-) -> Result<GatherOperation, ProgramError> {
-    let dimensions = operation.dimensions();
-    let operand_rank = operand_type.rank();
-    let update_window_dimensions = dimensions.update_window_dimensions();
-    let inserted_window_dimensions = dimensions.inserted_window_dimensions();
-    let operand_batching_dimensions = dimensions.operand_batching_dimensions();
-    let mut slice_sizes = Vec::with_capacity(operand_rank);
-    let mut window_position = 0;
-    for operand_axis in 0..operand_rank {
-        if inserted_window_dimensions.contains(&operand_axis) || operand_batching_dimensions.contains(&operand_axis) {
-            slice_sizes.push(1);
-        } else {
-            let update_axis = update_window_dimensions[window_position];
-            let extent = updates_type.dimension(update_axis as isize).value().ok_or_else(|| {
-                ProgramError::from(TypeError {
-                    message: format!(
-                        "{SCATTER_OPERATION_NAME} transpose requires a static update shape but update axis \
-                         {update_axis} has a dynamic size",
-                    ),
-                })
-            })?;
-            slice_sizes.push(extent);
-            window_position += 1;
-        }
-    }
-    let gather_dimensions = GatherDimensionNumbers::new(
-        update_window_dimensions.to_vec(),
-        inserted_window_dimensions.to_vec(),
-        dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
-    )
-    .with_batching_dimensions(
-        operand_batching_dimensions.to_vec(),
-        dimensions.scatter_indices_batching_dimensions().to_vec(),
-    );
-    Ok(GatherOperation::new(gather_dimensions, slice_sizes)
-        .with_mode(operation.mode())
-        .with_indices_are_sorted(operation.indices_are_sorted())
-        .with_unique_indices(operation.unique_indices())
-        .with_output_sharding(updates_type.sharding().cloned()))
-}
-
-/// Transposes a captured-index scatter-add (the `ScatterAdd` variant of [`LinearArrayOperation`]).
-///
-/// The forward linear map is `(t, u) ↦ scatter_add(t, indices, u, ...)`. Because scatter-add accumulates into its
-/// operand (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output
-/// cotangent unchanged; the update cotangent gathers the output cotangent at the scattered windows via the mirrored
-/// gather rebuilt by `make_gather`. Symbolic-zero cotangents propagate unchanged.
-pub(crate) fn transpose_captured_index_scatter_add<'transpose, V, P, MakeGatherOperationFn>(
-    make_gather: MakeGatherOperationFn,
-    context: &mut AbstractTracingContext<'transpose, ArrayType, V, P>,
-    input_types: &[&ArrayType],
-    output_cotangents: &[Cotangent<'transpose, ArrayType, V, P>],
-) -> Result<Vec<Cotangent<'transpose, ArrayType, V, P>>, ProgramError>
-where
-    V: Value<ArrayType>,
-    P: Operation<ArrayType>,
-    MakeGatherOperationFn: Fn() -> P,
-{
-    check_count!("input", input_types, 2, ProgramError);
-    check_count!("output", output_cotangents, 1, ProgramError);
-    match &output_cotangents[0] {
-        Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-        Cotangent::Staged(cotangent) => {
-            let update_cotangents = context.stage_operation(make_gather(), std::slice::from_ref(cotangent))?;
-            check_count!("output", update_cotangents, 1, ProgramError);
-            Ok(vec![
-                Cotangent::Staged(cotangent.clone()),
-                Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
-            ])
-        }
-    }
 }
 
 /// Rewriting strategy for backend extension payloads while mapping the factor payloads carried by one

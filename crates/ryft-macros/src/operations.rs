@@ -12,16 +12,13 @@ use crate::helpers::symbols::Symbol;
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
 const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
-const TRANSPOSABLE_OPERATION_ATTRIBUTE: Symbol = Symbol::new("transposable_operation");
-const BOUNDS_ATTRIBUTE: Symbol = Symbol::new("bounds");
-const VALID_TRANSPOSABLE_OPERATION_CONTAINER_ATTRIBUTES: [Symbol; 1] = [BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("crate");
 const DEFAULT_OPERATION_TYPE: Symbol = Symbol::new("__OperationType");
 
 const NESTED_ATTRIBUTE_ERROR: &str = "\
-  the '#[ryft(...)]' attribute is only supported at the top level \
-  for operation enums. It is not supported for fields or variants";
+  the '#[ryft(...)]' attribute is only supported at the top level for operation enums. It is not supported for \
+  variants or fields";
 
 /// Code generator for `#[derive(Operation)]`.
 pub(crate) struct CodeGenerator {
@@ -30,9 +27,6 @@ pub(crate) struct CodeGenerator {
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: syn::Type,
-
-    /// Extra where-predicates for the generated `TransposableOperation` implementation.
-    transposition_bounds: Vec<syn::WherePredicate>,
 
     /// Errors accumulated while validating and generating the derive output.
     errors: Vec<syn::Error>,
@@ -64,7 +58,6 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
-            transposition_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -90,11 +83,9 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
-            transposition_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
-        generator.extract_transposable_operation_attributes(&input);
         if let Some(error) = generator.compile_error() {
             return error.into();
         }
@@ -150,26 +141,6 @@ impl CodeGenerator {
                 &input.generics,
                 "could not infer a unique operation type because multiple distinct 'Value<T>' bounds are present",
             ),
-        }
-    }
-
-    /// Extracts supported top-level `#[transposable_operation(...)]` attributes.
-    fn extract_transposable_operation_attributes(&mut self, input: &syn::DeriveInput) {
-        let mut bounds = Attribute::<Vec<syn::WherePredicate>>::new(BOUNDS_ATTRIBUTE);
-        input.attrs.iter().filter(|attr| attr.path() == &TRANSPOSABLE_OPERATION_ATTRIBUTE).for_each(|attr| {
-            attr.parse_nested_meta(|meta| match &meta.path {
-                path if path == &BOUNDS_ATTRIBUTE => bounds.set(&meta),
-                _ => Err(meta.error(format_args!(
-                    "invalid '#[transposable_operation(...)]' attribute: '{}'; these are the attributes that are \
-                        supported here: {:?}",
-                    meta.path.to_token_stream().to_string().replace(' ', ""),
-                    VALID_TRANSPOSABLE_OPERATION_CONTAINER_ATTRIBUTES,
-                ))),
-            })
-            .unwrap_or_else(|error| self.errors.push(error));
-        });
-        if let Some(bounds) = bounds.get() {
-            self.transposition_bounds.extend(bounds);
         }
     }
 
@@ -305,22 +276,18 @@ impl CodeGenerator {
             return TokenStream::new();
         };
 
-        let transpose_bounds = variants.iter().filter_map(|variant| {
-            if bare_generic_parameter(&variant.operation_type, &input.generics).is_none() {
-                return None;
-            }
+        let transpose_bounds = variants.iter().map(|variant| {
             let operation_type = &variant.operation_type;
             let predicate: syn::WherePredicate = syn::parse_quote! {
                 #operation_type: #ryft::TransposableOperation<#primary_type, #transposed_value_type, #operation_self_type>
             };
-            Some(predicate)
+            predicate
         });
         let where_clause = transposition_generics.make_where_clause();
         where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
         where_clause.predicates.extend(transpose_bounds);
-        where_clause.predicates.extend(self.transposition_bounds.iter().cloned());
 
         let (transposition_impl_generics, _, transposition_where_clause) = transposition_generics.split_for_impl();
         let transpose_arms = variants.iter().map(|variant| {

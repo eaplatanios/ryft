@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display};
+use std::ops::Mul;
 
 use crate::batching::BatchingError;
 use crate::contexts::{EagerContext, StagingContext};
@@ -6,10 +7,11 @@ use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::{scan_output_types, stacked_scan_type, validate_scan_unroll};
 use crate::operations::control_flow::{SCAN_OPERATION_NAME, ScanOperation};
-use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, UpdateSlice};
+use crate::operations::manipulation::{Broadcast, BroadcastOperation, Reshape, Slice, Transpose, UpdateSlice};
+use crate::operations::sharding::{ConstrainSharding, Reshard};
 use crate::operations::{Operation, OperationFormatter};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
@@ -19,7 +21,9 @@ use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, LinearOperationOf,
     NestedLinearization, ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
 };
+use crate::tracing_v2::operations::dot::Dot;
 use crate::tracing_v2::operations::primitive::{LinearArrayOperation, render_factor_list};
+use crate::tracing_v2::operations::reshape::ReshapeValue;
 use crate::types::{ArrayType, Shape, Size, Type, TypeError, Typed};
 
 /// Trait that represents linear [`Operation`](crate::operations::Operation) types that support/include the linear
@@ -60,6 +64,27 @@ pub trait SupportsLinearScan<T: Type, V: Value<T>, F: Value<T>>: Sized {
         reverse: bool,
         unroll: usize,
     ) -> Result<Self, ProgramError>;
+}
+
+/// Represents scan-local linear array operation families that can transpose the body program captured by a
+/// [`LinearScanOperation`].
+///
+/// The body of a linear scan is always expressed over a scan-local residual-reference factor namespace. This trait
+/// names the recursive fixed point needed to transpose that body without making callers restate every variant-level
+/// transposition requirement of the operation family.
+pub trait LinearScanBodyTransposable<V: Value<ArrayType>>:
+    Operation<ArrayType> + MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>
+{
+    /// Transposes a scan-local body program captured by a [`LinearScanOperation`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `body`: Scan-local linear body program to transpose.
+    fn transpose_linear_scan_body(
+        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized;
 }
 
 /// JVP rule for [`ScanOperation`] with full JAX
@@ -573,16 +598,34 @@ where
     }
 }
 
+impl<V, C, Extension, P> LinearScanBodyTransposable<V>
+    for LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>
+where
+    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>
+        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>>,
+    P: Clone + Operation<ArrayType>,
+{
+    #[inline]
+    fn transpose_linear_scan_body(
+        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized,
+    {
+        body.transpose()
+    }
+}
+
 /// Transpose rule for the linear scan (the `Scan` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Linear-scan transposition is total: the body
 /// pushforward maps `[carry..., x_slice...]` to `[carry..., y_slice...]`, so its program transpose maps
 /// `[carry_cotangent..., y_slice_cotangent...]` to `[carry_cotangent..., x_slice_cotangent...]` — the same scan-body
 /// signature with the same carry count. Flipping `reverse` pairs cotangent lane `i` with residual stack lane `i`
 /// exactly when the forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
-/// carry over verbatim. The body transpose recurses into [`Program::transpose`]; the body's operation type is this
-/// enum pinned to the scan-local [`CapturedFactor<ArrayType, V>`](crate::tracing_v2::CapturedFactor) factor namespace,
-/// whose [`TransposableOperation`] obligation (on the enclosing enum itself) is the nested-factor fixed point that
-/// makes the recursion terminate.
+/// carry over verbatim. The body transpose recurses through [`LinearScanBodyTransposable`], keeping the scan-local
+/// fixed point owned by the operation family.
 impl<V, C, Extension, F, P> TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
     for LinearScanOperation<V, C, Extension, F, P>
 where
@@ -591,10 +634,8 @@ where
     F: Value<ArrayType>,
     Extension: Operation<ArrayType>,
     P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: From<ZeroOperation<ArrayType>> + From<AddOperation>,
-    LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>>
-        + From<ZeroOperation<ArrayType>>
-        + From<AddOperation>,
+    LinearArrayOperation<V, C, Extension, F, P>: From<ZeroOperation<ArrayType>>,
+    LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>: LinearScanBodyTransposable<V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -611,7 +652,10 @@ where
         let carry_count = self.carry_count();
         let length = self.length();
         let transposed = LinearArrayOperation::Scan(LinearScanOperation::new(
-            Box::new(body.transpose()?),
+            Box::new(
+                <LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P> as
+                    LinearScanBodyTransposable<V>>::transpose_linear_scan_body(body)?,
+            ),
             self.residual_stacks().to_vec(),
             carry_count,
             length,

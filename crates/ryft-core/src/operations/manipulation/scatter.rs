@@ -8,16 +8,15 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, Sharding};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::operations::primitive::{scatter_add_to_gather_operation, transpose_captured_index_scatter_add};
 use crate::types::{ArrayType, Size, TypeError};
 
+// TODO(eaplatanios): Review this module.
+
 use super::gather::{
-    GatherScatterMode, LinearGatherOperation, dimension_has_explicit_axis, references_auto_axis,
-    validate_sorted_unique_in_range, validate_unique_in_range,
+    GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation, dimension_has_explicit_axis,
+    references_auto_axis, validate_sorted_unique_in_range, validate_unique_in_range,
 };
 use super::slicing::is_integer;
-
-// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`ScatterOperation`].
 pub const SCATTER_OPERATION_NAME: &'static str = "scatter";
@@ -733,8 +732,8 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> 
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Because scatter-add accumulates into its operand
 /// (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output cotangent
 /// unchanged; the update cotangent gathers the output cotangent at the scattered windows via the dual gather built by
-/// [`scatter_add_to_gather_operation`]. That gather needs the operand and update types, so the input count is checked
-/// here before delegating to [`transpose_captured_index_scatter_add`]. Symbolic-zero cotangents propagate unchanged.
+/// mirroring the scatter geometry. That gather needs the operand and update types, so the input count is checked
+/// before the dual gather is derived. Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O>
     for LinearScatterAddOperation<F>
 where
@@ -747,14 +746,62 @@ where
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
-        let gather_operation = scatter_add_to_gather_operation(self.operation(), input_types[0], input_types[1])?;
-        let indices = self.indices().clone();
-        transpose_captured_index_scatter_add(
-            move || LinearGatherOperation::new(gather_operation.clone(), indices.clone()).into(),
-            context,
-            input_types,
-            output_cotangents,
+        let dimensions = self.operation().dimensions();
+        let operand_type = input_types[0];
+        let updates_type = input_types[1];
+        let operand_rank = operand_type.rank();
+        let update_window_dimensions = dimensions.update_window_dimensions();
+        let inserted_window_dimensions = dimensions.inserted_window_dimensions();
+        let operand_batching_dimensions = dimensions.operand_batching_dimensions();
+        let mut slice_sizes = Vec::with_capacity(operand_rank);
+        let mut window_position = 0;
+        for operand_axis in 0..operand_rank {
+            if inserted_window_dimensions.contains(&operand_axis) || operand_batching_dimensions.contains(&operand_axis)
+            {
+                slice_sizes.push(1);
+            } else {
+                let update_axis = update_window_dimensions[window_position];
+                let extent = updates_type.dimension(update_axis as isize).value().ok_or_else(|| {
+                    ProgramError::from(TypeError {
+                        message: format!(
+                            "{SCATTER_OPERATION_NAME} transpose requires a static update shape but update axis \
+                             {update_axis} has a dynamic size",
+                        ),
+                    })
+                })?;
+                slice_sizes.push(extent);
+                window_position += 1;
+            }
+        }
+        let gather_dimensions = GatherDimensionNumbers::new(
+            update_window_dimensions.to_vec(),
+            inserted_window_dimensions.to_vec(),
+            dimensions.scatter_dimensions_to_operand_dimensions().to_vec(),
         )
+        .with_batching_dimensions(
+            operand_batching_dimensions.to_vec(),
+            dimensions.scatter_indices_batching_dimensions().to_vec(),
+        );
+        let gather_operation = GatherOperation::new(gather_dimensions, slice_sizes)
+            .with_mode(self.operation().mode())
+            .with_indices_are_sorted(self.operation().indices_are_sorted())
+            .with_unique_indices(self.operation().unique_indices())
+            .with_output_sharding(updates_type.sharding().cloned());
+        check_count!("output", output_cotangents, 1, ProgramError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+            Cotangent::Staged(cotangent) => {
+                let update_cotangents = context.stage_operation(
+                    LinearGatherOperation::new(gather_operation, self.indices().clone()),
+                    std::slice::from_ref(cotangent),
+                )?;
+                check_count!("output", update_cotangents, 1, ProgramError);
+                Ok(vec![
+                    Cotangent::Staged(cotangent.clone()),
+                    Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
+                ])
+            }
+        }
     }
 }
 

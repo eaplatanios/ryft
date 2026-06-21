@@ -34,8 +34,8 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
 /// Generates a transposition dispatcher for a linear operation enum.
 ///
 /// See the `ryft-core` documentation for the `TransposableOperation` trait for the full derive contract, including
-/// operation-type inference, generic extension bounds, and supported `#[transposable_operation(...)]` attributes.
-#[proc_macro_derive(TransposableOperation, attributes(ryft, transposable_operation))]
+/// operation-type inference and generated payload bounds.
+#[proc_macro_derive(TransposableOperation, attributes(ryft))]
 pub fn derive_transposable_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_transposable_operation_impl(input)
 }

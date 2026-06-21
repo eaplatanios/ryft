@@ -108,7 +108,9 @@ pub use bounds::{
 pub use broadcasting::lift_broadcast;
 pub use captures::{CapturedFactor, MaterializeCapturedFactorOperation};
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
-pub use control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
+pub use control_flow::{
+    DefactorizedOperation, LinearConditionBranchTransposable, SupportsLinearCondition, SupportsLinearWhile,
+};
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
     custom_jvp, custom_vjp,
@@ -123,6 +125,6 @@ pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use recompute::RecomputeOperation;
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
-pub use scan::SupportsLinearScan;
+pub use scan::{LinearScanBodyTransposable, SupportsLinearScan};
 pub use select::LinearSelectOperation;
 pub use transpose::lift_permutation;

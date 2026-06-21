@@ -8,9 +8,9 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::operations::primitive::{
-    render_factor_list, transpose_captured_index_dynamic_slice, transpose_captured_index_dynamic_update_slice,
-};
+use crate::tracing_v2::operations::control_flow::stage_cotangent;
+use crate::tracing_v2::operations::primitive::render_factor_list;
+use crate::tracing_v2::operations::slicing::static_update_sizes;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
@@ -1031,12 +1031,20 @@ where
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        transpose_captured_index_dynamic_slice(
-            || LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()).into(),
-            context,
-            input_types,
-            output_cotangents,
-        )
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_cotangents, 1, ProgramError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+            Cotangent::Staged(cotangent) => {
+                let zeros = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+                let outputs = context.stage_operation(
+                    LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
+                    &[zeros, cotangent.clone()],
+                )?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
+            }
+        }
     }
 }
 
@@ -1118,13 +1126,29 @@ where
         input_types: &[&ArrayType],
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        transpose_captured_index_dynamic_update_slice(
-            || LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()).into(),
-            |sizes| LinearDynamicSliceOperation::new(self.start_indices().to_vec(), sizes).into(),
-            context,
-            input_types,
-            output_cotangents,
-        )
+        check_count!("input", input_types, 2, ProgramError);
+        check_count!("output", output_cotangents, 1, ProgramError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+            Cotangent::Staged(cotangent) => {
+                let update_sizes = static_update_sizes("dynamic_update_slice transpose", input_types[1])?;
+                let zeros = stage_cotangent(context, &Cotangent::Zero, input_types[1]);
+                let input_cotangents = context.stage_operation(
+                    LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
+                    &[cotangent.clone(), zeros],
+                )?;
+                check_count!("output", input_cotangents, 1, ProgramError);
+                let update_cotangents = context.stage_operation(
+                    LinearDynamicSliceOperation::new(self.start_indices().to_vec(), update_sizes),
+                    std::slice::from_ref(cotangent),
+                )?;
+                check_count!("output", update_cotangents, 1, ProgramError);
+                Ok(vec![
+                    Cotangent::Staged(input_cotangents.into_iter().next().unwrap()),
+                    Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
+                ])
+            }
+        }
     }
 }
 

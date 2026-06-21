@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display};
+use std::ops::Mul;
 
 use crate::batching::BatchingError;
 use crate::contexts::{Context, EagerContext, StagingContext};
@@ -6,13 +7,14 @@ use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{OneOperation, ZeroOperation};
+use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{CONDITION_OPERATION_NAME, ConditionOperation, SelectOperation, WhileOperation};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
+use crate::operations::sharding::{ConstrainSharding, Reshard};
 use crate::operations::{BooleanLike, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -22,8 +24,10 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched, move_axis_permutation,
 };
 use crate::tracing_v2::differentiation::{NestedLinearization, ProgramLinearizableOperation};
-use crate::tracing_v2::operations::primitive::{LinearArrayOperation, transpose_linear_condition};
+use crate::tracing_v2::operations::dot::Dot;
+use crate::tracing_v2::operations::primitive::LinearArrayOperation;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
+use crate::tracing_v2::operations::reshape::ReshapeValue;
 use crate::tracing_v2::operations::scan::SupportsLinearScan;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::{
@@ -120,6 +124,27 @@ pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
         true_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
         false_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
     ) -> Self;
+}
+
+/// Represents linear array operation families that can transpose branch programs captured by a
+/// [`LinearConditionOperation`].
+///
+/// This trait keeps the self-referential condition requirement at the operation-family boundary: condition
+/// transposition needs to recursively transpose the selected branch programs, but callers should not have to spell the
+/// full fixed point of all operation variants that can appear inside those branches.
+pub trait LinearConditionBranchTransposable<V: Value<ArrayType>>:
+    Operation<ArrayType> + MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>
+{
+    /// Transposes a branch program captured by a [`LinearConditionOperation`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `branch`: Linear branch program to transpose.
+    fn transpose_linear_condition_branch(
+        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized;
 }
 
 /// Trait that represents linear [`Operation`] types that support/include the staged doubled-state while loop. The
@@ -1980,14 +2005,32 @@ where
     }
 }
 
+impl<V, C, Extension, F, P> LinearConditionBranchTransposable<V> for LinearArrayOperation<V, C, Extension, F, P>
+where
+    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+    C: Value<ArrayType>,
+    Extension: Operation<ArrayType>
+        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
+        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+{
+    #[inline]
+    fn transpose_linear_condition_branch(
+        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized,
+    {
+        branch.transpose()
+    }
+}
+
 /// Transpose rule for the captured-predicate conditional (the `Condition` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The predicate is a residual of the primal
 /// computation rather than a linear operand, so it has no cotangent and is carried verbatim into a transposed
-/// condition over the transposed branch programs, selected by the same predicate. This delegates to
-/// [`transpose_linear_condition`], which recursively transposes each branch via
-/// [`Program::transpose`](crate::Program::transpose) — the staged operation type is the enclosing
-/// [`LinearArrayOperation`] itself, whose [`TransposableOperation`] obligation (on the enclosing enum itself) closes
-/// the body-check fixed point that makes this recursion terminate.
+/// condition over the transposed branch programs, selected by the same predicate. Branch transposition goes through
+/// [`LinearConditionBranchTransposable`], keeping the branch fixed point owned by the operation family.
 impl<V, C, Extension, F, P> TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
     for LinearConditionOperation<V, C, Extension, F, P>
 where
@@ -1996,9 +2039,7 @@ where
     F: Value<ArrayType>,
     Extension: Operation<ArrayType>,
     P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
-        + From<ZeroOperation<ArrayType>>
-        + From<AddOperation>,
+    LinearArrayOperation<V, C, Extension, F, P>: LinearConditionBranchTransposable<V>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2007,13 +2048,30 @@ where
         output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>>, ProgramError>
     {
-        transpose_linear_condition(
-            self.predicate(),
-            self.true_branch(),
-            self.false_branch(),
-            context,
-            output_cotangents,
-        )
+        // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
+        // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
+        if output_cotangents.iter().all(Cotangent::is_zero) {
+            return Ok(vec![Cotangent::Zero; self.true_branch().input_types().len()]);
+        }
+        let transposed_condition = LinearArrayOperation::Condition(LinearConditionOperation::new(
+            self.predicate().clone(),
+            Box::new(
+                <LinearArrayOperation<V, C, Extension, F, P> as
+                    LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.true_branch())?,
+            ),
+            Box::new(
+                <LinearArrayOperation<V, C, Extension, F, P> as
+                    LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.false_branch())?,
+            ),
+        ));
+        let materialized = output_cotangents
+            .iter()
+            .zip(self.true_branch().output_types())
+            .map(|(cotangent, output_type)| stage_cotangent(context, cotangent, &output_type))
+            .collect::<Vec<_>>();
+        let cotangents = context.stage_operation(transposed_condition, materialized.as_slice())?;
+        check_count!("output", cotangents, self.true_branch().input_types().len(), ProgramError);
+        Ok(cotangents.into_iter().map(Cotangent::Staged).collect())
     }
 }
 
