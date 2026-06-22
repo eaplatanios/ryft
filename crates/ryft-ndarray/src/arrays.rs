@@ -8,7 +8,6 @@ use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::EagerContext;
-use ryft_core::operations::BooleanLike;
 use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::{Select, SelectCondition};
@@ -18,6 +17,7 @@ use ryft_core::operations::manipulation::{
     ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use ryft_core::operations::sharding::{ConstrainSharding, Reshard};
+use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
@@ -494,16 +494,16 @@ impl<T: NdArrayElement> OneLike for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Zero<ArrayType> for Array<T> {
+impl<T: NdArrayElement, O: Operation<ArrayType>> Zero<ArrayType, Array<T>> for EagerContext<ArrayType, Array<T>, O> {
     #[inline]
-    fn zero(array_type: &ArrayType) -> Result<Self, ProgramError> {
+    fn zero(&self, array_type: &ArrayType) -> Result<Array<T>, ProgramError> {
         Array::zeros(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
-impl<T: NdArrayElement> One<ArrayType> for Array<T> {
+impl<T: NdArrayElement, O: Operation<ArrayType>> One<ArrayType, Array<T>> for EagerContext<ArrayType, Array<T>, O> {
     #[inline]
-    fn one(array_type: &ArrayType) -> Result<Self, ProgramError> {
+    fn one(&self, array_type: &ArrayType) -> Result<Array<T>, ProgramError> {
         Array::ones(array_type).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
@@ -597,14 +597,16 @@ impl<T: NdArrayElement> Scale for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Fill<ArrayType, f64> for Array<T> {
+impl<T: NdArrayElement, O: Operation<ArrayType>> Fill<ArrayType, f64, Array<T>>
+    for EagerContext<ArrayType, Array<T>, O>
+{
     #[inline]
-    fn fill(array_type: &ArrayType, value: f64) -> Result<Self, ProgramError> {
+    fn fill(&self, array_type: &ArrayType, value: f64) -> Result<Array<T>, ProgramError> {
         // Convert the `f64` value to `T` through the element type's `scale_by_constant` helper —
         // multiplying `T::one()` by `value` lifts the constant via the standard cast chain used
         // elsewhere in the backend.
         let element = T::scale_by_constant(T::one(), value);
-        Self::full(array_type, element).map_err(|error| TypeError { message: error.to_string() }.into())
+        Array::full(array_type, element).map_err(|error| TypeError { message: error.to_string() }.into())
     }
 }
 
@@ -1474,9 +1476,10 @@ mod tests {
         // instead of panicking.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
         let expected_message = "ndarray backend requires static shape dimensions, but dimension #0 is *";
-        assert_eq!(<Array>::zero(&dynamic_type).unwrap_err().to_string(), expected_message);
-        assert_eq!(<Array>::one(&dynamic_type).unwrap_err().to_string(), expected_message);
-        assert_eq!(<Array>::fill(&dynamic_type, 42.0).unwrap_err().to_string(), expected_message);
+        let context = ryft_core::EagerContext::<ArrayType, Array, std::convert::Infallible>::new();
+        assert_eq!(context.zero(&dynamic_type).unwrap_err().to_string(), expected_message);
+        assert_eq!(context.one(&dynamic_type).unwrap_err().to_string(), expected_message);
+        assert_eq!(context.fill(&dynamic_type, 42.0).unwrap_err().to_string(), expected_message);
     }
 
     #[test]

@@ -96,17 +96,17 @@ mod tests {
         }
     }
 
-    impl Zero<DataType> for DistinctPrimal {
-        fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
+    impl<O: Operation<DataType>> Zero<DataType, DistinctPrimal> for EagerContext<DataType, DistinctPrimal, O> {
+        fn zero(&self, r#type: &DataType) -> Result<DistinctPrimal, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
-            Ok(Self(0.0))
+            Ok(DistinctPrimal(0.0))
         }
     }
 
-    impl One<DataType> for DistinctPrimal {
-        fn one(r#type: &DataType) -> Result<Self, ProgramError> {
+    impl<O: Operation<DataType>> One<DataType, DistinctPrimal> for EagerContext<DataType, DistinctPrimal, O> {
+        fn one(&self, r#type: &DataType) -> Result<DistinctPrimal, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
-            Ok(Self(1.0))
+            Ok(DistinctPrimal(1.0))
         }
     }
 
@@ -178,17 +178,17 @@ mod tests {
         }
     }
 
-    impl Zero<DataType> for DistinctTangent {
-        fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
+    impl<O: Operation<DataType>> Zero<DataType, DistinctTangent> for EagerContext<DataType, DistinctTangent, O> {
+        fn zero(&self, r#type: &DataType) -> Result<DistinctTangent, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
-            Ok(Self(0.0))
+            Ok(DistinctTangent(0.0))
         }
     }
 
-    impl One<DataType> for DistinctTangent {
-        fn one(r#type: &DataType) -> Result<Self, ProgramError> {
+    impl<O: Operation<DataType>> One<DataType, DistinctTangent> for EagerContext<DataType, DistinctTangent, O> {
+        fn one(&self, r#type: &DataType) -> Result<DistinctTangent, ProgramError> {
             assert_eq!(r#type, &DataType::F64);
-            Ok(Self(1.0))
+            Ok(DistinctTangent(1.0))
         }
     }
 

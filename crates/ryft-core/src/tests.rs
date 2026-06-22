@@ -189,21 +189,23 @@ impl BooleanLike for TestArray {
     }
 }
 
-impl Zero<ArrayType> for TestArray {
-    fn zero(r#type: &ArrayType) -> Result<Self, ProgramError> {
-        Ok(Self { r#type: r#type.clone(), values: vec![0.0; Self::materialized_element_count(r#type)?] })
+impl<O: crate::operations::Operation<ArrayType>> Zero<ArrayType, TestArray> for EagerContext<ArrayType, TestArray, O> {
+    fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
+        Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl One<ArrayType> for TestArray {
-    fn one(r#type: &ArrayType) -> Result<Self, ProgramError> {
-        Ok(Self { r#type: r#type.clone(), values: vec![1.0; Self::materialized_element_count(r#type)?] })
+impl<O: crate::operations::Operation<ArrayType>> One<ArrayType, TestArray> for EagerContext<ArrayType, TestArray, O> {
+    fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
+        Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl Fill<ArrayType, f64> for TestArray {
-    fn fill(r#type: &ArrayType, value: f64) -> Result<Self, ProgramError> {
-        Ok(Self { r#type: r#type.clone(), values: vec![value; Self::materialized_element_count(r#type)?] })
+impl<O: crate::operations::Operation<ArrayType>> Fill<ArrayType, f64, TestArray>
+    for EagerContext<ArrayType, TestArray, O>
+{
+    fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
+        Ok(TestArray { r#type: r#type.clone(), values: vec![value; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
@@ -1010,16 +1012,17 @@ mod tests {
         // instead of panicking.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
         let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
+        let context = EagerContext::<ArrayType, TestArray, Infallible>::new();
         assert!(matches!(
-            TestArray::zero(&dynamic_type),
+            context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,
         ));
         assert!(matches!(
-            TestArray::one(&dynamic_type),
+            context.one(&dynamic_type),
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,
         ));
         assert!(matches!(
-            TestArray::fill(&dynamic_type, 42.0),
+            context.fill(&dynamic_type, 42.0),
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,
         ));
     }
