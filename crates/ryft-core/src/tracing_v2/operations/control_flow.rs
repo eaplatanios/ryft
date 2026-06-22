@@ -2340,11 +2340,11 @@ mod tests {
         }
     }
 
-    impl Zero<ArrayType> for TestValue {
-        fn zero(value_type: &ArrayType) -> Result<Self, ProgramError> {
+    impl<O: Operation<ArrayType>> Zero<ArrayType, TestValue> for EagerContext<ArrayType, TestValue, O> {
+        fn zero(&self, value_type: &ArrayType) -> Result<TestValue, ProgramError> {
             match value_type.data_type() {
-                DataType::Boolean => Ok(Self::Bool(false)),
-                DataType::F64 => Ok(Self::Number(0.0)),
+                DataType::Boolean => Ok(TestValue::Bool(false)),
+                DataType::F64 => Ok(TestValue::Number(0.0)),
                 _ => Err(crate::types::TypeError {
                     message: format!("test value cannot synthesize zero for {value_type}"),
                 }
@@ -2353,11 +2353,11 @@ mod tests {
         }
     }
 
-    impl One<ArrayType> for TestValue {
-        fn one(value_type: &ArrayType) -> Result<Self, ProgramError> {
+    impl<O: Operation<ArrayType>> One<ArrayType, TestValue> for EagerContext<ArrayType, TestValue, O> {
+        fn one(&self, value_type: &ArrayType) -> Result<TestValue, ProgramError> {
             match value_type.data_type() {
-                DataType::Boolean => Ok(Self::Bool(true)),
-                DataType::F64 => Ok(Self::Number(1.0)),
+                DataType::Boolean => Ok(TestValue::Bool(true)),
+                DataType::F64 => Ok(TestValue::Number(1.0)),
                 _ => Err(crate::types::TypeError {
                     message: format!("test value cannot synthesize one for {value_type}"),
                 }
@@ -2876,7 +2876,7 @@ mod tests {
             match self {
                 Self::Zero(value_type) => {
                     check_count!("input", inputs, 0, ProgramError);
-                    Ok(vec![TestValue::zero(value_type)?])
+                    Ok(vec![context.zero(value_type)?])
                 }
                 Self::IsPositive => match &inputs[0] {
                     TestValue::Number(value) => Ok(vec![TestValue::Bool(*value > 0.0)]),
@@ -2894,7 +2894,7 @@ mod tests {
                 },
                 Self::One(value_type) => {
                     check_count!("input", inputs, 0, ProgramError);
-                    Ok(vec![TestValue::one(value_type)?])
+                    Ok(vec![context.one(value_type)?])
                 }
                 Self::Add => match (&inputs[0], &inputs[1]) {
                     (TestValue::Number(left), TestValue::Number(right)) => Ok(vec![TestValue::Number(left + right)]),

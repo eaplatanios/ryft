@@ -185,25 +185,24 @@ impl<D: DifferentiationContext<Type = ArrayType>> DifferentiableOperation<D> for
 }
 
 /// Value-level batching rule for eager backends, where the reduced value already carries its concrete data and a
-/// `PMean`'s `1 / N` factor can be synthesized directly through [`Fill`].
+/// `PMean`'s `1 / N` factor can be synthesized directly through the eager context's [`Fill`] capability.
 ///
 /// Both this and the traced [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) rule below share
-/// [`collective_reduce_batch`]; they differ only in how the `PMean` factor is produced. A [`Tracer`] cannot satisfy
-/// the [`Type`]-driven [`Fill`] used here because it has no ambient context, so the traced rule stages the fill
-/// instead.
+/// [`collective_reduce_batch`]; they differ only in which context produces the `PMean` factor.
 impl<V, O> crate::tracing_v2::batching::BatchableOperation<V, EagerContext<ArrayType, V, O>> for CollectiveOperation
 where
-    V: Value<ArrayType> + Reduce + Fill<ArrayType, f64> + Mul<Output = V>,
-    O: crate::operations::Operation<ArrayType>,
+    V: Value<ArrayType> + Reduce + Mul<Output = V>,
+    EagerContext<ArrayType, V, O>: Fill<ArrayType, f64, V>,
+    O: Operation<ArrayType>,
     CollectiveOperation: InterpretableOperation<ArrayType, V>,
 {
     fn batch(
         &self,
-        _context: &EagerContext<ArrayType, V, O>,
+        context: &EagerContext<ArrayType, V, O>,
         inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
-            V::fill(&factor_type, inverse_axis_size)
+            context.fill(&factor_type, inverse_axis_size)
         })
     }
 }

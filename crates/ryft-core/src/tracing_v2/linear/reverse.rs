@@ -39,7 +39,7 @@ where
             To<<D as Domain>::Value> = <D as Domain>::Value,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
-    D::Tangent: One<<D as Domain>::Type>,
+    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext: One<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
@@ -54,8 +54,8 @@ where
     if !output.r#type().is_scalar() {
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
-    let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
-    let context = domain.context();
+    let context: <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext = domain.context();
+    let seed = context.one(output.r#type().as_ref())?;
     let gradient = pullback.interpret_in_context(&context, seed)?;
     Ok((output, gradient))
 }
@@ -89,7 +89,7 @@ where
             To<<D as Domain>::Value> = <D as Domain>::Value,
             ParameterStructure: Debug + PartialEq,
         > + 'domain,
-    D::Tangent: One<<D as Domain>::Type>,
+    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext: One<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
@@ -140,7 +140,8 @@ where
         > + 'domain,
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
-    D::Tangent: One<<D as Domain>::Type> + Zero<<D as Domain>::Type>,
+    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext:
+        One<<D as Domain>::Type, D::Tangent> + Zero<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
@@ -158,12 +159,10 @@ where
     if !output.r#type().is_scalar() {
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
-    let seed = <D::Tangent as One<<D as Domain>::Type>>::one(output.r#type().as_ref())?;
-    let context = domain.context();
-    let aux_zeros = aux
-        .parameters()
-        .map(|value| D::Tangent::zero(value.r#type().as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
+    let context: <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext = domain.context();
+    let seed = context.one(output.r#type().as_ref())?;
+    let aux_zeros =
+        aux.parameters().map(|value| context.zero(value.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?;
     let aux_cotangent =
         <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)
             .map_err(ProgramError::from)?;
@@ -208,7 +207,8 @@ where
         > + 'domain,
     Aux::To<LinearizationTracer<'domain, D>>:
         Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
-    D::Tangent: One<<D as Domain>::Type> + Zero<<D as Domain>::Type>,
+    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext:
+        One<<D as Domain>::Type, D::Tangent> + Zero<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
@@ -329,15 +329,15 @@ mod tests {
         }
     }
 
-    impl Zero<TestType> for TestValue {
-        fn zero(_type: &TestType) -> Result<Self, ProgramError> {
-            Ok(Self(0.0))
+    impl<O: Operation<TestType>> Zero<TestType, TestValue> for EagerContext<TestType, TestValue, O> {
+        fn zero(&self, _type: &TestType) -> Result<TestValue, ProgramError> {
+            Ok(TestValue(0.0))
         }
     }
 
-    impl One<TestType> for TestValue {
-        fn one(_type: &TestType) -> Result<Self, ProgramError> {
-            Ok(Self(1.0))
+    impl<O: Operation<TestType>> One<TestType, TestValue> for EagerContext<TestType, TestValue, O> {
+        fn one(&self, _type: &TestType) -> Result<TestValue, ProgramError> {
+            Ok(TestValue(1.0))
         }
     }
 

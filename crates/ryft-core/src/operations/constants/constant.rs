@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
+use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
@@ -71,15 +72,17 @@ impl<T: Type, V: Clone + Display + Typed<T>> Operation<T> for ConstantOperation<
     }
 }
 
-impl<T: Type, V: Clone + Display + Value<T>> InterpretableOperation<T, V> for ConstantOperation<T, V> {
+impl<T: Type, C: Value<T>, V: Value<T, InterpretationContext: Context<Type = T, Value = V, Constant = C>>>
+    InterpretableOperation<T, V> for ConstantOperation<T, C>
+{
     #[inline]
     fn interpret(
         &self,
-        _context: &<V as Value<T>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
-        Ok(vec![self.value.clone()])
+        Ok(vec![context.lift(self.value.clone())?])
     }
 }
 

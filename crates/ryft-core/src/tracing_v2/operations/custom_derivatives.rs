@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::contexts::{EagerContext, StagingContext};
+use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
@@ -115,19 +115,25 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomJvpOperation<
     }
 }
 
-impl<T, V, O> InterpretableOperation<T, V> for CustomJvpOperation<T, V, O>
+impl<T, C, O, V> InterpretableOperation<T, V> for CustomJvpOperation<T, C, O>
 where
     T: Type,
+    C: Value<T>,
     V: Value<T>,
+    V::InterpretationContext: Context<Type = T, Constant = C, Value = V>,
     O: InterpretableOperation<T, V> + Operation<T>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    Vec<C>: Parameterized<C, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(
         &self,
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        self.primal.interpret_in_context(context, inputs.to_vec())
+        self.primal.interpret_with(
+            inputs.to_vec(),
+            |_, constant| context.lift(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(context, inputs),
+        )
     }
 }
 
@@ -524,19 +530,25 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomVjpOperation<
     }
 }
 
-impl<T, V, O> InterpretableOperation<T, V> for CustomVjpOperation<T, V, O>
+impl<T, C, O, V> InterpretableOperation<T, V> for CustomVjpOperation<T, C, O>
 where
     T: Type,
+    C: Value<T>,
     V: Value<T>,
+    V::InterpretationContext: Context<Type = T, Constant = C, Value = V>,
     O: InterpretableOperation<T, V> + Operation<T>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    Vec<C>: Parameterized<C, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(
         &self,
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        self.primal.interpret_in_context(context, inputs.to_vec())
+        self.primal.interpret_with(
+            inputs.to_vec(),
+            |_, constant| context.lift(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(context, inputs),
+        )
     }
 }
 
@@ -835,76 +847,80 @@ impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for Custom
     }
 }
 
-impl<T, V, O, F> InterpretableOperation<T, V> for CustomVjpCallOperation<T, V, O, F>
+/// Interprets a [`CustomVjpCallOperation`] in an active [`Context`].
+///
+/// Custom-VJP calls are context-mediated because executing the call means replaying a captured tangent or backward
+/// program. Eager contexts replay the program into concrete values, while staging contexts replay it into tracer
+/// instructions by lifting constants and binding each captured instruction through the active context.
+pub trait CustomVjpCall<T: Type, C: Value<T>, O: Operation<T>, F: Value<T>, V: Value<T>>:
+    Context<Type = T, Constant = C, Value = V>
+{
+    /// Interprets `operation` over `inputs`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Custom-VJP call whose tangent or backward program is replayed.
+    ///   - `inputs`: Runtime tangent or cotangent inputs for the selected captured program.
+    fn interpret_custom_vjp_call(
+        &self,
+        operation: &CustomVjpCallOperation<T, C, O, F>,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError>;
+}
+
+impl<T, C, O, F, V, ContextT> CustomVjpCall<T, C, O, F, V> for ContextT
 where
     T: Type,
-    V: Value<T>,
+    C: Value<T>,
+    V: Value<T, InterpretationContext = ContextT>,
     F: CustomVjpResidual<T, V>,
     O: InterpretableOperation<T, V> + Operation<T>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    ContextT: Context<Type = T, Constant = C, Value = V>,
+    Vec<C>: Parameterized<C, ParameterStructure: Debug + PartialEq>,
+{
+    fn interpret_custom_vjp_call(
+        &self,
+        operation: &CustomVjpCallOperation<T, C, O, F>,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let program = if operation.transposed {
+            &operation.backward
+        } else if let Some(tangent) = &operation.tangent {
+            tangent
+        } else {
+            return Err(TypeError {
+                message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
+                    value_and_grad, or jacrev) instead"
+                    .to_string(),
+            }
+            .into());
+        };
+        let mut values =
+            operation.residuals.iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+        values.extend(inputs.iter().cloned());
+        program.interpret_with(
+            values,
+            |_, constant| self.lift(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(self, inputs),
+        )
+    }
+}
+
+impl<T, C, O, F, V> InterpretableOperation<T, V> for CustomVjpCallOperation<T, C, O, F>
+where
+    T: Type,
+    C: Value<T>,
+    V: Value<T>,
+    F: Value<T>,
+    O: Operation<T>,
+    V::InterpretationContext: CustomVjpCall<T, C, O, F, V>,
 {
     fn interpret(
         &self,
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        let program = if self.transposed {
-            &self.backward
-        } else if let Some(tangent) = &self.tangent {
-            tangent
-        } else {
-            return Err(TypeError {
-                message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                    value_and_grad, or jacrev) instead"
-                    .to_string(),
-            }
-            .into());
-        };
-        let mut values = self.residuals.iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
-        values.extend(inputs.iter().cloned());
-        program.interpret_in_context(context, values)
-    }
-}
-
-impl<T, V, O, S> CustomVjpCallOperation<T, V, O, Tracer<S>>
-where
-    T: Type,
-    V: Value<T>,
-    O: Clone + Operation<T>,
-    S: StagingContext<Type = T, Constant = V, Operation = O>,
-{
-    /// Replays this call's captured program over tracer values, staging the replayed instructions into the tracers'
-    /// context. The transposed form replays the backward program on `(residuals..., output_cotangents...)` and the
-    /// un-transposed form replays the tangent program on `(residuals..., input_tangents...)`, rejecting forward mode
-    /// when no tangent program is present — exactly mirroring concrete-value interpretation.
-    ///
-    /// This is what makes custom-VJP calls (and therefore rematerialized regions) nest inside outer traces: when an
-    /// outer transform derives a program symbolically, the captured residuals are already instantiated to tracers of
-    /// the outer trace, so the captured program — written over context constants and the context's own operation
-    /// type — can be inlined into the trace with [`StagingContext::stage_program`], routing every replayed
-    /// instruction through the active transform's rules.
-    pub(crate) fn interpret_over_tracers(&self, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
-        let program = if self.transposed {
-            &self.backward
-        } else if let Some(tangent) = &self.tangent {
-            tangent
-        } else {
-            return Err(TypeError {
-                message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                    value_and_grad, or jacrev) instead"
-                    .to_string(),
-            }
-            .into());
-        };
-        let context = self
-            .residuals
-            .first()
-            .or_else(|| inputs.first())
-            .map(|tracer| tracer.context().clone())
-            .ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        let mut values = self.residuals.to_vec();
-        values.extend(inputs.iter().cloned());
-        context.stage_program(program, values)
+        context.interpret_custom_vjp_call(self, inputs)
     }
 }
 

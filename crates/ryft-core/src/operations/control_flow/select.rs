@@ -117,6 +117,20 @@ impl<V: Value<DataType> + BooleanLike + Select<Condition = bool>> InterpretableO
     }
 }
 
+impl<C> InterpretableOperation<DataType, Tracer<C>> for SelectOperation
+where
+    C: StagingContext<Type = DataType, Operation: From<SelectOperation>>,
+{
+    fn interpret(
+        &self,
+        _context: &<Tracer<C> as Value<DataType>>::InterpretationContext,
+        inputs: &[Tracer<C>],
+    ) -> Result<Vec<Tracer<C>>, ProgramError> {
+        check_count!("input", inputs, 3, ProgramError);
+        Ok(vec![Tracer::select(&inputs[0], &inputs[1], &inputs[2])?])
+    }
+}
+
 impl<V: Value<ArrayType> + Select<Condition = V>> InterpretableOperation<ArrayType, V> for SelectOperation {
     fn interpret(
         &self,

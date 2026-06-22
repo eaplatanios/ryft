@@ -9,7 +9,7 @@ use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{
-    FillOperation, MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    FillOperation, MaybeZeroOperation, OneLike, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
@@ -28,7 +28,7 @@ use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 /// basis. [`CoordinateValue`] is the bridge from the generic tracing world into that coordinate-based
 /// view: it teaches the differential helpers how many coordinates a leaf contributes, what basis
 /// vectors to probe with, and how to flatten outputs back into numeric entries.
-pub trait CoordinateValue: Value<ArrayType> + ZeroLike + OneLike + Zero<ArrayType> + One<ArrayType> {
+pub trait CoordinateValue: Value<ArrayType> + ZeroLike + OneLike {
     /// Scalar-like coordinate type used by [`DifferentialBlock`] entries.
     type Coordinate: Clone + Debug + PartialEq + 'static;
 
@@ -145,7 +145,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             >,
         LinearOperationOf<Self>: ResidualizedOperation<Self>,
         LinearOperationOf<Self>: MaybeZeroOperation<ArrayType>,
-        <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default,
+        <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, Self::Tangent>,
     {
         let input_structure = primal.parameter_structure();
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
@@ -242,7 +242,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             + From<AddOperation>
             + MaybeZeroOperation<ArrayType>,
         <<Self as Domain>::Value as Value<<Self as Domain>::Type>>::InterpretationContext: Default,
-        <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default,
+        <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, Self::Tangent>,
         LinearOperationOf<Self>: MaybeZeroOperation<ArrayType>,
     {
         let input_structure = primals.parameter_structure();
@@ -579,14 +579,15 @@ where
         DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
             + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, DirectLinearOperationOf<D>>>,
         LinearOperationOf<D>: ResidualizedOperation<D>,
-        <D::Tangent as Value<ArrayType>>::InterpretationContext: Default,
+        <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,
     {
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
         let lane_count: usize = input_coordinate_counts.iter().sum();
+        let tangent_context = <D::Tangent as Value<ArrayType>>::InterpretationContext::default();
 
         let tangent_parameters = input_parameters
             .iter()
-            .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
+            .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
         let batched_basis_parameters = batched_standard_basis::<D::Tangent>(tangent_parameters.as_slice(), lane_count)?;
 
@@ -594,7 +595,7 @@ where
         let output_parameters = output.into_parameters().collect::<Vec<_>>();
         let tangent_output_parameters = output_parameters
             .iter()
-            .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
+            .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
         let columns = if lane_count == 0 {
@@ -873,7 +874,7 @@ where
     DirectLinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
-    <D::Tangent as Value<ArrayType>>::InterpretationContext: Default,
+    <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -883,9 +884,10 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let input_offsets = coordinate_offsets(&input_coordinate_counts);
+    let tangent_context = <D::Tangent as Value<ArrayType>>::InterpretationContext::default();
     let tangent_input_parameters = input_parameters
         .iter()
-        .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
+        .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
@@ -901,7 +903,7 @@ where
     let lane_count: usize = output_coordinate_counts.iter().sum();
     let cotangent_parameters = output_parameters
         .iter()
-        .map(|parameter| D::Tangent::zero(parameter.r#type().as_ref()))
+        .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let batched_basis_parameters = batched_standard_basis::<D::Tangent>(cotangent_parameters.as_slice(), lane_count)?;
 

@@ -13,6 +13,7 @@ use crate::operations::control_flow::scan::{
 use crate::operations::control_flow::{SCAN_OPERATION_NAME, ScanOperation};
 use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, UpdateSlice};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::CapturedFactor;
@@ -85,62 +86,7 @@ pub trait LinearScanBodyTransposable<V: Value<ArrayType>>:
         Self: Sized;
 }
 
-/// Represents scan-local linear array operation families that can interpret the lane body captured by a
-/// [`LinearScanOperation`].
-///
-/// A linear scan body is a recursive fixed point: nested control flow inside the body is expressed over the same
-/// operation family as the body itself. This trait names that fixed point for interpretation without requiring the
-/// whole operation enum's [`InterpretableOperation`] implementation to already be available.
-pub trait LinearScanBodyInterpretable<V: Value<ArrayType>>: Operation<ArrayType> {
-    /// Interprets one instruction in a scan-local body program.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Value interpretation context used for replay.
-    ///   - `inputs`: Already interpreted instruction inputs.
-    fn interpret_linear_scan_body_instruction(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError>;
-
-    /// Interprets a scan-local body program.
-    ///
-    /// # Parameters
-    ///
-    ///   - `body`: Scan-local linear body program to interpret.
-    ///   - `context`: Value interpretation context used for replay.
-    ///   - `inputs`: Flat input values aligned with `body`'s input signature.
-    fn interpret_linear_scan_body(
-        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        context: &V::InterpretationContext,
-        inputs: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        Self: Sized,
-    {
-        let input_types = body.input_types();
-        check_count!("input", inputs, input_types.len(), ProgramError);
-        for (input, declared) in inputs.iter().zip(input_types.iter()) {
-            let actual = input.r#type();
-            if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError {
-                    message: format!(
-                        "encountered input type {actual} which is incompatible with the program's declared type \
-                         {declared}",
-                    ),
-                }
-                .into());
-            }
-        }
-        body.interpret_with::<V, ProgramError, _, _>(
-            inputs,
-            |_, constant| Ok(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret_linear_scan_body_instruction(context, inputs),
-        )
-    }
-}
-
+// TODO(eaplatanios): Is this actually necessary?
 /// Represents scan-local body operation families whose [`CapturedFactor`] payloads can be instantiated into concrete
 /// lane values.
 ///
@@ -159,6 +105,67 @@ pub trait LinearScanBodyInstantiable<V: Value<ArrayType>>: Operation<ArrayType> 
     ///   - `residuals`: Residual values for the current scan lane, indexed by
     ///     [`CapturedFactor::Reference`](crate::tracing_v2::CapturedFactor::Reference).
     fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError>;
+}
+
+// TODO(eaplatanios): Is this actually necessary?
+/// Interprets a [`LinearScanOperation`] in an active interpretation context.
+///
+/// Linear scan interpretation is context-mediated because the operation owns a nested scan-local body program whose
+/// captured factors must be instantiated per lane before the body is replayed.
+pub trait LinearScanInterpretation<V: Value<ArrayType>, F: Value<ArrayType>, O: Operation<ArrayType>> {
+    /// Interprets `operation` over `inputs`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: Linear scan operation to interpret.
+    ///   - `inputs`: Carry tangents followed by stacked input tangents.
+    fn interpret_linear_scan(
+        &self,
+        operation: &LinearScanOperation<V, F, O>,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError>;
+}
+
+impl<V, F, O, ContextT> LinearScanInterpretation<V, F, O> for ContextT
+where
+    V: Value<ArrayType, InterpretationContext = ContextT> + Slice + UpdateSlice + Reshape,
+    ContextT: Zero<ArrayType, V>,
+    F: CustomVjpResidual<ArrayType, V>,
+    O: Clone + LinearScanBodyInstantiable<V>,
+    O::Instantiated: InterpretableOperation<ArrayType, V>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+{
+    fn interpret_linear_scan(
+        &self,
+        operation: &LinearScanOperation<V, F, O>,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        operation.infer_output_types(input_types.as_slice())?;
+        let stack_values = operation
+            .residual_stacks()
+            .iter()
+            .map(CustomVjpResidual::residual_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let body = operation.body();
+        let carry_count = operation.carry_count();
+        let y_slice_types = body.output_types().split_off(carry_count);
+        interpret_scan_lanes(
+            carry_count,
+            operation.length(),
+            operation.reverse(),
+            y_slice_types.as_slice(),
+            inputs,
+            |stacked_type| self.zero(stacked_type),
+            |lane, lane_inputs| {
+                let lane_residuals =
+                    stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
+                let lane_body =
+                    body.map_operations(|operation| operation.instantiate_linear_scan_body_factors(&lane_residuals))?;
+                lane_body.interpret_in_context(self, lane_inputs)
+            },
+        )
+    }
 }
 
 /// Renders a factor list as a bracketed, comma-separated sequence of `Display` renderings.
@@ -448,7 +455,8 @@ where
 
 impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ScanOperation<ArrayType, V, O>
 where
-    V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
+    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
+    EagerContext<ArrayType, V, O>: Zero<ArrayType, V>,
     O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
 {
     fn batch(
@@ -463,7 +471,7 @@ where
             self.reverse(),
             y_slice_types.as_slice(),
             inputs,
-            |stacked_type| V::zero(stacked_type),
+            |stacked_type| context.zero(stacked_type),
             |_, lane_inputs| {
                 self.body().interpret_with(
                     lane_inputs,
@@ -495,13 +503,7 @@ where
             self.reverse(),
             y_slice_types.as_slice(),
             inputs,
-            |stacked_type| {
-                let mut outputs = context
-                    .parent_context()
-                    .stage_nullary_operation(C::Operation::from(ZeroOperation::new(stacked_type.clone())))?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(outputs.remove(0))
-            },
+            |stacked_type| context.parent_context().zero(stacked_type),
             |_, lane_inputs| context.interpret_program(self.body(), lane_inputs),
         )
     }
@@ -664,41 +666,13 @@ where
 
 impl<V, F, O> InterpretableOperation<ArrayType, V> for LinearScanOperation<V, F, O>
 where
-    V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
-    F: CustomVjpResidual<ArrayType, V>,
-    O: Clone + LinearScanBodyInstantiable<V>,
-    O::Instantiated: LinearScanBodyInterpretable<V>,
+    V: Value<ArrayType>,
+    F: Value<ArrayType>,
+    O: Operation<ArrayType>,
+    V::InterpretationContext: LinearScanInterpretation<V, F, O>,
 {
     fn interpret(&self, context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let stack_values = self
-            .residual_stacks()
-            .iter()
-            .map(CustomVjpResidual::residual_value)
-            .collect::<Result<Vec<_>, _>>()?;
-        let body = self.body();
-        let carry_count = self.carry_count();
-        let y_slice_types = body.output_types().split_off(carry_count);
-        interpret_scan_lanes(
-            carry_count,
-            self.length(),
-            self.reverse(),
-            y_slice_types.as_slice(),
-            inputs,
-            |stacked_type| V::zero(stacked_type),
-            |lane, lane_inputs| {
-                let lane_residuals =
-                    stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
-                let lane_body =
-                    body.map_operations(|operation| operation.instantiate_linear_scan_body_factors(&lane_residuals))?;
-                <O::Instantiated as LinearScanBodyInterpretable<V>>::interpret_linear_scan_body(
-                    &lane_body,
-                    context,
-                    lane_inputs,
-                )
-            },
-        )
+        context.interpret_linear_scan(self, inputs)
     }
 }
 

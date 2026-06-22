@@ -20,7 +20,7 @@
 //! Each bundle has a blanket implementation, so consumers never implement them directly.
 //!
 //! Bundles are deliberately orthogonal: each impl site composes only the categories its dispatcher actually
-//! exercises. Single-trait bounds such as [`Fill<ArrayType, f64>`](crate::operations::constants::Fill),
+//! exercises. Context-side bounds such as [`Fill<ArrayType, f64, V>`](crate::operations::constants::Fill),
 //! [`Select`](crate::operations::control_flow::Select),
 //! [`BooleanLike`](crate::operations::BooleanLike), and the bare
 //! [`DotOps`](crate::tracing_v2::operations::dot::DotOps) (without the captured-factor variants) are intentionally
@@ -30,7 +30,7 @@
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use crate::operations::arithmetic::{AddOperation, NegOperation, Scale, ScaleOperation, SubOperation};
-use crate::operations::constants::{One, OneLike, Zero, ZeroLike, ZeroLikeOperation};
+use crate::operations::constants::{OneLike, ZeroLike, ZeroLikeOperation};
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, Pad, PadOperation,
     ReshapeOperation, Scatter, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
@@ -79,19 +79,18 @@ pub trait SupportsTrigonometricOperations: Sin + Cos {}
 
 impl<V> SupportsTrigonometricOperations for V where V: Sin + Cos {}
 
-/// Type-parameterized and "like"-style constant primitives.
+/// Exemplar-derived constant primitives.
 ///
-/// Composes [`Zero<T>`], [`One<T>`], [`ZeroLike`], and [`OneLike`]. The `f64`-keyed
-/// [`Fill<ArrayType, f64>`](crate::operations::constants::Fill) primitive is intentionally not included here:
-/// only the operation enums that include a `Fill` variant (notably [`ArrayOperation`](super::primitive::ArrayOperation)
-/// and [`LinearArrayOperation`](super::primitive::LinearArrayOperation)) need it, and it is cleaner to list it
-/// inline at those sites than to fragment this bundle.
-pub trait SupportsConstantOperations<T: Type>: Zero<T> + One<T> + ZeroLike + OneLike {}
+/// Composes [`ZeroLike`] and [`OneLike`]. Type-parameterized nullary primitives such as
+/// [`Zero`](crate::operations::constants::Zero), [`One`](crate::operations::constants::One), and
+/// [`Fill`](crate::operations::constants::Fill) are context-side capabilities, so impl sites that interpret nullary
+/// operations list those bounds on `V::InterpretationContext` directly.
+pub trait SupportsConstantOperations<T: Type>: ZeroLike + OneLike {}
 
 impl<T, V> SupportsConstantOperations<T> for V
 where
     T: Type,
-    V: Zero<T> + One<T> + ZeroLike + OneLike,
+    V: ZeroLike + OneLike,
 {
 }
 

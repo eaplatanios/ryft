@@ -2,6 +2,7 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use ryft_macros::{Operation, TransposableOperation};
 
+use crate::contexts::Context;
 use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{
@@ -142,17 +143,20 @@ where
     }
 }
 
-impl<V: Value<DataType>> InterpretableOperation<DataType, V> for ScalarOperation<V>
+impl<C, V> InterpretableOperation<DataType, V> for ScalarOperation<C>
 where
+    C: Value<DataType>,
+    V: Value<DataType>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
     ZeroOperation<DataType>: InterpretableOperation<DataType, V>,
     ZeroLikeOperation: InterpretableOperation<DataType, V>,
     OneOperation<DataType>: InterpretableOperation<DataType, V>,
     OneLikeOperation: InterpretableOperation<DataType, V>,
-    ConstantOperation<DataType, V>: InterpretableOperation<DataType, V>,
+    ConstantOperation<DataType, C>: InterpretableOperation<DataType, V>,
     NegOperation: InterpretableOperation<DataType, V>,
     AddOperation: InterpretableOperation<DataType, V>,
     SubOperation: InterpretableOperation<DataType, V>,
-    ScaleOperation<DataType, V>: InterpretableOperation<DataType, V>,
+    ScaleOperation<DataType, C>: InterpretableOperation<DataType, V>,
     MulOperation: InterpretableOperation<DataType, V>,
     DivOperation: InterpretableOperation<DataType, V>,
     SinOperation: InterpretableOperation<DataType, V>,
@@ -161,7 +165,6 @@ where
     SelectOperation: InterpretableOperation<DataType, V>,
     StopGradientOperation: InterpretableOperation<DataType, V>,
     RematerializationNameOperation: InterpretableOperation<DataType, V>,
-    V: Value<DataType>,
     Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(
@@ -195,12 +198,10 @@ where
 
 /// Closed scalar operation type for staged linear scalar programs.
 ///
-/// The `V` parameter is the scalar tangent/cotangent value type carried by the linear program. The `C` parameter is
-/// the constant type of the
-/// [`DifferentiationContext`](crate::tracing_v2::DifferentiationContext) that stages the linear program: every
-/// context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in its `LinearOperation` associated-type
-/// definition. It types the user-supplied backward programs captured by [`CustomVjpCall`](Self::CustomVjpCall),
-/// which are written over context constants rather than over the linear value type `V` or captured-factor type `F`.
+/// The `V` parameter is the scalar tangent/cotangent value type carried by the linear program. It is also the linear
+/// program's constant-table type, so linear constants are typed as `V`. The `C` parameter is the primal context
+/// constant type used by user-supplied programs captured by [`CustomVjpCall`](Self::CustomVjpCall), which are written
+/// over context constants rather than over the linear value type `V` or captured-factor type `F`.
 ///
 /// The variants mirror the linear scalar primitives: typed [`Zero`](Self::Zero)/[`One`](Self::One) and their
 /// exemplar-derived [`ZeroLike`](Self::ZeroLike)/[`OneLike`](Self::OneLike) maps, a typed

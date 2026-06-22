@@ -391,7 +391,8 @@ where
 
 impl<V, O> InterpretableOperation<ArrayType, V> for ScanOperation<ArrayType, V, O>
 where
-    V: Value<ArrayType> + Zero<ArrayType> + Slice + UpdateSlice + Reshape,
+    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     O: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -409,7 +410,7 @@ where
             self.reverse,
             y_slice_types.as_slice(),
             inputs,
-            |stacked_type| V::zero(stacked_type),
+            |stacked_type| context.zero(stacked_type),
             |_, lane_inputs| self.body.interpret_in_context(context, lane_inputs),
         )
     }

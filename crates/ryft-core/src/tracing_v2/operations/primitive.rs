@@ -19,19 +19,19 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use ryft_macros::{Operation, TransposableOperation};
 
 use crate::batching::BatchingError;
-use crate::contexts::{EagerContext, StagingContext};
+use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::domains::Domain;
-use crate::macros::check_count;
+use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero,
+    ConstantOperation, Fill, FillOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
     ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
+use crate::operations::control_flow::scan::read_scan_lane;
 use crate::operations::control_flow::{
     ConditionOperation, ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation,
 };
@@ -85,10 +85,7 @@ use super::control_flow::{
     SupportsLinearWhile, batch_condition_with_interpreter, batch_while_with_interpreter,
 };
 use super::dot::DotOps;
-use super::scan::{
-    LinearScanBodyInstantiable, LinearScanBodyInterpretable, LinearScanBodyTransposable, LinearScanOperation,
-    SupportsLinearScan,
-};
+use super::scan::{LinearScanBodyInstantiable, LinearScanBodyTransposable, LinearScanOperation, SupportsLinearScan};
 use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -343,12 +340,10 @@ where
 /// rendering, and interpretation). The [`Operation`]/[`Display`] and per-variant [`From`]/[`TryFrom`] impls are
 /// defined for [`ArrayType`].
 ///
-/// The `C` parameter is the constant type of the [`DifferentiationContext`]
-/// that stages the linear program: every context pins `C` to its [`Domain::Constant`](crate::domains::Domain) in
-/// its `LinearOperation` associated-type definition. It types the user-supplied programs captured by
-/// [`CustomVjpCall`](Self::CustomVjpCall), which are written over context constants rather than over the linear
-/// value type `V` (`V` instantiates to tracers inside transform contexts, while captured programs always hold
-/// concrete constants).
+/// The `V` parameter is the linear program's value and constant-table type. It instantiates to concrete tangent
+/// values for eager linear execution and to tracers when one transform stages another. The `C` parameter is the
+/// constant type of captured primal programs such as [`CustomVjpCall`](Self::CustomVjpCall), which are written over
+/// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
 pub enum LinearArrayOperation<
     V: Value<ArrayType>,
@@ -999,121 +994,6 @@ where
     }
 }
 
-impl<V, Extension, P> LinearScanBodyInterpretable<V> for LinearArrayOperation<V, V, Extension, V, P>
-where
-    V: Value<ArrayType>
-        + Parameter
-        + SupportsLinearArithmeticOperations
-        + SupportsConstantOperations<ArrayType>
-        + Fill<ArrayType, f64>
-        + SupportsLinearAlgebraOperations
-        + Scale<V, Output = V>
-        + LeftDot<V>
-        + RightDot<V>
-        + SupportsManipulationOperations
-        + Select<Condition = V>
-        + BooleanLike
-        + TransferToMemory
-        + CustomVjpResidual<ArrayType, V>,
-    ScaleOperation<ArrayType, V>: InterpretableOperation<ArrayType, V>,
-    LeftDotOperation<V>: InterpretableOperation<ArrayType, V>,
-    RightDotOperation<V>: InterpretableOperation<ArrayType, V>,
-    Extension: Clone + InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
-    P: Clone + InterpretableOperation<ArrayType, V>,
-{
-    fn interpret_linear_scan_body_instruction(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
-            Self::TransferToMemory(operation) => operation.interpret(context, inputs),
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::Fill(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::OneLike(operation) => operation.interpret(context, inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Mul(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Transpose(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => operation.interpret(context, inputs),
-            Self::LeftDot(operation) => operation.interpret(context, inputs),
-            Self::RightDot(operation) => operation.interpret(context, inputs),
-            Self::Reshape(operation) => operation.interpret(context, inputs),
-            Self::Reshard(operation) => operation.interpret(context, inputs),
-            Self::ShardingConstraint(operation) => operation.interpret(context, inputs),
-            Self::Broadcast(operation) => operation.interpret(context, inputs),
-            Self::Slice(operation) => operation.interpret(context, inputs),
-            Self::UpdateSlice(operation) => operation.interpret(context, inputs),
-            Self::DynamicSlice(operation) => operation.interpret(context, inputs),
-            Self::DynamicUpdateSlice(operation) => operation.interpret(context, inputs),
-            Self::Gather(operation) => operation.interpret(context, inputs),
-            Self::ScatterAdd(operation) => operation.interpret(context, inputs),
-            Self::Pad(operation) => operation.interpret(context, inputs),
-            Self::Concatenate(operation) => operation.interpret(context, inputs),
-            Self::Reduce(operation) => operation.interpret(context, inputs),
-            Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Residual(operation) => operation.interpret(context, inputs),
-            Self::Recompute(operation) => operation.interpret(context, inputs),
-            Self::Condition(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let branch = if operation.predicate().residual_value()?.boolean()? {
-                    operation.true_branch()
-                } else {
-                    operation.false_branch()
-                };
-                <Self as LinearScanBodyInterpretable<V>>::interpret_linear_scan_body(branch, context, inputs.to_vec())
-            }
-            Self::OperandCondition(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
-                <Self as LinearScanBodyInterpretable<V>>::interpret_linear_scan_body(
-                    branch,
-                    context,
-                    inputs[1..].to_vec(),
-                )
-            }
-            Self::While(operation) => {
-                let operation = operation.as_ref();
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let mut state = inputs.to_vec();
-                let mut completed_iterations = 0;
-                loop {
-                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                        return Ok(state);
-                    }
-                    let condition_outputs = <Self as LinearScanBodyInterpretable<V>>::interpret_linear_scan_body(
-                        operation.condition(),
-                        context,
-                        state.clone(),
-                    )?;
-                    check_count!("output", condition_outputs, 1, ProgramError);
-                    if !condition_outputs[0].boolean()? {
-                        return Ok(state);
-                    }
-                    state = <Self as LinearScanBodyInterpretable<V>>::interpret_linear_scan_body(
-                        operation.body(),
-                        context,
-                        state,
-                    )?;
-                    check_count!("output", state, operation.state_types().len(), ProgramError);
-                    completed_iterations += 1;
-                }
-            }
-            Self::Scan(operation) => operation.interpret(context, inputs),
-            Self::Extension(extension) => extension.interpret(context, inputs),
-        }
-    }
-}
-
 impl<V, C, Extension, P> LinearScanBodyTransposable<V>
     for LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>
 where
@@ -1503,12 +1383,14 @@ where
     }
 }
 
-impl<V: Value<DataType>, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, V, F>
+impl<V, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, V, F>
 where
-    V: SupportsLinearArithmeticOperations
+    V: Value<DataType, InterpretationContext = EagerContext<DataType, V, Infallible>>
+        + SupportsLinearArithmeticOperations
         + SupportsConstantOperations<DataType>
         + Scale<F, Output = V>
         + Select<Condition = bool>,
+    V::InterpretationContext: Context<Type = DataType, Constant = V, Value = V> + Zero<DataType, V> + One<DataType, V>,
     F: CustomVjpResidual<DataType, V> + SelectCondition<Condition = bool>,
     ScalarOperation<V>: InterpretableOperation<DataType, V>,
     ScaleOperation<DataType, F>: InterpretableOperation<DataType, V>,
@@ -1552,22 +1434,15 @@ where
 {
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(operation) => operation.interpret_over_tracers(inputs),
-            Self::Zero(operation) => context.stage_nullary_operation(ZeroOperation::new(*operation.r#type())),
-            Self::One(operation) => Err(TypeError {
-                message: format!(
-                    "linear one operation over tracer values was not materialized before interpretation for {}",
-                    operation.r#type()
-                ),
+            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => {
+                check_count!("input", inputs, 0, ProgramError);
+                check_builders!(context.builder(), operation.value().context().builder())
+                    .map_err(|error| context.error(error))?;
+                Ok(vec![operation.value().clone()])
             }
-            .into()),
-            Self::Constant(operation) => Err(TypeError {
-                message: format!(
-                    "linear constant operation over tracer values was not materialized before interpretation for {}",
-                    operation.value().r#type()
-                ),
-            }
-            .into()),
             Self::ZeroLike(operation) => operation.interpret(context, inputs),
             Self::OneLike(operation) => operation.interpret(context, inputs),
             Self::Add(operation) => operation.interpret(context, inputs),
@@ -1587,22 +1462,27 @@ where
 ///
 /// The value-side bound list is expressed via the orthogonal capability bundles defined in [`super::bounds`] (one
 /// per operation category — arithmetic, trigonometric, constants, manipulation, comparison) plus the few singleton
-/// traits ([`Fill<ArrayType, f64>`], [`DotOps`], [`Select`], [`BooleanLike`]) that the dispatcher requires
-/// directly. Each impl site composes only the categories it actually exercises, so downstream consumers never
-/// depend on a single monolithic value-bundle trait.
-impl<V: Value<ArrayType>, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, Extension>
+/// traits ([`DotOps`], [`Select`], [`BooleanLike`]) that the dispatcher requires directly. Context-side nullary
+/// capabilities ([`Zero`], [`One`], [`Fill`]) are listed on `V::InterpretationContext`. Each impl site composes only
+/// the categories it actually exercises, so downstream consumers never depend on a single monolithic value-bundle
+/// trait.
+impl<V, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, Extension>
 where
-    V: Parameter
+    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V, Infallible>>
+        + Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
         + SupportsConstantOperations<ArrayType>
-        + Fill<ArrayType, f64>
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = V>
         + BooleanLike
         + TransferToMemory,
+    V::InterpretationContext: Context<Type = ArrayType, Constant = V, Value = V>
+        + Zero<ArrayType, V>
+        + One<ArrayType, V>
+        + Fill<ArrayType, f64, V>,
     Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
@@ -1672,13 +1552,13 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, Extension, F: Value<ArrayType>, P> InterpretableOperation<ArrayType, V>
+impl<V, Extension, F: Value<ArrayType>, P> InterpretableOperation<ArrayType, V>
     for LinearArrayOperation<V, V, Extension, F, P>
 where
-    V: Parameter
+    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V, Infallible>>
+        + Parameter
         + SupportsLinearArithmeticOperations
         + SupportsConstantOperations<ArrayType>
-        + Fill<ArrayType, f64>
         + SupportsLinearAlgebraOperations
         + Scale<F, Output = V>
         + LeftDot<F>
@@ -1687,6 +1567,10 @@ where
         + Select<Condition = V>
         + BooleanLike
         + TransferToMemory,
+    V::InterpretationContext: Context<Type = ArrayType, Constant = V, Value = V>
+        + Zero<ArrayType, V>
+        + One<ArrayType, V>
+        + Fill<ArrayType, f64, V>,
     ScaleOperation<ArrayType, F>: InterpretableOperation<ArrayType, V>,
     LeftDotOperation<F>: InterpretableOperation<ArrayType, V>,
     RightDotOperation<F>: InterpretableOperation<ArrayType, V>,
@@ -1775,6 +1659,8 @@ where
     P: Clone
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
+        + From<OneOperation<ArrayType>>
+        + From<FillOperation<ArrayType, f64>>
         + From<TransferToMemoryOperation>
         + From<SelectOperation>
         + From<SliceOperation>
@@ -1791,30 +1677,17 @@ where
 {
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
         match self {
-            Self::CustomVjpCall(operation) => operation.interpret_over_tracers(inputs),
+            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
             Self::TransferToMemory(operation) => operation.interpret(context, inputs),
-            Self::Zero(operation) => context.stage_nullary_operation(ZeroOperation::new(operation.r#type().clone())),
-            Self::One(operation) => Err(TypeError {
-                message: format!(
-                    "linear one operation over tracer values was not materialized before interpretation for {}",
-                    operation.r#type()
-                ),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => {
+                check_count!("input", inputs, 0, ProgramError);
+                check_builders!(context.builder(), operation.value().context().builder())
+                    .map_err(|error| context.error(error))?;
+                Ok(vec![operation.value().clone()])
             }
-            .into()),
-            Self::Constant(operation) => Err(TypeError {
-                message: format!(
-                    "linear constant operation over tracer values was not materialized before interpretation for {}",
-                    operation.value().r#type()
-                ),
-            }
-            .into()),
-            Self::Fill(operation) => Err(TypeError {
-                message: format!(
-                    "linear fill operation over tracer values was not materialized before interpretation for {}",
-                    operation.r#type()
-                ),
-            }
-            .into()),
+            Self::Fill(operation) => operation.interpret(context, inputs),
             Self::ZeroLike(operation) => operation.interpret(context, inputs),
             Self::OneLike(operation) => operation.interpret(context, inputs),
             Self::Add(operation) => operation.interpret(context, inputs),
@@ -1830,13 +1703,23 @@ where
                 use crate::tracing_v2::operations::dot::Dot;
 
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![operation.factor().dot(&inputs[0], operation.dimensions())])
+                Ok(vec![match operation.output_sharding() {
+                    Some(output_sharding) => {
+                        operation.factor().dot_with_output_sharding(&inputs[0], operation.dimensions(), output_sharding)
+                    }
+                    None => operation.factor().dot(&inputs[0], operation.dimensions()),
+                }])
             }
             Self::RightDot(operation) => {
                 use crate::tracing_v2::operations::dot::Dot;
 
                 check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].dot(operation.factor(), operation.dimensions())])
+                Ok(vec![match operation.output_sharding() {
+                    Some(output_sharding) => {
+                        inputs[0].dot_with_output_sharding(operation.factor(), operation.dimensions(), output_sharding)
+                    }
+                    None => inputs[0].dot(operation.factor(), operation.dimensions()),
+                }])
             }
             Self::Reshape(operation) => operation.interpret(context, inputs),
             Self::Reshard(operation) => operation.interpret(context, inputs),
@@ -1857,46 +1740,7 @@ where
             Self::Condition(operation) => operation.interpret(context, inputs),
             Self::OperandCondition(operation) => operation.interpret(context, inputs),
             Self::While(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let body = operation.body();
-                let residual_stacks = operation.residual_stacks();
-                let carry_count = operation.carry_count();
-                let Some(exemplar) = inputs.first().or_else(|| residual_stacks.first()) else {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: "cannot replay a linear scan with no inputs and no residual stacks over tracer values"
-                            .to_string(),
-                    });
-                };
-                let staging_context = exemplar.context();
-                let y_slice_types = body.output_types().split_off(carry_count);
-                interpret_scan_lanes(
-                    carry_count,
-                    operation.length(),
-                    operation.reverse(),
-                    y_slice_types.as_slice(),
-                    inputs,
-                    |stacked_type| {
-                        let mut outputs = staging_context
-                            .stage_nullary_operation(P::from(ZeroOperation::new(stacked_type.clone())))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(outputs.remove(0))
-                    },
-                    |lane, lane_inputs| {
-                        let lane_residuals = residual_stacks
-                            .iter()
-                            .map(|stack| read_scan_lane(stack, lane))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let lane_body = body.map_operations(|operation| {
-                            operation.try_map_factors_preserving_extensions(&mut |factor| {
-                                factor.instantiate(lane_residuals.as_slice())
-                            })
-                        })?;
-                        lane_body.interpret_in_context(context, lane_inputs)
-                    },
-                )
-            }
+            Self::Scan(operation) => operation.interpret(context, inputs),
             Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
@@ -2046,15 +1890,14 @@ where
     V: Value<ArrayType>
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
-        + Zero<ArrayType>
         + ZeroLike
         + OneLike
-        + Fill<ArrayType, f64>
         + DotOps
         + SupportsManipulationOperations
         + SupportsComparisonOperations
         + Select<Condition = V>
         + BooleanLike,
+    EagerContext<ArrayType, V, ArrayOperation<V, E>>: Zero<ArrayType, V> + Fill<ArrayType, f64, V>,
     E: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<V, E>>>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
@@ -2344,7 +2187,6 @@ where
     V::InterpretationContext: Default,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations
-        + Zero<ArrayType>
         + ZeroLike
         + OneLike
         + SupportsLinearAlgebraOperations
@@ -2352,6 +2194,7 @@ where
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
+    EagerContext<ArrayType, V, LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>>: Zero<ArrayType, V>,
     E: Clone
         + Operation<ArrayType>
         + BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>>>,
@@ -2476,7 +2319,7 @@ where
                     operation.reverse(),
                     y_slice_types.as_slice(),
                     inputs,
-                    |stacked_type| V::zero(stacked_type),
+                    |stacked_type| context.zero(stacked_type),
                     |lane, lane_inputs| {
                         let lane_residuals = residual_stacks
                             .iter()
@@ -2684,9 +2527,147 @@ mod tests {
     use crate::domains::AbstractDomain;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::scalars::ScalarDomain;
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::tests::TestArray;
+    use crate::tracing::{Tracer, TracingContext};
+    use crate::types::{Shape, Size};
 
     use super::*;
+
+    type TestArrayDomain = AbstractDomain<ArrayType, TestArray, ArrayOperation<TestArray>>;
+    type TestArrayContext<'domain> = TracingContext<'domain, TestArrayDomain>;
+    type TestArrayTracer<'domain> = Tracer<TestArrayContext<'domain>>;
+    type TestLinearArrayOperation<'domain> = LinearArrayOperation<
+        TestArrayTracer<'domain>,
+        TestArray,
+        Infallible,
+        TestArrayTracer<'domain>,
+        ArrayOperation<TestArray>,
+    >;
+
+    #[test]
+    fn test_linear_scalar_tracer_materializes_one_and_constant() {
+        type TestScalarContext<'domain> = TracingContext<'domain, ScalarDomain<f64>>;
+        type TestScalarTracer<'domain> = Tracer<TestScalarContext<'domain>>;
+        type TestLinearScalarOperation<'domain> =
+            LinearScalarOperation<TestScalarTracer<'domain>, f64, TestScalarTracer<'domain>>;
+
+        let domain = ScalarDomain::<f64>::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let constant = context.input(DataType::F64);
+        let constant_operation: TestLinearScalarOperation<'_> =
+            LinearScalarOperation::Constant(ConstantOperation::new(constant.clone()));
+        let constant_outputs = constant_operation.interpret(&context, &[]).unwrap();
+        assert_eq!(constant_outputs.len(), 1);
+        assert_eq!(constant_outputs[0].atom_id(), constant.atom_id());
+        assert_eq!(builder.borrow().instructions().len(), 0);
+
+        let one_operation: TestLinearScalarOperation<'_> = LinearScalarOperation::One(OneOperation::new(DataType::F64));
+        let one_outputs = one_operation.interpret(&context, &[]).unwrap();
+        assert_eq!(one_outputs.len(), 1);
+
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert!(matches!(builder.instructions()[0].operation(), ScalarOperation::One(_)));
+    }
+
+    #[test]
+    fn test_linear_array_tracer_materializes_one_constant_and_fill() {
+        let array_type = ArrayType::scalar(DataType::F64);
+        let domain = TestArrayDomain::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let constant = context.input(array_type.clone());
+        let constant_operation: TestLinearArrayOperation<'_> =
+            LinearArrayOperation::Constant(ConstantOperation::new(constant.clone()));
+        let constant_outputs = constant_operation.interpret(&context, &[]).unwrap();
+        assert_eq!(constant_outputs.len(), 1);
+        assert_eq!(constant_outputs[0].atom_id(), constant.atom_id());
+        assert_eq!(builder.borrow().instructions().len(), 0);
+
+        let one_operation: TestLinearArrayOperation<'_> =
+            LinearArrayOperation::One(OneOperation::new(array_type.clone()));
+        let one_outputs = one_operation.interpret(&context, &[]).unwrap();
+        assert_eq!(one_outputs.len(), 1);
+
+        let fill_operation: TestLinearArrayOperation<'_> =
+            LinearArrayOperation::Fill(FillOperation::new(array_type, 3.5));
+        let fill_outputs = fill_operation.interpret(&context, &[]).unwrap();
+        assert_eq!(fill_outputs.len(), 1);
+
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 2);
+        assert!(matches!(builder.instructions()[0].operation(), ArrayOperation::One(_)));
+        assert!(matches!(builder.instructions()[1].operation(), ArrayOperation::Fill(_)));
+    }
+
+    #[test]
+    fn test_linear_array_tracer_scale_uses_dynamic_mul() {
+        let array_type = ArrayType::scalar(DataType::F64);
+        let domain = TestArrayDomain::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let factor = context.input(array_type.clone());
+        let input = context.input(array_type);
+        let operation: TestLinearArrayOperation<'_> = LinearArrayOperation::Scale(ScaleOperation::new(factor.clone()));
+        let outputs = operation.interpret(&context, &[input.clone()]).unwrap();
+        assert_eq!(outputs.len(), 1);
+
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert!(matches!(builder.instructions()[0].operation(), ArrayOperation::Mul(_)));
+        assert_eq!(builder.instructions()[0].inputs(), &[factor.atom_id().unwrap(), input.atom_id().unwrap()],);
+    }
+
+    #[test]
+    fn test_linear_array_tracer_dot_factors_use_dynamic_dot_with_output_sharding() {
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)]));
+        let output_sharding = Sharding::replicated(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            2,
+        );
+        let domain = TestArrayDomain::new();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let left_factor = context.input(array_type.clone());
+        let left_input = context.input(array_type.clone());
+        let left_operation: TestLinearArrayOperation<'_> = LinearArrayOperation::LeftDot(
+            LeftDotOperation::new(left_factor.clone(), DotDimensionNumbers::matmul())
+                .with_output_sharding(output_sharding.clone()),
+        );
+        let left_outputs = left_operation.interpret(&context, &[left_input.clone()]).unwrap();
+        assert_eq!(left_outputs.len(), 1);
+
+        let right_factor = context.input(array_type.clone());
+        let right_input = context.input(array_type);
+        let right_operation: TestLinearArrayOperation<'_> = LinearArrayOperation::RightDot(
+            RightDotOperation::new(right_factor.clone(), DotDimensionNumbers::matmul())
+                .with_output_sharding(output_sharding.clone()),
+        );
+        let right_outputs = right_operation.interpret(&context, &[right_input.clone()]).unwrap();
+        assert_eq!(right_outputs.len(), 1);
+
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 2);
+        let ArrayOperation::Dot(left_dot) = builder.instructions()[0].operation() else {
+            panic!("expected left-dot interpretation to stage an ordinary dot operation");
+        };
+        assert_eq!(left_dot.output_sharding(), Some(&output_sharding));
+        assert_eq!(
+            builder.instructions()[0].inputs(),
+            &[left_factor.atom_id().unwrap(), left_input.atom_id().unwrap()],
+        );
+        let ArrayOperation::Dot(right_dot) = builder.instructions()[1].operation() else {
+            panic!("expected right-dot interpretation to stage an ordinary dot operation");
+        };
+        assert_eq!(right_dot.output_sharding(), Some(&output_sharding));
+        assert_eq!(
+            builder.instructions()[1].inputs(),
+            &[right_input.atom_id().unwrap(), right_factor.atom_id().unwrap()],
+        );
+    }
 
     #[test]
     fn test_linear_condition_transpose_supports_runtime_predicates() {
