@@ -291,9 +291,8 @@ fn run_scalar_pushforward_apply(
 ) -> Result<TransformBenchmarkRecord, Box<dyn std::error::Error>> {
     let domain = ryft_core::scalars::ScalarDomain::<f64>::new();
     let (_, pushforward) = domain.linearize(|x| Ok(quartic_plus_sin(x)), 2.0)?;
-    let tangent_context = domain.context();
     measure("scalar_pushforward_apply", "scalar", "pushforward_apply", iterations, warmup, || {
-        Ok(scalar_checksum(pushforward.apply(&tangent_context, black_box(1.0))?))
+        Ok(scalar_checksum(pushforward.apply(&domain, black_box(1.0))?))
     })
 }
 

@@ -20,7 +20,7 @@ use ryft_core::tracing_v2::{
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
-use crate::experimental::domains::XlaDomain;
+use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::ops::{
     FactorSplitLinearXlaOperation, FlatXlaProgram, LinearXlaOperation, LinearXlaOperationExtension, XlaConstant,
     XlaOperation, XlaOperationExtension, XlaProgramBuilder,
@@ -201,12 +201,6 @@ impl<Capture> LinearShardMapState<Capture> {
     }
 }
 
-fn missing_traced_shard_map_staging_context() -> ProgramError {
-    ProgramError::Type(TypeError {
-        message: "traced shard_map with non-empty outputs requires at least one traced input leaf".into(),
-    })
-}
-
 fn missing_linear_shard_map_staging_context() -> ProgramError {
     ProgramError::Type(TypeError {
         message: "linear shard_map with non-empty outputs requires at least one traced input leaf".into(),
@@ -245,18 +239,6 @@ impl<V> ShardMapOperation<V> {
     #[inline]
     pub(crate) fn body(&self) -> &FlatTracedShardMap {
         &self.body
-    }
-}
-
-impl ShardMapOperation<XlaConstant> {
-    /// Replays this tensor-leaf shard-map op with already-traced global inputs.
-    pub(crate) fn interpret_traced_with_context(
-        &self,
-        tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
-        inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
-        apply_flat_traced_shard_map(tracing_builder, self.body.clone(), inputs.to_vec())
-            .map_err(trace_error_from_shard_map)
     }
 }
 
@@ -306,7 +288,7 @@ impl<V, Capture> LinearShardMapOperation<V, Capture> {
     /// Creates one linear shard-map op like this one but with the provided captured primals, preserving the
     /// carried body, types, and evaluation strategies.
     #[inline]
-    fn with_captured_global_primals<V2, Capture2>(
+    pub(crate) fn with_captured_global_primals<V2, Capture2>(
         &self,
         captured_global_primals: Vec<Capture2>,
     ) -> LinearShardMapOperation<V2, Capture2> {
@@ -370,7 +352,7 @@ impl<V, C: Context<Type = ArrayType>> LinearShardMapOperation<V, Tracer<C>> {
     /// Rebuilds this value-captured (instantiated) linear shard-map op as the tensor-leaf XLA operation variant,
     /// minting capture atom ids from the captured tracers at re-staging time so the ids always belong to the
     /// staging program the op is re-staged into.
-    fn to_tensor_xla_op(&self) -> Result<LinearShardMapOperation<XlaConstant>, ProgramError> {
+    pub(crate) fn to_tensor_xla_op(&self) -> Result<LinearShardMapOperation<XlaConstant>, ProgramError> {
         let captured_atoms = self
             .linear_state
             .captured_global_primals
@@ -378,25 +360,6 @@ impl<V, C: Context<Type = ArrayType>> LinearShardMapOperation<V, Tracer<C>> {
             .map(Tracer::atom_id)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(self.with_captured_global_primals(captured_atoms))
-    }
-}
-
-impl LinearShardMapOperation<XlaConstant> {
-    /// Replays this tensor-leaf linear shard-map op with already-traced global inputs, rebinding the capture atom
-    /// ids to the provided inputs' atoms in the target staging program.
-    pub(crate) fn interpret_traced_with_context(
-        &self,
-        tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
-        inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
-        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(abstract_inputs.as_slice())?;
-        let captured_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let staged_op: LinearShardMapOperation<XlaConstant> = self.with_captured_global_primals(captured_atoms);
-        TracingContext::new(XlaDomain::token(), tracing_builder).stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(staged_op))),
-            inputs,
-        )
     }
 }
 
@@ -520,6 +483,18 @@ impl ShardMapOperation<ShardMapTracer> {
     }
 }
 
+impl ShardMapOperation<XlaConstant> {
+    /// Stages this tensor-leaf shard-map into an explicit XLA tracing builder.
+    pub(crate) fn interpret_traced_with_context(
+        &self,
+        tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
+        inputs: &[XlaTracer<'static, 'static>],
+    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
+        apply_flat_traced_shard_map(tracing_builder, self.body.clone(), inputs.to_vec())
+            .map_err(trace_error_from_shard_map)
+    }
+}
+
 impl LinearShardMapOperation<XlaConstant> {
     /// Applies this tensor-leaf linear shard-map JVP against any staging differentiation context: the primal
     /// (ordinary) linear shard-map op is staged into `context`'s primal program through
@@ -552,6 +527,63 @@ impl LinearShardMapOperation<XlaConstant> {
         let captured_global_primals = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let linear_operation = self.with_captured_global_primals(captured_global_primals);
         complete_shard_map_jvp(context, inputs, primal_outputs, self.output_types.len(), linear_operation)
+    }
+
+    /// Stages this tensor-leaf linear shard-map into an explicit XLA tracing builder.
+    pub(crate) fn interpret_traced_with_context(
+        &self,
+        tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
+        inputs: &[XlaTracer<'static, 'static>],
+    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
+        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(abstract_inputs.as_slice())?;
+        let captured_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let staged_operation: LinearShardMapOperation<XlaConstant> = self.with_captured_global_primals(captured_atoms);
+        TracingContext::new(XlaDomain::token(), tracing_builder).stage_operation(
+            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(staged_operation))),
+            inputs,
+        )
+    }
+}
+
+impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTracer> {
+    fn interpret(
+        &self,
+        _context: &<ShardMapTracer as Value<ArrayType>>::InterpretationContext,
+        inputs: &[ShardMapTracer],
+    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
+        match inputs.first() {
+            Some(input) => self.interpret_with_tracing_builder(input.builder().clone(), inputs),
+            None => {
+                self.infer_output_types(&[])?;
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+impl<'domain, D> InterpretableOperation<ArrayType, DomainTracer<'domain, D>>
+    for LinearShardMapOperation<DomainTracer<'domain, D>, DomainTracer<'domain, D>>
+where
+    D: Domain<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
+{
+    fn interpret(
+        &self,
+        _context: &TracingContext<'domain, D>,
+        inputs: &[DomainTracer<'domain, D>],
+    ) -> Result<Vec<DomainTracer<'domain, D>>, ProgramError> {
+        let context = self
+            .linear_state
+            .captured_global_primals
+            .first()
+            .or_else(|| inputs.first())
+            .ok_or_else(missing_traced_shard_map_staging_context)?
+            .context()
+            .clone();
+        context.stage_operation(
+            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()?))),
+            inputs,
+        )
     }
 }
 
@@ -754,43 +786,6 @@ where
     context.tracer(output, None)
 }
 
-impl InterpretableOperation<ArrayType, ShardMapTracer> for ShardMapOperation<ShardMapTracer> {
-    fn interpret(
-        &self,
-        _context: &<ShardMapTracer as Value<ArrayType>>::InterpretationContext,
-        inputs: &[ShardMapTracer],
-    ) -> Result<Vec<ShardMapTracer>, ProgramError> {
-        let tracing_builder = match inputs.first() {
-            Some(input) => input.builder().clone(),
-            None if self.output_types.is_empty() => return Ok(Vec::new()),
-            None => return Err(missing_traced_shard_map_staging_context()),
-        };
-        self.interpret_with_tracing_builder(tracing_builder, inputs)
-    }
-}
-
-impl<'domain, 'o, D> InterpretableOperation<ArrayType, DomainTracer<'domain, D>>
-    for LinearShardMapOperation<DomainTracer<'domain, D>, DomainTracer<'domain, D>>
-where
-    D: Domain<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
-{
-    fn interpret(
-        &self,
-        _context: &<DomainTracer<'domain, D> as Value<ArrayType>>::InterpretationContext,
-        inputs: &[DomainTracer<'domain, D>],
-    ) -> Result<Vec<DomainTracer<'domain, D>>, ProgramError> {
-        let exemplar = match inputs.first() {
-            Some(input) => input,
-            None if self.output_types.is_empty() => return Ok(Vec::new()),
-            None => return Err(missing_traced_shard_map_staging_context()),
-        };
-        exemplar.context().stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()?))),
-            inputs,
-        )
-    }
-}
-
 impl<D> DifferentiableOperation<D> for ShardMapOperation<ShardMapTracer>
 where
     D: Domain<Type = ArrayType, Value = ShardMapTracer>
@@ -825,6 +820,12 @@ where
 
 fn trace_error_from_shard_map(error: ShardMapTraceError) -> ProgramError {
     ProgramError::Type(TypeError { message: error.to_string() })
+}
+
+fn missing_traced_shard_map_staging_context() -> ProgramError {
+    ProgramError::Type(TypeError {
+        message: "traced shard_map with non-empty outputs requires at least one traced input leaf".to_string(),
+    })
 }
 
 /// Builds an empty shard-map body that consumes no inputs and produces no outputs.
@@ -997,8 +998,9 @@ fn factorize_transpose_shard_map_body(
     };
     let residual_body_global_output_types = residual_body.global_output_types().to_vec();
 
-    // Stage the cotangent-application body. The linear program is re-pointed at fresh residual inputs and then transposed
-    // against the body's local-output cotangents to produce one cotangent per local input.
+    // Stage the cotangent-application body. Residual references are first instantiated to the fresh residual inputs
+    // in this apply trace, then the direct program is transposed and interpreted through the standard tracer
+    // interpretation path.
     let apply_builder = Rc::new(RefCell::new(XlaProgramBuilder::new()));
     let apply_context = TracingContext::new(XlaDomain::token(), apply_builder.clone());
     let output_cotangents = simplified_body
@@ -1019,11 +1021,7 @@ fn factorize_transpose_shard_map_body(
         )
     })?;
     let transposed = apply_context.transpose(&direct)?;
-    let interpretation_context = output_cotangents
-        .iter()
-        .find_map(|cotangent| cotangent.interpretation_context())
-        .ok_or_else(missing_traced_shard_map_staging_context)?;
-    let input_cotangents = transposed.interpret_in_context(&interpretation_context, output_cotangents.clone())?;
+    let input_cotangents = transposed.interpret_in_context(&apply_context, output_cotangents.clone())?;
     check_count!("output", input_cotangents, local_input_count, ProgramError);
 
     // Record where each input cotangent comes from. The transpose materializes structural-zero cotangents as `zero`
@@ -1044,16 +1042,13 @@ fn factorize_transpose_shard_map_body(
         }
     }
 
-    // Release every other holder of the apply builder before unwrapping it to build the apply body program. The
-    // recovered interpretation context is a clone of the apply staging context and therefore holds a strong reference
-    // to the apply builder, so it must be released here as well.
+    // Release every other holder of the apply builder before unwrapping it to build the apply body program.
     drop(apply_context);
     drop(transposed);
     drop(direct);
     drop(output_cotangents);
     drop(residual_inputs);
     drop(input_cotangents);
-    drop(interpretation_context);
     let apply_body_program = build_traced_xla_program(
         apply_builder,
         apply_output_tracers,

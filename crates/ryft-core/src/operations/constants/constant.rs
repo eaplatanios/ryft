@@ -18,6 +18,14 @@ pub const CONSTANT_OPERATION_NAME: &'static str = "constant";
 /// its output type is exactly the value's type, and interpreting it simply clones the captured value. Unlike
 /// [`FillOperation`](super::FillOperation), it does not synthesize a value from a scalar; it returns the value the
 /// caller already provided when constructing it.
+///
+/// The `Payload` type parameter is a zero-sized semantic tag that tells interpretation how the stored value should be
+/// treated. The default [`Captured`] payload means the value is a literal carried by the operation, such as an eager
+/// array stored in a program. The [`Input`] payload is used when the value is already part of the active runtime or
+/// staging context, such as a [`Tracer`] captured while rewriting a program. In that case, interpretation forwards the
+/// existing value after validating that it belongs to the same builder. Keeping this distinction in the operation type
+/// lets both forms share the same operation struct without adding runtime fields or ambiguous interpretation
+/// implementations.
 #[derive(Copy, Clone)]
 pub struct ConstantOperation<T: Type, V: Clone + Typed<T>, Payload = Captured> {
     /// Captured value produced by this [`Operation`] when interpreted.
@@ -100,6 +108,11 @@ impl<T: Type, V: Value<T, InterpretationContext: Constant<T, V, C, Payload>>, C:
 /// a runtime value from a captured payload can be context-dependent. For example, [`EagerContext`]s can return the
 /// value directly, ordinary [`StagingContext`]s record a builder constant, and nested [`StagingContext`]s may receive
 /// an already-staged [`Tracer`] that should be forwarded after builder validation.
+///
+/// The `Payload` parameter mirrors [`ConstantOperation`]'s payload tag and selects the context-specific materialization
+/// path. [`Captured`] payloads are values carried by the operation and may need to be inserted into the context, while
+/// [`Input`] payloads are already context values and should be reused rather than re-materialized. This type-level tag
+/// keeps those semantics explicit even when the payload value type itself is otherwise the same.
 pub trait Constant<T: Type, V: Value<T>, C, Payload = Captured> {
     /// Returns the runtime value represented by `value`.
     fn constant(&self, value: C) -> Result<V, ProgramError>;
@@ -182,19 +195,18 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this test.
     #[test]
-    fn test_literal_constant_interpretation_stages_builder_constant() {
-        type TestContext<'domain> = TracingContext<'domain, ScalarDomain<f64>>;
-
+    fn test_constant_captured_interpretation() {
         let domain = ScalarDomain::<f64>::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let context = TracingContext::new(&domain, builder.clone());
         let operation = ConstantOperation::<DataType, f64>::new(3.5);
-
-        let outputs =
-            InterpretableOperation::<DataType, Tracer<TestContext<'_>>>::interpret(&operation, &context, &[]).unwrap();
-
+        let outputs = InterpretableOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>>::interpret(
+            &operation,
+            &context,
+            &[],
+        )
+        .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let builder = builder.borrow();
@@ -202,42 +214,36 @@ mod tests {
         assert!(matches!(&builder.atoms()[0], Atom::Constant(value) if *value == 3.5));
     }
 
-    // TODO(eaplatanios): Review this test.
     #[test]
-    fn test_value_constant_interpretation_forwards_same_builder_tracer() {
-        type TestContext<'domain> = TracingContext<'domain, ScalarDomain<f64>>;
-
+    fn test_constant_input_interpretation() {
         let domain = ScalarDomain::<f64>::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
         let context = TracingContext::new(&domain, builder.clone());
         let input = context.input(DataType::F64);
-        let operation = ConstantOperation::<DataType, Tracer<TestContext<'_>>, Input>::new(input.clone());
-
-        let outputs =
-            InterpretableOperation::<DataType, Tracer<TestContext<'_>>>::interpret(&operation, &context, &[]).unwrap();
-
+        let operation =
+            ConstantOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>, Input>::new(input.clone());
+        let outputs = InterpretableOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>>::interpret(
+            &operation,
+            &context,
+            &[],
+        )
+        .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].atom_id(), input.atom_id());
         assert!(builder.borrow().instructions().is_empty());
-    }
 
-    // TODO(eaplatanios): Review this test.
-    #[test]
-    fn test_value_constant_interpretation_rejects_foreign_builder_tracer() {
-        type TestContext<'domain> = TracingContext<'domain, ScalarDomain<f64>>;
-
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
+        // Test that interpretation rejects a foreign builder.
         let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
-        let foreign_context = TracingContext::new(&domain, foreign_builder);
-        let foreign_input = foreign_context.input(DataType::F64);
-        let operation = ConstantOperation::<DataType, Tracer<TestContext<'_>>, Input>::new(foreign_input);
-
+        let foreign_context = TracingContext::new(&domain, foreign_builder.clone());
         assert!(matches!(
-            InterpretableOperation::<DataType, Tracer<TestContext<'_>>>::interpret(&operation, &context, &[]),
+            InterpretableOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>>::interpret(
+                &operation,
+                &foreign_context,
+                &[]
+            ),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
-        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+        assert_eq!(builder.borrow().error().cloned(), None);
+        assert_eq!(foreign_builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
     }
 }

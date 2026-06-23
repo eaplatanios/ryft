@@ -5,7 +5,7 @@ pub mod one_like;
 pub mod zero;
 pub mod zero_like;
 
-pub use constant::{CONSTANT_OPERATION_NAME, ConstantOperation};
+pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation};
 pub use fill::{FILL_OPERATION_NAME, Fill, FillOperation};
 pub use one::{ONE_OPERATION_NAME, One, OneOperation};
 pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};

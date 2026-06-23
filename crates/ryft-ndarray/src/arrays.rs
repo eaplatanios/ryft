@@ -8,7 +8,6 @@ use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::EagerContext;
-use ryft_core::operations::arithmetic::Scale;
 use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::{Select, SelectCondition};
 use ryft_core::operations::manipulation::{
@@ -20,7 +19,7 @@ use ryft_core::operations::sharding::{ConstrainSharding, Reshard};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameter;
 use ryft_core::programs::{ProgramError, Value};
-use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, LeftDot, RightDot, dot_general_evaluate};
+use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers, dot_general_evaluate};
 use ryft_core::tracing_v2::{CoordinateValue, Cos, Sin};
 use ryft_core::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 
@@ -588,12 +587,12 @@ impl<T: NdArrayElement> Mul for Array<T> {
     }
 }
 
-impl<T: NdArrayElement> Scale for Array<T> {
+impl<T: NdArrayElement> Mul<f64> for Array<T> {
     type Output = Self;
 
     #[inline]
-    fn scale(&self, factor: Self) -> Self::Output {
-        factor * self.clone()
+    fn mul(self, rhs: f64) -> Self::Output {
+        Self::new(self.values.mapv(|value| value.scale_by_constant(rhs)))
     }
 }
 
@@ -695,20 +694,6 @@ impl<T: NdArrayElement> Dot for Array<T> {
         let result = ArrayD::from_shape_vec(IxDyn(output_shape.as_slice()), values)
             .expect("dot result shape and value count agree by construction");
         Self::new(result)
-    }
-}
-
-impl<T: NdArrayElement> LeftDot for Array<T> {
-    #[inline]
-    fn left_dot(&self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
-        factor.dot(self, dimensions)
-    }
-}
-
-impl<T: NdArrayElement> RightDot for Array<T> {
-    #[inline]
-    fn right_dot(&self, factor: Self, dimensions: &DotDimensionNumbers) -> Self {
-        self.dot(&factor, dimensions)
     }
 }
 

@@ -150,6 +150,26 @@ impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRemater
 
 pub type XlaOperation = ArrayOperation<XlaConstant, XlaOperationExtension<XlaConstant>>;
 
+impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<XlaConstant> {
+    fn interpret(
+        &self,
+        _context: &TracingContext<'static, XlaDomain<'static>>,
+        inputs: &[XlaTracer<'static, 'static>],
+    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
+        match self {
+            Self::JitCall(operation) => operation.interpret_traced_with_context(inputs),
+            Self::ShardMap(operation) => {
+                let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
+                operation.interpret_traced_with_context(exemplar.builder().clone(), inputs)
+            }
+            Self::LinearShardMap(operation) => {
+                let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
+                operation.interpret_traced_with_context(exemplar.builder().clone(), inputs)
+            }
+        }
+    }
+}
+
 /// Staged XLA program specialized to the backend-owned XLA op universe.
 pub type XlaProgram<Input, Output> = Program<ArrayType, XlaConstant, XlaOperation, Input, Output>;
 
@@ -799,26 +819,6 @@ where
             cotangent_inputs.as_slice(),
         )?;
         Ok(input_cotangents.into_iter().map(Cotangent::Staged).collect())
-    }
-}
-
-impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<XlaConstant> {
-    fn interpret(
-        &self,
-        _context: &<XlaTracer<'static, 'static> as Value<ArrayType>>::InterpretationContext,
-        inputs: &[XlaTracer<'static, 'static>],
-    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
-        match self {
-            Self::JitCall(op) => op.interpret_traced_with_context(inputs),
-            Self::ShardMap(op) => {
-                let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
-                op.interpret_traced_with_context(exemplar.builder().clone(), inputs)
-            }
-            Self::LinearShardMap(op) => {
-                let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
-                op.interpret_traced_with_context(exemplar.builder().clone(), inputs)
-            }
-        }
     }
 }
 

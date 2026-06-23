@@ -2,9 +2,11 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::{EagerContext, StagingContext};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`FillOperation`].
@@ -73,32 +75,45 @@ impl<T: Type, V: Display> Operation<T> for FillOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Clone + Display, W: Value<T> + Fill<T, V>> InterpretableOperation<T, W> for FillOperation<T, V> {
+impl<T: Type, V: Value<T, InterpretationContext: Fill<T, C, V>>, C: Clone + Display> InterpretableOperation<T, V>
+    for FillOperation<T, C>
+{
     #[inline]
     fn interpret(
         &self,
-        _context: &<W as Value<T>>::InterpretationContext,
-        inputs: &[W],
-    ) -> Result<Vec<W>, ProgramError> {
+        context: &<V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
-        Ok(vec![W::fill(&self.r#type, self.value.clone())?])
+        Ok(vec![context.fill(&self.r#type, self.value.clone())?])
     }
 }
 
-/// Synthesizes a value for a given [`Type`] filled with a captured scalar. [`Fill`] is the [`Type`]-driven
-/// counterpart needed by [`FillOperation`] for its [`InterpretableOperation`] implementation. It sits alongside
-/// [`Zero`](super::Zero) and [`One`](super::One) in the same type-driven family, but generalizes the fixed `zero`
-/// or `one` value to an arbitrary scalar `V` value supplied at the call site.
-pub trait Fill<T: Type, V>: Sized {
+/// Represents the ability to synthesize a value for a given [`Type`] filled with a captured scalar in an interpretation
+/// context. [`Fill`] is the [`Type`]-driven counterpart needed by [`FillOperation`] for its [`InterpretableOperation`]
+/// implementation. It sits alongside [`Zero`](super::Zero) and [`One`](super::One) in the same type-driven family, but
+/// generalizes the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
+pub trait Fill<T: Type, S, V: Value<T>> {
     /// Returns a value of `type` with every element set to `value`.
-    fn fill(r#type: &T, value: V) -> Result<Self, ProgramError>;
+    fn fill(&self, r#type: &T, value: S) -> Result<V, ProgramError>;
+}
+
+impl<C: StagingContext<Operation: From<FillOperation<C::Type, V>>>, V: Clone + Display> Fill<C::Type, V, Tracer<C>>
+    for C
+{
+    #[inline]
+    fn fill(&self, r#type: &C::Type, value: V) -> Result<Tracer<C>, ProgramError> {
+        let mut outputs = self.stage_nullary_operation(FillOperation::new(r#type.clone(), value))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
 }
 
 macro_rules! impl_fill_for_scalar {
     ($ty:ty) => {
-        impl Fill<DataType, $ty> for $ty {
+        impl<O: Operation<DataType>> Fill<DataType, $ty, $ty> for EagerContext<DataType, $ty, O> {
             #[inline]
-            fn fill(r#type: &DataType, value: $ty) -> Result<Self, ProgramError> {
+            fn fill(&self, r#type: &DataType, value: $ty) -> Result<$ty, ProgramError> {
                 let value_type = <$ty as Typed<DataType>>::r#type(&value).into_owned();
                 if *r#type != value_type {
                     return Err(TypeError {
@@ -141,9 +156,10 @@ mod tests {
 
     #[test]
     fn test_fill() {
-        assert_eq!(f64::fill(&DataType::F64, 3.5), Ok(3.5));
+        let context = EagerContext::<DataType, f64, FillOperation<DataType, f64>>::new();
+        assert_eq!(context.fill(&DataType::F64, 3.5), Ok(3.5));
         assert_eq!(
-            f64::fill(&DataType::F32, 3.5),
+            context.fill(&DataType::F32, 3.5),
             Err(ProgramError::Type(TypeError {
                 message: "scalar value expected data type f64 but got f32".to_string()
             })),

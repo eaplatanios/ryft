@@ -429,7 +429,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for DotOperation {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ScaleOperation<ArrayType, V> {
+impl<V: MlirLowerableValue, Payload> LowerableXlaOperation<V> for ScaleOperation<ArrayType, V, Payload> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -485,7 +485,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for FillOperation<ArrayType
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<ArrayType, V> {
+impl<V: MlirLowerableValue, Payload> LowerableXlaOperation<V> for ConstantOperation<ArrayType, V, Payload> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -501,7 +501,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConstantOperation<Array
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LeftDotOperation<V> {
+impl<V: MlirLowerableValue, Payload> LowerableXlaOperation<V> for LeftDotOperation<V, Payload> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -532,7 +532,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LeftDotOperation<V> {
     }
 }
 
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for RightDotOperation<V> {
+impl<V: MlirLowerableValue, Payload> LowerableXlaOperation<V> for RightDotOperation<V, Payload> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -859,15 +859,7 @@ where
                 }
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
-            ArrayOperation::Constant(constant) => {
-                <ConstantOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    constant,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
+            ArrayOperation::Constant(constant) => constant.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::Fill(fill) => <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
                 fill,
                 input_values,
@@ -997,15 +989,7 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Scale(operation) => {
-                <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
+            ArrayOperation::Scale(operation) => operation.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -1258,13 +1242,7 @@ where
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             LinearArrayOperation::Constant(constant) => {
-                <ConstantOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    constant,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
+                constant.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             LinearArrayOperation::Fill(fill) => {
                 <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
@@ -1322,13 +1300,7 @@ where
                 )
             }
             LinearArrayOperation::Scale(operation) => {
-                <ScaleOperation<ArrayType, V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &ScaleOperation::new(operation.factor().clone()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
+                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             LinearArrayOperation::Mul(_) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &MulOperation,
@@ -1345,24 +1317,10 @@ where
                 lowerer.location,
             ),
             LinearArrayOperation::LeftDot(operation) => {
-                <LeftDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &LeftDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
-                        .with_output_sharding(operation.output_sharding().cloned()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
+                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             LinearArrayOperation::RightDot(operation) => {
-                <RightDotOperation<V> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &RightDotOperation::new(operation.factor().clone(), operation.dimensions().clone())
-                        .with_output_sharding(operation.output_sharding().cloned()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
+                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             LinearArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 &ReshapeOperation::new(operation.output_shape().clone()),
@@ -4768,6 +4726,7 @@ mod tests {
     };
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::Placeholder;
+    use ryft_core::payloads::Input;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tests::{TestArray, TestArrayDomain};
     use ryft_core::tracing::TracingContext;
@@ -5413,7 +5372,10 @@ mod tests {
         let false_tangent = false_builder.add_input(scalar_f64.clone());
         let _false_forwarded = false_builder.add_input(scalar_f64.clone());
         let doubled = false_builder
-            .add_instruction(ScaleOperation::new(TestArray::scalar(2.0)), vec![false_tangent])
+            .add_instruction(
+                ScaleOperation::<ArrayType, TestArray, Input>::new(TestArray::scalar(2.0)),
+                vec![false_tangent],
+            )
             .unwrap()[0];
         let false_branch = false_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder, Placeholder], vec![Placeholder])
@@ -5599,7 +5561,9 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScaleOperation::new(CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() }),
+                ScaleOperation::<ArrayType, CapturedFactor<ArrayType, TestArray>, Input>::new(
+                    CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() },
+                ),
                 vec![tangent_carry],
             )
             .unwrap()[0];
