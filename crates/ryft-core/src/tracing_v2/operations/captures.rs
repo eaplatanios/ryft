@@ -36,7 +36,7 @@ pub enum ValueOrCapture<T: Type, V: Value<T>> {
 
 impl<T: Type, V: Value<T>> ValueOrCapture<T, V> {
     /// Instantiates this payload into a concrete value using `captures`.
-    pub(crate) fn instantiate(&self, captures: &[V]) -> Result<V, ProgramError> {
+    pub fn instantiate(&self, captures: &[V]) -> Result<V, ProgramError> {
         match self {
             Self::Value(value) => Ok(value.clone()),
             Self::Capture { index, .. } => {

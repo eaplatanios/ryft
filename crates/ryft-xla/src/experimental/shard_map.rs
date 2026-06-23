@@ -441,7 +441,7 @@ where
     Input::Family: ParameterizedFamily<Sharding>,
 {
     stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
-        XlaOperation::Reshard(ReshardOperation::new(sharding))
+        XlaOperation::from(ReshardOperation::new(sharding))
     })
 }
 
@@ -467,7 +467,7 @@ where
     Input::Family: ParameterizedFamily<Sharding>,
 {
     stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
-        XlaOperation::ShardingConstraint(ShardingConstraintOperation::new(sharding))
+        XlaOperation::from(ShardingConstraintOperation::new(sharding))
     })
 }
 

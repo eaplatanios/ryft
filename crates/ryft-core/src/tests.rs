@@ -968,7 +968,7 @@ impl Context for TestArrayDomain {
 impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-        LinearArrayOperation<V, TestArray, Infallible, F, ArrayOperation<TestArray>>;
+        LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 }
 
 impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for TestArrayDomain {

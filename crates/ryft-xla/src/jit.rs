@@ -188,9 +188,7 @@ impl<
         let capture_tracers = capture_references.iter().cloned().map(|capture| context.constant(capture));
         let full_inputs = capture_tracers.chain(inputs).collect::<Vec<_>>();
         context.stage_operation(
-            XlaOperation::Extension(crate::experimental::ops::XlaOperationExtension::JitCall(Box::new(
-                JitCallOperation::new(self.opened_program()?.clone()),
-            ))),
+            XlaOperation::JitCall(Box::new(JitCallOperation::new(self.opened_program()?.clone()))),
             full_inputs.as_slice(),
         )
     }
@@ -1068,7 +1066,7 @@ mod tests {
     use ryft_core::compilation::CompilationOptions;
 
     use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
-    use crate::experimental::ops::{XlaOperation, XlaOperationExtension};
+    use crate::experimental::ops::XlaOperation;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
         Array, CompiledXlaFunction, FromPjrt, StagedXlaFunction, compile, compile_with_captures, compile_with_options,
@@ -1300,9 +1298,7 @@ mod tests {
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| {
-                matches!(instruction.operation(), XlaOperation::Extension(XlaOperationExtension::JitCall(_)))
-            })
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
             .count();
         let inlined_sin_count = outer
             .source_program()
@@ -1867,9 +1863,7 @@ mod tests {
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| {
-                matches!(instruction.operation(), XlaOperation::Extension(XlaOperationExtension::JitCall(_)))
-            })
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
             .count();
         let inlined_sin_count = jvp_compiled
             .source_program()
@@ -1956,9 +1950,7 @@ mod tests {
             .program()
             .instructions()
             .iter()
-            .filter(|instruction| {
-                matches!(instruction.operation(), XlaOperation::Extension(XlaOperationExtension::JitCall(_)))
-            })
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
             .count();
         let inlined_sin_count = batched
             .source_program()

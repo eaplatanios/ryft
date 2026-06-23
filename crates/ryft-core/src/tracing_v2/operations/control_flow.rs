@@ -1,6 +1,3 @@
-use std::fmt::{Debug, Display};
-use std::ops::Mul;
-
 use crate::batching::BatchingError;
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation};
@@ -14,9 +11,9 @@ use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
-use crate::operations::sharding::{ConstrainSharding, Reshard};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
+use crate::payloads::Captured;
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{
@@ -25,10 +22,7 @@ use crate::tracing_v2::batching::{
 };
 use crate::tracing_v2::differentiation::{NestedLinearization, ProgramLinearizableOperation};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::tracing_v2::operations::dot::Dot;
-use crate::tracing_v2::operations::primitive::LinearArrayOperation;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
-use crate::tracing_v2::operations::reshape::ReshapeValue;
 use crate::tracing_v2::operations::scan::{LinearScanOperation, linear_scan_operation};
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::{
@@ -36,6 +30,7 @@ use crate::tracing_v2::{
     ResidualizedOperation, TangentContext, ValueOrCapture,
 };
 use crate::types::{ArrayType, DataType, Size, Type, TypeError, Typed};
+use std::fmt::{Debug, Display};
 
 impl<'domain, E> BooleanLike for JvpTracer<'domain, E>
 where
@@ -127,8 +122,8 @@ pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
     ) -> Self;
 }
 
-/// Represents linear array operation families that can transpose branch programs captured by a
-/// [`LinearConditionOperation`].
+/// Represents linear array operation families that can transpose branch programs captured by a captured-predicate
+/// [`ConditionOperation`].
 ///
 /// This trait keeps the self-referential condition requirement at the operation-family boundary: condition
 /// transposition needs to recursively transpose the selected branch programs, but callers should not have to spell the
@@ -136,7 +131,7 @@ pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
 pub trait LinearConditionBranchTransposable<V: Value<ArrayType>>:
     Operation<ArrayType> + MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>
 {
-    /// Transposes a branch program captured by a [`LinearConditionOperation`].
+    /// Transposes a branch program captured by a captured-predicate [`ConditionOperation`].
     ///
     /// # Parameters
     ///
@@ -1903,123 +1898,11 @@ where
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
 
-/// Captured-predicate conditional linear operation: a higher-order conditional restricted to linear branch programs,
-/// with the Boolean primal predicate captured as a factor (the predicate itself has no tangent space, so the map is
-/// linear in the branch operands).
-///
-/// It is the counterpart of the `Condition` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation). The operation inputs are exactly the branch
-/// operands, and the captured predicate selects which branch program runs. Because the predicate is a residual of the
-/// primal computation rather than a linear operand, it receives no cotangent and is carried verbatim through
-/// transposition.
-#[derive(Clone, Debug)]
-pub struct LinearConditionOperation<V, C, Extension, F, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-{
-    /// Captured Boolean predicate that selects the branch to run.
-    predicate: F,
-
-    /// Branch [`Program`] evaluated when the predicate is true.
-    true_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
-
-    /// Branch [`Program`] evaluated when the predicate is false.
-    false_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
-}
-
-impl<V, C, Extension, F, P> LinearConditionOperation<V, C, Extension, F, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-{
-    /// Creates a new [`LinearConditionOperation`] capturing the predicate factor and the two branch programs.
-    #[inline]
-    pub fn new(
-        predicate: F,
-        true_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
-        false_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
-    ) -> Self {
-        Self { predicate, true_branch, false_branch }
-    }
-
-    /// Returns the captured Boolean predicate that selects the branch to run.
-    #[inline]
-    pub fn predicate(&self) -> &F {
-        &self.predicate
-    }
-
-    /// Returns the branch [`Program`] evaluated when the predicate is true.
-    #[inline]
-    pub fn true_branch(&self) -> &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>> {
-        self.true_branch.as_ref()
-    }
-
-    /// Returns the branch [`Program`] evaluated when the predicate is false.
-    #[inline]
-    pub fn false_branch(&self) -> &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>> {
-        self.false_branch.as_ref()
-    }
-}
-
-impl<V, C, Extension, F, P> Display for LinearConditionOperation<V, C, Extension, F, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-    Extension: Operation<ArrayType>,
-    Self: Operation<ArrayType>,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<V, C, Extension, F, P> Operation<ArrayType> for LinearConditionOperation<V, C, Extension, F, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONDITION_OPERATION_NAME
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        let branch_input_types = self.true_branch.input_types();
-        check_types!("condition branch input", &branch_input_types, &self.false_branch.input_types());
-        let output_types = self.true_branch.output_types();
-        check_types!("condition branch output", &output_types, &self.false_branch.output_types());
-        check_count!("input", input_types, branch_input_types.len(), TypeError);
-        check_types!("condition operand", &branch_input_types, input_types);
-        Ok(output_types)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.field("predicate", &self.predicate)?;
-            operation.program("true_branch", self.true_branch.as_ref())?;
-            operation.program("false_branch", self.false_branch.as_ref())
-        })
-    }
-}
-
-impl<V, C, Extension, F, P> InterpretableOperation<ArrayType, V> for LinearConditionOperation<V, C, Extension, F, P>
+impl<V, F, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, V, O, F, Captured>
 where
     V: Value<ArrayType> + BooleanLike,
-    C: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
     F: CustomVjpResidual<ArrayType, V>,
-    P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: InterpretableOperation<ArrayType, V>,
+    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(
@@ -2035,66 +1918,33 @@ where
     }
 }
 
-impl<V, C, Extension, F, P> LinearConditionBranchTransposable<V> for LinearArrayOperation<V, C, Extension, F, P>
-where
-    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-    C: Value<ArrayType>,
-    Extension: Clone
-        + Operation<ArrayType>
-        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
-        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>>,
-    F: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-{
-    #[inline]
-    fn transpose_linear_condition_branch(
-        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        branch.transpose()
-    }
-}
-
 /// Transpose rule for the captured-predicate conditional (the `Condition` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The predicate is a residual of the primal
 /// computation rather than a linear operand, so it has no cotangent and is carried verbatim into a transposed
 /// condition over the transposed branch programs, selected by the same predicate. Branch transposition goes through
 /// [`LinearConditionBranchTransposable`], keeping the branch fixed point owned by the operation family.
-impl<V, C, Extension, F, P> TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>
-    for LinearConditionOperation<V, C, Extension, F, P>
+impl<V, F, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<ArrayType, V, O, F, Captured>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
     F: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: LinearConditionBranchTransposable<V>,
+    O: Operation<ArrayType> + SupportsLinearCondition<ArrayType, V, F> + LinearConditionBranchTransposable<V>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>>>, ProgramError>
-    {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
         // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
         // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
         if output_cotangents.iter().all(Cotangent::is_zero) {
             return Ok(vec![Cotangent::Zero; self.true_branch().input_types().len()]);
         }
-        let transposed_condition = LinearArrayOperation::Condition(LinearConditionOperation::new(
+        let transposed_condition = O::linear_condition_operation(
             self.predicate().clone(),
-            Box::new(
-                <LinearArrayOperation<V, C, Extension, F, P> as
-                    LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.true_branch())?,
-            ),
-            Box::new(
-                <LinearArrayOperation<V, C, Extension, F, P> as
-                    LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.false_branch())?,
-            ),
-        ));
+            <O as LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.true_branch())?,
+            <O as LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.false_branch())?,
+        );
         let materialized = output_cotangents
             .iter()
             .zip(self.true_branch().output_types())
@@ -2106,8 +1956,8 @@ where
     }
 }
 
-/// Operand-form conditional linear operation: the operand-form counterpart of [`LinearConditionOperation`] produced
-/// by [`SupportsLinearWhile::defactorize`] for fused while bodies.
+/// Operand-form conditional linear operation: the operand-form counterpart of captured-predicate
+/// [`ConditionOperation`] produced by [`SupportsLinearWhile::defactorize`] for fused while bodies.
 ///
 /// It is the counterpart of the `OperandCondition` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation): the Boolean predicate is operand `0` (recomputed
@@ -2118,56 +1968,49 @@ where
 /// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
 /// transposition, which is only reachable behind the while transpose error.
 #[derive(Clone, Debug)]
-pub struct LinearOperandConditionOperation<V, C, Extension, F, P>
+pub struct LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     /// Branch [`Program`] evaluated when the predicate operand is true.
-    true_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
+    true_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
 
     /// Branch [`Program`] evaluated when the predicate operand is false.
-    false_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
+    false_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
 }
 
-impl<V, C, Extension, F, P> LinearOperandConditionOperation<V, C, Extension, F, P>
+impl<V, O> LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     /// Creates a new [`LinearOperandConditionOperation`] from the two branch programs.
     #[inline]
     pub fn new(
-        true_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
-        false_branch: Box<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>>>,
+        true_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
+        false_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
     ) -> Self {
         Self { true_branch, false_branch }
     }
 
     /// Returns the branch [`Program`] evaluated when the predicate operand is true.
     #[inline]
-    pub fn true_branch(&self) -> &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>> {
+    pub fn true_branch(&self) -> &Program<ArrayType, V, O, Vec<V>, Vec<V>> {
         self.true_branch.as_ref()
     }
 
     /// Returns the branch [`Program`] evaluated when the predicate operand is false.
     #[inline]
-    pub fn false_branch(&self) -> &Program<ArrayType, V, LinearArrayOperation<V, C, Extension, F, P>, Vec<V>, Vec<V>> {
+    pub fn false_branch(&self) -> &Program<ArrayType, V, O, Vec<V>, Vec<V>> {
         self.false_branch.as_ref()
     }
 }
 
-impl<V, C, Extension, F, P> Display for LinearOperandConditionOperation<V, C, Extension, F, P>
+impl<V, O> Display for LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
     Self: Operation<ArrayType>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2175,13 +2018,10 @@ where
     }
 }
 
-impl<V, C, Extension, F, P> Operation<ArrayType> for LinearOperandConditionOperation<V, C, Extension, F, P>
+impl<V, O> Operation<ArrayType> for LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     #[inline]
     fn name(&self) -> &'static str {
@@ -2211,15 +2051,10 @@ where
     }
 }
 
-impl<V, C, Extension, F, P> InterpretableOperation<ArrayType, V>
-    for LinearOperandConditionOperation<V, C, Extension, F, P>
+impl<V, O> InterpretableOperation<ArrayType, V> for LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType> + BooleanLike,
-    C: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-    LinearArrayOperation<V, C, Extension, F, P>: InterpretableOperation<ArrayType, V>,
+    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(
@@ -2238,14 +2073,11 @@ where
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Like recomputed primal operations, the
 /// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
 /// transposition; this rule is only reachable behind the while transpose error, which fires first.
-impl<V, C, Extension, F, P, OLinear: Operation<ArrayType>> TransposableOperation<ArrayType, V, OLinear>
-    for LinearOperandConditionOperation<V, C, Extension, F, P>
+impl<V, O, OLinear: Operation<ArrayType>> TransposableOperation<ArrayType, V, OLinear>
+    for LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    Extension: Operation<ArrayType>,
-    P: Operation<ArrayType>,
+    O: Operation<ArrayType>,
 {
     fn transpose<'transpose>(
         &self,
@@ -2668,22 +2500,11 @@ mod tests {
 
     impl<Factor: Value<ArrayType>> CaptureParameterizedOperation<ArrayType, Factor> for TestLinearOperation {
         type WithCapture<MappedFactor: Value<ArrayType>> = Self;
-        type WithLocalCapture<MappedFactor: Value<ArrayType>> = Self;
 
         fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
             &self,
             _map_factor: &mut MapFactorFn,
         ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
-        where
-            MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
-        {
-            Ok(self.clone())
-        }
-
-        fn try_map_local_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
-            &self,
-            _map_factor: &mut MapFactorFn,
-        ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
         where
             MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
         {
@@ -3292,8 +3113,6 @@ mod tests {
         // instead of concretizing the predicate, which previously failed with `ProgramError::Concretization`. The
         // true branch is sin(x), whose pushforward captures cos(x) as a residual, so the staged primal condition
         // must carry residual-extended joined branches; the false branch is 3 * x, which captures no residuals.
-        use std::convert::Infallible;
-
         use crate::tests::{TestArray, TestArrayDomain};
         use crate::tracing::{DomainTracer, TracingContext};
         use crate::tracing_v2::LinearArrayOperation;
@@ -3321,7 +3140,6 @@ mod tests {
             LinearArrayOperation<
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                Infallible,
                 ValueOrCapture<ArrayType, DomainTracer<TestArrayDomain>>,
                 TestArrayOperation,
             >,
@@ -3406,8 +3224,6 @@ mod tests {
         // until it reaches 8: the primal trace must gain exactly one `while` over the original condition and body,
         // and the linear trace must gain one nullary residual injection (the loop-entry primal state) plus one
         // doubled-state linear `while` whose fused programs consume `[primal_state, tangent_state]`.
-        use std::convert::Infallible;
-
         use crate::operations::compare::ComparisonDirection;
         use crate::tests::{TestArray, TestArrayDomain};
         use crate::tracing::{DomainTracer, TracingContext};
@@ -3444,7 +3260,6 @@ mod tests {
             LinearArrayOperation<
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                Infallible,
                 ValueOrCapture<ArrayType, DomainTracer<TestArrayDomain>>,
                 TestArrayOperation,
             >,
@@ -3489,8 +3304,6 @@ mod tests {
         // captures that state as a loop-varying residual on both sides of the product rule. The fused doubled-state
         // loop must rewrite those references into operand form (`defactorize`), which shows up as recomputed `mul`
         // instructions inside the staged linear while body.
-        use std::convert::Infallible;
-
         use crate::operations::compare::ComparisonDirection;
         use crate::tests::{TestArray, TestArrayDomain};
         use crate::tracing::{DomainTracer, TracingContext};
@@ -3540,7 +3353,6 @@ mod tests {
             LinearArrayOperation<
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                Infallible,
                 ValueOrCapture<ArrayType, DomainTracer<TestArrayDomain>>,
                 TestArrayOperation,
             >,
@@ -3625,7 +3437,6 @@ mod tests {
     type AbstractLinearOperation = LinearArrayOperation<
         AbstractTangentTracer,
         TestArray,
-        Infallible,
         ValueOrCapture<ArrayType, AbstractTangentTracer>,
         TestArrayOperation,
     >;
@@ -3662,7 +3473,7 @@ mod tests {
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<V, TestArray, Infallible, F, ArrayOperation<TestArray>>;
+            LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {
             false
@@ -3847,7 +3658,7 @@ mod tests {
         Program<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
             Vec<TestArray>,
             Vec<TestArray>,
         >,
@@ -3856,13 +3667,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                ValueOrCapture<ArrayType, TestArray>,
-                ArrayOperation<TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

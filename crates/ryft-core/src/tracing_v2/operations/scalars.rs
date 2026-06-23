@@ -22,7 +22,6 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
     for LinearScalarOperation<V, C, F>
 {
     type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, C, MappedFactor>;
-    type WithLocalCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, C, MappedFactor>;
 
     fn try_map_captures<MappedFactor: Value<DataType>, MapFactorFn>(
         &self,
@@ -59,16 +58,6 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
                 Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
             }
         }
-    }
-
-    fn try_map_local_captures<MappedFactor: Value<DataType>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        self.try_map_captures(map_factor)
     }
 }
 

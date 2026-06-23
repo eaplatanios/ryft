@@ -365,7 +365,6 @@ mod tests {
 
     impl<F: Value<DataType>> CaptureParameterizedOperation<DataType, F> for DistinctLinearOperation<F> {
         type WithCapture<MappedFactor: Value<DataType>> = DistinctLinearOperation<MappedFactor>;
-        type WithLocalCapture<MappedFactor: Value<DataType>> = DistinctLinearOperation<MappedFactor>;
 
         fn try_map_captures<MappedFactor: Value<DataType>, MapFactorFn>(
             &self,
@@ -385,16 +384,6 @@ mod tests {
                     DistinctLinearOperation::ScaleByPrimal { factor: map_factor(factor)? }
                 }
             })
-        }
-
-        fn try_map_local_captures<MappedFactor: Value<DataType>, MapFactorFn>(
-            &self,
-            map_factor: &mut MapFactorFn,
-        ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
-        where
-            MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-        {
-            self.try_map_captures(map_factor)
         }
     }
 

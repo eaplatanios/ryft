@@ -279,7 +279,11 @@ impl CodeGenerator {
         let transpose_bounds = variants.iter().map(|variant| {
             let operation_type = &variant.operation_type;
             let predicate: syn::WherePredicate = syn::parse_quote! {
-                #operation_type: #ryft::TransposableOperation<#primary_type, #transposed_value_type, #operation_self_type>
+                #operation_type: #ryft::TransposableOperation<
+                    #primary_type,
+                    #transposed_value_type,
+                    #operation_self_type,
+                >
             };
             predicate
         });

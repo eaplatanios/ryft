@@ -49,9 +49,15 @@ use crate::types::{Type, Typed};
 ///     `Payload: TransposableOperation<T, V, Enum>` `where` predicate. Payload-specific capability requirements should
 ///     live on the payload's own [`TransposableOperation`] implementation; the enum derivation carries them through
 ///     this generated payload bound.
+///   - Recursive higher-order payloads that contain the enum itself as the operation-family fixed point should expose
+///     semantic helper bounds for their nested-program requirements, and their own [`TransposableOperation`]
+///     implementation should depend on those helper bounds. Helper-trait implementations should avoid spelling a
+///     direct `Enum: TransposableOperation<T, V, Enum>` super-bound when the helper only calls [`Program::transpose`];
+///     the generated payload bound already supplies the recursive transposition obligation at the enum-dispatch
+///     boundary.
 ///   - Bare generic payload variants such as `Extension(Extension)` receive the same generated
 ///     `Extension: TransposableOperation<T, V, Enum>` bound, because the macro cannot know which concrete extension
-///     enum will be substituted by the caller.
+///     type will be substituted by the caller.
 ///
 /// Recursive higher-order payloads should expose a semantic helper trait for the operation-family capability they need
 /// and make their own [`TransposableOperation`] implementation depend on that helper trait. This keeps the derived

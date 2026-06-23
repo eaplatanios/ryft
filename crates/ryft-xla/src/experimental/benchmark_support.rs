@@ -12,7 +12,7 @@ use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
-use crate::experimental::ops::{XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram};
+use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
 use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
 /// Returns the XLA-focused IR benchmark cases.
@@ -129,11 +129,11 @@ fn summarize_xla_program<Input: Parameterized<XlaConstant>, Output: Parameterize
     }
 
     summarize_program(program, |op| {
-        if let XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) = op {
+        if let XlaOperation::ShardMap(shard_map_op) = op {
             return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
         }
 
-        if let XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) = op {
+        if let XlaOperation::LinearShardMap(shard_map_op) = op {
             let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
             nested_regions.extend(summarize_linear_eval_mode(
                 "linear_shard_map.eval_body",

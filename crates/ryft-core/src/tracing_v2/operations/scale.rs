@@ -99,7 +99,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::convert::Infallible;
     use std::rc::Rc;
 
     use super::*;
@@ -117,14 +116,14 @@ mod tests {
         domain: &'transpose AbstractDomain<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >,
         builder: Rc<
             RefCell<
                 ProgramBuilder<
                     ArrayType,
                     TestArray,
-                    LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
                 >,
             >,
         >,
@@ -132,7 +131,7 @@ mod tests {
         'transpose,
         ArrayType,
         TestArray,
-        LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+        LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
     > {
         AbstractTracingContext::new(domain, builder)
     }
@@ -147,7 +146,7 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let domain = AbstractDomain::new();

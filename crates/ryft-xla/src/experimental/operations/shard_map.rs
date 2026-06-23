@@ -20,11 +20,8 @@ use ryft_core::tracing_v2::{
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
-use crate::experimental::domains::{XlaDomain, XlaTracer};
-use crate::experimental::ops::{
-    FactorSplitLinearXlaOperation, FlatXlaProgram, LinearXlaOperation, LinearXlaOperationExtension, XlaConstant,
-    XlaOperation, XlaOperationExtension, XlaProgramBuilder,
-};
+use crate::experimental::domains::XlaDomain;
+use crate::experimental::ops::{FlatXlaProgram, LinearXlaOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use crate::experimental::shard_map::{
     FlatTracedShardMap, ShardMap, ShardMapInvocationLeaf, ShardMapLocalTraceInput, ShardMapLocalTraceOutput,
     ShardMapTraceError, ShardMapTracer, TracedShardMap,
@@ -149,13 +146,12 @@ pub(crate) enum LinearShardMapEvalMode {
 /// `captured_global_primals` holds the global primal inputs captured when the shard-map body was linearized, in a
 /// representation chosen by the `Capture` parameter:
 ///
-///   - Linear shard-map ops staged in tangent/cotangent programs ([`LinearXlaOperationExtension`]) capture the
-///     primals as factors of the linear program's factor carrier (residual references in reusable residualized
-///     pushforwards, concrete values in instantiated direct programs), so the captures flow through residual
-///     compaction, rebasing, and instantiation like every other captured primal factor.
-///   - The ordinary staged form ([`XlaOperationExtension`]) captures [`AtomId`]s of the staging program the op is
-///     re-staged into; those ids are minted from live tracers at re-staging time and resolved against the program
-///     being lowered.
+///   - Linear shard-map ops staged in tangent/cotangent programs ([`LinearXlaOperation`]) capture the primals as
+///     factors of the linear program's factor carrier (residual references in reusable residualized pushforwards,
+///     concrete values in instantiated direct programs), so the captures flow through residual compaction, rebasing,
+///     and instantiation like every other captured primal factor.
+///   - The ordinary staged form ([`XlaOperation`]) captures [`AtomId`]s of the staging program the op is re-staged
+///     into; those ids are minted from live tracers at re-staging time and resolved against the program being lowered.
 ///
 /// The vector is empty for tensor-leaf shard-map ops, where captures are never read.
 #[derive(Clone, Debug)]
@@ -391,7 +387,7 @@ where
     check_count!("output", primal_outputs, output_count, ProgramError);
     let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
     let operation: LinearXlaOperation<TangentValue, XlaConstant, ValueOrCapture<ArrayType, PrimalValue>> =
-        LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation)));
+        LinearXlaOperation::LinearShardMap(Box::new(linear_operation));
     let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
     Ok(primal_outputs
@@ -428,9 +424,7 @@ impl<LeafV> ShardMapOperation<LeafV> {
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.bind_primal(
-            XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(
-                self.body.clone(),
-            )))),
+            XlaOperation::ShardMap(Box::new(ShardMapOperation::new(self.body.clone()))),
             primal_inputs.as_slice(),
         )?;
         let captured_global_primals = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
@@ -483,18 +477,6 @@ impl ShardMapOperation<ShardMapTracer> {
     }
 }
 
-impl ShardMapOperation<XlaConstant> {
-    /// Stages this tensor-leaf shard-map into an explicit XLA tracing builder.
-    pub(crate) fn interpret_traced_with_context(
-        &self,
-        tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
-        inputs: &[XlaTracer<'static, 'static>],
-    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
-        apply_flat_traced_shard_map(tracing_builder, self.body.clone(), inputs.to_vec())
-            .map_err(trace_error_from_shard_map)
-    }
-}
-
 impl LinearShardMapOperation<XlaConstant> {
     /// Applies this tensor-leaf linear shard-map JVP against any staging differentiation context: the primal
     /// (ordinary) linear shard-map op is staged into `context`'s primal program through
@@ -520,29 +502,11 @@ impl LinearShardMapOperation<XlaConstant> {
         LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal_outputs = context.bind_primal(
-            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.clone()))),
-            primal_inputs.as_slice(),
-        )?;
+        let primal_outputs =
+            context.bind_primal(XlaOperation::LinearShardMap(Box::new(self.clone())), primal_inputs.as_slice())?;
         let captured_global_primals = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let linear_operation = self.with_captured_global_primals(captured_global_primals);
         complete_shard_map_jvp(context, inputs, primal_outputs, self.output_types.len(), linear_operation)
-    }
-
-    /// Stages this tensor-leaf linear shard-map into an explicit XLA tracing builder.
-    pub(crate) fn interpret_traced_with_context(
-        &self,
-        tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
-        inputs: &[XlaTracer<'static, 'static>],
-    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
-        let abstract_inputs = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(abstract_inputs.as_slice())?;
-        let captured_atoms = inputs.iter().map(|input| input.atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let staged_operation: LinearShardMapOperation<XlaConstant> = self.with_captured_global_primals(captured_atoms);
-        TracingContext::new(XlaDomain::token(), tracing_builder).stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(staged_operation))),
-            inputs,
-        )
     }
 }
 
@@ -580,10 +544,7 @@ where
             .ok_or_else(missing_traced_shard_map_staging_context)?
             .context()
             .clone();
-        context.stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(Box::new(self.to_tensor_xla_op()?))),
-            inputs,
-        )
+        context.stage_operation(XlaOperation::LinearShardMap(Box::new(self.to_tensor_xla_op()?)), inputs)
     }
 }
 
@@ -713,29 +674,18 @@ impl<V, Capture> Operation<ArrayType> for LinearShardMapOperation<V, Capture> {
     }
 }
 
-impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
-    for LinearShardMapOperation<V, Factor>
+impl<V, Factor, Target> TransposableOperation<ArrayType, V, Target> for LinearShardMapOperation<V, Factor>
+where
+    V: Value<ArrayType>,
+    Factor: Value<ArrayType>,
+    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearShardMapOperation<V, Factor>>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            V,
-            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-        >,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, Target>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            V,
-            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
-        ProgramError,
-    > {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, Target>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, Target>>, ProgramError> {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         if output_cotangents.is_empty() {
             return Ok(vec![Cotangent::Zero; self.input_types.len()]);
@@ -748,12 +698,7 @@ impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayT
             .zip(self.output_types.iter())
             .map(|(cotangent, output_type)| materialize_cotangent(context, cotangent, output_type))
             .collect::<Vec<_>>();
-        let contributions = context.stage_operation(
-            FactorSplitLinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(
-                self.transpose_op(),
-            ))),
-            materialized.as_slice(),
-        )?;
+        let contributions = context.stage_operation(Target::from(self.transpose_op()), materialized.as_slice())?;
         check_count!("output", contributions, self.input_types.len(), ProgramError);
         Ok(contributions.into_iter().map(Cotangent::Staged).collect::<Vec<_>>())
     }
@@ -1144,7 +1089,7 @@ fn apply_flat_traced_shard_map(
 ) -> Result<Vec<ShardMapTracer>, ShardMapTraceError> {
     TracingContext::new(XlaDomain::token(), tracing_builder)
         .stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(body.clone())))),
+            XlaOperation::ShardMap(Box::new(ShardMapOperation::new(body.clone()))),
             traced_inputs.as_slice(),
         )
         .map_err(ShardMapTraceError::from)
@@ -1394,7 +1339,7 @@ where
     Output: Parameterized<Tracer<C>>,
 {
     let staged_outputs = context.stage_operation(
-        XlaOperation::Extension(XlaOperationExtension::ShardMap(Box::new(ShardMapOperation::new(traced.clone())))),
+        XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
         traced_inputs.as_slice(),
     )?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
@@ -1579,9 +1524,7 @@ mod tests {
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::domains::XlaTracer;
-    use crate::experimental::ops::{
-        LinearXlaOperation, XlaConstant, XlaOperation, XlaOperationExtension, XlaProgramBuilder,
-    };
+    use crate::experimental::ops::{LinearXlaOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
     use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap, ShardMapTracer};
 
     use super::{
@@ -1738,9 +1681,7 @@ mod tests {
     fn zero_input_traced_shard_map_body() -> FlatTracedShardMap {
         let array_type = test_array_type();
         let mut builder = XlaProgramBuilder::new();
-        let output = builder
-            .add_instruction(XlaOperation::Zero(ryft_core::ZeroOperation::new(array_type.clone())), vec![])
-            .unwrap()[0];
+        let output = builder.add_instruction(ryft_core::ZeroOperation::new(array_type.clone()), vec![]).unwrap()[0];
         FlatTracedShardMap::from_parts(
             zero_input_test_shard_map(),
             Vec::new(),
@@ -1929,7 +1870,7 @@ mod tests {
         let primal_input = tracing_context.input(test_array_type());
         let tangent_input = context.input(test_array_type());
 
-        let outputs = XlaOperationExtension::LinearShardMap(Box::new(operation))
+        let outputs = XlaOperation::LinearShardMap(Box::new(operation))
             .jvp(&mut context, &[JvpTracer::from_value(primal_input, tangent_input)])
             .expect("linear tensor shard_map jvp should succeed");
 
@@ -2014,10 +1955,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(staged_program.instructions().len(), 1);
-        assert!(matches!(
-            staged_program.instructions()[0].operation(),
-            XlaOperation::Extension(XlaOperationExtension::ShardMap(_))
-        ));
+        assert!(matches!(staged_program.instructions()[0].operation(), XlaOperation::ShardMap(_)));
         assert!(staged_program.instructions()[0].inputs().is_empty());
     }
 }

@@ -31,7 +31,8 @@ use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::{
-    ArrayOperation, DefactorizedOperation, LinearArrayOperation, SupportsLinearWhile, ValueOrCapture,
+    ArrayOperation, CaptureParameterizedOperation, DefactorizedOperation, LinearArrayOperation, SupportsLinearWhile,
+    ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
@@ -40,9 +41,7 @@ use crate::experimental::operations::{
 };
 #[cfg(test)]
 use crate::experimental::ops::XlaProgramBuilder;
-use crate::experimental::ops::{
-    FlatXlaProgram, LinearXlaOperationExtension, XlaConstant, XlaOperation, XlaOperationExtension, XlaProgram,
-};
+use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
 use crate::mlir::ToMlir;
 
 use super::shard_map::{ShardMap, ShardMapError};
@@ -725,15 +724,153 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
     Ok(vec![operation.result(0).expect("stablehlo.custom_call should return one result").as_ref()])
 }
 
-impl LowerableXlaOperation<XlaConstant> for XlaOperationExtension<XlaConstant> {
+impl<V: MlirLowerableValue> LowerableXlaOperation<V> for XlaOperation<V> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
+        output_types: &[ArrayType],
+        mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
+            Self::Zero(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::ZeroLike(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::One(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::OneLike(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Constant(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Fill(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Neg(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Add(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Sub(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Scale(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Mul(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Div(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Sin(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Cos(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::StopGradient(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::RematerializationName(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::TransferToMemory(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Dot(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Transpose(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Reshape(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Reshard(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::ShardingConstraint(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Broadcast(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Slice(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::UpdateSlice(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::DynamicSlice(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::DynamicUpdateSlice(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Pad(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Concatenate(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Gather(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Scatter(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Reduce(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Compare(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Not(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::And(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Or(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Xor(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Collective(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Select(operation) => {
+                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            }
+            Self::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::While(while_operation) => while_operation.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::Scan(scan) => scan.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::CustomJvp(operation) => lower_nested_program_inline(
+                operation.primal(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+                lowerer.nested_functions.as_ref(),
+            ),
+            Self::CustomVjp(operation) => lower_nested_program_inline(
+                operation.primal(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+                lowerer.nested_functions.as_ref(),
+            ),
             Self::JitCall(jit_call_op) => lower_jit_call(
                 jit_call_op.program_rc(),
                 input_values,
@@ -834,10 +971,9 @@ fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
 }
 
-impl<V, Extension> LowerableXlaOperation<V> for ArrayOperation<V, Extension>
+impl<V> LowerableXlaOperation<V> for ArrayOperation<V>
 where
     V: MlirLowerableValue,
-    Extension: LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1169,16 +1305,14 @@ where
                 while_operation.lower_to_mlir(input_values, output_types, mode, lowerer)
             }
             ArrayOperation::Scan(scan) => scan.lower_to_mlir(input_values, output_types, mode, lowerer),
-            ArrayOperation::Extension(extension) => extension.lower_to_mlir(input_values, output_types, mode, lowerer),
         }
     }
 }
 
-impl<V, C, Extension, P> LowerableXlaOperation<V> for LinearArrayOperation<V, C, Extension, V, P>
+impl<V, C, P> LowerableXlaOperation<V> for LinearArrayOperation<V, C, V, P>
 where
     V: MlirLowerableValue,
     C: MlirLowerableValue,
-    Extension: Clone + LowerableXlaOperation<V>,
     P: Clone
         + Operation<ArrayType>
         + LowerableXlaOperation<C>
@@ -1575,60 +1709,6 @@ where
                     lowerer.context,
                     lowerer.location,
                     lowerer.nested_functions.as_ref(),
-                )
-            }
-            LinearArrayOperation::Extension(extension) => {
-                extension.lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-        }
-    }
-}
-
-impl LowerableXlaOperation<ArrayType> for LinearXlaOperationExtension<ArrayType> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        match self {
-            Self::LinearJitCall(jit_call_op) => {
-                let mut captured_values = jit_call_op
-                    .captured_inputs()
-                    .iter()
-                    .map(|value| lowerer.lower_literal_value(value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                captured_values.extend_from_slice(input_values);
-                // A linear call always inlines its callee body: matching JAX, linear operations have no distinct
-                // lowering path — reverse-mode AD re-stages the backward pass as ordinary `jit_call`s before it
-                // reaches the backend, and those are what call-site deduplication acts on.
-                lower_nested_program_inline(
-                    jit_call_op.program(),
-                    captured_values.as_slice(),
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                    false,
-                    lowerer.nested_functions.as_ref(),
-                )
-            }
-            Self::LinearShardMap(op) => {
-                // The captured global primals of an instantiated linear shard-map are concrete factor values;
-                // materialize each one as a literal so the evaluation-mode bodies receive their captured operands
-                // (mirroring how `Select { condition }` and `Residual { factor }` lower instantiated factors).
-                let captured_values = op
-                    .linear_state()
-                    .captured_global_primals()
-                    .iter()
-                    .map(|value| lowerer.lower_literal_value(value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut shard_map_lowerer = ShardMapMlirLowerer::new(lowerer.block, lowerer.context, lowerer.location)
-                    .with_nested_functions(lowerer.nested_functions.clone());
-                shard_map_lowerer.lower_linear_shard_map_eval_mode(
-                    op.linear_state().eval_mode(),
-                    captured_values.as_slice(),
-                    input_values,
                 )
             }
         }
@@ -2210,10 +2290,10 @@ where
     let mut mesh = existing;
     for instruction in program.instructions() {
         match &instruction.operation() {
-            XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => {
+            XlaOperation::JitCall(jit_call_op) => {
                 mesh = collect_nested_sharding_mesh(jit_call_op.program(), mesh)?;
             }
-            XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
+            XlaOperation::ShardMap(shard_map_op) => {
                 let body = shard_map_op.body();
                 mesh = Some(match mesh.take() {
                     Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map().mesh())?,
@@ -2221,7 +2301,7 @@ where
                 });
                 mesh = collect_nested_sharding_mesh(body.program(), mesh)?;
             }
-            XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => {
+            XlaOperation::LinearShardMap(shard_map_op) => {
                 mesh = collect_nested_linear_shard_map_mesh(shard_map_op.linear_state().eval_mode(), mesh)?;
             }
             XlaOperation::Condition(condition_op) => {
@@ -2833,20 +2913,13 @@ where
 /// [`SupportsLinearWhile::defactorize`] (a scale by a referenced residual becomes a recomputed elementwise product,
 /// exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads, so the result
 /// lowers through the ordinary direct linear operation path.
-fn operand_form_scan_body<V, C, Extension, P>(
-    body: &Program<
-        ArrayType,
-        V,
-        LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>,
-        Vec<V>,
-        Vec<V>,
-    >,
+fn operand_form_scan_body<V, C, P>(
+    body: &Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, Vec<V>, Vec<V>>,
     residual_slice_types: &[ArrayType],
-) -> Result<Program<ArrayType, V, LinearArrayOperation<V, C, Extension, V, P>, Vec<V>, Vec<V>>, LoweringError>
+) -> Result<Program<ArrayType, V, LinearArrayOperation<V, C, V, P>, Vec<V>, Vec<V>>, LoweringError>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
     P: Clone
         + Operation<ArrayType>
         + From<MulOperation>
@@ -2856,7 +2929,7 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ConcatenateOperation>,
 {
-    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, Extension, V, P>>::new();
+    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, V, P>>::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
     let body_input_types = body.input_types();
     for (body_atom, input_type) in body.input_ids().iter().zip(body_input_types.iter()) {
@@ -2883,7 +2956,7 @@ where
         match instruction.operation().defactorize(residual_atoms.as_slice(), inputs).map_err(ProgramError::from)? {
             DefactorizedOperation::Operation { operation, inputs } => {
                 let operation = operation
-                    .try_map_captures_preserving_extensions(&mut |factor| match factor {
+                    .try_map_captures(&mut |factor| match factor {
                         ValueOrCapture::Value(value) => Ok(value.clone()),
                         ValueOrCapture::Capture { index, .. } => Err(ProgramError::MalformedProgram(format!(
                             "scan body defactorization left residual reference {index} in operand form",
@@ -2964,12 +3037,14 @@ where
     program.instructions().iter().all(|instruction| {
         !matches!(
             instruction.operation(),
-            ArrayOperation::Condition(_)
-                | ArrayOperation::While(_)
-                | ArrayOperation::Scan(_)
-                | ArrayOperation::CustomJvp(_)
-                | ArrayOperation::CustomVjp(_)
-                | ArrayOperation::Extension(_)
+            XlaOperation::Condition(_)
+                | XlaOperation::While(_)
+                | XlaOperation::Scan(_)
+                | XlaOperation::CustomJvp(_)
+                | XlaOperation::CustomVjp(_)
+                | XlaOperation::JitCall(_)
+                | XlaOperation::ShardMap(_)
+                | XlaOperation::LinearShardMap(_)
         )
     })
 }
@@ -3036,18 +3111,18 @@ fn count_jit_calls<Input, Output>(
 {
     for instruction in program.instructions() {
         match instruction.operation() {
-            ArrayOperation::Condition(condition) => {
+            XlaOperation::Condition(condition) => {
                 count_jit_calls(condition.true_branch(), counts, order, memo);
                 count_jit_calls(condition.false_branch(), counts, order, memo);
             }
-            ArrayOperation::While(while_op) => {
+            XlaOperation::While(while_op) => {
                 count_jit_calls(while_op.condition(), counts, order, memo);
                 count_jit_calls(while_op.body(), counts, order, memo);
             }
-            ArrayOperation::Scan(scan) => count_jit_calls(scan.body(), counts, order, memo),
-            ArrayOperation::CustomJvp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
-            ArrayOperation::CustomVjp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
-            ArrayOperation::Extension(XlaOperationExtension::JitCall(call)) => {
+            XlaOperation::Scan(scan) => count_jit_calls(scan.body(), counts, order, memo),
+            XlaOperation::CustomJvp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
+            XlaOperation::CustomVjp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
+            XlaOperation::JitCall(call) => {
                 let program = call.program_rc();
                 let pointer = Rc::as_ptr(program) as *const () as usize;
                 let key = memo.entry(pointer).or_insert_with(|| jit_call_program_key(program)).clone();
@@ -4021,7 +4096,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
         XlaOperation::Condition(condition_op) => lowerer.lower_condition(condition_op.as_ref(), input_values),
         XlaOperation::While(while_op) => lowerer.lower_while(while_op.as_ref(), input_values),
         XlaOperation::Scan(scan_op) => lowerer.lower_scan(scan_op.as_ref(), input_values),
-        XlaOperation::Extension(XlaOperationExtension::JitCall(jit_call_op)) => lower_jit_call(
+        XlaOperation::JitCall(jit_call_op) => lower_jit_call(
             jit_call_op.program_rc(),
             input_values,
             &mut lowerer.block,
@@ -4029,7 +4104,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.location,
             lowerer.nested_functions.as_ref(),
         ),
-        XlaOperation::Extension(XlaOperationExtension::ShardMap(shard_map_op)) => {
+        XlaOperation::ShardMap(shard_map_op) => {
             let simplified_body = shard_map_op
                 .body()
                 .simplified()
@@ -4042,8 +4117,11 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 simplified_body.global_output_types(),
             )
         }
-        XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => lowerer
-            .lower_linear_shard_map_eval_mode(shard_map_op.linear_state().eval_mode(), captured_values, input_values),
+        XlaOperation::LinearShardMap(shard_map_op) => lowerer.lower_linear_shard_map_eval_mode(
+            shard_map_op.linear_state().eval_mode(),
+            captured_values,
+            input_values,
+        ),
     }
 }
 
@@ -4068,7 +4146,7 @@ where
         .map(|output| program.atoms()[output.index()].r#type().into_owned())
         .collect::<Vec<_>>();
     let captured_values = match &instruction.operation() {
-        XlaOperation::Extension(XlaOperationExtension::LinearShardMap(shard_map_op)) => shard_map_op
+        XlaOperation::LinearShardMap(shard_map_op) => shard_map_op
             .linear_state()
             .captured_global_primals()
             .iter()
@@ -4859,9 +4937,7 @@ mod tests {
 
     /// Wraps `callee` in a `jit_call` operation.
     fn xla_jit_call(callee: std::rc::Rc<FlatXlaProgram>) -> XlaOperation {
-        XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(
-            crate::experimental::ops::JitCallOperation::new(callee),
-        )))
+        XlaOperation::JitCall(Box::new(crate::experimental::ops::JitCallOperation::new(callee)))
     }
 
     /// Lowers an outer program that calls `callees` (one `jit_call` each) and sums the results, returning the
@@ -5177,8 +5253,7 @@ mod tests {
                 .unwrap();
         let mut builder = XlaProgramBuilder::new();
         let input = builder.add_input(input_type);
-        let predicate =
-            builder.add_instruction(XlaOperation::One(OneOperation::new(predicate_type)), vec![]).unwrap()[0];
+        let predicate = builder.add_instruction(OneOperation::new(predicate_type), vec![]).unwrap()[0];
         let output = builder
             .add_instruction(XlaOperation::Condition(Box::new(condition)), vec![predicate, input])
             .unwrap()[0];
@@ -5252,8 +5327,7 @@ mod tests {
         use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
         use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
         type CoreTestOperation = CoreArrayOperation<TestArray>;
-        type DirectLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         // Extended condition over the doubled state `[primal, tangent]`: recomputes `primal > 0` from the primal
@@ -5345,8 +5419,7 @@ mod tests {
         // materialized predicate literal.
         use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
         type CoreTestOperation = CoreArrayOperation<TestArray>;
-        type DirectLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
 
         let scalar_boolean = ArrayType::scalar(DataType::Boolean);
         let scalar_f64 = ArrayType::scalar(DataType::F64);
@@ -5539,15 +5612,11 @@ mod tests {
         // stacked residuals as factor payloads. Lowering materializes each stack as a constant, rewrites the body
         // into operand form (the referenced scale becomes a recomputed `stablehlo.multiply` against the lane
         // slice), and reuses the `stablehlo.while` scan skeleton with the stacks as extra scanned inputs.
-        use std::convert::Infallible;
-
         use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
-        type DirectLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
         type ScanBodyOperation = LinearArrayOperation<
             TestArray,
             TestArray,
-            Infallible,
             ValueOrCapture<ArrayType, TestArray>,
             CoreArrayOperation<TestArray>,
         >;
@@ -5815,13 +5884,7 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<TestArray>,
-            >,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
             TestArray,
             TestArray,
         >;
@@ -5873,13 +5936,7 @@ mod tests {
         type TestPadPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<TestArray>,
-            >,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
             TestArray,
             (TestArray, TestArray),
         >;
@@ -5946,13 +6003,7 @@ mod tests {
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::LinearArrayOperation<
-                    TestArray,
-                    TestArray,
-                    Infallible,
-                    TestArray,
-                    ArrayOperation<TestArray>,
-                >,
+                ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
                 TestArray,
                 (TestArray, TestArray),
             >,
@@ -5976,13 +6027,7 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<TestArray>,
-            >,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
             TestArray,
             TestArray,
         >;
@@ -6064,13 +6109,7 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                TestArray,
-                ArrayOperation<TestArray>,
-            >,
+            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
             TestArray,
             TestArray,
         >;
@@ -6133,7 +6172,6 @@ mod tests {
                 ryft_core::tracing_v2::LinearArrayOperation<
                     NdArrayValue<f64>,
                     NdArrayValue<f64>,
-                    Infallible,
                     NdArrayValue<f64>,
                     ArrayOperation<NdArrayValue<f64>>,
                 >,

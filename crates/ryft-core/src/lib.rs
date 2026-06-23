@@ -1,3 +1,7 @@
+// Derive macros emitted by `ryft-macros` use the public `ryft::...` facade path by default. This `self`-alias
+// lets those same generated paths resolve when those macros are used inside `ryft-core` itself.
+extern crate self as ryft;
+
 pub mod batching;
 pub mod broadcasting;
 pub mod compilation;

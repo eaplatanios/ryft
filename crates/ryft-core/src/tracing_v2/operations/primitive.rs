@@ -1,19 +1,13 @@
-//! Reusable staged operation enums for built-in primitives and backend extensions.
+//! Reusable staged operation enums for built-in primitives.
 //!
-//! [`ArrayOperation`] and [`LinearArrayOperation`] contain the core operations implemented by `ryft-core` plus an
-//! optional statically typed backend extension slot. A backend that needs additional operations should define an
-//! ordinary extension enum, define a linear extension enum when it has linear-only operations, implement the standard
-//! operation traits for those enums, and select `ArrayOperation<Value, Extension>` and
-//! `LinearArrayOperation<Tangent, Constant, LinearExtension, Factor, PrimalOperation>` as its tracing operation types.
-//!
-//! `ryft-core` intentionally does not expose a universal dynamic custom-operation primitive. Backend-specific or
-//! user-defined operations should be represented by a backend extension variant, so transform, interpretation, and
-//! lowering rules remain statically typed and owned by the backend that understands the operation.
+//! [`ArrayOperation`] and [`LinearArrayOperation`] contain the core operations implemented by `ryft-core`. Backends
+//! that need additional operations should define their own operation enum that wraps these core enums together with
+//! backend-specific variants, so transform, interpretation, and lowering rules remain statically typed and owned by
+//! the backend that understands each operation.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
 use ryft_macros::{Operation, TransposableOperation};
@@ -81,7 +75,7 @@ use super::bounds::{
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
-    DefactorizedOperation, LinearConditionOperation, LinearOperandConditionOperation, SupportsLinearCondition,
+    DefactorizedOperation, LinearConditionBranchTransposable, LinearOperandConditionOperation, SupportsLinearCondition,
     SupportsLinearWhile, batch_condition_with_interpreter, batch_while_with_interpreter,
 };
 use super::dot::DotOps;
@@ -94,17 +88,13 @@ use crate::operations::manipulation::Reshape;
 /// Reusable operation enum for ordinary staged programs.
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates. Most variants are thin tags
-/// around one semantic primitive defined elsewhere in [`super`]. The [`Extension`](Self::Extension) variant lets
-/// backends statically compose their own operation enum into the same operation type without dynamic
-/// custom-operation registries. Backends that only need built-in operations can omit the `Extension` parameter and
-/// use the uninhabited [`Infallible`] default.
+/// around one semantic primitive defined elsewhere in [`super`].
 ///
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`],
 /// [`Scale`](Self::Scale) a [`ScaleOperation`], and [`Dot`](Self::Dot) a [`DotOperation`].
 #[derive(Clone, Debug, Operation)]
-#[ryft(crate = "crate")]
-pub enum ArrayOperation<V: Value<ArrayType>, Extension = Infallible> {
+pub enum ArrayOperation<V: Value<ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
@@ -149,18 +139,16 @@ pub enum ArrayOperation<V: Value<ArrayType>, Extension = Infallible> {
     Scan(Box<ScanOperation<ArrayType, V, Self>>),
     CustomJvp(Box<CustomJvpOperation<ArrayType, V, Self>>),
     CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
-    Extension(Extension),
 }
 
 // Differentiation (JVP) for the `ArrayOperation` sum type: each variant delegates to its backing operation's own
 // `DifferentiableOperation` rule. The per-variant `<Payload>: DifferentiableOperation<D>` bounds cover the
-// non-self-referential variants (including the `Extension` slot); the self-referential higher-order
+// non-self-referential variants; the self-referential higher-order
 // `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
 // `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
-impl<V: Value<ArrayType>, Extension, D> DifferentiableOperation<D> for ArrayOperation<V, Extension>
+impl<V: Value<ArrayType>, D> DifferentiableOperation<D> for ArrayOperation<V>
 where
-    Extension: Operation<ArrayType>,
     ZeroOperation<ArrayType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
     OneOperation<ArrayType>: DifferentiableOperation<D>,
@@ -200,8 +188,7 @@ where
     XorOperation: DifferentiableOperation<D>,
     CollectiveOperation: DifferentiableOperation<D>,
     SelectOperation: DifferentiableOperation<D>,
-    Extension: DifferentiableOperation<D>,
-    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = ArrayOperation<V, Extension>>,
+    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = ArrayOperation<V>>,
     D::Operation: From<ZeroOperation<ArrayType>> + From<OneOperation<ArrayType>> + From<FillOperation<ArrayType, f64>>,
     D::Value: crate::tracing_v2::rematerialization::RematerializationName + TransferToMemory,
     D::Value: Add<Output = D::Value>
@@ -242,7 +229,7 @@ where
         >,
     LinearOperationOf<D>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, D::Value>>
         + crate::tracing_v2::ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<ArrayType, V, ArrayOperation<V, Extension>, ValueOrCapture<ArrayType, D::Value>>>
+        + From<CustomVjpCallOperation<ArrayType, V, ArrayOperation<V>, ValueOrCapture<ArrayType, D::Value>>>
         + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
@@ -251,10 +238,10 @@ where
         + From<LinearGatherOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, D::Value>>>
         + SupportsLinearCondition<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>>
-        + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, ArrayOperation<V, Extension>>
+        + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, ArrayOperation<V>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
-    ArrayOperation<V, Extension>: Clone + ProgramLinearizableOperation<D>,
+    ArrayOperation<V>: Clone + ProgramLinearizableOperation<D>,
 {
     fn jvp<'jvp>(
         &self,
@@ -325,20 +312,16 @@ where
                 context,
                 inputs,
             ),
-            Self::Extension(extension) => extension.jvp(context, inputs),
         }
     }
 }
 
 /// Reusable operation enum for staged linear programs.
 ///
-/// [`LinearArrayOperation`] is the linear-program sibling of [`ArrayOperation`]. It contains
-/// operations that can appear in tangent and cotangent programs, including captured-factor linear
-/// maps such as [`LeftDot`](Self::LeftDot) and [`RightDot`](Self::RightDot), and the
-/// linearized higher-order operations needed by rematerialization and control flow. The
-/// [`Extension`](Self::Extension) variant lets backends statically compose linear backend operations into the same
-/// operation type. Backends that only need built-in linear operations can omit the `Extension` parameter and use
-/// the uninhabited [`Infallible`] default.
+/// [`LinearArrayOperation`] is the linear-program sibling of [`ArrayOperation`]. It contains operations that can
+/// appear in tangent and cotangent programs, including captured-factor linear maps such as [`LeftDot`](Self::LeftDot)
+/// and [`RightDot`](Self::RightDot), and the linearized higher-order operations needed by rematerialization and
+/// control flow.
 ///
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
 /// rendering, and interpretation). The [`Operation`]/[`Display`] and per-variant [`From`]/[`TryFrom`] impls are
@@ -349,14 +332,7 @@ where
 /// constant type of captured primal programs such as [`CustomVjpCall`](Self::CustomVjpCall), which are written over
 /// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
-#[ryft(crate = "crate")]
-pub enum LinearArrayOperation<
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    Extension,
-    F: Value<ArrayType>,
-    P: Operation<ArrayType>,
-> {
+pub enum LinearArrayOperation<V: Value<ArrayType>, C: Value<ArrayType>, F: Value<ArrayType>, P: Operation<ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
@@ -388,12 +364,11 @@ pub enum LinearArrayOperation<
     Select(LinearSelectOperation<F>),
     Residual(MaterializeCaptureOperation<F>),
     Recompute(RecomputeOperation<P>),
-    Condition(LinearConditionOperation<V, C, Extension, F, P>),
-    OperandCondition(LinearOperandConditionOperation<V, C, Extension, F, P>),
+    Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
+    OperandCondition(LinearOperandConditionOperation<V, Self>),
     While(Box<WhileOperation<ArrayType, V, Self>>),
-    Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>, F>>),
+    Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
-    Extension(Extension),
 }
 
 impl<T: Type> Operation<T> for Infallible {
@@ -442,7 +417,6 @@ impl<D: DifferentiationContext> DifferentiableOperation<D> for Infallible {
 
 impl<T: Type, F: Value<T>> CaptureParameterizedOperation<T, F> for Infallible {
     type WithCapture<MappedFactor: Value<T>> = Infallible;
-    type WithLocalCapture<MappedFactor: Value<T>> = Infallible;
 
     fn try_map_captures<MappedFactor: Value<T>, MapFactorFn>(
         &self,
@@ -453,50 +427,12 @@ impl<T: Type, F: Value<T>> CaptureParameterizedOperation<T, F> for Infallible {
     {
         match *self {}
     }
-
-    fn try_map_local_captures<MappedFactor: Value<T>, MapFactorFn>(
-        &self,
-        _map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        match *self {}
-    }
-}
-
-impl<V: Value<ArrayType>, Extension: MaybeRematerializationName> MaybeRematerializationName
-    for ArrayOperation<V, Extension>
-{
-    #[inline]
-    fn rematerialization_name(&self) -> Option<&str> {
-        match self {
-            Self::RematerializationName(operation) => Some(operation.tag()),
-            Self::Extension(extension) => extension.rematerialization_name(),
-            _ => None,
-        }
-    }
 }
 
 impl MaybeRematerializationName for Infallible {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
         match *self {}
-    }
-}
-
-impl<V, Extension> MaybeDot for ArrayOperation<V, Extension>
-where
-    V: Value<ArrayType>,
-    Extension: MaybeDot,
-{
-    #[inline]
-    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
-        match self {
-            Self::Dot(operation) => Some(operation.dimensions()),
-            Self::Extension(extension) => extension.dot_dimensions(),
-            _ => None,
-        }
     }
 }
 
@@ -507,8 +443,31 @@ impl MaybeDot for Infallible {
     }
 }
 
-impl<V: Value<ArrayType>, C: Value<ArrayType>, Extension, F: Value<ArrayType>, P>
-    SupportsLinearCondition<ArrayType, V, F> for LinearArrayOperation<V, C, Extension, F, P>
+impl<V: Value<ArrayType>> MaybeRematerializationName for ArrayOperation<V> {
+    #[inline]
+    fn rematerialization_name(&self) -> Option<&str> {
+        match self {
+            Self::RematerializationName(operation) => Some(operation.tag()),
+            _ => None,
+        }
+    }
+}
+
+impl<V> MaybeDot for ArrayOperation<V>
+where
+    V: Value<ArrayType>,
+{
+    #[inline]
+    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
+        match self {
+            Self::Dot(operation) => Some(operation.dimensions()),
+            _ => None,
+        }
+    }
+}
+
+impl<V: Value<ArrayType>, C: Value<ArrayType>, F: Value<ArrayType>, P> SupportsLinearCondition<ArrayType, V, F>
+    for LinearArrayOperation<V, C, F, P>
 where
     P: Operation<ArrayType>,
 {
@@ -518,11 +477,7 @@ where
         true_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         false_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
     ) -> Self {
-        LinearArrayOperation::Condition(LinearConditionOperation::new(
-            predicate,
-            Box::new(true_branch),
-            Box::new(false_branch),
-        ))
+        LinearArrayOperation::Condition(ConditionOperation::new_captured(predicate, true_branch, false_branch).unwrap())
     }
 }
 
@@ -555,24 +510,17 @@ enum NestedResidualDisposition {
 ///   - Instructions referencing both kinds are rejected, mirroring the mixed constant/reference index rejection of
 ///     the dynamic-slicing defactorization arms (defactorization stages exactly one instruction per source
 ///     instruction).
-fn defactorize_nested_linear_program<V, C, Extension, R, P>(
-    program: &Program<
-        ArrayType,
-        V,
-        LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, R>, P>,
-        Vec<V>,
-        Vec<V>,
-    >,
+fn defactorize_nested_linear_program<V, C, R, P>(
+    program: &Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>, Vec<V>, Vec<V>>,
     dispositions: &[Option<NestedResidualDisposition>],
     forwarded_input_types: &[ArrayType],
 ) -> Result<
-    Program<ArrayType, V, LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, R>, P>, Vec<V>, Vec<V>>,
+    Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>, Vec<V>, Vec<V>>,
     ProgramError,
 >
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
         + Operation<ArrayType>
@@ -584,7 +532,7 @@ where
         + From<ConcatenateOperation>,
 {
     let mut builder =
-        ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, R>, P>>::new();
+        ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>>::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
     for (program_atom, input_type) in program.input_ids().iter().zip(program.input_types().into_iter()) {
         atom_map[program_atom.index()] = Some(builder.add_input(input_type));
@@ -617,10 +565,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut references_operand_residual = false;
         let mut references_factor_residual = false;
-        instruction.operation().try_map_captures_preserving_extensions(&mut |factor: &ValueOrCapture<
-            ArrayType,
-            R,
-        >| {
+        instruction.operation().try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
             if let ValueOrCapture::Capture { index, .. } = factor {
                 match resolve_disposition(*index)? {
                     NestedResidualDisposition::Operand(_) => references_operand_residual = true,
@@ -638,7 +583,7 @@ where
                 ),
             });
         }
-        let remapped = instruction.operation().try_map_captures_preserving_extensions(&mut |factor| match factor {
+        let remapped = instruction.operation().try_map_captures(&mut |factor| match factor {
             ValueOrCapture::Capture { index, r#type } => {
                 let position = match resolve_disposition(*index)? {
                     NestedResidualDisposition::Operand(position) => position,
@@ -680,12 +625,11 @@ where
     builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
-impl<V, C, Extension, R, P> SupportsLinearWhile<ArrayType, V, ValueOrCapture<ArrayType, R>, P>
-    for LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, R>, P>
+impl<V, C, R, P> SupportsLinearWhile<ArrayType, V, ValueOrCapture<ArrayType, R>, P>
+    for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
         + Operation<ArrayType>
@@ -827,14 +771,12 @@ where
                 let mut forwarded_residuals = BTreeMap::new();
                 for branch in [true_branch, false_branch] {
                     for instruction in branch.instructions() {
-                        instruction.operation().try_map_captures_preserving_extensions(
-                            &mut |factor: &ValueOrCapture<ArrayType, R>| {
-                                if let ValueOrCapture::Capture { index, r#type } = factor {
-                                    forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
-                                }
-                                Ok(factor.clone())
-                            },
-                        )?;
+                        instruction.operation().try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
+                            if let ValueOrCapture::Capture { index, r#type } = factor {
+                                forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
+                            }
+                            Ok(factor.clone())
+                        })?;
                     }
                 }
                 let mut dispositions = vec![None; residual_atoms.len()];
@@ -913,7 +855,7 @@ where
                 // stages exactly one instruction, so a constant predicate cannot be materialized as the operand the
                 // rewritten branches would require) — are rejected with the offending operation's name.
                 let mut references_residual = false;
-                operation.try_map_captures_preserving_extensions(&mut |factor: &ValueOrCapture<ArrayType, R>| {
+                operation.try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
                     if matches!(factor, ValueOrCapture::Capture { .. }) {
                         references_residual = true;
                     }
@@ -941,22 +883,20 @@ where
     }
 }
 
-impl<V, C, Extension, P> LinearScanBodyInstantiable<ArrayType, V>
-    for LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>
+impl<V, C, P> LinearScanBodyInstantiable<ArrayType, V> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
     P: Clone + Operation<ArrayType>,
 {
-    type Instantiated = LinearArrayOperation<V, C, Extension, V, P>;
+    type Instantiated = LinearArrayOperation<V, C, V, P>;
 
     fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError> {
-        self.try_map_captures_preserving_extensions(&mut |factor| factor.instantiate(residuals))
+        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
     }
 }
 
-impl<V, C, Extension, P> InterpretableNestedProgram<ArrayType, V> for LinearArrayOperation<V, C, Extension, V, P>
+impl<V, C, P> InterpretableNestedProgram<ArrayType, V> for LinearArrayOperation<V, C, V, P>
 where
     V: Value<ArrayType>
         + Parameter
@@ -979,7 +919,6 @@ where
     ConstantOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
     LeftDotOperation<V, Input>: InterpretableOperation<ArrayType, V>,
     RightDotOperation<V, Input>: InterpretableOperation<ArrayType, V>,
-    Extension: Clone + InterpretableOperation<ArrayType, V>,
     V: CustomVjpResidual<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
     P: Clone + InterpretableOperation<ArrayType, V>,
@@ -1099,21 +1038,17 @@ where
                         },
                     )
                 }
-                Self::Extension(extension) => extension.interpret(context, instruction_inputs),
             },
         )
     }
 }
 
-impl<V, C, Extension, P> LinearScanBodyTransposable<ArrayType, V>
-    for LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>
+impl<V, C, P> LinearScanBodyTransposable<ArrayType, V> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>
 where
     V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
     C: Value<ArrayType>,
-    Extension: Clone
-        + Operation<ArrayType>
-        + TransposableOperation<ArrayType, V, LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>>,
     P: Clone + Operation<ArrayType>,
+    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
 {
     #[inline]
     fn transpose_linear_scan_body(
@@ -1123,6 +1058,25 @@ where
         Self: Sized,
     {
         body.transpose()
+    }
+}
+
+impl<V, C, F, P> LinearConditionBranchTransposable<V> for LinearArrayOperation<V, C, F, P>
+where
+    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
+{
+    #[inline]
+    fn transpose_linear_condition_branch(
+        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized,
+    {
+        branch.transpose()
     }
 }
 
@@ -1188,103 +1142,6 @@ pub(crate) fn gather_to_scatter_operation(operation: &GatherOperation) -> Scatte
         .with_unique_indices(operation.unique_indices())
 }
 
-/// Rewriting strategy for backend extension payloads while mapping the factor payloads carried by one
-/// [`LinearArrayOperation`] (see [`map_linear_array_operation_factors`]).
-///
-/// The two implementations cover the two factor spaces a linear program can be mapped in:
-///
-///   - [`RecurseExtensionFactors`] serves enclosing-space passes ([`CaptureParameterizedOperation::try_map_captures`]
-///     and everything built on it, such as residual compaction, rebasing, and instantiation): backend extensions
-///     carry their captured primal payloads in the same enclosing factor space, so the strategy recurses into the
-///     extension's own [`CaptureParameterizedOperation::try_map_captures`].
-///   - [`PreserveExtensionFactors`] serves *body-local* passes (scan-namespace rebinding and per-lane residual
-///     instantiation), whose factor space is local to one control-flow body: extension captures never join such a
-///     local namespace, so the strategy clones extensions unchanged.
-trait ExtensionFactorMapping<Extension, F, MappedFactor>
-where
-    Extension: Clone + Operation<ArrayType>,
-    F: Value<ArrayType>,
-    MappedFactor: Value<ArrayType>,
-{
-    /// Extension operation type produced by this strategy.
-    type MappedExtension: Clone + Operation<ArrayType>;
-
-    /// Maps one backend extension payload, with `map_factor` available for strategies that recurse into the
-    /// extension's own factor payloads.
-    fn map_extension(
-        extension: &Extension,
-        map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    ) -> Result<Self::MappedExtension, ProgramError>;
-}
-
-/// [`ExtensionFactorMapping`] strategy that maps extension payloads through the extension's own
-/// [`CaptureParameterizedOperation::try_map_captures`]; see the trait documentation.
-struct RecurseExtensionFactors;
-
-impl<Extension, F, MappedFactor> ExtensionFactorMapping<Extension, F, MappedFactor> for RecurseExtensionFactors
-where
-    Extension: CaptureParameterizedOperation<ArrayType, F>,
-    F: Value<ArrayType>,
-    MappedFactor: Value<ArrayType>,
-{
-    type MappedExtension = Extension::WithCapture<MappedFactor>;
-
-    fn map_extension(
-        extension: &Extension,
-        mut map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    ) -> Result<Self::MappedExtension, ProgramError> {
-        extension.try_map_captures(&mut map_factor)
-    }
-}
-
-/// [`ExtensionFactorMapping`] strategy that clones extension payloads unchanged; see the trait documentation.
-struct PreserveExtensionFactors;
-
-/// [`ExtensionFactorMapping`] strategy used for the scan-body traversal of an enclosing factor pass: scan bodies
-/// live in their own scan-local factor space that backend extensions never join, so the traversal only converts
-/// the body's static extension type to the enclosing pass's `MappedExtension` and reports
-/// [`ProgramError::UnsupportedOperation`] if an extension operation is actually present inside a scan body.
-struct RejectExtensionFactors<MappedExtension>(PhantomData<MappedExtension>);
-
-impl<Extension, F, MappedFactor, MappedExtension> ExtensionFactorMapping<Extension, F, MappedFactor>
-    for RejectExtensionFactors<MappedExtension>
-where
-    Extension: Clone + Operation<ArrayType>,
-    F: Value<ArrayType>,
-    MappedFactor: Value<ArrayType>,
-    MappedExtension: Clone + Operation<ArrayType>,
-{
-    type MappedExtension = MappedExtension;
-
-    fn map_extension(
-        extension: &Extension,
-        _map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    ) -> Result<Self::MappedExtension, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "extension operation '{}' inside a linear scan body does not support factor mapping",
-                extension.name(),
-            ),
-        })
-    }
-}
-
-impl<Extension, F, MappedFactor> ExtensionFactorMapping<Extension, F, MappedFactor> for PreserveExtensionFactors
-where
-    Extension: Clone + Operation<ArrayType>,
-    F: Value<ArrayType>,
-    MappedFactor: Value<ArrayType>,
-{
-    type MappedExtension = Extension;
-
-    fn map_extension(
-        extension: &Extension,
-        _map_factor: &mut dyn FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    ) -> Result<Self::MappedExtension, ProgramError> {
-        Ok(extension.clone())
-    }
-}
-
 /// Clones one factor payload unchanged; used as a stable `fn`-pointer identity mapping by the scan-body
 /// traversal of [`map_linear_array_operation_factors`].
 fn clone_factor<F: Clone>(factor: &F) -> Result<F, ProgramError> {
@@ -1292,21 +1149,18 @@ fn clone_factor<F: Clone>(factor: &F) -> Result<F, ProgramError> {
 }
 
 /// Shared payload-mapping core behind [`CaptureParameterizedOperation::try_map_captures`] for
-/// [`LinearArrayOperation`], parameterized by an [`ExtensionFactorMapping`] strategy that decides how backend
-/// extension payloads are rewritten (recursed into for enclosing-space passes, cloned for body-local passes).
-fn map_linear_array_operation_factors<V, C, Extension, F, MappedFactor, P, MapFactorFn, Strategy>(
-    operation: &LinearArrayOperation<V, C, Extension, F, P>,
+/// [`LinearArrayOperation`].
+fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
+    operation: &LinearArrayOperation<V, C, F, P>,
     map_factor: &mut MapFactorFn,
-) -> Result<LinearArrayOperation<V, C, Strategy::MappedExtension, MappedFactor, P>, ProgramError>
+) -> Result<LinearArrayOperation<V, C, MappedFactor, P>, ProgramError>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    Strategy: ExtensionFactorMapping<Extension, F, MappedFactor>,
 {
     {
         match operation {
@@ -1375,60 +1229,49 @@ where
             }
             LinearArrayOperation::Recompute(operation) => Ok(LinearArrayOperation::Recompute(operation.clone())),
             LinearArrayOperation::Condition(operation) => {
-                Ok(LinearArrayOperation::Condition(LinearConditionOperation::new(
+                Ok(LinearArrayOperation::Condition(ConditionOperation::new_captured(
                     map_factor(operation.predicate())?,
-                    Box::new(operation.true_branch().map_operations(|operation| {
-                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
-                    })?),
-                    Box::new(operation.false_branch().map_operations(|operation| {
-                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
-                    })?),
-                )))
+                    operation.true_branch().map_operations(|operation| {
+                        map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
+                    })?,
+                    operation.false_branch().map_operations(|operation| {
+                        map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
+                    })?,
+                )?))
             }
             // Operand-form condition branches carry only closed constant factors after defactorization, but the
             // traversal stays total over them like the factor-form variant's.
             LinearArrayOperation::OperandCondition(operation) => {
                 Ok(LinearArrayOperation::OperandCondition(LinearOperandConditionOperation::new(
                     Box::new(operation.true_branch().map_operations(|operation| {
-                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                        map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
                     })?),
                     Box::new(operation.false_branch().map_operations(|operation| {
-                        map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                        map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
                     })?),
                 )))
             }
             LinearArrayOperation::While(while_operation) => {
                 let condition = while_operation.condition().map_operations(|operation| {
-                    map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                    map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
                 })?;
                 let body = while_operation.body().map_operations(|operation| {
-                    map_linear_array_operation_factors::<_, _, _, _, _, _, _, Strategy>(operation, map_factor)
+                    map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
                 })?;
                 Ok(LinearArrayOperation::While(Box::new(
                     WhileOperation::new(condition, body)?.with_iteration_bound(while_operation.iteration_bound())?,
                 )))
             }
-            // The scan body's factor space is scan-local (references index `residual_stacks` per lane), so
-            // enclosing factor passes map only the stack payloads and never rewrite body-internal factors; the
-            // body traversal below merely converts the body's static extension type through
-            // [`RejectExtensionFactors`], which fails only if an extension operation actually appears in the body.
+            // The scan body's factor space is scan-local (references index `residual_stacks` per lane), so enclosing
+            // factor passes map only the stack payloads and clone the body-internal factors unchanged.
             LinearArrayOperation::Scan(operation) => {
                 // The factor-cloning function is passed as a `fn` pointer (not a closure) so the recursive
-                // monomorphization below reaches a fixed point: nested scans reuse the exact same
-                // `(map_factor, Strategy)` instantiation instead of minting a fresh closure type per level.
+                // monomorphization below reaches a fixed point: nested scans reuse the exact same mapper
+                // instantiation instead of minting a fresh closure type per level.
                 let mut clone_scan_local_factor = clone_factor::<ValueOrCapture<ArrayType, V>>
                     as fn(&ValueOrCapture<ArrayType, V>) -> Result<ValueOrCapture<ArrayType, V>, ProgramError>;
                 let body = operation.body().map_operations(|operation| {
-                    map_linear_array_operation_factors::<
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        _,
-                        RejectExtensionFactors<Strategy::MappedExtension>,
-                    >(operation, &mut clone_scan_local_factor)
+                    map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, &mut clone_scan_local_factor)
                 })?;
                 let scan = ScanOperation::<ArrayType, _, _>::new(body, operation.carry_count(), operation.length())?
                     .with_reverse(operation.reverse())
@@ -1436,24 +1279,18 @@ where
                     .with_captures(operation.captures().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?);
                 Ok(LinearArrayOperation::Scan(Box::new(scan)))
             }
-            LinearArrayOperation::Extension(extension) => {
-                Ok(LinearArrayOperation::Extension(Strategy::map_extension(extension, map_factor)?))
-            }
         }
     }
 }
 
-impl<V, C, Extension, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, Extension, F, P>
+impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, F, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension: CaptureParameterizedOperation<ArrayType, F>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
 {
-    type WithCapture<MappedFactor: Value<ArrayType>> =
-        LinearArrayOperation<V, C, Extension::WithCapture<MappedFactor>, MappedFactor, P>;
-    type WithLocalCapture<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, C, Extension, MappedFactor, P>;
+    type WithCapture<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, C, MappedFactor, P>;
 
     fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -1462,44 +1299,7 @@ where
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
-        map_linear_array_operation_factors::<_, _, _, _, _, _, _, RecurseExtensionFactors>(self, map_factor)
-    }
-
-    fn try_map_local_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        self.try_map_captures_preserving_extensions(map_factor)
-    }
-}
-
-impl<V, C, Extension, F, P> LinearArrayOperation<V, C, Extension, F, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
-    F: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-{
-    /// Maps this operation's factor payloads through `map_factor` while cloning backend extension payloads
-    /// unchanged.
-    ///
-    /// This is the *body-local* counterpart of [`CaptureParameterizedOperation::try_map_captures`], used by passes
-    /// whose factor space is local to one control-flow body (scan-namespace rebinding and per-lane residual
-    /// instantiation): extension captures live in the enclosing residual environment rather than in any body-local
-    /// namespace, so such passes must not rewrite them. The extension type is preserved exactly, which is also what
-    /// keeps the rewritten operation embeddable in the same operation universe.
-    pub fn try_map_captures_preserving_extensions<MappedFactor: Value<ArrayType>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<LinearArrayOperation<V, C, Extension, MappedFactor, P>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        map_linear_array_operation_factors::<_, _, _, _, _, _, _, PreserveExtensionFactors>(self, map_factor)
+        map_linear_array_operation_factors::<_, _, _, _, _, _>(self, map_factor)
     }
 }
 
@@ -1567,7 +1367,7 @@ where
 /// capabilities ([`Zero`], [`One`], [`Fill`]) are listed on `V::InterpretationContext`. Each impl site composes only
 /// the categories it actually exercises, so downstream consumers never depend on a single monolithic value-bundle
 /// trait.
-impl<V, Extension> InterpretableOperation<ArrayType, V> for ArrayOperation<V, Extension>
+impl<V> InterpretableOperation<ArrayType, V> for ArrayOperation<V>
 where
     V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V, Infallible>>
         + Parameter
@@ -1584,7 +1384,6 @@ where
         + Zero<ArrayType, V>
         + One<ArrayType, V>
         + Fill<ArrayType, f64, V>,
-    Extension: InterpretableOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
     fn interpret(
@@ -1637,16 +1436,14 @@ where
             Self::Condition(condition) => condition.interpret(context, inputs),
             Self::While(while_operation) => while_operation.interpret(context, inputs),
             Self::Scan(scan) => scan.interpret(context, inputs),
-            Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
 }
 
-impl<S, C, Extension> InterpretableOperation<ArrayType, Tracer<S>> for ArrayOperation<C, Extension>
+impl<S, C> InterpretableOperation<ArrayType, Tracer<S>> for ArrayOperation<C>
 where
     S: StagingContext<Type = ArrayType>,
     C: Value<ArrayType>,
-    Extension: Clone + Operation<ArrayType>,
     Self: Clone + Into<S::Operation>,
 {
     fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
@@ -1654,8 +1451,7 @@ where
     }
 }
 
-impl<V, C, Extension, F: Value<ArrayType>, P> InterpretableOperation<ArrayType, V>
-    for LinearArrayOperation<V, C, Extension, F, P>
+impl<V, C, F: Value<ArrayType>, P> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V, C, F, P>
 where
     V: Value<ArrayType>
         + Parameter
@@ -1677,12 +1473,11 @@ where
         + Scale<ArrayType, V, V, Input>
         + LeftDot<V, V, Input>
         + RightDot<V, V, Input>
-        + LinearScanInterpretation<V, F, LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>>,
+        + LinearScanInterpretation<V, F, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>>,
     ScaleOperation<ArrayType, F, Input>: InterpretableOperation<ArrayType, V>,
     ConstantOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
     LeftDotOperation<F, Input>: InterpretableOperation<ArrayType, V>,
     RightDotOperation<F, Input>: InterpretableOperation<ArrayType, V>,
-    Extension: Clone + InterpretableOperation<ArrayType, V>,
     F: CustomVjpResidual<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
     P: Clone + InterpretableOperation<ArrayType, V>,
@@ -1729,7 +1524,6 @@ where
             Self::OperandCondition(operation) => operation.interpret(context, inputs),
             Self::While(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => context.interpret_linear_scan(operation, inputs),
-            Self::Extension(extension) => extension.interpret(context, inputs),
         }
     }
 }
@@ -1749,8 +1543,8 @@ fn missing_zero_input_batch_rule(operation_enum: &str, kind: &str) -> ProgramErr
 ///
 /// Higher-order variants are intentionally returned as `None` so concrete impls can handle them with their specialized
 /// recursive bounds instead of forcing the trait solver through one fully generic recursive operation impl.
-fn batch_array_non_control_operation<F, V, E>(
-    operation: &ArrayOperation<F, E>,
+fn batch_array_non_control_operation<F, V>(
+    operation: &ArrayOperation<F>,
     context: &V::InterpretationContext,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
@@ -1807,8 +1601,7 @@ where
         | ArrayOperation::While(_)
         | ArrayOperation::Scan(_)
         | ArrayOperation::CustomJvp(_)
-        | ArrayOperation::CustomVjp(_)
-        | ArrayOperation::Extension(_) => return Ok(None),
+        | ArrayOperation::CustomVjp(_) => return Ok(None),
         ArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Zero")),
         ArrayOperation::One(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "One")),
         ArrayOperation::Constant(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Constant")),
@@ -1821,9 +1614,9 @@ where
 /// variant delegates to its backing operation's batching rule (shared with the eager impl through
 /// [`batch_array_non_control_operation`]), while the lane-uniform memory transfer, the named-axis collective, and the
 /// higher-order control-flow variants are handled by their specialized recursive rules.
-impl<C, V, E> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<V, E>
+impl<C, V> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<V>
 where
-    C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<V, E>>,
+    C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<V>>,
     V: Value<ArrayType> + BooleanLike,
     C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
     Tracer<C>: SupportsArithmeticOperations<V>
@@ -1837,7 +1630,6 @@ where
         + BooleanLike
         + Broadcast
         + Transpose,
-    E: Clone + BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
     Self: ProgramBatchableOperation<V>,
 {
@@ -1866,14 +1658,13 @@ where
             Self::Scan(scan) => scan.batch(context, inputs),
             Self::CustomJvp(operation) => operation.batch(context, inputs),
             Self::CustomVjp(operation) => operation.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
     }
 }
 
 /// Blanket value-level batching impl for the [`ArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<V, E>>> for ArrayOperation<V, E>
+impl<V> BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<V>>> for ArrayOperation<V>
 where
     V::InterpretationContext: Default,
     V::InterpretationContext: Scale<ArrayType, V, V>,
@@ -1887,13 +1678,12 @@ where
         + SupportsComparisonOperations
         + Select<Condition = V>
         + BooleanLike,
-    EagerContext<ArrayType, V, ArrayOperation<V, E>>: Zero<ArrayType, V> + Fill<ArrayType, f64, V>,
-    E: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<V, E>>>,
+    EagerContext<ArrayType, V, ArrayOperation<V>>: Zero<ArrayType, V> + Fill<ArrayType, f64, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
         &self,
-        context: &EagerContext<ArrayType, V, ArrayOperation<V, E>>,
+        context: &EagerContext<ArrayType, V, ArrayOperation<V>>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let interpretation_context = V::InterpretationContext::default();
@@ -1911,7 +1701,6 @@ where
             Self::Scan(scan) => scan.batch(context, inputs),
             Self::CustomJvp(operation) => operation.batch(context, inputs),
             Self::CustomVjp(operation) => operation.batch(context, inputs),
-            Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
     }
@@ -1936,13 +1725,9 @@ where
 /// batching-context obligations, which is what lets the traced batching impl require
 /// `Self: ProgramBatchableOperation<..>` without sending the trait solver into an unbounded
 /// batching-context recursion.
-impl<V, E> ProgramBatchableOperation<V> for ArrayOperation<V, E>
+impl<V> ProgramBatchableOperation<V> for ArrayOperation<V>
 where
     V: Value<ArrayType> + BooleanLike + 'static,
-    E: Clone
-        + Operation<ArrayType>
-        + 'static
-        + BatchableOperation<Tracer<ProgramBatchingContext<V, Self>>, BatchingContext<ProgramBatchingContext<V, Self>>>,
     Tracer<ProgramBatchingContext<V, Self>>: SupportsArithmeticOperations<V>
         + SupportsTrigonometricOperations
         + ZeroLike
@@ -1983,14 +1768,13 @@ where
 /// recursion. The `WithCapture<V> = ..` equality pins the canonical linear operation as a fixed point of factor
 /// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
-impl<V, E, Extension> ProgramLinearizableOperation<E> for ArrayOperation<V, Extension>
+impl<V, E> ProgramLinearizableOperation<E> for ArrayOperation<V>
 where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
     E::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
         CaptureParameterizedOperation<ArrayType, V, WithCapture<V> = E::LinearOperation<E::Tangent, V>>,
-    Extension: Clone + Operation<ArrayType> + DifferentiableOperation<LinearizationContextOf<E, Self>>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
         + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
         + From<ZeroOperation<ArrayType>>
@@ -2070,15 +1854,14 @@ where
 }
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
-fn batch_linear_non_control_operation<F, C, V, E>(
-    operation: &LinearArrayOperation<F, C, E, F, ArrayOperation<C, E>>,
+fn batch_linear_non_control_operation<F, C, V>(
+    operation: &LinearArrayOperation<F, C, F, ArrayOperation<C>>,
     context: &V::InterpretationContext,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
     F: Value<ArrayType>,
     C: Value<ArrayType>,
-    E: Operation<ArrayType>,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations<F>
         + ZeroLike
@@ -2157,8 +1940,7 @@ where
         | LinearArrayOperation::OperandCondition(_)
         | LinearArrayOperation::While(_)
         | LinearArrayOperation::Scan(_)
-        | LinearArrayOperation::CustomVjpCall(_)
-        | LinearArrayOperation::Extension(_) => {
+        | LinearArrayOperation::CustomVjpCall(_) => {
             return Ok(None);
         }
         LinearArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("LinearArrayOperation", "Zero")),
@@ -2172,10 +1954,10 @@ where
 }
 
 /// Blanket value-level batching impl for the [`LinearArrayOperation`] sum type.
-impl<V, E> BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>>>
-    for LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>
+impl<V> BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<V, V, V, ArrayOperation<V>>>>
+    for LinearArrayOperation<V, V, V, ArrayOperation<V>>
 where
-    ArrayOperation<V, E>: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<V, E>>>,
+    ArrayOperation<V>: BatchableOperation<V, EagerContext<ArrayType, V, ArrayOperation<V>>>,
     V::InterpretationContext: Default,
     V::InterpretationContext: Scale<ArrayType, V, V> + LeftDot<V, V, Captured> + RightDot<V, V, Captured>,
     V: Value<ArrayType>
@@ -2187,15 +1969,12 @@ where
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
-    EagerContext<ArrayType, V, LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>>: Zero<ArrayType, V>,
-    E: Clone
-        + Operation<ArrayType>
-        + BatchableOperation<V, EagerContext<ArrayType, V, LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>>>,
+    EagerContext<ArrayType, V, LinearArrayOperation<V, V, V, ArrayOperation<V>>>: Zero<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
         &self,
-        context: &EagerContext<ArrayType, V, LinearArrayOperation<V, V, E, V, ArrayOperation<V, E>>>,
+        context: &EagerContext<ArrayType, V, LinearArrayOperation<V, V, V, ArrayOperation<V>>>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
         let interpretation_context = V::InterpretationContext::default();
@@ -2260,7 +2039,7 @@ where
             }
             // Recomputed primal operations batch through the wrapped operation's own primal batching rule.
             Self::Recompute(operation) => {
-                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<V, E>>::new();
+                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<V>>::new();
                 operation.batch(&primal_context, inputs)
             }
             // The captured predicate is lane-uniform: prepending it as an unbatched input lets the condition
@@ -2319,9 +2098,7 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_captures_preserving_extensions(&mut |factor| {
-                                factor.instantiate(lane_residuals.as_slice())
-                            })
+                            operation.try_map_captures(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
                         })?;
                         lane_body.interpret_with(
                             lane_inputs,
@@ -2334,20 +2111,19 @@ where
                 )
             }
             Self::CustomVjpCall(call) => {
-                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<V, E>>::new();
+                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<V>>::new();
                 call.batch(&primal_context, inputs)
             }
-            Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }
     }
 }
 
 /// Blanket active batching impl for the [`LinearArrayOperation`] sum type.
-impl<C, E> BatchableOperation<Tracer<C>, BatchingContext<C>>
-    for LinearArrayOperation<C::Constant, C::Constant, E, C::Constant, ArrayOperation<C::Constant, E>>
+impl<C> BatchableOperation<Tracer<C>, BatchingContext<C>>
+    for LinearArrayOperation<C::Constant, C::Constant, C::Constant, ArrayOperation<C::Constant>>
 where
-    ArrayOperation<C::Constant, E>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
+    ArrayOperation<C::Constant>: BatchableOperation<Tracer<C>, BatchingContext<C>>,
     C: StagingContext<Type = ArrayType>
         + Scale<ArrayType, Tracer<C>, C::Constant>
         + LeftDot<Tracer<C>, C::Constant, Captured>
@@ -2363,7 +2139,6 @@ where
         + Select<Condition = Tracer<C>>
         + BooleanLike
         + TransferToMemory,
-    E: Clone + Operation<ArrayType> + BatchableOperation<Tracer<C>, BatchingContext<C>>,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
 {
     fn batch(
@@ -2482,9 +2257,7 @@ where
                             .map(|stack| read_scan_lane(stack, lane))
                             .collect::<Result<Vec<_>, _>>()?;
                         let lane_body = body.map_operations(|operation| {
-                            operation.try_map_captures_preserving_extensions(&mut |factor| {
-                                factor.instantiate(lane_residuals.as_slice())
-                            })
+                            operation.try_map_captures(&mut |factor| factor.instantiate(lane_residuals.as_slice()))
                         })?;
                         context.interpret_program(&lane_body, lane_inputs)
                     },
@@ -2507,7 +2280,6 @@ where
                 values.extend(inputs.iter().cloned());
                 context.interpret_program(call.backward(), values)
             }
-            Self::Extension(extension) => extension.batch(context, inputs),
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }
     }
@@ -2534,8 +2306,7 @@ mod tests {
         // computation rather than a linear operand, so it is carried verbatim into one staged transposed condition
         // over the transposed branch programs. Runtime (factor) predicates used to be rejected with an
         // `UnsupportedOperation` error.
-        type TestLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
+        type TestLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
         let scale_branch = |factor: f64| {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -2549,11 +2320,14 @@ mod tests {
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
         };
-        let operation = TestLinearOperation::Condition(LinearConditionOperation::new(
-            TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-            Box::new(scale_branch(2.0)),
-            Box::new(scale_branch(3.0)),
-        ));
+        let operation = TestLinearOperation::Condition(
+            ConditionOperation::new_captured(
+                TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+                scale_branch(2.0),
+                scale_branch(3.0),
+            )
+            .unwrap(),
+        );
 
         let domain = AbstractDomain::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestLinearOperation>::new()));

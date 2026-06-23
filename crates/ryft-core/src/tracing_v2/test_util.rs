@@ -25,7 +25,6 @@ pub(crate) fn scalar_scale_branch(
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::convert::Infallible;
     use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
@@ -40,7 +39,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::payloads::Input;
     use crate::programs::ProgramBuilder;
-    use crate::tracing_v2::operations::control_flow::LinearConditionOperation;
     use crate::tracing_v2::{
         ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext,
         JvpTracer, LinearArrayOperation, ResidualizedOperation, TangentContext, ValueOrCapture, jacrev,
@@ -318,46 +316,40 @@ mod tests {
         let mut builder = ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
             .add_instruction(ScaleOperation::<ArrayType, TestArray, Input>::new(TestArray::scalar(5.0)), vec![input])
             .unwrap()[0];
         let linear_branch = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let operation: LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>> =
-            LinearArrayOperation::Condition(LinearConditionOperation::new(
-                TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-                Box::new(linear_branch.clone()),
-                Box::new(linear_branch),
-            ));
+        let operation: LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> =
+            LinearArrayOperation::Condition(
+                ConditionOperation::new_captured(
+                    TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+                    linear_branch.clone(),
+                    linear_branch,
+                )
+                .unwrap(),
+            );
 
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let zero_input = ArrayBatch::new(batched_type, TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
         let context = EagerContext::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new();
-        let outputs = <LinearArrayOperation<TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<TestArray>,
-        > as BatchableOperation<
-            TestArray,
-            EagerContext<
-                ArrayType,
+        let outputs =
+            <LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> as BatchableOperation<
                 TestArray,
-                LinearArrayOperation<TestArray,
+                EagerContext<
+                    ArrayType,
                     TestArray,
-                    Infallible,
-                    TestArray,
-                    ArrayOperation<TestArray>,
+                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
                 >,
-            >,
-        >>::batch(&operation, &context, &[zero_input])
-        .unwrap();
+            >>::batch(&operation, &context, &[zero_input])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].value().values, vec![0.0, 0.0, 0.0, 0.0]);
     }
@@ -367,14 +359,14 @@ mod tests {
     ) -> crate::programs::Program<
         ArrayType,
         TestArray,
-        LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+        LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         Vec<TestArray>,
         Vec<TestArray>,
     > {
         let mut builder = ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
@@ -602,12 +594,15 @@ mod tests {
 
         // Linear condition with a captured `true` predicate factor dispatches to the selected branch over the batched
         // operand. Per-lane output is `[1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]`.
-        let operation: LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>> =
-            LinearArrayOperation::Condition(LinearConditionOperation::new(
-                TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-                Box::new(linear_scalar_scale_branch(2.0)),
-                Box::new(linear_scalar_scale_branch(3.0)),
-            ));
+        let operation: LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> =
+            LinearArrayOperation::Condition(
+                ConditionOperation::new_captured(
+                    TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+                    linear_scalar_scale_branch(2.0),
+                    linear_scalar_scale_branch(3.0),
+                )
+                .unwrap(),
+            );
 
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let operand_batch =
@@ -616,27 +611,18 @@ mod tests {
         let context = EagerContext::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new();
-        let outputs = <LinearArrayOperation<TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<TestArray>,
-        > as BatchableOperation<
-            TestArray,
-            EagerContext<
-                ArrayType,
+        let outputs =
+            <LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> as BatchableOperation<
                 TestArray,
-                LinearArrayOperation<TestArray,
+                EagerContext<
+                    ArrayType,
                     TestArray,
-                    Infallible,
-                    TestArray,
-                    ArrayOperation<TestArray>,
+                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
                 >,
-            >,
-        >>::batch(&operation, &context, &[operand_batch])
-        .unwrap();
+            >>::batch(&operation, &context, &[operand_batch])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![2.0, 4.0, 6.0, 8.0]);
@@ -647,12 +633,15 @@ mod tests {
         use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 
         // Linear condition with a captured predicate factor and an all-zero tangent operand preserves the zero payload.
-        let operation: LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>> =
-            LinearArrayOperation::Condition(LinearConditionOperation::new(
-                TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-                Box::new(linear_scalar_scale_branch(2.0)),
-                Box::new(linear_scalar_scale_branch(3.0)),
-            ));
+        let operation: LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> =
+            LinearArrayOperation::Condition(
+                ConditionOperation::new_captured(
+                    TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
+                    linear_scalar_scale_branch(2.0),
+                    linear_scalar_scale_branch(3.0),
+                )
+                .unwrap(),
+            );
 
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let zero_operand_batch =
@@ -661,27 +650,18 @@ mod tests {
         let context = EagerContext::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new();
-        let outputs = <LinearArrayOperation<TestArray,
-            TestArray,
-            Infallible,
-            TestArray,
-            ArrayOperation<TestArray>,
-        > as BatchableOperation<
-            TestArray,
-            EagerContext<
-                ArrayType,
+        let outputs =
+            <LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> as BatchableOperation<
                 TestArray,
-                LinearArrayOperation<TestArray,
+                EagerContext<
+                    ArrayType,
                     TestArray,
-                    Infallible,
-                    TestArray,
-                    ArrayOperation<TestArray>,
+                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
                 >,
-            >,
-        >>::batch(&operation, &context, &[zero_operand_batch])
-        .unwrap();
+            >>::batch(&operation, &context, &[zero_operand_batch])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 0.0, 0.0, 0.0]);
@@ -1172,13 +1152,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                ValueOrCapture<ArrayType, TestArray>,
-                ArrayOperation<TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
@@ -1222,13 +1196,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                TestArray,
-                TestArray,
-                Infallible,
-                ValueOrCapture<ArrayType, TestArray>,
-                ArrayOperation<TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

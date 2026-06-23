@@ -553,22 +553,11 @@ mod tests {
 
     impl<Factor: Value<TestType>> CaptureParameterizedOperation<TestType, Factor> for TestLinearOperation {
         type WithCapture<MappedFactor: Value<TestType>> = Self;
-        type WithLocalCapture<MappedFactor: Value<TestType>> = Self;
 
         fn try_map_captures<MappedFactor: Value<TestType>, MapFactorFn>(
             &self,
             _map_factor: &mut MapFactorFn,
         ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
-        where
-            MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
-        {
-            Ok(self.clone())
-        }
-
-        fn try_map_local_captures<MappedFactor: Value<TestType>, MapFactorFn>(
-            &self,
-            _map_factor: &mut MapFactorFn,
-        ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
         where
             MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
         {

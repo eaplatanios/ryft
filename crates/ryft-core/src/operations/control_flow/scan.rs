@@ -313,36 +313,26 @@ impl ScanTypeSemantics for DataType {
 /// This trait mirrors [`ScanTypeSemantics`] at execution time. Array values must support slicing, updating, and
 /// reshaping so lanes can be read from and written to stacked values. Scalar values need no such capabilities because
 /// scalar scans are carry-only.
-pub(crate) trait ScanRuntime<T: ScanTypeSemantics>: Value<T> {
+pub(crate) trait ScanRuntime<T: ScanTypeSemantics, C: Value<T>>: Value<T> {
     /// Interprets `operation` in `context` using `inputs`.
-    fn interpret_scan<BodyValue, O, Capture>(
-        operation: &ScanOperation<T, BodyValue, O, Capture>,
+    fn interpret_scan<O: InterpretableOperation<T, Self>, Capture: Value<T>>(
+        operation: &ScanOperation<T, C, O, Capture>,
         context: &Self::InterpretationContext,
         inputs: &[Self],
-    ) -> Result<Vec<Self>, ProgramError>
-    where
-        BodyValue: Value<T>,
-        O: InterpretableOperation<T, Self>,
-        Capture: Value<T>,
-        Self::InterpretationContext: Context<Type = T, Constant = BodyValue, Value = Self>;
+    ) -> Result<Vec<Self>, ProgramError>;
 }
 
-impl<V> ScanRuntime<ArrayType> for V
+impl<C, V> ScanRuntime<ArrayType, C> for V
 where
+    C: Value<ArrayType>,
     V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V> + Zero<ArrayType, V>,
 {
-    fn interpret_scan<BodyValue, O, Capture>(
-        operation: &ScanOperation<ArrayType, BodyValue, O, Capture>,
+    fn interpret_scan<O: InterpretableOperation<ArrayType, Self>, Capture: Value<ArrayType>>(
+        operation: &ScanOperation<ArrayType, C, O, Capture>,
         context: &Self::InterpretationContext,
         inputs: &[Self],
-    ) -> Result<Vec<Self>, ProgramError>
-    where
-        BodyValue: Value<ArrayType>,
-        O: InterpretableOperation<ArrayType, Self>,
-        Capture: Value<ArrayType>,
-        Self::InterpretationContext: Context<Type = ArrayType, Constant = BodyValue, Value = Self>,
-    {
+    ) -> Result<Vec<Self>, ProgramError> {
         let y_slice_types = operation.body.output_types().split_off(operation.carry_count);
         interpret_scan_lanes(
             operation.carry_count,
@@ -362,21 +352,17 @@ where
     }
 }
 
-impl<V> ScanRuntime<DataType> for V
+impl<C, V> ScanRuntime<DataType, C> for V
 where
+    C: Value<DataType>,
     V: Value<DataType>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
 {
-    fn interpret_scan<BodyValue, O, Capture>(
-        operation: &ScanOperation<DataType, BodyValue, O, Capture>,
+    fn interpret_scan<O: InterpretableOperation<DataType, Self>, Capture: Value<DataType>>(
+        operation: &ScanOperation<DataType, C, O, Capture>,
         context: &Self::InterpretationContext,
         inputs: &[Self],
-    ) -> Result<Vec<Self>, ProgramError>
-    where
-        BodyValue: Value<DataType>,
-        O: InterpretableOperation<DataType, Self>,
-        Capture: Value<DataType>,
-        Self::InterpretationContext: Context<Type = DataType, Constant = BodyValue, Value = Self>,
-    {
+    ) -> Result<Vec<Self>, ProgramError> {
         let mut state = inputs.to_vec();
         for _ in 0..operation.length {
             state = operation.body.interpret_with(
@@ -564,7 +550,7 @@ where
 ///
 /// The slice bounds and the squeezed shape are derived from the stacked value's own type, which must be fully static
 /// with a leading axis of extent greater than `lane` (guaranteed for stacked scan values by construction).
-pub(crate) fn read_scan_lane<V>(stack: &V, lane: usize) -> Result<V, ProgramError>
+pub fn read_scan_lane<V>(stack: &V, lane: usize) -> Result<V, ProgramError>
 where
     V: Value<ArrayType> + Slice + Reshape,
 {
@@ -626,7 +612,7 @@ where
 ///   - `allocate_zero`: Allocates a zero value of the provided stacked output type.
 ///   - `interpret_lane`: Evaluates one iteration, mapping `(lane, [carry..., x_slice...])` to `[carry...,
 ///     y_slice...]`.
-pub(crate) fn interpret_scan_lanes<V, AllocateZeroFn, InterpretLaneFn>(
+pub fn interpret_scan_lanes<V, AllocateZeroFn, InterpretLaneFn>(
     carry_count: usize,
     length: usize,
     reverse: bool,
@@ -667,18 +653,16 @@ where
     Ok(carries)
 }
 
-impl<T, BodyValue, V, O, Capture> InterpretableOperation<T, V> for ScanOperation<T, BodyValue, O, Capture>
+impl<C, V, O, Capture> InterpretableOperation<ArrayType, V> for ScanOperation<ArrayType, C, O, Capture>
 where
-    T: ScanTypeSemantics,
-    BodyValue: Value<T>,
-    V: ScanRuntime<T>,
-    V::InterpretationContext: Context<Type = T, Constant = BodyValue, Value = V>,
-    O: InterpretableOperation<T, V>,
-    Capture: Value<T>,
+    C: Value<ArrayType>,
+    V: ScanRuntime<ArrayType, C>,
+    O: InterpretableOperation<ArrayType, V>,
+    Capture: Value<ArrayType>,
 {
     fn interpret(
         &self,
-        context: &<V as Value<T>>::InterpretationContext,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();

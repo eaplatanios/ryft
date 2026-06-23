@@ -54,13 +54,6 @@ pub trait CaptureParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation
     /// Operation type produced by replacing `F` payloads with `MappedFactor` payloads.
     type WithCapture<MappedFactor: Value<T>>: Clone + Operation<T>;
 
-    /// Operation type produced by replacing body-local `F` payloads with `MappedFactor` payloads.
-    ///
-    /// This is usually identical to [`WithCapture`](Self::WithCapture). Operation families that statically embed
-    /// backend extension variants may keep extension payloads in the enclosing capture namespace while remapping a
-    /// nested control-flow body's local namespace; those families use a distinct local mapping type.
-    type WithLocalCapture<MappedFactor: Value<T>>: Clone + Operation<T>;
-
     /// Maps every factor payload carried by this operation through `map_factor`.
     ///
     /// Operations without factor payloads should return an equivalent operation and not call `map_factor`.
@@ -68,18 +61,6 @@ pub trait CaptureParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation
         &self,
         map_factor: &mut MapFactorFn,
     ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>;
-
-    /// Maps factor payloads that belong to a nested body-local namespace through `map_factor`.
-    ///
-    /// For most operation families this is the same as [`try_map_captures`](Self::try_map_captures). Families with
-    /// backend extension slots can preserve extension payloads here because extension captures remain owned by the
-    /// enclosing program, not by a scan-local or condition-local body namespace.
-    fn try_map_local_captures<MappedFactor: Value<T>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>;
 }

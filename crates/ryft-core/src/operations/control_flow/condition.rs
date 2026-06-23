@@ -1,8 +1,10 @@
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use crate::macros::{check_count, check_types};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
+use crate::payloads::{Captured, Input};
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, Type, TypeError};
 
@@ -11,9 +13,11 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// [`Operation`] that evaluates one of two nested branch [`Program`]s depending on a Boolean predicate that is always
-/// supplied as the first operation input (a scalar Boolean operand). The remaining operation inputs are forwarded to
-/// the selected branch, and so both branches must consume the same input types and produce the same output types.
+/// [`Operation`] that evaluates one of two nested branch [`Program`]s depending on a Boolean predicate. Ordinary
+/// conditions use the [`Input`] predicate payload: the predicate is supplied as the first operation input (a scalar
+/// Boolean operand) and the remaining operation inputs are forwarded to the selected branch. Linearized conditions use
+/// the [`Captured`] predicate payload: the predicate is stored in the operation payload as a residual value and the
+/// operation inputs are exactly the branch operand tangents or cotangents.
 ///
 /// A predicate that is already known while *building* a program is naturally expressed with a plain Rust `if` that
 /// chooses which operations to stage, so no `condition` operation is needed for it. A predicate that is staged as a
@@ -25,13 +29,33 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 /// directly. Structured Rust parameters are flattened before a branch is captured (i.e., via [`Parameterized`]
 /// helpers) and reconstructed later as needed. The operation itself only needs the ordered parameter signature for
 /// type checking, interpretation, batching, differentiation, transposition, and other transforms.
-#[derive(Clone, Debug)]
-pub struct ConditionOperation<T: Type, V: Value<T>, O> {
+#[derive(Clone)]
+pub struct ConditionOperation<T: Type, V: Value<T>, O, F: Value<T> = V, PredicatePayload = Input> {
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     pub(crate) true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is false.
     pub(crate) false_branch: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Captured predicate for captured-predicate conditions, or `None` for input-predicate conditions.
+    pub(crate) predicate: Option<F>,
+
+    /// Marker describing where the predicate value lives.
+    pub(crate) predicate_payload: PhantomData<PredicatePayload>,
+}
+
+impl<T: Type, V: Value<T>, O: Debug, F: Value<T>, PredicatePayload> Debug
+    for ConditionOperation<T, V, O, F, PredicatePayload>
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("ConditionOperation");
+        debug.field("true_branch", &self.true_branch);
+        debug.field("false_branch", &self.false_branch);
+        if let Some(predicate) = &self.predicate {
+            debug.field("predicate", predicate);
+        }
+        debug.finish()
+    }
 }
 
 impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<ArrayType, V, O> {
@@ -52,11 +76,42 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ConditionOperation<ArrayType,
         check_types!("condition branch input", &input_types, &false_branch.input_types());
         let output_types = true_branch.output_types();
         check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self { true_branch, false_branch })
+        Ok(Self { true_branch, false_branch, predicate: None, predicate_payload: PhantomData })
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> ConditionOperation<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>, F: Value<T>> ConditionOperation<T, V, O, F, Captured> {
+    /// Creates a new [`ConditionOperation`] whose predicate is captured in the operation payload rather than supplied
+    /// as an input operand.
+    ///
+    /// # Parameters
+    ///
+    ///   - `predicate`: Captured Boolean predicate that selects the branch program to run.
+    ///   - `true_branch`: Branch [`Program`] evaluated when the predicate is true.
+    ///   - `false_branch`: Branch [`Program`] evaluated when the predicate is false. This program must have the same
+    ///     input and output type signatures as `true_branch`.
+    pub fn new_captured(
+        predicate: F,
+        true_branch: Program<T, V, O, Vec<V>, Vec<V>>,
+        false_branch: Program<T, V, O, Vec<V>, Vec<V>>,
+    ) -> Result<Self, TypeError> {
+        let input_types = true_branch.input_types();
+        check_types!("condition branch input", &input_types, &false_branch.input_types());
+        let output_types = true_branch.output_types();
+        check_types!("condition branch output", &output_types, &false_branch.output_types());
+        Ok(Self { true_branch, false_branch, predicate: Some(predicate), predicate_payload: PhantomData })
+    }
+
+    /// Returns the captured Boolean predicate that selects the branch to run.
+    #[inline]
+    pub fn predicate(&self) -> &F {
+        self.predicate.as_ref().unwrap()
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>, F: Value<T>, PredicatePayload>
+    ConditionOperation<T, V, O, F, PredicatePayload>
+{
     /// Returns the branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
     #[inline]
     pub fn true_branch(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -76,7 +131,8 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ConditionOperation<T, V, O> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for ConditionOperation<T, V, O>
+impl<T: Type, V: Value<T>, O, F: Value<T>, PredicatePayload> Display
+    for ConditionOperation<T, V, O, F, PredicatePayload>
 where
     Self: Operation<T>,
 {
@@ -85,7 +141,7 @@ where
     }
 }
 
-impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<T, V, O> {
+impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for ConditionOperation<T, V, O, V, Input> {
     #[inline]
     fn name(&self) -> &'static str {
         CONDITION_OPERATION_NAME
@@ -111,7 +167,34 @@ impl<T: Type + BooleanLike, V: Value<T>, O: Operation<T>> Operation<T> for Condi
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, V, O>
+impl<V: Value<ArrayType>, F: Value<ArrayType>, O: Operation<ArrayType>> Operation<ArrayType>
+    for ConditionOperation<ArrayType, V, O, F, Captured>
+{
+    #[inline]
+    fn name(&self) -> &'static str {
+        CONDITION_OPERATION_NAME
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        let branch_input_types = self.true_branch.input_types();
+        check_types!("condition branch input", &branch_input_types, &self.false_branch.input_types());
+        let output_types = self.true_branch.output_types();
+        check_types!("condition branch output", &output_types, &self.false_branch.output_types());
+        check_count!("input", input_types, branch_input_types.len(), TypeError);
+        check_types!("condition operand", &branch_input_types, input_types);
+        Ok(output_types)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, CONDITION_OPERATION_NAME)?.bracketed(|operation| {
+            operation.field("predicate", self.predicate())?;
+            operation.program("true_branch", &self.true_branch)?;
+            operation.program("false_branch", &self.false_branch)
+        })
+    }
+}
+
+impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, V, O, V, Input>
 where
     V: Value<ArrayType> + BooleanLike,
     O: InterpretableOperation<ArrayType, V>,

@@ -295,9 +295,9 @@ impl Operation<ArrayType> for DotOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum NoExtension {}
+enum BackendPayload {}
 
-impl Operation<ArrayType> for NoExtension {
+impl Operation<ArrayType> for BackendPayload {
     fn name(&self) -> &'static str {
         match *self {}
     }
@@ -307,7 +307,7 @@ impl Operation<ArrayType> for NoExtension {
     }
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> TransposableOperation<ArrayType, V, O> for NoExtension {
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> TransposableOperation<ArrayType, V, O> for BackendPayload {
     fn transpose<'transpose>(
         &self,
         _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
@@ -381,11 +381,11 @@ fn test_array_operation_type_inference() {
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
-enum ArrayOperation<V: Value<ArrayType>, Extension = NoExtension> {
+enum ArrayOperation<V: Value<ArrayType>, Backend = BackendPayload> {
     Zero(ZeroOperation<ArrayType>),
     Dot(DotOperation),
     Scale(ScaleOperation<ArrayType, V>),
-    Extension(Extension),
+    Backend(Backend),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -516,20 +516,20 @@ impl<T: Clone + Type, V: Value<T>, O: Operation<T>, C, P, F> TransposableOperati
 enum LinearArrayOperation<
     V: Value<ArrayType>,
     C: Value<ArrayType>,
-    Extension = NoExtension,
+    Backend = BackendPayload,
     F: Value<ArrayType> = V,
-    P: Operation<ArrayType> = ArrayOperation<C, Extension>,
+    P: Operation<ArrayType> = ArrayOperation<C, Backend>,
 > {
     Zero(ZeroOperation<ArrayType>),
     Scale(ScaleOperation<ArrayType, F>),
     Recompute(RecomputeOperation<P>),
     While(Box<WhileOperation<ArrayType, V, Self>>),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
-    Extension(Extension),
+    Backend(Backend),
 }
 
 #[test]
-fn test_array_operation_extension_conversion_skip() {
+fn test_array_operation_generic_payload_conversion_skip() {
     let zero = ArrayOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
     let dot = ArrayOperation::<Factor>::from(DotOperation);
     let scale = ArrayOperation::<Factor>::from(ScaleOperation { factor: Factor(11), marker: PhantomData });
@@ -546,8 +546,8 @@ fn test_array_operation_extension_conversion_skip() {
         Ok(&ScaleOperation { factor: Factor(11), marker: PhantomData }),
     );
 
-    // If the derive generated `From<Extension>` for `Extension(Extension)`, it would overlap with `From<DotOperation>`
-    // because `Extension` is unconstrained and could be `DotOperation`. This test target compiling proves that the
+    // If the derive generated `From<Backend>` for `Backend(Backend)`, it would overlap with `From<DotOperation>`
+    // because `Backend` is unconstrained and could be `DotOperation`. This test target compiling proves that the
     // bare generic payload was skipped automatically.
 }
 
@@ -560,7 +560,7 @@ fn test_linear_array_operation_shape() {
     let recompute = Linear::from(RecomputeOperation { operation: ArrayOperation::<Factor>::from(DotOperation) });
     let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
     let custom_vjp_call =
-        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, NoExtension>, Factor> {
+        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, BackendPayload>, Factor> {
             marker: PhantomData,
         });
 
@@ -574,7 +574,7 @@ fn test_linear_array_operation_shape() {
 
     assert_eq!(recompute, Linear::Recompute(RecomputeOperation { operation: ArrayOperation::from(DotOperation) }));
     assert_eq!(
-        <&RecomputeOperation<ArrayOperation<Factor, NoExtension>>>::try_from(&recompute),
+        <&RecomputeOperation<ArrayOperation<Factor, BackendPayload>>>::try_from(&recompute),
         Ok(&RecomputeOperation { operation: ArrayOperation::from(DotOperation) }),
     );
     assert_eq!(
@@ -582,14 +582,14 @@ fn test_linear_array_operation_shape() {
         Ok(&WhileOperation { marker: PhantomData }),
     );
     assert_eq!(
-        <&CustomVjpCallOperation<ArrayType, Factor, ArrayOperation<Factor, NoExtension>, Factor>>::try_from(
+        <&CustomVjpCallOperation<ArrayType, Factor, ArrayOperation<Factor, BackendPayload>, Factor>>::try_from(
             &custom_vjp_call
         ),
         Ok(&CustomVjpCallOperation { marker: PhantomData }),
     );
     assert_eq!(<&ZeroOperation<ArrayType>>::try_from(&while_operation), Err(()));
 
-    // `Extension(Extension)` is a bare generic payload, so its conversion is skipped automatically, while the
+    // `Backend(Backend)` is a bare generic payload, so its conversion is skipped automatically, while the
     // recompute wrapper and boxed payloads still expose conversions.
 }
 
@@ -604,7 +604,7 @@ fn test_transposable_operation_forwards_to_variant_payloads() {
     let recompute = Linear::from(RecomputeOperation { operation: ArrayOperation::<Factor>::from(DotOperation) });
     let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
     let custom_vjp_call =
-        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, NoExtension>, Factor> {
+        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, BackendPayload>, Factor> {
             marker: PhantomData,
         });
 

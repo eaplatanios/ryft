@@ -1,6 +1,8 @@
 use std::cell::RefCell;
-use std::fmt::Display;
+use std::ops::Mul;
 use std::rc::Rc;
+
+use ryft_macros::Operation;
 
 use ryft_core::batching::BatchingError;
 use ryft_core::compilation::CapturedConstant;
@@ -8,165 +10,697 @@ use ryft_core::contexts::StagingContext;
 use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
-use ryft_core::operations::constants::ZeroOperation;
-use ryft_core::operations::{InterpretableOperation, Operation, OperationFormatter};
-use ryft_core::parameters::Placeholder;
+use ryft_core::operations::arithmetic::{
+    AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
+};
+use ryft_core::operations::compare::CompareOperation;
+use ryft_core::operations::constants::{
+    ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
+};
+use ryft_core::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
+use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
+use ryft_core::operations::differentiation::StopGradientOperation;
+use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
+use ryft_core::operations::manipulation::{
+    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+    GatherOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation,
+    LinearScatterAddOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
+    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+};
+use ryft_core::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
+use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
+use ryft_core::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
+use ryft_core::parameters::{Parameterized, ParameterizedFamily, Placeholder};
+use ryft_core::payloads::{Captured, Input};
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
-use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
+use ryft_core::tracing_v2::batching::{
+    ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingContext,
+    ProgramBatchingOutputAxes, batch_input_metadata, batch_program,
+};
+use ryft_core::tracing_v2::differentiation::LinearizationContextOf;
+use ryft_core::tracing_v2::operations::SupportsLinearArrayOperation;
+use ryft_core::tracing_v2::operations::bounds::{
+    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsManipulationOperations,
+    SupportsTrigonometricOperations,
+};
+use ryft_core::tracing_v2::operations::control_flow::{
+    LinearConditionBranchTransposable, LinearOperandConditionOperation, SupportsLinearCondition, SupportsLinearWhile,
+};
+use ryft_core::tracing_v2::operations::custom_derivatives::{
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
+};
+use ryft_core::tracing_v2::operations::dot::{Dot, DotOps, LeftDotOperation, RightDotOperation};
+use ryft_core::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
+use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
+use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
+use ryft_core::tracing_v2::operations::reshape::ReshapeValue;
+use ryft_core::tracing_v2::operations::scan::{
+    InterpretableNestedProgram, LinearScanBodyInstantiable, LinearScanBodyTransposable,
+};
+use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
-    ArrayOperation, CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer,
-    LinearArrayOperation, LinearOperationOf, TangentContext, ValueOrCapture,
+    ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DefactorizedOperation, DifferentiableOperation,
+    DifferentiationContext, DotOperation, JvpTracer, LinearArrayOperation, LinearOperationOf,
+    MaterializeCaptureOperation, NestedLinearization, ProgramLinearizableOperation, RematerializationNameOperation,
+    ResidualizedOperation, TangentContext, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
 use crate::experimental::operations::{LinearShardMapOperation, ShardMapOperation};
 
-/// Backend-owned ordinary operations that extend the reusable core array operation set: a call to a jitted XLA
-/// sub-program ([`JitCall`](Self::JitCall)), an XLA `shard_map` ([`ShardMap`](Self::ShardMap)), and an XLA
-/// `linear_shard_map` staged in ordinary traced programs ([`LinearShardMap`](Self::LinearShardMap)).
+/// Lifetime-free reference to a concrete XLA value captured by a compiled program.
+pub type XlaConstant = CapturedConstant<ArrayType>;
+
+/// Ordinary staged-operation universe owned by the XLA backend.
 ///
-/// The [`Operation`]/[`Display`] and per-variant [`From`]/[`TryFrom`] impls below are uniform per-variant delegations
-/// to the backing operation structs. The backend-specific interpretation, batching, and differentiation rules are
-/// bespoke (per-variant exemplar extraction, an erroring `shard_map` batching rule, and distinct `jvp` entry points),
-/// so they are hand-written individually further below.
-#[derive(Clone, Debug)]
-pub enum XlaOperationExtension<V: Value<ArrayType>> {
-    /// Call to a jitted XLA sub-program.
+/// This enum flattens the core array operation payloads directly into the backend-owned operation family. Higher-order
+/// operations that own nested programs use XLA-owned bodies so those programs can contain backend-specific operations
+/// such as [`jit_call`](JitCallOperation) and [`shard_map`](ShardMapOperation).
+#[derive(Clone, Debug, Operation)]
+#[ryft(crate = "ryft_core")]
+pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
+    Zero(ZeroOperation<ArrayType>),
+    ZeroLike(ZeroLikeOperation),
+    One(OneOperation<ArrayType>),
+    OneLike(OneLikeOperation),
+    Constant(ConstantOperation<ArrayType, V>),
+    Fill(FillOperation<ArrayType, f64>),
+    Neg(NegOperation),
+    Add(AddOperation),
+    Sub(SubOperation),
+    Scale(ScaleOperation<ArrayType, V>),
+    Mul(MulOperation),
+    Div(DivOperation),
+    Sin(SinOperation),
+    Cos(CosOperation),
+    StopGradient(StopGradientOperation),
+    RematerializationName(RematerializationNameOperation),
+    TransferToMemory(TransferToMemoryOperation),
+    Dot(DotOperation),
+    Transpose(TransposeOperation),
+    Reshape(ReshapeOperation),
+    Reshard(ReshardOperation),
+    ShardingConstraint(ShardingConstraintOperation),
+    Broadcast(BroadcastOperation),
+    Slice(SliceOperation),
+    UpdateSlice(UpdateSliceOperation),
+    DynamicSlice(DynamicSliceOperation),
+    DynamicUpdateSlice(DynamicUpdateSliceOperation),
+    Pad(PadOperation),
+    Concatenate(ConcatenateOperation),
+    Gather(GatherOperation),
+    Scatter(ScatterOperation),
+    Reduce(ReduceOperation),
+    Compare(CompareOperation),
+    Not(NotOperation),
+    And(AndOperation),
+    Or(OrOperation),
+    Xor(XorOperation),
+    Collective(CollectiveOperation),
+    Select(SelectOperation),
+    /// Backend-owned condition whose branch bodies can contain XLA operations.
+    Condition(Box<ConditionOperation<ArrayType, V, Self>>),
+
+    /// Backend-owned loop whose condition and body programs can contain XLA operations.
+    While(Box<WhileOperation<ArrayType, V, Self>>),
+
+    /// Backend-owned scan whose body program can contain XLA operations.
+    Scan(Box<ScanOperation<ArrayType, V, Self>>),
+
+    /// Backend-owned custom JVP call whose nested programs can contain XLA operations.
+    CustomJvp(Box<CustomJvpOperation<ArrayType, V, Self>>),
+
+    /// Backend-owned custom VJP call whose nested programs can contain XLA operations.
+    CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
+
+    /// Call to a flat jitted XLA sub-program.
     JitCall(Box<JitCallOperation>),
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<V>>),
 
-    /// XLA-specific `linear_shard_map` staged in ordinary traced programs.
+    /// XLA-specific `linear_shard_map` staged in an ordinary traced program.
     LinearShardMap(Box<LinearShardMapOperation<V>>),
 }
 
-impl<V: Value<ArrayType>> Operation<ArrayType> for XlaOperationExtension<V> {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::JitCall(operation) => operation.name(),
-            Self::ShardMap(operation) => operation.name(),
-            Self::LinearShardMap(operation) => operation.name(),
-        }
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        match self {
-            Self::JitCall(operation) => operation.infer_output_types(input_types),
-            Self::ShardMap(operation) => operation.infer_output_types(input_types),
-            Self::LinearShardMap(operation) => operation.infer_output_types(input_types),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::JitCall(operation) => operation.render(formatter, indentation),
-            Self::ShardMap(operation) => operation.render(formatter, indentation),
-            Self::LinearShardMap(operation) => operation.render(formatter, indentation),
-        }
-    }
+fn map_core_xla_program<V: Value<ArrayType>>(
+    program: &Program<ArrayType, V, ArrayOperation<V>, Vec<V>, Vec<V>>,
+) -> Program<ArrayType, V, XlaOperation<V>, Vec<V>, Vec<V>> {
+    program.map_operations(|operation| Ok(XlaOperation::from(operation.clone()))).unwrap()
 }
 
-impl<V: Value<ArrayType>> Display for XlaOperationExtension<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<V: Value<ArrayType>> From<JitCallOperation> for XlaOperationExtension<V> {
-    fn from(operation: JitCallOperation) -> Self {
-        Self::JitCall(Box::new(operation))
-    }
-}
-
-impl<'a, V: Value<ArrayType>> TryFrom<&'a XlaOperationExtension<V>> for &'a JitCallOperation {
-    type Error = ();
-
-    fn try_from(value: &'a XlaOperationExtension<V>) -> Result<Self, ()> {
-        match value {
-            XlaOperationExtension::JitCall(operation) => Ok(&**operation),
-            _ => Err(()),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>> From<ShardMapOperation<V>> for XlaOperationExtension<V> {
-    fn from(operation: ShardMapOperation<V>) -> Self {
-        Self::ShardMap(Box::new(operation))
-    }
-}
-
-impl<'a, V: Value<ArrayType>> TryFrom<&'a XlaOperationExtension<V>> for &'a ShardMapOperation<V> {
-    type Error = ();
-
-    fn try_from(value: &'a XlaOperationExtension<V>) -> Result<Self, ()> {
-        match value {
-            XlaOperationExtension::ShardMap(operation) => Ok(&**operation),
-            _ => Err(()),
+impl<V: Value<ArrayType>> From<ArrayOperation<V>> for XlaOperation<V> {
+    fn from(operation: ArrayOperation<V>) -> Self {
+        match operation {
+            ArrayOperation::Zero(operation) => Self::Zero(operation),
+            ArrayOperation::ZeroLike(operation) => Self::ZeroLike(operation),
+            ArrayOperation::One(operation) => Self::One(operation),
+            ArrayOperation::OneLike(operation) => Self::OneLike(operation),
+            ArrayOperation::Constant(operation) => Self::Constant(operation),
+            ArrayOperation::Fill(operation) => Self::Fill(operation),
+            ArrayOperation::Neg(operation) => Self::Neg(operation),
+            ArrayOperation::Add(operation) => Self::Add(operation),
+            ArrayOperation::Sub(operation) => Self::Sub(operation),
+            ArrayOperation::Scale(operation) => Self::Scale(operation),
+            ArrayOperation::Mul(operation) => Self::Mul(operation),
+            ArrayOperation::Div(operation) => Self::Div(operation),
+            ArrayOperation::Sin(operation) => Self::Sin(operation),
+            ArrayOperation::Cos(operation) => Self::Cos(operation),
+            ArrayOperation::StopGradient(operation) => Self::StopGradient(operation),
+            ArrayOperation::RematerializationName(operation) => Self::RematerializationName(operation),
+            ArrayOperation::TransferToMemory(operation) => Self::TransferToMemory(operation),
+            ArrayOperation::Dot(operation) => Self::Dot(operation),
+            ArrayOperation::Transpose(operation) => Self::Transpose(operation),
+            ArrayOperation::Reshape(operation) => Self::Reshape(operation),
+            ArrayOperation::Reshard(operation) => Self::Reshard(operation),
+            ArrayOperation::ShardingConstraint(operation) => Self::ShardingConstraint(operation),
+            ArrayOperation::Broadcast(operation) => Self::Broadcast(operation),
+            ArrayOperation::Slice(operation) => Self::Slice(operation),
+            ArrayOperation::UpdateSlice(operation) => Self::UpdateSlice(operation),
+            ArrayOperation::DynamicSlice(operation) => Self::DynamicSlice(operation),
+            ArrayOperation::DynamicUpdateSlice(operation) => Self::DynamicUpdateSlice(operation),
+            ArrayOperation::Pad(operation) => Self::Pad(operation),
+            ArrayOperation::Concatenate(operation) => Self::Concatenate(operation),
+            ArrayOperation::Gather(operation) => Self::Gather(operation),
+            ArrayOperation::Scatter(operation) => Self::Scatter(operation),
+            ArrayOperation::Reduce(operation) => Self::Reduce(operation),
+            ArrayOperation::Compare(operation) => Self::Compare(operation),
+            ArrayOperation::Not(operation) => Self::Not(operation),
+            ArrayOperation::And(operation) => Self::And(operation),
+            ArrayOperation::Or(operation) => Self::Or(operation),
+            ArrayOperation::Xor(operation) => Self::Xor(operation),
+            ArrayOperation::Collective(operation) => Self::Collective(operation),
+            ArrayOperation::Select(operation) => Self::Select(operation),
+            ArrayOperation::Condition(operation) => XlaOperation::from(*operation),
+            ArrayOperation::While(operation) => XlaOperation::from(*operation),
+            ArrayOperation::Scan(operation) => XlaOperation::from(*operation),
+            ArrayOperation::CustomJvp(operation) => XlaOperation::from(*operation),
+            ArrayOperation::CustomVjp(operation) => XlaOperation::from(*operation),
         }
     }
 }
 
-impl<V: Value<ArrayType>> From<LinearShardMapOperation<V>> for XlaOperationExtension<V> {
-    fn from(operation: LinearShardMapOperation<V>) -> Self {
-        Self::LinearShardMap(Box::new(operation))
+impl<V: Value<ArrayType>> From<ConditionOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+    fn from(operation: ConditionOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        Self::Condition(Box::new(
+            ConditionOperation::new(
+                map_core_xla_program(operation.true_branch()),
+                map_core_xla_program(operation.false_branch()),
+            )
+            .unwrap(),
+        ))
     }
 }
 
-impl<'a, V: Value<ArrayType>> TryFrom<&'a XlaOperationExtension<V>> for &'a LinearShardMapOperation<V> {
-    type Error = ();
+impl<V: Value<ArrayType>> From<WhileOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+    fn from(operation: WhileOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        Self::While(Box::new(
+            WhileOperation::new(map_core_xla_program(operation.condition()), map_core_xla_program(operation.body()))
+                .unwrap()
+                .with_iteration_bound(operation.iteration_bound())
+                .unwrap(),
+        ))
+    }
+}
 
-    fn try_from(value: &'a XlaOperationExtension<V>) -> Result<Self, ()> {
-        match value {
-            XlaOperationExtension::LinearShardMap(operation) => Ok(&**operation),
-            _ => Err(()),
+impl<V: Value<ArrayType>> From<ScanOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+    fn from(operation: ScanOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        Self::Scan(Box::new(
+            ScanOperation::new(map_core_xla_program(operation.body()), operation.carry_count(), operation.length())
+                .unwrap()
+                .with_reverse(operation.reverse())
+                .with_unroll(operation.unroll())
+                .unwrap()
+                .with_captures(operation.captures().to_vec()),
+        ))
+    }
+}
+
+impl<V: Value<ArrayType>> From<CustomJvpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+    fn from(operation: CustomJvpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        Self::CustomJvp(Box::new(
+            CustomJvpOperation::new(
+                map_core_xla_program(operation.primal()),
+                map_core_xla_program(operation.jvp_program()),
+            )
+            .unwrap(),
+        ))
+    }
+}
+
+impl<V: Value<ArrayType>> From<CustomVjpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+    fn from(core_operation: CustomVjpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        let mut operation = CustomVjpOperation::new(
+            map_core_xla_program(core_operation.primal()),
+            map_core_xla_program(core_operation.forward()),
+            map_core_xla_program(core_operation.backward()),
+        )
+        .unwrap()
+        .with_prevent_cse(core_operation.prevent_cse());
+        if let Some(tangent) = core_operation.tangent_program() {
+            operation = operation.with_tangent_program(map_core_xla_program(tangent)).unwrap();
         }
+        Self::CustomVjp(Box::new(operation))
     }
 }
 
-/// Lifetime-free reference to a concrete XLA value captured by a compiled program.
-pub type XlaConstant = CapturedConstant<ArrayType>;
-
-/// Ordinary staged-op universe owned by the XLA backend.
-impl<V: Value<ArrayType>> ryft_core::tracing_v2::operations::MaybeDot for XlaOperationExtension<V> {
+impl<V: Value<ArrayType>> ryft_core::tracing_v2::operations::MaybeDot for XlaOperation<V> {
     #[inline]
     fn dot_dimensions(&self) -> Option<&ryft_core::tracing_v2::DotDimensionNumbers> {
-        // Higher-order XLA calls may contain dots in their bodies but are not themselves dot primitives, mirroring
-        // how JAX's `dots_saveable` rematerialization policy matches only dot primitives.
-        None
+        match self {
+            Self::Dot(operation) => Some(operation.dimensions()),
+            _ => None,
+        }
     }
 }
 
-impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRematerializationName
-    for XlaOperationExtension<V>
-{
+impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRematerializationName for XlaOperation<V> {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
-        None
+        match self {
+            Self::RematerializationName(operation) => Some(operation.tag()),
+            _ => None,
+        }
     }
 }
 
-pub type XlaOperation = ArrayOperation<XlaConstant, XlaOperationExtension<XlaConstant>>;
-
-impl InterpretableOperation<ArrayType, XlaTracer<'static, 'static>> for XlaOperationExtension<XlaConstant> {
+impl<'domain, 'context> InterpretableOperation<ArrayType, XlaTracer<'domain, 'context>> for XlaOperation {
     fn interpret(
         &self,
-        _context: &TracingContext<'static, XlaDomain<'static>>,
-        inputs: &[XlaTracer<'static, 'static>],
-    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
+        context: &TracingContext<'domain, XlaDomain<'context>>,
+        inputs: &[XlaTracer<'domain, 'context>],
+    ) -> Result<Vec<XlaTracer<'domain, 'context>>, ProgramError> {
+        context.stage_operation(self.clone(), inputs)
+    }
+}
+
+impl<C> BatchableOperation<Tracer<C>, BatchingContext<C>> for XlaOperation
+where
+    C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
+    Tracer<C>: SupportsArithmeticOperations<XlaConstant>
+        + SupportsTrigonometricOperations
+        + ZeroLike
+        + OneLike
+        + DotOps
+        + SupportsManipulationOperations
+        + SupportsComparisonOperations
+        + Select<Condition = Tracer<C>>
+        + BooleanLike
+        + Broadcast
+        + Transpose,
+    Vec<Tracer<C>>:
+        Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: std::fmt::Debug + PartialEq>,
+    Self: ProgramBatchableOperation<XlaConstant>,
+{
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<Tracer<C>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
         match self {
-            Self::JitCall(operation) => operation.interpret_traced_with_context(inputs),
-            Self::ShardMap(operation) => {
-                let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
-                operation.interpret_traced_with_context(exemplar.builder().clone(), inputs)
+            Self::Add(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Sub(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Mul(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Div(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Neg(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Sin(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Cos(operation) => operation.batch(context.parent_context(), inputs),
+            Self::StopGradient(operation) => operation.batch(context.parent_context(), inputs),
+            Self::RematerializationName(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Select(operation) => operation.batch(context.parent_context(), inputs),
+            Self::ZeroLike(operation) => operation.batch(context.parent_context(), inputs),
+            Self::OneLike(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Scale(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Dot(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Transpose(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Reshape(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Reshard(operation) => operation.batch(context.parent_context(), inputs),
+            Self::ShardingConstraint(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Broadcast(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Slice(operation) => operation.batch(context.parent_context(), inputs),
+            Self::UpdateSlice(operation) => operation.batch(context.parent_context(), inputs),
+            Self::DynamicSlice(operation) => operation.batch(context.parent_context(), inputs),
+            Self::DynamicUpdateSlice(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Pad(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Concatenate(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Gather(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Scatter(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Reduce(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Compare(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Not(operation) => operation.batch(context.parent_context(), inputs),
+            Self::And(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Or(operation) => operation.batch(context.parent_context(), inputs),
+            Self::Xor(operation) => operation.batch(context.parent_context(), inputs),
+            Self::TransferToMemory(operation) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let tracer = inputs[0].value().transfer_to_memory(operation.destination());
+                let physical_type = tracer.r#type().into_owned();
+                Ok(vec![ArrayBatch::new(physical_type, tracer, inputs[0].batch_axis())?])
             }
-            Self::LinearShardMap(operation) => {
-                let exemplar = inputs.first().ok_or_else(missing_traced_input)?;
-                operation.interpret_traced_with_context(exemplar.builder().clone(), inputs)
+            Self::Collective(operation) => operation.batch(context, inputs),
+            Self::Zero(_) | Self::One(_) | Self::Constant(_) | Self::Fill(_) => {
+                Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "zero-input operation '{}' must be staged through the batching context",
+                        self.name()
+                    ),
+                }
+                .into())
             }
+            Self::Condition(operation) => operation.batch(context, inputs),
+            Self::While(operation) => operation.batch(context, inputs),
+            Self::Scan(operation) => operation.batch(context, inputs),
+            Self::CustomJvp(operation) => operation.batch(context, inputs),
+            Self::CustomVjp(operation) => operation.batch(context, inputs),
+            Self::JitCall(operation) => operation.batch(context, inputs),
+            Self::ShardMap(_) | Self::LinearShardMap(_) => Err(BatchingError::UnsupportedOperation {
+                message: format!("missing batching rule for operation '{}'", self.name()),
+            }
+            .into()),
         }
+    }
+}
+
+impl ProgramBatchableOperation<XlaConstant> for XlaOperation
+where
+    Tracer<ProgramBatchingContext<XlaConstant, Self>>: SupportsArithmeticOperations<XlaConstant>
+        + SupportsTrigonometricOperations
+        + ZeroLike
+        + OneLike
+        + DotOps
+        + SupportsManipulationOperations
+        + SupportsComparisonOperations
+        + Select<Condition = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + BooleanLike
+        + Broadcast
+        + Transpose,
+    Vec<Tracer<ProgramBatchingContext<XlaConstant, Self>>>: Parameterized<
+            Tracer<ProgramBatchingContext<XlaConstant, Self>>,
+            To<Tracer<ProgramBatchingContext<XlaConstant, Self>>> = Vec<
+                Tracer<ProgramBatchingContext<XlaConstant, Self>>,
+            >,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+{
+    fn batch_program(
+        program: &Program<ArrayType, XlaConstant, Self, Vec<XlaConstant>, Vec<XlaConstant>>,
+        axis_size: usize,
+        input_batch_axes: &[Option<usize>],
+        output_batch_axes: ProgramBatchingOutputAxes,
+    ) -> Result<
+        (Program<ArrayType, XlaConstant, Self, Vec<XlaConstant>, Vec<XlaConstant>>, Vec<Option<usize>>),
+        ProgramError,
+    > {
+        batch_program::<XlaConstant, Self>(program, axis_size, input_batch_axes, output_batch_axes)
+    }
+}
+
+impl<E> DifferentiableOperation<E> for XlaOperation
+where
+    E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+        + DifferentiationContext<
+            LinearOperation<
+                <E as DifferentiationContext>::Tangent,
+                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+            > = LinearXlaOperation<
+                <E as DifferentiationContext>::Tangent,
+                XlaConstant,
+                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+            >,
+            LinearOperation<
+                <E as DifferentiationContext>::Tangent,
+                ValueOrCapture<ArrayType, Tracer<E>>,
+            > = LinearXlaOperation<
+                <E as DifferentiationContext>::Tangent,
+                XlaConstant,
+                ValueOrCapture<ArrayType, Tracer<E>>,
+            >,
+        >,
+    ZeroOperation<ArrayType>: DifferentiableOperation<E>,
+    ZeroLikeOperation: DifferentiableOperation<E>,
+    OneOperation<ArrayType>: DifferentiableOperation<E>,
+    OneLikeOperation: DifferentiableOperation<E>,
+    ConstantOperation<ArrayType, XlaConstant>: DifferentiableOperation<E>,
+    FillOperation<ArrayType, f64>: DifferentiableOperation<E>,
+    NegOperation: DifferentiableOperation<E>,
+    AddOperation: DifferentiableOperation<E>,
+    SubOperation: DifferentiableOperation<E>,
+    ScaleOperation<ArrayType, XlaConstant>: DifferentiableOperation<E>,
+    MulOperation: DifferentiableOperation<E>,
+    DivOperation: DifferentiableOperation<E>,
+    SinOperation: DifferentiableOperation<E>,
+    CosOperation: DifferentiableOperation<E>,
+    StopGradientOperation: DifferentiableOperation<E>,
+    RematerializationNameOperation: DifferentiableOperation<E>,
+    TransferToMemoryOperation: DifferentiableOperation<E>,
+    DotOperation: DifferentiableOperation<E>,
+    TransposeOperation: DifferentiableOperation<E>,
+    ReshapeOperation: DifferentiableOperation<E>,
+    ReshardOperation: DifferentiableOperation<E>,
+    ShardingConstraintOperation: DifferentiableOperation<E>,
+    BroadcastOperation: DifferentiableOperation<E>,
+    SliceOperation: DifferentiableOperation<E>,
+    UpdateSliceOperation: DifferentiableOperation<E>,
+    DynamicSliceOperation: DifferentiableOperation<E>,
+    DynamicUpdateSliceOperation: DifferentiableOperation<E>,
+    PadOperation: DifferentiableOperation<E>,
+    ConcatenateOperation: DifferentiableOperation<E>,
+    GatherOperation: DifferentiableOperation<E>,
+    ScatterOperation: DifferentiableOperation<E>,
+    ReduceOperation: DifferentiableOperation<E>,
+    CompareOperation: DifferentiableOperation<E>,
+    NotOperation: DifferentiableOperation<E>,
+    AndOperation: DifferentiableOperation<E>,
+    OrOperation: DifferentiableOperation<E>,
+    XorOperation: DifferentiableOperation<E>,
+    CollectiveOperation: DifferentiableOperation<E>,
+    SelectOperation: DifferentiableOperation<E>,
+    Vec<XlaConstant>: Parameterized<
+            XlaConstant,
+            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>
+                + ParameterizedFamily<<E as Domain>::Value, To = Vec<<E as Domain>::Value>>,
+            To<XlaConstant> = Vec<XlaConstant>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            To<<E as Domain>::Value> = Vec<<E as Domain>::Value>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    Vec<<E as Domain>::Value>: Parameterized<
+            <E as Domain>::Value,
+            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    Vec<Tracer<E>>: Parameterized<
+            Tracer<E>,
+            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, Tracer<E>>>:
+        CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, Tracer<E>>,
+            WithCapture<ValueOrCapture<ArrayType, E::Tangent>> =
+                LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
+        >,
+    LinearOperationOf<E>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>
+        + ResidualizedOperation<E>
+        + From<CustomVjpCallOperation<ArrayType, XlaConstant, XlaOperation, ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<TransferToMemoryOperation>
+        + From<ConcatenateOperation>
+        + From<LinearSelectOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<LinearGatherOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<
+            ScanOperation<
+                ArrayType,
+                E::Tangent,
+                LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
+                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+            >,
+        >
+        + SupportsLinearCondition<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>>
+        + SupportsLinearWhile<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>, XlaOperation>,
+    Self: Clone + ProgramLinearizableOperation<E>,
+{
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, E>,
+        inputs: &[JvpTracer<'jvp, E>],
+    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+    where
+        E: 'jvp,
+        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+    {
+        match self {
+            Self::Zero(operation) => operation.jvp(context, inputs),
+            Self::ZeroLike(operation) => operation.jvp(context, inputs),
+            Self::One(operation) => operation.jvp(context, inputs),
+            Self::OneLike(operation) => operation.jvp(context, inputs),
+            Self::Constant(operation) => operation.jvp(context, inputs),
+            Self::Fill(operation) => operation.jvp(context, inputs),
+            Self::Neg(operation) => operation.jvp(context, inputs),
+            Self::Add(operation) => operation.jvp(context, inputs),
+            Self::Sub(operation) => operation.jvp(context, inputs),
+            Self::Scale(operation) => operation.jvp(context, inputs),
+            Self::Mul(operation) => operation.jvp(context, inputs),
+            Self::Div(operation) => operation.jvp(context, inputs),
+            Self::Sin(operation) => operation.jvp(context, inputs),
+            Self::Cos(operation) => operation.jvp(context, inputs),
+            Self::StopGradient(operation) => operation.jvp(context, inputs),
+            Self::RematerializationName(operation) => operation.jvp(context, inputs),
+            Self::TransferToMemory(operation) => operation.jvp(context, inputs),
+            Self::Dot(operation) => operation.jvp(context, inputs),
+            Self::Transpose(operation) => operation.jvp(context, inputs),
+            Self::Reshape(operation) => operation.jvp(context, inputs),
+            Self::Reshard(operation) => operation.jvp(context, inputs),
+            Self::ShardingConstraint(operation) => operation.jvp(context, inputs),
+            Self::Broadcast(operation) => operation.jvp(context, inputs),
+            Self::Slice(operation) => operation.jvp(context, inputs),
+            Self::UpdateSlice(operation) => operation.jvp(context, inputs),
+            Self::DynamicSlice(operation) => operation.jvp(context, inputs),
+            Self::DynamicUpdateSlice(operation) => operation.jvp(context, inputs),
+            Self::Pad(operation) => operation.jvp(context, inputs),
+            Self::Concatenate(operation) => operation.jvp(context, inputs),
+            Self::Gather(operation) => operation.jvp(context, inputs),
+            Self::Scatter(operation) => operation.jvp(context, inputs),
+            Self::Reduce(operation) => operation.jvp(context, inputs),
+            Self::Compare(operation) => operation.jvp(context, inputs),
+            Self::Not(operation) => operation.jvp(context, inputs),
+            Self::And(operation) => operation.jvp(context, inputs),
+            Self::Or(operation) => operation.jvp(context, inputs),
+            Self::Xor(operation) => operation.jvp(context, inputs),
+            Self::Collective(operation) => operation.jvp(context, inputs),
+            Self::Select(operation) => operation.jvp(context, inputs),
+            Self::Condition(operation) => {
+                <ConditionOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                    operation, context, inputs,
+                )
+            }
+            Self::While(operation) => <WhileOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                operation, context, inputs,
+            ),
+            Self::Scan(operation) => <ScanOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                operation, context, inputs,
+            ),
+            Self::CustomJvp(operation) => {
+                <CustomJvpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                    operation, context, inputs,
+                )
+            }
+            Self::CustomVjp(operation) => {
+                <CustomVjpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                    operation, context, inputs,
+                )
+            }
+            Self::JitCall(operation) => operation.jvp(context, inputs),
+            Self::ShardMap(operation) => operation.jvp_with_staging_context(context, inputs),
+            Self::LinearShardMap(operation) => operation.jvp_with_staging_context(context, inputs),
+        }
+    }
+}
+
+impl<E> ProgramLinearizableOperation<E> for XlaOperation
+where
+    E: DifferentiationContext<
+        Type = ArrayType,
+        Constant = XlaConstant,
+        LinearOperation<
+            <E as DifferentiationContext>::Tangent,
+            ValueOrCapture<ArrayType, <E as Domain>::Value>,
+        > = LinearXlaOperation<
+            <E as DifferentiationContext>::Tangent,
+            XlaConstant,
+            ValueOrCapture<ArrayType, <E as Domain>::Value>,
+        >,
+    >,
+    Self: Clone + Operation<ArrayType>,
+    ZeroOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ZeroLikeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    OneOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    OneLikeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ConstantOperation<ArrayType, XlaConstant>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    FillOperation<ArrayType, f64>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    NegOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    AddOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    SubOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ScaleOperation<ArrayType, XlaConstant>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    MulOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    DivOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    SinOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    CosOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    StopGradientOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    RematerializationNameOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    TransferToMemoryOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    DotOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    TransposeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ReshapeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ReshardOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ShardingConstraintOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    BroadcastOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    SliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    UpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    DynamicSliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    DynamicUpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    PadOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ConcatenateOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    GatherOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ScatterOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    ReduceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    CompareOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    NotOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    AndOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    OrOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    XorOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    CollectiveOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    SelectOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    JitCallOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
+    E::Tangent: Transpose + Broadcast + ReduceValue + Slice + Reshard + ConstrainSharding,
+    Vec<XlaConstant>: Parameterized<
+            XlaConstant,
+            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>
+                + ParameterizedFamily<
+                    Tracer<LinearizationContextOf<E, Self>>,
+                    To = Vec<Tracer<LinearizationContextOf<E, Self>>>,
+                >,
+            To<XlaConstant> = Vec<XlaConstant>,
+            To<E::Tangent> = Vec<E::Tangent>,
+            To<Tracer<LinearizationContextOf<E, Self>>> = Vec<Tracer<LinearizationContextOf<E, Self>>>,
+            ParameterStructure: std::fmt::Debug + PartialEq,
+        >,
+    E::LinearOperation<E::Tangent, XlaConstant>: CaptureParameterizedOperation<
+            ArrayType,
+            XlaConstant,
+            WithCapture<XlaConstant> = E::LinearOperation<E::Tangent, XlaConstant>,
+            WithCapture<Tracer<LinearizationContextOf<E, Self>>> = LinearXlaOperation<
+                E::Tangent,
+                XlaConstant,
+                Tracer<LinearizationContextOf<E, Self>>,
+            >,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = LinearXlaOperation<
+                E::Tangent,
+                XlaConstant,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            >,
+        >,
+    LinearOperationOf<LinearizationContextOf<E, Self>>:
+        ResidualizedOperation<LinearizationContextOf<E, Self>>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = LinearOperationOf<E>,
+        > + MaybeZeroOperation<ArrayType>,
+{
+    fn linearize_program(
+        differentiable: &E,
+        program: &Program<ArrayType, XlaConstant, Self, Vec<XlaConstant>, Vec<XlaConstant>>,
+    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
+        ryft_core::tracing_v2::differentiation::linearize_program(differentiable, program)
     }
 }
 
@@ -179,133 +713,651 @@ pub type XlaProgramBuilder = ProgramBuilder<ArrayType, XlaConstant, XlaOperation
 /// Flat XLA program payload used by staged call operations.
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
-/// Backend-owned linear operations that extend the reusable core linear array operation set: a linearized call to
-/// a jitted XLA sub-program ([`LinearJitCall`](Self::LinearJitCall)) and an XLA linear `shard_map`
-/// ([`LinearShardMap`](Self::LinearShardMap)).
-///
-/// The enum is parameterized by the tangent carrier `V` *and* the factor carrier `F` of the linear program it is
-/// staged in, mirroring [`LinearArrayOperation`]'s factor parameter: captured primal payloads (the prefix inputs of
-/// a linear jitted call and the captured global primals of a linear shard-map) are stored as `F` factors, so they
-/// participate in the residual-factor machinery ([`CaptureParameterizedOperation`] and everything built on it, such
-/// as residual compaction, rebasing onto an enclosing linearization context, and instantiation into a directly
-/// executable program). Residualized pushforwards use [`ValueOrCapture`] as `F`; direct (instantiated) programs use
-/// the concrete value type, in which case `F` defaults to `V`.
-///
-/// The [`Operation`]/[`Display`], per-variant [`From`]/[`TryFrom`], and the per-variant interpretation delegation below
-/// are uniform per-variant delegations to the backing operation structs. Transposition (which targets the factor-split
-/// linear universe) and factor mapping are bespoke and hand-written further below, since neither is a uniform
-/// per-variant delegation.
-#[derive(Clone, Debug)]
-pub enum LinearXlaOperationExtension<V: Value<ArrayType>, F: Value<ArrayType> = V> {
+/// Linear staged-op universe owned by the XLA backend.
+#[derive(Clone, Debug, Operation, ryft_macros::TransposableOperation)]
+#[ryft(crate = "ryft_core")]
+pub enum LinearXlaOperation<
+    V: Value<ArrayType>,
+    C: Value<ArrayType> = XlaConstant,
+    F: Value<ArrayType> = V,
+    P: Operation<ArrayType> = XlaOperation,
+    CaptureFactor: Value<ArrayType> = F,
+> {
+    Zero(ZeroOperation<ArrayType>),
+    ZeroLike(ZeroLikeOperation),
+    One(OneOperation<ArrayType>),
+    OneLike(OneLikeOperation),
+    Constant(ConstantOperation<ArrayType, V, Input>),
+    Fill(FillOperation<ArrayType, f64>),
+    Neg(NegOperation),
+    Add(AddOperation),
+    Sub(SubOperation),
+    Scale(ScaleOperation<ArrayType, F, Input>),
+    Mul(MulOperation),
+    TransferToMemory(TransferToMemoryOperation),
+    Transpose(TransposeOperation),
+    LeftDot(LeftDotOperation<F, Input>),
+    RightDot(RightDotOperation<F, Input>),
+    Reshape(ReshapeOperation),
+    Reshard(ReshardOperation),
+    ShardingConstraint(ShardingConstraintOperation),
+    Broadcast(BroadcastOperation),
+    Slice(SliceOperation),
+    UpdateSlice(UpdateSliceOperation),
+    DynamicSlice(LinearDynamicSliceOperation<F>),
+    DynamicUpdateSlice(LinearDynamicUpdateSliceOperation<F>),
+    Gather(LinearGatherOperation<F>),
+    ScatterAdd(LinearScatterAddOperation<F>),
+    Pad(PadOperation),
+    Concatenate(ConcatenateOperation),
+    Reduce(ReduceOperation),
+    Select(LinearSelectOperation<F>),
+    Residual(MaterializeCaptureOperation<F>),
+    Recompute(RecomputeOperation<P>),
+    /// Backend-owned captured-predicate condition whose branch bodies can contain XLA linear operations.
+    Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
+
+    /// Backend-owned operand-form condition whose branch bodies can contain XLA linear operations.
+    OperandCondition(LinearOperandConditionOperation<V, Self>),
+
+    /// Backend-owned while loop whose nested programs can contain XLA linear operations.
+    While(Box<WhileOperation<ArrayType, V, Self>>),
+
+    /// Backend-owned scan whose body can contain XLA linear operations.
+    Scan(Box<ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
+
+    CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
+
     /// Linearized call to a jitted XLA sub-program.
-    LinearJitCall(Box<LinearJitCallOperation<F>>),
+    LinearJitCall(Box<LinearJitCallOperation<CaptureFactor>>),
 
     /// XLA-specific linear `shard_map`.
-    LinearShardMap(Box<LinearShardMapOperation<V, F>>),
+    LinearShardMap(Box<LinearShardMapOperation<V, CaptureFactor>>),
 }
 
-impl<V: Value<ArrayType>, F: Value<ArrayType>> Operation<ArrayType> for LinearXlaOperationExtension<V, F> {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::LinearJitCall(operation) => operation.name(),
-            Self::LinearShardMap(operation) => operation.name(),
-        }
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        match self {
-            Self::LinearJitCall(operation) => operation.infer_output_types(input_types),
-            Self::LinearShardMap(operation) => operation.infer_output_types(input_types),
-        }
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        match self {
-            Self::LinearJitCall(operation) => operation.render(formatter, indentation),
-            Self::LinearShardMap(operation) => operation.render(formatter, indentation),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, F: Value<ArrayType>> Display for LinearXlaOperationExtension<V, F> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<V: Value<ArrayType>, F: Value<ArrayType>> From<LinearJitCallOperation<F>> for LinearXlaOperationExtension<V, F> {
-    fn from(operation: LinearJitCallOperation<F>) -> Self {
-        Self::LinearJitCall(Box::new(operation))
-    }
-}
-
-impl<'a, V: Value<ArrayType>, F: Value<ArrayType>> TryFrom<&'a LinearXlaOperationExtension<V, F>>
-    for &'a LinearJitCallOperation<F>
-{
-    type Error = ();
-
-    fn try_from(value: &'a LinearXlaOperationExtension<V, F>) -> Result<Self, ()> {
-        match value {
-            LinearXlaOperationExtension::LinearJitCall(operation) => Ok(&**operation),
-            _ => Err(()),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, F: Value<ArrayType>> From<LinearShardMapOperation<V, F>>
-    for LinearXlaOperationExtension<V, F>
-{
-    fn from(operation: LinearShardMapOperation<V, F>) -> Self {
-        Self::LinearShardMap(Box::new(operation))
-    }
-}
-
-impl<'a, V: Value<ArrayType>, F: Value<ArrayType>> TryFrom<&'a LinearXlaOperationExtension<V, F>>
-    for &'a LinearShardMapOperation<V, F>
-{
-    type Error = ();
-
-    fn try_from(value: &'a LinearXlaOperationExtension<V, F>) -> Result<Self, ()> {
-        match value {
-            LinearXlaOperationExtension::LinearShardMap(operation) => Ok(&**operation),
-            _ => Err(()),
-        }
-    }
-}
-
-/// Per-variant interpretation delegation. Each backing operation interprets over the tangent carrier `V` only when the
-/// factor carrier `F` equals `V` (concrete values rather than residual factors); the per-variant bounds capture that.
-impl<V: Value<ArrayType>, F: Value<ArrayType>> InterpretableOperation<ArrayType, V>
-    for LinearXlaOperationExtension<V, F>
+impl<V, C, F, P, CaptureFactor> LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    LinearJitCallOperation<F>: InterpretableOperation<ArrayType, V>,
-    LinearShardMapOperation<V, F>: InterpretableOperation<ArrayType, V>,
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    CaptureFactor: Value<ArrayType>,
+{
+    fn to_core_linear_array_operation(&self) -> Option<LinearArrayOperation<V, C, F, P>> {
+        Some(match self {
+            Self::Zero(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::ZeroLike(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::One(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::OneLike(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Constant(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Fill(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Neg(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Add(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Sub(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Scale(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Mul(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::TransferToMemory(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Transpose(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::LeftDot(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::RightDot(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Reshape(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Reshard(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::ShardingConstraint(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Broadcast(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Slice(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::UpdateSlice(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::DynamicSlice(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::DynamicUpdateSlice(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Gather(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::ScatterAdd(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Pad(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Concatenate(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Reduce(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Select(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Residual(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::Recompute(operation) => LinearArrayOperation::from(operation.clone()),
+            Self::CustomVjpCall(operation) => LinearArrayOperation::from((**operation).clone()),
+            Self::Condition(_)
+            | Self::OperandCondition(_)
+            | Self::While(_)
+            | Self::Scan(_)
+            | Self::LinearJitCall(_)
+            | Self::LinearShardMap(_) => return None,
+        })
+    }
+}
+
+impl<V, C, F, P, CaptureFactor> From<LinearArrayOperation<V, C, F, P>> for LinearXlaOperation<V, C, F, P, CaptureFactor>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    CaptureFactor: Value<ArrayType>,
+{
+    fn from(operation: LinearArrayOperation<V, C, F, P>) -> Self {
+        match operation {
+            LinearArrayOperation::Zero(operation) => Self::Zero(operation),
+            LinearArrayOperation::ZeroLike(operation) => Self::ZeroLike(operation),
+            LinearArrayOperation::One(operation) => Self::One(operation),
+            LinearArrayOperation::OneLike(operation) => Self::OneLike(operation),
+            LinearArrayOperation::Constant(operation) => Self::Constant(operation),
+            LinearArrayOperation::Fill(operation) => Self::Fill(operation),
+            LinearArrayOperation::Neg(operation) => Self::Neg(operation),
+            LinearArrayOperation::Add(operation) => Self::Add(operation),
+            LinearArrayOperation::Sub(operation) => Self::Sub(operation),
+            LinearArrayOperation::Scale(operation) => Self::Scale(operation),
+            LinearArrayOperation::Mul(operation) => Self::Mul(operation),
+            LinearArrayOperation::TransferToMemory(operation) => Self::TransferToMemory(operation),
+            LinearArrayOperation::Transpose(operation) => Self::Transpose(operation),
+            LinearArrayOperation::LeftDot(operation) => Self::LeftDot(operation),
+            LinearArrayOperation::RightDot(operation) => Self::RightDot(operation),
+            LinearArrayOperation::Reshape(operation) => Self::Reshape(operation),
+            LinearArrayOperation::Reshard(operation) => Self::Reshard(operation),
+            LinearArrayOperation::ShardingConstraint(operation) => Self::ShardingConstraint(operation),
+            LinearArrayOperation::Broadcast(operation) => Self::Broadcast(operation),
+            LinearArrayOperation::Slice(operation) => Self::Slice(operation),
+            LinearArrayOperation::UpdateSlice(operation) => Self::UpdateSlice(operation),
+            LinearArrayOperation::DynamicSlice(operation) => Self::DynamicSlice(operation),
+            LinearArrayOperation::DynamicUpdateSlice(operation) => Self::DynamicUpdateSlice(operation),
+            LinearArrayOperation::Gather(operation) => Self::Gather(operation),
+            LinearArrayOperation::ScatterAdd(operation) => Self::ScatterAdd(operation),
+            LinearArrayOperation::Pad(operation) => Self::Pad(operation),
+            LinearArrayOperation::Concatenate(operation) => Self::Concatenate(operation),
+            LinearArrayOperation::Reduce(operation) => Self::Reduce(operation),
+            LinearArrayOperation::Select(operation) => Self::Select(operation),
+            LinearArrayOperation::Residual(operation) => Self::Residual(operation),
+            LinearArrayOperation::Recompute(operation) => Self::Recompute(operation),
+            LinearArrayOperation::Condition(operation) => Self::Condition(
+                ConditionOperation::new_captured(
+                    operation.predicate().clone(),
+                    operation
+                        .true_branch()
+                        .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                        .unwrap(),
+                    operation
+                        .false_branch()
+                        .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            LinearArrayOperation::OperandCondition(operation) => {
+                Self::OperandCondition(LinearOperandConditionOperation::new(
+                    Box::new(
+                        operation
+                            .true_branch()
+                            .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                            .unwrap(),
+                    ),
+                    Box::new(
+                        operation
+                            .false_branch()
+                            .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                            .unwrap(),
+                    ),
+                ))
+            }
+            LinearArrayOperation::While(operation) => Self::While(Box::new(
+                WhileOperation::new(
+                    operation
+                        .condition()
+                        .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                        .unwrap(),
+                    operation
+                        .body()
+                        .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                        .unwrap(),
+                )
+                .unwrap()
+                .with_iteration_bound(operation.iteration_bound())
+                .unwrap(),
+            )),
+            LinearArrayOperation::Scan(operation) => LinearXlaOperation::from(*operation),
+            LinearArrayOperation::CustomVjpCall(operation) => Self::CustomVjpCall(operation),
+        }
+    }
+}
+
+impl<V, C, F, P, CaptureFactor>
+    From<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>
+    for LinearXlaOperation<V, C, F, P, CaptureFactor>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    CaptureFactor: Value<ArrayType>,
+{
+    fn from(
+        operation: ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>,
+    ) -> Self {
+        let body = operation
+            .body()
+            .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+            .unwrap();
+        let scan = ScanOperation::<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>>::new(
+            body,
+            operation.carry_count(),
+            operation.length(),
+        )
+        .unwrap()
+        .with_reverse(operation.reverse())
+        .with_unroll(operation.unroll())
+        .unwrap()
+        .with_captures(operation.captures().to_vec());
+        Self::Scan(Box::new(scan))
+    }
+}
+
+fn interpret_direct_linear_xla_operation<V, C, P>(
+    operation: &LinearXlaOperation<V, C, V, P, V>,
+    context: &V::InterpretationContext,
+    inputs: &[V],
+) -> Result<Vec<V>, ProgramError>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Zero<ArrayType, V>,
+    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
+{
+    if let Some(operation) = operation.to_core_linear_array_operation() {
+        return operation.interpret(context, inputs);
+    }
+    match operation {
+        LinearXlaOperation::Condition(operation) => {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            operation.infer_output_types(input_types.as_slice())?;
+            let branch = if operation.predicate().residual_value()?.boolean()? {
+                operation.true_branch()
+            } else {
+                operation.false_branch()
+            };
+            interpret_direct_linear_xla_program(context, branch, inputs.to_vec())
+        }
+        LinearXlaOperation::OperandCondition(operation) => {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            operation.infer_output_types(input_types.as_slice())?;
+            let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
+            interpret_direct_linear_xla_program(context, branch, inputs[1..].to_vec())
+        }
+        LinearXlaOperation::While(operation) => {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            operation.infer_output_types(input_types.as_slice())?;
+            let mut state = inputs.to_vec();
+            let mut completed_iterations = 0;
+            loop {
+                if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                    break Ok(state);
+                }
+                let condition_outputs =
+                    interpret_direct_linear_xla_program(context, operation.condition(), state.clone())?;
+                check_count!("output", condition_outputs, 1, ProgramError);
+                if !condition_outputs[0].boolean()? {
+                    break Ok(state);
+                }
+                state = interpret_direct_linear_xla_program(context, operation.body(), state)?;
+                check_count!("output", state, operation.state_types().len(), ProgramError);
+                completed_iterations += 1;
+            }
+        }
+        LinearXlaOperation::Scan(operation) => interpret_direct_linear_xla_scan(context, operation, inputs),
+        LinearXlaOperation::LinearJitCall(operation) => operation.interpret(context, inputs),
+        LinearXlaOperation::LinearShardMap(operation) => operation.interpret(context, inputs),
+        _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
+    }
+}
+
+fn interpret_direct_linear_xla_scan<V, C, P>(
+    context: &V::InterpretationContext,
+    operation: &ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, V>,
+    inputs: &[V],
+) -> Result<Vec<V>, ProgramError>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Zero<ArrayType, V>,
+    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
+{
+    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+    operation.infer_output_types(input_types.as_slice())?;
+    let stack_values = operation.captures().to_vec();
+    let body = operation.body();
+    let carry_count = operation.carry_count();
+    let y_slice_types = body.output_types().split_off(carry_count);
+    interpret_scan_lanes(
+        carry_count,
+        operation.length(),
+        operation.reverse(),
+        y_slice_types.as_slice(),
+        inputs,
+        |stacked_type| context.zero(stacked_type),
+        |lane, lane_inputs| {
+            let lane_residuals =
+                stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
+            let lane_body =
+                body.map_operations(|operation| operation.instantiate_linear_scan_body_factors(&lane_residuals))?;
+            interpret_direct_linear_xla_program(context, &lane_body, lane_inputs)
+        },
+    )
+}
+
+fn interpret_direct_linear_xla_program<V, C, P>(
+    context: &V::InterpretationContext,
+    program: &Program<ArrayType, V, LinearXlaOperation<V, C, V, P, V>, Vec<V>, Vec<V>>,
+    input: Vec<V>,
+) -> Result<Vec<V>, ProgramError>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Zero<ArrayType, V>,
+    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
+{
+    program.interpret_with(
+        input,
+        |_, constant| Ok(constant.clone()),
+        |instruction, instruction_inputs| {
+            interpret_direct_linear_xla_operation(instruction.operation(), context, instruction_inputs)
+        },
+    )
+}
+
+impl<V, C, P> InterpretableOperation<ArrayType, V> for LinearXlaOperation<V, C, V, P, V>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Zero<ArrayType, V>,
+    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
 {
     fn interpret(
         &self,
         context: &<V as Value<ArrayType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::LinearJitCall(operation) => operation.interpret(context, inputs),
-            Self::LinearShardMap(operation) => operation.interpret(context, inputs),
-        }
+        interpret_direct_linear_xla_operation(self, context, inputs)
     }
 }
 
-/// Linear staged-op universe owned by the XLA backend.
-pub type LinearXlaOperation<V, C = V, Factor = V> =
-    LinearArrayOperation<V, C, LinearXlaOperationExtension<V, Factor>, Factor, XlaOperation>;
+impl<V, C, P> LinearScanBodyInstantiable<ArrayType, V>
+    for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P, ValueOrCapture<ArrayType, V>>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+{
+    type Instantiated = LinearXlaOperation<V, C, V, P, V>;
 
-/// [`LinearXlaOperation`] with the extension's factor carrier decoupled from the universe's factor carrier.
-///
-/// Scan bodies pin their factor payloads to the scan-local `ValueOrCapture` namespace while extension captures stay
-/// in the enclosing factor space, so transposing an extension operation inside a scan body targets a universe whose
-/// factor (`UniverseFactor`) differs from the extension's own (`Factor`). The XLA transposition rules are
-/// implemented against this split form; [`LinearXlaOperation`] is the aligned special case
-/// `UniverseFactor = Factor`.
-pub(crate) type FactorSplitLinearXlaOperation<V, Factor, UniverseFactor> =
-    LinearArrayOperation<V, XlaConstant, LinearXlaOperationExtension<V, Factor>, UniverseFactor, XlaOperation>;
+    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError> {
+        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
+    }
+}
+
+impl<V, C, P> InterpretableNestedProgram<ArrayType, V> for LinearXlaOperation<V, C, V, P, V>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Zero<ArrayType, V>,
+    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
+    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
+{
+    fn interpret_nested_program(
+        context: &V::InterpretationContext,
+        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        input: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError> {
+        interpret_direct_linear_xla_program(context, program, input)
+    }
+}
+
+fn clone_capture<F: Clone>(factor: &F) -> Result<F, ProgramError> {
+    Ok(factor.clone())
+}
+
+fn map_defactorized_operation<O, P: From<O>>(defactorized: DefactorizedOperation<O>) -> DefactorizedOperation<P> {
+    match defactorized {
+        DefactorizedOperation::Operation { operation, inputs } => {
+            DefactorizedOperation::Operation { operation: P::from(operation), inputs }
+        }
+        DefactorizedOperation::Forward { atom } => DefactorizedOperation::Forward { atom },
+    }
+}
+
+fn map_linear_xla_operation_captures<V, C, F, MappedFactor, P, MapFactorFn>(
+    operation: &LinearXlaOperation<V, C, F, P, F>,
+    map_factor: &mut MapFactorFn,
+) -> Result<LinearXlaOperation<V, C, MappedFactor, P, MappedFactor>, ProgramError>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    MappedFactor: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+{
+    if let Some(operation) = operation.to_core_linear_array_operation() {
+        return Ok(LinearXlaOperation::from(operation.try_map_captures(map_factor)?));
+    }
+    match operation {
+        LinearXlaOperation::Condition(operation) => {
+            Ok(LinearXlaOperation::Condition(ConditionOperation::new_captured(
+                map_factor(operation.predicate())?,
+                operation
+                    .true_branch()
+                    .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
+                operation
+                    .false_branch()
+                    .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
+            )?))
+        }
+        LinearXlaOperation::OperandCondition(operation) => {
+            Ok(LinearXlaOperation::OperandCondition(LinearOperandConditionOperation::new(
+                Box::new(
+                    operation
+                        .true_branch()
+                        .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
+                ),
+                Box::new(
+                    operation
+                        .false_branch()
+                        .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
+                ),
+            )))
+        }
+        LinearXlaOperation::While(operation) => {
+            let condition = operation
+                .condition()
+                .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?;
+            let body = operation
+                .body()
+                .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?;
+            Ok(LinearXlaOperation::While(Box::new(
+                WhileOperation::new(condition, body)?.with_iteration_bound(operation.iteration_bound())?,
+            )))
+        }
+        LinearXlaOperation::Scan(operation) => {
+            let mut clone_scan_local_capture = clone_capture::<ValueOrCapture<ArrayType, V>>
+                as fn(&ValueOrCapture<ArrayType, V>) -> Result<ValueOrCapture<ArrayType, V>, ProgramError>;
+            let body = operation.body().map_operations(|operation| {
+                map_linear_xla_operation_captures(operation, &mut clone_scan_local_capture)
+            })?;
+            let scan = ScanOperation::<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>>::new(
+                body,
+                operation.carry_count(),
+                operation.length(),
+            )?
+            .with_reverse(operation.reverse())
+            .with_unroll(operation.unroll())?
+            .with_captures(operation.captures().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?);
+            Ok(LinearXlaOperation::Scan(Box::new(scan)))
+        }
+        LinearXlaOperation::LinearJitCall(operation) => {
+            Ok(LinearXlaOperation::LinearJitCall(Box::new(operation.map_captured_inputs(map_factor)?)))
+        }
+        LinearXlaOperation::LinearShardMap(operation) => {
+            Ok(LinearXlaOperation::LinearShardMap(Box::new(operation.map_captured_global_primals(map_factor)?)))
+        }
+        _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
+    }
+}
+
+impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearXlaOperation<V, C, F, P, F>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+{
+    type WithCapture<MappedFactor: Value<ArrayType>> = LinearXlaOperation<V, C, MappedFactor, P, MappedFactor>;
+
+    fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    {
+        map_linear_xla_operation_captures(self, map_factor)
+    }
+}
+
+impl<V, C, F, P, CaptureFactor> SupportsLinearCondition<ArrayType, V, F>
+    for LinearXlaOperation<V, C, F, P, CaptureFactor>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Operation<ArrayType>,
+    CaptureFactor: Value<ArrayType>,
+{
+    fn linear_condition_operation(
+        predicate: F,
+        true_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        false_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Self {
+        Self::Condition(ConditionOperation::new_captured(predicate, true_branch, false_branch).unwrap())
+    }
+}
+
+impl<V, C, R, P> SupportsLinearWhile<ArrayType, V, ValueOrCapture<ArrayType, R>, P>
+    for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    R: Value<ArrayType>,
+    P: Clone
+        + Operation<ArrayType>
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<ConcatenateOperation>,
+{
+    fn recompute_operation(operation: P) -> Self {
+        Self::Recompute(RecomputeOperation::new(operation))
+    }
+
+    fn residual_operation(factor: ValueOrCapture<ArrayType, R>) -> Self {
+        Self::Residual(MaterializeCaptureOperation::new(factor))
+    }
+
+    fn defactorize(
+        &self,
+        residual_atoms: &[ryft_core::programs::AtomId],
+        inputs: Vec<ryft_core::programs::AtomId>,
+    ) -> Result<DefactorizedOperation<Self>, ProgramError> {
+        if let Some(operation) = self.to_core_linear_array_operation() {
+            return operation.defactorize(residual_atoms, inputs).map(map_defactorized_operation);
+        }
+
+        match self {
+            operation @ (Self::Condition(_)
+            | Self::OperandCondition(_)
+            | Self::While(_)
+            | Self::Scan(_)
+            | Self::LinearJitCall(_)
+            | Self::LinearShardMap(_)) => {
+                let mut references_residual = false;
+                operation.try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
+                    if matches!(factor, ValueOrCapture::Capture { .. }) {
+                        references_residual = true;
+                    }
+                    Ok(factor.clone())
+                })?;
+                if references_residual {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "jvp of a while loop whose body pushforward stages {} over a loop-varying residual \
+                             reference is not supported",
+                            operation.name(),
+                        ),
+                    });
+                }
+                Ok(DefactorizedOperation::Operation { operation: operation.clone(), inputs })
+            }
+            _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
+        }
+    }
+
+    fn linear_while_operation(
+        condition: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Self, TypeError> {
+        Ok(Self::While(Box::new(WhileOperation::new(condition, body)?)))
+    }
+}
+
+impl<V, C, P> LinearScanBodyTransposable<ArrayType, V>
+    for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P, ValueOrCapture<ArrayType, V>>
+where
+    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+    C: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
+{
+    fn transpose_linear_scan_body(
+        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized,
+    {
+        body.transpose()
+    }
+}
+
+impl<V, C, F, P, CaptureFactor> LinearConditionBranchTransposable<V> for LinearXlaOperation<V, C, F, P, CaptureFactor>
+where
+    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+    CaptureFactor: Value<ArrayType>,
+    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
+{
+    #[inline]
+    fn transpose_linear_condition_branch(
+        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized,
+    {
+        branch.transpose()
+    }
+}
 
 /// Staged call to a flat jitted XLA program.
 #[derive(Clone, Debug)]
@@ -372,18 +1424,6 @@ impl<F: Value<ArrayType>> LinearJitCallOperation<F> {
         Self { program, transpose_program, captured_inputs, input_types, output_types }
     }
 
-    /// Returns the flat transformed callee program.
-    #[inline]
-    pub(crate) fn program(&self) -> &FlatXlaProgram {
-        self.program.as_ref()
-    }
-
-    /// Returns captured prefix inputs supplied before the operation's explicit inputs.
-    #[inline]
-    pub(crate) fn captured_inputs(&self) -> &[F] {
-        self.captured_inputs.as_slice()
-    }
-
     /// Maps this call's captured prefix factors through `map_factor`, preserving the carried programs and types.
     fn map_captured_inputs<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -404,14 +1444,6 @@ impl<F: Value<ArrayType>> LinearJitCallOperation<F> {
 
 fn missing_traced_input() -> ProgramError {
     ProgramError::InvalidInputCount { expected: 1, actual: 0 }
-}
-
-macro_rules! delegate_extension {
-    ($self:expr, [$($variant:ident),+ $(,)?], |$operation:ident| $body:expr) => {
-        match $self {
-            $(Self::$variant($operation) => $body,)+
-        }
-    };
 }
 
 fn ensure_call_input_types(
@@ -557,15 +1589,6 @@ impl Operation<ArrayType> for JitCallOperation {
 }
 
 impl JitCallOperation {
-    /// Stages this call operation into the active XLA tracing context carried by `inputs`.
-    fn interpret_traced_with_context(
-        &self,
-        inputs: &[XlaTracer<'static, 'static>],
-    ) -> Result<Vec<XlaTracer<'static, 'static>>, ProgramError> {
-        let context = inputs.first().ok_or_else(missing_traced_input)?.context().clone();
-        context.stage_operation(XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(self.clone()))), inputs)
-    }
-
     /// Creates the linear call operation corresponding to this ordinary call, capturing the primal inputs as
     /// `captured_inputs` factors.
     fn linear_call_operation<F: Value<ArrayType>>(
@@ -629,7 +1652,7 @@ impl JitCallOperation {
         let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let linear_operation = self.linear_call_operation(captured_inputs)?;
         let operation: LinearXlaOperation<TangentValue, XlaConstant, ValueOrCapture<ArrayType, PrimalValue>> =
-            LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation)));
+            LinearXlaOperation::LinearJitCall(Box::new(linear_operation));
         let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
         check_count!("output", tangent_outputs, primal_outputs.len(), ProgramError);
         Ok(primal_outputs
@@ -669,10 +1692,7 @@ where
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = context.stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(operation))),
-            physical_inputs.as_slice(),
-        )?;
+        let outputs = context.stage_operation(operation, physical_inputs.as_slice())?;
         outputs
             .into_iter()
             .zip(output_axes)
@@ -711,7 +1731,7 @@ where
         check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.bind_primal(
-            XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(self.clone()))),
+            XlaOperation::JitCall(Box::new(self.clone())),
             primals.as_slice(),
         )?;
         self.jvp_from_primal_outputs(context, inputs, primal_outputs)
@@ -752,39 +1772,24 @@ where
             .clone();
         let full_inputs = self.captured_inputs.iter().cloned().chain(inputs.iter().cloned()).collect::<Vec<_>>();
         context.stage_operation(
-            XlaOperation::Extension(XlaOperationExtension::JitCall(Box::new(JitCallOperation::new(
-                self.program.clone(),
-            )))),
+            XlaOperation::JitCall(Box::new(JitCallOperation::new(self.program.clone()))),
             full_inputs.as_slice(),
         )
     }
 }
 
-impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
-    for LinearJitCallOperation<Factor>
+impl<V, Factor, Target> TransposableOperation<ArrayType, V, Target> for LinearJitCallOperation<Factor>
 where
-    FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>: From<ZeroOperation<ArrayType>>,
+    V: Value<ArrayType>,
+    Factor: Value<ArrayType>,
+    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearJitCallOperation<Factor>>,
 {
     fn transpose<'transpose>(
         &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            V,
-            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-        >,
+        context: &mut AbstractTracingContext<'transpose, ArrayType, V, Target>,
         _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            V,
-            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
-        ProgramError,
-    > {
+        output_cotangents: &[Cotangent<'transpose, ArrayType, V, Target>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, Target>>, ProgramError> {
         check_count!("output", output_cotangents, self.output_types.len(), ProgramError);
         let mut cotangent_inputs = Vec::with_capacity(output_cotangents.len());
         for (cotangent, output_type) in output_cotangents.iter().zip(self.output_types.iter()) {
@@ -792,15 +1797,8 @@ where
                 Cotangent::Staged(cotangent) => cotangent_inputs.push(cotangent.clone()),
                 Cotangent::Zero => {
                     let zero_outputs = context.stage_operation(
-                        FactorSplitLinearXlaOperation::<V, Factor, UniverseFactor>::from(ZeroOperation::new(
-                            output_type.clone(),
-                        )),
-                        &[] as &[ryft_core::tracing::AbstractTracer<
-                            'transpose,
-                            ArrayType,
-                            V,
-                            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-                        >],
+                        Target::from(ZeroOperation::new(output_type.clone())),
+                        &[] as &[ryft_core::tracing::AbstractTracer<'transpose, ArrayType, V, Target>],
                     )?;
                     check_count!("output", zero_outputs, 1, ProgramError);
                     cotangent_inputs.push(zero_outputs[0].clone());
@@ -814,133 +1812,7 @@ where
             self.output_types.clone(),
             self.input_types.clone(),
         );
-        let input_cotangents = context.stage_operation(
-            LinearArrayOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(transposed))),
-            cotangent_inputs.as_slice(),
-        )?;
+        let input_cotangents = context.stage_operation(Target::from(transposed), cotangent_inputs.as_slice())?;
         Ok(input_cotangents.into_iter().map(Cotangent::Staged).collect())
-    }
-}
-
-/// Batching rules for the XLA-specific extension variants.
-///
-/// `ShardMap` and `LinearShardMap` carry inner programs whose proper batching requires lifting the captured body
-/// through context-aware batching rules per instruction. These variants return
-/// [`BatchingError::UnsupportedOperation`] so that programs which use shard_map can't be silently mis-batched;
-/// programs that don't touch these ops batch correctly through this trait impl.
-impl<V, C> BatchableOperation<V, C> for XlaOperationExtension<XlaConstant>
-where
-    V: Value<ArrayType>,
-    JitCallOperation: BatchableOperation<V, C>,
-{
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        match self {
-            Self::JitCall(op) => op.batch(context, inputs),
-            _ => Err(BatchingError::UnsupportedOperation {
-                message: format!("missing batching rule for operation '{}'", self.name()),
-            }
-            .into()),
-        }
-    }
-}
-
-/// Forward-mode rule for the XLA extension variants against any staging differentiation context whose linear
-/// operations are the XLA backend's, covering both ordinary XLA tracing contexts and the
-/// [`LinearizationContext`]s derived from them by nested symbolic linearization (the contexts that
-/// higher-order JVP rules and [`linearize_program`](ryft_core::tracing_v2::linearize_program) use to linearize
-/// captured programs without primal values).
-///
-/// Every arm stages its primal operation through [`TangentContext::bind_primal`] — splicing it into the active
-/// trace in an ordinary tracing context and into the nested primal program under nested symbolic linearization —
-/// and captures the primal payloads its linear operation needs as residual factors through [`JvpTracer::factor`]
-/// (environment references under reusable linearization, closed constants under direct execution).
-impl<E> DifferentiableOperation<E> for XlaOperationExtension<XlaConstant>
-where
-    E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
-        + DifferentiationContext<
-            LinearOperation<
-                <E as DifferentiationContext>::Tangent,
-                ValueOrCapture<ArrayType, Tracer<E>>,
-            > = LinearXlaOperation<
-                <E as DifferentiationContext>::Tangent,
-                XlaConstant,
-                ValueOrCapture<ArrayType, Tracer<E>>,
-            >,
-        >,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
-    where
-        E: 'jvp,
-        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
-    {
-        match self {
-            Self::JitCall(op) => op.jvp(context, inputs),
-            Self::ShardMap(op) => op.jvp_with_staging_context(context, inputs),
-            Self::LinearShardMap(op) => op.jvp_with_staging_context(context, inputs),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>, Factor: Value<ArrayType>, UniverseFactor: Value<ArrayType>>
-    TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>
-    for LinearXlaOperationExtension<V, Factor>
-where
-    LinearShardMapOperation<V, Factor>:
-        TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
-    LinearJitCallOperation<Factor>:
-        TransposableOperation<ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>,
-{
-    fn transpose<'transpose>(
-        &self,
-        context: &mut AbstractTracingContext<
-            'transpose,
-            ArrayType,
-            V,
-            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-        >,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<
-            'transpose,
-            ArrayType,
-            V,
-            FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>,
-        >],
-    ) -> Result<
-        Vec<Cotangent<'transpose, ArrayType, V, FactorSplitLinearXlaOperation<V, Factor, UniverseFactor>>>,
-        ProgramError,
-    > {
-        delegate_extension!(self, [LinearJitCall, LinearShardMap], |op| {
-            op.transpose(context, input_types, output_cotangents)
-        })
-    }
-}
-
-/// Maps the captured primal factor payloads carried by the XLA linear extension operations, so they participate in
-/// residual compaction, rebasing onto an enclosing linearization context, and instantiation into directly
-/// executable linear programs exactly like the core linear array operations' factor payloads.
-impl<V: Value<ArrayType>, F: Value<ArrayType>> CaptureParameterizedOperation<ArrayType, F>
-    for LinearXlaOperationExtension<V, F>
-{
-    type WithCapture<MappedFactor: Value<ArrayType>> = LinearXlaOperationExtension<V, MappedFactor>;
-
-    fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        match self {
-            Self::LinearJitCall(operation) => {
-                Ok(LinearXlaOperationExtension::LinearJitCall(Box::new(operation.map_captured_inputs(map_factor)?)))
-            }
-            Self::LinearShardMap(operation) => Ok(LinearXlaOperationExtension::LinearShardMap(Box::new(
-                operation.map_captured_global_primals(map_factor)?,
-            ))),
-        }
     }
 }

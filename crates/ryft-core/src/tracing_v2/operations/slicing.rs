@@ -632,8 +632,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
-
     use pretty_assertions::assert_eq;
 
     use crate::ProvidesContext;
@@ -699,7 +697,7 @@ mod tests {
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
         type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-            LinearArrayOperation<V, TestArray, Infallible, F, ArrayOperation<TestArray>>;
+            LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {
             false
@@ -1049,13 +1047,8 @@ mod tests {
         use crate::tracing_v2::{CaptureParameterizedOperation, DifferentiableOperation};
 
         type TestArrayOperation = ArrayOperation<TestArray>;
-        type TestLinearOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            Infallible,
-            ValueOrCapture<ArrayType, TestArray>,
-            ArrayOperation<TestArray>,
-        >;
+        type TestLinearOperation =
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
 
         let index_type = ArrayType::scalar(DataType::I32);
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -1149,13 +1142,8 @@ mod tests {
 
     #[test]
     fn test_dynamic_slicing_defactorize_splices_residual_start_indices() {
-        type TestLinearOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            Infallible,
-            ValueOrCapture<ArrayType, TestArray>,
-            ArrayOperation<TestArray>,
-        >;
+        type TestLinearOperation =
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
 
         // A loop-varying residual start index is rewritten into operand form: the residual atom is spliced into the
         // operand list and the operation becomes the recomputed primal dynamic slice.

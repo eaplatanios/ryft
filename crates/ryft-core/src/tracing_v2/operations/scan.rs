@@ -67,7 +67,7 @@ where
             ScanOperation<
                 T,
                 V,
-                <O as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithLocalCapture<ValueOrCapture<T, V>>,
+                <O as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithCapture<ValueOrCapture<T, V>>,
                 ValueOrCapture<T, R>,
             >,
         >,
@@ -81,7 +81,7 @@ where
         unroll: usize,
     ) -> Result<Self, ProgramError> {
         let body = body.map_operations(|operation| {
-            operation.try_map_local_captures(&mut |factor| match factor {
+            operation.try_map_captures(&mut |factor| match factor {
                 ValueOrCapture::Capture { index, r#type } => {
                     Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
                 }
@@ -95,7 +95,7 @@ where
         let scan = ScanOperation::<
             T,
             V,
-            <Self as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithLocalCapture<ValueOrCapture<T, V>>,
+            <Self as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithCapture<ValueOrCapture<T, V>>,
         >::new(body, carry_count, length)?
         .with_reverse(reverse)
         .with_unroll(unroll)?
@@ -936,15 +936,9 @@ mod tests {
         // The instantiated linear scan body interpreter must recursively replay nested linear while programs rather
         // than rejecting them. This loop's predicate is false, so each scan lane forwards the carry and returns the
         // current input slice as the stacked output.
-        type DirectLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
-        type ScanBodyOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            Infallible,
-            ValueOrCapture<ArrayType, TestArray>,
-            ArrayOperation<TestArray>,
-        >;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
+        type ScanBodyOperation =
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
@@ -1011,7 +1005,6 @@ mod tests {
             LinearArrayOperation<
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                Infallible,
                 ValueOrCapture<ArrayType, DomainTracer<TestArrayDomain>>,
                 TestOperation,
             >,
@@ -1080,7 +1073,6 @@ mod tests {
             LinearArrayOperation<
                 DomainTracer<TestArrayDomain>,
                 TestArray,
-                Infallible,
                 ValueOrCapture<ArrayType, DomainTracer<TestArrayDomain>>,
                 TestOperation,
             >,
@@ -1122,15 +1114,9 @@ mod tests {
         // Transposing a linear scan flips `reverse` and transposes the body, so transposing twice restores the
         // original direction and the original linear map. The body `carry' = r[lane] * carry + x` references its
         // residual stack scan-locally, which both transposes carry verbatim.
-        type DirectLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
-        type ScanBodyOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            Infallible,
-            ValueOrCapture<ArrayType, TestArray>,
-            ArrayOperation<TestArray>,
-        >;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
+        type ScanBodyOperation =
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -1281,13 +1267,8 @@ mod tests {
         // are re-indexed against the compacted constant-only stack list.
         use crate::tracing_v2::{DefactorizedOperation, ResidualizedOperation, SupportsLinearWhile};
 
-        type ScanBodyOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            Infallible,
-            ValueOrCapture<ArrayType, TestArray>,
-            ArrayOperation<TestArray>,
-        >;
+        type ScanBodyOperation =
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
@@ -1386,15 +1367,9 @@ mod tests {
         // stacks are lane-uniform across *batch* lanes but vary across *scan* lanes) and reuses the shared scan
         // batching loop: with `r = [2, 3, 4]` and body `carry' = r[lane] * carry + x`, batched tangent carries
         // `[1, 2]` produce final carries `[c2, 2 * 24 + ...]` computed per batch lane.
-        type DirectLinearOperation =
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>;
-        type ScanBodyOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            Infallible,
-            ValueOrCapture<ArrayType, TestArray>,
-            ArrayOperation<TestArray>,
-        >;
+        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
+        type ScanBodyOperation =
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();

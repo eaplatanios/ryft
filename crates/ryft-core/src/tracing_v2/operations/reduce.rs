@@ -697,8 +697,6 @@ pub fn reduce_evaluate<T: Clone>(
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
-
     use pretty_assertions::assert_eq;
 
     use crate::batching::BatchingError;
@@ -1021,14 +1019,14 @@ mod tests {
         let transpose_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
@@ -1098,13 +1096,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<
-                TestArray,
-                TestArray,
-                std::convert::Infallible,
-                ValueOrCapture<ArrayType, TestArray>,
-                ArrayOperation<TestArray>,
-            >,
+            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>,
         >::new()));
         let residuals = Rc::new(RefCell::new(Vec::new()));
         let residual_atoms = Rc::new(RefCell::new(HashMap::new()));

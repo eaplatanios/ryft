@@ -4,7 +4,7 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::operations::InterpretableOperation;
+use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -16,6 +16,7 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
@@ -41,7 +42,6 @@ use crate::types::DataType;
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug, Operation)]
-#[ryft(crate = "crate")]
 pub enum ScalarOperation<V: Value<DataType>> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
@@ -205,6 +205,34 @@ where
     }
 }
 
+impl<C, V, Capture> InterpretableOperation<DataType, V> for ScanOperation<DataType, C, ScalarOperation<C>, Capture>
+where
+    C: Value<DataType>,
+    V: Value<DataType>,
+    Capture: Value<DataType>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
+    ScalarOperation<C>: InterpretableOperation<DataType, V>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let mut state = inputs.to_vec();
+        for _ in 0..self.length() {
+            state = self.body().interpret_with(
+                state,
+                |_, constant| context.lift(constant.clone()),
+                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+            )?;
+            check_count!("output", state, self.carry_count(), ProgramError);
+        }
+        Ok(state)
+    }
+}
+
 /// Closed scalar operation type for staged linear scalar programs.
 ///
 /// The `V` parameter is the scalar tangent/cotangent value type carried by the linear program. It is also the linear
@@ -219,7 +247,6 @@ where
 /// ([`LinearSelectOperation`]), and the opaque [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp`
 /// linearization (its transpose replays the user's backward program).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
-#[ryft(crate = "crate")]
 pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Value<DataType> = C> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),

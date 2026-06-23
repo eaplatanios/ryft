@@ -162,7 +162,6 @@ impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableO
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::convert::Infallible;
     use std::rc::Rc;
 
     use indoc::indoc;
@@ -190,14 +189,14 @@ mod tests {
     ) -> Program<
         ArrayType,
         TestArray,
-        LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+        LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         TestArray,
         TestArray,
     > {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
         let domain = AbstractDomain::new();
@@ -291,7 +290,7 @@ mod tests {
         let builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             TestArray,
-            LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
+            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
         >::new()));
         let domain = AbstractDomain::new();
         let mut context = AbstractTracingContext::new(&domain, builder);
