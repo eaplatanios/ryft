@@ -1054,7 +1054,8 @@ impl<C> DifferentiationContext for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType> + DifferentiationContext + Domain<Type = ArrayType, Value = Tracer<C>>,
     C: DifferentiationContext<Tangent = Tracer<C>>,
-    BatchingContext<C>: StagingContext<Type = ArrayType, Constant = <C as Domain>::Constant>,
+    BatchingContext<C>:
+        StagingContext<Type = ArrayType, Constant = <C as Domain>::Constant, Operation = <C as Domain>::Operation>,
 {
     type Tangent = Tracer<BatchingContext<C>>;
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = C::LinearOperation<V, F>;

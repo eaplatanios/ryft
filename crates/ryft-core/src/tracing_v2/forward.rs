@@ -16,7 +16,7 @@ mod tests {
     use crate::domains::Domain;
     use crate::macros::check_count;
     use crate::operations::arithmetic::{
-        AddOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
+        AddOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation, ValueScale,
     };
     use crate::operations::constants::{MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
@@ -325,25 +325,26 @@ mod tests {
         }
     }
 
-    impl From<ScaleOperation<DataType, DistinctTangent>> for DistinctLinearOperation<DistinctPrimal> {
-        fn from(operation: ScaleOperation<DataType, DistinctTangent>) -> Self {
-            Self::ScaleByTangent { factor: operation.factor().clone() }
-        }
-    }
-
-    impl<Factor: Value<DataType>> From<ScaleOperation<DataType, Factor>> for DistinctLinearOperation<Factor> {
-        fn from(operation: ScaleOperation<DataType, Factor>) -> Self {
+    impl<Factor: Value<DataType>> From<ScaleOperation<DataType, Factor, ValueScale>> for DistinctLinearOperation<Factor> {
+        fn from(operation: ScaleOperation<DataType, Factor, ValueScale>) -> Self {
             Self::ScaleByPrimal { factor: operation.factor().clone() }
         }
     }
 
-    impl TransposableOperation<DataType, DistinctTangent, DistinctLinearOperation> for DistinctLinearOperation {
+    impl<Factor: Value<DataType>> TransposableOperation<DataType, DistinctTangent, DistinctLinearOperation<Factor>>
+        for DistinctLinearOperation<Factor>
+    {
         fn transpose<'transpose>(
             &self,
-            _context: &mut AbstractTracingContext<'transpose, DataType, DistinctTangent, DistinctLinearOperation>,
+            _context: &mut AbstractTracingContext<
+                'transpose,
+                DataType,
+                DistinctTangent,
+                DistinctLinearOperation<Factor>,
+            >,
             _input_types: &[&DataType],
-            output_cotangents: &[Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>],
-        ) -> Result<Vec<Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation>>, ProgramError>
+            output_cotangents: &[Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation<Factor>>],
+        ) -> Result<Vec<Cotangent<'transpose, DataType, DistinctTangent, DistinctLinearOperation<Factor>>>, ProgramError>
         {
             check_count!("output", output_cotangents, 1, ProgramError);
             match (&output_cotangents[0], self) {
@@ -361,12 +362,12 @@ mod tests {
                 (Cotangent::Staged(output_cotangent), Self::Sub) => {
                     Ok(vec![Cotangent::Staged(output_cotangent.clone()), Cotangent::Staged(-output_cotangent.clone())])
                 }
-                (Cotangent::Staged(output_cotangent), Self::ScaleByTangent { factor }) => {
-                    Ok(vec![Cotangent::Staged(output_cotangent.scale(*factor))])
-                }
-                (Cotangent::Staged(output_cotangent), Self::ScaleByPrimal { factor }) => {
-                    Ok(vec![Cotangent::Staged(output_cotangent.scale(*factor))])
-                }
+                (Cotangent::Staged(output_cotangent), Self::ScaleByTangent { factor }) => Ok(vec![Cotangent::Staged(
+                    output_cotangent.unary(DistinctLinearOperation::ScaleByTangent { factor: *factor }),
+                )]),
+                (Cotangent::Staged(output_cotangent), Self::ScaleByPrimal { factor }) => Ok(vec![Cotangent::Staged(
+                    output_cotangent.unary(ScaleOperation::<DataType, Factor, ValueScale>::new(factor.clone())),
+                )]),
             }
         }
     }
@@ -446,8 +447,8 @@ mod tests {
     where
         D: DifferentiationContext<Type = DataType>,
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
-        LinearOperationOf<D>:
-            From<AddOperation> + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>>>,
+        LinearOperationOf<D>: From<AddOperation>
+            + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>, ValueScale>>,
         LinearOperationOf<D>: MaybeZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
@@ -666,8 +667,7 @@ mod tests {
 
         assert_eq!(call_count.get(), 1);
         assert_eq!(output, (2.0, 2.0, 5.0, 3.0));
-        let tangent_context = domain.context();
-        assert_eq!(pushforward.apply(&tangent_context, 4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
+        assert_eq!(pushforward.apply(&domain, 4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
     }
 
     #[test]

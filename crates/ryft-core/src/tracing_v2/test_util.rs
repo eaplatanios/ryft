@@ -1,4 +1,4 @@
-use crate::operations::arithmetic::ScaleOperation;
+use crate::operations::arithmetic::{ScaleOperation, ValueScale};
 use crate::parameters::Placeholder;
 use crate::programs::ProgramBuilder;
 use crate::tests::{TestArray, TestArrayDomain};
@@ -30,7 +30,6 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::ProvidesContext;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
@@ -321,7 +320,12 @@ mod tests {
             LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         >::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(ScaleOperation::new(TestArray::scalar(5.0)), vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ScaleOperation::<ArrayType, TestArray, ValueScale>::new(TestArray::scalar(5.0)),
+                vec![input],
+            )
+            .unwrap()[0];
         let linear_branch = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let operation: LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>> =
             LinearArrayOperation::Condition(LinearConditionOperation::new(
@@ -375,7 +379,12 @@ mod tests {
             LinearArrayOperation<TestArray, TestArray, Infallible, TestArray, ArrayOperation<TestArray>>,
         >::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(ScaleOperation::new(TestArray::scalar(factor)), vec![input]).unwrap()[0];
+        let output = builder
+            .add_instruction(
+                ScaleOperation::<ArrayType, TestArray, ValueScale>::new(TestArray::scalar(factor)),
+                vec![input],
+            )
+            .unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
@@ -805,13 +814,12 @@ mod tests {
             .unwrap();
         assert_eq!(primal.values, vec![8.0]);
         assert!(!pushforward.program().to_string().contains("while"));
-        let tangent_context = TestArrayDomain.context();
         assert_eq!(
-            pushforward.apply(&tangent_context, TestArray::scalar(1.0)).map(|tangent| tangent.values),
+            pushforward.apply(&TestArrayDomain, TestArray::scalar(1.0)).map(|tangent| tangent.values),
             Ok(vec![8.0])
         );
         assert_eq!(
-            pushforward.apply(&tangent_context, TestArray::scalar(2.5)).map(|tangent| tangent.values),
+            pushforward.apply(&TestArrayDomain, TestArray::scalar(2.5)).map(|tangent| tangent.values),
             Ok(vec![20.0])
         );
     }
@@ -878,9 +886,8 @@ mod tests {
         assert!(pushforward.program().to_string().contains("scale"));
         assert!(!pushforward.program().to_string().contains("while"));
 
-        let tangent_context = TestArrayDomain.context();
         let (counter_tangent, value_tangent) =
-            pushforward.apply(&tangent_context, (TestArray::scalar(0.0), TestArray::scalar(1.0))).unwrap();
+            pushforward.apply(&TestArrayDomain, (TestArray::scalar(0.0), TestArray::scalar(1.0))).unwrap();
         assert_eq!(counter_tangent.values, vec![0.0]);
         assert_eq!(value_tangent.values, vec![108.0]);
     }
@@ -1079,13 +1086,12 @@ mod tests {
             .unwrap();
         assert_eq!(primal.values, vec![24.0]);
         assert!(pushforward.program().to_string().contains("scan"));
-        let tangent_context = TestArrayDomain.context();
         let tangent = pushforward
-            .apply(&tangent_context, (TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0])))
+            .apply(&TestArrayDomain, (TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0])))
             .unwrap();
         assert_eq!(tangent.values, vec![24.0]);
         let tangent = pushforward
-            .apply(&tangent_context, (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 1.0, 1.0])))
+            .apply(&TestArrayDomain, (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 1.0, 1.0])))
             .unwrap();
         assert_eq!(tangent.values, vec![26.0]);
     }

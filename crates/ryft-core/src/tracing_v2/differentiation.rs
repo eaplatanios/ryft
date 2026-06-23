@@ -14,7 +14,7 @@ use crate::domains::{AbstractDomain, Domain};
 use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
-use crate::operations::scalars::LinearScalarOperation;
+use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -683,8 +683,7 @@ pub trait DifferentiationContext:
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>,
         DirectLinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
-        LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: ResidualizedOperation<Self> + MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -723,8 +722,7 @@ pub trait DifferentiationContext:
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>,
         DirectLinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
-        LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: ResidualizedOperation<Self> + MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -767,8 +765,7 @@ pub trait DifferentiationContext:
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>,
         DirectLinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
-        LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: MaybeZeroOperation<<Self as Domain>::Type>,
+        LinearOperationOf<Self>: ResidualizedOperation<Self> + MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Tracer<PrimalTracingContext<Self>>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -1954,13 +1951,8 @@ impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E
 impl<S: Value<DataType>> DifferentiationContext for ScalarDomain<S>
 where
     <S as Value<DataType>>::InterpretationContext: Default,
-    ScalarDomain<S>: Context
-        + Domain<
-            Type = DataType,
-            Value = S,
-            Constant = S,
-            Operation: Clone + InterpretableOperation<DataType, S> + From<ZeroOperation<DataType>>,
-        >,
+    ScalarDomain<S>: Context + Domain<Type = DataType, Value = S, Constant = S, Operation = ScalarOperation<S>>,
+    ScalarOperation<S>: Clone + InterpretableOperation<DataType, S> + From<ZeroOperation<DataType>>,
 {
     type Tangent = S;
     type LinearOperation<V: Value<DataType>, F: Value<DataType>> = LinearScalarOperation<V, S, F>;
@@ -1981,7 +1973,6 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::ProvidesContext;
     use crate::scalars::ScalarDomain;
     use crate::types::{ArrayType, DataType};
 
@@ -2103,9 +2094,8 @@ mod tests {
             vec![TestArray::scalar(1.0), TestArray::scalar(0.0)],
             vec![TestArray::scalar(0.5), TestArray::scalar(-2.0)],
         ] {
-            let tangent_context = domain.context();
-            let symbolic_tangents = symbolic_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
-            let eager_tangents = eager_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
+            let symbolic_tangents = symbolic_pushforward.apply(&domain, tangents.clone()).unwrap();
+            let eager_tangents = eager_pushforward.apply(&domain, tangents.clone()).unwrap();
             assert_eq!(symbolic_tangents.len(), 1);
             assert_eq!(
                 symbolic_tangents[0].values,
@@ -2151,9 +2141,8 @@ mod tests {
             vec![TestArray::scalar(1.0), TestArray::scalar(7.0)],
             vec![TestArray::scalar(-0.5), TestArray::scalar(1.0)],
         ] {
-            let tangent_context = domain.context();
-            let symbolic_tangents = symbolic_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
-            let eager_tangents = eager_pushforward.apply(&tangent_context, tangents.clone()).unwrap();
+            let symbolic_tangents = symbolic_pushforward.apply(&domain, tangents.clone()).unwrap();
+            let eager_tangents = eager_pushforward.apply(&domain, tangents.clone()).unwrap();
             assert_eq!(symbolic_tangents.len(), 2);
             assert_eq!(symbolic_tangents[0].values, vec![2.0 * tangents[0].values[0]]);
             assert_eq!(symbolic_tangents[1].values, vec![0.0]);

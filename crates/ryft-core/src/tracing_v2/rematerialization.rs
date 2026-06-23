@@ -34,9 +34,10 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DirectLinearOperationOf, JvpTracer, LinearOperationOf,
-    ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
+    DifferentiableOperation, DifferentiationContext, JvpTracer, ProgramLinearizableOperation, ResidualizedOperation,
+    TangentContext,
 };
+use crate::tracing_v2::operations::captures::CapturedFactor;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
@@ -839,13 +840,15 @@ where
         + From<OneOperation<D::Type>>
         + DifferentiableOperation<TracingContext<'d, D>>
         + ProgramLinearizableOperation<TracingContext<'d, D>>,
-    LinearOperationOf<TracingContext<'d, D>>: ResidualizedOperation<TracingContext<'d, D>>,
-    LinearOperationOf<TracingContext<'d, D>>: MaybeZeroOperation<D::Type>,
-    DirectLinearOperationOf<TracingContext<'d, D>>: TransposableOperation<D::Type, DomainTracer<'d, D>, DirectLinearOperationOf<TracingContext<'d, D>>>
-        + From<ZeroOperation<D::Type>>
+    D::LinearOperation<DomainTracer<'d, D>, CapturedFactor<D::Type, DomainTracer<'d, D>>>: ResidualizedOperation<TracingContext<'d, D>>
+        + TransposableOperation<
+            D::Type,
+            DomainTracer<'d, D>,
+            D::LinearOperation<DomainTracer<'d, D>, CapturedFactor<D::Type, DomainTracer<'d, D>>>,
+        > + From<ZeroOperation<D::Type>>
         + From<AddOperation>
-        + InterpretableOperation<D::Type, DomainTracer<'d, D>>,
-    DirectLinearOperationOf<TracingContext<'d, D>>: MaybeZeroOperation<D::Type>,
+        + MaybeZeroOperation<D::Type>,
+    D::LinearOperation<DomainTracer<'d, D>, DomainTracer<'d, D>>: InterpretableOperation<D::Type, DomainTracer<'d, D>>,
     Vec<D::Type>: Parameterized<
             D::Type,
             Family: ParameterizedFamily<<D as Domain>::Constant> + ParameterizedFamily<DomainTracer<'d, D>>,
@@ -974,10 +977,9 @@ where
                     let restored = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[*index])?;
                     residuals[*index] = restored;
                 }
-                let instantiated = pushforward
-                    .program()
-                    .map_operations(|operation| operation.instantiate_residuals(residuals.as_slice()))?;
-                let pullback = context.transpose_linear_program(&instantiated)?;
+                let pullback = context.transpose_linear_program(pushforward.program())?;
+                let pullback =
+                    pullback.map_operations(|operation| operation.instantiate_residuals(residuals.as_slice()))?;
                 pullback.interpret_in_context(&context, cotangent_tracers)
             },
             backward_input_types,
@@ -1011,10 +1013,10 @@ where
                     let restored = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[*index])?;
                     residuals[*index] = restored;
                 }
-                let instantiated = pushforward
+                let tangent_program = pushforward
                     .program()
                     .map_operations(|operation| operation.instantiate_residuals(residuals.as_slice()))?;
-                instantiated.interpret_in_context(&context, tangent_tracers)
+                tangent_program.interpret_in_context(&context, tangent_tracers)
             },
             tangent_input_types,
         )?;
@@ -1032,7 +1034,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::contexts::ProvidesContext;
     use crate::operations::trigonometric::Sin;
     use crate::scalars::ScalarDomain;
     use crate::tests::{TestArray, TestArrayDomain};
@@ -1590,8 +1591,7 @@ mod tests {
         )
         .unwrap();
         let (gradient, pushforward) = domain.linearize_program(&gradient_program, vec![0.7]).unwrap();
-        let tangent_context = domain.context();
-        let second_derivative = pushforward.apply(&tangent_context, 1.0).unwrap();
+        let second_derivative = pushforward.apply(&domain, 1.0).unwrap();
         let x: f64 = 0.7;
         assert_close(gradient, 2.0 * x * (x * x).cos());
         assert_close(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());

@@ -849,12 +849,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 
     /// Interprets/executes this [`Program`] with the provided input, within the supplied
-    /// [`InterpretationContext`](Value::InterpretationContext). This is the context-taking core behind
-    /// [`Self::interpret`]. [`Self::interpret`] supports eager value types by building a dummy `()` context, while
-    /// callers that interpret using [`Tracer`](crate::Tracer)s need to supply the surrounding staging context using
-    /// this function so that nullary operations can stage themselves into it. Nested program interpretation (e.g.,
-    /// control flow branches, custom derivative programs, etc.) routes through here so that a single replay path
-    /// handles both eager and traced values.
+    /// [`InterpretationContext`](Value::InterpretationContext). This is the context-taking core
+    /// behind [`Self::interpret`]. [`Self::interpret`] supports eager value types by building an
+    /// [`EagerContext`](crate::EagerContext), while callers that interpret using [`Tracer`](crate::Tracer)s need to
+    /// supply the surrounding [`StagingContext`](crate::StagingContext) using this function so that nullary operations
+    /// can stage themselves into it. Nested program interpretation (e.g., control flow branches, custom derivative
+    /// programs, etc.) routes through here so that a single replay path handles both eager and traced values.
     pub fn interpret_in_context(
         &self,
         context: &<V as Value<T>>::InterpretationContext,
