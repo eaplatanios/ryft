@@ -7,14 +7,14 @@ use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::payloads::Input;
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 
 impl<D> DifferentiableOperation<D> for SinOperation
 where
     D: DifferentiationContext,
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
-    LinearOperationOf<D>: From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>,
+    LinearOperationOf<D>: From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
     #[inline]

@@ -15,8 +15,8 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
 use ryft_core::tracing::{AbstractTracer, AbstractTracingContext, DomainTracer, Tracer, TracingContext};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
-    CapturedFactor, DifferentiableOperation, DifferentiationContext, LinearOperationOf, ResidualizedOperation,
-    TangentContext,
+    DifferentiableOperation, DifferentiationContext, LinearOperationOf, ResidualizedOperation, TangentContext,
+    ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
@@ -372,17 +372,17 @@ fn complete_shard_map_jvp<'jvp, E, PrimalValue, TangentValue>(
     inputs: &[JvpTracer<'jvp, E>],
     primal_outputs: Vec<PrimalValue>,
     output_count: usize,
-    linear_operation: LinearShardMapOperation<TangentValue, CapturedFactor<ArrayType, PrimalValue>>,
+    linear_operation: LinearShardMapOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>>,
 ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
 where
     PrimalValue: Value<ArrayType>,
     TangentValue: Value<ArrayType>,
     E: DifferentiationContext<
             Tangent = TangentValue,
-            LinearOperation<TangentValue, CapturedFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
+            LinearOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>> = LinearXlaOperation<
                 TangentValue,
                 XlaConstant,
-                CapturedFactor<ArrayType, PrimalValue>,
+                ValueOrCapture<ArrayType, PrimalValue>,
             >,
         > + Domain<Type = ArrayType, Value = PrimalValue>
         + 'jvp,
@@ -390,7 +390,7 @@ where
 {
     check_count!("output", primal_outputs, output_count, ProgramError);
     let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-    let operation: LinearXlaOperation<TangentValue, XlaConstant, CapturedFactor<ArrayType, PrimalValue>> =
+    let operation: LinearXlaOperation<TangentValue, XlaConstant, ValueOrCapture<ArrayType, PrimalValue>> =
         LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearShardMap(Box::new(linear_operation)));
     let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
@@ -417,11 +417,11 @@ impl<LeafV> ShardMapOperation<LeafV> {
             + DifferentiationContext<
                 LinearOperation<
                     <E as DifferentiationContext>::Tangent,
-                    CapturedFactor<ArrayType, Tracer<E>>,
+                    ValueOrCapture<ArrayType, Tracer<E>>,
                 > = LinearXlaOperation<
                     <E as DifferentiationContext>::Tangent,
                     XlaConstant,
-                    CapturedFactor<ArrayType, Tracer<E>>,
+                    ValueOrCapture<ArrayType, Tracer<E>>,
                 >,
             > + 'jvp,
         LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
@@ -466,10 +466,10 @@ impl ShardMapOperation<ShardMapTracer> {
             + Domain<Type = ArrayType>
             + DifferentiationContext<
                 Tangent = ShardMapTracer,
-                LinearOperation<ShardMapTracer, CapturedFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
+                LinearOperation<ShardMapTracer, ValueOrCapture<ArrayType, ShardMapTracer>> = LinearXlaOperation<
                     ShardMapTracer,
                     XlaConstant,
-                    CapturedFactor<ArrayType, ShardMapTracer>,
+                    ValueOrCapture<ArrayType, ShardMapTracer>,
                 >,
             > + 'jvp,
         LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
@@ -510,11 +510,11 @@ impl LinearShardMapOperation<XlaConstant> {
             + DifferentiationContext<
                 LinearOperation<
                     <E as DifferentiationContext>::Tangent,
-                    CapturedFactor<ArrayType, Tracer<E>>,
+                    ValueOrCapture<ArrayType, Tracer<E>>,
                 > = LinearXlaOperation<
                     <E as DifferentiationContext>::Tangent,
                     XlaConstant,
-                    CapturedFactor<ArrayType, Tracer<E>>,
+                    ValueOrCapture<ArrayType, Tracer<E>>,
                 >,
             > + 'jvp,
         LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
@@ -792,10 +792,10 @@ where
         + Domain<Type = ArrayType>
         + DifferentiationContext<
             Tangent = ShardMapTracer,
-            LinearOperation<ShardMapTracer, CapturedFactor<ArrayType, ShardMapTracer>> = LinearXlaOperation<
+            LinearOperation<ShardMapTracer, ValueOrCapture<ArrayType, ShardMapTracer>> = LinearXlaOperation<
                 ShardMapTracer,
                 XlaConstant,
-                CapturedFactor<ArrayType, ShardMapTracer>,
+                ValueOrCapture<ArrayType, ShardMapTracer>,
             >,
         >,
 {
@@ -1575,7 +1575,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing::{AbstractTracingContext, TracingContext};
     use ryft_core::tracing_v2::differentiation::JvpTracer;
-    use ryft_core::tracing_v2::{CapturedFactor, DifferentiableOperation, TangentContext};
+    use ryft_core::tracing_v2::{DifferentiableOperation, TangentContext, ValueOrCapture};
     use ryft_core::types::{ArrayType, DataType, Typed};
 
     use crate::experimental::domains::XlaTracer;
@@ -1923,7 +1923,7 @@ mod tests {
         let tangent_builder = Rc::new(RefCell::new(ProgramBuilder::<
             ArrayType,
             XlaTracer<'_, '_>,
-            LinearXlaOperation<XlaTracer<'_, '_>, XlaConstant, CapturedFactor<ArrayType, XlaTracer<'_, '_>>>,
+            LinearXlaOperation<XlaTracer<'_, '_>, XlaConstant, ValueOrCapture<ArrayType, XlaTracer<'_, '_>>>,
         >::new()));
         let mut context = TangentContext::new(&tracing_context, tangent_builder.clone());
         let primal_input = tracing_context.input(test_array_type());

@@ -106,7 +106,7 @@ pub use bounds::{
     SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 pub use broadcasting::lift_broadcast;
-pub use captures::{CapturedFactor, MaterializeCapturedFactorOperation};
+pub use captures::{MaterializeCaptureOperation, ValueOrCapture};
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use control_flow::{
     DefactorizedOperation, LinearConditionBranchTransposable, SupportsLinearCondition, SupportsLinearWhile,
@@ -125,6 +125,6 @@ pub use primitive::{ArrayOperation, LinearArrayOperation};
 pub use recompute::RecomputeOperation;
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
-pub use scan::{LinearScanBodyTransposable, SupportsLinearScan};
+pub use scan::{InterpretableNestedProgram, LinearScanBodyTransposable};
 pub use select::LinearSelectOperation;
 pub use transpose::lift_permutation;

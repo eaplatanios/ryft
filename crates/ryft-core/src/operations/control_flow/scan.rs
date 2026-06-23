@@ -1,12 +1,12 @@
 use std::fmt::{Debug, Display};
 
+use crate::contexts::Context;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
-use crate::types::{ArrayType, Shape, Size, Type, TypeError};
+use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -43,13 +43,21 @@ pub const SCAN_OPERATION_NAME: &'static str = "scan";
 ///
 /// [`WhileOperation`]: crate::operations::control_flow::WhileOperation
 #[derive(Clone, Debug)]
-pub struct ScanOperation<T, V, O>
+pub struct ScanOperation<T, V, O, C = V>
 where
     T: Type,
     V: Value<T>,
 {
     /// Body [`Program`] of this [`ScanOperation`] that maps `[carry..., x_slice...]` to `[carry..., y_slice...]`.
     pub(crate) body: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Captured values used by the body operation payloads.
+    ///
+    /// Ordinary primal scans leave this empty. Linearized scans use it for values captured from the primal program,
+    /// such as per-lane residual stacks. Keeping the captures on the ordinary scan operation avoids a separate
+    /// linear scan operation while preserving the fact that captures can have a different value family from the
+    /// tangent operands carried by the scan body.
+    pub(crate) captures: Vec<C>,
 
     /// Number of loop-carried state leaves at the front of the body's inputs and outputs.
     pub(crate) carry_count: usize,
@@ -128,47 +136,295 @@ pub(crate) fn scan_output_types(
     Ok(output_types)
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> ScanOperation<ArrayType, V, O> {
+/// Validates a carry-only scalar scan and returns the final carry types.
+///
+/// `DataType` has no length-indexed stack metadata, so scalar scans can only represent loop-carried state. Scanned
+/// scalar inputs and stacked scalar outputs require a separate stack value representation and are rejected here.
+pub(crate) fn scalar_scan_output_types(
+    body_input_types: &[DataType],
+    body_output_types: &[DataType],
+    carry_count: usize,
+    input_types: &[DataType],
+) -> Result<Vec<DataType>, TypeError> {
+    if carry_count != body_input_types.len() {
+        return Err(TypeError {
+            message: format!(
+                "scalar scan requires every body input to be loop-carried, but carry count {carry_count} is smaller \
+                 than the body input count {}",
+                body_input_types.len(),
+            ),
+        });
+    }
+    if carry_count != body_output_types.len() {
+        return Err(TypeError {
+            message: format!(
+                "scalar scan requires every body output to be loop-carried, but carry count {carry_count} is smaller \
+                 than the body output count {}",
+                body_output_types.len(),
+            ),
+        });
+    }
+    check_types!("scan body carry", body_input_types, body_output_types);
+    check_count!("input", input_types, carry_count, TypeError);
+    check_types!("scan input", body_input_types, input_types);
+    Ok(body_output_types.to_vec())
+}
+
+/// Type-family semantics for [`ScanOperation`].
+///
+/// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-lane value type, while
+/// [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. This trait keeps
+/// those type rules local to the scan operation so the operation dispatcher itself can be generic over `T`.
+pub trait ScanTypeSemantics: Type {
+    /// Validates a scan body signature for this type family.
+    fn validate_scan_body(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: usize,
+    ) -> Result<(), TypeError>;
+
+    /// Returns this scan's input types from its body input types.
+    fn scan_input_types(body_input_types: &[Self], carry_count: usize, length: usize) -> Vec<Self>;
+
+    /// Returns this scan's declared output types from its body output types.
+    fn scan_declared_output_types(body_output_types: &[Self], carry_count: usize, length: usize) -> Vec<Self>;
+
+    /// Infers this scan's output types from concrete input types.
+    fn infer_scan_output_types(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: usize,
+        input_types: &[Self],
+    ) -> Result<Vec<Self>, TypeError>;
+
+    /// Validates one capture value stored on this scan.
+    fn validate_scan_capture<C: Value<Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError>;
+}
+
+impl ScanTypeSemantics for ArrayType {
+    fn validate_scan_body(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        _length: usize,
+    ) -> Result<(), TypeError> {
+        if carry_count > body_input_types.len() {
+            return Err(TypeError {
+                message: format!(
+                    "scan carry count {carry_count} exceeds the body input count {}",
+                    body_input_types.len(),
+                ),
+            });
+        }
+        if carry_count > body_output_types.len() {
+            return Err(TypeError {
+                message: format!(
+                    "scan carry count {carry_count} exceeds the body output count {}",
+                    body_output_types.len(),
+                ),
+            });
+        }
+        check_types!("scan body carry", &body_input_types[..carry_count], &body_output_types[..carry_count]);
+        for (index, input_type) in body_input_types.iter().enumerate() {
+            check_static_scan_type("input", index, input_type)?;
+        }
+        for (index, output_type) in body_output_types.iter().enumerate() {
+            check_static_scan_type("output", index, output_type)?;
+        }
+        Ok(())
+    }
+
+    fn scan_input_types(body_input_types: &[Self], carry_count: usize, length: usize) -> Vec<Self> {
+        let mut input_types = body_input_types[..carry_count].to_vec();
+        input_types
+            .extend(body_input_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
+        input_types
+    }
+
+    fn scan_declared_output_types(body_output_types: &[Self], carry_count: usize, length: usize) -> Vec<Self> {
+        let mut output_types = body_output_types[..carry_count].to_vec();
+        output_types
+            .extend(body_output_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
+        output_types
+    }
+
+    fn infer_scan_output_types(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        length: usize,
+        input_types: &[Self],
+    ) -> Result<Vec<Self>, TypeError> {
+        scan_output_types(body_input_types, body_output_types, carry_count, length, input_types)
+    }
+
+    fn validate_scan_capture<C: Value<Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
+        let capture_type = capture.r#type();
+        if capture_type.rank() == 0 || capture_type.dimension(0) != Size::Static(length) {
+            return Err(TypeError {
+                message: format!(
+                    "scan capture {index} must have leading dimension {length} but has type {capture_type}",
+                    capture_type = capture_type.as_ref(),
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl ScanTypeSemantics for DataType {
+    fn validate_scan_body(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        _length: usize,
+    ) -> Result<(), TypeError> {
+        scalar_scan_output_types(body_input_types, body_output_types, carry_count, body_input_types)?;
+        Ok(())
+    }
+
+    fn scan_input_types(body_input_types: &[Self], _carry_count: usize, _length: usize) -> Vec<Self> {
+        body_input_types.to_vec()
+    }
+
+    fn scan_declared_output_types(body_output_types: &[Self], _carry_count: usize, _length: usize) -> Vec<Self> {
+        body_output_types.to_vec()
+    }
+
+    fn infer_scan_output_types(
+        body_input_types: &[Self],
+        body_output_types: &[Self],
+        carry_count: usize,
+        _length: usize,
+        input_types: &[Self],
+    ) -> Result<Vec<Self>, TypeError> {
+        scalar_scan_output_types(body_input_types, body_output_types, carry_count, input_types)
+    }
+
+    fn validate_scan_capture<C: Value<Self>>(_capture: &C, _index: usize, _length: usize) -> Result<(), TypeError> {
+        Err(TypeError { message: "scalar scan captures require a scalar stack representation".to_string() })
+    }
+}
+
+/// Runtime value semantics for interpreting [`ScanOperation`] over a concrete value family.
+///
+/// This trait mirrors [`ScanTypeSemantics`] at execution time. Array values must support slicing, updating, and
+/// reshaping so lanes can be read from and written to stacked values. Scalar values need no such capabilities because
+/// scalar scans are carry-only.
+pub(crate) trait ScanRuntime<T: ScanTypeSemantics>: Value<T> {
+    /// Interprets `operation` in `context` using `inputs`.
+    fn interpret_scan<BodyValue, O, Capture>(
+        operation: &ScanOperation<T, BodyValue, O, Capture>,
+        context: &Self::InterpretationContext,
+        inputs: &[Self],
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        BodyValue: Value<T>,
+        O: InterpretableOperation<T, Self>,
+        Capture: Value<T>,
+        Self::InterpretationContext: Context<Type = T, Constant = BodyValue, Value = Self>;
+}
+
+impl<V> ScanRuntime<ArrayType> for V
+where
+    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
+{
+    fn interpret_scan<BodyValue, O, Capture>(
+        operation: &ScanOperation<ArrayType, BodyValue, O, Capture>,
+        context: &Self::InterpretationContext,
+        inputs: &[Self],
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        BodyValue: Value<ArrayType>,
+        O: InterpretableOperation<ArrayType, Self>,
+        Capture: Value<ArrayType>,
+        Self::InterpretationContext: Context<Type = ArrayType, Constant = BodyValue, Value = Self>,
+    {
+        let y_slice_types = operation.body.output_types().split_off(operation.carry_count);
+        interpret_scan_lanes(
+            operation.carry_count,
+            operation.length,
+            operation.reverse,
+            y_slice_types.as_slice(),
+            inputs,
+            |stacked_type| context.zero(stacked_type),
+            |_, lane_inputs| {
+                operation.body.interpret_with(
+                    lane_inputs,
+                    |_, constant| context.lift(constant.clone()),
+                    |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+                )
+            },
+        )
+    }
+}
+
+impl<V> ScanRuntime<DataType> for V
+where
+    V: Value<DataType>,
+{
+    fn interpret_scan<BodyValue, O, Capture>(
+        operation: &ScanOperation<DataType, BodyValue, O, Capture>,
+        context: &Self::InterpretationContext,
+        inputs: &[Self],
+    ) -> Result<Vec<Self>, ProgramError>
+    where
+        BodyValue: Value<DataType>,
+        O: InterpretableOperation<DataType, Self>,
+        Capture: Value<DataType>,
+        Self::InterpretationContext: Context<Type = DataType, Constant = BodyValue, Value = Self>,
+    {
+        let mut state = inputs.to_vec();
+        for _ in 0..operation.length {
+            state = operation.body.interpret_with(
+                state,
+                |_, constant| context.lift(constant.clone()),
+                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+            )?;
+            check_count!("output", state, operation.carry_count, ProgramError);
+        }
+        Ok(state)
+    }
+}
+
+impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> {
     /// Creates a new [`ScanOperation`] with the provided body program, carry count, and static trip count, visiting
-    /// the stacked slices in increasing order (use [`Self::with_reverse`] to flip the visit order).
+    /// iterations in increasing order (use [`Self::with_reverse`] to flip the visit order).
     ///
     /// # Parameters
     ///
     ///   - `body`: Body [`Program`] that maps `[carry..., x_slice...]` to `[carry..., y_slice...]`. Its first
-    ///     `carry_count` input and output types must agree, and every input and output type must be fully static.
+    ///     `carry_count` input and output types must agree. For [`ArrayType`] every input and output type must be
+    ///     fully static because stacked values prepend a static `length` axis. [`DataType`] currently supports only
+    ///     carry-only scans because it has no scalar-stack metadata.
     ///   - `carry_count`: Number of loop-carried state leaves at the front of the body's inputs and outputs.
-    ///   - `length`: Static trip count; each stacked input and output type prepends a static `length` dimension to
-    ///     the corresponding body slice type.
-    pub fn new(
-        body: Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-        carry_count: usize,
-        length: usize,
-    ) -> Result<Self, TypeError> {
+    ///   - `length`: Static trip count.
+    pub fn new(body: Program<T, V, O, Vec<V>, Vec<V>>, carry_count: usize, length: usize) -> Result<Self, TypeError> {
         let input_types = body.input_types();
         let output_types = body.output_types();
-        if carry_count > input_types.len() {
-            return Err(TypeError {
-                message: format!("scan carry count {carry_count} exceeds the body input count {}", input_types.len(),),
-            });
-        }
-        if carry_count > output_types.len() {
-            return Err(TypeError {
-                message: format!("scan carry count {carry_count} exceeds the body output count {}", output_types.len(),),
-            });
-        }
-        check_types!("scan body carry", &input_types[..carry_count], &output_types[..carry_count]);
-        for (index, input_type) in input_types.iter().enumerate() {
-            check_static_scan_type("input", index, input_type)?;
-        }
-        for (index, output_type) in output_types.iter().enumerate() {
-            check_static_scan_type("output", index, output_type)?;
-        }
-        Ok(Self { body, carry_count, length, reverse: false, unroll: 1 })
+        T::validate_scan_body(input_types.as_slice(), output_types.as_slice(), carry_count, length)?;
+        Ok(Self { body, captures: Vec::new(), carry_count, length, reverse: false, unroll: 1 })
+    }
+}
+
+impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
+    /// Returns the input types of this [`ScanOperation`].
+    pub fn input_types(&self) -> Vec<T> {
+        T::scan_input_types(self.body.input_types().as_slice(), self.carry_count, self.length)
     }
 
-    /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. When `reverse` is `true`,
-    /// iterations visit the stacked slices from `length - 1` down to `0` while slice `i` of every stacked output
-    /// still corresponds to slice `i` of the stacked inputs.
+    /// Returns the output types of this [`ScanOperation`].
+    pub fn output_types(&self) -> Vec<T> {
+        T::scan_declared_output_types(self.body.output_types().as_slice(), self.carry_count, self.length)
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
+    /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. For carry-only scalar scans this
+    /// only preserves lowering metadata because all iterations consume and produce loop-carried state.
     #[inline]
     pub fn with_reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
@@ -186,36 +442,33 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> ScanOperation<ArrayType, V, O
         Ok(self)
     }
 
-    /// Returns the `[carry..., stacked_xs...]` input types of this [`ScanOperation`].
-    pub fn input_types(&self) -> Vec<ArrayType> {
-        let body_input_types = self.body.input_types();
-        let mut input_types = body_input_types[..self.carry_count].to_vec();
-        input_types.extend(
-            body_input_types[self.carry_count..]
-                .iter()
-                .map(|slice_type| stacked_scan_type(slice_type, self.length)),
-        );
-        input_types
+    /// Returns this [`ScanOperation`] with the provided capture environment.
+    ///
+    /// Captures are interpreted by operation payloads inside the body. The scan operation itself only stores and
+    /// preserves them; linear interpretation, transposition, and batching rules decide how to instantiate each
+    /// captured value for a lane.
+    #[inline]
+    pub fn with_captures<MappedCapture>(self, captures: Vec<MappedCapture>) -> ScanOperation<T, V, O, MappedCapture> {
+        ScanOperation {
+            body: self.body,
+            captures,
+            carry_count: self.carry_count,
+            length: self.length,
+            reverse: self.reverse,
+            unroll: self.unroll,
+        }
     }
 
-    /// Returns the `[final_carry..., stacked_ys...]` output types of this [`ScanOperation`].
-    pub fn output_types(&self) -> Vec<ArrayType> {
-        let body_output_types = self.body.output_types();
-        let mut output_types = body_output_types[..self.carry_count].to_vec();
-        output_types.extend(
-            body_output_types[self.carry_count..]
-                .iter()
-                .map(|slice_type| stacked_scan_type(slice_type, self.length)),
-        );
-        output_types
-    }
-}
-
-impl<T: Type, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> {
     /// Returns the body [`Program`] of this [`ScanOperation`] that computes one iteration.
     #[inline]
     pub fn body(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.body
+    }
+
+    /// Returns the capture environment used by this [`ScanOperation`]'s body payloads.
+    #[inline]
+    pub fn captures(&self) -> &[C] {
+        self.captures.as_slice()
     }
 
     /// Returns the number of loop-carried state leaves of this [`ScanOperation`].
@@ -244,7 +497,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> {
     }
 }
 
-impl<T: Type, V: Value<T>, O> Display for ScanOperation<T, V, O>
+impl<T: Type, V: Value<T>, O, C> Display for ScanOperation<T, V, O, C>
 where
     Self: Operation<T>,
 {
@@ -253,20 +506,42 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> Operation<ArrayType> for ScanOperation<ArrayType, V, O> {
+fn render_capture_list<C: Display>(captures: &[C]) -> String {
+    let mut rendered = String::from("[");
+    for (index, capture) in captures.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&capture.to_string());
+    }
+    rendered.push(']');
+    rendered
+}
+
+impl<T, V, O, C> Operation<T> for ScanOperation<T, V, O, C>
+where
+    T: ScanTypeSemantics,
+    V: Value<T>,
+    O: Operation<T>,
+    C: Value<T>,
+{
     #[inline]
     fn name(&self) -> &'static str {
         SCAN_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        scan_output_types(
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        let output_types = T::infer_scan_output_types(
             self.body.input_types().as_slice(),
             self.body.output_types().as_slice(),
             self.carry_count,
             self.length,
             input_types,
-        )
+        )?;
+        for (index, capture) in self.captures.iter().enumerate() {
+            T::validate_scan_capture(capture, index, self.length)?;
+        }
+        Ok(output_types)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -276,6 +551,9 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> Operation<ArrayType> for Scan
             operation.field("reverse", self.reverse)?;
             if self.unroll > 1 {
                 operation.field("unroll", self.unroll)?;
+            }
+            if !self.captures.is_empty() {
+                operation.field("captures", format_args!("{}", render_capture_list(&self.captures)))?;
             }
             operation.program("body", &self.body)
         })
@@ -389,30 +667,23 @@ where
     Ok(carries)
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for ScanOperation<ArrayType, V, O>
+impl<T, BodyValue, V, O, Capture> InterpretableOperation<T, V> for ScanOperation<T, BodyValue, O, Capture>
 where
-    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    O: InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    T: ScanTypeSemantics,
+    BodyValue: Value<T>,
+    V: ScanRuntime<T>,
+    V::InterpretationContext: Context<Type = T, Constant = BodyValue, Value = V>,
+    O: InterpretableOperation<T, V>,
+    Capture: Value<T>,
 {
     fn interpret(
         &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
-        let y_slice_types = self.body.output_types().split_off(self.carry_count);
-        interpret_scan_lanes(
-            self.carry_count,
-            self.length,
-            self.reverse,
-            y_slice_types.as_slice(),
-            inputs,
-            |stacked_type| context.zero(stacked_type),
-            |_, lane_inputs| self.body.interpret_in_context(context, lane_inputs),
-        )
+        V::interpret_scan(self, context, inputs)
     }
 }
 
@@ -436,6 +707,8 @@ mod tests {
     use crate::types::DataType;
 
     use super::*;
+
+    type TestScanOperation = ScanOperation<ArrayType, TestArray, ArrayOperation<TestArray>>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`: the new carry is
     /// the running product and each iteration also emits that product as a stacked output slice.
@@ -461,7 +734,7 @@ mod tests {
     fn test_scan() {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let operation = ScanOperation::new(product_body(), 1, 3).unwrap();
+        let operation = TestScanOperation::new(product_body(), 1, 3).unwrap();
 
         // Operation identity and accessors.
         assert_eq!(operation.name(), SCAN_OPERATION_NAME);
@@ -470,7 +743,7 @@ mod tests {
         assert!(!operation.reverse());
         assert_eq!(operation.unroll(), 1);
         assert!(operation.with_reverse(true).reverse());
-        let operation = ScanOperation::new(product_body(), 1, 3).unwrap();
+        let operation = TestScanOperation::new(product_body(), 1, 3).unwrap();
         assert_eq!(operation.body().input_types(), vec![scalar_f64.clone(), scalar_f64.clone()]);
         assert_eq!(operation.input_types(), vec![scalar_f64.clone(), stacked_f64.clone()]);
         assert_eq!(operation.output_types(), vec![scalar_f64.clone(), stacked_f64.clone()]);
@@ -511,16 +784,16 @@ mod tests {
         // The lowering-only unroll factor must be at least 1 and must evenly divide the scan length; valid factors
         // render only when greater than 1 and interpretation ignores them entirely.
         assert_eq!(
-            ScanOperation::new(product_body(), 1, 3).unwrap().with_unroll(0).map(|_| ()),
+            TestScanOperation::new(product_body(), 1, 3).unwrap().with_unroll(0).map(|_| ()),
             Err(ProgramError::Type(TypeError { message: "scan unroll factor must be at least 1".to_string() })),
         );
         assert_eq!(
-            ScanOperation::new(product_body(), 1, 3).unwrap().with_unroll(2).map(|_| ()),
+            TestScanOperation::new(product_body(), 1, 3).unwrap().with_unroll(2).map(|_| ()),
             Err(ProgramError::Type(TypeError {
                 message: "scan unroll factor 2 must evenly divide the scan length 3".to_string(),
             })),
         );
-        let unrolled = ScanOperation::new(product_body(), 1, 3).unwrap().with_unroll(3).unwrap();
+        let unrolled = TestScanOperation::new(product_body(), 1, 3).unwrap().with_unroll(3).unwrap();
         assert_eq!(unrolled.unroll(), 3);
         assert_eq!(
             format!("{unrolled}"),
@@ -548,7 +821,7 @@ mod tests {
         // Construction rejects carry counts that exceed the body signature, mismatched carry types, and dynamically
         // sized body slice types.
         assert_eq!(
-            ScanOperation::new(product_body(), 3, 3).map(|_| ()),
+            TestScanOperation::new(product_body(), 3, 3).map(|_| ()),
             Err(TypeError { message: "scan carry count 3 exceeds the body input count 2".to_string() }),
         );
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
@@ -559,7 +832,7 @@ mod tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            ScanOperation::new(no_output_body, 2, 3).map(|_| ()),
+            TestScanOperation::new(no_output_body, 2, 3).map(|_| ()),
             Err(TypeError { message: "scan carry count 2 exceeds the body output count 1".to_string() }),
         );
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
@@ -575,7 +848,7 @@ mod tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![mismatched_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            ScanOperation::new(mismatched_body, 1, 3).map(|_| ()),
+            TestScanOperation::new(mismatched_body, 1, 3).map(|_| ()),
             Err(TypeError {
                 message: "scan body carry type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
             }),
@@ -587,7 +860,7 @@ mod tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![dynamic_carry], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            ScanOperation::new(dynamic_body, 1, 3).map(|_| ()),
+            TestScanOperation::new(dynamic_body, 1, 3).map(|_| ()),
             Err(TypeError {
                 message: "scan body input 0 must have a fully static type but axis 0 of f64[*] has size *".to_string(),
             }),
@@ -603,7 +876,7 @@ mod tests {
 
         // A reversed scan visits the slices from the back while keeping output slice `i` aligned with input slice
         // `i`: the running products visit `4, 3, 2` and land in lanes `2, 1, 0`.
-        let reversed = ScanOperation::new(product_body(), 1, 3).unwrap().with_reverse(true);
+        let reversed = TestScanOperation::new(product_body(), 1, 3).unwrap().with_reverse(true);
         let outputs = reversed
             .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
             .unwrap();
@@ -611,13 +884,13 @@ mod tests {
         assert_eq!(outputs[1].values, vec![24.0, 12.0, 4.0]);
 
         // A carry-only scan with no stacked inputs or outputs applies the body `length` times.
-        let carry_only = ScanOperation::new(doubling_body(), 1, 3).unwrap();
+        let carry_only = TestScanOperation::new(doubling_body(), 1, 3).unwrap();
         let outputs = carry_only.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].values, vec![8.0]);
 
         // A zero-length scan returns the initial carries and empty stacked outputs.
-        let empty = ScanOperation::new(product_body(), 1, 0).unwrap();
+        let empty = TestScanOperation::new(product_body(), 1, 0).unwrap();
         let empty_stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
         let outputs = empty
             .interpret(

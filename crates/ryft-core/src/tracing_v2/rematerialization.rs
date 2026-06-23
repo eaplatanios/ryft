@@ -37,7 +37,7 @@ use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, JvpTracer, ProgramLinearizableOperation, ResidualizedOperation,
     TangentContext,
 };
-use crate::tracing_v2::operations::captures::CapturedFactor;
+use crate::tracing_v2::operations::captures::ValueOrCapture;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
@@ -840,11 +840,11 @@ where
         + From<OneOperation<D::Type>>
         + DifferentiableOperation<TracingContext<'d, D>>
         + ProgramLinearizableOperation<TracingContext<'d, D>>,
-    D::LinearOperation<DomainTracer<'d, D>, CapturedFactor<D::Type, DomainTracer<'d, D>>>: ResidualizedOperation<TracingContext<'d, D>>
+    D::LinearOperation<DomainTracer<'d, D>, ValueOrCapture<D::Type, DomainTracer<'d, D>>>: ResidualizedOperation<TracingContext<'d, D>>
         + TransposableOperation<
             D::Type,
             DomainTracer<'d, D>,
-            D::LinearOperation<DomainTracer<'d, D>, CapturedFactor<D::Type, DomainTracer<'d, D>>>,
+            D::LinearOperation<DomainTracer<'d, D>, ValueOrCapture<D::Type, DomainTracer<'d, D>>>,
         > + From<ZeroOperation<D::Type>>
         + From<AddOperation>
         + MaybeZeroOperation<D::Type>,

@@ -13,7 +13,7 @@ const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
 const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
 
-const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("crate");
+const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_OPERATION_TYPE: Symbol = Symbol::new("__OperationType");
 
 const NESTED_ATTRIBUTE_ERROR: &str = "\

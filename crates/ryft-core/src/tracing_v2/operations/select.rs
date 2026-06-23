@@ -11,7 +11,7 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::operations::primitive::transpose_captured_condition_select;
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext, LinearOperationOf};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, LinearOperationOf, ValueOrCapture};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
@@ -204,7 +204,7 @@ where
     D: DifferentiationContext,
     SelectOperation: Operation<D::Type>,
     D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
-    LinearOperationOf<D>: From<LinearSelectOperation<CapturedFactor<D::Type, D::Value>>> + From<ZeroOperation<D::Type>>,
+    LinearOperationOf<D>: From<LinearSelectOperation<ValueOrCapture<D::Type, D::Value>>> + From<ZeroOperation<D::Type>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
     fn jvp<'jvp>(

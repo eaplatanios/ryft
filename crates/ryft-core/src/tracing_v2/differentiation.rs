@@ -20,7 +20,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::scalars::ScalarDomain;
 use crate::tracing::{Tracer, TracerState, TracingContext};
-use crate::tracing_v2::operations::captures::CapturedFactor;
+use crate::tracing_v2::operations::captures::ValueOrCapture;
 use crate::types::{DataType, Type, Typed};
 
 /// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
@@ -49,44 +49,63 @@ pub enum DifferentiationError {
 /// A linear operation acts on values of some carrier `V` chosen by the surrounding [`Program`]. Some linear operations
 /// also carry coefficients from the primal computation, such as scale factors and product-rule factors. This trait is
 /// parameterized by that factor carrier `F` and provides the single hook needed to rewrite those carried factors.
-/// Residualized pushforwards use [`CapturedFactor`] as `F`; direct programs use the concrete primal value type as `F`.
-pub trait FactorParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation<T> {
+/// Residualized pushforwards use [`ValueOrCapture`] as `F`; direct programs use the concrete primal value type as `F`.
+pub trait CaptureParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation<T> {
     /// Operation type produced by replacing `F` payloads with `MappedFactor` payloads.
-    type WithFactor<MappedFactor: Value<T>>: Clone + Operation<T>;
+    type WithCapture<MappedFactor: Value<T>>: Clone + Operation<T>;
+
+    /// Operation type produced by replacing body-local `F` payloads with `MappedFactor` payloads.
+    ///
+    /// This is usually identical to [`WithCapture`](Self::WithCapture). Operation families that statically embed
+    /// backend extension variants may keep extension payloads in the enclosing capture namespace while remapping a
+    /// nested control-flow body's local namespace; those families use a distinct local mapping type.
+    type WithLocalCapture<MappedFactor: Value<T>>: Clone + Operation<T>;
 
     /// Maps every factor payload carried by this operation through `map_factor`.
     ///
     /// Operations without factor payloads should return an equivalent operation and not call `map_factor`.
-    fn try_map_factors<MappedFactor: Value<T>, MapFactorFn>(
+    fn try_map_captures<MappedFactor: Value<T>, MapFactorFn>(
         &self,
         map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>;
+
+    /// Maps factor payloads that belong to a nested body-local namespace through `map_factor`.
+    ///
+    /// For most operation families this is the same as [`try_map_captures`](Self::try_map_captures). Families with
+    /// backend extension slots can preserve extension payloads here because extension captures remain owned by the
+    /// enclosing program, not by a scan-local or condition-local body namespace.
+    fn try_map_local_captures<MappedFactor: Value<T>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>;
 }
 
 /// Contract for linear operations whose factor payloads may reference residual values.
 ///
-/// This is the residual-aware specialization of [`FactorParameterizedOperation`]. It turns the low-level factor-mapping
+/// This is the residual-aware specialization of [`CaptureParameterizedOperation`]. It turns the low-level factor-mapping
 /// hook into the operations needed by reusable pushforwards: finding referenced residuals, remapping compacted residual
 /// indices, instantiating a direct operation, and rebinding residual references as closed constant factors.
 ///
 /// The [`From<ZeroOperation>`](ZeroOperation) supertrait records that every residualized linear operation can build a
 /// nullary zero. This lets JVP rules represent zero tangents as ordinary staged operations while requiring only that
 /// conversion at each operation boundary. It is declared on this residual-aware specialization — implemented only by
-/// whole linear-operation algebras — rather than on [`FactorParameterizedOperation`], which component backend
+/// whole linear-operation algebras — rather than on [`CaptureParameterizedOperation`], which component backend
 /// extensions that have no standalone zero also implement.
 pub trait ResidualizedOperation<D: DifferentiationContext>:
-    FactorParameterizedOperation<
+    CaptureParameterizedOperation<
         D::Type,
-        CapturedFactor<D::Type, D::Value>,
-        WithFactor<D::Value> = DirectLinearOperationOf<D>,
-        WithFactor<CapturedFactor<D::Type, D::Value>> = LinearOperationOf<D>,
+        ValueOrCapture<D::Type, D::Value>,
+        WithCapture<D::Value> = DirectLinearOperationOf<D>,
+        WithCapture<ValueOrCapture<D::Type, D::Value>> = LinearOperationOf<D>,
     > + From<ZeroOperation<D::Type>>
 {
     /// Appends residual indices referenced by this operation to `indices`.
     fn append_residual_indices(&self, indices: &mut Vec<usize>) -> Result<(), ProgramError> {
-        self.try_map_factors(&mut |factor| {
+        self.try_map_captures(&mut |factor| {
             if let Some(index) = factor.residual_index() {
                 indices.push(index);
             }
@@ -97,23 +116,23 @@ pub trait ResidualizedOperation<D: DifferentiationContext>:
 
     /// Rewrites residual references using `mapping`.
     fn remap_residuals(&self, mapping: &[Option<usize>]) -> Result<LinearOperationOf<D>, ProgramError> {
-        self.try_map_factors(&mut |factor| factor.remap_residuals(mapping))
+        self.try_map_captures(&mut |factor| factor.remap_residuals(mapping))
     }
 
     /// Instantiates residual references using `residuals`, producing a direct linear operation.
     fn instantiate_residuals(&self, residuals: &[D::Value]) -> Result<DirectLinearOperationOf<D>, ProgramError> {
-        self.try_map_factors(&mut |factor| factor.instantiate(residuals))
+        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
     }
 }
 
 impl<D, O> ResidualizedOperation<D> for O
 where
     D: DifferentiationContext,
-    O: FactorParameterizedOperation<
+    O: CaptureParameterizedOperation<
             D::Type,
-            CapturedFactor<D::Type, D::Value>,
-            WithFactor<D::Value> = DirectLinearOperationOf<D>,
-            WithFactor<CapturedFactor<D::Type, D::Value>> = LinearOperationOf<D>,
+            ValueOrCapture<D::Type, D::Value>,
+            WithCapture<D::Value> = DirectLinearOperationOf<D>,
+            WithCapture<ValueOrCapture<D::Type, D::Value>> = LinearOperationOf<D>,
         > + From<ZeroOperation<D::Type>>,
 {
 }
@@ -121,7 +140,7 @@ where
 /// Residualized linear operation type selected by a [`DifferentiationContext`] implementation.
 pub type LinearOperationOf<E> = <E as DifferentiationContext>::LinearOperation<
     <E as DifferentiationContext>::Tangent,
-    CapturedFactor<<E as Domain>::Type, <E as Domain>::Value>,
+    ValueOrCapture<<E as Domain>::Type, <E as Domain>::Value>,
 >;
 
 /// Directly executable linear operation type selected by a [`DifferentiationContext`] implementation.
@@ -1095,8 +1114,8 @@ impl<'domain, D: Domain + 'domain, Capture> ProvidesContext<TracingContext<'doma
 ///
 /// `CanonicalLinearOperation` is the enclosing context's linear operation family pinned at the factor type
 /// `C` (the constant type): `E::LinearOperation<E::Tangent, E::Constant>`. Because
-/// [`FactorParameterizedOperation::try_map_factors`] maps only the factor parameter,
-/// `CanonicalLinearOperation::WithFactor<F>` recovers `E::LinearOperation<E::Tangent, F>` for every factor type `F`,
+/// [`CaptureParameterizedOperation::try_map_captures`] maps only the factor parameter,
+/// `CanonicalLinearOperation::WithCapture<F>` recovers `E::LinearOperation<E::Tangent, F>` for every factor type `F`,
 /// which is how this context defines its own [`LinearOperation`](DifferentiationContext::LinearOperation) family
 /// without referring to `E`.
 ///
@@ -1108,7 +1127,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     /// [`ProgramBuilder`] that owns the nested primal [`Program`] staged by this context.
     builder: Rc<RefCell<ProgramBuilder<T, C, O>>>,
@@ -1125,7 +1144,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     /// Creates a new [`LinearizationContext`] that owns a fresh [`ProgramBuilder`].
     fn new() -> Self {
@@ -1140,7 +1159,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     fn clone(&self) -> Self {
         Self { builder: self.builder.clone(), marker: PhantomData }
@@ -1154,7 +1173,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LinearizationContext").finish_non_exhaustive()
@@ -1168,7 +1187,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     type Type = T;
     type Value = Tracer<Self>;
@@ -1183,7 +1202,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     /// Lifts a constant payload into this context by recording it as a constant primal [`Tracer`].
     #[inline]
@@ -1210,7 +1229,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, C, O>>> {
@@ -1226,7 +1245,7 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     #[inline]
     fn context(&self) -> LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation> {
@@ -1241,11 +1260,11 @@ where
     C: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: FactorParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     type Tangent = TangentValue;
     type LinearOperation<V: Value<T>, F: Value<T>> =
-        <CanonicalLinearOperation as FactorParameterizedOperation<T, C>>::WithFactor<F>;
+        <CanonicalLinearOperation as CaptureParameterizedOperation<T, C>>::WithCapture<F>;
 
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
@@ -1265,7 +1284,7 @@ where
 ///
 /// Every component of this instantiation is a fixed point under nesting: the nested context's type, constant, and
 /// tangent associated types equal `E`'s, its operation type is `O` again, and its canonical linear operation
-/// `E::LinearOperation<E::Tangent, E::Constant>` maps to itself under `WithFactor<E::Constant>`. Consequently
+/// `E::LinearOperation<E::Tangent, E::Constant>` maps to itself under `WithCapture<E::Constant>`. Consequently
 /// `LinearizationContextOf<LinearizationContextOf<E, O>, O>` normalizes to
 /// `LinearizationContextOf<E, O>`, which keeps `DifferentiableOperation` bounds for nested control flow
 /// finite for the trait solver.
@@ -1294,7 +1313,7 @@ pub type LinearizationContextOf<E, O> = LinearizationContext<
 ///     `i` of the original program remains output `i`, and residual index `j` becomes appended output
 ///     `original_output_count + j`.
 ///   - [`pushforward_program`](Self::pushforward_program) is the residualized linear map of the function at the
-///     primal point. Its [`CapturedFactor::Reference`] factors index into [`residual_types`](Self::residual_types)
+///     primal point. Its [`ValueOrCapture::Capture`] factors index into [`residual_types`](Self::residual_types)
 ///     positionally, which by the contract above means reference `j` is satisfied by appended primal output
 ///     `original_output_count + j`. References are *not* baked into constants, so callers can rebind them against
 ///     any residual environment.
@@ -1322,7 +1341,7 @@ where
     pub primal_program: Program<E::Type, E::Constant, O, Input, Vec<E::Constant>>,
 
     /// Residualized pushforward program, expressed directly in the enclosing context's linear representation. Its
-    /// [`CapturedFactor::Reference`] factors index the residual outputs appended to
+    /// [`ValueOrCapture::Capture`] factors index the residual outputs appended to
     /// [`primal_program`](Self::primal_program).
     // The `tangent_program` name is reserved for this field once the remaining `pushforward_program` consumers are
     // migrated; renaming now would break the `NestedLinearization` alias's field accesses.
@@ -1349,7 +1368,7 @@ where
     /// active trace. The flat interpreted outputs are split using [`residual_types`](Self::residual_types): the
     /// leading outputs are reassembled into the original structured output and the trailing
     /// `residual_types.len()` values are returned as the residual environment, aligned with the pushforward
-    /// program's [`CapturedFactor::Reference`] indices.
+    /// program's [`ValueOrCapture::Capture`] indices.
     ///
     /// # Parameters
     ///
@@ -1490,7 +1509,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
 /// The returned [`Linearization`] preserves the program's `Input`/`Output` parameterizations and packages the
 /// residual-extended primal program, the residualized pushforward program, and the residual types; refer to the
 /// [`Linearization`] documentation for the exact program-shape contract. Factor payloads captured from program
-/// *constants* (which have no residual atom) are converted into closed [`CapturedFactor::Constant`] factors by
+/// *constants* (which have no residual atom) are converted into closed [`ValueOrCapture::Value`] factors by
 /// lifting the constant through `differentiable`.
 ///
 /// # Parameters
@@ -1511,12 +1530,12 @@ where
             Family: ParameterizedFamily<Tracer<LinearizationContextOf<E, O>>> + ParameterizedFamily<E::Tangent>,
         >,
     E::LinearOperation<E::Tangent, <E as Domain>::Constant>:
-        FactorParameterizedOperation<<E as Domain>::Type, <E as Domain>::Constant>,
+        CaptureParameterizedOperation<<E as Domain>::Type, <E as Domain>::Constant>,
     LinearOperationOf<LinearizationContextOf<E, O>>: ResidualizedOperation<LinearizationContextOf<E, O>>
-        + FactorParameterizedOperation<
+        + CaptureParameterizedOperation<
             <E as Domain>::Type,
-            CapturedFactor<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
-            WithFactor<CapturedFactor<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
+            ValueOrCapture<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
+            WithCapture<ValueOrCapture<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
         > + MaybeZeroOperation<<E as Domain>::Type>,
 {
     let nested_context = LinearizationContextOf::<E, O>::new();
@@ -1542,17 +1561,15 @@ where
     // references are positional and carry over unchanged, while closed factors can only have been captured from
     // nested program constants and are lifted through the enclosing context.
     let pushforward_program = pushforward.program().map_operations(|operation| {
-        operation.try_map_factors(&mut |factor| match factor {
-            CapturedFactor::Reference { index, r#type } => {
-                Ok(CapturedFactor::Reference { index: *index, r#type: r#type.clone() })
+        operation.try_map_captures(&mut |factor| match factor {
+            ValueOrCapture::Capture { index, r#type } => {
+                Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
             }
-            CapturedFactor::Constant(tracer) => {
+            ValueOrCapture::Value(tracer) => {
                 let atom = tracer.atom_id()?;
                 let builder = nested_context.builder().borrow();
                 match builder.atoms().get(atom.index()) {
-                    Some(Atom::Constant(constant)) => {
-                        Ok(CapturedFactor::Constant(differentiable.lift(constant.clone())?))
-                    }
+                    Some(Atom::Constant(constant)) => Ok(ValueOrCapture::Value(differentiable.lift(constant.clone())?)),
                     Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
                         "nested symbolic linearization captured non-constant primal atom {atom} as a closed factor",
                     ))),
@@ -1719,26 +1736,26 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     ///
     /// Higher-order JVP rules also use this to register primal values they computed themselves — for example, the
     /// residual outputs of a staged primal condition — in the active linearization residual environment, obtaining
-    /// [`CapturedFactor::Reference`] factors that reusable pushforwards instantiate later.
-    pub fn factor(&mut self, value: E::Value) -> CapturedFactor<E::Type, E::Value> {
+    /// [`ValueOrCapture::Capture`] factors that reusable pushforwards instantiate later.
+    pub fn factor(&mut self, value: E::Value) -> ValueOrCapture<E::Type, E::Value> {
         let r#type = value.r#type().into_owned();
         let mut residuals = self.residuals.borrow_mut();
         let index = residuals.len();
         residuals.push(value);
-        CapturedFactor::Reference { index, r#type }
+        ValueOrCapture::Capture { index, r#type }
     }
 
     /// Captures `value` as a residual factor, deduplicating by `atom` when one is available.
-    fn factor_for_atom(&mut self, atom: AtomId, value: E::Value) -> CapturedFactor<E::Type, E::Value> {
+    fn factor_for_atom(&mut self, atom: AtomId, value: E::Value) -> ValueOrCapture<E::Type, E::Value> {
         let r#type = value.r#type().into_owned();
         if let Some(index) = self.residual_atoms.borrow().get(&atom).copied() {
-            return CapturedFactor::Reference { index, r#type };
+            return ValueOrCapture::Capture { index, r#type };
         }
         let mut residuals = self.residuals.borrow_mut();
         let index = residuals.len();
         residuals.push(value);
         self.residual_atoms.borrow_mut().insert(atom, index);
-        CapturedFactor::Reference { index, r#type }
+        ValueOrCapture::Capture { index, r#type }
     }
 }
 
@@ -1912,10 +1929,10 @@ where
 
     /// Returns this tracer's primal value as a residual factor.
     #[inline]
-    pub fn factor(&self, context: &mut TangentContext<'domain, E>) -> CapturedFactor<E::Type, E::Value> {
+    pub fn factor(&self, context: &mut TangentContext<'domain, E>) -> ValueOrCapture<E::Type, E::Value> {
         match self.residual_atom {
             Some(atom) => context.factor_for_atom(atom, self.primal.clone()),
-            None => CapturedFactor::Constant(self.primal.clone()),
+            None => ValueOrCapture::Value(self.primal.clone()),
         }
     }
 

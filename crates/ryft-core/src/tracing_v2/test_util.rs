@@ -42,8 +42,8 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::operations::control_flow::LinearConditionOperation;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, CapturedFactor, DifferentiableDomainExtension, DifferentiableOperation,
-        DifferentiationContext, JvpTracer, LinearArrayOperation, ResidualizedOperation, TangentContext, jacrev,
+        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext,
+        JvpTracer, LinearArrayOperation, ResidualizedOperation, TangentContext, ValueOrCapture, jacrev,
     };
     use crate::types::{Shape, Size, Typed};
 
@@ -1014,7 +1014,11 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        crate::operations::control_flow::ScanOperation::new(body, 1, 3).unwrap().with_reverse(reverse)
+        crate::operations::control_flow::ScanOperation::<ArrayType, TestArray, ArrayOperation<TestArray>>::new(
+            body, 1, 3,
+        )
+        .unwrap()
+        .with_reverse(reverse)
     }
 
     #[test]
@@ -1172,7 +1176,7 @@ mod tests {
                 TestArray,
                 TestArray,
                 Infallible,
-                CapturedFactor<ArrayType, TestArray>,
+                ValueOrCapture<ArrayType, TestArray>,
                 ArrayOperation<TestArray>,
             >,
         >::new()));
@@ -1222,7 +1226,7 @@ mod tests {
                 TestArray,
                 TestArray,
                 Infallible,
-                CapturedFactor<ArrayType, TestArray>,
+                ValueOrCapture<ArrayType, TestArray>,
                 ArrayOperation<TestArray>,
             >,
         >::new()));

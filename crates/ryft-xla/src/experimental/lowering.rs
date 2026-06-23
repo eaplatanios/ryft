@@ -31,7 +31,7 @@ use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::{
-    ArrayOperation, CapturedFactor, DefactorizedOperation, LinearArrayOperation, SupportsLinearWhile,
+    ArrayOperation, DefactorizedOperation, LinearArrayOperation, SupportsLinearWhile, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 
@@ -1479,7 +1479,7 @@ where
                 if !input_values.is_empty() {
                     return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
                 }
-                Ok(vec![lowerer.lower_literal_value(operation.factor())?])
+                Ok(vec![lowerer.lower_literal_value(operation.capture())?])
             }
             LinearArrayOperation::Recompute(operation) => {
                 operation.operation().lower_to_mlir(input_values, output_types, mode, lowerer)
@@ -1556,7 +1556,7 @@ where
                 // Materialize the residual stacks after the operand stacks and rewrite the body into operand form
                 // so each lane's residual slices enter as extra scanned inputs, mirroring how fused while bodies
                 // defactorize loop-varying residual references.
-                let residual_stacks = operation.residual_stacks();
+                let residual_stacks = operation.captures();
                 let mut full_inputs = input_values.to_vec();
                 let mut residual_slice_types = Vec::with_capacity(residual_stacks.len());
                 for stack in residual_stacks {
@@ -2837,7 +2837,7 @@ fn operand_form_scan_body<V, C, Extension, P>(
     body: &Program<
         ArrayType,
         V,
-        LinearArrayOperation<V, C, Extension, CapturedFactor<ArrayType, V>, P>,
+        LinearArrayOperation<V, C, Extension, ValueOrCapture<ArrayType, V>, P>,
         Vec<V>,
         Vec<V>,
     >,
@@ -2883,9 +2883,9 @@ where
         match instruction.operation().defactorize(residual_atoms.as_slice(), inputs).map_err(ProgramError::from)? {
             DefactorizedOperation::Operation { operation, inputs } => {
                 let operation = operation
-                    .try_map_factors_preserving_extensions(&mut |factor| match factor {
-                        CapturedFactor::Constant(value) => Ok(value.clone()),
-                        CapturedFactor::Reference { index, .. } => Err(ProgramError::MalformedProgram(format!(
+                    .try_map_captures_preserving_extensions(&mut |factor| match factor {
+                        ValueOrCapture::Value(value) => Ok(value.clone()),
+                        ValueOrCapture::Capture { index, .. } => Err(ProgramError::MalformedProgram(format!(
                             "scan body defactorization left residual reference {index} in operand form",
                         ))),
                     })
@@ -4731,10 +4731,9 @@ mod tests {
     use ryft_core::tests::{TestArray, TestArrayDomain};
     use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::DifferentiationContext;
-    use ryft_core::tracing_v2::operations::captures::MaterializeCapturedFactorOperation;
+    use ryft_core::tracing_v2::operations::captures::MaterializeCaptureOperation;
     use ryft_core::tracing_v2::operations::control_flow::LinearOperandConditionOperation;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use ryft_core::tracing_v2::operations::scan::LinearScanOperation;
     use ryft_core::types::{Shape, Size};
     #[cfg(feature = "ndarray")]
     use ryft_ndarray::{Array as NdArrayValue, NdArrayDomain};
@@ -5320,9 +5319,8 @@ mod tests {
         // over `[primal, tangent]`, returning the final tangent half.
         let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
         let tangent_input = builder.add_input(scalar_f64.clone());
-        let primal_entry = builder
-            .add_instruction(MaterializeCapturedFactorOperation::new(TestArray::scalar(2.0)), vec![])
-            .unwrap()[0];
+        let primal_entry =
+            builder.add_instruction(MaterializeCaptureOperation::new(TestArray::scalar(2.0)), vec![]).unwrap()[0];
         let while_outputs = builder
             .add_instruction(DirectLinearOperation::While(Box::new(fused_while)), vec![primal_entry, tangent_input])
             .unwrap()
@@ -5425,7 +5423,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::new(body, 1, 3).unwrap();
+        let scan = CoreScanOperation::<ArrayType, _, _>::new(body, 1, 3).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let init = builder.add_input(scalar_f32);
@@ -5468,7 +5466,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::new(body, 1, 3).unwrap().with_unroll(3).unwrap();
+        let scan = CoreScanOperation::<ArrayType, _, _>::new(body, 1, 3).unwrap().with_unroll(3).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let init = builder.add_input(scalar_f32);
@@ -5511,7 +5509,7 @@ mod tests {
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
-        let scan = CoreScanOperation::new(body, 1, 4).unwrap().with_unroll(2).unwrap();
+        let scan = CoreScanOperation::<ArrayType, _, _>::new(body, 1, 4).unwrap().with_unroll(2).unwrap();
 
         let mut builder = XlaProgramBuilder::new();
         let init = builder.add_input(scalar_f32);
@@ -5550,7 +5548,7 @@ mod tests {
             TestArray,
             TestArray,
             Infallible,
-            CapturedFactor<ArrayType, TestArray>,
+            ValueOrCapture<ArrayType, TestArray>,
             CoreArrayOperation<TestArray>,
         >;
 
@@ -5561,8 +5559,8 @@ mod tests {
         let tangent_x = body_builder.add_input(scalar_f64.clone());
         let scaled = body_builder
             .add_instruction(
-                ScaleOperation::<ArrayType, CapturedFactor<ArrayType, TestArray>, Input>::new(
-                    CapturedFactor::Reference { index: 0, r#type: scalar_f64.clone() },
+                ScaleOperation::<ArrayType, ValueOrCapture<ArrayType, TestArray>, Input>::new(
+                    ValueOrCapture::Capture { index: 0, r#type: scalar_f64.clone() },
                 ),
                 vec![tangent_carry],
             )
@@ -5579,11 +5577,12 @@ mod tests {
         let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
         let tangent_init = builder.add_input(scalar_f64);
         let tangent_xs = builder.add_input(stacked_f64);
+        let scan = ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(body, 1, 3)
+            .unwrap()
+            .with_reverse(true)
+            .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
         let outputs = builder
-            .add_instruction(
-                LinearScanOperation::new(Box::new(body), vec![TestArray::vector(vec![2.0, 3.0, 4.0])], 1, 3, true, 1),
-                vec![tangent_init, tangent_xs],
-            )
+            .add_instruction(DirectLinearOperation::Scan(Box::new(scan)), vec![tangent_init, tangent_xs])
             .unwrap()
             .to_vec();
         let program = builder

@@ -12,31 +12,31 @@ use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{DifferentiationContext, JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation};
+use crate::tracing_v2::{DifferentiableOperation, ValueOrCapture};
 use crate::types::Type;
 
-impl<C, V> Scale<C::Type, Tracer<C>, CapturedFactor<C::Type, V>, Input> for C
+impl<C, V> Scale<C::Type, Tracer<C>, ValueOrCapture<C::Type, V>, Input> for C
 where
     C: StagingContext,
     V: Value<C::Type>,
-    C::Operation: From<ScaleOperation<C::Type, CapturedFactor<C::Type, V>, Input>>,
+    C::Operation: From<ScaleOperation<C::Type, ValueOrCapture<C::Type, V>, Input>>,
 {
     #[inline]
-    fn scale(&self, input: &Tracer<C>, factor: CapturedFactor<C::Type, V>) -> Result<Tracer<C>, ProgramError> {
+    fn scale(&self, input: &Tracer<C>, factor: ValueOrCapture<C::Type, V>) -> Result<Tracer<C>, ProgramError> {
         let mut outputs = self.stage_operation(ScaleOperation::<C::Type, _, Input>::new(factor), &[input])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<C, V> Scalable<CapturedFactor<C::Type, V>, Input> for Tracer<C>
+impl<C, V> Scalable<ValueOrCapture<C::Type, V>, Input> for Tracer<C>
 where
     C: StagingContext,
     V: Value<C::Type>,
-    C::Operation: From<ScaleOperation<C::Type, CapturedFactor<C::Type, V>, Input>>,
+    C::Operation: From<ScaleOperation<C::Type, ValueOrCapture<C::Type, V>, Input>>,
 {
     #[inline]
-    fn scale(&self, factor: CapturedFactor<C::Type, V>) -> Result<Self, ProgramError> {
+    fn scale(&self, factor: ValueOrCapture<C::Type, V>) -> Result<Self, ProgramError> {
         let mut outputs = self.context().stage_operation(ScaleOperation::<C::Type, _, Input>::new(factor), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -46,7 +46,7 @@ where
 /// Transpose rule for [`ScaleOperation`]: scaling by a captured factor is self-adjoint, so the input cotangent is the
 /// output cotangent scaled by the same factor. The captured factor type `F` is independent of the cotangent value type
 /// `V` (they coincide only at the top level; inside a linear scan body the factor lives in the scan-local
-/// `CapturedFactor` namespace while the cotangent does not), so this impl is generic over both and stages the adjoint
+/// `ValueOrCapture` namespace while the cotangent does not), so this impl is generic over both and stages the adjoint
 /// scale into `O` using the same scale interpretation mode as `self`.
 impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T> + From<ScaleOperation<T, F, Payload>>, Payload>
     TransposableOperation<T, V, O> for ScaleOperation<T, F, Payload>
@@ -72,7 +72,7 @@ impl<T: Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
 where
     D: DifferentiationContext<Type = T>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: From<ScaleOperation<T, CapturedFactor<T, D::Value>, Input>>,
+    LinearOperationOf<D>: From<ScaleOperation<T, ValueOrCapture<T, D::Value>, Input>>,
     ScaleOperation<T, D::Constant>: Operation<T>,
 {
     #[inline]
@@ -88,7 +88,7 @@ where
         let input = &inputs[0];
         let factor = context.differentiable().lift(self.factor().clone())?;
         let mut tangent_outputs = context.stage_operation(
-            ScaleOperation::<T, CapturedFactor<T, D::Value>, Input>::new(CapturedFactor::Constant(factor.clone())),
+            ScaleOperation::<T, ValueOrCapture<T, D::Value>, Input>::new(ValueOrCapture::Value(factor.clone())),
             &[input.tangent().clone()],
         )?;
         check_count!("output", tangent_outputs, 1, ProgramError);

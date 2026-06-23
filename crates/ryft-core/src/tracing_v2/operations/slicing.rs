@@ -15,7 +15,7 @@ use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, align_batch_axis, apply_with_axes, batch_input_metadata,
 };
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 use super::control_flow::stage_cotangent;
@@ -243,7 +243,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicSlice,
     LinearOperationOf<D>:
-        From<LinearDynamicSliceOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
+        From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -287,7 +287,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicUpdateSlice,
     LinearOperationOf<D>:
-        From<LinearDynamicUpdateSliceOperation<CapturedFactor<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
+        From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -646,7 +646,7 @@ mod tests {
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{
-        ArrayOperation, CapturedFactor, DifferentiableDomainExtension, LinearArrayOperation, LinearizationTracer,
+        ArrayOperation, DifferentiableDomainExtension, LinearArrayOperation, LinearizationTracer, ValueOrCapture,
         value_and_grad,
     };
     use crate::types::DataType;
@@ -1046,14 +1046,14 @@ mod tests {
         use crate::operations::control_flow::WhileOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
-        use crate::tracing_v2::{DifferentiableOperation, FactorParameterizedOperation};
+        use crate::tracing_v2::{CaptureParameterizedOperation, DifferentiableOperation};
 
         type TestArrayOperation = ArrayOperation<TestArray>;
         type TestLinearOperation = LinearArrayOperation<
             TestArray,
             TestArray,
             Infallible,
-            CapturedFactor<ArrayType, TestArray>,
+            ValueOrCapture<ArrayType, TestArray>,
             ArrayOperation<TestArray>,
         >;
 
@@ -1131,10 +1131,10 @@ mod tests {
         // interpretable pushforward.
         let tangent_program = tangent_program
             .map_operations(|operation| {
-                operation.try_map_factors::<TestArray, _>(&mut |factor: &CapturedFactor<ArrayType, TestArray>| {
+                operation.try_map_captures::<TestArray, _>(&mut |factor: &ValueOrCapture<ArrayType, TestArray>| {
                     match factor {
-                        CapturedFactor::Constant(value) => Ok(value.clone()),
-                        CapturedFactor::Reference { .. } => Err(crate::programs::ProgramError::MalformedProgram(
+                        ValueOrCapture::Value(value) => Ok(value.clone()),
+                        ValueOrCapture::Capture { .. } => Err(crate::programs::ProgramError::MalformedProgram(
                             "expected all loop-varying residual references to be closed into constants".to_string(),
                         )),
                     }
@@ -1153,14 +1153,14 @@ mod tests {
             TestArray,
             TestArray,
             Infallible,
-            CapturedFactor<ArrayType, TestArray>,
+            ValueOrCapture<ArrayType, TestArray>,
             ArrayOperation<TestArray>,
         >;
 
         // A loop-varying residual start index is rewritten into operand form: the residual atom is spliced into the
         // operand list and the operation becomes the recomputed primal dynamic slice.
         let operation = TestLinearOperation::DynamicSlice(LinearDynamicSliceOperation::new(
-            vec![CapturedFactor::Reference { index: 1, r#type: ArrayType::scalar(DataType::I32) }],
+            vec![ValueOrCapture::Capture { index: 1, r#type: ArrayType::scalar(DataType::I32) }],
             vec![2],
         ));
         let residual_atoms = vec![AtomId::new(7), AtomId::new(9)];
@@ -1180,7 +1180,7 @@ mod tests {
 
         // The same rewrite applies to the captured-index dynamic update-slice.
         let operation = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
-            CapturedFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
+            ValueOrCapture::Capture { index: 0, r#type: ArrayType::scalar(DataType::I32) },
         ]));
         match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
@@ -1195,8 +1195,8 @@ mod tests {
 
         // Mixed constant/reference index lists are rejected precisely.
         let mixed = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
-            CapturedFactor::Reference { index: 0, r#type: ArrayType::scalar(DataType::I32) },
-            CapturedFactor::Constant(index(0.0)),
+            ValueOrCapture::Capture { index: 0, r#type: ArrayType::scalar(DataType::I32) },
+            ValueOrCapture::Value(index(0.0)),
         ]));
         assert!(matches!(
             mixed.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]),
@@ -1207,7 +1207,7 @@ mod tests {
 
         // All-constant index lists pass through unchanged via the closed-factor catch-all.
         let constant = TestLinearOperation::DynamicSlice(LinearDynamicSliceOperation::new(
-            vec![CapturedFactor::Constant(index(1.0))],
+            vec![ValueOrCapture::Value(index(1.0))],
             vec![2],
         ));
         match constant.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {

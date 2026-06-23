@@ -15,8 +15,8 @@ use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext, batch_input_metadata};
 use ryft_core::tracing_v2::{
-    ArrayOperation, CapturedFactor, DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation,
-    JvpTracer, LinearArrayOperation, LinearOperationOf, TangentContext,
+    ArrayOperation, CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer,
+    LinearArrayOperation, LinearOperationOf, TangentContext, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
@@ -186,9 +186,9 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 /// The enum is parameterized by the tangent carrier `V` *and* the factor carrier `F` of the linear program it is
 /// staged in, mirroring [`LinearArrayOperation`]'s factor parameter: captured primal payloads (the prefix inputs of
 /// a linear jitted call and the captured global primals of a linear shard-map) are stored as `F` factors, so they
-/// participate in the residual-factor machinery ([`FactorParameterizedOperation`] and everything built on it, such
+/// participate in the residual-factor machinery ([`CaptureParameterizedOperation`] and everything built on it, such
 /// as residual compaction, rebasing onto an enclosing linearization context, and instantiation into a directly
-/// executable program). Residualized pushforwards use [`CapturedFactor`] as `F`; direct (instantiated) programs use
+/// executable program). Residualized pushforwards use [`ValueOrCapture`] as `F`; direct (instantiated) programs use
 /// the concrete value type, in which case `F` defaults to `V`.
 ///
 /// The [`Operation`]/[`Display`], per-variant [`From`]/[`TryFrom`], and the per-variant interpretation delegation below
@@ -299,7 +299,7 @@ pub type LinearXlaOperation<V, C = V, Factor = V> =
 
 /// [`LinearXlaOperation`] with the extension's factor carrier decoupled from the universe's factor carrier.
 ///
-/// Scan bodies pin their factor payloads to the scan-local `CapturedFactor` namespace while extension captures stay
+/// Scan bodies pin their factor payloads to the scan-local `ValueOrCapture` namespace while extension captures stay
 /// in the enclosing factor space, so transposing an extension operation inside a scan body targets a universe whose
 /// factor (`UniverseFactor`) differs from the extension's own (`Factor`). The XLA transposition rules are
 /// implemented against this split form; [`LinearXlaOperation`] is the aligned special case
@@ -338,7 +338,7 @@ impl JitCallOperation {
 /// Linearized jitted call used inside tangent and cotangent programs.
 ///
 /// The captured primal prefix inputs are stored as factors of the linear program's factor carrier `F`
-/// ([`CapturedFactor`] references in residualized pushforwards, concrete values in instantiated direct programs),
+/// ([`ValueOrCapture`] references in residualized pushforwards, concrete values in instantiated direct programs),
 /// so they flow through residual compaction, rebasing, and instantiation like every other captured primal factor.
 #[derive(Clone, Debug)]
 pub struct LinearJitCallOperation<F: Value<ArrayType>> {
@@ -616,10 +616,10 @@ impl JitCallOperation {
         TangentValue: Value<ArrayType>,
         E: DifferentiationContext<
                 Tangent = TangentValue,
-                LinearOperation<TangentValue, CapturedFactor<ArrayType, PrimalValue>> = LinearXlaOperation<
+                LinearOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>> = LinearXlaOperation<
                     TangentValue,
                     XlaConstant,
-                    CapturedFactor<ArrayType, PrimalValue>,
+                    ValueOrCapture<ArrayType, PrimalValue>,
                 >,
             > + Domain<Type = ArrayType, Value = PrimalValue>
             + 'jvp,
@@ -628,7 +628,7 @@ impl JitCallOperation {
         let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let linear_operation = self.linear_call_operation(captured_inputs)?;
-        let operation: LinearXlaOperation<TangentValue, XlaConstant, CapturedFactor<ArrayType, PrimalValue>> =
+        let operation: LinearXlaOperation<TangentValue, XlaConstant, ValueOrCapture<ArrayType, PrimalValue>> =
             LinearXlaOperation::Extension(LinearXlaOperationExtension::LinearJitCall(Box::new(linear_operation)));
         let tangent_outputs = context.stage_operation(operation, tangent_inputs.as_slice())?;
         check_count!("output", tangent_outputs, primal_outputs.len(), ProgramError);
@@ -691,11 +691,11 @@ where
         + DifferentiationContext<
             LinearOperation<
                 <E as DifferentiationContext>::Tangent,
-                CapturedFactor<ArrayType, Tracer<E>>,
+                ValueOrCapture<ArrayType, Tracer<E>>,
             > = LinearXlaOperation<
                 <E as DifferentiationContext>::Tangent,
                 XlaConstant,
-                CapturedFactor<ArrayType, Tracer<E>>,
+                ValueOrCapture<ArrayType, Tracer<E>>,
             >,
         >,
 {
@@ -860,11 +860,11 @@ where
         + DifferentiationContext<
             LinearOperation<
                 <E as DifferentiationContext>::Tangent,
-                CapturedFactor<ArrayType, Tracer<E>>,
+                ValueOrCapture<ArrayType, Tracer<E>>,
             > = LinearXlaOperation<
                 <E as DifferentiationContext>::Tangent,
                 XlaConstant,
-                CapturedFactor<ArrayType, Tracer<E>>,
+                ValueOrCapture<ArrayType, Tracer<E>>,
             >,
         >,
 {
@@ -922,15 +922,15 @@ where
 /// Maps the captured primal factor payloads carried by the XLA linear extension operations, so they participate in
 /// residual compaction, rebasing onto an enclosing linearization context, and instantiation into directly
 /// executable linear programs exactly like the core linear array operations' factor payloads.
-impl<V: Value<ArrayType>, F: Value<ArrayType>> FactorParameterizedOperation<ArrayType, F>
+impl<V: Value<ArrayType>, F: Value<ArrayType>> CaptureParameterizedOperation<ArrayType, F>
     for LinearXlaOperationExtension<V, F>
 {
-    type WithFactor<MappedFactor: Value<ArrayType>> = LinearXlaOperationExtension<V, MappedFactor>;
+    type WithCapture<MappedFactor: Value<ArrayType>> = LinearXlaOperationExtension<V, MappedFactor>;
 
-    fn try_map_factors<MappedFactor: Value<ArrayType>, MapFactorFn>(
+    fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
         map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {

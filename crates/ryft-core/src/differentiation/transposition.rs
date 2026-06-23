@@ -58,8 +58,9 @@ use crate::types::{Type, Typed};
 /// implementation a simple dispatcher while allowing the payload type that owns the recursion to name the fixed point
 /// directly.
 ///
-/// The derivaction macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
-/// This attribute can be omitted when the default `crate` path is desired. `#[ryft(crate = "crate")]` is not needed.
+/// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
+/// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
+/// attribute.
 ///
 /// ## Example
 ///

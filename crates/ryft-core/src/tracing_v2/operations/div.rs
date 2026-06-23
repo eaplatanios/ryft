@@ -8,7 +8,7 @@ use crate::operations::constants::{MaybeZeroOperation, OneLike, ZeroOperation};
 use crate::payloads::Input;
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::Typed;
 
 impl<D> DifferentiableOperation<D> for DivOperation
@@ -18,7 +18,7 @@ where
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>
         + From<AddOperation>
-        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>
+        + From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>
         + From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(

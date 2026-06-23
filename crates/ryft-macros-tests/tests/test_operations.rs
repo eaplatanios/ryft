@@ -202,6 +202,7 @@ impl<T: Clone + Type, V> Operation<T> for CustomJvpOperation<T, V> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
 enum ScalarOperation<V: Value<DataType>> {
     Zero(ZeroOperation<DataType>),
     Add(AddOperation),
@@ -210,6 +211,7 @@ enum ScalarOperation<V: Value<DataType>> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
 enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V> {
     Zero(ZeroOperation<DataType>),
     Constant(ConstantOperation<DataType, V>),
@@ -257,6 +259,26 @@ fn test_transposable_operation_infers_value_type() {
         add.transpose(&mut context, &[&DataType], &[]).unwrap(),
         vec![transposed::<DataType, Factor, Linear>("add")],
     );
+}
+
+#[derive(Clone, Debug, ryft::Operation)]
+enum DefaultPathOperation<V: ryft::Value<ryft::DataType>> {
+    Zero(ryft::ZeroOperation<ryft::DataType>),
+    Constant(ryft::ConstantOperation<ryft::DataType, V>),
+}
+
+#[derive(Clone, Debug, ryft::Operation, ryft::TransposableOperation)]
+enum DefaultPathLinearOperation<V: ryft::Value<ryft::DataType>> {
+    Zero(ryft::ZeroOperation<ryft::DataType>),
+    Constant(ryft::ConstantOperation<ryft::DataType, V>),
+}
+
+#[test]
+fn test_operation_default_crate_path_is_ryft() {
+    let operation = DefaultPathOperation::<f64>::from(ryft::ZeroOperation::new(ryft::DataType::F64));
+    let linear_operation = DefaultPathLinearOperation::<f64>::from(ryft::ZeroOperation::new(ryft::DataType::F64));
+    assert_eq!(ryft::Operation::name(&operation), "zero");
+    assert_eq!(ryft::Operation::name(&linear_operation), "zero");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,12 +347,14 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
 enum SpecialLinearOperation<V: Value<ArrayType>> {
     Special(SpecialOperation),
     Constant(ConstantOperation<ArrayType, V>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
 enum InferredArrayOperation<V: Value<ArrayType>, C: Value<ArrayType> = V> {
     Zero(ZeroOperation<ArrayType>),
     Constant(ConstantOperation<ArrayType, V>),
@@ -356,6 +380,7 @@ fn test_array_operation_type_inference() {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
 enum ArrayOperation<V: Value<ArrayType>, Extension = NoExtension> {
     Zero(ZeroOperation<ArrayType>),
     Dot(DotOperation),
@@ -422,6 +447,7 @@ where
 trait RecursiveOperationTransposable<V: Value<ArrayType>>: Operation<ArrayType> {}
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
 enum RecursiveLinearOperation<V: Value<ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Recursive(RecursiveOperation<V, Self>),
@@ -486,6 +512,7 @@ impl<T: Clone + Type, V: Value<T>, O: Operation<T>, C, P, F> TransposableOperati
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
 enum LinearArrayOperation<
     V: Value<ArrayType>,
     C: Value<ArrayType>,

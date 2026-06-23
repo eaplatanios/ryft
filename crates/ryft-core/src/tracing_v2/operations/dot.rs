@@ -17,7 +17,7 @@ use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
@@ -676,8 +676,8 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Dot,
     LinearOperationOf<D>: From<AddOperation>
-        + From<LeftDotOperation<CapturedFactor<ArrayType, D::Value>, Input>>
-        + From<RightDotOperation<CapturedFactor<ArrayType, D::Value>, Input>>
+        + From<LeftDotOperation<ValueOrCapture<ArrayType, D::Value>, Input>>
+        + From<RightDotOperation<ValueOrCapture<ArrayType, D::Value>, Input>>
         + From<ZeroOperation<ArrayType>>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
 {
@@ -706,7 +706,7 @@ where
             let factor = right.factor(context);
             Some(<TangentContext<'jvp, D> as RightDot<
                 crate::tracing::Tracer<TangentContext<'jvp, D>>,
-                CapturedFactor<ArrayType, D::Value>,
+                ValueOrCapture<ArrayType, D::Value>,
                 Input,
             >>::right_dot(
                 context, left.tangent(), factor, &self.dimensions, self.output_sharding.as_ref()
@@ -718,7 +718,7 @@ where
             let factor = left.factor(context);
             Some(<TangentContext<'jvp, D> as LeftDot<
                 crate::tracing::Tracer<TangentContext<'jvp, D>>,
-                CapturedFactor<ArrayType, D::Value>,
+                ValueOrCapture<ArrayType, D::Value>,
                 Input,
             >>::left_dot(
                 context, right.tangent(), factor, &self.dimensions, self.output_sharding.as_ref()
@@ -747,7 +747,7 @@ where
 /// The `Payload` type parameter is a zero-sized semantic tag that tells interpretation how the factor should be
 /// treated. The default [`Captured`] payload means the factor is carried by the operation and can remain a unary
 /// `left_dot` instruction in a staged linear program. The [`Input`] payload is used when the factor is already part of
-/// the active runtime or staging context, such as a tracer-valued factor or an instantiated [`CapturedFactor`]; in that
+/// the active runtime or staging context, such as a tracer-valued factor or an instantiated [`ValueOrCapture`]; in that
 /// case interpretation either lowers to an ordinary binary [`DotOperation`] or stages an input-payload `left_dot`
 /// explicitly. Keeping this distinction in the operation type lets captured-factor and input-factor dot maps share one
 /// operation struct without adding runtime fields or ambiguous interpretation implementations.
@@ -939,17 +939,17 @@ where
     }
 }
 
-impl<C, V> LeftDot<Tracer<C>, CapturedFactor<ArrayType, V>, Input> for C
+impl<C, V> LeftDot<Tracer<C>, ValueOrCapture<ArrayType, V>, Input> for C
 where
     C: StagingContext<Type = ArrayType>,
     V: Value<ArrayType>,
-    C::Operation: From<LeftDotOperation<CapturedFactor<ArrayType, V>, Input>>,
+    C::Operation: From<LeftDotOperation<ValueOrCapture<ArrayType, V>, Input>>,
 {
     #[inline]
     fn left_dot(
         &self,
         input: &Tracer<C>,
-        factor: CapturedFactor<ArrayType, V>,
+        factor: ValueOrCapture<ArrayType, V>,
         dimensions: &DotDimensionNumbers,
         output_sharding: Option<&Sharding>,
     ) -> Result<Tracer<C>, ProgramError> {
@@ -970,7 +970,7 @@ where
 /// The `Payload` type parameter is a zero-sized semantic tag that tells interpretation how the factor should be
 /// treated. The default [`Captured`] payload means the factor is carried by the operation and can remain a unary
 /// `right_dot` instruction in a staged linear program. The [`Input`] payload is used when the factor is already part
-/// of the active runtime or staging context, such as a tracer-valued factor or an instantiated [`CapturedFactor`]; in
+/// of the active runtime or staging context, such as a tracer-valued factor or an instantiated [`ValueOrCapture`]; in
 /// that case interpretation either lowers to an ordinary binary [`DotOperation`] or stages an input-payload
 /// `right_dot` explicitly. Keeping this distinction in the operation type lets captured-factor and input-factor dot
 /// maps share one operation struct without adding runtime fields or ambiguous interpretation implementations.
@@ -1162,17 +1162,17 @@ where
     }
 }
 
-impl<C, V> RightDot<Tracer<C>, CapturedFactor<ArrayType, V>, Input> for C
+impl<C, V> RightDot<Tracer<C>, ValueOrCapture<ArrayType, V>, Input> for C
 where
     C: StagingContext<Type = ArrayType>,
     V: Value<ArrayType>,
-    C::Operation: From<RightDotOperation<CapturedFactor<ArrayType, V>, Input>>,
+    C::Operation: From<RightDotOperation<ValueOrCapture<ArrayType, V>, Input>>,
 {
     #[inline]
     fn right_dot(
         &self,
         input: &Tracer<C>,
-        factor: CapturedFactor<ArrayType, V>,
+        factor: ValueOrCapture<ArrayType, V>,
         dimensions: &DotDimensionNumbers,
         output_sharding: Option<&Sharding>,
     ) -> Result<Tracer<C>, ProgramError> {

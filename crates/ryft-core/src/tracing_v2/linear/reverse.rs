@@ -245,7 +245,7 @@ mod tests {
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
     use crate::tracing_v2::{
-        DifferentiableOperation, DifferentiationContext, FactorParameterizedOperation, JvpTracer, TangentContext,
+        CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, TangentContext,
     };
     use crate::types::{DataType, Type, TypeError, Typed};
     use crate::{Context, ProvidesContext};
@@ -551,13 +551,24 @@ mod tests {
         }
     }
 
-    impl<Factor: Value<TestType>> FactorParameterizedOperation<TestType, Factor> for TestLinearOperation {
-        type WithFactor<MappedFactor: Value<TestType>> = Self;
+    impl<Factor: Value<TestType>> CaptureParameterizedOperation<TestType, Factor> for TestLinearOperation {
+        type WithCapture<MappedFactor: Value<TestType>> = Self;
+        type WithLocalCapture<MappedFactor: Value<TestType>> = Self;
 
-        fn try_map_factors<MappedFactor: Value<TestType>, MapFactorFn>(
+        fn try_map_captures<MappedFactor: Value<TestType>, MapFactorFn>(
             &self,
             _map_factor: &mut MapFactorFn,
-        ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+        ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
+        where
+            MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
+        {
+            Ok(self.clone())
+        }
+
+        fn try_map_local_captures<MappedFactor: Value<TestType>, MapFactorFn>(
+            &self,
+            _map_factor: &mut MapFactorFn,
+        ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
         where
             MapFactorFn: FnMut(&Factor) -> Result<MappedFactor, ProgramError>,
         {

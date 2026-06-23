@@ -26,9 +26,9 @@ mod tests {
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
     use crate::tracing_v2::differentiation::{
-        FactorParameterizedOperation, JvpTracer, LinearOperationOf, TangentContext,
+        CaptureParameterizedOperation, JvpTracer, LinearOperationOf, TangentContext,
     };
-    use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+    use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
     use crate::types::{DataType, Typed};
 
     #[derive(Copy, Clone, Debug, PartialEq, Parameter)]
@@ -363,13 +363,14 @@ mod tests {
         }
     }
 
-    impl<F: Value<DataType>> FactorParameterizedOperation<DataType, F> for DistinctLinearOperation<F> {
-        type WithFactor<MappedFactor: Value<DataType>> = DistinctLinearOperation<MappedFactor>;
+    impl<F: Value<DataType>> CaptureParameterizedOperation<DataType, F> for DistinctLinearOperation<F> {
+        type WithCapture<MappedFactor: Value<DataType>> = DistinctLinearOperation<MappedFactor>;
+        type WithLocalCapture<MappedFactor: Value<DataType>> = DistinctLinearOperation<MappedFactor>;
 
-        fn try_map_factors<MappedFactor: Value<DataType>, MapFactorFn>(
+        fn try_map_captures<MappedFactor: Value<DataType>, MapFactorFn>(
             &self,
             map_factor: &mut MapFactorFn,
-        ) -> Result<Self::WithFactor<MappedFactor>, ProgramError>
+        ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
         where
             MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
         {
@@ -384,6 +385,16 @@ mod tests {
                     DistinctLinearOperation::ScaleByPrimal { factor: map_factor(factor)? }
                 }
             })
+        }
+
+        fn try_map_local_captures<MappedFactor: Value<DataType>, MapFactorFn>(
+            &self,
+            map_factor: &mut MapFactorFn,
+        ) -> Result<Self::WithLocalCapture<MappedFactor>, ProgramError>
+        where
+            MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+        {
+            self.try_map_captures(map_factor)
         }
     }
 
@@ -439,7 +450,7 @@ mod tests {
         D: DifferentiationContext<Type = DataType>,
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
         LinearOperationOf<D>:
-            From<AddOperation> + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>, Input>>,
+            From<AddOperation> + From<ScaleOperation<DataType, ValueOrCapture<DataType, <D as Domain>::Value>, Input>>,
         LinearOperationOf<D>: MaybeZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
@@ -533,7 +544,7 @@ mod tests {
             LinearScalarOperation<
                 DomainTracer<ScalarDomain<f64>>,
                 f64,
-                CapturedFactor<DataType, DomainTracer<ScalarDomain<f64>>>,
+                ValueOrCapture<DataType, DomainTracer<ScalarDomain<f64>>>,
             >,
         >::new()));
         let mut context = TangentContext::new(&outer_tracing_context, linear_builder.clone());

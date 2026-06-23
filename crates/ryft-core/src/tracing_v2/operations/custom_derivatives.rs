@@ -16,11 +16,11 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched,
 };
 use crate::tracing_v2::differentiation::{
-    FactorParameterizedOperation, JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext,
+    CaptureParameterizedOperation, JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::{
-    CapturedFactor, DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation,
+    DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation, ValueOrCapture,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -193,12 +193,12 @@ where
     let residual_factors =
         pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
     let pushforward_program = pushforward.program().map_operations(|operation| {
-        operation.try_map_factors(&mut |factor: &CapturedFactor<D::Type, <D as Domain>::Value>| match factor {
-            CapturedFactor::Reference { index, .. } => residual_factors
+        operation.try_map_captures(&mut |factor: &ValueOrCapture<D::Type, <D as Domain>::Value>| match factor {
+            ValueOrCapture::Capture { index, .. } => residual_factors
                 .get(*index)
                 .cloned()
                 .ok_or(ProgramError::UnboundAtomId { id: crate::programs::AtomId::new(*index) }),
-            CapturedFactor::Constant(value) => Ok(CapturedFactor::Constant(value.clone())),
+            ValueOrCapture::Value(value) => Ok(ValueOrCapture::Value(value.clone())),
         })
     })?;
     let tangent_outputs = context.stage_program(&pushforward_program, tangent_seeds)?;
@@ -569,7 +569,7 @@ where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
+        + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
@@ -610,7 +610,7 @@ where
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
     O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<D::Type, V, O, CapturedFactor<D::Type, <D as Domain>::Value>>>,
+        + From<CustomVjpCallOperation<D::Type, V, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<V>: Parameterized<
             V,
@@ -686,7 +686,7 @@ where
 
 /// Access to a custom-VJP residual payload as a concrete value during pullback interpretation.
 ///
-/// Implemented by plain values (identity) and by [`CapturedFactor`] (whose `Constant` form yields its payload and
+/// Implemented by plain values (identity) and by [`ValueOrCapture`] (whose `Constant` form yields its payload and
 /// whose `Reference` form errors, since references are only meaningful before residual instantiation).
 #[doc(hidden)]
 pub trait CustomVjpResidual<T: Type, V: Value<T>>: Value<T> {
@@ -701,11 +701,11 @@ impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for V {
     }
 }
 
-impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for CapturedFactor<T, V> {
+impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for ValueOrCapture<T, V> {
     fn residual_value(&self) -> Result<V, ProgramError> {
         match self {
-            CapturedFactor::Constant(value) => Ok(value.clone()),
-            CapturedFactor::Reference { .. } => Err(TypeError {
+            ValueOrCapture::Value(value) => Ok(value.clone()),
+            ValueOrCapture::Capture { .. } => Err(TypeError {
                 message: "custom_vjp pullback interpretation requires instantiated residuals".to_string(),
             }
             .into()),
@@ -791,7 +791,7 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<T, V, O, F> {
     }
 
     /// Maps the residual factor payloads with `map_factor`, preserving the backward program and direction.
-    pub fn map_factors<MappedFactor: Value<T>, MapFactorFn>(
+    pub fn map_captures<MappedFactor: Value<T>, MapFactorFn>(
         &self,
         map_factor: &mut MapFactorFn,
     ) -> Result<CustomVjpCallOperation<T, V, O, MappedFactor>, ProgramError>

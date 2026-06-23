@@ -201,8 +201,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     In those cases, the caller must split the enum by operation type or implement [`Operation`] manually.
 ///
 /// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
-/// Ryft traits and error types from generated code. This attribute can be omitted when the default `crate` path is
-/// desired. `#[ryft(crate = "crate")]` is not needed.
+/// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on
+/// the `ryft` crate normally do not need this attribute.
 ///
 /// ## Example
 ///

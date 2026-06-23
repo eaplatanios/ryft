@@ -10,7 +10,7 @@ use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Typed};
 
 impl<D> DifferentiableOperation<D> for MulOperation
@@ -19,7 +19,7 @@ where
     MulOperation: Operation<D::Type>,
     D::Value: Mul<Output = D::Value>,
     LinearOperationOf<D>: From<AddOperation>
-        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>
+        + From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>
         + From<ZeroOperation<D::Type>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {

@@ -13,7 +13,7 @@ use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
@@ -504,7 +504,7 @@ where
     D::Value: Reduce + Broadcast + crate::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
     LinearOperationOf<D>:
-        From<ReduceOperation> + From<ScaleOperation<ArrayType, CapturedFactor<ArrayType, D::Value>, Input>>,
+        From<ReduceOperation> + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>, Input>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -1102,7 +1102,7 @@ mod tests {
                 TestArray,
                 TestArray,
                 std::convert::Infallible,
-                CapturedFactor<ArrayType, TestArray>,
+                ValueOrCapture<ArrayType, TestArray>,
                 ArrayOperation<TestArray>,
             >,
         >::new()));
