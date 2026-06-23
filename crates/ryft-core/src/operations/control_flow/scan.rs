@@ -653,16 +653,12 @@ where
     Ok(carries)
 }
 
-impl<C, V, O, Capture> InterpretableOperation<ArrayType, V> for ScanOperation<ArrayType, C, O, Capture>
-where
-    C: Value<ArrayType>,
-    V: ScanRuntime<ArrayType, C>,
-    O: InterpretableOperation<ArrayType, V>,
-    Capture: Value<ArrayType>,
+impl<T: ScanTypeSemantics, C: Value<T>, V: ScanRuntime<T, C>, O: InterpretableOperation<T, V>, Capture: Value<T>>
+    InterpretableOperation<T, V> for ScanOperation<T, C, O, Capture>
 {
     fn interpret(
         &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();

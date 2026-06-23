@@ -4,7 +4,7 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::macros::check_count;
+use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -16,7 +16,6 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
@@ -202,34 +201,6 @@ where
             Self::CustomJvp(operation) => operation.interpret(context, inputs),
             Self::CustomVjp(operation) => operation.interpret(context, inputs),
         }
-    }
-}
-
-impl<C, V, Capture> InterpretableOperation<DataType, V> for ScanOperation<DataType, C, ScalarOperation<C>, Capture>
-where
-    C: Value<DataType>,
-    V: Value<DataType>,
-    Capture: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
-    ScalarOperation<C>: InterpretableOperation<DataType, V>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<DataType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let mut state = inputs.to_vec();
-        for _ in 0..self.length() {
-            state = self.body().interpret_with(
-                state,
-                |_, constant| context.lift(constant.clone()),
-                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-            )?;
-            check_count!("output", state, self.carry_count(), ProgramError);
-        }
-        Ok(state)
     }
 }
 
