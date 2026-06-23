@@ -334,6 +334,34 @@ impl<V: Value<DataType>, C: Value<DataType>> LinearScanBodyInstantiable<DataType
     }
 }
 
+// TODO(eaplatanios): Why do we need this?
+impl<V, C, F> ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F>
+where
+    V: Value<DataType>,
+    C: Value<DataType>,
+    F: Value<DataType>,
+    LinearScalarOperation<V, C, V>: InterpretableNestedProgram<DataType, V>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let body = self.body().map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
+        let mut state = inputs.to_vec();
+        for _ in 0..self.length() {
+            state =
+                <LinearScalarOperation<V, C, V> as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(
+                    context, &body, state,
+                )?;
+            check_count!("output", state, self.carry_count(), ProgramError);
+        }
+        Ok(state)
+    }
+}
+
 impl<V, C, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, C, F>
 where
     V: Value<DataType>
@@ -370,21 +398,7 @@ where
             Self::Neg(operation) => operation.interpret(context, inputs),
             Self::Scale(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let body =
-                    operation.body().map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
-                let mut state = inputs.to_vec();
-                for _ in 0..operation.length() {
-                    state =
-                        <LinearScalarOperation<V, C, V> as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(
-                            context, &body, state,
-                        )?;
-                    check_count!("output", state, operation.carry_count(), ProgramError);
-                }
-                Ok(state)
-            }
+            Self::Scan(operation) => operation.interpret(context, inputs),
         }
     }
 }
@@ -428,20 +442,7 @@ where
                 Self::Neg(operation) => operation.interpret(context, instruction_inputs),
                 Self::Scale(operation) => operation.interpret(context, instruction_inputs),
                 Self::Select(operation) => operation.interpret(context, instruction_inputs),
-                Self::Scan(operation) => {
-                    let input_types =
-                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    operation.infer_output_types(input_types.as_slice())?;
-                    let body = operation
-                        .body()
-                        .map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
-                    let mut state = instruction_inputs.to_vec();
-                    for _ in 0..operation.length() {
-                        state = Self::interpret_nested_program(context, &body, state)?;
-                        check_count!("output", state, operation.carry_count(), ProgramError);
-                    }
-                    Ok(state)
-                }
+                Self::Scan(operation) => operation.interpret(context, instruction_inputs),
             },
         )
     }

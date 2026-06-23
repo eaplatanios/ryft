@@ -2094,7 +2094,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::convert::Infallible;
 
     use crate::macros::check_types;
     use std::cell::RefCell;
@@ -2114,7 +2113,8 @@ mod tests {
     };
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{
-        One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+        ConstantOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation,
+        ZeroOperation,
     };
     use crate::operations::control_flow::SelectOperation;
     use crate::operations::trigonometric::SinOperation;
@@ -2152,7 +2152,7 @@ mod tests {
     }
 
     impl Value<ArrayType> for TestValue {
-        type InterpretationContext = EagerContext<ArrayType, Self, Infallible>;
+        type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
 
         #[inline]
         fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

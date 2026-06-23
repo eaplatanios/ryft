@@ -778,7 +778,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::convert::Infallible;
     use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
@@ -786,6 +785,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
+    use crate::operations::constants::ConstantOperation;
     use crate::operations::control_flow::WhileOperation;
     use crate::parameters::Placeholder;
     use crate::payloads::Input;
@@ -973,7 +973,7 @@ mod tests {
         let linear_scan = DirectLinearOperation::Scan(Box::new(
             ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(scan_body, 1, 3).unwrap(),
         ));
-        let context = EagerContext::<ArrayType, TestArray, Infallible>::new();
+        let context = EagerContext::<ArrayType, TestArray, ConstantOperation<ArrayType, TestArray>>::new();
         let outputs = linear_scan
             .interpret(&context, &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
             .unwrap();

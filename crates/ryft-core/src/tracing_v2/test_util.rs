@@ -565,7 +565,14 @@ mod tests {
         let operation = crate::operations::constants::ZeroOperation::new(scalar.clone());
 
         let outputs: Vec<ArrayBatch<TestArray>> = operation
-            .batch(&crate::EagerContext::<ArrayType, TestArray, std::convert::Infallible>::new(), &[])
+            .batch(
+                &EagerContext::<
+                    ArrayType,
+                    TestArray,
+                    crate::operations::constants::ConstantOperation<ArrayType, TestArray>,
+                >::new(),
+                &[],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);
@@ -580,7 +587,14 @@ mod tests {
         let operation = crate::operations::constants::OneOperation::new(scalar.clone());
 
         let outputs: Vec<ArrayBatch<TestArray>> = operation
-            .batch(&crate::EagerContext::<ArrayType, TestArray, std::convert::Infallible>::new(), &[])
+            .batch(
+                &EagerContext::<
+                    ArrayType,
+                    TestArray,
+                    crate::operations::constants::ConstantOperation<ArrayType, TestArray>,
+                >::new(),
+                &[],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), None);

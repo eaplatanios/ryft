@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::marker::PhantomData;
 
 use half::{bf16, f16};
@@ -7,6 +6,7 @@ use half::{bf16, f16};
 use crate::contexts::{Context, EagerContext};
 use crate::domains::Domain;
 use crate::operations::InterpretableOperation;
+use crate::operations::constants::ConstantOperation;
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::programs::{ProgramError, Value};
 use crate::types::{DataType, Typed};
@@ -41,7 +41,7 @@ impl_typed_for_scalar!(f64, DataType::F64);
 macro_rules! impl_value_for_scalar {
     ($ty:ty) => {
         impl Value<DataType> for $ty {
-            type InterpretationContext = EagerContext<DataType, Self, Infallible>;
+            type InterpretationContext = EagerContext<DataType, Self, ConstantOperation<DataType, Self>>;
 
             #[inline]
             fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

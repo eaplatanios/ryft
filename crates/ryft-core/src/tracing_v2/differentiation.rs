@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -13,7 +12,7 @@ use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
+use crate::operations::constants::{ConstantOperation, MaybeZeroOperation, OneOperation, ZeroOperation};
 use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -1938,7 +1937,7 @@ impl<'domain, E: DifferentiationContext> Display for JvpTracer<'domain, E> {
 }
 
 impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E> {
-    type InterpretationContext = EagerContext<E::Type, Self, Infallible>;
+    type InterpretationContext = EagerContext<E::Type, Self, ConstantOperation<E::Type, Self>>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

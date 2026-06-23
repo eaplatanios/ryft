@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -11,7 +10,7 @@ use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFing
 use ryft_core::contexts::{Context, EagerContext, ProvidesContext};
 use ryft_core::domains::Domain;
 use ryft_core::operations::Operation;
-use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
+use ryft_core::operations::constants::{ConstantOperation, ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::{DeviceMesh, Sharding};
@@ -279,14 +278,18 @@ impl<'c> DifferentiationContext for XlaDomain<'c> {
     type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, XlaConstant, F>;
 }
 
-impl<'c> ProvidesContext<EagerContext<ArrayType, Array<'c>, Infallible>> for XlaDomain<'c> {
-    fn context(&self) -> EagerContext<ArrayType, Array<'c>, Infallible> {
+impl<'c> ProvidesContext<EagerContext<ArrayType, Array<'c>, ConstantOperation<ArrayType, Array<'c>>>>
+    for XlaDomain<'c>
+{
+    fn context(&self) -> EagerContext<ArrayType, Array<'c>, ConstantOperation<ArrayType, Array<'c>>> {
         EagerContext::new()
     }
 }
 
-impl<'c> ProvidesContext<EagerContext<ArrayType, ArrayType, Infallible>> for XlaDomain<'c> {
-    fn context(&self) -> EagerContext<ArrayType, ArrayType, Infallible> {
+impl<'c> ProvidesContext<EagerContext<ArrayType, ArrayType, ConstantOperation<ArrayType, ArrayType>>>
+    for XlaDomain<'c>
+{
+    fn context(&self) -> EagerContext<ArrayType, ArrayType, ConstantOperation<ArrayType, ArrayType>> {
         EagerContext::new()
     }
 }

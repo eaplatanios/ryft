@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::Range;
 use std::sync::Arc;
 
 use ryft_core::EagerContext;
+use ryft_core::operations::constants::ConstantOperation;
 use ryft_core::programs::Value;
 use ryft_core::{
     ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Sharding, ShardingDimension, ShardingError,
@@ -409,7 +409,7 @@ impl Typed<ArrayType> for Array<'_> {
 }
 
 impl Value<ArrayType> for Array<'_> {
-    type InterpretationContext = EagerContext<ArrayType, Self, Infallible>;
+    type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

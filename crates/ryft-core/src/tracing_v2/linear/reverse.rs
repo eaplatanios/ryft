@@ -224,7 +224,6 @@ where
 mod tests {
     use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
-    use std::convert::Infallible;
     use std::fmt::{self, Display};
     use std::ops::{Add, Neg};
     use std::rc::Rc;
@@ -236,7 +235,7 @@ mod tests {
     use crate::domains::Domain;
     use crate::macros::check_count;
     use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, NegOperation, ScaleOperation};
-    use crate::operations::constants::{One, OneLike, Zero, ZeroLike, ZeroOperation};
+    use crate::operations::constants::{ConstantOperation, One, OneLike, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Parameter;
@@ -307,7 +306,7 @@ mod tests {
     }
 
     impl Value<TestType> for TestValue {
-        type InterpretationContext = EagerContext<TestType, Self, Infallible>;
+        type InterpretationContext = EagerContext<TestType, Self, ConstantOperation<TestType, Self>>;
 
         #[inline]
         fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

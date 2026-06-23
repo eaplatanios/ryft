@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::rc::Rc;
 
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
@@ -256,18 +255,6 @@ pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue>: Operation<ArrayTy
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>;
-}
-
-impl<V: MlirLowerableValue> LowerableXlaOperation<V> for Infallible {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        _lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        match *self {}
-    }
 }
 
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for AddOperation {

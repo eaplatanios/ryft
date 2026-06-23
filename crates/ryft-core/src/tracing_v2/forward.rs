@@ -2,7 +2,6 @@
 mod tests {
     use std::borrow::Cow;
     use std::cell::{Cell, RefCell};
-    use std::convert::Infallible;
     use std::fmt::Display;
     use std::ops::{Add, Div, Mul, Neg, Sub};
     use std::rc::Rc;
@@ -16,7 +15,9 @@ mod tests {
     use crate::domains::Domain;
     use crate::macros::check_count;
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation, ScaleOperation, SubOperation};
-    use crate::operations::constants::{MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
+    use crate::operations::constants::{
+        ConstantOperation, MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation,
+    };
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
@@ -47,7 +48,7 @@ mod tests {
     }
 
     impl Value<DataType> for DistinctPrimal {
-        type InterpretationContext = EagerContext<DataType, Self, Infallible>;
+        type InterpretationContext = EagerContext<DataType, Self, ConstantOperation<DataType, Self>>;
 
         #[inline]
         fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
@@ -137,7 +138,7 @@ mod tests {
     }
 
     impl Value<DataType> for DistinctTangent {
-        type InterpretationContext = EagerContext<DataType, Self, Infallible>;
+        type InterpretationContext = EagerContext<DataType, Self, ConstantOperation<DataType, Self>>;
 
         #[inline]
         fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

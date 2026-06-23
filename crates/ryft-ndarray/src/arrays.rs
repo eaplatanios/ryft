@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
@@ -8,7 +7,7 @@ use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::EagerContext;
-use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
+use ryft_core::operations::constants::{ConstantOperation, Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::{Select, SelectCondition};
 use ryft_core::operations::manipulation::{
     Broadcast, Concatenate, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice,
@@ -435,7 +434,7 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
 }
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {
-    type InterpretationContext = EagerContext<ArrayType, Self, Infallible>;
+    type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
@@ -1461,7 +1460,11 @@ mod tests {
         // instead of panicking.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
         let expected_message = "ndarray backend requires static shape dimensions, but dimension #0 is *";
-        let context = ryft_core::EagerContext::<ArrayType, Array, std::convert::Infallible>::new();
+        let context = ryft_core::EagerContext::<
+            ArrayType,
+            Array,
+            ryft_core::operations::constants::ConstantOperation<ArrayType, Array>,
+        >::new();
         assert_eq!(context.zero(&dynamic_type).unwrap_err().to_string(), expected_message);
         assert_eq!(context.one(&dynamic_type).unwrap_err().to_string(), expected_message);
         assert_eq!(context.fill(&dynamic_type, 42.0).unwrap_err().to_string(), expected_message);

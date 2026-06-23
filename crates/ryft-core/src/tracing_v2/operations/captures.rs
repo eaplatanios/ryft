@@ -6,7 +6,7 @@ use ryft_macros::Parameter;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::control_flow::SelectCondition;
-use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameter;
 use crate::programs::{AtomId, ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
@@ -101,16 +101,16 @@ impl<T: Type, V: Value<T>> Value<T> for ValueOrCapture<T, V> {
 }
 
 /// Scalar captured-condition payloads carry the [`SelectOperation`](crate::operations::control_flow::SelectOperation)
-/// condition as an in-band Boolean over a [`DataType`] value, so the linear select interprets them by decoding that
-/// Boolean. Captures are residuals of the primal computation and must be instantiated before interpretation, so the
-/// capture form errors here, matching
+/// condition as an in-band scalar value, so the linear select interprets embedded values by delegating to their
+/// [`SelectCondition`] implementation. Captures are residuals of the primal computation and must be instantiated
+/// before interpretation, so the capture form errors here, matching
 /// [`CustomVjpResidual::residual_value`](crate::tracing_v2::operations::CustomVjpResidual).
-impl<V: Value<DataType> + BooleanLike> SelectCondition for ValueOrCapture<DataType, V> {
-    type Condition = bool;
+impl<V: Value<DataType> + SelectCondition> SelectCondition for ValueOrCapture<DataType, V> {
+    type Condition = V::Condition;
 
-    fn select_condition(&self) -> Result<bool, ProgramError> {
+    fn select_condition(&self) -> Result<Self::Condition, ProgramError> {
         match self {
-            Self::Value(value) => value.boolean(),
+            Self::Value(value) => value.select_condition(),
             Self::Capture { .. } => Err(ProgramError::Concretization {
                 message: "captured select condition requires instantiated captures".to_string(),
             }),

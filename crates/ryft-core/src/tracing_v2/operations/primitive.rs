@@ -6,7 +6,6 @@
 //! the backend that understands each operation.
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::fmt::Debug;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
@@ -14,7 +13,7 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::batching::BatchingError;
 use crate::contexts::{Context, EagerContext, StagingContext};
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::Cotangent;
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
@@ -337,78 +336,6 @@ pub enum LinearArrayOperation<V: Value<ArrayType>, C: Value<ArrayType>, F: Value
     While(Box<WhileOperation<ArrayType, V, Self>>),
     Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
-}
-
-impl<T: Type> Operation<T> for Infallible {
-    fn name(&self) -> &'static str {
-        match *self {}
-    }
-
-    fn infer_output_types(&self, _input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        match *self {}
-    }
-}
-
-impl<T: Type, V: Value<T>> InterpretableOperation<T, V> for Infallible {
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        _inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match *self {}
-    }
-}
-
-impl<T: Type, V: Value<T>, P: Operation<T>> TransposableOperation<T, V, P> for Infallible {
-    fn transpose<'transpose>(
-        &self,
-        _context: &mut AbstractTracingContext<'transpose, T, V, P>,
-        _input_types: &[&T],
-        _output_cotangents: &[Cotangent<'transpose, T, V, P>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, P>>, ProgramError> {
-        match *self {}
-    }
-}
-
-impl<D: DifferentiationContext> DifferentiableOperation<D> for Infallible {
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, D>,
-        _inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
-    where
-        D: 'jvp,
-    {
-        match *self {}
-    }
-}
-
-impl<T: Type, F: Value<T>> CaptureParameterizedOperation<T, F> for Infallible {
-    type WithCapture<MappedFactor: Value<T>> = Infallible;
-
-    fn try_map_captures<MappedFactor: Value<T>, MapFactorFn>(
-        &self,
-        _map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        match *self {}
-    }
-}
-
-impl MaybeRematerializationName for Infallible {
-    #[inline]
-    fn rematerialization_name(&self) -> Option<&str> {
-        match *self {}
-    }
-}
-
-impl MaybeDot for Infallible {
-    #[inline]
-    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
-        match *self {}
-    }
 }
 
 impl<V: Value<ArrayType>> MaybeRematerializationName for ArrayOperation<V> {
@@ -1282,7 +1209,7 @@ where
 /// trait.
 impl<V> InterpretableOperation<ArrayType, V> for ArrayOperation<V>
 where
-    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V, Infallible>>
+    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V, ConstantOperation<ArrayType, V>>>
         + Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations
@@ -2168,6 +2095,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::differentiation::TransposableOperation;
     use crate::domains::AbstractDomain;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;

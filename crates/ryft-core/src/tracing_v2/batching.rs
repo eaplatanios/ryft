@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
 
@@ -266,12 +265,6 @@ pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the
     /// resulting lane axes, using `context` for rules that need active transform state.
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
-}
-
-impl<V: Value<ArrayType>, C> BatchableOperation<V, C> for Infallible {
-    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        match *self {}
-    }
 }
 
 /// Blanket [`BatchableOperation`] impl for any [`ElementwiseOperation`].

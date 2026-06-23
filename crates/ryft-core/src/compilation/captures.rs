@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::convert::Infallible;
 use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
@@ -7,6 +6,7 @@ use ryft_macros::Parameter;
 use crate::contexts::EagerContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
+use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::types::{Type, Typed};
@@ -54,7 +54,7 @@ impl<T: Type> Typed<T> for CapturedConstant<T> {
 }
 
 impl<T: Type> Value<T> for CapturedConstant<T> {
-    type InterpretationContext = EagerContext<T, Self, Infallible>;
+    type InterpretationContext = EagerContext<T, Self, ConstantOperation<T, Self>>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
