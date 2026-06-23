@@ -1591,7 +1591,7 @@ mod tests {
         )
         .unwrap();
         let (gradient, pushforward) = domain.linearize_program(&gradient_program, vec![0.7]).unwrap();
-        let second_derivative = pushforward.apply(&domain, 1.0).unwrap();
+        let second_derivative = pushforward.apply(&crate::contexts::EagerContext::new(), 1.0).unwrap();
         let x: f64 = 0.7;
         assert_close(gradient, 2.0 * x * (x * x).cos());
         assert_close(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());

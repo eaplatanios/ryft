@@ -3,8 +3,9 @@ use std::ops::{Div, Mul, Neg};
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{AddOperation, DivOperation, Scale, ScaleOperation};
+use crate::operations::arithmetic::{AddOperation, DivOperation, Scalable, ScaleOperation};
 use crate::operations::constants::{MaybeZeroOperation, OneLike, ZeroOperation};
+use crate::payloads::Input;
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
@@ -17,7 +18,7 @@ where
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>
         + From<AddOperation>
-        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>
+        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>
         + From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(
@@ -37,12 +38,14 @@ where
         let left_term = if context.is_zero(left.tangent())? {
             None
         } else {
-            Some(left.tangent().clone().scale(context.factor(left_factor)))
+            let factor = context.factor(left_factor);
+            Some(left.tangent().scale(factor)?)
         };
         let right_term = if context.is_zero(right.tangent())? {
             None
         } else {
-            Some(right.tangent().clone().scale(context.factor(right_factor)))
+            let factor = context.factor(right_factor);
+            Some(right.tangent().scale(factor)?)
         };
         let tangent = match (left_term, right_term) {
             (Some(left_term), Some(right_term)) => left_term + right_term,

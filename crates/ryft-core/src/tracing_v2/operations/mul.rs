@@ -4,8 +4,9 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{AddOperation, MulOperation, Scale, ScaleOperation};
+use crate::operations::arithmetic::{AddOperation, MulOperation, Scalable, ScaleOperation};
 use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
+use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
@@ -18,7 +19,7 @@ where
     MulOperation: Operation<D::Type>,
     D::Value: Mul<Output = D::Value>,
     LinearOperationOf<D>: From<AddOperation>
-        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>
+        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>
         + From<ZeroOperation<D::Type>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
@@ -37,12 +38,14 @@ where
         let left_term = if context.is_zero(left.tangent())? {
             None
         } else {
-            Some(left.tangent().clone().scale(right.factor(context)))
+            let factor = right.factor(context);
+            Some(left.tangent().scale(factor)?)
         };
         let right_term = if context.is_zero(right.tangent())? {
             None
         } else {
-            Some(right.tangent().clone().scale(left.factor(context)))
+            let factor = left.factor(context);
+            Some(right.tangent().scale(factor)?)
         };
         let tangent = match (left_term, right_term) {
             (Some(left_term), Some(right_term)) => left_term + right_term,

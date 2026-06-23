@@ -179,7 +179,7 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
         }
         for instruction in builder.instructions() {
             if instruction.outputs().contains(&atom) {
-                return Ok(instruction.inputs().is_empty() && instruction.operation().zero_operation().is_some());
+                return Ok(instruction.inputs().is_empty() && instruction.operation().is_zero_operation());
             }
         }
         Ok(false)
@@ -342,7 +342,7 @@ mod tests {
             assert_eq!(builder.instructions().len(), 2);
             assert_eq!(builder.instructions()[0].inputs(), &[]);
             assert_eq!(builder.instructions()[0].outputs(), &[AtomId::new(0)]);
-            assert!(builder.instructions()[0].operation().zero_operation().is_some());
+            assert!(builder.instructions()[0].operation().is_zero_operation());
             assert_eq!(builder.instructions()[1].inputs(), &[AtomId::new(1), AtomId::new(2)]);
             assert_eq!(builder.instructions()[1].outputs(), &[AtomId::new(3)]);
         }

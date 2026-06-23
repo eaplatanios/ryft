@@ -3,9 +3,10 @@ use std::ops::Neg;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{NegOperation, Scale, ScaleOperation};
+use crate::operations::arithmetic::{NegOperation, Scalable, ScaleOperation};
 use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::trigonometric::{Cos, CosOperation, Sin};
+use crate::payloads::Input;
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
@@ -17,7 +18,7 @@ where
     D::Value: Cos + Sin + Neg<Output = D::Value>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>
         + From<NegOperation>
-        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
+        + From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -33,7 +34,7 @@ where
         let tangent = if context.is_zero(input.tangent())? {
             input.tangent().clone()
         } else {
-            -input.tangent().clone().scale(context.factor(input.primal().clone().sin()))
+            -input.tangent().scale(context.factor(input.primal().clone().sin()))?
         };
         Ok(vec![JvpTracer::new(input.primal().clone().cos(), tangent)])
     }

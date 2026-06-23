@@ -29,7 +29,7 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 /// pushforwards remap or instantiate it like other captured factors. Its transpose routes the output cotangent into
 /// the selected branch: `select(condition, cotangent, 0)` for the `on_true` input and
 /// `select(condition, 0, cotangent)` for the `on_false` input.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LinearSelectOperation<F> {
     /// Captured Boolean condition that drives the selection.
     condition: F,
@@ -51,6 +51,12 @@ impl<F> LinearSelectOperation<F> {
     #[inline]
     pub fn condition(&self) -> &F {
         &self.condition
+    }
+}
+
+impl<F: Debug> Debug for LinearSelectOperation<F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("LinearSelectOperation").field("condition", &self.condition).finish()
     }
 }
 
@@ -239,6 +245,8 @@ mod tests {
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, jacrev};
 
+    use super::LinearSelectOperation;
+
     /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged tracers of any context with [`TestArray`] semantics.
     fn piecewise_select<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
     where
@@ -262,6 +270,12 @@ mod tests {
 
         let jacobian = jacrev(&TestArrayDomain, |x| Ok(piecewise_select(x)), TestArray::scalar(-2.0)).unwrap();
         assert_close(jacobian.rows().partials().values()[0], 3.0);
+    }
+
+    #[test]
+    fn test_linear_select_debug_omits_marker() {
+        let operation = LinearSelectOperation::new(true);
+        assert_eq!(format!("{operation:?}"), "LinearSelectOperation { condition: true }");
     }
 
     #[test]

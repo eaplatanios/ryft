@@ -2,6 +2,8 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::ops::Mul;
 
+use half::{bf16, f16};
+
 use crate::contexts::{EagerContext, StagingContext};
 use crate::macros::{check_builders, check_count};
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
@@ -104,6 +106,65 @@ impl<
     }
 }
 
+/// Represents the ability to scale a value by a factor. [`Scalable`] is the ergonomic counterpart to the context-owned
+/// [`Scale`] interpretation trait. It must be used when the receiver value knows how to route the operation itself,
+/// such as a [`Tracer`] staging a [`ScaleOperation`] through its own [`StagingContext`]. The `Payload` tag mirrors
+/// [`ScaleOperation`]'s tag and preserves the distinction between captured factors and factors that are already active
+/// program inputs.
+pub trait Scalable<F, Payload = Captured>: Sized {
+    /// Scales `self` by `factor`.
+    fn scale(&self, factor: F) -> Result<Self, ProgramError>;
+}
+
+macro_rules! impl_scalable_for_scalar {
+    ($ty:ty) => {
+        impl<F> Scalable<F> for $ty
+        where
+            $ty: Mul<F, Output = $ty>,
+        {
+            #[inline]
+            fn scale(&self, factor: F) -> Result<Self, ProgramError> {
+                Ok(*self * factor)
+            }
+        }
+    };
+}
+
+impl_scalable_for_scalar!(i8);
+impl_scalable_for_scalar!(i16);
+impl_scalable_for_scalar!(i32);
+impl_scalable_for_scalar!(i64);
+impl_scalable_for_scalar!(u8);
+impl_scalable_for_scalar!(u16);
+impl_scalable_for_scalar!(u32);
+impl_scalable_for_scalar!(u64);
+impl_scalable_for_scalar!(bf16);
+impl_scalable_for_scalar!(f16);
+impl_scalable_for_scalar!(f32);
+impl_scalable_for_scalar!(f64);
+
+impl<C: StagingContext<Operation: From<ScaleOperation<C::Type, F>>>, F: Clone + Display + Typed<C::Type>>
+    Scalable<F, Captured> for Tracer<C>
+{
+    #[inline]
+    fn scale(&self, factor: F) -> Result<Self, ProgramError> {
+        let mut outputs = self.context().stage_operation(ScaleOperation::new(factor), &[self])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl<C: StagingContext> Scalable<Tracer<C>, Input> for Tracer<C>
+where
+    Tracer<C>: Mul<Output = Tracer<C>>,
+{
+    #[inline]
+    fn scale(&self, factor: Tracer<C>) -> Result<Self, ProgramError> {
+        check_builders!(self.builder(), factor.context().builder()).map_err(|error| self.context().error(error))?;
+        Ok(factor * self.clone())
+    }
+}
+
 /// Represents the ability to interpret a [`ScaleOperation`]. [`Captured`] factors stage a unary `scale`
 /// [`Instruction`](crate::Instruction), while [`Input`] [`Tracer`] factors lower to ordinary multiplication in the
 /// active context. [`EagerContext`]s interpret scaling through [`Mul`].
@@ -174,6 +235,7 @@ mod tests {
         assert_eq!(format!("{operation}"), "scale [factor=3]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(2.0 * 3.0, 6.0);
+        assert_eq!(2.0f64.scale(3.0), Ok(6.0));
         assert_eq!(
             InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0]),
             Ok(vec![6.0]),

@@ -1,9 +1,10 @@
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scale, ScaleOperation};
+use crate::operations::arithmetic::{Scalable, ScaleOperation};
 use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
+use crate::payloads::Input;
 use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{CapturedFactor, DifferentiableOperation, DifferentiationContext};
@@ -13,7 +14,7 @@ where
     D: DifferentiationContext,
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
-    LinearOperationOf<D>: From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>>>,
+    LinearOperationOf<D>: From<ScaleOperation<D::Type, CapturedFactor<D::Type, D::Value>, Input>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
 {
     #[inline]
@@ -30,7 +31,8 @@ where
         let tangent = if context.is_zero(input.tangent())? {
             input.tangent().clone()
         } else {
-            input.tangent().clone().scale(context.factor(input.primal().clone().cos()))
+            let factor = context.factor(input.primal().clone().cos());
+            input.tangent().scale(factor)?
         };
         Ok(vec![JvpTracer::new(input.primal().clone().sin(), tangent)])
     }

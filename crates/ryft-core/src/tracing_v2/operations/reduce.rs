@@ -4,9 +4,11 @@ use std::ops::Mul;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
+use crate::operations::arithmetic::{Scalable, ScaleOperation};
 use crate::operations::constants::FillOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
@@ -501,8 +503,8 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Reduce + Broadcast + crate::operations::compare::Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    LinearOperationOf<D>: From<ReduceOperation>
-        + From<crate::operations::arithmetic::ScaleOperation<ArrayType, CapturedFactor<ArrayType, D::Value>>>,
+    LinearOperationOf<D>:
+        From<ReduceOperation> + From<ScaleOperation<ArrayType, CapturedFactor<ArrayType, D::Value>, Input>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -539,7 +541,6 @@ where
                 Ok(vec![JvpTracer::new(primal, tangent)])
             }
             ReductionKind::Max | ReductionKind::Min => {
-                use crate::operations::arithmetic::Scale;
                 use crate::operations::compare::{Compare, ComparisonDirection};
                 let primal_input = inputs[0].primal().clone();
                 let primal_y = primal_input.reduce(self.axes.as_slice(), self.kind);
@@ -547,7 +548,8 @@ where
                 let output_axes = output_to_input_axis_map(input_type.rank(), &self.axes);
                 let broadcast_y = primal_y.broadcast(input_type, output_axes.as_slice())?;
                 let mask = primal_input.compare(&broadcast_y, ComparisonDirection::Equal);
-                let masked_tangent = inputs[0].tangent().clone().scale(context.factor(mask));
+                let factor = context.factor(mask);
+                let masked_tangent = inputs[0].tangent().scale(factor)?;
                 let tangent_y = masked_tangent.reduce(self.axes.as_slice(), ReductionKind::Sum);
                 Ok(vec![JvpTracer::new(primal_y, tangent_y)])
             }
