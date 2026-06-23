@@ -37,7 +37,6 @@ use crate::operations::manipulation::{
     LinearScatterAddOperation, PadOperation, ReshapeOperation, ScatterDimensionNumbers, ScatterOperation,
     ScatterReductionKind, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSliceOperation,
 };
-use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation};
@@ -65,13 +64,13 @@ use crate::tracing_v2::operations::reshape::ReshapeValue;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
-use crate::tracing_v2::{DifferentiableOperation, ValueOrCapture};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::tracing_v2::{DifferentiableOperation, RematerializationName, ResidualizedOperation, ValueOrCapture};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 use super::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
     SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
-    SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
+    SupportsManipulationOperations, SupportsTrigonometricOperations,
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
@@ -190,7 +189,7 @@ where
     SelectOperation: DifferentiableOperation<D>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = ArrayOperation<V>>,
     D::Operation: From<ZeroOperation<ArrayType>> + From<OneOperation<ArrayType>> + From<FillOperation<ArrayType, f64>>,
-    D::Value: crate::tracing_v2::rematerialization::RematerializationName + TransferToMemory,
+    D::Value: RematerializationName + TransferToMemory,
     D::Value: Add<Output = D::Value>
         + Sub<Output = D::Value>
         + Mul<Output = D::Value>
@@ -212,23 +211,8 @@ where
         + Parameterized<D::Value>,
     D::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<V>: Parameterized<
-            V,
-            Family: crate::parameters::ParameterizedFamily<D::Tangent>
-                        + crate::parameters::ParameterizedFamily<D::Value>,
-            To<V> = Vec<V>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
-    Vec<D::Value>: Parameterized<
-            D::Value,
-            Family: crate::parameters::ParameterizedFamily<D::Tangent>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
     LinearOperationOf<D>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, D::Value>>
-        + crate::tracing_v2::ResidualizedOperation<D>
+        + ResidualizedOperation<D>
         + From<CustomVjpCallOperation<ArrayType, V, ArrayOperation<V>, ValueOrCapture<ArrayType, D::Value>>>
         + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
@@ -291,27 +275,11 @@ where
             Self::Xor(operation) => operation.jvp(context, inputs),
             Self::Collective(operation) => operation.jvp(context, inputs),
             Self::Select(operation) => operation.jvp(context, inputs),
-            Self::Condition(operation) => <ConditionOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(
-                &**operation,
-                context,
-                inputs,
-            ),
-            Self::While(operation) => {
-                <WhileOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(&**operation, context, inputs)
-            }
-            Self::Scan(operation) => {
-                <ScanOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(&**operation, context, inputs)
-            }
-            Self::CustomJvp(operation) => <CustomJvpOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(
-                &**operation,
-                context,
-                inputs,
-            ),
-            Self::CustomVjp(operation) => <CustomVjpOperation<ArrayType, V, Self> as DifferentiableOperation<D>>::jvp(
-                &**operation,
-                context,
-                inputs,
-            ),
+            Self::Condition(operation) => operation.jvp(context, inputs),
+            Self::While(operation) => operation.jvp(context, inputs),
+            Self::Scan(operation) => operation.jvp(context, inputs),
+            Self::CustomJvp(operation) => operation.jvp(context, inputs),
+            Self::CustomVjp(operation) => operation.jvp(context, inputs),
         }
     }
 }
@@ -1303,61 +1271,6 @@ where
     }
 }
 
-impl<V, C, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, C, F>
-where
-    V: Value<DataType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + SupportsConstantOperations<DataType>
-        + Select<Condition = <V as SelectCondition>::Condition>
-        + SelectCondition,
-    C: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Zero<DataType, V> + One<DataType, V>,
-    F: CustomVjpResidual<DataType, V> + SelectCondition,
-    ScalarOperation<C>: InterpretableOperation<DataType, V>,
-    ScaleOperation<DataType, F, Input>: InterpretableOperation<DataType, V>,
-    ScaleOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
-    LinearSelectOperation<F>: InterpretableOperation<DataType, V>,
-    ConstantOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<DataType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::OneLike(operation) => operation.interpret(context, inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => operation.interpret(context, inputs),
-            Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let body =
-                    operation.body().map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
-                let mut state = inputs.to_vec();
-                for _ in 0..operation.length() {
-                    state =
-                        <LinearScalarOperation<V, C, V> as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(
-                            context, &body, state,
-                        )?;
-                    check_count!("output", state, operation.carry_count(), ProgramError);
-                }
-                Ok(state)
-            }
-        }
-    }
-}
-
 /// [`InterpretableOperation`] for [`ArrayOperation`] requires the full union of value capabilities exercised by the
 /// closed default ordinary operation enum.
 ///
@@ -1816,43 +1729,6 @@ where
     }
 }
 
-/// Nested symbolic linearization for the [`ScalarOperation`] sum type, mirroring the [`ArrayOperation`] impl above
-/// (refer to its documentation for why the where clauses spell the *leaf* closure of what
-/// [`linearize_program`](crate::tracing_v2::linearize_program)`::<E, Self>` needs instead of the recursive
-/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound).
-impl<F, E> ProgramLinearizableOperation<E> for ScalarOperation<F>
-where
-    F: Value<DataType>,
-    E: DifferentiationContext<Type = DataType, Constant = F>,
-    E::LinearOperation<E::Tangent, F>:
-        CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>
-        + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
-        + LinearScanOperation<DataType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>
-        + From<ZeroOperation<DataType>>
-        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
-        + From<
-            CustomVjpCallOperation<
-                DataType,
-                F,
-                Self,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-            >,
-        >,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
-            DataType,
-            ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<DataType, E::Value>> = LinearOperationOf<E>,
-        > + MaybeZeroOperation<DataType>,
-{
-    fn linearize_program(
-        differentiable: &E,
-        program: &crate::programs::Program<DataType, F, Self, Vec<F>, Vec<F>>,
-    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
-        crate::tracing_v2::differentiation::linearize_program(differentiable, program)
-    }
-}
-
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
 fn batch_linear_non_control_operation<F, C, V>(
     operation: &LinearArrayOperation<F, C, F, ArrayOperation<C>>,
@@ -2297,6 +2173,7 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;
     use crate::tracing::AbstractTracingContext;
+    use crate::types::DataType;
 
     use super::*;
 

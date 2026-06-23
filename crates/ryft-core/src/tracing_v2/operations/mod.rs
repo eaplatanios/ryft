@@ -67,9 +67,6 @@ pub mod reshape;
 /// Captured-factor payloads and materialization.
 pub mod captures;
 
-/// Factor-payload mapping for the scalar linear operation.
-pub mod scalars;
-
 /// Scalar and tensor scaling.
 pub mod scale;
 

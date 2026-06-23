@@ -4,27 +4,36 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::operations::InterpretableOperation;
+use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    ConstantOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
-use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
-use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
+use crate::programs::{Program, ProgramError, Value};
+use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{
+    CaptureParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContextOf, NestedLinearization,
+    TangentContext,
 };
-use crate::tracing_v2::operations::scan::LinearScanOperation;
+use crate::tracing_v2::operations::bounds::{
+    SupportsConstantOperations, SupportsLinearScalarOperation, SupportsTrigonometricOperations,
+};
+use crate::tracing_v2::operations::custom_derivatives::{
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
+};
+use crate::tracing_v2::operations::scan::{
+    InterpretableNestedProgram, LinearScanBodyInstantiable, LinearScanBodyTransposable, LinearScanOperation,
+};
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{
@@ -150,6 +159,45 @@ where
     }
 }
 
+/// Nested symbolic linearization for the [`ScalarOperation`] sum type.
+///
+/// The where clauses spell the leaf closure required by
+/// [`linearize_program`](crate::tracing_v2::linearize_program) instead of the recursive
+/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound, which avoids pushing that recursive
+/// obligation back into every consumer.
+impl<F, E> ProgramLinearizableOperation<E> for ScalarOperation<F>
+where
+    F: Value<DataType>,
+    E: DifferentiationContext<Type = DataType, Constant = F>,
+    E::LinearOperation<E::Tangent, F>:
+        CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
+    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>
+        + ResidualizedOperation<LinearizationContextOf<E, Self>>
+        + LinearScanOperation<DataType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>
+        + From<ZeroOperation<DataType>>
+        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<
+            CustomVjpCallOperation<
+                DataType,
+                F,
+                Self,
+                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            >,
+        >,
+    LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
+            DataType,
+            ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithCapture<ValueOrCapture<DataType, E::Value>> = LinearOperationOf<E>,
+        > + MaybeZeroOperation<DataType>,
+{
+    fn linearize_program(
+        differentiable: &E,
+        program: &Program<DataType, F, Self, Vec<F>, Vec<F>>,
+    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
+        crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+    }
+}
+
 impl<C, V> InterpretableOperation<DataType, V> for ScalarOperation<C>
 where
     C: Value<DataType>,
@@ -231,6 +279,187 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     Select(LinearSelectOperation<F>),
     Scan(Box<ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F>>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
+}
+
+impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
+    for LinearScalarOperation<V, C, F>
+{
+    type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, C, MappedFactor>;
+
+    fn try_map_captures<MappedFactor: Value<DataType>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+    {
+        match self {
+            Self::Zero(operation) => Ok(operation.clone().into()),
+            Self::ZeroLike(operation) => Ok(operation.clone().into()),
+            Self::One(operation) => Ok(operation.clone().into()),
+            Self::OneLike(operation) => Ok(operation.clone().into()),
+            Self::Constant(operation) => Ok(operation.clone().into()),
+            Self::Neg(operation) => Ok(operation.clone().into()),
+            Self::Add(operation) => Ok(operation.clone().into()),
+            Self::Sub(operation) => Ok(operation.clone().into()),
+            Self::Scale(operation) => {
+                Ok(ScaleOperation::<DataType, MappedFactor, Input>::new(map_factor(operation.factor())?).into())
+            }
+            Self::Select(operation) => Ok(LinearSelectOperation::new(map_factor(operation.condition())?).into()),
+            Self::Scan(operation) => {
+                let scan = ScanOperation::<DataType, _, _>::new(
+                    operation.body().clone(),
+                    operation.carry_count(),
+                    operation.length(),
+                )?
+                .with_reverse(operation.reverse())
+                .with_unroll(operation.unroll())?
+                .with_captures(operation.captures().iter().map(map_factor).collect::<Result<Vec<_>, _>>()?);
+                Ok(LinearScalarOperation::Scan(Box::new(scan)))
+            }
+            Self::CustomVjpCall(call) => {
+                Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
+            }
+        }
+    }
+}
+
+impl<V: Value<DataType>, C: Value<DataType>> LinearScanBodyInstantiable<DataType, V>
+    for LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>
+{
+    type Instantiated = LinearScalarOperation<V, C, V>;
+
+    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError> {
+        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
+    }
+}
+
+impl<V, C, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, C, F>
+where
+    V: Value<DataType>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + SupportsConstantOperations<DataType>
+        + Select<Condition = <V as SelectCondition>::Condition>
+        + SelectCondition,
+    C: Value<DataType>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Zero<DataType, V> + One<DataType, V>,
+    F: CustomVjpResidual<DataType, V> + SelectCondition,
+    ScalarOperation<C>: InterpretableOperation<DataType, V>,
+    ScaleOperation<DataType, F, Input>: InterpretableOperation<DataType, V>,
+    ScaleOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
+    LinearSelectOperation<F>: InterpretableOperation<DataType, V>,
+    ConstantOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        match self {
+            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
+            Self::Zero(operation) => operation.interpret(context, inputs),
+            Self::One(operation) => operation.interpret(context, inputs),
+            Self::Constant(operation) => operation.interpret(context, inputs),
+            Self::ZeroLike(operation) => operation.interpret(context, inputs),
+            Self::OneLike(operation) => operation.interpret(context, inputs),
+            Self::Add(operation) => operation.interpret(context, inputs),
+            Self::Sub(operation) => operation.interpret(context, inputs),
+            Self::Neg(operation) => operation.interpret(context, inputs),
+            Self::Scale(operation) => operation.interpret(context, inputs),
+            Self::Select(operation) => operation.interpret(context, inputs),
+            Self::Scan(operation) => {
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                operation.infer_output_types(input_types.as_slice())?;
+                let body =
+                    operation.body().map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
+                let mut state = inputs.to_vec();
+                for _ in 0..operation.length() {
+                    state =
+                        <LinearScalarOperation<V, C, V> as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(
+                            context, &body, state,
+                        )?;
+                    check_count!("output", state, operation.carry_count(), ProgramError);
+                }
+                Ok(state)
+            }
+        }
+    }
+}
+
+impl<V, C> InterpretableNestedProgram<DataType, V> for LinearScalarOperation<V, C, V>
+where
+    V: Value<DataType>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + SupportsConstantOperations<DataType>
+        + Select<Condition = <V as SelectCondition>::Condition>
+        + SelectCondition,
+    C: Value<DataType>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Zero<DataType, V> + One<DataType, V>,
+    ScaleOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
+    ConstantOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
+    ScalarOperation<C>: InterpretableOperation<DataType, V>,
+    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
+{
+    fn interpret_nested_program(
+        context: &V::InterpretationContext,
+        program: &Program<DataType, V, Self, Vec<V>, Vec<V>>,
+        input: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        Self: Sized,
+    {
+        program.interpret_with(
+            input,
+            |_, constant| Ok(constant.clone()),
+            |instruction, instruction_inputs| match instruction.operation() {
+                Self::CustomVjpCall(operation) => operation.interpret(context, instruction_inputs),
+                Self::Zero(operation) => operation.interpret(context, instruction_inputs),
+                Self::One(operation) => operation.interpret(context, instruction_inputs),
+                Self::Constant(operation) => operation.interpret(context, instruction_inputs),
+                Self::ZeroLike(operation) => operation.interpret(context, instruction_inputs),
+                Self::OneLike(operation) => operation.interpret(context, instruction_inputs),
+                Self::Add(operation) => operation.interpret(context, instruction_inputs),
+                Self::Sub(operation) => operation.interpret(context, instruction_inputs),
+                Self::Neg(operation) => operation.interpret(context, instruction_inputs),
+                Self::Scale(operation) => operation.interpret(context, instruction_inputs),
+                Self::Select(operation) => operation.interpret(context, instruction_inputs),
+                Self::Scan(operation) => {
+                    let input_types =
+                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                    operation.infer_output_types(input_types.as_slice())?;
+                    let body = operation
+                        .body()
+                        .map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
+                    let mut state = instruction_inputs.to_vec();
+                    for _ in 0..operation.length() {
+                        state = Self::interpret_nested_program(context, &body, state)?;
+                        check_count!("output", state, operation.carry_count(), ProgramError);
+                    }
+                    Ok(state)
+                }
+            },
+        )
+    }
+}
+
+impl<V, C> LinearScanBodyTransposable<DataType, V> for LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>
+where
+    V: Value<DataType>,
+    C: Value<DataType>,
+{
+    fn transpose_linear_scan_body(
+        body: &Program<DataType, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<DataType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: Sized,
+    {
+        body.transpose()
+    }
 }
 
 impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
