@@ -3,25 +3,53 @@ use std::ops::Mul;
 #[cfg(test)]
 use indoc::indoc;
 
+use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scale, ScaleOperation};
+use crate::operations::arithmetic::{Scalable, Scale, ScaleOperation};
+use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
+use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{DifferentiationContext, JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{CapturedFactor, DifferentiableOperation};
 use crate::types::Type;
+
+impl<C, V> Scale<C::Type, Tracer<C>, CapturedFactor<C::Type, V>, Input> for C
+where
+    C: StagingContext,
+    V: Value<C::Type>,
+    C::Operation: From<ScaleOperation<C::Type, CapturedFactor<C::Type, V>, Input>>,
+{
+    #[inline]
+    fn scale(&self, input: &Tracer<C>, factor: CapturedFactor<C::Type, V>) -> Result<Tracer<C>, ProgramError> {
+        let mut outputs = self.stage_operation(ScaleOperation::<C::Type, _, Input>::new(factor), &[input])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+impl<C, V> Scalable<CapturedFactor<C::Type, V>, Input> for Tracer<C>
+where
+    C: StagingContext,
+    V: Value<C::Type>,
+    C::Operation: From<ScaleOperation<C::Type, CapturedFactor<C::Type, V>, Input>>,
+{
+    #[inline]
+    fn scale(&self, factor: CapturedFactor<C::Type, V>) -> Result<Self, ProgramError> {
+        let mut outputs = self.context().stage_operation(ScaleOperation::<C::Type, _, Input>::new(factor), &[self])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
 
 /// Transpose rule for [`ScaleOperation`]: scaling by a captured factor is self-adjoint, so the input cotangent is the
 /// output cotangent scaled by the same factor. The captured factor type `F` is independent of the cotangent value type
 /// `V` (they coincide only at the top level; inside a linear scan body the factor lives in the scan-local
 /// `CapturedFactor` namespace while the cotangent does not), so this impl is generic over both and stages the adjoint
-/// scale into `O` through the cotangent's own `Scale<F>` capability.
-impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T> + From<ScaleOperation<T, F>>> TransposableOperation<T, V, O>
-    for ScaleOperation<T, F>
-where
-    ScaleOperation<T, F>: Operation<T>,
+/// scale into `O` using the same scale interpretation mode as `self`.
+impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T> + From<ScaleOperation<T, F, Payload>>, Payload>
+    TransposableOperation<T, V, O> for ScaleOperation<T, F, Payload>
 {
     #[inline]
     fn transpose<'transpose>(
@@ -32,7 +60,9 @@ where
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         check_count!("output", output_cotangents, 1, ProgramError);
         match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.scale(self.factor().clone()))]),
+            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(
+                cotangent.unary(ScaleOperation::<T, F, Payload>::new(self.factor().clone())),
+            )]),
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
         }
     }
@@ -42,7 +72,7 @@ impl<T: Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
 where
     D: DifferentiationContext<Type = T>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: From<ScaleOperation<T, CapturedFactor<T, D::Value>>>,
+    LinearOperationOf<D>: From<ScaleOperation<T, CapturedFactor<T, D::Value>, Input>>,
     ScaleOperation<T, D::Constant>: Operation<T>,
 {
     #[inline]
@@ -57,10 +87,12 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let factor = context.differentiable().lift(self.factor().clone())?;
-        Ok(vec![JvpTracer::new(
-            factor.clone() * input.primal().clone(),
-            input.tangent().clone().scale(CapturedFactor::Constant(factor)),
-        )])
+        let mut tangent_outputs = context.stage_operation(
+            ScaleOperation::<T, CapturedFactor<T, D::Value>, Input>::new(CapturedFactor::Constant(factor.clone())),
+            &[input.tangent().clone()],
+        )?;
+        check_count!("output", tangent_outputs, 1, ProgramError);
+        Ok(vec![JvpTracer::new(factor.clone() * input.primal().clone(), tangent_outputs.remove(0))])
     }
 }
 
@@ -121,7 +153,7 @@ mod tests {
         let domain = AbstractDomain::new();
         let mut context = test_transposition_context(&domain, transpose_builder.clone());
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution = ScaleOperation::new(TestArray::scalar(3.0))
+        let contribution = ScaleOperation::<ArrayType, TestArray, Input>::new(TestArray::scalar(3.0))
             .transpose(&mut context, &[&ArrayType::scalar(DataType::F64)], &[Cotangent::Staged(output_cotangent)])
             .unwrap()
             .into_iter()
