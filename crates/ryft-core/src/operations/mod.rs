@@ -35,6 +35,9 @@ pub mod logical;
 /// Array shape and axis manipulation operations and capability traits.
 pub mod manipulation;
 
+/// Shared marker types for operations with payload-dependent interpretation.
+pub mod payloads;
+
 /// Scalar operation types built from the core primitive operation traits.
 pub mod scalars;
 
@@ -159,6 +162,64 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// [`Instruction`](crate::Instruction)s in [`Program`]s. This trait represents the high-level operation interface
 /// that only requires operations to be able to provide their name and to infer their output [`Type`]s given their
 /// input [`Type`]s.
+///
+/// # Deriving Operation Enums
+///
+/// Ryft provides a `#[derive(Operation)]` procedural macro via the `ryft-macros` crate for [`Operation`] sum types.
+/// It is meant for enums such as [`ScalarOperation`], where every variant wraps one concrete operation payload and
+/// the enum should behave exactly like whichever payload it contains. The derived implementation generates:
+///
+///   - An [`Operation<T>`](Operation) implementation whose [`name`](Operation::name),
+///     [`infer_output_types`](Operation::infer_output_types), and [`render`](Operation::render) methods forward to the
+///     active variant payload.
+///   - A [`Display`] implementation that renders through [`Operation::render`] with zero indentation, so that the enum
+///     display matches the canonical program rendering format.
+///   - `From<Payload> for Enum` conversions for concrete payload variants.
+///   - Borrowed `TryFrom<&Enum> for &Payload` conversions for concrete payload variants, including boxed payloads.
+///
+/// The macro has the following requirements:
+///
+///   - The derivation macro input must be an enum. Structs and unions are not supported.
+///   - Every variant must be a tuple variant with exactly one payload field.
+///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`. Boxed variants still delegate to
+///     `Payload`, and their generated `From<Payload>` implementation boxes the payload for the caller.
+///   - Every payload must implement [`Operation<T>`](Operation), either because it is a concrete operation type whose
+///     implementation already exists or because the derivation macro adds a bound for a bare generic payload.
+///   - Bare generic payload variants such as `Extension(Extension)` do not receive `From` or `TryFrom` conversions.
+///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
+///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
+///     generic payload by adding an `Extension: Operation<T>` bound.
+///
+/// The operation type `T` is selected as follows:
+///
+///   - If the enum has exactly one distinct generic bound of the form `Value<T>`, the derivation infers `T` from that
+///     bound. For example, `enum BackendOperation<V: Value<ArrayType>>` derives `Operation<ArrayType>`. Multiple
+///     generic parameters may use the same `T`. For example, `V: Value<ArrayType>, C: Value<ArrayType>` still infers
+///     `ArrayType`.
+///   - If no `Value<T>` bound is present, or if multiple distinct operation types are present (e.g., `Value<DataType>`
+///     and `Value<ArrayType>`), the derivation macro cannot choose an operation type and reports a compilation error.
+///     In those cases, the caller must split the enum by operation type or implement [`Operation`] manually.
+///
+/// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
+/// Ryft traits and error types from generated code. This attribute can be omitted when the default `crate` path is
+/// desired. `#[ryft(crate = "crate")]` is not needed.
+///
+/// ## Example
+/// 
+/// ```rust
+/// # use ryft_core as ryft;
+/// # use ryft_core::{ConstantOperation, DataType, Operation, Value, ZeroOperation};
+/// # use ryft_macros::Operation;
+///
+/// #[derive(Clone, Debug, Operation)]
+/// enum BackendOperation<V: Value<DataType>> {
+///     Zero(ZeroOperation<DataType>),
+///     Constant(ConstantOperation<DataType, V>),
+/// }
+///
+/// let operation = BackendOperation::<f32>::from(ZeroOperation::new(DataType::F32));
+/// assert_eq!(operation.name(), "zero");
+/// ```
 pub trait Operation<T: Type> {
     /// Returns the name of this [`Operation`] that is used in diagnostics and when rendering [`Program`]s as strings.
     fn name(&self) -> &'static str;
@@ -193,7 +254,10 @@ impl<T: Type, O: Operation<T> + ?Sized> Operation<T> for Box<O> {
     }
 }
 
-/// [`InterpretableOperation`]s are [`Operation`]s that can be interpreted (i.e., executed) given concrete input values.
+/// [`Operation`]s that can be interpreted (i.e., executed) given concrete input values. Interpretation consumes input
+/// values and returns outputs in `V`'s [`InterpretationContext`](Value::InterpretationContext). Eager implementations
+/// execute value semantics directly. [`Tracer`] implementations are the staged replay path and may stage operations
+/// into the active [`StagingContext`](crate::StagingContext) while preserving operation-owned lowering rules.
 pub trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
     /// Interprets this [`Operation`] given the provided input values and returns the resulting output values. The
     /// provided `context` is the [`InterpretationContext`](Value::InterpretationContext) required to produce values

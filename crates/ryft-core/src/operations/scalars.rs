@@ -17,6 +17,7 @@ use crate::operations::control_flow::{Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::parameters::Parameterized;
+use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
@@ -215,11 +216,11 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<DataType, V>),
+    Constant(ConstantOperation<DataType, V, Input>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
-    Scale(ScaleOperation<DataType, F>),
+    Scale(ScaleOperation<DataType, F, Input>),
     Select(LinearSelectOperation<F>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }

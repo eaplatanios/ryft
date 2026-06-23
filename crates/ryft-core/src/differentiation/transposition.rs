@@ -22,6 +22,58 @@ use crate::types::{Type, Typed};
 ///
 /// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
 /// it relates to the algebraic notion of transposition.
+///
+/// # Deriving Transposable Operation Enums
+///
+/// Ryft provides a `#[derive(TransposableOperation)]` procedural macro via the `ryft-macros` crate for
+/// [`TransposableOperation`] sum types whose variants already own their transpose rules. The derivation is
+/// intentionally only a dispatcher: it matches on the enum variant and forwards [`transpose`](Self::transpose) to
+/// the wrapped payload. Operation-specific transpose semantics still live on the concrete payload types. The derived
+/// implementation follows the same enum-shape rules as `#[derive(Operation)]`:
+///
+///   - The derivation macro input must be an enum.
+///   - Every variant must be a tuple variant with exactly one payload field.
+///   - A payload may be stored directly as `Payload` or indirectly as `Box<Payload>`. Boxed variants still delegate
+///     to `Payload`.
+///   - The enum must implement [`Operation<T>`](Operation). In practice, transposable operation enums usually derive
+///     both [`Operation`] and [`TransposableOperation`].
+///
+/// The generated implementation is:
+///
+///   - `impl TransposableOperation<T, V, Enum> for Enum`, where `T` is selected using the same rules that are used for
+///     inferring `T` in the `#[derive(Operation)]` macro.
+///   - `V` is inferred as the first generic type parameter bounded by `Value<T>`. This matches the convention that the
+///     first value parameter is the tangent/cotangent value type and later value parameters are constants or captured
+///     factors.
+///   - Concrete payload variants forward directly to their payload implementations and receive a generated
+///     `Payload: TransposableOperation<T, V, Enum>` `where` predicate. Payload-specific capability requirements should
+///     live on the payload's own [`TransposableOperation`] implementation; the enum derivation carries them through
+///     this generated payload bound.
+///   - Bare generic payload variants such as `Extension(Extension)` receive the same generated
+///     `Extension: TransposableOperation<T, V, Enum>` bound, because the macro cannot know which concrete extension
+///     enum will be substituted by the caller.
+///
+/// Recursive higher-order payloads should expose a semantic helper trait for the operation-family capability they need
+/// and make their own [`TransposableOperation`] implementation depend on that helper trait. This keeps the derived
+/// implementation a simple dispatcher while allowing the payload type that owns the recursion to name the fixed point
+/// directly.
+///
+/// The derivaction macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
+/// This attribute can be omitted when the default `crate` path is desired. `#[ryft(crate = "crate")]` is not needed.
+///
+/// ## Example
+///
+/// ```rust
+/// # use ryft_core as ryft;
+/// # use ryft_core::{ArrayType, ConstantOperation, Value, ZeroOperation};
+/// # use ryft_macros::{Operation, TransposableOperation};
+///
+/// #[derive(Clone, Debug, Operation, TransposableOperation)]
+/// enum LinearOperation<V: Value<ArrayType>> {
+///     Zero(ZeroOperation<ArrayType>),
+///     Constant(ConstantOperation<ArrayType, V>),
+/// }
+/// ```
 pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operation<T> {
     /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
     /// contain one entry per operation input. Each [`Cotangent::Staged`] value is a staged cotangent contribution in
