@@ -98,17 +98,6 @@ pub trait Fill<T: Type, S, V: Value<T>> {
     fn fill(&self, r#type: &T, value: S) -> Result<V, ProgramError>;
 }
 
-impl<C: StagingContext<Operation: From<FillOperation<C::Type, V>>>, V: Clone + Display> Fill<C::Type, V, Tracer<C>>
-    for C
-{
-    #[inline]
-    fn fill(&self, r#type: &C::Type, value: V) -> Result<Tracer<C>, ProgramError> {
-        let mut outputs = self.stage_nullary_operation(FillOperation::new(r#type.clone(), value))?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-}
-
 macro_rules! impl_fill_for_scalar {
     ($ty:ty) => {
         impl<O: Operation<DataType>> Fill<DataType, $ty, $ty> for EagerContext<DataType, $ty, O> {
@@ -140,6 +129,17 @@ impl_fill_for_scalar!(bf16);
 impl_fill_for_scalar!(f16);
 impl_fill_for_scalar!(f32);
 impl_fill_for_scalar!(f64);
+
+impl<C: StagingContext<Operation: From<FillOperation<C::Type, V>>>, V: Clone + Display> Fill<C::Type, V, Tracer<C>>
+    for C
+{
+    #[inline]
+    fn fill(&self, r#type: &C::Type, value: V) -> Result<Tracer<C>, ProgramError> {
+        let mut outputs = self.stage_nullary_operation(FillOperation::new(r#type.clone(), value))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
 
 #[cfg(test)]
 mod tests {

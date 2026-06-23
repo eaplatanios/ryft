@@ -226,7 +226,16 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
             crate::tracing_v2::CapturedFactor<ArrayType, Tracer<TracingContext<'domain, Self>>>,
-        >: ResidualizedOperation<TracingContext<'domain, Self>> + MaybeZeroOperation<ArrayType>,
+        >: ResidualizedOperation<TracingContext<'domain, Self>>
+            + TransposableOperation<
+                ArrayType,
+                Tracer<TracingContext<'domain, Self>>,
+                <Self as DifferentiationContext>::LinearOperation<
+                    Tracer<TracingContext<'domain, Self>>,
+                    crate::tracing_v2::CapturedFactor<ArrayType, Tracer<TracingContext<'domain, Self>>>,
+                >,
+            > + From<AddOperation>
+            + MaybeZeroOperation<ArrayType>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
             Tracer<TracingContext<'domain, Self>>,
@@ -864,16 +873,15 @@ where
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
     <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
     DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
-        + BatchableOperation<
-            D::Tangent,
-            EagerContext<ArrayType, D::Tangent, DirectLinearOperationOf<D>>,
-        >
+        + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, DirectLinearOperationOf<D>>>
         + TransposableOperation<ArrayType, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
     DirectLinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    LinearOperationOf<D>: ResidualizedOperation<D>
+        + TransposableOperation<ArrayType, D::Tangent, LinearOperationOf<D>>
+        + From<AddOperation>
+        + MaybeZeroOperation<ArrayType>,
     <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,
 {
     let input_structure = primals.parameter_structure();

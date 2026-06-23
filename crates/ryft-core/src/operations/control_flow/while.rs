@@ -211,15 +211,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::StagingContext;
     use crate::operations::arithmetic::SubOperation;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::{OneLikeOperation, ZeroLikeOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tests::TestArray;
+    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tracing::TracingContext;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::{DataType, Shape, Size};
 
@@ -372,7 +377,7 @@ mod tests {
         let outputs = operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(-1.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![-1.0]);
         assert_eq!(
-            operation.interpret(&crate::EagerContext::new(), &[]),
+            operation.interpret(&crate::EagerContext::new(), &[] as &[TestArray]),
             Err(ProgramError::Type(TypeError { message: "expected 1 input but got 0".to_string() })),
         );
 
@@ -383,6 +388,20 @@ mod tests {
         // A loop that exits before reaching the bound is unaffected by it.
         let outputs = bounded.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
+
+        // Staging records the while payload into the active program instead of trying to drive the loop with a
+        // concrete predicate.
+        let domain = TestArrayDomain;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let staged_state = context.input(state_type.clone());
+        let outputs = context.stage_operation(operation.clone(), std::slice::from_ref(&staged_state)).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert!(matches!(builder.instructions()[0].operation(), ArrayOperation::While(_)));
+        assert_eq!(builder.instructions()[0].inputs(), &[staged_state.atom_id().unwrap()]);
+        assert_eq!(outputs[0].atom_id(), Ok(builder.instructions()[0].outputs()[0]));
 
         // Program rendering uses the canonical operation name and includes the nested condition and body programs.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();

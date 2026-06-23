@@ -2272,8 +2272,7 @@ mod tests {
     use crate::domains::Domain;
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
-        ADD_OPERATION_NAME, AddOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, Scale, ScaleOperation,
-        SubOperation,
+        ADD_OPERATION_NAME, AddOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
     };
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{
@@ -2282,6 +2281,7 @@ mod tests {
     use crate::operations::control_flow::SelectOperation;
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::{Parameter, Placeholder};
+    use crate::payloads::Input;
     use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing_v2::operations::reduce::ReduceOperation;
     use crate::tracing_v2::{ArrayOperation, FactorParameterizedOperation};
@@ -2630,7 +2630,11 @@ mod tests {
                 Self::Scale { factor } => {
                     check_count!("output", output_cotangents, 1, ProgramError);
                     match &output_cotangents[0] {
-                        Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.scale(factor.clone()))]),
+                        Cotangent::Staged(cotangent) => {
+                            Ok(vec![Cotangent::Staged(
+                                cotangent.unary(ScaleOperation::<ArrayType, TestValue, Input>::new(factor.clone())),
+                            )])
+                        }
                         Cotangent::Zero => Ok(vec![Cotangent::Zero]),
                     }
                 }
@@ -2688,8 +2692,8 @@ mod tests {
         }
     }
 
-    impl From<ScaleOperation<ArrayType, TestValue>> for TestLinearOperation {
-        fn from(operation: ScaleOperation<ArrayType, TestValue>) -> Self {
+    impl From<ScaleOperation<ArrayType, TestValue, Input>> for TestLinearOperation {
+        fn from(operation: ScaleOperation<ArrayType, TestValue, Input>) -> Self {
             Self::Scale { factor: operation.factor().clone() }
         }
     }
@@ -2985,7 +2989,7 @@ mod tests {
     where
         D: DifferentiationContext<Type = ArrayType, Constant = TestValue>
             + Domain<Operation = TestDifferentiableOperation>,
-        LinearOperationOf<D>: From<ScaleOperation<ArrayType, TestValue>>,
+        LinearOperationOf<D>: From<ScaleOperation<ArrayType, TestValue, Input>>,
     {
         fn jvp<'jvp>(
             &self,
@@ -3026,7 +3030,9 @@ mod tests {
                     let mut primals = context.bind_primal(self.clone(), &[inputs[0].primal().clone()])?;
                     check_count!("output", primals, 1, ProgramError);
                     let tangent_outputs = context.stage_operation(
-                        LinearOperationOf::<D>::from(ScaleOperation::new(factor.clone())),
+                        LinearOperationOf::<D>::from(ScaleOperation::<ArrayType, TestValue, Input>::new(
+                            factor.clone(),
+                        )),
                         &[inputs[0].tangent()],
                     )?;
                     check_count!("output", tangent_outputs, 1, ProgramError);

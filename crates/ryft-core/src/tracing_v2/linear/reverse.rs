@@ -44,8 +44,8 @@ where
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
-        + From<AddOperation>,
-    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
+        + From<AddOperation>
+        + MaybeZeroOperation<<D as Domain>::Type>,
     LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
@@ -56,8 +56,7 @@ where
     }
     let context: <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext = domain.context();
     let seed = context.one(output.r#type().as_ref())?;
-    let gradient = pullback.interpret_in_context(&context, seed)?;
-    Ok((output, gradient))
+    Ok((output, pullback.interpret_in_context(&context, seed)?))
 }
 
 /// Computes the reverse-mode gradient of a scalar-output function.
@@ -94,8 +93,8 @@ where
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
-        + From<AddOperation>,
-    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
+        + From<AddOperation>
+        + MaybeZeroOperation<<D as Domain>::Type>,
     LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
 {
     value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
@@ -146,10 +145,9 @@ where
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
-        + From<AddOperation>,
-    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
+        + From<AddOperation>
+        + MaybeZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -213,10 +211,9 @@ where
     DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
         + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
         + From<ZeroOperation<<D as Domain>::Type>>
-        + From<AddOperation>,
-    DirectLinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: MaybeZeroOperation<<D as Domain>::Type>,
+        + From<AddOperation>
+        + MaybeZeroOperation<<D as Domain>::Type>,
+    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -238,11 +235,12 @@ mod tests {
     use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::Domain;
     use crate::macros::check_count;
-    use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, NegOperation, Scale, ScaleOperation};
+    use crate::operations::arithmetic::{ADD_OPERATION_NAME, AddOperation, NegOperation, ScaleOperation};
     use crate::operations::constants::{One, OneLike, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Parameter;
+    use crate::payloads::Input;
     use crate::programs::{ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
@@ -520,8 +518,8 @@ mod tests {
         }
     }
 
-    impl From<ScaleOperation<TestType, TestValue>> for TestLinearOperation {
-        fn from(operation: ScaleOperation<TestType, TestValue>) -> Self {
+    impl From<ScaleOperation<TestType, TestValue, Input>> for TestLinearOperation {
+        fn from(operation: ScaleOperation<TestType, TestValue, Input>) -> Self {
             Self::Scale { factor: operation.factor().clone() }
         }
     }
@@ -542,7 +540,11 @@ mod tests {
                     Cotangent::Zero => vec![Cotangent::Zero],
                 },
                 Self::Scale { factor } => match &output_cotangents[0] {
-                    Cotangent::Staged(cotangent) => vec![Cotangent::Staged(cotangent.scale(factor.clone()))],
+                    Cotangent::Staged(cotangent) => {
+                        vec![Cotangent::Staged(
+                            cotangent.unary(ScaleOperation::<TestType, TestValue, Input>::new(factor.clone())),
+                        )]
+                    }
                     Cotangent::Zero => vec![Cotangent::Zero],
                 },
             })
@@ -614,8 +616,7 @@ mod tests {
         let (output, pushforward) = domain.linearize(|x| Ok(x.clone() + x), TestValue(3.0)).unwrap();
 
         assert_eq!(output, TestValue(6.0));
-        let tangent_context = domain.context();
-        assert_eq!(pushforward.apply(&tangent_context, TestValue(5.0)), Ok(TestValue(10.0)));
+        assert_eq!(pushforward.apply(&crate::contexts::EagerContext::new(), TestValue(5.0)), Ok(TestValue(10.0)));
     }
 
     #[test]

@@ -2,9 +2,11 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::{EagerContext, StagingContext};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`ZeroOperation`].
@@ -58,26 +60,25 @@ impl<T: Type> Operation<T> for ZeroOperation<T> {
     }
 }
 
-impl<T: Type, V: Value<T> + Zero<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
+impl<T: Type, V: Value<T, InterpretationContext: Zero<T, V>>> InterpretableOperation<T, V> for ZeroOperation<T> {
     #[inline]
     fn interpret(
         &self,
-        _context: &<V as Value<T>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
-        Ok(vec![V::zero(&self.r#type)?])
+        Ok(vec![context.zero(&self.r#type)?])
     }
 }
 
-/// Represents [`Operation`]s that may be carrying [`ZeroOperation`] payloads. This trait is intentionally narrower
-/// than [`From<ZeroOperation<T>>`](From). `From` says that an operation type can stage a new zero operation, while
-/// [`MaybeZeroOperation`] says that a borrowed operation value can be inspected to determine whether it already is a
-/// zero operation. Structural-zero analyses use this borrowed form so that they can recognize existing staged zeros
-/// without cloning, moving, allocating, or manufacturing placeholder operations.
+/// Represents [`Operation`]s that may be or may be carrying [`ZeroOperation`] payloads. [`MaybeZeroOperation`] says
+/// that a borrowed operation value can be inspected to determine whether it is a [`ZeroOperation`] (or a wrapper of
+/// one). Structural zero analyses use this borrowed form so that they can recognize existing staged zeros without
+/// cloning, moving, allocating, or manufacturing placeholder operations.
 pub trait MaybeZeroOperation<T: Type> {
-    /// Returns the borrowed [`ZeroOperation`] payload when `self` is a zero operation.
-    fn zero_operation(&self) -> Option<&ZeroOperation<T>>;
+    /// Returns `true` if `self` is a [`ZeroOperation`] (or a wrapper of one).
+    fn is_zero_operation(&self) -> bool;
 }
 
 impl<T: Type, O> MaybeZeroOperation<T> for O
@@ -85,23 +86,34 @@ where
     for<'operation> &'operation ZeroOperation<T>: TryFrom<&'operation O>,
 {
     #[inline]
-    fn zero_operation(&self) -> Option<&ZeroOperation<T>> {
-        <&ZeroOperation<T>>::try_from(self).ok()
+    fn is_zero_operation(&self) -> bool {
+        <&ZeroOperation<T>>::try_from(self).is_ok()
     }
 }
 
-/// Synthesizes a _zero_ value for a given [`Type`]. [`Zero`] is the [`Type`]-driven counterpart to
-/// [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its [`InterpretableOperation`] implementation.
-pub trait Zero<T: Type>: Sized {
+/// Represents the ability to synthesize a _zero_ value for a given [`Type`] in an interpretation context. [`Zero`] is
+/// the [`Type`]-driven counterpart to [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its
+/// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
+/// backend- or context-dependent.
+pub trait Zero<T: Type, V: Value<T>> {
     /// Returns a _zero_ value for the provided [`Type`].
-    fn zero(r#type: &T) -> Result<Self, ProgramError>;
+    fn zero(&self, r#type: &T) -> Result<V, ProgramError>;
+}
+
+impl<C: StagingContext<Operation: From<ZeroOperation<C::Type>>>> Zero<C::Type, Tracer<C>> for C {
+    #[inline]
+    fn zero(&self, r#type: &C::Type) -> Result<Tracer<C>, ProgramError> {
+        let mut outputs = self.stage_nullary_operation(ZeroOperation::new(r#type.clone()))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
 }
 
 macro_rules! impl_zero_for_scalar {
     ($ty:ty, $data_type:path, $zero:expr) => {
-        impl Zero<DataType> for $ty {
+        impl<O: Operation<DataType>> Zero<DataType, $ty> for EagerContext<DataType, $ty, O> {
             #[inline]
-            fn zero(r#type: &DataType) -> Result<Self, ProgramError> {
+            fn zero(&self, r#type: &DataType) -> Result<$ty, ProgramError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
                         message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
@@ -144,19 +156,22 @@ mod tests {
 
     #[test]
     fn test_zero() {
-        assert_eq!(bool::zero(&DataType::Boolean), Ok(false));
-        assert_eq!(i8::zero(&DataType::I8), Ok(0i8));
-        assert_eq!(i16::zero(&DataType::I16), Ok(0i16));
-        assert_eq!(i32::zero(&DataType::I32), Ok(0i32));
-        assert_eq!(i64::zero(&DataType::I64), Ok(0i64));
-        assert_eq!(u8::zero(&DataType::U8), Ok(0u8));
-        assert_eq!(u16::zero(&DataType::U16), Ok(0u16));
-        assert_eq!(u32::zero(&DataType::U32), Ok(0u32));
-        assert_eq!(u64::zero(&DataType::U64), Ok(0u64));
-        assert_eq!(bf16::zero(&DataType::BF16), Ok(bf16::ZERO));
-        assert_eq!(f16::zero(&DataType::F16), Ok(f16::ZERO));
-        assert_eq!(f32::zero(&DataType::F32), Ok(0.0f32));
-        assert_eq!(f64::zero(&DataType::F64), Ok(0.0f64));
+        assert_eq!(EagerContext::<DataType, bool, ZeroOperation<DataType>>::new().zero(&DataType::Boolean), Ok(false));
+        assert_eq!(EagerContext::<DataType, i8, ZeroOperation<DataType>>::new().zero(&DataType::I8), Ok(0i8));
+        assert_eq!(EagerContext::<DataType, i16, ZeroOperation<DataType>>::new().zero(&DataType::I16), Ok(0i16));
+        assert_eq!(EagerContext::<DataType, i32, ZeroOperation<DataType>>::new().zero(&DataType::I32), Ok(0i32));
+        assert_eq!(EagerContext::<DataType, i64, ZeroOperation<DataType>>::new().zero(&DataType::I64), Ok(0i64));
+        assert_eq!(EagerContext::<DataType, u8, ZeroOperation<DataType>>::new().zero(&DataType::U8), Ok(0u8));
+        assert_eq!(EagerContext::<DataType, u16, ZeroOperation<DataType>>::new().zero(&DataType::U16), Ok(0u16));
+        assert_eq!(EagerContext::<DataType, u32, ZeroOperation<DataType>>::new().zero(&DataType::U32), Ok(0u32));
+        assert_eq!(EagerContext::<DataType, u64, ZeroOperation<DataType>>::new().zero(&DataType::U64), Ok(0u64));
+        assert_eq!(
+            EagerContext::<DataType, bf16, ZeroOperation<DataType>>::new().zero(&DataType::BF16),
+            Ok(bf16::ZERO),
+        );
+        assert_eq!(EagerContext::<DataType, f16, ZeroOperation<DataType>>::new().zero(&DataType::F16), Ok(f16::ZERO));
+        assert_eq!(EagerContext::<DataType, f32, ZeroOperation<DataType>>::new().zero(&DataType::F32), Ok(0.0f32));
+        assert_eq!(EagerContext::<DataType, f64, ZeroOperation<DataType>>::new().zero(&DataType::F64), Ok(0.0f64));
 
         let operation = ZeroOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), ZERO_OPERATION_NAME);

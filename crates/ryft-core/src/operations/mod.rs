@@ -205,7 +205,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// desired. `#[ryft(crate = "crate")]` is not needed.
 ///
 /// ## Example
-/// 
+///
 /// ```rust
 /// # use ryft_core as ryft;
 /// # use ryft_core::{ConstantOperation, DataType, Operation, Value, ZeroOperation};

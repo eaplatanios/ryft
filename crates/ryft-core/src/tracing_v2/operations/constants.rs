@@ -188,7 +188,7 @@ where
     }
 }
 
-impl<T, V, O, F> TransposableOperation<T, V, O> for ConstantOperation<T, F>
+impl<T, V, O, F, Mode> TransposableOperation<T, V, O> for ConstantOperation<T, F, Mode>
 where
     T: Type,
     V: Value<T>,

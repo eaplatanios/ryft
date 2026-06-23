@@ -418,15 +418,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::StagingContext;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tests::TestArray;
+    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tracing::TracingContext;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
@@ -628,6 +633,25 @@ mod tests {
             operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]),
             Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 1".to_string() })),
         );
+
+        // Staging records the scan payload into the active program instead of running scan lanes eagerly over staged
+        // values.
+        let domain = TestArrayDomain;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let staged_carry = context.input(scalar_f64.clone());
+        let staged_xs = context.input(stacked_f64.clone());
+        let outputs = context.stage_operation(operation.clone(), &[staged_carry.clone(), staged_xs.clone()]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert!(matches!(builder.instructions()[0].operation(), ArrayOperation::Scan(_)));
+        assert_eq!(
+            builder.instructions()[0].inputs(),
+            &[staged_carry.atom_id().unwrap(), staged_xs.atom_id().unwrap()],
+        );
+        assert_eq!(outputs[0].atom_id(), Ok(builder.instructions()[0].outputs()[0]));
+        assert_eq!(outputs[1].atom_id(), Ok(builder.instructions()[0].outputs()[1]));
 
         // Program rendering uses the canonical operation name and includes the nested body program.
         let mut builder = ProgramBuilder::<

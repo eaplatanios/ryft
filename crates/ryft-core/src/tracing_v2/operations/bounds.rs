@@ -29,38 +29,38 @@
 
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
-use crate::operations::arithmetic::{AddOperation, NegOperation, Scale, ScaleOperation, SubOperation};
+use crate::operations::arithmetic::{AddOperation, NegOperation, ScaleOperation, SubOperation};
 use crate::operations::constants::{OneLike, ZeroLike, ZeroLikeOperation};
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, Pad, PadOperation,
     ReshapeOperation, Scatter, Slice, SliceOperation, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::trigonometric::{Cos, Sin};
+use crate::payloads::Input;
 use crate::programs::Value;
 use crate::types::{ArrayType, Type};
 
-use super::dot::{DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation};
+use super::dot::{DotOps, LeftDotOperation, RightDotOperation};
 use super::reduce::{Reduce, ReduceOperation};
 use super::reshape::ReshapeOps;
 use crate::operations::compare::Compare;
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 
-/// Linear elementwise arithmetic primitives: addition, subtraction, negation, multiplication, and captured-factor
-/// [`Scale`].
+/// Linear elementwise arithmetic primitives: addition, subtraction, negation, and multiplication.
 ///
 /// This bundle deliberately excludes [`Div`], which is not a linear map. See [`SupportsArithmeticOperations`] for
 /// the ordinary (non-linear) extension that adds division.
 ///
-/// The factor type parameter `F` of the captured-factor [`Scale`] defaults to `Self`; provide a distinct `F` when
-/// the scaling factor lives in another value family, such as the parent context's constant type in the batching
-/// rules for [`ArrayOperation`](super::primitive::ArrayOperation).
+/// The factor type parameter is retained for API symmetry with the operation-side linear bundles, but factor scaling
+/// itself is provided by the context-owned [`Scale`](crate::operations::arithmetic::Scale) capability at the impl sites
+/// that interpret [`ScaleOperation`]s.
 pub trait SupportsLinearArithmeticOperations<F = Self>:
-    Sized + Add<Output = Self> + Sub<Output = Self> + Neg<Output = Self> + Mul<Output = Self> + Scale<F, Output = Self>
+    Sized + Add<Output = Self> + Sub<Output = Self> + Neg<Output = Self> + Mul<Output = Self>
 {
 }
 
 impl<F, V> SupportsLinearArithmeticOperations<F> for V where
-    V: Add<Output = V> + Sub<Output = V> + Neg<Output = V> + Mul<Output = V> + Scale<F, Output = V>
+    V: Add<Output = V> + Sub<Output = V> + Neg<Output = V> + Mul<Output = V>
 {
 }
 
@@ -131,15 +131,16 @@ impl<V> SupportsManipulationOperations for V where
 {
 }
 
-/// Linear-side linear-algebra primitives: the general [`DotOps`] plus the captured-factor [`LeftDot`] and
-/// [`RightDot`] maps emitted by JVP rules of `Dot` and `Transpose`.
+/// Linear-side linear-algebra primitives: the general [`DotOps`].
 ///
-/// Ordinary (non-linear) operation enums that only require [`DotOps`] should list it as a single bound rather than pulling
-/// in this bundle, to avoid spurious captured-factor requirements on the value type. The factor type parameter `F`
-/// of the captured-factor maps follows [`SupportsLinearArithmeticOperations`].
-pub trait SupportsLinearAlgebraOperations<F = Self>: DotOps + LeftDot<F> + RightDot<F> {}
+/// Captured-factor dot maps are context-owned interpretation capabilities on
+/// [`LeftDot`](crate::tracing_v2::operations::dot::LeftDot) and
+/// [`RightDot`](crate::tracing_v2::operations::dot::RightDot), so impl sites that interpret
+/// [`LeftDotOperation`]s or [`RightDotOperation`]s list those context bounds directly. The factor type parameter is
+/// retained for API symmetry with the operation-side linear bundles.
+pub trait SupportsLinearAlgebraOperations<F = Self>: DotOps {}
 
-impl<F, V> SupportsLinearAlgebraOperations<F> for V where V: DotOps + LeftDot<F> + RightDot<F> {}
+impl<F, V> SupportsLinearAlgebraOperations<F> for V where V: DotOps {}
 
 /// Comparison and boolean-logical primitives: typed [`Compare`], the binary [`BitAnd`], [`BitOr`], and
 /// [`BitXor`], and negation [`Not`].
@@ -161,7 +162,11 @@ impl<V> SupportsComparisonOperations for V where
 /// type `V`; provide a distinct `F` (typically the primal value type from the source trace) when captured-factor
 /// scaling crosses the primal/tangent boundary.
 pub trait SupportsLinearScalarOperation<T: Type, F: Value<T>>:
-    From<AddOperation> + From<ZeroLikeOperation> + From<NegOperation> + From<SubOperation> + From<ScaleOperation<T, F>>
+    From<AddOperation>
+    + From<ZeroLikeOperation>
+    + From<NegOperation>
+    + From<SubOperation>
+    + From<ScaleOperation<T, F, Input>>
 {
 }
 
@@ -173,7 +178,7 @@ where
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
-        + From<ScaleOperation<T, F>>,
+        + From<ScaleOperation<T, F, Input>>,
 {
 }
 
@@ -198,8 +203,8 @@ where
 /// inline, mirroring [`From<LinearSelectOperation>`](crate::tracing_v2::operations::select::LinearSelectOperation).
 pub trait SupportsLinearArrayOperation<F: Value<ArrayType>>:
     SupportsLinearScalarOperation<ArrayType, F>
-    + From<LeftDotOperation<F>>
-    + From<RightDotOperation<F>>
+    + From<LeftDotOperation<F, Input>>
+    + From<RightDotOperation<F, Input>>
     + From<TransposeOperation>
     + From<ReshapeOperation>
     + From<BroadcastOperation>
@@ -216,8 +221,8 @@ impl<F, C> SupportsLinearArrayOperation<F> for C
 where
     F: Value<ArrayType>,
     C: SupportsLinearScalarOperation<ArrayType, F>
-        + From<LeftDotOperation<F>>
-        + From<RightDotOperation<F>>
+        + From<LeftDotOperation<F, Input>>
+        + From<RightDotOperation<F, Input>>
         + From<TransposeOperation>
         + From<ReshapeOperation>
         + From<BroadcastOperation>

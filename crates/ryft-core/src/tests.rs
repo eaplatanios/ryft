@@ -26,7 +26,6 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, EagerContext, ProvidesContext};
 use crate::domains::Domain;
-use crate::operations::arithmetic::Scale;
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
@@ -285,19 +284,11 @@ impl Mul for TestArray {
     }
 }
 
-impl Scale for TestArray {
+impl Mul<f64> for TestArray {
     type Output = Self;
 
-    fn scale(&self, factor: Self) -> Self::Output {
-        factor * self.clone()
-    }
-}
-
-impl Scale<f64> for TestArray {
-    type Output = Self;
-
-    fn scale(&self, factor: f64) -> Self::Output {
-        Self { r#type: self.r#type.clone(), values: self.values.iter().map(|value| value * factor).collect() }
+    fn mul(self, rhs: f64) -> Self::Output {
+        Self { r#type: self.r#type, values: self.values.into_iter().map(|value| value * rhs).collect() }
     }
 }
 
@@ -380,22 +371,6 @@ impl crate::tracing_v2::operations::dot::Dot for TestArray {
         );
         let output_type = ArrayType::new(self.r#type.data_type(), Shape::from(&output_shape));
         Self { r#type: output_type, values }
-    }
-}
-
-impl crate::tracing_v2::operations::dot::LeftDot for TestArray {
-    #[inline]
-    fn left_dot(&self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
-        use crate::tracing_v2::operations::dot::Dot;
-        factor.dot(self, dimensions)
-    }
-}
-
-impl crate::tracing_v2::operations::dot::RightDot for TestArray {
-    #[inline]
-    fn right_dot(&self, factor: Self, dimensions: &crate::tracing_v2::operations::dot::DotDimensionNumbers) -> Self {
-        use crate::tracing_v2::operations::dot::Dot;
-        self.dot(&factor, dimensions)
     }
 }
 

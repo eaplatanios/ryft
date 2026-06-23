@@ -2,9 +2,11 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::contexts::{EagerContext, StagingContext};
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::types::{DataType, Type, TypeError};
 
 /// Canonical operation name for [`OneOperation`].
@@ -58,30 +60,41 @@ impl<T: Type> Operation<T> for OneOperation<T> {
     }
 }
 
-impl<T: Type, V: Value<T> + One<T>> InterpretableOperation<T, V> for OneOperation<T> {
+impl<T: Type, V: Value<T, InterpretationContext: One<T, V>>> InterpretableOperation<T, V> for OneOperation<T> {
     #[inline]
     fn interpret(
         &self,
-        _context: &<V as Value<T>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
-        Ok(vec![V::one(&self.r#type)?])
+        Ok(vec![context.one(&self.r#type)?])
     }
 }
 
-/// Synthesizes a _one_ value for a given [`Type`]. [`One`] is the [`Type`]-driven counterpart to
-/// [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its [`InterpretableOperation`] implementation.
-pub trait One<T: Type>: Sized {
+/// Represents the ability to synthesize a _one_ value for a given [`Type`] in an interpretation context. [`One`]
+/// is the [`Type`]-driven counterpart to [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its
+/// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
+/// backend- or context-dependent.
+pub trait One<T: Type, V: Value<T>> {
     /// Returns a _one_ value for the provided [`Type`].
-    fn one(r#type: &T) -> Result<Self, ProgramError>;
+    fn one(&self, r#type: &T) -> Result<V, ProgramError>;
+}
+
+impl<C: StagingContext<Operation: From<OneOperation<C::Type>>>> One<C::Type, Tracer<C>> for C {
+    #[inline]
+    fn one(&self, r#type: &C::Type) -> Result<Tracer<C>, ProgramError> {
+        let mut outputs = self.stage_nullary_operation(OneOperation::new(r#type.clone()))?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
 }
 
 macro_rules! impl_one_for_scalar {
     ($ty:ty, $data_type:path, $one:expr) => {
-        impl One<DataType> for $ty {
+        impl<O: Operation<DataType>> One<DataType, $ty> for EagerContext<DataType, $ty, O> {
             #[inline]
-            fn one(r#type: &DataType) -> Result<Self, ProgramError> {
+            fn one(&self, r#type: &DataType) -> Result<$ty, ProgramError> {
                 if *r#type != $data_type {
                     return Err(TypeError {
                         message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
@@ -124,19 +137,19 @@ mod tests {
 
     #[test]
     fn test_one() {
-        assert_eq!(bool::one(&DataType::Boolean), Ok(true));
-        assert_eq!(i8::one(&DataType::I8), Ok(1i8));
-        assert_eq!(i16::one(&DataType::I16), Ok(1i16));
-        assert_eq!(i32::one(&DataType::I32), Ok(1i32));
-        assert_eq!(i64::one(&DataType::I64), Ok(1i64));
-        assert_eq!(u8::one(&DataType::U8), Ok(1u8));
-        assert_eq!(u16::one(&DataType::U16), Ok(1u16));
-        assert_eq!(u32::one(&DataType::U32), Ok(1u32));
-        assert_eq!(u64::one(&DataType::U64), Ok(1u64));
-        assert_eq!(bf16::one(&DataType::BF16), Ok(bf16::ONE));
-        assert_eq!(f16::one(&DataType::F16), Ok(f16::ONE));
-        assert_eq!(f32::one(&DataType::F32), Ok(1.0f32));
-        assert_eq!(f64::one(&DataType::F64), Ok(1.0f64));
+        assert_eq!(EagerContext::<DataType, bool, OneOperation<DataType>>::new().one(&DataType::Boolean), Ok(true));
+        assert_eq!(EagerContext::<DataType, i8, OneOperation<DataType>>::new().one(&DataType::I8), Ok(1i8));
+        assert_eq!(EagerContext::<DataType, i16, OneOperation<DataType>>::new().one(&DataType::I16), Ok(1i16));
+        assert_eq!(EagerContext::<DataType, i32, OneOperation<DataType>>::new().one(&DataType::I32), Ok(1i32));
+        assert_eq!(EagerContext::<DataType, i64, OneOperation<DataType>>::new().one(&DataType::I64), Ok(1i64));
+        assert_eq!(EagerContext::<DataType, u8, OneOperation<DataType>>::new().one(&DataType::U8), Ok(1u8));
+        assert_eq!(EagerContext::<DataType, u16, OneOperation<DataType>>::new().one(&DataType::U16), Ok(1u16));
+        assert_eq!(EagerContext::<DataType, u32, OneOperation<DataType>>::new().one(&DataType::U32), Ok(1u32));
+        assert_eq!(EagerContext::<DataType, u64, OneOperation<DataType>>::new().one(&DataType::U64), Ok(1u64));
+        assert_eq!(EagerContext::<DataType, bf16, OneOperation<DataType>>::new().one(&DataType::BF16), Ok(bf16::ONE));
+        assert_eq!(EagerContext::<DataType, f16, OneOperation<DataType>>::new().one(&DataType::F16), Ok(f16::ONE));
+        assert_eq!(EagerContext::<DataType, f32, OneOperation<DataType>>::new().one(&DataType::F32), Ok(1.0f32));
+        assert_eq!(EagerContext::<DataType, f64, OneOperation<DataType>>::new().one(&DataType::F64), Ok(1.0f64));
 
         let operation = OneOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), ONE_OPERATION_NAME);

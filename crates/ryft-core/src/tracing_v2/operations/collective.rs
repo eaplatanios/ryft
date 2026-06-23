@@ -222,7 +222,6 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
     Tracer<C>: Reduce + Mul<Output = Tracer<C>>,
-    CollectiveOperation: InterpretableOperation<ArrayType, Tracer<C>>,
 {
     fn batch(
         &self,

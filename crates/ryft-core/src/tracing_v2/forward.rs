@@ -15,14 +15,13 @@ mod tests {
     use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::Domain;
     use crate::macros::check_count;
-    use crate::operations::arithmetic::{
-        AddOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation, ValueScale,
-    };
+    use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation, ScaleOperation, SubOperation};
     use crate::operations::constants::{MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::{Parameter, ParameterError, Parameterized};
+    use crate::payloads::Input;
     use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
@@ -204,19 +203,11 @@ mod tests {
         }
     }
 
-    impl Scale<DistinctTangent> for DistinctTangent {
+    impl Mul<DistinctPrimal> for DistinctTangent {
         type Output = Self;
 
-        fn scale(&self, factor: DistinctTangent) -> Self::Output {
-            Self(factor.0 * self.0)
-        }
-    }
-
-    impl Scale<DistinctPrimal> for DistinctTangent {
-        type Output = Self;
-
-        fn scale(&self, factor: DistinctPrimal) -> Self::Output {
-            Self(factor.0 * self.0)
+        fn mul(self, rhs: DistinctPrimal) -> Self::Output {
+            Self(self.0 * rhs.0)
         }
     }
 
@@ -325,8 +316,8 @@ mod tests {
         }
     }
 
-    impl<Factor: Value<DataType>> From<ScaleOperation<DataType, Factor, ValueScale>> for DistinctLinearOperation<Factor> {
-        fn from(operation: ScaleOperation<DataType, Factor, ValueScale>) -> Self {
+    impl<Factor: Value<DataType>> From<ScaleOperation<DataType, Factor, Input>> for DistinctLinearOperation<Factor> {
+        fn from(operation: ScaleOperation<DataType, Factor, Input>) -> Self {
             Self::ScaleByPrimal { factor: operation.factor().clone() }
         }
     }
@@ -366,7 +357,7 @@ mod tests {
                     output_cotangent.unary(DistinctLinearOperation::ScaleByTangent { factor: *factor }),
                 )]),
                 (Cotangent::Staged(output_cotangent), Self::ScaleByPrimal { factor }) => Ok(vec![Cotangent::Staged(
-                    output_cotangent.unary(ScaleOperation::<DataType, Factor, ValueScale>::new(factor.clone())),
+                    output_cotangent.unary(ScaleOperation::<DataType, Factor, Input>::new(factor.clone())),
                 )]),
             }
         }
@@ -447,8 +438,8 @@ mod tests {
     where
         D: DifferentiationContext<Type = DataType>,
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
-        LinearOperationOf<D>: From<AddOperation>
-            + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>, ValueScale>>,
+        LinearOperationOf<D>:
+            From<AddOperation> + From<ScaleOperation<DataType, CapturedFactor<DataType, <D as Domain>::Value>, Input>>,
         LinearOperationOf<D>: MaybeZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
@@ -667,7 +658,7 @@ mod tests {
 
         assert_eq!(call_count.get(), 1);
         assert_eq!(output, (2.0, 2.0, 5.0, 3.0));
-        assert_eq!(pushforward.apply(&domain, 4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
+        assert_eq!(pushforward.apply(&crate::contexts::EagerContext::new(), 4.0).unwrap(), (4.0, 4.0, 4.0, 0.0));
     }
 
     #[test]

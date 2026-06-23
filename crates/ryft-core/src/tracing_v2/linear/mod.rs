@@ -13,7 +13,7 @@ pub use reverse::{grad, grad_with_aux, value_and_grad, value_and_grad_with_aux};
 mod tests {
     use indoc::indoc;
 
-    use crate::contexts::{ProvidesContext, StagingContext};
+    use crate::contexts::StagingContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
@@ -33,8 +33,10 @@ mod tests {
         let (primal, pushforward) = domain.linearize(|x| Ok(x.clone() * x.clone() + x.sin()), 2.0f64).unwrap();
 
         approx_eq(primal, 2.0f64.powi(2) + 2.0f64.sin());
-        let tangent_context = domain.context();
-        approx_eq(pushforward.apply(&tangent_context, 1.5f64).unwrap(), (4.0 + 2.0f64.cos()) * 1.5);
+        approx_eq(
+            pushforward.apply(&crate::contexts::EagerContext::new(), 1.5f64).unwrap(),
+            (4.0 + 2.0f64.cos()) * 1.5,
+        );
         let pushforward = pushforward.instantiate_program().unwrap();
         assert_eq!(
             pushforward.to_string(),
@@ -110,10 +112,9 @@ mod tests {
         approx_eq(active_output, program_output);
         approx_eq(active_output, replayed_output);
         assert_eq!(active_pushforward.residuals().len(), replayed_pushforward.residuals().len());
-        let tangent_context = domain.context();
         approx_eq(
-            active_pushforward.apply(&tangent_context, 1.5f64).unwrap(),
-            replayed_pushforward.apply(&tangent_context, 1.5f64).unwrap(),
+            active_pushforward.apply(&crate::contexts::EagerContext::new(), 1.5f64).unwrap(),
+            replayed_pushforward.apply(&crate::contexts::EagerContext::new(), 1.5f64).unwrap(),
         );
     }
 
@@ -123,8 +124,7 @@ mod tests {
         let (_, pushforward) = domain.linearize(|x| Ok(x.clone() * x), 2.0f64).unwrap();
 
         assert_eq!(pushforward.residuals().len(), 1);
-        let tangent_context = domain.context();
-        approx_eq(pushforward.apply(&tangent_context, 3.0f64).unwrap(), 12.0);
+        approx_eq(pushforward.apply(&crate::contexts::EagerContext::new(), 3.0f64).unwrap(), 12.0);
     }
 
     #[test]
@@ -141,8 +141,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(pushforward.residuals().len(), 0);
-        let tangent_context = domain.context();
-        approx_eq(pushforward.apply(&tangent_context, 7.0f64).unwrap(), 7.0);
+        approx_eq(pushforward.apply(&crate::contexts::EagerContext::new(), 7.0f64).unwrap(), 7.0);
     }
 
     #[test]
@@ -159,7 +158,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(pushforward.residuals().len(), 0);
-        let tangent_context = domain.context();
-        approx_eq(pushforward.apply(&tangent_context, 4.0f64).unwrap(), 12.0);
+        approx_eq(pushforward.apply(&crate::contexts::EagerContext::new(), 4.0f64).unwrap(), 12.0);
     }
 }

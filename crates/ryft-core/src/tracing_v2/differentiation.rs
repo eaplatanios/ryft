@@ -2094,8 +2094,10 @@ mod tests {
             vec![TestArray::scalar(1.0), TestArray::scalar(0.0)],
             vec![TestArray::scalar(0.5), TestArray::scalar(-2.0)],
         ] {
-            let symbolic_tangents = symbolic_pushforward.apply(&domain, tangents.clone()).unwrap();
-            let eager_tangents = eager_pushforward.apply(&domain, tangents.clone()).unwrap();
+            let symbolic_tangents =
+                symbolic_pushforward.apply(&crate::contexts::EagerContext::new(), tangents.clone()).unwrap();
+            let eager_tangents =
+                eager_pushforward.apply(&crate::contexts::EagerContext::new(), tangents.clone()).unwrap();
             assert_eq!(symbolic_tangents.len(), 1);
             assert_eq!(
                 symbolic_tangents[0].values,
@@ -2141,8 +2143,10 @@ mod tests {
             vec![TestArray::scalar(1.0), TestArray::scalar(7.0)],
             vec![TestArray::scalar(-0.5), TestArray::scalar(1.0)],
         ] {
-            let symbolic_tangents = symbolic_pushforward.apply(&domain, tangents.clone()).unwrap();
-            let eager_tangents = eager_pushforward.apply(&domain, tangents.clone()).unwrap();
+            let symbolic_tangents =
+                symbolic_pushforward.apply(&crate::contexts::EagerContext::new(), tangents.clone()).unwrap();
+            let eager_tangents =
+                eager_pushforward.apply(&crate::contexts::EagerContext::new(), tangents.clone()).unwrap();
             assert_eq!(symbolic_tangents.len(), 2);
             assert_eq!(symbolic_tangents[0].values, vec![2.0 * tangents[0].values[0]]);
             assert_eq!(symbolic_tangents[1].values, vec![0.0]);

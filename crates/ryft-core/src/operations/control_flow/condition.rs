@@ -131,15 +131,20 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::StagingContext;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tests::TestArray;
+    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tracing::TracingContext;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::{DataType, Shape, Size};
 
@@ -248,9 +253,29 @@ mod tests {
             operation.interpret(&crate::EagerContext::new(), &[predicate(0.0), TestArray::scalar(4.0)]).unwrap();
         assert_eq!(outputs[0].values, vec![0.0]);
         assert_eq!(
-            operation.interpret(&crate::EagerContext::new(), &[]),
+            operation.interpret(&crate::EagerContext::new(), &[] as &[TestArray]),
             Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 0".to_string() })),
         );
+
+        // Staging records the condition payload into the active program instead of trying to concretize the staged
+        // predicate.
+        let domain = TestArrayDomain;
+        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
+        let context = TracingContext::new(&domain, builder.clone());
+        let staged_predicate = context.input(predicate_type.clone());
+        let staged_operand = context.input(operand_type.clone());
+        let outputs = context
+            .stage_operation(operation.clone(), &[staged_predicate.clone(), staged_operand.clone()])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        let builder = builder.borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert!(matches!(builder.instructions()[0].operation(), ArrayOperation::Condition(_)));
+        assert_eq!(
+            builder.instructions()[0].inputs(),
+            &[staged_predicate.atom_id().unwrap(), staged_operand.atom_id().unwrap()],
+        );
+        assert_eq!(outputs[0].atom_id(), Ok(builder.instructions()[0].outputs()[0]));
 
         // Program rendering uses the canonical operation name and includes the nested branch programs.
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
