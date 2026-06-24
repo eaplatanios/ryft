@@ -105,7 +105,7 @@ pub use bounds::{
 pub use broadcasting::lift_broadcast;
 pub use captures::{MaterializeCaptureOperation, ValueOrCapture};
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
-pub use control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
+pub use control_flow::{DefactorizedOperation, SupportsLinearWhile};
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
     custom_jvp, custom_vjp,

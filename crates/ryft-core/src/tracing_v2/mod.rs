@@ -49,7 +49,7 @@ pub use linear::{
 };
 pub use operations::captures::{MaterializeCaptureOperation, ValueOrCapture};
 pub use operations::collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
-pub use operations::control_flow::{DefactorizedOperation, SupportsLinearCondition, SupportsLinearWhile};
+pub use operations::control_flow::{DefactorizedOperation, SupportsLinearWhile};
 pub use operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation,
 };

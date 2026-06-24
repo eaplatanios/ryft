@@ -46,9 +46,7 @@ use ryft_core::tracing_v2::operations::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsManipulationOperations,
     SupportsTrigonometricOperations,
 };
-use ryft_core::tracing_v2::operations::control_flow::{
-    LinearOperandConditionOperation, SupportsLinearCondition, SupportsLinearWhile,
-};
+use ryft_core::tracing_v2::operations::control_flow::{LinearOperandConditionOperation, SupportsLinearWhile};
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
@@ -521,7 +519,15 @@ where
                 ValueOrCapture<ArrayType, <E as Domain>::Value>,
             >,
         >
-        + SupportsLinearCondition<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>>
+        + From<
+            ConditionOperation<
+                ArrayType,
+                E::Tangent,
+                LinearOperationOf<E>,
+                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+                Captured,
+            >,
+        >
         + SupportsLinearWhile<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>, XlaOperation>,
     Self: Clone + LinearizableProgramOperation<E>,
 {
@@ -1217,24 +1223,6 @@ where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
         map_linear_xla_operation_captures(self, map_factor)
-    }
-}
-
-impl<V, C, F, P, CaptureFactor> SupportsLinearCondition<ArrayType, V, F>
-    for LinearXlaOperation<V, C, F, P, CaptureFactor>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    CaptureFactor: Value<ArrayType>,
-{
-    fn linear_condition_operation(
-        predicate: F,
-        true_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        false_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Self {
-        Self::Condition(ConditionOperation::new_captured(predicate, true_branch, false_branch).unwrap())
     }
 }
 

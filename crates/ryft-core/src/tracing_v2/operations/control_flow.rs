@@ -100,29 +100,6 @@ where
     context.tracer(output, None)
 }
 
-// TODO(eaplatanios): Replace with a `Condition` trait that has `fn condition(&self, on_true, on_false)`.
-/// Trait that represents linear [`Operation`] types that support/include a captured-predicate condition. The
-/// captured-predicate condition is the linear-program counterpart of [`ConditionOperation`]: the Boolean predicate is
-/// a primal value captured at linearization time as a residual factor, the operation inputs are exactly the branch
-/// operand tangents (or cotangents), and the staged map runs the linear branch program selected by the predicate,
-/// which is linear in the branch operands (the predicate itself has no tangent space). Linear operation enums
-/// implement this trait so that the JVP rule of [`ConditionOperation`] can stage the captured-predicate condition
-/// without knowing which linear operation type is in use.
-pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
-    /// Constructs the linear-operation representation of the captured-predicate condition.
-    ///
-    /// # Parameters
-    ///
-    ///   - `predicate`: Captured Boolean predicate factor that selects the branch program to run.
-    ///   - `true_branch`: Linear branch [`Program`] evaluated when the predicate is true.
-    ///   - `false_branch`: Linear branch [`Program`] evaluated when the predicate is false.
-    fn linear_condition_operation(
-        predicate: F,
-        true_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
-        false_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
-    ) -> Self;
-}
-
 /// Trait that represents linear [`Operation`] types that support/include the staged doubled-state while loop. The
 /// staged while loop is the linear-program counterpart of [`WhileOperation`]: its state is the primal state followed
 /// by the tangent state, its body interleaves recomputed primal operations with the body pushforward (whose
@@ -742,11 +719,12 @@ where
 ///      branches.
 ///   4. The primal condition's residual outputs are registered in the active linearization residual environment, and
 ///      each branch pushforward's local residual references are remapped onto the resulting factors.
-///   5. One linear condition ([`SupportsLinearCondition`]) is staged over the operand tangents, capturing the
-///      predicate primal as a residual factor (exactly like [`SelectOperation`](
-///      crate::operations::control_flow::SelectOperation)'s rule captures its condition) and carrying both
-///      residualized branch pushforwards. Replaying the resulting pushforward with fresh tangents instantiates the
-///      captured predicate factor and runs the branch pushforward selected at the original primal point.
+///   5. One captured-predicate linear [`ConditionOperation`] is staged over the operand tangents, capturing the
+///      predicate primal as a residual factor (exactly like
+///      [`SelectOperation`](crate::operations::control_flow::SelectOperation)'s rule captures its condition) and
+///      carrying both residualized branch pushforwards. Replaying the resulting pushforward with fresh tangents
+///      instantiates the captured predicate factor and runs the branch pushforward selected at the original primal
+///      point.
 ///
 /// The predicate is the first operand and its tangent is ignored (Boolean predicates have no tangent space).
 /// Reverse mode composes through the total linear-condition transpose rule, which transposes both branch programs
@@ -762,7 +740,15 @@ where
         + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>>
         + ResidualizedOperation<D>
-        + SupportsLinearCondition<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>>,
+        + From<
+            ConditionOperation<
+                ArrayType,
+                D::Tangent,
+                LinearOperationOf<D>,
+                ValueOrCapture<ArrayType, D::Value>,
+                Captured,
+            >,
+        >,
 {
     fn jvp<'jvp>(
         &self,
@@ -818,10 +804,8 @@ where
         // Stage one linear condition over the operand tangents, capturing the predicate primal as a residual factor.
         let predicate_factor = predicate.factor(context);
         let tangent_operands = operands.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-        let tangent_outputs = context.stage_operation(
-            LinearOperationOf::<D>::linear_condition_operation(predicate_factor, true_branch, false_branch),
-            tangent_operands.as_slice(),
-        )?;
+        let linear_condition = ConditionOperation::new_captured(predicate_factor, true_branch, false_branch)?;
+        let tangent_outputs = context.stage_operation(linear_condition, tangent_operands.as_slice())?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
         Ok(primal_outputs
             .into_iter()
@@ -1908,9 +1892,9 @@ where
     V: Value<ArrayType>,
     F: Value<ArrayType>,
     O: Operation<ArrayType>
-        + SupportsLinearCondition<ArrayType, V, F>
         + TransposableProgramOperation<ArrayType, V>
-        + From<ZeroOperation<ArrayType>>,
+        + From<ZeroOperation<ArrayType>>
+        + From<ConditionOperation<ArrayType, V, O, F, Captured>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -1923,11 +1907,11 @@ where
         if output_cotangents.iter().all(Cotangent::is_zero) {
             return Ok(vec![Cotangent::Zero; self.true_branch().input_types().len()]);
         }
-        let transposed_condition = O::linear_condition_operation(
+        let transposed_condition = ConditionOperation::new_captured(
             self.predicate().clone(),
             <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(self.true_branch())?,
             <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(self.false_branch())?,
-        );
+        )?;
         let materialized = output_cotangents
             .iter()
             .zip(self.true_branch().output_types())
@@ -2529,13 +2513,18 @@ mod tests {
         }
     }
 
-    impl SupportsLinearCondition<ArrayType, TestValue, ValueOrCapture<ArrayType, TestValue>> for TestLinearOperation {
-        fn linear_condition_operation(
-            predicate: ValueOrCapture<ArrayType, TestValue>,
-            true_branch: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
-            false_branch: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+    impl From<ConditionOperation<ArrayType, TestValue, Self, ValueOrCapture<ArrayType, TestValue>, Captured>>
+        for TestLinearOperation
+    {
+        fn from(
+            operation: ConditionOperation<ArrayType, TestValue, Self, ValueOrCapture<ArrayType, TestValue>, Captured>,
         ) -> Self {
-            Self::Condition { predicate, true_branch: Box::new(true_branch), false_branch: Box::new(false_branch) }
+            let ConditionOperation { true_branch, false_branch, predicate, predicate_payload: _ } = operation;
+            Self::Condition {
+                predicate: predicate.unwrap(),
+                true_branch: Box::new(true_branch),
+                false_branch: Box::new(false_branch),
+            }
         }
     }
 

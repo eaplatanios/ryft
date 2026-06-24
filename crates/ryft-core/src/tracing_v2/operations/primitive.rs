@@ -72,8 +72,8 @@ use super::bounds::{
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
-    DefactorizedOperation, LinearOperandConditionOperation, SupportsLinearCondition, SupportsLinearWhile,
-    batch_condition_with_interpreter, batch_while_with_interpreter,
+    DefactorizedOperation, LinearOperandConditionOperation, SupportsLinearWhile, batch_condition_with_interpreter,
+    batch_while_with_interpreter,
 };
 use super::dot::DotOps;
 use super::scan::{LinearScanInterpretation, LinearScanOperation};
@@ -215,8 +215,15 @@ where
         + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<LinearGatherOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, D::Value>>>
-        + SupportsLinearCondition<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>>
-        + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, ArrayOperation<V>>
+        + From<
+            ConditionOperation<
+                ArrayType,
+                D::Tangent,
+                LinearOperationOf<D>,
+                ValueOrCapture<ArrayType, D::Value>,
+                Captured,
+            >,
+        > + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, ArrayOperation<V>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<V>: Clone + LinearizableProgramOperation<D>,
@@ -358,21 +365,6 @@ where
             Self::Dot(operation) => Some(operation.dimensions()),
             _ => None,
         }
-    }
-}
-
-impl<V: Value<ArrayType>, C: Value<ArrayType>, F: Value<ArrayType>, P> SupportsLinearCondition<ArrayType, V, F>
-    for LinearArrayOperation<V, C, F, P>
-where
-    P: Clone + Operation<ArrayType>,
-{
-    #[inline]
-    fn linear_condition_operation(
-        predicate: F,
-        true_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        false_branch: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Self {
-        LinearArrayOperation::Condition(ConditionOperation::new_captured(predicate, true_branch, false_branch).unwrap())
     }
 }
 
@@ -1586,10 +1578,14 @@ where
         + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<LinearGatherOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
-        + SupportsLinearCondition<
-            ArrayType,
-            E::Tangent,
-            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+        + From<
+            ConditionOperation<
+                ArrayType,
+                E::Tangent,
+                LinearOperationOf<LinearizationContextOf<E, Self>>,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                Captured,
+            >,
         > + SupportsLinearWhile<
             ArrayType,
             E::Tangent,
