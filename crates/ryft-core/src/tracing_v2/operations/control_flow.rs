@@ -30,7 +30,7 @@ use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::dot::{LeftDotOperation, RightDotOperation};
 use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
-use crate::tracing_v2::operations::scan::{LinearScanOperation, linear_scan_operation};
+use crate::tracing_v2::operations::scan::linear_scan_operation;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::{
     CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf,
@@ -1515,7 +1515,7 @@ where
 /// loop therefore requires an iteration bound (the masked-scan pushforward above transposes totally). Concretizing
 /// domains are unaffected: their pushforwards are straight-line and contain no loop to transpose, so eager reverse
 /// mode works even for unbounded loops.
-impl<V, D, O> DifferentiableOperation<D> for WhileOperation<ArrayType, V, O>
+impl<V, D, O, BodyOperation> DifferentiableOperation<D> for WhileOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
@@ -1530,17 +1530,19 @@ where
         + From<AddOperation>
         + From<BroadcastOperation>
         + From<DynamicUpdateSliceOperation>,
+    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Tangent>>>,
     LinearOperationOf<D>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, D::Value>,
             WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
+            WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
         > + ResidualizedOperation<D>
         + DefactorizableProgramOperation<D::Tangent, D::Value, O>
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<RecomputeOperation<O>>
         + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
-        + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
+        + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
     Vec<V>: Parameterized<
             V,
             Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
@@ -1677,33 +1679,36 @@ where
             // lane-uniform stacks, exactly like the scan JVP rule.
             let mut stack_factors = stack_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
             let pushforward_body = linearization.pushforward_program.map_operations(|operation| {
-                operation.try_map_captures(&mut |factor| match factor {
-                    ValueOrCapture::Capture { index, r#type } => {
-                        Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
-                    }
-                    ValueOrCapture::Value(value) => {
-                        let value_type = value.r#type().into_owned();
-                        if value_type.static_shape().is_none() {
-                            return Err(TypeError {
-                                message: format!(
-                                    "while body pushforwards cannot capture a constant factor of dynamically sized \
-                                     type {value_type}",
-                                ),
+                operation.try_map_captures(
+                    &mut |factor| -> Result<ValueOrCapture<ArrayType, D::Tangent>, ProgramError> {
+                        match factor {
+                            ValueOrCapture::Capture { index, r#type } => {
+                                Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
                             }
-                            .into());
+                            ValueOrCapture::Value(value) => {
+                                let value_type = value.r#type().into_owned();
+                                if value_type.static_shape().is_none() {
+                                    return Err(TypeError {
+                                        message: format!(
+                                            "while body pushforwards cannot capture a constant factor of dynamically sized type {value_type}",
+                                        ),
+                                    }
+                                    .into());
+                                }
+                                let stacked_type = stacked_scan_type(&value_type, bound);
+                                let output_axes = (1..=value_type.rank()).collect::<Vec<_>>();
+                                let mut broadcasted = context.bind_primal(
+                                    O::from(BroadcastOperation::new(stacked_type, output_axes)),
+                                    std::slice::from_ref(value),
+                                )?;
+                                check_count!("output", broadcasted, 1, ProgramError);
+                                let scan_local_index = stack_factors.len();
+                                stack_factors.push(context.factor(broadcasted.remove(0)));
+                                Ok(ValueOrCapture::Capture { index: scan_local_index, r#type: value_type })
+                            }
                         }
-                        let stacked_type = stacked_scan_type(&value_type, bound);
-                        let output_axes = (1..=value_type.rank()).collect::<Vec<_>>();
-                        let mut broadcasted = context.bind_primal(
-                            O::from(BroadcastOperation::new(stacked_type, output_axes)),
-                            std::slice::from_ref(value),
-                        )?;
-                        check_count!("output", broadcasted, 1, ProgramError);
-                        let scan_local_index = stack_factors.len();
-                        stack_factors.push(context.factor(broadcasted.remove(0)));
-                        Ok(ValueOrCapture::Capture { index: scan_local_index, r#type: value_type })
-                    }
-                })
+                    },
+                )
             })?;
 
             // Register the mask stack and derive the per-state-element select conditions: scalar state elements
@@ -1714,7 +1719,7 @@ where
             stack_factors.push(context.factor(mask_value.clone()));
             let select_conditions = state_types
                 .iter()
-                .map(|state_type| -> Result<ValueOrCapture<ArrayType, D::Value>, ProgramError> {
+                .map(|state_type| -> Result<ValueOrCapture<ArrayType, D::Tangent>, ProgramError> {
                     if state_type.rank() == 0 {
                         return Ok(ValueOrCapture::Capture { index: mask_index, r#type: boolean_scalar_type.clone() });
                     }
@@ -1747,7 +1752,7 @@ where
                     let select_output = AtomId::new(scan_body.atoms.len());
                     scan_body.atoms.push(Atom::Variable(state_type.clone()));
                     scan_body.instructions.push(Instruction::new(
-                        LinearOperationOf::<D>::from(LinearSelectOperation::new(condition)),
+                        BodyOperation::from(LinearSelectOperation::new(condition)),
                         vec![pushforward_output, carried_input],
                         vec![select_output],
                     ));
@@ -1761,10 +1766,11 @@ where
                 ArrayType,
                 D::Tangent,
                 D::Value,
-                LinearOperationOf<D>,
+                BodyOperation,
             >(
                 scan_body, stack_factors, state_count, bound, false, 1
-            )?;
+            )?
+            .into();
             let tangent_outputs = context.stage_operation(linear_scan, tangent_operands.as_slice())?;
             check_count!("output", tangent_outputs, state_count, ProgramError);
             return Ok(primal_outputs

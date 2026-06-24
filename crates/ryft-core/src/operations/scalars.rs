@@ -28,9 +28,8 @@ use crate::tracing_v2::operations::bounds::{
     SupportsConstantOperations, SupportsLinearScalarOperation, SupportsTrigonometricOperations,
 };
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, custom_jvp_rule, custom_vjp_rule,
 };
-use crate::tracing_v2::operations::scan::LinearScanOperation;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{
@@ -71,7 +70,7 @@ pub enum ScalarOperation<V: Value<DataType>> {
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
-impl<V: Value<DataType>, D> DifferentiableOperation<D> for ScalarOperation<V>
+impl<V: Value<DataType>, D, BodyOperation> DifferentiableOperation<D> for ScalarOperation<V>
 where
     ZeroOperation<DataType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
@@ -88,10 +87,9 @@ where
     CosOperation: DifferentiableOperation<D>,
     CompareOperation: DifferentiableOperation<D>,
     SelectOperation: DifferentiableOperation<D>,
-    ScanOperation<DataType, V, Self>: DifferentiableOperation<D>,
-    WhileOperation<DataType, V, Self>: DifferentiableOperation<D>,
     StopGradientOperation: DifferentiableOperation<D>,
     RematerializationNameOperation: DifferentiableOperation<D>,
+    BodyOperation: crate::operations::Operation<DataType>,
     D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = ScalarOperation<V>>,
     D::Operation: From<ZeroOperation<DataType>> + From<OneOperation<DataType>>,
     D::Value: RematerializationName,
@@ -104,6 +102,7 @@ where
         + ZeroLike
         + OneLike
         + Compare<Output = D::Value>
+        + BooleanLike
         + SelectCondition
         + Parameterized<D::Value>,
     D::Value: Select<Condition = <D::Value as SelectCondition>::Condition>,
@@ -111,7 +110,11 @@ where
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScalarOperation<V>: Clone + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, D::Value>>
-        + LinearScanOperation<DataType, D::Tangent, D::Value>
+        + CaptureParameterizedOperation<
+            DataType,
+            ValueOrCapture<DataType, D::Value>,
+            WithCapture<ValueOrCapture<DataType, D::Tangent>> = BodyOperation,
+        > + From<ScanOperation<DataType, D::Tangent, BodyOperation, ValueOrCapture<DataType, D::Value>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
         + ResidualizedOperation<D>
         + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, ValueOrCapture<DataType, D::Value>>>,
@@ -153,8 +156,8 @@ where
             Self::While(operation) => operation.jvp(context, inputs),
             Self::StopGradient(operation) => operation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::CustomJvp(operation) => operation.jvp(context, inputs),
-            Self::CustomVjp(operation) => operation.jvp(context, inputs),
+            Self::CustomJvp(operation) => custom_jvp_rule(operation.as_ref(), context, inputs),
+            Self::CustomVjp(operation) => custom_vjp_rule(operation.as_ref(), context, inputs),
         }
     }
 }
@@ -166,17 +169,29 @@ where
 /// [`linearize_program`](crate::tracing_v2::linearize_program) instead of the recursive
 /// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound, which avoids pushing that recursive
 /// obligation back into every consumer.
-impl<F, E> LinearizableProgramOperation<E> for ScalarOperation<F>
+impl<F, E, BodyOperation> LinearizableProgramOperation<E> for ScalarOperation<F>
 where
     F: Value<DataType>,
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
+    BodyOperation: crate::operations::Operation<DataType>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>
         + ResidualizedOperation<LinearizationContextOf<E, Self>>
-        + LinearScanOperation<DataType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>
         + From<ZeroOperation<DataType>>
-        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + CaptureParameterizedOperation<
+            DataType,
+            ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithCapture<ValueOrCapture<DataType, E::Tangent>> = BodyOperation,
+        > + From<
+            ScanOperation<
+                DataType,
+                E::Tangent,
+                BodyOperation,
+                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+                Input,
+            >,
+        > + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<
             CustomVjpCallOperation<
                 DataType,

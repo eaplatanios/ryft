@@ -51,7 +51,7 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, custom_jvp_rule, custom_vjp_rule,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
@@ -74,7 +74,6 @@ use super::control_flow::{
     batch_condition_with_interpreter, batch_while_with_interpreter, defactorize_operation_default,
 };
 use super::dot::DotOps;
-use super::scan::LinearScanOperation;
 use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -139,7 +138,7 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
 // `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
 // `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
-impl<V: Value<ArrayType>, D> DifferentiableOperation<D> for ArrayOperation<V>
+impl<V: Value<ArrayType>, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
 where
     ZeroOperation<ArrayType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
@@ -180,6 +179,7 @@ where
     XorOperation: DifferentiableOperation<D>,
     CollectiveOperation: DifferentiableOperation<D>,
     SelectOperation: DifferentiableOperation<D>,
+    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Tangent>>>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = ArrayOperation<V>>,
     D::Operation: From<ZeroOperation<ArrayType>> + From<OneOperation<ArrayType>> + From<FillOperation<ArrayType, f64>>,
     D::Value: RematerializationName + TransferToMemory,
@@ -224,11 +224,12 @@ where
         > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<RecomputeOperation<ArrayOperation<V>>>
         + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>, Input>>
-        + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
+        + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
     LinearOperationOf<D>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, D::Value>,
             WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
+            WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
         > + DefactorizableProgramOperation<D::Tangent, D::Value, ArrayOperation<V>>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<V>: Clone + LinearizableProgramOperation<D>,
@@ -284,8 +285,8 @@ where
             Self::Condition(operation) => operation.jvp(context, inputs),
             Self::While(operation) => operation.jvp(context, inputs),
             Self::Scan(operation) => operation.jvp(context, inputs),
-            Self::CustomJvp(operation) => operation.jvp(context, inputs),
-            Self::CustomVjp(operation) => operation.jvp(context, inputs),
+            Self::CustomJvp(operation) => custom_jvp_rule(operation.as_ref(), context, inputs),
+            Self::CustomVjp(operation) => custom_vjp_rule(operation.as_ref(), context, inputs),
         }
     }
 }
@@ -1120,13 +1121,14 @@ where
 /// recursion. The `WithCapture<V> = ..` equality pins the canonical linear operation as a fixed point of factor
 /// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
-impl<V, E> LinearizableProgramOperation<E> for ArrayOperation<V>
+impl<V, E, BodyOperation> LinearizableProgramOperation<E> for ArrayOperation<V>
 where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
     E::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
         CaptureParameterizedOperation<ArrayType, V, WithCapture<V> = E::LinearOperation<E::Tangent, V>>,
+    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, E::Tangent>>>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
         + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
         + From<ZeroOperation<ArrayType>>
@@ -1156,7 +1158,15 @@ where
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<RecomputeOperation<Self>>
         + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<LinearizationContextOf<E, Self>>, Input>>
-        + LinearScanOperation<ArrayType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>,
+        + From<
+            ScanOperation<
+                ArrayType,
+                E::Tangent,
+                BodyOperation,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                Input,
+            >,
+        >,
     LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
@@ -1164,6 +1174,7 @@ where
                 LinearizationContextOf<E, Self>,
             >,
             WithCapture<ValueOrCapture<ArrayType, E::Value>> = LinearOperationOf<E>,
+            WithCapture<ValueOrCapture<ArrayType, E::Tangent>> = BodyOperation,
         > + MaybeZeroOperation<ArrayType>,
 {
     fn linearize_program(

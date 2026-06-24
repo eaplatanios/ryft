@@ -38,91 +38,25 @@ pub(crate) fn render_factor_list<C: Display>(factors: &[C]) -> String {
     rendered
 }
 
-/// Internal blanket capability for building the linear-operation representation of a residualized scan pushforward.
-///
-/// This trait is intentionally private to the scan rule. Operation families do not implement it directly; the blanket
-/// implementation below derives it from the existing capture-mapping contract and the generated
-/// `From<ScanOperation<...>>` conversion for the family's `Scan` variant.
-pub(crate) trait LinearScanOperation<T: ScanTypeSemantics, V: Value<T>, R: Value<T>>:
-    CaptureParameterizedOperation<T, ValueOrCapture<T, R>> + Sized
-{
-    /// Builds the linear scan operation.
-    fn linear_scan_operation(
-        body: Program<T, V, Self, Vec<V>, Vec<V>>,
-        residual_stacks: Vec<ValueOrCapture<T, R>>,
-        carry_count: usize,
-        length: usize,
-        reverse: bool,
-        unroll: usize,
-    ) -> Result<Self, ProgramError>;
-}
-
-impl<T, V, R, O> LinearScanOperation<T, V, R> for O
-where
-    T: ScanTypeSemantics,
-    V: Value<T>,
-    R: Value<T>,
-    O: CaptureParameterizedOperation<T, ValueOrCapture<T, R>>
-        + From<
-            ScanOperation<
-                T,
-                V,
-                <O as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithCapture<ValueOrCapture<T, V>>,
-                ValueOrCapture<T, R>,
-                Input,
-            >,
-        >,
-{
-    fn linear_scan_operation(
-        body: Program<T, V, Self, Vec<V>, Vec<V>>,
-        residual_stacks: Vec<ValueOrCapture<T, R>>,
-        carry_count: usize,
-        length: usize,
-        reverse: bool,
-        unroll: usize,
-    ) -> Result<Self, ProgramError> {
-        let body = body.map_operations(|operation| {
-            operation.try_map_captures(&mut |factor| match factor {
-                ValueOrCapture::Capture { index, r#type } => {
-                    Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
-                }
-                ValueOrCapture::Value(_) => Err(ProgramError::UnsupportedOperation {
-                    message: "scan body pushforwards must reference residual stacks instead of carrying closed \
-                              constant captures"
-                        .to_string(),
-                }),
-            })
-        })?;
-        let scan = ScanOperation::<
-            T,
-            V,
-            <Self as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithCapture<ValueOrCapture<T, V>>,
-            ValueOrCapture<T, R>,
-            Input,
-        >::new_with_payload(body, carry_count, length)?
-        .with_reverse(reverse)
-        .with_unroll(unroll)?
-        .with_captures(residual_stacks);
-        Ok(Self::from(scan))
-    }
-}
-
-/// Builds a linear scan operation through [`LinearScanOperation`].
-pub(crate) fn linear_scan_operation<T, V, R, O>(
-    body: Program<T, V, O, Vec<V>, Vec<V>>,
+/// Builds the linear-operation representation of a residualized scan pushforward.
+pub(crate) fn linear_scan_operation<T, V, R, BodyOperation>(
+    body: Program<T, V, BodyOperation, Vec<V>, Vec<V>>,
     residual_stacks: Vec<ValueOrCapture<T, R>>,
     carry_count: usize,
     length: usize,
     reverse: bool,
     unroll: usize,
-) -> Result<O, ProgramError>
+) -> Result<ScanOperation<T, V, BodyOperation, ValueOrCapture<T, R>, Input>, ProgramError>
 where
     T: ScanTypeSemantics,
     V: Value<T>,
     R: Value<T>,
-    O: LinearScanOperation<T, V, R>,
+    BodyOperation: Operation<T>,
 {
-    O::linear_scan_operation(body, residual_stacks, carry_count, length, reverse, unroll)
+    ScanOperation::<T, V, BodyOperation, ValueOrCapture<T, R>, Input>::new_with_payload(body, carry_count, length)?
+        .with_reverse(reverse)
+        .with_unroll(unroll)
+        .map(|operation| operation.with_captures(residual_stacks))
 }
 
 impl<V, O, Capture> ScanPayload<DataType, V, V, O, Capture> for Input
@@ -231,7 +165,7 @@ where
 /// processed. Transposing the linear scan flips `reverse` (and transposes the body program), which pairs cotangent
 /// lane `i` with residual lane `i` in the opposite visit order — making reverse-mode differentiation through `scan`
 /// total, with no array-reversal operation anywhere.
-impl<V, D, O> DifferentiableOperation<D> for ScanOperation<ArrayType, V, O>
+impl<V, D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<ArrayType, V, O>
 where
     V: Value<ArrayType>,
     D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
@@ -240,7 +174,13 @@ where
         + From<BroadcastOperation>
         + From<ScanOperation<ArrayType, V, O>>
         + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
+    BodyOperation: Operation<ArrayType>,
+    LinearOperationOf<D>: ResidualizedOperation<D>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, D::Value>,
+            WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
+        > + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
     LinearOperationOf<D>: From<ZeroOperation<ArrayType>> + MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
@@ -302,31 +242,32 @@ where
         let mut stack_factors =
             residual_stack_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
         let body = pushforward_program.map_operations(|operation| {
-            operation.try_map_captures(&mut |factor| match factor {
-                ValueOrCapture::Capture { index, r#type } => {
-                    Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
-                }
-                ValueOrCapture::Value(value) => {
-                    let value_type = value.r#type().into_owned();
-                    if value_type.static_shape().is_none() {
-                        return Err(TypeError {
-                            message: format!(
-                                "scan body pushforwards cannot capture a constant factor of dynamically sized type \
-                                 {value_type}",
-                            ),
-                        }
-                        .into());
+            operation.try_map_captures(&mut |factor| -> Result<ValueOrCapture<ArrayType, D::Tangent>, ProgramError> {
+                match factor {
+                    ValueOrCapture::Capture { index, r#type } => {
+                        Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
                     }
-                    let stacked_type = stacked_scan_type(&value_type, length);
-                    let output_axes = (1..=value_type.rank()).collect::<Vec<_>>();
-                    let mut broadcasted = context.bind_primal(
-                        O::from(BroadcastOperation::new(stacked_type, output_axes)),
-                        std::slice::from_ref(value),
-                    )?;
-                    check_count!("output", broadcasted, 1, ProgramError);
-                    let scan_local_index = stack_factors.len();
-                    stack_factors.push(context.factor(broadcasted.remove(0)));
-                    Ok(ValueOrCapture::Capture { index: scan_local_index, r#type: value_type })
+                    ValueOrCapture::Value(value) => {
+                        let value_type = value.r#type().into_owned();
+                        if value_type.static_shape().is_none() {
+                            return Err(TypeError {
+                                message: format!(
+                                    "scan body pushforwards cannot capture a constant factor of dynamically sized type {value_type}",
+                                ),
+                            }
+                            .into());
+                        }
+                        let stacked_type = stacked_scan_type(&value_type, length);
+                        let output_axes = (1..=value_type.rank()).collect::<Vec<_>>();
+                        let mut broadcasted = context.bind_primal(
+                            O::from(BroadcastOperation::new(stacked_type, output_axes)),
+                            std::slice::from_ref(value),
+                        )?;
+                        check_count!("output", broadcasted, 1, ProgramError);
+                        let scan_local_index = stack_factors.len();
+                        stack_factors.push(context.factor(broadcasted.remove(0)));
+                        Ok(ValueOrCapture::Capture { index: scan_local_index, r#type: value_type })
+                    }
                 }
             })
         })?;
@@ -335,7 +276,15 @@ where
         // residual-extended scan.
         let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let linear_scan: LinearOperationOf<D> =
-            linear_scan_operation(body, stack_factors, carry_count, length, reverse, unroll)?;
+            linear_scan_operation::<ArrayType, D::Tangent, D::Value, BodyOperation>(
+                body,
+                stack_factors,
+                carry_count,
+                length,
+                reverse,
+                unroll,
+            )?
+            .into();
         let tangent_outputs = context.stage_operation(linear_scan, tangent_operands.as_slice())?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
         Ok(primal_outputs
@@ -346,12 +295,18 @@ where
     }
 }
 
-impl<V, D, O> DifferentiableOperation<D> for ScanOperation<DataType, V, O>
+impl<V, D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<DataType, V, O>
 where
     V: Value<DataType>,
     D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = O>,
     O: Clone + Operation<DataType> + From<ScanOperation<DataType, V, O>> + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + LinearScanOperation<DataType, D::Tangent, D::Value>,
+    BodyOperation: Operation<DataType>,
+    LinearOperationOf<D>: ResidualizedOperation<D>
+        + CaptureParameterizedOperation<
+            DataType,
+            ValueOrCapture<DataType, D::Value>,
+            WithCapture<ValueOrCapture<DataType, D::Tangent>> = BodyOperation,
+        > + From<ScanOperation<DataType, D::Tangent, BodyOperation, ValueOrCapture<DataType, D::Value>, Input>>,
     LinearOperationOf<D>: From<ZeroOperation<DataType>> + MaybeZeroOperation<DataType>,
 {
     fn jvp<'jvp>(
@@ -407,21 +362,22 @@ where
         check_count!("output", primal_outputs, output_count, ProgramError);
 
         let body = pushforward_program.map_operations(|operation| {
-            let mut has_factor = false;
-            let operation = operation.try_map_captures(&mut |factor| {
-                has_factor = true;
-                Ok(factor.clone())
-            })?;
-            if has_factor {
-                return Err(ProgramError::UnsupportedOperation {
+            operation.try_map_captures(&mut |_| -> Result<ValueOrCapture<DataType, D::Tangent>, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
                     message: "scalar scan JVP with captured factors requires a scalar stack representation".to_string(),
-                });
-            }
-            Ok(operation)
+                })
+            })
         })?;
         let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-        let linear_scan: LinearOperationOf<D> =
-            linear_scan_operation(body, vec![], carry_count, length, reverse, unroll)?;
+        let linear_scan: LinearOperationOf<D> = linear_scan_operation::<DataType, D::Tangent, D::Value, BodyOperation>(
+            body,
+            vec![],
+            carry_count,
+            length,
+            reverse,
+            unroll,
+        )?
+        .into();
         let tangent_outputs = context.stage_operation(linear_scan, tangent_operands.as_slice())?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
         Ok(primal_outputs
