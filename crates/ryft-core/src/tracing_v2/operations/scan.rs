@@ -1246,7 +1246,7 @@ mod tests {
         // constant (kept as a factor payload) rewrites its body so references to the moved stack become recomputed
         // operand-form products against a new trailing lane input, while references to the surviving constant stack
         // are re-indexed against the compacted constant-only stack list.
-        use crate::tracing_v2::{DefactorizableOperation, DefactorizedOperation, ResidualizedOperation};
+        use crate::tracing_v2::{DefactorizableProgramOperation, DefactorizedOperation, ResidualizedOperation};
 
         type ScanBodyOperation =
             LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;
@@ -1292,7 +1292,7 @@ mod tests {
             ]);
         let scan = ScanBodyOperation::Scan(Box::new(scan_operation));
         let DefactorizedOperation::Operation { operation, inputs } =
-            scan.defactorize(&[moved_stack_atom], vec![tangent_input]).unwrap()
+            scan.defactorize_operation(&[moved_stack_atom], vec![tangent_input]).unwrap()
         else {
             panic!("expected the scan defactorization to produce an operand-form scan");
         };

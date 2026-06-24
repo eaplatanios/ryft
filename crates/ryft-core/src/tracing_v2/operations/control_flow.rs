@@ -3,17 +3,20 @@ use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation, TransposableProgramOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
-use crate::operations::arithmetic::AddOperation;
+use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
 use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
-use crate::operations::control_flow::{CONDITION_OPERATION_NAME, ConditionOperation, SelectOperation, WhileOperation};
+use crate::operations::control_flow::{
+    CONDITION_OPERATION_NAME, ConditionOperation, ScanOperation, SelectOperation, WhileOperation,
+};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
+    Broadcast, BroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LinearDynamicSliceOperation,
+    LinearDynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
-use crate::payloads::Captured;
+use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{
@@ -21,8 +24,10 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched, move_axis_permutation,
 };
 use crate::tracing_v2::differentiation::{LinearizableProgramOperation, NestedLinearization};
+use crate::tracing_v2::operations::DotOperation;
 use crate::tracing_v2::operations::captures::MaterializeCaptureOperation;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
+use crate::tracing_v2::operations::dot::{LeftDotOperation, RightDotOperation};
 use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::tracing_v2::operations::scan::{LinearScanOperation, linear_scan_operation};
@@ -32,6 +37,7 @@ use crate::tracing_v2::{
     ResidualizedOperation, TangentContext, ValueOrCapture,
 };
 use crate::types::{ArrayType, DataType, Size, Type, TypeError, Typed};
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 
 impl<'domain, E> BooleanLike for JvpTracer<'domain, E>
@@ -102,17 +108,33 @@ where
     context.tracer(output, None)
 }
 
-/// Linear operation family that can rewrite loop-varying captures into explicit operands.
+/// Disposition of one residual-reference index while defactorizing a nested linear program.
+#[derive(Copy, Clone)]
+pub enum DefactorizationDisposition {
+    /// The referenced residual enters the rewritten program as the trailing input at this position, and references
+    /// to it are rewritten into operand form against that input.
+    Operand(usize),
+
+    /// The referenced residual stays a factor payload, re-indexed to this position.
+    Capture(usize),
+}
+
+/// Linear operation family whose nested programs can rewrite loop-varying captures into explicit operands.
 ///
 /// Unbounded [`WhileOperation`] JVPs build one fused doubled-state loop whose body recomputes the primal state and
 /// then replays the body pushforward. Pushforward operations can contain [`ValueOrCapture::Capture`] payloads that
 /// refer to residuals produced by the recomputed primal half of the same fused loop iteration. Those residuals are not
 /// closed-over constants anymore, so the operation family must rewrite such captures into ordinary operand atoms.
 ///
-/// This trait is intentionally narrower than the rest of the while JVP machinery. Recomputed primal instructions,
-/// residual injections, and the final fused while operation are staged directly through their payload operation types
-/// and ordinary `From<...>` conversions. Implementors only own the operation-specific capture-to-operand rewrite.
-pub trait DefactorizableOperation: Clone + Sized {
+/// This trait plays the same fixed-point role for defactorization that
+/// [`TransposableProgramOperation`] plays for transposition: higher-order payloads can recursively defactorize nested
+/// branch or scan-body programs without naming a concrete wrapper enum such as
+/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation). Recomputed primal instructions, residual
+/// injections, and the final fused while operation are staged directly through their payload operation types and
+/// ordinary `From<...>` conversions. Implementors own only the operation-family capture-to-operand rewrite.
+pub trait DefactorizableProgramOperation<V: Value<ArrayType>, R: Value<ArrayType>, P: Operation<ArrayType>>:
+    Clone + Operation<ArrayType> + Sized
+{
     /// Rewrites this operation's loop-varying [`ValueOrCapture::Capture`] factors into operand form against
     /// `residual_atoms`, where `residual_atoms[i]` is the fused-body atom carrying residual `i`.
     ///
@@ -132,15 +154,139 @@ pub trait DefactorizableOperation: Clone + Sized {
     ///
     ///   - `residual_atoms`: Fused-body atoms carrying the recomputed residual values, indexed by residual index.
     ///   - `inputs`: Already-remapped operand atoms of this operation inside the fused body.
-    fn defactorize(
+    fn defactorize_operation(
         &self,
         residual_atoms: &[AtomId],
         inputs: Vec<AtomId>,
     ) -> Result<DefactorizedOperation<Self>, ProgramError>;
+
+    /// Rewrites a nested linear `program`'s capture references into operand form against new trailing inputs.
+    ///
+    /// The returned program consumes `[original_inputs..., forwarded_inputs...]` with one trailing input per entry of
+    /// `forwarded_input_types`. Each instruction is rewritten according to `dispositions`, indexed by the program's
+    /// capture-reference namespace:
+    ///
+    ///   - Instructions whose references all map to [`DefactorizationDisposition::Capture`] keep their capture form
+    ///     with the references re-indexed to the compacted capture positions.
+    ///   - Instructions whose references all map to [`DefactorizationDisposition::Operand`] are rewritten into
+    ///     operand form against the trailing input atoms through
+    ///     [`Self::defactorize_operation`].
+    ///   - Instructions referencing both kinds are rejected because one source instruction is rewritten to at most
+    ///     one target instruction.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Nested flat linear program to rewrite.
+    ///   - `dispositions`: Per-capture rewrite disposition, indexed by the source program capture index.
+    ///   - `forwarded_input_types`: Types of the trailing inputs added for operand-form captures.
+    fn defactorize_program(
+        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        dispositions: &[Option<DefactorizationDisposition>],
+        forwarded_input_types: &[ArrayType],
+    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
+    where
+        Self: CaptureParameterizedOperation<
+                ArrayType,
+                ValueOrCapture<ArrayType, R>,
+                WithCapture<ValueOrCapture<ArrayType, R>> = Self,
+            >,
+    {
+        let mut builder = ProgramBuilder::<ArrayType, V, Self>::new();
+        let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
+        for (program_atom, input_type) in program.input_ids().iter().zip(program.input_types().into_iter()) {
+            atom_map[program_atom.index()] = Some(builder.add_input(input_type));
+        }
+        let forwarded_atoms = forwarded_input_types
+            .iter()
+            .map(|forwarded_type| builder.add_input(forwarded_type.clone()))
+            .collect::<Vec<_>>();
+        for (atom_index, atom) in program.atoms().iter().enumerate() {
+            if let Atom::Constant(constant) = atom {
+                atom_map[atom_index] = Some(builder.add_constant(constant.clone()));
+            }
+        }
+        let map_atom = |atom_map: &[Option<AtomId>], atom: AtomId| {
+            atom_map.get(atom.index()).copied().flatten().ok_or(ProgramError::UnboundAtomId { id: atom })
+        };
+        let resolve_disposition = |index: usize| {
+            dispositions.get(index).copied().flatten().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "nested linear program references residual {index} but only {} residuals were dispositioned",
+                    dispositions.len(),
+                ))
+            })
+        };
+        for instruction in program.instructions() {
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .map(|input| map_atom(atom_map.as_slice(), *input))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut references_operand_residual = false;
+            let mut references_capture_residual = false;
+            instruction.operation().try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
+                if let ValueOrCapture::Capture { index, .. } = factor {
+                    match resolve_disposition(*index)? {
+                        DefactorizationDisposition::Operand(_) => references_operand_residual = true,
+                        DefactorizationDisposition::Capture(_) => references_capture_residual = true,
+                    }
+                }
+                Ok(factor.clone())
+            })?;
+            if references_operand_residual && references_capture_residual {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "jvp of a while loop whose body pushforward stages {} over a mix of loop-varying and \
+                         constant-stack residual references is not supported",
+                        instruction.operation().name(),
+                    ),
+                });
+            }
+            let remapped = instruction.operation().try_map_captures(&mut |factor| match factor {
+                ValueOrCapture::Capture { index, r#type } => {
+                    let position = match resolve_disposition(*index)? {
+                        DefactorizationDisposition::Operand(position) => position,
+                        DefactorizationDisposition::Capture(position) => position,
+                    };
+                    Ok(ValueOrCapture::Capture { index: position, r#type: r#type.clone() })
+                }
+                ValueOrCapture::Value(value) => Ok(ValueOrCapture::Value(value.clone())),
+            })?;
+            if !references_operand_residual {
+                let outputs = builder.add_instruction(remapped, inputs)?.to_vec();
+                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
+                    atom_map[program_atom.index()] = Some(builder_atom);
+                }
+                continue;
+            }
+            match remapped.defactorize_operation(forwarded_atoms.as_slice(), inputs)? {
+                DefactorizedOperation::Operation { operation, inputs } => {
+                    let outputs = builder.add_instruction(operation, inputs)?.to_vec();
+                    check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                    for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
+                        atom_map[program_atom.index()] = Some(builder_atom);
+                    }
+                }
+                DefactorizedOperation::Forward { atom } => {
+                    check_count!("output", instruction.outputs(), 1, ProgramError);
+                    atom_map[instruction.outputs()[0].index()] = Some(atom);
+                }
+            }
+        }
+        let outputs = program
+            .output_ids()
+            .iter()
+            .map(|output| map_atom(atom_map.as_slice(), *output))
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let input_count = program.input_ids().len() + forwarded_input_types.len();
+        let output_count = outputs.len();
+        builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
+    }
 }
 
 /// Result of rewriting one pushforward operation's residual references into operand form (see
-/// [`DefactorizableOperation::defactorize`]).
+/// [`DefactorizableProgramOperation::defactorize_operation`]).
 pub enum DefactorizedOperation<O> {
     /// Defactorized operation to stage over `inputs`.
     Operation {
@@ -156,6 +302,366 @@ pub enum DefactorizedOperation<O> {
         /// Atom carrying the operation's single output.
         atom: AtomId,
     },
+}
+
+/// Applies the standard captured-factor-to-operand rewrite for one linear program operation.
+///
+/// Operation families that use the standard linear payloads can implement
+/// [`DefactorizableProgramOperation::defactorize_operation`] by delegating to this helper. The helper is generic over
+/// the operation enum and uses that enum's generated borrowed `TryFrom` conversions to detect supported payloads, so
+/// the rewrite rules stay independent of concrete wrapper enums such as `LinearArrayOperation` or backend operation
+/// enums.
+///
+/// # Parameters
+///
+///   - `self_operation`: Operation whose loop-varying captures should be rewritten.
+///   - `residual_atoms`: Fused-body atoms carrying recomputed residual values, indexed by residual index.
+///   - `inputs`: Already-remapped operand atoms of `self_operation` inside the fused body.
+pub fn defactorize_operation_default<V, R, P, O>(
+    self_operation: &O,
+    residual_atoms: &[AtomId],
+    mut inputs: Vec<AtomId>,
+) -> Result<DefactorizedOperation<O>, ProgramError>
+where
+    V: Value<ArrayType>,
+    R: Value<ArrayType>,
+    P: Clone
+        + Operation<ArrayType>
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>,
+    O: Clone
+        + Operation<ArrayType>
+        + DefactorizableProgramOperation<V, R, P>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, R>,
+            WithCapture<ValueOrCapture<ArrayType, R>> = O,
+        > + From<RecomputeOperation<P>>
+        + From<LinearOperandConditionOperation<V, O>>
+        + From<
+            ScanOperation<
+                ArrayType,
+                V,
+                <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+                    ValueOrCapture<ArrayType, V>,
+                >,
+                ValueOrCapture<ArrayType, R>,
+            >,
+        >,
+    <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+        ValueOrCapture<ArrayType, V>,
+    >: DefactorizableProgramOperation<V, V, P>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, V>,
+            WithCapture<ValueOrCapture<ArrayType, V>> = <O as CaptureParameterizedOperation<
+                ArrayType,
+                ValueOrCapture<ArrayType, R>,
+            >>::WithCapture<ValueOrCapture<ArrayType, V>>,
+        > + From<RecomputeOperation<P>>
+        + From<
+            LinearOperandConditionOperation<
+                V,
+                <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+                    ValueOrCapture<ArrayType, V>,
+                >,
+            >,
+        > + From<
+            ScanOperation<
+                ArrayType,
+                V,
+                <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+                    ValueOrCapture<ArrayType, V>,
+                > as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<
+                    ValueOrCapture<ArrayType, V>,
+                >,
+                ValueOrCapture<ArrayType, V>,
+            >,
+        >,
+    for<'operation> &'operation ScaleOperation<ArrayType, ValueOrCapture<ArrayType, V>, Input>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation LeftDotOperation<ValueOrCapture<ArrayType, V>, Input>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation RightDotOperation<ValueOrCapture<ArrayType, V>, Input>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation LinearDynamicSliceOperation<ValueOrCapture<ArrayType, V>>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, V>>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation MaterializeCaptureOperation<ValueOrCapture<ArrayType, V>>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation LinearSelectOperation<ValueOrCapture<ArrayType, V>>: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation ConditionOperation<
+        ArrayType,
+        V,
+        <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+        ValueOrCapture<ArrayType, V>,
+        Captured,
+    >: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation ScanOperation<
+        ArrayType,
+        V,
+        <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        > as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+        ValueOrCapture<ArrayType, V>,
+    >: TryFrom<
+        &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+    >,
+    for<'operation> &'operation ScaleOperation<ArrayType, ValueOrCapture<ArrayType, R>, Input>: TryFrom<&'operation O>,
+    for<'operation> &'operation LeftDotOperation<ValueOrCapture<ArrayType, R>, Input>: TryFrom<&'operation O>,
+    for<'operation> &'operation RightDotOperation<ValueOrCapture<ArrayType, R>, Input>: TryFrom<&'operation O>,
+    for<'operation> &'operation LinearDynamicSliceOperation<ValueOrCapture<ArrayType, R>>: TryFrom<&'operation O>,
+    for<'operation> &'operation LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, R>>: TryFrom<&'operation O>,
+    for<'operation> &'operation MaterializeCaptureOperation<ValueOrCapture<ArrayType, R>>: TryFrom<&'operation O>,
+    for<'operation> &'operation LinearSelectOperation<ValueOrCapture<ArrayType, R>>: TryFrom<&'operation O>,
+    for<'operation> &'operation ConditionOperation<ArrayType, V, O, ValueOrCapture<ArrayType, R>, Captured>:
+        TryFrom<&'operation O>,
+    for<'operation> &'operation ScanOperation<
+        ArrayType,
+        V,
+        <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+        ValueOrCapture<ArrayType, R>,
+    >: TryFrom<&'operation O>,
+{
+    let resolve_residual_atom = |index: usize| {
+        residual_atoms.get(index).copied().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "while body pushforward references residual {index} but only {} residuals were captured",
+                residual_atoms.len(),
+            ))
+        })
+    };
+    if let Ok(operation) = <&ScaleOperation<ArrayType, ValueOrCapture<ArrayType, R>, Input>>::try_from(self_operation)
+        && let ValueOrCapture::Capture { index, .. } = operation.factor()
+    {
+        inputs.insert(0, resolve_residual_atom(*index)?);
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(RecomputeOperation::new(P::from(MulOperation))),
+            inputs,
+        });
+    }
+    if let Ok(operation) = <&LeftDotOperation<ValueOrCapture<ArrayType, R>, Input>>::try_from(self_operation)
+        && let ValueOrCapture::Capture { index, .. } = operation.factor()
+    {
+        inputs.insert(0, resolve_residual_atom(*index)?);
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(RecomputeOperation::new(P::from(
+                DotOperation::new(operation.dimensions().clone())
+                    .with_output_sharding(operation.output_sharding().cloned()),
+            ))),
+            inputs,
+        });
+    }
+    if let Ok(operation) = <&RightDotOperation<ValueOrCapture<ArrayType, R>, Input>>::try_from(self_operation)
+        && let ValueOrCapture::Capture { index, .. } = operation.factor()
+    {
+        inputs.push(resolve_residual_atom(*index)?);
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(RecomputeOperation::new(P::from(
+                DotOperation::new(operation.dimensions().clone())
+                    .with_output_sharding(operation.output_sharding().cloned()),
+            ))),
+            inputs,
+        });
+    }
+    if let Ok(operation) = <&LinearDynamicSliceOperation<ValueOrCapture<ArrayType, R>>>::try_from(self_operation)
+        && operation.start_indices().iter().any(|index| matches!(index, ValueOrCapture::Capture { .. }))
+    {
+        for start_index in operation.start_indices() {
+            let ValueOrCapture::Capture { index, .. } = start_index else {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "jvp of a while loop whose body captures a mix of loop-varying and constant \
+                                  dynamic_slice start indices is not supported"
+                        .to_string(),
+                });
+            };
+            inputs.push(resolve_residual_atom(*index)?);
+        }
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(RecomputeOperation::new(P::from(DynamicSliceOperation::new(
+                operation.sizes().to_vec(),
+            )))),
+            inputs,
+        });
+    }
+    if let Ok(operation) = <&LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, R>>>::try_from(self_operation)
+        && operation.start_indices().iter().any(|index| matches!(index, ValueOrCapture::Capture { .. }))
+    {
+        for start_index in operation.start_indices() {
+            let ValueOrCapture::Capture { index, .. } = start_index else {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "jvp of a while loop whose body captures a mix of loop-varying and constant \
+                                  dynamic_update_slice start indices is not supported"
+                        .to_string(),
+                });
+            };
+            inputs.push(resolve_residual_atom(*index)?);
+        }
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(RecomputeOperation::new(P::from(DynamicUpdateSliceOperation))),
+            inputs,
+        });
+    }
+    if let Ok(operation) = <&MaterializeCaptureOperation<ValueOrCapture<ArrayType, R>>>::try_from(self_operation)
+        && let ValueOrCapture::Capture { index, .. } = operation.capture()
+    {
+        return Ok(DefactorizedOperation::Forward { atom: resolve_residual_atom(*index)? });
+    }
+    if let Ok(operation) = <&LinearSelectOperation<ValueOrCapture<ArrayType, R>>>::try_from(self_operation)
+        && let ValueOrCapture::Capture { index, .. } = operation.condition()
+    {
+        inputs.insert(0, resolve_residual_atom(*index)?);
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(RecomputeOperation::new(P::from(SelectOperation))),
+            inputs,
+        });
+    }
+    if let Ok(operation) =
+        <&ConditionOperation<ArrayType, V, O, ValueOrCapture<ArrayType, R>, Captured>>::try_from(self_operation)
+        && let ValueOrCapture::Capture { index, .. } = operation.predicate()
+    {
+        let predicate_atom = resolve_residual_atom(*index)?;
+        let mut forwarded_residuals = BTreeMap::new();
+        for branch in [operation.true_branch(), operation.false_branch()] {
+            for instruction in branch.instructions() {
+                instruction.operation().try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
+                    if let ValueOrCapture::Capture { index, r#type } = factor {
+                        forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
+                    }
+                    Ok(factor.clone())
+                })?;
+            }
+        }
+        let mut dispositions = vec![None; residual_atoms.len()];
+        let mut forwarded_types = Vec::with_capacity(forwarded_residuals.len());
+        let mut forwarded_atoms = Vec::with_capacity(forwarded_residuals.len());
+        for (position, (residual_index, residual_type)) in forwarded_residuals.into_iter().enumerate() {
+            forwarded_atoms.push(resolve_residual_atom(residual_index)?);
+            dispositions[residual_index] = Some(DefactorizationDisposition::Operand(position));
+            forwarded_types.push(residual_type);
+        }
+        let true_branch = <O as DefactorizableProgramOperation<V, R, P>>::defactorize_program(
+            operation.true_branch(),
+            dispositions.as_slice(),
+            forwarded_types.as_slice(),
+        )?;
+        let false_branch = <O as DefactorizableProgramOperation<V, R, P>>::defactorize_program(
+            operation.false_branch(),
+            dispositions.as_slice(),
+            forwarded_types.as_slice(),
+        )?;
+        let mut condition_inputs = Vec::with_capacity(1 + inputs.len() + forwarded_atoms.len());
+        condition_inputs.push(predicate_atom);
+        condition_inputs.extend(inputs);
+        condition_inputs.extend(forwarded_atoms);
+        return Ok(DefactorizedOperation::Operation {
+            operation: O::from(LinearOperandConditionOperation::new(Box::new(true_branch), Box::new(false_branch))),
+            inputs: condition_inputs,
+        });
+    }
+    if let Ok(operation) = <&ScanOperation<
+        ArrayType,
+        V,
+        <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        >,
+        ValueOrCapture<ArrayType, R>,
+    >>::try_from(self_operation)
+        && operation.captures().iter().any(|stack| matches!(stack, ValueOrCapture::Capture { .. }))
+    {
+        let mut dispositions = Vec::with_capacity(operation.captures().len());
+        let mut lane_types = Vec::new();
+        let mut moved_stack_atoms = Vec::new();
+        let mut surviving_stacks = Vec::new();
+        for stack in operation.captures() {
+            match stack {
+                ValueOrCapture::Capture { index, r#type } => {
+                    dispositions.push(Some(DefactorizationDisposition::Operand(lane_types.len())));
+                    lane_types.push(r#type.without_dimension(0)?.0);
+                    moved_stack_atoms.push(resolve_residual_atom(*index)?);
+                }
+                constant_stack => {
+                    dispositions.push(Some(DefactorizationDisposition::Capture(surviving_stacks.len())));
+                    surviving_stacks.push(constant_stack.clone());
+                }
+            }
+        }
+        let body = <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+            ValueOrCapture<ArrayType, V>,
+        > as DefactorizableProgramOperation<V, V, P>>::defactorize_program(
+            operation.body(),
+            dispositions.as_slice(),
+            lane_types.as_slice(),
+        )?;
+        inputs.extend(moved_stack_atoms);
+        let scan = ScanOperation::<
+            ArrayType,
+            V,
+            <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
+                ValueOrCapture<ArrayType, V>,
+            >,
+        >::new(body, operation.carry_count(), operation.length())?
+        .with_reverse(operation.reverse())
+        .with_unroll(operation.unroll())?
+        .with_captures(surviving_stacks);
+        return Ok(DefactorizedOperation::Operation { operation: O::from(scan), inputs });
+    }
+
+    let mut references_residual = false;
+    self_operation.try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
+        if matches!(factor, ValueOrCapture::Capture { .. }) {
+            references_residual = true;
+        }
+        Ok(factor.clone())
+    })?;
+    if references_residual {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "jvp of a while loop whose body pushforward stages {} over a loop-varying residual reference \
+                     is not supported",
+                self_operation.name(),
+            ),
+        });
+    }
+    Ok(DefactorizedOperation::Operation { operation: self_operation.clone(), inputs })
 }
 
 /// Appends one fresh variable atom to a built `program` by direct program-field extension (every appended atom is a
@@ -399,24 +905,44 @@ where
     program.output_ids().iter().map(|output| map_atom(atom_map.as_slice(), *output)).collect()
 }
 
-/// Inlines a body pushforward `program` into the linear `builder`, mapping the program's tangent input atoms onto
-/// `input_atoms` and rewriting loop-varying [`ValueOrCapture::Capture`] factors into operand form against
-/// `residual_atoms` through [`DefactorizableOperation::defactorize`]. Returns the builder atoms carrying the program
-/// outputs.
-fn inline_defactorized_pushforward_program<E>(
+/// Defactorizes a body pushforward `program`, inlines it into the linear `builder`, and returns the builder atoms
+/// carrying the program outputs.
+fn inline_defactorized_pushforward_program<E, O>(
     builder: &mut ProgramBuilder<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>,
     program: &Program<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>, Vec<E::Tangent>, Vec<E::Tangent>>,
     input_atoms: &[AtomId],
     residual_atoms: &[AtomId],
+    residual_types: &[ArrayType],
 ) -> Result<Vec<AtomId>, ProgramError>
 where
-    E: DifferentiationContext,
-    LinearOperationOf<E>: DefactorizableOperation,
+    E: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    O: Clone + Operation<ArrayType>,
+    LinearOperationOf<E>: DefactorizableProgramOperation<E::Tangent, E::Value, O>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, E::Value>,
+            WithCapture<ValueOrCapture<ArrayType, E::Value>> = LinearOperationOf<E>,
+        >,
 {
+    if residual_atoms.len() != residual_types.len() {
+        return Err(ProgramError::InvalidInputCount { expected: residual_types.len(), actual: residual_atoms.len() });
+    }
+    let dispositions = residual_types
+        .iter()
+        .enumerate()
+        .map(|(index, _)| Some(DefactorizationDisposition::Operand(index)))
+        .collect::<Vec<_>>();
+    let program =
+        <LinearOperationOf<E> as DefactorizableProgramOperation<E::Tangent, E::Value, O>>::defactorize_program(
+            program,
+            dispositions.as_slice(),
+            residual_types,
+        )?;
+    let input_atoms = input_atoms.iter().chain(residual_atoms.iter()).copied().collect::<Vec<_>>();
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
-    for (program_atom, builder_atom) in program.input_ids().iter().zip(input_atoms.iter()) {
-        atom_map[program_atom.index()] = Some(*builder_atom);
+    for (program_atom, builder_atom) in program.input_ids().iter().zip(input_atoms.into_iter()) {
+        atom_map[program_atom.index()] = Some(builder_atom);
     }
     for (atom_index, atom) in program.atoms().iter().enumerate() {
         if let Atom::Constant(constant) = atom {
@@ -432,18 +958,10 @@ where
             .iter()
             .map(|input| map_atom(atom_map.as_slice(), *input))
             .collect::<Result<Vec<_>, _>>()?;
-        match instruction.operation().defactorize(residual_atoms, inputs)? {
-            DefactorizedOperation::Operation { operation, inputs } => {
-                let outputs = builder.add_instruction(operation, inputs)?.to_vec();
-                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-                for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
-                    atom_map[program_atom.index()] = Some(builder_atom);
-                }
-            }
-            DefactorizedOperation::Forward { atom } => {
-                check_count!("output", instruction.outputs(), 1, ProgramError);
-                atom_map[instruction.outputs()[0].index()] = Some(atom);
-            }
+        let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+        for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
+            atom_map[program_atom.index()] = Some(builder_atom);
         }
     }
     program.output_ids().iter().map(|output| map_atom(atom_map.as_slice(), *output)).collect()
@@ -475,10 +993,14 @@ fn build_fused_while_programs<E, O>(
     ProgramError,
 >
 where
-    E: DifferentiationContext + Domain<Operation = O>,
-    O: Clone + Operation<<E as Domain>::Type>,
-    LinearOperationOf<E>: DefactorizableOperation
-        + From<MaterializeCaptureOperation<ValueOrCapture<<E as Domain>::Type, E::Value>>>
+    E: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    O: Clone + Operation<ArrayType>,
+    LinearOperationOf<E>: DefactorizableProgramOperation<E::Tangent, E::Value, O>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, E::Value>,
+            WithCapture<ValueOrCapture<ArrayType, E::Value>> = LinearOperationOf<E>,
+        > + From<MaterializeCaptureOperation<ValueOrCapture<<E as Domain>::Type, E::Value>>>
         + From<RecomputeOperation<O>>,
 {
     let state_types = condition.input_types();
@@ -497,11 +1019,12 @@ where
         primal_inputs.as_slice(),
     )?;
     check_count!("output", primal_outputs, state_count + residual_count, ProgramError);
-    let tangent_outputs = inline_defactorized_pushforward_program::<E>(
+    let tangent_outputs = inline_defactorized_pushforward_program::<E, O>(
         &mut body_builder,
         &linearization.pushforward_program,
         tangent_inputs.as_slice(),
         &primal_outputs[state_count..],
+        linearization.residual_types.as_slice(),
     )?;
     check_count!("output", tangent_outputs, state_count, ProgramError);
     let mut body_outputs = primal_outputs[..state_count].to_vec();
@@ -794,9 +1317,9 @@ where
     }
 }
 
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for WhileOperation<ArrayType, V, O>
+impl<T: Type, V: Value<T>, O> TransposableOperation<T, V, O> for WhileOperation<T, V, O>
 where
-    O: Operation<ArrayType>,
+    O: Operation<T>,
 {
     /// Rejects transposition. This rule is only reachable for *unbounded* staged while loops — the doubled-state
     /// fused linear loop staged by the [`WhileOperation`] JVP rule, which recomputes primal state *forward* through
@@ -808,16 +1331,111 @@ where
     /// scan transpose without reaching this rule.
     fn transpose<'transpose>(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        _input_types: &[&ArrayType],
-        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
+        _input_types: &[&T],
+        _output_cotangents: &[Cotangent<'transpose, T, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "while does not support transposition (reverse-mode differentiation through staged unbounded \
                       while loops is not supported; eager differentiation unrolls the loop instead, and loops built \
                       with `with_iteration_bound` stage a transposable masked scan)"
                 .to_string(),
         })
+    }
+}
+
+impl<V, D, O> DifferentiableOperation<D> for WhileOperation<DataType, V, O>
+where
+    V: Value<DataType>,
+    D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = O>,
+    D::Value: BooleanLike,
+    O: Clone + Operation<DataType> + LinearizableProgramOperation<D>,
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            DataType,
+            ValueOrCapture<DataType, D::Value>,
+            WithCapture<ValueOrCapture<DataType, D::Value>> = LinearOperationOf<D>,
+        >,
+    Vec<V>: Parameterized<
+            V,
+            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
+            To<D::Value> = Vec<D::Value>,
+            To<D::Tangent> = Vec<D::Tangent>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+{
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, D>,
+        inputs: &[JvpTracer<'jvp, D>],
+    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+    where
+        D: 'jvp,
+    {
+        let state_count = self.state_types().len();
+        check_count!("input", inputs, state_count, ProgramError);
+        if !context.differentiable().supports_primal_concretization() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "staged scalar while JVP requires scalar residual-stack or defactorization support"
+                    .to_string(),
+            });
+        }
+
+        let linearization = self.body().linearize(context.differentiable())?;
+        let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let mut state_tangents = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
+        let mut completed_iterations = 0;
+        loop {
+            if self.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                return Ok(state_primals
+                    .into_iter()
+                    .zip(state_tangents)
+                    .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
+                    .collect());
+            }
+            let condition_outputs = self.condition().interpret_with(
+                state_primals.clone(),
+                |_, constant| context.differentiable().lift(constant.clone()),
+                |instruction, instruction_inputs| {
+                    context.differentiable().bind(instruction.operation().clone(), instruction_inputs)
+                },
+            )?;
+            check_count!("output", condition_outputs, 1, ProgramError);
+            if !condition_outputs[0].boolean()? {
+                return Ok(state_primals
+                    .into_iter()
+                    .zip(state_tangents)
+                    .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
+                    .collect());
+            }
+
+            let (next_primals, pushforward) = linearization.at(context.differentiable(), state_primals.clone())?;
+            check_count!("output", next_primals, state_count, ProgramError);
+            let residual_factors =
+                pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
+            let next_tangents = pushforward.program().interpret_with(
+                state_tangents,
+                |_, tangent| context.lift(tangent.clone()),
+                |instruction, tangent_inputs| {
+                    let operation = instruction.operation().try_map_captures(&mut |factor| match factor {
+                        ValueOrCapture::Capture { index, .. } => {
+                            residual_factors.get(*index).cloned().ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "while body pushforward references residual {index} but only {} residuals \
+                                     were captured",
+                                    residual_factors.len(),
+                                ))
+                            })
+                        }
+                        ValueOrCapture::Value(value) => Ok(ValueOrCapture::Value(value.clone())),
+                    })?;
+                    context.stage_operation(operation, tangent_inputs)
+                },
+            )?;
+            check_count!("output", next_tangents, state_count, ProgramError);
+            state_primals = next_primals;
+            state_tangents = next_tangents;
+            completed_iterations += 1;
+        }
     }
 }
 
@@ -905,9 +1523,12 @@ where
         + From<AddOperation>
         + From<BroadcastOperation>
         + From<DynamicUpdateSliceOperation>,
-    LinearOperationOf<D>: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>>
-        + ResidualizedOperation<D>
-        + DefactorizableOperation
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, D::Value>,
+            WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
+        > + ResidualizedOperation<D>
+        + DefactorizableProgramOperation<D::Tangent, D::Value, O>
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<RecomputeOperation<O>>
         + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>>>
@@ -1907,7 +2528,8 @@ where
 }
 
 /// Operand-form conditional linear operation: the operand-form counterpart of captured-predicate
-/// [`ConditionOperation`] produced by [`DefactorizableOperation::defactorize`] for fused while bodies.
+/// [`ConditionOperation`] produced by [`DefactorizableProgramOperation::defactorize_operation`] for fused while
+/// bodies.
 ///
 /// It is the counterpart of the `OperandCondition` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation): the Boolean predicate is operand `0` (recomputed
@@ -2545,8 +3167,8 @@ mod tests {
         }
     }
 
-    impl DefactorizableOperation for TestLinearOperation {
-        fn defactorize(
+    impl DefactorizableProgramOperation<TestValue, TestValue, TestDifferentiableOperation> for TestLinearOperation {
+        fn defactorize_operation(
             &self,
             residual_atoms: &[AtomId],
             inputs: Vec<AtomId>,

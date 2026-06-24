@@ -426,7 +426,7 @@ impl BooleanLike for ArrayType {
     }
 }
 
-impl<C: Context<Type = ArrayType>> BooleanLike for Tracer<C> {
+impl<C: Context> BooleanLike for Tracer<C> {
     #[inline]
     fn as_boolean(&self) -> Self {
         // Returns this `Tracer` unchanged. Tracers carry no concrete payload to reinterpret, and a staged Boolean

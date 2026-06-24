@@ -4,12 +4,48 @@ use crate::macros::{check_count, check_types};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
 
 /// Canonical operation name for [`WhileOperation`].
 pub const WHILE_OPERATION_NAME: &'static str = "while";
+
+/// Type-family semantics for [`WhileOperation`].
+///
+/// [`ArrayType`] conditions must produce a rank-0 Boolean array value, while [`DataType`] conditions must produce a
+/// scalar Boolean data type. The loop-carried state rule is otherwise identical for both type families: the condition
+/// and body consume the same state signature, and the body returns the next state with that same signature.
+pub trait WhileTypeSemantics: Type {
+    /// Validates the condition output type of a while loop.
+    ///
+    /// # Parameters
+    ///
+    ///   - `condition_output`: The single output type produced by the condition program.
+    fn validate_while_condition_output(condition_output: &Self) -> Result<(), TypeError>;
+}
+
+impl WhileTypeSemantics for ArrayType {
+    fn validate_while_condition_output(condition_output: &Self) -> Result<(), TypeError> {
+        if !condition_output.is_scalar() || condition_output != &condition_output.as_boolean() {
+            return Err(TypeError {
+                message: format!("while condition output type must be a scalar boolean, but got {condition_output}"),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl WhileTypeSemantics for DataType {
+    fn validate_while_condition_output(condition_output: &Self) -> Result<(), TypeError> {
+        if condition_output != &DataType::Boolean {
+            return Err(TypeError {
+                message: format!("while condition output type must be bool, but got {condition_output}"),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// [`Operation`] that repeatedly applies a nested body [`Program`] to a loop-carried state while a nested condition
 /// [`Program`] over that same state produces a true scalar Boolean predicate. The condition and body consume identical
@@ -60,7 +96,7 @@ where
     pub(crate) iteration_bound: Option<usize>,
 }
 
-impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<ArrayType, V, O> {
+impl<T: WhileTypeSemantics, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O> {
     /// Creates a new [`WhileOperation`] with the provided condition and body programs.
     ///
     /// # Parameters
@@ -69,8 +105,8 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<ArrayType, V, 
     ///   - `body`: Body [`Program`] that maps the loop-carried state to the next loop state. This program must
     ///     consume and produce the same state type signature that `condition` consumes.
     pub fn new(
-        condition: Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-        body: Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+        condition: Program<T, V, O, Vec<V>, Vec<V>>,
+        body: Program<T, V, O, Vec<V>, Vec<V>>,
     ) -> Result<Self, TypeError> {
         let state_types = condition.input_types();
         check_types!("while condition/body input", &state_types, &body.input_types());
@@ -83,15 +119,7 @@ impl<V: Value<ArrayType>, O: Operation<ArrayType>> WhileOperation<ArrayType, V, 
                 ),
             });
         }
-        if !condition_output_types[0].is_scalar() || condition_output_types[0] != condition_output_types[0].as_boolean()
-        {
-            return Err(TypeError {
-                message: format!(
-                    "while condition output type must be a scalar boolean, but got {}",
-                    condition_output_types[0],
-                ),
-            });
-        }
+        T::validate_while_condition_output(&condition_output_types[0])?;
         check_types!("while body output", &state_types, &body.output_types());
         Ok(Self { condition, body, iteration_bound: None })
     }
@@ -176,15 +204,16 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<T, V
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for WhileOperation<ArrayType, V, O>
+impl<T, V, O> InterpretableOperation<T, V> for WhileOperation<T, V, O>
 where
-    V: Value<ArrayType> + BooleanLike,
-    O: InterpretableOperation<ArrayType, V>,
+    T: WhileTypeSemantics,
+    V: Value<T> + BooleanLike,
+    O: InterpretableOperation<T, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret(
         &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();

@@ -11,10 +11,9 @@ use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::tracing_v2::operations::primitive::gather_to_scatter_operation;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
-use super::scatter::LinearScatterAddOperation;
+use super::scatter::{LinearScatterAddOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 use super::slicing::is_integer;
 
 // TODO(eaplatanios): Review this module.
@@ -852,8 +851,8 @@ where
 /// Transpose rule for the captured-index gather (the `Gather` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The forward linear map
 /// `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the output cotangent back into a
-/// zero operand at the gathered windows: the scatter geometry mirrors the gather axis-for-axis (see
-/// [`gather_to_scatter_operation`]) and the captured indices carry over. Symbolic-zero cotangents propagate unchanged.
+/// zero operand at the gathered windows: the scatter geometry mirrors the gather axis-for-axis and the captured
+/// indices carry over. Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O> for LinearGatherOperation<F>
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearScatterAddOperation<F>>,
@@ -870,11 +869,22 @@ where
             Cotangent::Zero => Ok(vec![Cotangent::Zero]),
             Cotangent::Staged(cotangent) => {
                 let zeros = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+                let dimensions = self.operation().dimensions();
+                let scatter_dimensions = ScatterDimensionNumbers::new(
+                    dimensions.offset_dimensions().to_vec(),
+                    dimensions.collapsed_slice_dimensions().to_vec(),
+                    dimensions.start_index_map().to_vec(),
+                )
+                .with_batching_dimensions(
+                    dimensions.operand_batching_dimensions().to_vec(),
+                    dimensions.start_indices_batching_dimensions().to_vec(),
+                );
+                let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
+                    .with_mode(self.operation().mode())
+                    .with_indices_are_sorted(self.operation().indices_are_sorted())
+                    .with_unique_indices(self.operation().unique_indices());
                 let outputs = context.stage_operation(
-                    LinearScatterAddOperation::new(
-                        gather_to_scatter_operation(self.operation()),
-                        self.indices().clone(),
-                    ),
+                    LinearScatterAddOperation::new(scatter_operation, self.indices().clone()),
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);

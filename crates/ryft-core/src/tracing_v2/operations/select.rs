@@ -10,7 +10,7 @@ use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::operations::primitive::transpose_captured_condition_select;
+use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, LinearOperationOf, ValueOrCapture};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -153,9 +153,8 @@ where
 /// `(t, f) ↦ select(condition, t, f)` routes the output cotangent into the branch the captured condition selected:
 /// the `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
 /// `select(condition, 0, cotangent)`. The transposed select reuses the same captured condition, reconstructed from
-/// `self` and staged via [`transpose_captured_condition_select`]. The impl is generic over the primary type `T` and
-/// applies wherever `LinearSelectOperation<F>` implements [`Operation`] for `T` (i.e., [`DataType`] and
-/// [`ArrayType`]).
+/// `self` and staged back into the transpose builder. The impl is generic over the primary type `T` and applies
+/// wherever `LinearSelectOperation<F>` implements [`Operation`] for `T` (i.e., [`DataType`] and [`ArrayType`]).
 impl<T: Type, V: Value<T>, O: Operation<T>, F: Clone> TransposableOperation<T, V, O> for LinearSelectOperation<F>
 where
     Self: Operation<T>,
@@ -167,12 +166,23 @@ where
         input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
-        transpose_captured_condition_select(
-            || O::from(LinearSelectOperation::new(self.condition().clone())),
-            context,
-            input_types,
-            output_cotangents,
-        )
+        check_count!("input", input_types, 2, ProgramError);
+        check_count!("output", output_cotangents, 1, ProgramError);
+        match &output_cotangents[0] {
+            Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+            Cotangent::Staged(cotangent) => {
+                let zero = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+                let operation = || O::from(LinearSelectOperation::new(self.condition().clone()));
+                let on_true = context.stage_operation(operation(), &[cotangent.clone(), zero.clone()])?;
+                check_count!("output", on_true, 1, ProgramError);
+                let on_false = context.stage_operation(operation(), &[zero, cotangent.clone()])?;
+                check_count!("output", on_false, 1, ProgramError);
+                Ok(vec![
+                    Cotangent::Staged(on_true.into_iter().next().unwrap()),
+                    Cotangent::Staged(on_false.into_iter().next().unwrap()),
+                ])
+            }
+        }
     }
 }
 

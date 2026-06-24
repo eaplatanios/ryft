@@ -640,7 +640,7 @@ mod tests {
     use crate::operations::manipulation::{LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation};
     use crate::programs::AtomId;
     use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing_v2::operations::control_flow::{DefactorizableOperation, DefactorizedOperation};
+    use crate::tracing_v2::operations::control_flow::{DefactorizableProgramOperation, DefactorizedOperation};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{
@@ -1152,7 +1152,7 @@ mod tests {
             vec![2],
         ));
         let residual_atoms = vec![AtomId::new(7), AtomId::new(9)];
-        match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
+        match operation.defactorize_operation(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
                 let TestLinearOperation::Recompute(recompute) = operation else {
                     panic!("expected a recomputed dynamic slice");
@@ -1170,7 +1170,10 @@ mod tests {
         let operation = TestLinearOperation::DynamicUpdateSlice(LinearDynamicUpdateSliceOperation::new(vec![
             ValueOrCapture::Capture { index: 0, r#type: ArrayType::scalar(DataType::I32) },
         ]));
-        match operation.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]).unwrap() {
+        match operation
+            .defactorize_operation(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)])
+            .unwrap()
+        {
             DefactorizedOperation::Operation { operation, inputs } => {
                 let TestLinearOperation::Recompute(recompute) = operation else {
                     panic!("expected a recomputed dynamic update slice");
@@ -1187,7 +1190,7 @@ mod tests {
             ValueOrCapture::Value(index(0.0)),
         ]));
         assert!(matches!(
-            mixed.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]),
+            mixed.defactorize_operation(residual_atoms.as_slice(), vec![AtomId::new(3), AtomId::new(4)]),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "jvp of a while loop whose body captures a mix of loop-varying and constant \
                     dynamic_update_slice start indices is not supported",
@@ -1198,7 +1201,7 @@ mod tests {
             vec![ValueOrCapture::Value(index(1.0))],
             vec![2],
         ));
-        match constant.defactorize(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
+        match constant.defactorize_operation(residual_atoms.as_slice(), vec![AtomId::new(3)]).unwrap() {
             DefactorizedOperation::Operation { operation, inputs } => {
                 assert!(matches!(operation, TestLinearOperation::DynamicSlice(_)));
                 assert_eq!(inputs, vec![AtomId::new(3)]);

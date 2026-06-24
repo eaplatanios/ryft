@@ -5,7 +5,6 @@
 //! backend-specific variants, so transform, interpretation, and lowering rules remain statically typed and owned by
 //! the backend that understands each operation.
 
-use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 
@@ -13,7 +12,6 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::batching::BatchingError;
 use crate::contexts::{Context, EagerContext, StagingContext};
-use crate::differentiation::Cotangent;
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
@@ -33,16 +31,16 @@ use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOpe
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     GatherOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation,
-    LinearScatterAddOperation, PadOperation, ReshapeOperation, ScatterDimensionNumbers, ScatterOperation,
-    ScatterReductionKind, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSliceOperation,
+    LinearScatterAddOperation, PadOperation, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
+    TransposeOperation, UpdateSliceOperation,
 };
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation};
-use crate::parameters::{Parameter, Parameterized, Placeholder};
+use crate::parameters::{Parameter, Parameterized};
 use crate::payloads::{Captured, Input};
-use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::programs::{AtomId, Program, ProgramError, Value};
+use crate::tracing::Tracer;
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingContext,
     ProgramBatchingOutputAxes,
@@ -63,7 +61,7 @@ use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{DifferentiableOperation, RematerializationName, ResidualizedOperation, ValueOrCapture};
-use crate::types::{ArrayType, Type, Typed};
+use crate::types::{ArrayType, Typed};
 
 use super::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
@@ -72,8 +70,8 @@ use super::bounds::{
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
-    DefactorizableOperation, DefactorizedOperation, LinearOperandConditionOperation, batch_condition_with_interpreter,
-    batch_while_with_interpreter,
+    DefactorizableProgramOperation, DefactorizedOperation, LinearOperandConditionOperation,
+    batch_condition_with_interpreter, batch_while_with_interpreter, defactorize_operation_default,
 };
 use super::dot::DotOps;
 use super::scan::{LinearScanInterpretation, LinearScanOperation};
@@ -223,11 +221,15 @@ where
                 ValueOrCapture<ArrayType, D::Value>,
                 Captured,
             >,
-        > + DefactorizableOperation
-        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
+        > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<RecomputeOperation<ArrayOperation<V>>>
         + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, D::Value>,
+            WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
+        > + DefactorizableProgramOperation<D::Tangent, D::Value, ArrayOperation<V>>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<V>: Clone + LinearizableProgramOperation<D>,
 {
@@ -367,390 +369,6 @@ where
         match self {
             Self::Dot(operation) => Some(operation.dimensions()),
             _ => None,
-        }
-    }
-}
-
-/// Disposition of one residual-reference index while defactorizing a nested linear program (see
-/// [`defactorize_nested_linear_program`]).
-#[derive(Copy, Clone)]
-enum NestedResidualDisposition {
-    /// The referenced residual enters the rewritten program as the trailing input at this position, and references
-    /// to it are rewritten into operand form against that input.
-    Operand(usize),
-
-    /// The referenced residual stays a factor payload, re-indexed to this position.
-    Factor(usize),
-}
-
-/// Rewrites a nested linear `program`'s residual references into operand form against new trailing inputs.
-///
-/// This is the whole-program counterpart of [`DefactorizableOperation::defactorize`], used by the higher-order
-/// defactorization arms: operand-form condition branches receive their forwarded while-body residuals as trailing
-/// inputs, and operand-form scan bodies receive the lane slices of their moved residual stacks as trailing scanned
-/// inputs. The returned program consumes `[original_inputs..., forwarded_inputs...]` with one trailing input per
-/// entry of `forwarded_input_types`, and each instruction is rewritten according to `dispositions`, indexed by the
-/// program's residual-reference namespace:
-///
-///   - Instructions whose references all map to [`NestedResidualDisposition::Factor`] keep their factor form with
-///     the references re-indexed to the compacted factor positions.
-///   - Instructions whose references all map to [`NestedResidualDisposition::Operand`] are rewritten into operand
-///     form against the trailing input atoms through [`DefactorizableOperation::defactorize`] (a nested residual
-///     injection collapses to forwarding the trailing input).
-///   - Instructions referencing both kinds are rejected, mirroring the mixed constant/reference index rejection of
-///     the dynamic-slicing defactorization arms (defactorization stages exactly one instruction per source
-///     instruction).
-fn defactorize_nested_linear_program<V, C, R, P>(
-    program: &Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>, Vec<V>, Vec<V>>,
-    dispositions: &[Option<NestedResidualDisposition>],
-    forwarded_input_types: &[ArrayType],
-) -> Result<
-    Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>, Vec<V>, Vec<V>>,
-    ProgramError,
->
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    R: Value<ArrayType>,
-    P: Clone
-        + Operation<ArrayType>
-        + From<MulOperation>
-        + From<DotOperation>
-        + From<SelectOperation>
-        + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<ConcatenateOperation>,
-{
-    let mut builder =
-        ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>>::new();
-    let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
-    for (program_atom, input_type) in program.input_ids().iter().zip(program.input_types().into_iter()) {
-        atom_map[program_atom.index()] = Some(builder.add_input(input_type));
-    }
-    let forwarded_atoms = forwarded_input_types
-        .iter()
-        .map(|forwarded_type| builder.add_input(forwarded_type.clone()))
-        .collect::<Vec<_>>();
-    for (atom_index, atom) in program.atoms().iter().enumerate() {
-        if let Atom::Constant(constant) = atom {
-            atom_map[atom_index] = Some(builder.add_constant(constant.clone()));
-        }
-    }
-    let map_atom = |atom_map: &[Option<AtomId>], atom: AtomId| {
-        atom_map.get(atom.index()).copied().flatten().ok_or(ProgramError::UnboundAtomId { id: atom })
-    };
-    let resolve_disposition = |index: usize| {
-        dispositions.get(index).copied().flatten().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "nested linear program references residual {index} but only {} residuals were dispositioned",
-                dispositions.len(),
-            ))
-        })
-    };
-    for instruction in program.instructions() {
-        let inputs = instruction
-            .inputs()
-            .iter()
-            .map(|input| map_atom(atom_map.as_slice(), *input))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut references_operand_residual = false;
-        let mut references_factor_residual = false;
-        instruction.operation().try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
-            if let ValueOrCapture::Capture { index, .. } = factor {
-                match resolve_disposition(*index)? {
-                    NestedResidualDisposition::Operand(_) => references_operand_residual = true,
-                    NestedResidualDisposition::Factor(_) => references_factor_residual = true,
-                }
-            }
-            Ok(factor.clone())
-        })?;
-        if references_operand_residual && references_factor_residual {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "jvp of a while loop whose body pushforward stages {} over a mix of loop-varying and \
-                     constant-stack residual references is not supported",
-                    instruction.operation().name(),
-                ),
-            });
-        }
-        let remapped = instruction.operation().try_map_captures(&mut |factor| match factor {
-            ValueOrCapture::Capture { index, r#type } => {
-                let position = match resolve_disposition(*index)? {
-                    NestedResidualDisposition::Operand(position) => position,
-                    NestedResidualDisposition::Factor(position) => position,
-                };
-                Ok(ValueOrCapture::Capture { index: position, r#type: r#type.clone() })
-            }
-            ValueOrCapture::Value(value) => Ok(ValueOrCapture::Value(value.clone())),
-        })?;
-        if !references_operand_residual {
-            let outputs = builder.add_instruction(remapped, inputs)?.to_vec();
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-            for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
-                atom_map[program_atom.index()] = Some(builder_atom);
-            }
-            continue;
-        }
-        match remapped.defactorize(forwarded_atoms.as_slice(), inputs)? {
-            DefactorizedOperation::Operation { operation, inputs } => {
-                let outputs = builder.add_instruction(operation, inputs)?.to_vec();
-                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-                for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
-                    atom_map[program_atom.index()] = Some(builder_atom);
-                }
-            }
-            DefactorizedOperation::Forward { atom } => {
-                check_count!("output", instruction.outputs(), 1, ProgramError);
-                atom_map[instruction.outputs()[0].index()] = Some(atom);
-            }
-        }
-    }
-    let outputs = program
-        .output_ids()
-        .iter()
-        .map(|output| map_atom(atom_map.as_slice(), *output))
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    let input_count = program.input_ids().len() + forwarded_input_types.len();
-    let output_count = outputs.len();
-    builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
-}
-
-impl<V, C, R, P> DefactorizableOperation for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    R: Value<ArrayType>,
-    P: Clone
-        + Operation<ArrayType>
-        + From<MulOperation>
-        + From<DotOperation>
-        + From<SelectOperation>
-        + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<ConcatenateOperation>,
-{
-    fn defactorize(
-        &self,
-        residual_atoms: &[AtomId],
-        mut inputs: Vec<AtomId>,
-    ) -> Result<DefactorizedOperation<Self>, ProgramError> {
-        let resolve_residual_atom = |index: usize| {
-            residual_atoms.get(index).copied().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "while body pushforward references residual {index} but only {} residuals were captured",
-                    residual_atoms.len(),
-                ))
-            })
-        };
-        match self {
-            // `Scale` by a loop-varying residual becomes a recomputed elementwise product against the recomputed
-            // residual atom; `LeftDot` / `RightDot` become the recomputed operand-form dot with the residual spliced
-            // in on the side the captured factor occupied. All three target `Recompute` so that every
-            // recomputed-primal instruction in a fused while body carries the same provenance.
-            Self::Scale(operation) if matches!(operation.factor(), ValueOrCapture::Capture { .. }) => {
-                let ValueOrCapture::Capture { index, .. } = operation.factor() else { unreachable!() };
-                inputs.insert(0, resolve_residual_atom(*index)?);
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(MulOperation))),
-                    inputs,
-                })
-            }
-            Self::LeftDot(operation) if matches!(operation.factor(), ValueOrCapture::Capture { .. }) => {
-                let ValueOrCapture::Capture { index, .. } = operation.factor() else { unreachable!() };
-                inputs.insert(0, resolve_residual_atom(*index)?);
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
-                        DotOperation::new(operation.dimensions().clone())
-                            .with_output_sharding(operation.output_sharding().cloned()),
-                    ))),
-                    inputs,
-                })
-            }
-            Self::RightDot(operation) if matches!(operation.factor(), ValueOrCapture::Capture { .. }) => {
-                let ValueOrCapture::Capture { index, .. } = operation.factor() else { unreachable!() };
-                inputs.push(resolve_residual_atom(*index)?);
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
-                        DotOperation::new(operation.dimensions().clone())
-                            .with_output_sharding(operation.output_sharding().cloned()),
-                    ))),
-                    inputs,
-                })
-            }
-            // `DynamicSlice` / `DynamicUpdateSlice` over loop-varying residual start indices become the recomputed
-            // operand-form primal operations with the residual atoms spliced in as index operands. Mixed
-            // constant/reference index lists are rejected because defactorization stages exactly one instruction,
-            // while constant indices would need their own materializing instructions.
-            Self::DynamicSlice(operation)
-                if operation.start_indices().iter().any(|index| matches!(index, ValueOrCapture::Capture { .. })) =>
-            {
-                for start_index in operation.start_indices() {
-                    let ValueOrCapture::Capture { index, .. } = start_index else {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: "jvp of a while loop whose body captures a mix of loop-varying and constant \
-                                      dynamic_slice start indices is not supported"
-                                .to_string(),
-                        });
-                    };
-                    inputs.push(resolve_residual_atom(*index)?);
-                }
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
-                        DynamicSliceOperation::new(operation.sizes().to_vec()),
-                    ))),
-                    inputs,
-                })
-            }
-            Self::DynamicUpdateSlice(operation)
-                if operation.start_indices().iter().any(|index| matches!(index, ValueOrCapture::Capture { .. })) =>
-            {
-                for start_index in operation.start_indices() {
-                    let ValueOrCapture::Capture { index, .. } = start_index else {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: "jvp of a while loop whose body captures a mix of loop-varying and constant \
-                                      dynamic_update_slice start indices is not supported"
-                                .to_string(),
-                        });
-                    };
-                    inputs.push(resolve_residual_atom(*index)?);
-                }
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(
-                        DynamicUpdateSliceOperation,
-                    ))),
-                    inputs,
-                })
-            }
-            // A nested loop's residual injection materializes a value the fused body already recomputes, so the
-            // instruction collapses to forwarding the residual atom.
-            Self::Residual(operation) if matches!(operation.capture(), ValueOrCapture::Capture { .. }) => {
-                let ValueOrCapture::Capture { index, .. } = operation.capture() else { unreachable!() };
-                Ok(DefactorizedOperation::Forward { atom: resolve_residual_atom(*index)? })
-            }
-            // `Select` over a loop-varying residual condition becomes the recomputed operand-form primal select
-            // with the residual atom spliced in as the condition operand.
-            Self::Select(operation) if matches!(operation.condition(), ValueOrCapture::Capture { .. }) => {
-                let ValueOrCapture::Capture { index, .. } = operation.condition() else { unreachable!() };
-                inputs.insert(0, resolve_residual_atom(*index)?);
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::Recompute(RecomputeOperation::new(P::from(SelectOperation))),
-                    inputs,
-                })
-            }
-            // A loop-varying condition predicate becomes operand 0 of an operand-form condition
-            // (`OperandCondition`). The branch programs may carry their own references into the same while-body
-            // residual table (the condition JVP rule remapped them onto the enclosing linearization environment), so
-            // the union of the residual indices referenced by both branches is forwarded as additional trailing
-            // operands — both branches receive the full union because their signatures must agree — and each branch
-            // is recursively defactorized against the new trailing branch inputs.
-            Self::Condition(operation) if matches!(operation.predicate(), ValueOrCapture::Capture { .. }) => {
-                let ValueOrCapture::Capture { index, .. } = operation.predicate() else { unreachable!() };
-                let (true_branch, false_branch) = (operation.true_branch(), operation.false_branch());
-                let predicate_atom = resolve_residual_atom(*index)?;
-                let mut forwarded_residuals = BTreeMap::new();
-                for branch in [true_branch, false_branch] {
-                    for instruction in branch.instructions() {
-                        instruction.operation().try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
-                            if let ValueOrCapture::Capture { index, r#type } = factor {
-                                forwarded_residuals.entry(*index).or_insert_with(|| r#type.clone());
-                            }
-                            Ok(factor.clone())
-                        })?;
-                    }
-                }
-                let mut dispositions = vec![None; residual_atoms.len()];
-                let mut forwarded_types = Vec::with_capacity(forwarded_residuals.len());
-                let mut forwarded_atoms = Vec::with_capacity(forwarded_residuals.len());
-                for (position, (residual_index, residual_type)) in forwarded_residuals.into_iter().enumerate() {
-                    forwarded_atoms.push(resolve_residual_atom(residual_index)?);
-                    dispositions[residual_index] = Some(NestedResidualDisposition::Operand(position));
-                    forwarded_types.push(residual_type);
-                }
-                let true_branch = defactorize_nested_linear_program(
-                    true_branch,
-                    dispositions.as_slice(),
-                    forwarded_types.as_slice(),
-                )?;
-                let false_branch = defactorize_nested_linear_program(
-                    false_branch,
-                    dispositions.as_slice(),
-                    forwarded_types.as_slice(),
-                )?;
-                let mut condition_inputs = Vec::with_capacity(1 + inputs.len() + forwarded_atoms.len());
-                condition_inputs.push(predicate_atom);
-                condition_inputs.extend(inputs);
-                condition_inputs.extend(forwarded_atoms);
-                Ok(DefactorizedOperation::Operation {
-                    operation: LinearArrayOperation::OperandCondition(LinearOperandConditionOperation::new(
-                        Box::new(true_branch),
-                        Box::new(false_branch),
-                    )),
-                    inputs: condition_inputs,
-                })
-            }
-            // A linear scan whose residual stacks reference loop-varying residuals moves those stacks into operand
-            // position: each referenced stack becomes one extra scanned input, the body gains one trailing lane
-            // input per moved stack (the stack type minus its leading length axis), and the body's scan-local
-            // references to moved stacks are rewritten into operand form against those inputs. Constant stacks stay
-            // factor payloads, with the surviving body references re-indexed against the compacted constant-only
-            // stack list.
-            Self::Scan(operation)
-                if operation.captures().iter().any(|stack| matches!(stack, ValueOrCapture::Capture { .. })) =>
-            {
-                let residual_stacks = operation.captures();
-                let mut dispositions = Vec::with_capacity(residual_stacks.len());
-                let mut lane_types = Vec::new();
-                let mut moved_stack_atoms = Vec::new();
-                let mut surviving_stacks = Vec::new();
-                for stack in residual_stacks {
-                    match stack {
-                        ValueOrCapture::Capture { index, r#type } => {
-                            dispositions.push(Some(NestedResidualDisposition::Operand(lane_types.len())));
-                            lane_types.push(r#type.without_dimension(0)?.0);
-                            moved_stack_atoms.push(resolve_residual_atom(*index)?);
-                        }
-                        constant_stack => {
-                            dispositions.push(Some(NestedResidualDisposition::Factor(surviving_stacks.len())));
-                            surviving_stacks.push(constant_stack.clone());
-                        }
-                    }
-                }
-                let body = defactorize_nested_linear_program(
-                    operation.body(),
-                    dispositions.as_slice(),
-                    lane_types.as_slice(),
-                )?;
-                inputs.extend(moved_stack_atoms);
-                let scan = ScanOperation::<ArrayType, _, _>::new(body, operation.carry_count(), operation.length())?
-                    .with_reverse(operation.reverse())
-                    .with_unroll(operation.unroll())?
-                    .with_captures(surviving_stacks);
-                Ok(DefactorizedOperation::Operation { operation: LinearArrayOperation::Scan(Box::new(scan)), inputs })
-            }
-            operation => {
-                // Closed constant factors and factor-free operations pass through unchanged. Residual references
-                // hidden in payloads this rule cannot splice operands into — custom VJP call residuals, factor-form
-                // while payloads, and condition branches whose predicate factor is a closed constant (defactorization
-                // stages exactly one instruction, so a constant predicate cannot be materialized as the operand the
-                // rewritten branches would require) — are rejected with the offending operation's name.
-                let mut references_residual = false;
-                operation.try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
-                    if matches!(factor, ValueOrCapture::Capture { .. }) {
-                        references_residual = true;
-                    }
-                    Ok(factor.clone())
-                })?;
-                if references_residual {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "jvp of a while loop whose body pushforward stages {} over a loop-varying residual \
-                             reference is not supported",
-                            operation.name(),
-                        ),
-                    });
-                }
-                Ok(DefactorizedOperation::Operation { operation: operation.clone(), inputs })
-            }
         }
     }
 }
@@ -904,74 +522,6 @@ where
     }
 }
 
-/// Transposes a captured-condition select (the `Select` variant of [`LinearArrayOperation`] and the scalar
-/// [`LinearSelectOperation`](crate::tracing_v2::operations::select::LinearSelectOperation)).
-///
-/// The forward linear map is `(t, f) ↦ select(condition, t, f)`. Its transpose routes the output cotangent into the
-/// branch that the condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)` and the
-/// `on_false` cotangent is `select(condition, 0, cotangent)`. The zero operand is staged as a typed `Zero` operation
-/// via [`stage_cotangent`](crate::tracing_v2::operations::control_flow::stage_cotangent), and `make_operation`
-/// rebuilds the captured-condition select for staging into the transpose builder.
-pub(crate) fn transpose_captured_condition_select<'transpose, T, V, P, MakeOperationFn>(
-    make_operation: MakeOperationFn,
-    context: &mut AbstractTracingContext<'transpose, T, V, P>,
-    input_types: &[&T],
-    output_cotangents: &[Cotangent<'transpose, T, V, P>],
-) -> Result<Vec<Cotangent<'transpose, T, V, P>>, ProgramError>
-where
-    T: Type,
-    V: Value<T>,
-    P: Operation<T> + From<ZeroOperation<T>>,
-    MakeOperationFn: Fn() -> P,
-{
-    check_count!("input", input_types, 2, ProgramError);
-    check_count!("output", output_cotangents, 1, ProgramError);
-    match &output_cotangents[0] {
-        Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-        Cotangent::Staged(cotangent) => {
-            let zero =
-                crate::tracing_v2::operations::control_flow::stage_cotangent(context, &Cotangent::Zero, input_types[0]);
-            let on_true = context.stage_operation(make_operation(), &[cotangent.clone(), zero.clone()])?;
-            check_count!("output", on_true, 1, ProgramError);
-            let on_false = context.stage_operation(make_operation(), &[zero, cotangent.clone()])?;
-            check_count!("output", on_false, 1, ProgramError);
-            Ok(vec![
-                Cotangent::Staged(on_true.into_iter().next().unwrap()),
-                Cotangent::Staged(on_false.into_iter().next().unwrap()),
-            ])
-        }
-    }
-}
-
-/// Builds the scatter-add operation that is the transpose dual of a captured-index gather. The forward gather
-/// `t ↦ gather(t, indices, ...)` has adjoint `cotangent ↦ scatter_add(zeros, indices, cotangent, ...)`, so the scatter
-/// dimension numbers mirror the gather's axis-for-axis (offset↔update-window, collapsed↔inserted-window,
-/// `start_index_map`↔`scatter_dimensions_to_operand_dimensions`, the batching pairs carried over), the combiner is
-/// [`ScatterReductionKind::Add`], and the mode/flags carry through unchanged. The scatter writes into a zero operand of
-/// the gather operand's type, so no `output_sharding` is requested (that zero operand already carries it).
-pub(crate) fn gather_to_scatter_operation(operation: &GatherOperation) -> ScatterOperation {
-    let dimensions = operation.dimensions();
-    let scatter_dimensions = ScatterDimensionNumbers::new(
-        dimensions.offset_dimensions().to_vec(),
-        dimensions.collapsed_slice_dimensions().to_vec(),
-        dimensions.start_index_map().to_vec(),
-    )
-    .with_batching_dimensions(
-        dimensions.operand_batching_dimensions().to_vec(),
-        dimensions.start_indices_batching_dimensions().to_vec(),
-    );
-    ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
-        .with_mode(operation.mode())
-        .with_indices_are_sorted(operation.indices_are_sorted())
-        .with_unique_indices(operation.unique_indices())
-}
-
-/// Clones one factor payload unchanged; used as a stable `fn`-pointer identity mapping by the scan-body
-/// traversal of [`map_linear_array_operation_factors`].
-fn clone_factor<F: Clone>(factor: &F) -> Result<F, ProgramError> {
-    Ok(factor.clone())
-}
-
 /// Shared payload-mapping core behind [`CaptureParameterizedOperation::try_map_captures`] for
 /// [`LinearArrayOperation`].
 fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
@@ -1092,8 +642,10 @@ where
                 // The factor-cloning function is passed as a `fn` pointer (not a closure) so the recursive
                 // monomorphization below reaches a fixed point: nested scans reuse the exact same mapper
                 // instantiation instead of minting a fresh closure type per level.
-                let mut clone_scan_local_factor = clone_factor::<ValueOrCapture<ArrayType, V>>
-                    as fn(&ValueOrCapture<ArrayType, V>) -> Result<ValueOrCapture<ArrayType, V>, ProgramError>;
+                let mut clone_scan_local_factor: fn(
+                    &ValueOrCapture<ArrayType, V>,
+                )
+                    -> Result<ValueOrCapture<ArrayType, V>, ProgramError> = |factor| Ok(factor.clone());
                 let body = operation.body().map_operations(|operation| {
                     map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, &mut clone_scan_local_factor)
                 })?;
@@ -1125,6 +677,29 @@ where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
     {
         map_linear_array_operation_factors::<_, _, _, _, _, _>(self, map_factor)
+    }
+}
+
+// TODO(eaplatanios): Fold this into our `TransposableOperation` derive macro.
+impl<V, C, R, P> DefactorizableProgramOperation<V, R, P> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
+where
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    R: Value<ArrayType>,
+    P: Clone
+        + Operation<ArrayType>
+        + From<MulOperation>
+        + From<DotOperation>
+        + From<SelectOperation>
+        + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>,
+{
+    fn defactorize_operation(
+        &self,
+        residual_atoms: &[AtomId],
+        inputs: Vec<AtomId>,
+    ) -> Result<DefactorizedOperation<Self>, ProgramError> {
+        defactorize_operation_default::<V, R, P, Self>(self, residual_atoms, inputs)
     }
 }
 
@@ -1380,6 +955,7 @@ where
     Ok(Some(outputs))
 }
 
+// TODO(eaplatanios): Why does this not simply forward to per-variant `BatchableOperation::batch` calls. It should.
 /// Blanket active batching impl for the [`ArrayOperation`] sum type over a staged tracer context: each non-control
 /// variant delegates to its backing operation's batching rule (shared with the eager impl through
 /// [`batch_array_non_control_operation`]), while the lane-uniform memory transfer, the named-axis collective, and the
@@ -1476,6 +1052,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Fold this into our `BatchableOperation` derive macro.
 /// Blanket active batching impl for the [`ArrayOperation`] sum type.
 ///
 /// The `Operation = Self` projection equality and the
@@ -1570,7 +1147,7 @@ where
                 ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
                 Captured,
             >,
-        > + DefactorizableOperation
+        > + DefactorizableProgramOperation<E::Tangent, Tracer<LinearizationContextOf<E, Self>>, Self>
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<RecomputeOperation<Self>>
         + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<LinearizationContextOf<E, Self>>>>
@@ -1578,6 +1155,9 @@ where
     LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = LinearOperationOf<
+                LinearizationContextOf<E, Self>,
+            >,
             WithCapture<ValueOrCapture<ArrayType, E::Value>> = LinearOperationOf<E>,
         > + MaybeZeroOperation<ArrayType>,
 {
@@ -2028,7 +1608,7 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::differentiation::TransposableOperation;
+    use crate::differentiation::{Cotangent, TransposableOperation};
     use crate::domains::AbstractDomain;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;

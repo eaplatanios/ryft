@@ -30,7 +30,7 @@ use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::operations::reduce::ReductionKind;
 use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::{
-    ArrayOperation, CaptureParameterizedOperation, DefactorizableOperation, DefactorizedOperation,
+    ArrayOperation, CaptureParameterizedOperation, DefactorizableProgramOperation, DefactorizedOperation,
     LinearArrayOperation, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
@@ -2897,9 +2897,9 @@ where
 /// The returned program consumes `[tangent_carry..., tangent_x_slice..., residual_slice...]`: each residual stack
 /// contributes one extra input carrying its current lane slice, and every body operation whose factors reference a
 /// residual is rewritten into operand form against those inputs through
-/// [`DefactorizableOperation::defactorize`] (a scale by a referenced residual becomes a recomputed elementwise product,
-/// exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads, so the result
-/// lowers through the ordinary direct linear operation path.
+/// [`DefactorizableProgramOperation::defactorize_operation`] (a scale by a referenced residual becomes a recomputed
+/// elementwise product, exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads,
+/// so the result lowers through the ordinary direct linear operation path.
 fn operand_form_scan_body<V, C, P>(
     body: &Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, Vec<V>, Vec<V>>,
     residual_slice_types: &[ArrayType],
@@ -2940,7 +2940,11 @@ where
             .iter()
             .map(|input| map_atom(atom_map.as_slice(), *input))
             .collect::<Result<Vec<_>, _>>()?;
-        match instruction.operation().defactorize(residual_atoms.as_slice(), inputs).map_err(ProgramError::from)? {
+        match instruction
+            .operation()
+            .defactorize_operation(residual_atoms.as_slice(), inputs)
+            .map_err(ProgramError::from)?
+        {
             DefactorizedOperation::Operation { operation, inputs } => {
                 let operation = operation
                     .try_map_captures(&mut |factor| match factor {

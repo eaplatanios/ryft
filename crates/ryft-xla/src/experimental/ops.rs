@@ -34,7 +34,7 @@ use ryft_core::operations::{
 };
 use ryft_core::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::payloads::{Captured, Input};
-use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
+use ryft_core::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingContext,
@@ -46,7 +46,10 @@ use ryft_core::tracing_v2::operations::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsManipulationOperations,
     SupportsTrigonometricOperations,
 };
-use ryft_core::tracing_v2::operations::control_flow::{DefactorizableOperation, LinearOperandConditionOperation};
+use ryft_core::tracing_v2::operations::control_flow::{
+    DefactorizableProgramOperation, DefactorizedOperation, LinearOperandConditionOperation,
+    defactorize_operation_default,
+};
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
@@ -56,7 +59,7 @@ use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
-    ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DefactorizedOperation, DifferentiableOperation,
+    ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DifferentiableOperation,
     DifferentiationContext, DotOperation, JvpTracer, LinearArrayOperation, LinearOperationOf,
     LinearizableProgramOperation, MaterializeCaptureOperation, NestedLinearization, RematerializationNameOperation,
     ResidualizedOperation, TangentContext, ValueOrCapture,
@@ -528,10 +531,14 @@ where
                 Captured,
             >,
         >
-        + DefactorizableOperation
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
         + From<RecomputeOperation<XlaOperation>>
         + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<E>>>,
+    LinearOperationOf<E>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, <E as Domain>::Value>,
+            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = LinearOperationOf<E>,
+        > + DefactorizableProgramOperation<E::Tangent, <E as Domain>::Value, XlaOperation>,
     Self: Clone + LinearizableProgramOperation<E>,
 {
     fn jvp<'jvp>(
@@ -699,6 +706,9 @@ where
         + CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = LinearOperationOf<
+                LinearizationContextOf<E, Self>,
+            >,
             WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = LinearOperationOf<E>,
         > + MaybeZeroOperation<ArrayType>,
 {
@@ -1122,15 +1132,6 @@ fn clone_capture<F: Clone>(factor: &F) -> Result<F, ProgramError> {
     Ok(factor.clone())
 }
 
-fn map_defactorized_operation<O, P: From<O>>(defactorized: DefactorizedOperation<O>) -> DefactorizedOperation<P> {
-    match defactorized {
-        DefactorizedOperation::Operation { operation, inputs } => {
-            DefactorizedOperation::Operation { operation: P::from(operation), inputs }
-        }
-        DefactorizedOperation::Forward { atom } => DefactorizedOperation::Forward { atom },
-    }
-}
-
 fn map_linear_xla_operation_captures<V, C, F, MappedFactor, P, MapFactorFn>(
     operation: &LinearXlaOperation<V, C, F, P, F>,
     map_factor: &mut MapFactorFn,
@@ -1229,7 +1230,7 @@ where
     }
 }
 
-impl<V, C, R, P> DefactorizableOperation
+impl<V, C, R, P> DefactorizableProgramOperation<V, R, P>
     for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
 where
     V: Value<ArrayType>,
@@ -1241,45 +1242,14 @@ where
         + From<DotOperation>
         + From<SelectOperation>
         + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<ConcatenateOperation>,
+        + From<DynamicUpdateSliceOperation>,
 {
-    fn defactorize(
+    fn defactorize_operation(
         &self,
-        residual_atoms: &[ryft_core::programs::AtomId],
-        inputs: Vec<ryft_core::programs::AtomId>,
+        residual_atoms: &[AtomId],
+        inputs: Vec<AtomId>,
     ) -> Result<DefactorizedOperation<Self>, ProgramError> {
-        if let Some(operation) = self.to_core_linear_array_operation() {
-            return operation.defactorize(residual_atoms, inputs).map(map_defactorized_operation);
-        }
-
-        match self {
-            operation @ (Self::Condition(_)
-            | Self::OperandCondition(_)
-            | Self::While(_)
-            | Self::Scan(_)
-            | Self::LinearJitCall(_)
-            | Self::LinearShardMap(_)) => {
-                let mut references_residual = false;
-                operation.try_map_captures(&mut |factor: &ValueOrCapture<ArrayType, R>| {
-                    if matches!(factor, ValueOrCapture::Capture { .. }) {
-                        references_residual = true;
-                    }
-                    Ok(factor.clone())
-                })?;
-                if references_residual {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "jvp of a while loop whose body pushforward stages {} over a loop-varying residual \
-                             reference is not supported",
-                            operation.name(),
-                        ),
-                    });
-                }
-                Ok(DefactorizedOperation::Operation { operation: operation.clone(), inputs })
-            }
-            _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
-        }
+        defactorize_operation_default::<V, R, P, Self>(self, residual_atoms, inputs)
     }
 }
 

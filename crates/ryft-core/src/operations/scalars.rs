@@ -4,6 +4,7 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
+use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -12,10 +13,10 @@ use crate::operations::constants::{
     ConstantOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation};
+use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{InterpretableOperation, InterpretableProgramOperation};
+use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -64,6 +65,7 @@ pub enum ScalarOperation<V: Value<DataType>> {
     Compare(CompareOperation),
     Select(SelectOperation),
     Scan(Box<ScanOperation<DataType, V, Self>>),
+    While(Box<WhileOperation<DataType, V, Self>>),
     StopGradient(StopGradientOperation),
     RematerializationName(RematerializationNameOperation),
     CustomJvp(Box<CustomJvpOperation<DataType, V, Self>>),
@@ -88,6 +90,7 @@ where
     CompareOperation: DifferentiableOperation<D>,
     SelectOperation: DifferentiableOperation<D>,
     ScanOperation<DataType, V, Self>: DifferentiableOperation<D>,
+    WhileOperation<DataType, V, Self>: DifferentiableOperation<D>,
     StopGradientOperation: DifferentiableOperation<D>,
     RematerializationNameOperation: DifferentiableOperation<D>,
     D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = ScalarOperation<V>>,
@@ -148,6 +151,7 @@ where
             Self::Compare(operation) => operation.jvp(context, inputs),
             Self::Select(operation) => operation.jvp(context, inputs),
             Self::Scan(operation) => operation.jvp(context, inputs),
+            Self::While(operation) => operation.jvp(context, inputs),
             Self::StopGradient(operation) => operation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::CustomJvp(operation) => operation.jvp(context, inputs),
@@ -199,7 +203,7 @@ where
 impl<C, V> InterpretableOperation<DataType, V> for ScalarOperation<C>
 where
     C: Value<DataType>,
-    V: Value<DataType>,
+    V: Value<DataType> + BooleanLike,
     V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
     ZeroOperation<DataType>: InterpretableOperation<DataType, V>,
     ZeroLikeOperation: InterpretableOperation<DataType, V>,
@@ -242,6 +246,37 @@ where
             Self::Compare(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => operation.interpret(context, inputs),
+            Self::While(operation) => {
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                operation.infer_output_types(input_types.as_slice())?;
+                let mut state = inputs.to_vec();
+                let mut completed_iterations = 0;
+                loop {
+                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                        return Ok(state);
+                    }
+                    let condition_outputs = operation.condition().interpret_with(
+                        state.clone(),
+                        |_, constant| context.lift(constant.clone()),
+                        |instruction, instruction_inputs| {
+                            instruction.operation().interpret(context, instruction_inputs)
+                        },
+                    )?;
+                    check_count!("output", condition_outputs, 1, ProgramError);
+                    if !condition_outputs[0].boolean()? {
+                        return Ok(state);
+                    }
+                    state = operation.body().interpret_with(
+                        state,
+                        |_, constant| context.lift(constant.clone()),
+                        |instruction, instruction_inputs| {
+                            instruction.operation().interpret(context, instruction_inputs)
+                        },
+                    )?;
+                    check_count!("output", state, operation.state_types().len(), ProgramError);
+                    completed_iterations += 1;
+                }
+            }
             Self::StopGradient(operation) => operation.interpret(context, inputs),
             Self::RematerializationName(operation) => operation.interpret(context, inputs),
             Self::CustomJvp(operation) => operation.interpret(context, inputs),
@@ -261,8 +296,9 @@ where
 /// exemplar-derived [`ZeroLike`](Self::ZeroLike)/[`OneLike`](Self::OneLike) maps, a typed
 /// [`Constant`](Self::Constant), [`Neg`](Self::Neg)/[`Add`](Self::Add)/[`Sub`](Self::Sub), scaling by a captured
 /// factor ([`Scale`](Self::Scale)), the captured-condition [`Select`](Self::Select)
-/// ([`LinearSelectOperation`]), and the opaque [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp`
-/// linearization (its transpose replays the user's backward program).
+/// ([`LinearSelectOperation`]), linearized [`Scan`](Self::Scan)/[`While`](Self::While) payloads, and the opaque
+/// [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp` linearization (its transpose replays the user's
+/// backward program).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
 pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Value<DataType> = C> {
     Zero(ZeroOperation<DataType>),
@@ -276,6 +312,7 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     Scale(ScaleOperation<DataType, F, Input>),
     Select(LinearSelectOperation<F>),
     Scan(Box<ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F>>),
+    While(Box<WhileOperation<DataType, V, Self>>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
 
@@ -315,6 +352,17 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
                 .with_captures(operation.captures().iter().map(map_factor).collect::<Result<Vec<_>, _>>()?);
                 Ok(LinearScalarOperation::Scan(Box::new(scan)))
             }
+            Self::While(operation) => {
+                let condition = operation
+                    .condition()
+                    .map_operations(|operation| operation.try_map_captures::<MappedFactor, _>(map_factor))?;
+                let body = operation
+                    .body()
+                    .map_operations(|operation| operation.try_map_captures::<MappedFactor, _>(map_factor))?;
+                Ok(LinearScalarOperation::While(Box::new(
+                    WhileOperation::new(condition, body)?.with_iteration_bound(operation.iteration_bound())?,
+                )))
+            }
             Self::CustomVjpCall(call) => {
                 Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
             }
@@ -328,6 +376,7 @@ where
         + Add<Output = V>
         + Sub<Output = V>
         + Neg<Output = V>
+        + BooleanLike
         + SupportsConstantOperations<DataType>
         + Select<Condition = <V as SelectCondition>::Condition>
         + SelectCondition,
@@ -359,6 +408,25 @@ where
             Self::Scale(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => operation.interpret(context, inputs),
+            Self::While(operation) => {
+                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                operation.infer_output_types(input_types.as_slice())?;
+                let mut state = inputs.to_vec();
+                let mut completed_iterations = 0;
+                loop {
+                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                        return Ok(state);
+                    }
+                    let condition_outputs = operation.condition().interpret_in_context(context, state.clone())?;
+                    check_count!("output", condition_outputs, 1, ProgramError);
+                    if !condition_outputs[0].boolean()? {
+                        return Ok(state);
+                    }
+                    state = operation.body().interpret_in_context(context, state)?;
+                    check_count!("output", state, operation.state_types().len(), ProgramError);
+                    completed_iterations += 1;
+                }
+            }
         }
     }
 }
@@ -369,6 +437,7 @@ where
         + Add<Output = V>
         + Sub<Output = V>
         + Neg<Output = V>
+        + BooleanLike
         + SupportsConstantOperations<DataType>
         + Select<Condition = <V as SelectCondition>::Condition>
         + SelectCondition,
@@ -403,6 +472,26 @@ where
                 Self::Scale(operation) => operation.interpret(context, instruction_inputs),
                 Self::Select(operation) => operation.interpret(context, instruction_inputs),
                 Self::Scan(operation) => operation.interpret(context, instruction_inputs),
+                Self::While(operation) => {
+                    let input_types =
+                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                    operation.infer_output_types(input_types.as_slice())?;
+                    let mut state = instruction_inputs.to_vec();
+                    let mut completed_iterations = 0;
+                    loop {
+                        if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+                            return Ok(state);
+                        }
+                        let condition_outputs = operation.condition().interpret_in_context(context, state.clone())?;
+                        check_count!("output", condition_outputs, 1, ProgramError);
+                        if !condition_outputs[0].boolean()? {
+                            return Ok(state);
+                        }
+                        state = operation.body().interpret_in_context(context, state)?;
+                        check_count!("output", state, operation.state_types().len(), ProgramError);
+                        completed_iterations += 1;
+                    }
+                }
             },
         )
     }
@@ -432,7 +521,7 @@ mod tests {
 
     use crate::contexts::StagingContext;
     use crate::operations::Operation;
-    use crate::operations::compare::Compare;
+    use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::control_flow::Select;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
@@ -449,6 +538,17 @@ mod tests {
         let carry = builder.add_input(DataType::F64);
         let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a scalar while condition that maps `[carry]` to `[carry < 8]`.
+    fn scalar_less_than_eight_condition() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let carry = builder.add_input(DataType::F64);
+        let eight = builder.add_constant(8.0);
+        let predicate = builder
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight])
+            .unwrap()[0];
+        builder.build(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     #[test]
@@ -607,6 +707,101 @@ mod tests {
                           than the body output count 2"
                     .to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_scalar_while() {
+        let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+            scalar_less_than_eight_condition(),
+            scalar_doubling_body(),
+        )
+        .unwrap();
+
+        assert_eq!(operation.name(), crate::operations::control_flow::WHILE_OPERATION_NAME);
+        assert_eq!(operation.state_types(), vec![DataType::F64]);
+        assert_eq!(operation.iteration_bound(), None);
+        assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[1.0]), Ok(vec![8.0]));
+
+        let domain = ScalarDomain::<f64>::new();
+        let (output_type, program) = trace(
+            &domain,
+            |carry| {
+                let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+                    scalar_less_than_eight_condition(),
+                    scalar_doubling_body(),
+                )
+                .unwrap();
+                let mut outputs = carry.context().stage_operation(operation, &[&carry])?;
+                Ok(outputs.remove(0))
+            },
+            DataType::F64,
+        )
+        .unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = while [
+                    condition={
+                        lambda %0:f64 .
+                        let %1:f64 = const
+                            %2:bool = compare [direction=LessThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64 .
+                        let %1:f64 = add %0 %0
+                        in (%1)
+                    },
+                ] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.interpret(1.0), Ok(8.0));
+
+        let (primal, tangent): (f64, f64) = domain
+            .jvp(
+                |carry| {
+                    let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+                        scalar_less_than_eight_condition(),
+                        scalar_doubling_body(),
+                    )
+                    .unwrap();
+                    carry.unary(operation)
+                },
+                1.0,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(primal, 8.0);
+        assert_eq!(tangent, 8.0);
+
+        let (_, pushforward) = domain
+            .linearize(
+                |carry| {
+                    let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+                        scalar_less_than_eight_condition(),
+                        scalar_doubling_body(),
+                    )
+                    .unwrap();
+                    Ok(carry.unary(operation))
+                },
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(pushforward.apply(&crate::EagerContext::new(), 1.0), Ok(8.0));
+    }
+
+    #[test]
+    fn test_scalar_while_rejects_non_boolean_condition() {
+        assert_eq!(
+            WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(scalar_doubling_body(), scalar_doubling_body())
+                .map(|_| ()),
+            Err(TypeError { message: "while condition output type must be bool, but got f64".to_string() }),
         );
     }
 }
