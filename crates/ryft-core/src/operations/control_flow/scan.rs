@@ -5,7 +5,7 @@ use crate::contexts::Context;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter};
 use crate::payloads::Captured;
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
@@ -345,7 +345,7 @@ where
     C: Value<ArrayType>,
     V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V> + Zero<ArrayType, V>,
-    O: InterpretableOperation<ArrayType, V>,
+    O: InterpretableProgramOperation<ArrayType, V, C>,
     Capture: Value<ArrayType>,
 {
     fn interpret_scan(
@@ -361,13 +361,7 @@ where
             y_slice_types.as_slice(),
             inputs,
             |stacked_type| context.zero(stacked_type),
-            |_, lane_inputs| {
-                operation.body.interpret_with(
-                    lane_inputs,
-                    |_, constant| context.lift(constant.clone()),
-                    |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-                )
-            },
+            |_, lane_inputs| O::interpret_program(context, &operation.body, lane_inputs),
         )
     }
 }
@@ -377,7 +371,7 @@ where
     C: Value<DataType>,
     V: Value<DataType>,
     V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
-    O: InterpretableOperation<DataType, V>,
+    O: InterpretableProgramOperation<DataType, V, C>,
     Capture: Value<DataType>,
 {
     fn interpret_scan(
@@ -387,11 +381,7 @@ where
     ) -> Result<Vec<V>, ProgramError> {
         let mut state = inputs.to_vec();
         for _ in 0..operation.length {
-            state = operation.body.interpret_with(
-                state,
-                |_, constant| context.lift(constant.clone()),
-                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-            )?;
+            state = O::interpret_program(context, &operation.body, state)?;
             check_count!("output", state, operation.carry_count, ProgramError);
         }
         Ok(state)

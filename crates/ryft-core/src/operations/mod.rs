@@ -172,6 +172,15 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - An [`Operation<T>`](Operation) implementation whose [`name`](Operation::name),
 ///     [`infer_output_types`](Operation::infer_output_types), and [`render`](Operation::render) methods forward to the
 ///     active variant payload.
+///   - An [`InterpretableOperation<T, V>`](InterpretableOperation) implementation that forwards
+///     [`interpret`](InterpretableOperation::interpret) to the active variant payload. Operation-specific eager or
+///     staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
+///   - An [`InterpretableProgramOperation<T, V, C>`](InterpretableProgramOperation) implementation that interprets
+///     nested flat [`Program`]s in the enum's closed operation family. This is the interpretation fixed-point witness
+///     used by higher-order payloads such as condition, while, scan, and custom derivative calls. The generated
+///     implementation performs a flat program walk and dispatches each instruction to the concrete variant payload
+///     directly. That finite dispatch avoids asking Rust to prove the enum's full recursive [`InterpretableOperation`]
+///     implementation while defining the program witness.
 ///   - A [`Display`] implementation that renders through [`Operation::render`] with zero indentation, so that the enum
 ///     display matches the canonical program rendering format.
 ///   - `From<Payload> for Enum` conversions for concrete payload variants.
@@ -189,6 +198,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
 ///     generic payload by adding an `Extension: Operation<T>` bound.
+///   - Each payload receives a generated `Payload: InterpretableOperation<T, V>` bound for the interpretation
+///     dispatcher. Payload-specific value or context requirements should live on the payload's own
+///     [`InterpretableOperation`] implementation; the enum derivation carries them through this generated payload
+///     bound.
 ///
 /// The operation type `T` is selected as follows:
 ///
@@ -199,6 +212,23 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - If no `Value<T>` bound is present, or if multiple distinct operation types are present (e.g., `Value<DataType>`
 ///     and `Value<ArrayType>`), the derivation macro cannot choose an operation type and reports a compilation error.
 ///     In those cases, the caller must split the enum by operation type or implement [`Operation`] manually.
+///
+/// The value types used for interpretation are inferred from the enum's `Value<T>` generic parameters:
+///
+///   - For enums with one `Value<T>` parameter, the payload parameter is treated as the nested program's captured
+///     constant type `C`, and the derived [`InterpretableOperation`] implementation is generic over a runtime value
+///     `V`. The generated [`InterpretableProgramOperation`] implementation requires `V::InterpretationContext` to be a
+///     [`Context`] that can lift constants from `C` into `V`.
+///   - For enums with two or more `Value<T>` parameters, the first value parameter is treated as both the runtime value
+///     type and the nested program constant type for direct program interpretation. Later value parameters remain
+///     payload-specific metadata unless the generated program witness needs to instantiate a direct-linear operation
+///     family, in which case extra value parameters after the first two are substituted with the first value parameter.
+///   - For recursive operation enums over built-in [`DataType`] or [`ArrayType`] payloads, the generated nested-program
+///     witness adds the same runtime capabilities required by Ryft's built-in higher-order interpretation rules.
+///     Scalar recursive programs require [`BooleanLike`]. Array recursive programs require [`BooleanLike`], [`Slice`],
+///     [`UpdateSlice`], [`Reshape`], and a context that can materialize [`ZeroOperation`]s. These bounds keep recursive
+///     condition, while, and scan payloads local to their own operation semantics while avoiding a recursive proof of
+///     the whole enum's [`InterpretableOperation`] implementation.
 ///
 /// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
 /// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on
@@ -272,7 +302,11 @@ pub trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
 /// the recursive fixed point needed by higher-order interpretation helpers without requiring the full operation enum's
 /// [`InterpretableOperation`] implementation while proving that implementation. Operation families implement it by
 /// replaying nested flat [`Program`]s through their operation-owned interpretation rules.
-pub trait InterpretableProgramOperation<T: Type, V: Value<T>>: Operation<T> + Sized {
+///
+/// The `C` parameter is the nested program's constant value type. It defaults to `V`, which covers direct linear
+/// programs whose constants are already runtime values. Captured higher-order programs and custom derivative bodies
+/// can set `C` to their captured constant type and let the implementation decide how to lift those constants into `V`.
+pub trait InterpretableProgramOperation<T: Type, V: Value<T>, C: Value<T> = V>: Operation<T> + Sized {
     /// Interprets a nested flat [`Program`].
     ///
     /// # Parameters
@@ -282,7 +316,7 @@ pub trait InterpretableProgramOperation<T: Type, V: Value<T>>: Operation<T> + Si
     ///   - `input`: Input values to use for interpreting the provided [`Program`].
     fn interpret_program(
         context: &V::InterpretationContext,
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+        program: &Program<T, C, Self, Vec<C>, Vec<C>>,
         input: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>;
 }

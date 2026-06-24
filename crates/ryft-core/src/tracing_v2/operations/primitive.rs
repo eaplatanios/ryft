@@ -11,7 +11,7 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use ryft_macros::{Operation, TransposableOperation};
 
 use crate::batching::BatchingError;
-use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::contexts::{EagerContext, StagingContext};
 use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
@@ -19,10 +19,10 @@ use crate::operations::arithmetic::{
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    Constant, ConstantOperation, Fill, FillOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation,
-    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, Fill, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero,
+    ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
+use crate::operations::control_flow::scan::read_scan_lane;
 use crate::operations::control_flow::{
     ConditionOperation, ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation,
 };
@@ -36,10 +36,10 @@ use crate::operations::manipulation::{
 };
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation};
-use crate::parameters::{Parameter, Parameterized};
+use crate::operations::{BooleanLike, Operation};
+use crate::parameters::Parameterized;
 use crate::payloads::{Captured, Input};
-use crate::programs::{AtomId, Program, ProgramError, Value};
+use crate::programs::{AtomId, ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingContext,
@@ -51,7 +51,7 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, custom_jvp_rule, custom_vjp_rule,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, custom_jvp_rule, custom_vjp_rule,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
@@ -64,9 +64,9 @@ use crate::tracing_v2::{DifferentiableOperation, RematerializationName, Residual
 use crate::types::{ArrayType, Typed};
 
 use super::bounds::{
-    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
-    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
-    SupportsManipulationOperations, SupportsTrigonometricOperations,
+    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsLinearAlgebraOperations,
+    SupportsLinearArithmeticOperations, SupportsLinearArrayOperation, SupportsManipulationOperations,
+    SupportsTrigonometricOperations,
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
@@ -374,156 +374,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
-impl<V, C, P> InterpretableProgramOperation<ArrayType, V> for LinearArrayOperation<V, C, V, P>
-where
-    V: Value<ArrayType>
-        + Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + SupportsConstantOperations<ArrayType>
-        + Transpose
-        + SupportsManipulationOperations
-        + Select<Condition = V>
-        + BooleanLike
-        + TransferToMemory,
-    C: Value<ArrayType>,
-    V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V>
-        + Zero<ArrayType, V>
-        + One<ArrayType, V>
-        + Fill<ArrayType, f64, V>
-        + Constant<ArrayType, V, V, Input>,
-    ScaleOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
-    ConstantOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
-    LeftDotOperation<V, Input>: InterpretableOperation<ArrayType, V>,
-    RightDotOperation<V, Input>: InterpretableOperation<ArrayType, V>,
-    V: CustomVjpResidual<ArrayType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    P: Clone + InterpretableOperation<ArrayType, V>,
-{
-    fn interpret_program(
-        context: &V::InterpretationContext,
-        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        input: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError> {
-        program.interpret_with(
-            input,
-            |_, constant| Ok(constant.clone()),
-            |instruction, instruction_inputs| match instruction.operation() {
-                Self::CustomVjpCall(operation) => operation.interpret(context, instruction_inputs),
-                Self::TransferToMemory(operation) => operation.interpret(context, instruction_inputs),
-                Self::Zero(operation) => operation.interpret(context, instruction_inputs),
-                Self::One(operation) => operation.interpret(context, instruction_inputs),
-                Self::Constant(operation) => operation.interpret(context, instruction_inputs),
-                Self::Fill(operation) => operation.interpret(context, instruction_inputs),
-                Self::ZeroLike(operation) => operation.interpret(context, instruction_inputs),
-                Self::OneLike(operation) => operation.interpret(context, instruction_inputs),
-                Self::Add(operation) => operation.interpret(context, instruction_inputs),
-                Self::Sub(operation) => operation.interpret(context, instruction_inputs),
-                Self::Mul(operation) => operation.interpret(context, instruction_inputs),
-                Self::Neg(operation) => operation.interpret(context, instruction_inputs),
-                Self::Transpose(operation) => operation.interpret(context, instruction_inputs),
-                Self::Scale(operation) => operation.interpret(context, instruction_inputs),
-                Self::LeftDot(operation) => operation.interpret(context, instruction_inputs),
-                Self::RightDot(operation) => operation.interpret(context, instruction_inputs),
-                Self::Reshape(operation) => operation.interpret(context, instruction_inputs),
-                Self::Reshard(operation) => operation.interpret(context, instruction_inputs),
-                Self::ShardingConstraint(operation) => operation.interpret(context, instruction_inputs),
-                Self::Broadcast(operation) => operation.interpret(context, instruction_inputs),
-                Self::Slice(operation) => operation.interpret(context, instruction_inputs),
-                Self::UpdateSlice(operation) => operation.interpret(context, instruction_inputs),
-                Self::DynamicSlice(operation) => operation.interpret(context, instruction_inputs),
-                Self::DynamicUpdateSlice(operation) => operation.interpret(context, instruction_inputs),
-                Self::Gather(operation) => operation.interpret(context, instruction_inputs),
-                Self::ScatterAdd(operation) => operation.interpret(context, instruction_inputs),
-                Self::Pad(operation) => operation.interpret(context, instruction_inputs),
-                Self::Concatenate(operation) => operation.interpret(context, instruction_inputs),
-                Self::Reduce(operation) => operation.interpret(context, instruction_inputs),
-                Self::Select(operation) => operation.interpret(context, instruction_inputs),
-                Self::Residual(operation) => operation.interpret(context, instruction_inputs),
-                Self::Recompute(operation) => operation.interpret(context, instruction_inputs),
-                Self::Condition(operation) => {
-                    let input_types =
-                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    operation.infer_output_types(input_types.as_slice())?;
-                    let branch = if operation.predicate().residual_value()?.boolean()? {
-                        operation.true_branch()
-                    } else {
-                        operation.false_branch()
-                    };
-                    Self::interpret_program(context, branch, instruction_inputs.to_vec())
-                }
-                Self::OperandCondition(operation) => {
-                    let input_types =
-                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    operation.infer_output_types(input_types.as_slice())?;
-                    let branch = if instruction_inputs[0].boolean()? {
-                        operation.true_branch()
-                    } else {
-                        operation.false_branch()
-                    };
-                    Self::interpret_program(context, branch, instruction_inputs[1..].to_vec())
-                }
-                Self::While(operation) => {
-                    let input_types =
-                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    operation.infer_output_types(input_types.as_slice())?;
-                    let mut state = instruction_inputs.to_vec();
-                    let mut completed_iterations = 0;
-                    loop {
-                        if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                            break Ok(state);
-                        }
-                        let condition_outputs = Self::interpret_program(context, operation.condition(), state.clone())?;
-                        check_count!("output", condition_outputs, 1, ProgramError);
-                        if !condition_outputs[0].boolean()? {
-                            break Ok(state);
-                        }
-                        state = Self::interpret_program(context, operation.body(), state)?;
-                        check_count!("output", state, operation.state_types().len(), ProgramError);
-                        completed_iterations += 1;
-                    }
-                }
-                Self::Scan(operation) => {
-                    let input_types =
-                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    operation.infer_output_types(input_types.as_slice())?;
-                    let stack_values = operation
-                        .captures()
-                        .iter()
-                        .map(CustomVjpResidual::residual_value)
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let body = operation.body();
-                    let carry_count = operation.carry_count();
-                    let y_slice_types = body.output_types().split_off(carry_count);
-                    interpret_scan_lanes(
-                        carry_count,
-                        operation.length(),
-                        operation.reverse(),
-                        y_slice_types.as_slice(),
-                        instruction_inputs,
-                        |stacked_type| context.zero(stacked_type),
-                        |lane, lane_inputs| {
-                            let lane_residuals = stack_values
-                                .iter()
-                                .map(|stack| read_scan_lane(stack, lane))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let lane_body = body.map_operations(|operation| {
-                                operation.try_map_captures(&mut |capture: &ValueOrCapture<ArrayType, V>| {
-                                    capture.instantiate(lane_residuals.as_slice())
-                                })
-                            })?;
-                            Self::interpret_program(context, &lane_body, lane_inputs)
-                        },
-                    )
-                }
-            },
-        )
-    }
-}
-
 /// Shared payload-mapping core behind [`CaptureParameterizedOperation::try_map_captures`] for
 /// [`LinearArrayOperation`].
 fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
@@ -706,176 +556,6 @@ where
         inputs: Vec<AtomId>,
     ) -> Result<DefactorizedOperation<Self>, ProgramError> {
         defactorize_operation_default::<V, R, P, Self>(self, residual_atoms, inputs)
-    }
-}
-
-/// [`InterpretableOperation`] for [`ArrayOperation`] requires the full union of value capabilities exercised by the
-/// closed default ordinary operation enum.
-///
-/// The value-side bound list is expressed via the orthogonal capability bundles defined in [`super::bounds`] (one
-/// per operation category — arithmetic, trigonometric, constants, manipulation, comparison) plus the few singleton
-/// traits ([`DotOps`], [`Select`], [`BooleanLike`]) that the dispatcher requires directly. Context-side nullary
-/// capabilities ([`Zero`], [`One`], [`Fill`]) are listed on `V::InterpretationContext`. Each impl site composes only
-/// the categories it actually exercises, so downstream consumers never depend on a single monolithic value-bundle
-/// trait.
-impl<V> InterpretableOperation<ArrayType, V> for ArrayOperation<V>
-where
-    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V>>
-        + Parameter
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
-        + SupportsConstantOperations<ArrayType>
-        + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
-        + Select<Condition = V>
-        + BooleanLike
-        + TransferToMemory,
-    V::InterpretationContext: Context<Type = ArrayType, Constant = V, Value = V>
-        + Zero<ArrayType, V>
-        + One<ArrayType, V>
-        + Fill<ArrayType, f64, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomJvp(operation) => operation.interpret(context, inputs),
-            Self::CustomVjp(operation) => operation.interpret(context, inputs),
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::Fill(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::OneLike(operation) => operation.interpret(context, inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Mul(operation) => operation.interpret(context, inputs),
-            Self::Div(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Sin(operation) => operation.interpret(context, inputs),
-            Self::Cos(operation) => operation.interpret(context, inputs),
-            Self::StopGradient(operation) => operation.interpret(context, inputs),
-            Self::RematerializationName(operation) => operation.interpret(context, inputs),
-            Self::TransferToMemory(operation) => operation.interpret(context, inputs),
-            Self::Dot(operation) => operation.interpret(context, inputs),
-            Self::Transpose(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => operation.interpret(context, inputs),
-            Self::Reshape(operation) => operation.interpret(context, inputs),
-            Self::Reshard(operation) => operation.interpret(context, inputs),
-            Self::ShardingConstraint(operation) => operation.interpret(context, inputs),
-            Self::Broadcast(operation) => operation.interpret(context, inputs),
-            Self::Slice(operation) => operation.interpret(context, inputs),
-            Self::UpdateSlice(operation) => operation.interpret(context, inputs),
-            Self::DynamicSlice(operation) => operation.interpret(context, inputs),
-            Self::DynamicUpdateSlice(operation) => operation.interpret(context, inputs),
-            Self::Pad(operation) => operation.interpret(context, inputs),
-            Self::Concatenate(operation) => operation.interpret(context, inputs),
-            Self::Gather(operation) => operation.interpret(context, inputs),
-            Self::Scatter(operation) => operation.interpret(context, inputs),
-            Self::Reduce(operation) => operation.interpret(context, inputs),
-            Self::Compare(operation) => operation.interpret(context, inputs),
-            Self::Not(operation) => operation.interpret(context, inputs),
-            Self::And(operation) => operation.interpret(context, inputs),
-            Self::Or(operation) => operation.interpret(context, inputs),
-            Self::Xor(operation) => operation.interpret(context, inputs),
-            Self::Collective(operation) => operation.interpret(context, inputs),
-            Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Condition(condition) => condition.interpret(context, inputs),
-            Self::While(while_operation) => while_operation.interpret(context, inputs),
-            Self::Scan(scan) => scan.interpret(context, inputs),
-        }
-    }
-}
-
-impl<S, C> InterpretableOperation<ArrayType, Tracer<S>> for ArrayOperation<C>
-where
-    S: StagingContext<Type = ArrayType>,
-    C: Value<ArrayType>,
-    Self: Clone + Into<S::Operation>,
-{
-    fn interpret(&self, context: &S, inputs: &[Tracer<S>]) -> Result<Vec<Tracer<S>>, ProgramError> {
-        context.stage_operation(self.clone(), inputs)
-    }
-}
-
-impl<V, C, F: Value<ArrayType>, P> InterpretableOperation<ArrayType, V> for LinearArrayOperation<V, C, F, P>
-where
-    V: Value<ArrayType>
-        + Parameter
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Mul<Output = V>
-        + Neg<Output = V>
-        + SupportsConstantOperations<ArrayType>
-        + Transpose
-        + SupportsManipulationOperations
-        + Select<Condition = V>
-        + BooleanLike
-        + TransferToMemory,
-    C: Value<ArrayType>,
-    V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V>
-        + Zero<ArrayType, V>
-        + One<ArrayType, V>
-        + Fill<ArrayType, f64, V>
-        + Constant<ArrayType, V, V, Input>
-        + Scale<ArrayType, V, V, Input>
-        + LeftDot<V, V, Input>
-        + RightDot<V, V, Input>,
-    ScaleOperation<ArrayType, F, Input>: InterpretableOperation<ArrayType, V>,
-    ConstantOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
-    LeftDotOperation<F, Input>: InterpretableOperation<ArrayType, V>,
-    RightDotOperation<F, Input>: InterpretableOperation<ArrayType, V>,
-    F: CustomVjpResidual<ArrayType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    P: Clone + InterpretableOperation<ArrayType, V>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
-            Self::TransferToMemory(operation) => operation.interpret(context, inputs),
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::Fill(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::OneLike(operation) => operation.interpret(context, inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Mul(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Transpose(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => operation.interpret(context, inputs),
-            Self::LeftDot(operation) => operation.interpret(context, inputs),
-            Self::RightDot(operation) => operation.interpret(context, inputs),
-            Self::Reshape(operation) => operation.interpret(context, inputs),
-            Self::Reshard(operation) => operation.interpret(context, inputs),
-            Self::ShardingConstraint(operation) => operation.interpret(context, inputs),
-            Self::Broadcast(operation) => operation.interpret(context, inputs),
-            Self::Slice(operation) => operation.interpret(context, inputs),
-            Self::UpdateSlice(operation) => operation.interpret(context, inputs),
-            Self::DynamicSlice(operation) => operation.interpret(context, inputs),
-            Self::DynamicUpdateSlice(operation) => operation.interpret(context, inputs),
-            Self::Gather(operation) => operation.interpret(context, inputs),
-            Self::ScatterAdd(operation) => operation.interpret(context, inputs),
-            Self::Pad(operation) => operation.interpret(context, inputs),
-            Self::Concatenate(operation) => operation.interpret(context, inputs),
-            Self::Reduce(operation) => operation.interpret(context, inputs),
-            Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Residual(operation) => operation.interpret(context, inputs),
-            Self::Recompute(operation) => operation.interpret(context, inputs),
-            Self::Condition(operation) => operation.interpret(context, inputs),
-            Self::OperandCondition(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => operation.interpret(context, inputs),
-        }
     }
 }
 
@@ -1112,7 +792,7 @@ where
 /// [`ConditionOperation`]; see [`LinearizableProgramOperation`](crate::tracing_v2::LinearizableProgramOperation).
 ///
 /// The where clauses here are deliberately the *leaf* closure of what
-/// [`linearize_program`](crate::tracing_v2::linearize_program)`::<E, Self>` needs — the generic JVP
+/// [`Program::linearize`] needs — the generic JVP
 /// dispatch impl's bounds instantiated at [`LinearizationContextOf`] — rather than the
 /// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound itself. Spelling out the leaves keeps
 /// instantiating this impl free of derived-context differentiation obligations (the recursive obligation is
@@ -1181,7 +861,7 @@ where
         differentiable: &E,
         program: &crate::programs::Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
     ) -> Result<NestedLinearization<E, Self>, ProgramError> {
-        crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+        program.linearize(differentiable)
     }
 }
 

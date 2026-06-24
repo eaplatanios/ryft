@@ -285,7 +285,7 @@ pub type LinearizationTracer<'domain, D> = Tracer<PrimalTracingContext<D>>;
 /// (there is no negative reasoning to disjoin the two domains); and (3) [`TracingContext`] borrows its domain, which
 /// would thread a borrow lifetime through every closure signature, whereas owning the clone keeps the tracer leaf
 /// lifetime-free. No differentiation work happens while the closure runs; the traced program is differentiated
-/// afterwards — symbolically by [`linearize_program`] for [`linearize`](DifferentiationContext::linearize) and the
+/// afterwards — symbolically by [`Program::linearize`] for [`linearize`](DifferentiationContext::linearize) and the
 /// reverse-mode entry points, or through the value-level JVP replay for [`jvp`](DifferentiationContext::jvp).
 pub struct PrimalTracingContext<E: Context> {
     /// Enclosing [`Context`] on whose behalf the closure is being traced.
@@ -788,7 +788,7 @@ pub trait DifferentiationContext:
     ///     the [`WhileOperation`](crate::operations::control_flow::WhileOperation) rule — take their eager strategy
     ///     (unrolling the loop into a straight-line, transposable pushforward), so eager reverse mode works.
     ///   - **Staging contexts** ([`TracingContext`], abstract domains, gate `false`) cannot concretize primals, so the
-    ///     program is linearized *symbolically* once through [`linearize_program`] (via the
+    ///     program is linearized *symbolically* once through [`Program::linearize`] (via the
     ///     [`LinearizableProgramOperation`] witness), producing a residual-extended primal program and a residualized
     ///     pushforward program, and the resulting [`Linearization`] is evaluated [`at`](Linearization::at)
     ///     `input_primals` against this context (splicing the primal program into the active trace).
@@ -849,7 +849,7 @@ pub trait DifferentiationContext:
 ///
 /// This is the value-level forward-mode replay loop. [`DifferentiationContext::jvp`] and the eager branch of
 /// [`linearize_program`](DifferentiationContext::linearize_program) run it against a concretizing context; the
-/// symbolic core (the free [`linearize_program`]) runs it against a nested [`LinearizationContext`]. The contexts
+/// symbolic core ([`Program::linearize`]) runs it against a nested [`LinearizationContext`]. The contexts
 /// represent structural zero tangents uniformly as canonical staged zero operations.
 fn linearize_program_by_replay<'context, E, O, Input, Output>(
     context: &'context E,
@@ -1075,7 +1075,7 @@ impl<'domain, D: Domain + 'domain, Capture> ProvidesContext<TracingContext<'doma
 ///   - **Primal side**: [`Domain::Value`] is this context's own [`Tracer`], so JVP rules that compute primal results
 ///     through [`Context::bind`] stage ordinary primal instructions into the owned [`ProgramBuilder`] instead of
 ///     evaluating them. The staged program becomes the nested primal program (extended with residual outputs by
-///     [`linearize_program`]).
+///     [`Program::linearize`]).
 ///   - **Linear side**: [`DifferentiationContext::Tangent`] and
 ///     [`DifferentiationContext::LinearOperation`] are inherited from the *enclosing* context (through the
 ///     `TangentValue` and `CanonicalLinearOperation` parameters), so the staged pushforward program is directly
@@ -1278,7 +1278,7 @@ pub type LinearizationContextOf<E, O> = LinearizationContext<
 >;
 
 /// Result of one symbolic linearization run: a pair of programs that together represent a function and its
-/// derivative at *every* primal point, produced without any concrete primal values (see [`linearize_program`]).
+/// derivative at *every* primal point, produced without any concrete primal values (see [`Program::linearize`]).
 ///
 /// A [`Linearization`] is the fully program-level form of forward-mode differentiation. Where a [`Pushforward`]
 /// pairs a residualized linear program with the concrete residual values saved by one primal execution, a
@@ -1440,7 +1440,7 @@ pub type NestedLinearization<E, O> = Linearization<E, O, Vec<<E as Domain>::Cons
 /// the same closed enum currently being proven differentiable. Writing that need directly as
 /// `O: DifferentiableOperation<LinearizationContextOf<C, O>>` at every recursive payload boundary can make Rust's
 /// trait solver repeatedly re-enter the same enum and overflow. [`LinearizableProgramOperation`] names that recursive
-/// fixed point once: a closed operation enum implements this trait by calling [`linearize_program`], while
+/// fixed point once: a closed operation enum implements this trait by calling [`Program::linearize`], while
 /// higher-order payloads depend on this semantic witness instead of reproducing the full derived linearization
 /// context obligation.
 ///
@@ -1450,7 +1450,7 @@ pub type NestedLinearization<E, O> = Linearization<E, O, Vec<<E as Domain>::Cons
 /// complete operation families, not individual primitive payloads.
 pub trait LinearizableProgramOperation<C: DifferentiationContext>: Operation<<C as Domain>::Type> + Sized {
     /// Linearizes `program` symbolically on behalf of `differentiable`; refer to the documentation of
-    /// [`linearize_program`] for the returned packaging.
+    /// [`Program::linearize`] for the returned packaging.
     fn linearize_program(
         differentiable: &C,
         program: &Program<
@@ -1463,117 +1463,105 @@ pub trait LinearizableProgramOperation<C: DifferentiationContext>: Operation<<C 
     ) -> Result<NestedLinearization<C, Self>, ProgramError>;
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
-    /// Linearizes this [`Program`] symbolically on behalf of `differentiable`.
+impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<T, V, O, Input, Output>
+{
+    /// Linearizes this [`Program`] symbolically on behalf of the enclosing differentiation context `differentiable`.
     ///
-    /// Refer to [`linearize_program`] for the returned packaging and replay semantics.
+    /// This is the typed core behind every program-level forward-mode transform, and in particular the building block
+    /// for higher-order JVP rules that must differentiate nested programs *without* concrete primal values, exactly
+    /// like JAX's [`jvp_jaxpr`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html) + partial evaluation split for
+    /// control-flow primitives. The program is replayed through JVP rules against a fresh
+    /// [`LinearizationContext`] whose values are tracers, so the primal side is *staged* into a fresh program instead of
+    /// being evaluated, while the tangent side is staged into a pushforward expressed directly over the enclosing
+    /// context's [`Tangent`](DifferentiationContext::Tangent) and
+    /// [`LinearOperation`](DifferentiationContext::LinearOperation) types.
+    ///
+    /// The returned [`Linearization`] preserves the program's `Input`/`Output` parameterizations and packages the
+    /// residual-extended primal program, the residualized pushforward program, and the residual types; refer to the
+    /// [`Linearization`] documentation for the exact program-shape contract. Factor payloads captured from program
+    /// *constants* (which have no residual atom) are converted into closed [`ValueOrCapture::Value`] factors by lifting
+    /// the constant through `differentiable`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `differentiable`: Enclosing [`DifferentiationContext`] implementation. It is only used to lift program
+    ///     constants that JVP rules captured as closed factors; no primal computation runs on it.
     pub fn linearize<C: DifferentiationContext<Type = T, Constant = V>>(
         &self,
-        context: &C,
-    ) -> Result<NestedLinearization<C, O>, ProgramError>
+        differentiable: &C,
+    ) -> Result<Linearization<C, O, Input, Output>, ProgramError>
     where
-        O: LinearizableProgramOperation<C>,
+        O: Clone + Operation<T> + DifferentiableOperation<LinearizationContextOf<C, O>>,
+        Input: Parameterized<V, Family: ParameterizedFamily<C::Tangent>>,
+        Output: Parameterized<
+                V,
+                Family: ParameterizedFamily<Tracer<LinearizationContextOf<C, O>>> + ParameterizedFamily<C::Tangent>,
+            >,
+        C::LinearOperation<C::Tangent, V>: CaptureParameterizedOperation<T, V>,
+        LinearOperationOf<LinearizationContextOf<C, O>>: ResidualizedOperation<LinearizationContextOf<C, O>>
+            + CaptureParameterizedOperation<
+                T,
+                ValueOrCapture<T, Tracer<LinearizationContextOf<C, O>>>,
+                WithCapture<ValueOrCapture<T, C::Value>> = LinearOperationOf<C>,
+            > + MaybeZeroOperation<T>,
     {
-        O::linearize_program(context, self)
-    }
-}
+        let nested_context = LinearizationContextOf::<C, O>::new();
+        let input_tracers = self
+            .input_types()
+            .into_iter()
+            .map(|input_type| nested_context.input(input_type))
+            .collect::<Vec<_>>();
+        let (output_primals, pushforward) = linearize_program_by_replay(&nested_context, self, input_tracers)?;
+        // Surface errors that nested staging recorded on the builder while a rule continued with poisoned tracers, so
+        // callers see the original failure instead of an opaque `PoisonedValue` from the atom collection below.
+        if let Some(error) = nested_context.builder().borrow_mut().error.take() {
+            return Err(error);
+        }
 
-/// Linearizes a staged [`Program`] symbolically on behalf of the enclosing differentiation context `differentiable`.
-///
-/// This is the typed core behind every program-level forward-mode transform, and in particular the building block
-/// for higher-order JVP rules that must differentiate nested programs *without* concrete primal values, exactly
-/// like JAX's [`jvp_jaxpr`](https://docs.jax.dev/en/latest/jax.interpreters.ad.html) + partial evaluation split for
-/// control-flow primitives. The program is replayed through JVP rules against a fresh
-/// [`LinearizationContext`] whose values are tracers, so the primal side is *staged* into a fresh program
-/// instead of being evaluated, while the tangent side is staged into a pushforward expressed directly over the
-/// enclosing context's [`Tangent`](DifferentiationContext::Tangent) and
-/// [`LinearOperation`](DifferentiationContext::LinearOperation) types.
-///
-/// The returned [`Linearization`] preserves the program's `Input`/`Output` parameterizations and packages the
-/// residual-extended primal program, the residualized pushforward program, and the residual types; refer to the
-/// [`Linearization`] documentation for the exact program-shape contract. Factor payloads captured from program
-/// *constants* (which have no residual atom) are converted into closed [`ValueOrCapture::Value`] factors by
-/// lifting the constant through `differentiable`.
-///
-/// # Parameters
-///
-///   - `differentiable`: Enclosing [`DifferentiationContext`] implementation. It is only used to lift program
-///     constants that JVP rules captured as closed factors; no primal computation runs on it.
-///   - `program`: Staged primal program to linearize symbolically.
-pub fn linearize_program<E, O, Input, Output>(
-    differentiable: &E,
-    program: &Program<<E as Domain>::Type, <E as Domain>::Constant, O, Input, Output>,
-) -> Result<Linearization<E, O, Input, Output>, ProgramError>
-where
-    E: DifferentiationContext,
-    O: Clone + Operation<E::Type> + DifferentiableOperation<LinearizationContextOf<E, O>>,
-    Input: Parameterized<<E as Domain>::Constant, Family: ParameterizedFamily<E::Tangent>>,
-    Output: Parameterized<
-            <E as Domain>::Constant,
-            Family: ParameterizedFamily<Tracer<LinearizationContextOf<E, O>>> + ParameterizedFamily<E::Tangent>,
-        >,
-    E::LinearOperation<E::Tangent, <E as Domain>::Constant>:
-        CaptureParameterizedOperation<<E as Domain>::Type, <E as Domain>::Constant>,
-    LinearOperationOf<LinearizationContextOf<E, O>>: ResidualizedOperation<LinearizationContextOf<E, O>>
-        + CaptureParameterizedOperation<
-            <E as Domain>::Type,
-            ValueOrCapture<<E as Domain>::Type, Tracer<LinearizationContextOf<E, O>>>,
-            WithCapture<ValueOrCapture<<E as Domain>::Type, <E as Domain>::Value>> = LinearOperationOf<E>,
-        > + MaybeZeroOperation<<E as Domain>::Type>,
-{
-    let nested_context = LinearizationContextOf::<E, O>::new();
-    let input_tracers = program
-        .input_types()
-        .into_iter()
-        .map(|input_type| nested_context.input(input_type))
-        .collect::<Vec<_>>();
-    let (output_primals, pushforward) = linearize_program_by_replay(&nested_context, program, input_tracers)?;
-    // Surface errors that nested staging recorded on the builder while a rule continued with poisoned tracers, so
-    // callers see the original failure instead of an opaque `PoisonedValue` from the atom collection below.
-    if let Some(error) = nested_context.builder().borrow_mut().error.take() {
-        return Err(error);
-    }
+        // Collect the atoms and types that outlive the nested run before dropping any tracer.
+        let output_atoms = output_primals.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        let residual_atoms = pushforward.residuals().iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+        let residual_types =
+            pushforward.residuals().iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>();
 
-    // Collect the atoms and types that outlive the nested run before dropping any tracer.
-    let output_atoms = output_primals.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-    let residual_atoms = pushforward.residuals().iter().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-    let residual_types =
-        pushforward.residuals().iter().map(|residual| residual.r#type().into_owned()).collect::<Vec<_>>();
-
-    // Rebase the pushforward's factor payloads from nested tracers onto the enclosing context's value type. Residual
-    // references are positional and carry over unchanged, while closed factors can only have been captured from
-    // nested program constants and are lifted through the enclosing context.
-    let pushforward_program = pushforward.program().map_operations(|operation| {
-        operation.try_map_captures(&mut |factor| match factor {
-            ValueOrCapture::Capture { index, r#type } => {
-                Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
-            }
-            ValueOrCapture::Value(tracer) => {
-                let atom = tracer.atom_id()?;
-                let builder = nested_context.builder().borrow();
-                match builder.atoms().get(atom.index()) {
-                    Some(Atom::Constant(constant)) => Ok(ValueOrCapture::Value(differentiable.lift(constant.clone())?)),
-                    Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
-                        "nested symbolic linearization captured non-constant primal atom {atom} as a closed factor",
-                    ))),
-                    None => Err(ProgramError::UnboundAtomId { id: atom }),
+        // Rebase the pushforward's factor payloads from nested tracers onto the enclosing context's value type.
+        // Residual references are positional and carry over unchanged, while closed factors can only have been captured
+        // from nested program constants and are lifted through the enclosing context.
+        let pushforward_program = pushforward.program().map_operations(|operation| {
+            operation.try_map_captures(&mut |factor| match factor {
+                ValueOrCapture::Capture { index, r#type } => {
+                    Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
                 }
-            }
-        })
-    })?;
+                ValueOrCapture::Value(tracer) => {
+                    let atom = tracer.atom_id()?;
+                    let builder = nested_context.builder().borrow();
+                    match builder.atoms().get(atom.index()) {
+                        Some(Atom::Constant(constant)) => {
+                            Ok(ValueOrCapture::Value(differentiable.lift(constant.clone())?))
+                        }
+                        Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
+                            "nested symbolic linearization captured non-constant primal atom {atom} as a closed factor",
+                        ))),
+                        None => Err(ProgramError::UnboundAtomId { id: atom }),
+                    }
+                }
+            })
+        })?;
 
-    // Drop every tracer so the nested primal builder can be recovered, then build the residual-extended program.
-    drop(output_primals);
-    drop(pushforward);
-    let LinearizationContext { builder, marker: _ } = nested_context;
-    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let mut output_ids = output_atoms;
-    output_ids.extend(residual_atoms);
-    let extended_output_count = output_ids.len();
-    let primal_program = builder
-        .build(output_ids, program.input_structure().clone(), vec![Placeholder; extended_output_count])?
-        .simplified()?;
-    Ok(Linearization { primal_program, pushforward_program, residual_types })
+        // Drop every tracer so the nested primal builder can be recovered, then build the residual-extended program.
+        drop(output_primals);
+        drop(pushforward);
+        let LinearizationContext { builder, marker: _ } = nested_context;
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let mut output_ids = output_atoms;
+        output_ids.extend(residual_atoms);
+        let extended_output_count = output_ids.len();
+        let primal_program = builder
+            .build(output_ids, self.input_structure().clone(), vec![Placeholder; extended_output_count])?
+            .simplified()?;
+        Ok(Linearization { primal_program, pushforward_program, residual_types })
+    }
 }
 
 /// Operation-level contract for forward-mode Jacobian-Vector Product (JVP) staging.

@@ -14,8 +14,8 @@ use ryft_core::operations::arithmetic::{
 };
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::constants::{
-    Constant, ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero,
-    ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike,
+    ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use ryft_core::operations::differentiation::StopGradientOperation;
@@ -23,14 +23,12 @@ use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, Xo
 use ryft_core::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     GatherOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation,
-    LinearScatterAddOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
-    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    LinearScatterAddOperation, PadOperation, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
+    TransposeOperation, UpdateSliceOperation,
 };
 use ryft_core::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
-use ryft_core::operations::{
-    BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter,
-};
+use ryft_core::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::payloads::{Captured, Input};
 use ryft_core::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -50,7 +48,7 @@ use ryft_core::tracing_v2::operations::control_flow::{
     defactorize_operation_default,
 };
 use ryft_core::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
 };
 use ryft_core::tracing_v2::operations::dot::{DotOps, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
@@ -716,7 +714,7 @@ where
         differentiable: &E,
         program: &Program<ArrayType, XlaConstant, Self, Vec<XlaConstant>, Vec<XlaConstant>>,
     ) -> Result<NestedLinearization<E, Self>, ProgramError> {
-        ryft_core::tracing_v2::differentiation::linearize_program(differentiable, program)
+        program.linearize(differentiable)
     }
 }
 
@@ -965,113 +963,6 @@ where
         .unwrap()
         .with_captures(operation.captures().to_vec());
         Self::Scan(Box::new(scan))
-    }
-}
-
-fn interpret_direct_linear_xla_operation<V, C, P>(
-    operation: &LinearXlaOperation<V, C, V, P, V>,
-    context: &V::InterpretationContext,
-    inputs: &[V],
-) -> Result<Vec<V>, ProgramError>
-where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
-    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
-    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-{
-    if let Some(operation) = operation.to_core_linear_array_operation() {
-        return operation.interpret(context, inputs);
-    }
-    match operation {
-        LinearXlaOperation::Condition(operation) => {
-            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            operation.infer_output_types(input_types.as_slice())?;
-            let branch = if operation.predicate().residual_value()?.boolean()? {
-                operation.true_branch()
-            } else {
-                operation.false_branch()
-            };
-            interpret_direct_linear_xla_program(context, branch, inputs.to_vec())
-        }
-        LinearXlaOperation::OperandCondition(operation) => {
-            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            operation.infer_output_types(input_types.as_slice())?;
-            let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
-            interpret_direct_linear_xla_program(context, branch, inputs[1..].to_vec())
-        }
-        LinearXlaOperation::While(operation) => operation.interpret(context, inputs),
-        LinearXlaOperation::Scan(operation) => operation.interpret(context, inputs),
-        LinearXlaOperation::LinearJitCall(operation) => operation.interpret(context, inputs),
-        LinearXlaOperation::LinearShardMap(operation) => operation.interpret(context, inputs),
-        _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
-    }
-}
-
-fn interpret_direct_linear_xla_program<V, C, P>(
-    context: &V::InterpretationContext,
-    program: &Program<ArrayType, V, LinearXlaOperation<V, C, V, P, V>, Vec<V>, Vec<V>>,
-    input: Vec<V>,
-) -> Result<Vec<V>, ProgramError>
-where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
-    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
-    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-{
-    program.interpret_with(
-        input,
-        |_, constant| Ok(constant.clone()),
-        |instruction, instruction_inputs| {
-            interpret_direct_linear_xla_operation(instruction.operation(), context, instruction_inputs)
-        },
-    )
-}
-
-impl<V, C, P> InterpretableOperation<ArrayType, V> for LinearXlaOperation<V, C, V, P, V>
-where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
-    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
-    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        interpret_direct_linear_xla_operation(self, context, inputs)
-    }
-}
-
-impl<V, C, P> InterpretableProgramOperation<ArrayType, V> for LinearXlaOperation<V, C, V, P, V>
-where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
-    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
-    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-{
-    fn interpret_program(
-        context: &V::InterpretationContext,
-        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        input: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError> {
-        interpret_direct_linear_xla_program(context, program, input)
     }
 }
 

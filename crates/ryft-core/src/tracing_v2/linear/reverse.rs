@@ -572,7 +572,7 @@ mod tests {
             differentiable: &TestDomain,
             program: &crate::programs::Program<TestType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
         ) -> Result<crate::tracing_v2::NestedLinearization<TestDomain, Self>, ProgramError> {
-            crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+            program.linearize(differentiable)
         }
     }
 

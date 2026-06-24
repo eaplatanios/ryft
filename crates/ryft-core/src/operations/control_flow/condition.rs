@@ -2,8 +2,9 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::macros::{check_count, check_types};
-use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
-use crate::parameters::Parameterized;
+use crate::operations::{
+    BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter,
+};
 use crate::payloads::{Captured, Input};
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, Type, TypeError};
@@ -26,9 +27,10 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 /// simplification), so `ryft` performs no predicate folding of its own.
 ///
 /// The nested branches are stored as flat `Vec`-parameter [`Program`]s because they consume the operation operands
-/// directly. Structured Rust parameters are flattened before a branch is captured (i.e., via [`Parameterized`]
-/// helpers) and reconstructed later as needed. The operation itself only needs the ordered parameter signature for
-/// type checking, interpretation, batching, differentiation, transposition, and other transforms.
+/// directly. Structured Rust parameters are flattened before a branch is captured (i.e., via
+/// [`Parameterized`](crate::parameters::Parameterized) helpers) and reconstructed later as needed. The operation
+/// itself only needs the ordered parameter signature for type checking, interpretation, batching, differentiation,
+/// transposition, and other transforms.
 #[derive(Clone)]
 pub struct ConditionOperation<T: Type, V: Value<T>, O, F: Value<T> = V, PredicatePayload = Input> {
     /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
@@ -194,11 +196,11 @@ impl<V: Value<ArrayType>, F: Value<ArrayType>, O: Operation<ArrayType>> Operatio
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, V, O, V, Input>
+impl<C, V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, C, O, C, Input>
 where
+    C: Value<ArrayType>,
     V: Value<ArrayType> + BooleanLike,
-    O: InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    O: InterpretableProgramOperation<ArrayType, V, C>,
 {
     fn interpret(
         &self,
@@ -208,7 +210,7 @@ where
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let (predicate, operands) = (inputs[0].boolean()?, &inputs[1..]);
-        if predicate { &self.true_branch } else { &self.false_branch }.interpret_in_context(context, operands.to_vec())
+        O::interpret_program(context, if predicate { &self.true_branch } else { &self.false_branch }, operands.to_vec())
     }
 }
 

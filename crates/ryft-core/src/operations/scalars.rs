@@ -2,20 +2,19 @@ use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use ryft_macros::{Operation, TransposableOperation};
 
-use crate::contexts::Context;
 use crate::domains::Domain;
+use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    Constant, ConstantOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
+    ZeroOperation,
 };
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -24,11 +23,9 @@ use crate::tracing_v2::differentiation::{
     CaptureParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContextOf, NestedLinearization,
     TangentContext,
 };
-use crate::tracing_v2::operations::bounds::{
-    SupportsConstantOperations, SupportsLinearScalarOperation, SupportsTrigonometricOperations,
-};
+use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual, custom_jvp_rule, custom_vjp_rule,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, custom_jvp_rule, custom_vjp_rule,
 };
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
@@ -166,7 +163,7 @@ where
 /// Nested symbolic linearization for the [`ScalarOperation`] sum type.
 ///
 /// The where clauses spell the leaf closure required by
-/// [`linearize_program`](crate::tracing_v2::linearize_program) instead of the recursive
+/// [`Program::linearize`] instead of the recursive
 /// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound, which avoids pushing that recursive
 /// obligation back into every consumer.
 impl<F, E, BodyOperation> LinearizableProgramOperation<E> for ScalarOperation<F>
@@ -210,62 +207,7 @@ where
         differentiable: &E,
         program: &Program<DataType, F, Self, Vec<F>, Vec<F>>,
     ) -> Result<NestedLinearization<E, Self>, ProgramError> {
-        crate::tracing_v2::differentiation::linearize_program(differentiable, program)
-    }
-}
-
-impl<C, V> InterpretableOperation<DataType, V> for ScalarOperation<C>
-where
-    C: Value<DataType>,
-    V: Value<DataType> + BooleanLike,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Constant<DataType, V, C>,
-    ZeroOperation<DataType>: InterpretableOperation<DataType, V>,
-    ZeroLikeOperation: InterpretableOperation<DataType, V>,
-    OneOperation<DataType>: InterpretableOperation<DataType, V>,
-    OneLikeOperation: InterpretableOperation<DataType, V>,
-    ConstantOperation<DataType, C>: InterpretableOperation<DataType, V>,
-    NegOperation: InterpretableOperation<DataType, V>,
-    AddOperation: InterpretableOperation<DataType, V>,
-    SubOperation: InterpretableOperation<DataType, V>,
-    ScaleOperation<DataType, C>: InterpretableOperation<DataType, V>,
-    MulOperation: InterpretableOperation<DataType, V>,
-    DivOperation: InterpretableOperation<DataType, V>,
-    SinOperation: InterpretableOperation<DataType, V>,
-    CosOperation: InterpretableOperation<DataType, V>,
-    CompareOperation: InterpretableOperation<DataType, V>,
-    SelectOperation: InterpretableOperation<DataType, V>,
-    StopGradientOperation: InterpretableOperation<DataType, V>,
-    RematerializationNameOperation: InterpretableOperation<DataType, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<DataType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::OneLike(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => operation.interpret(context, inputs),
-            Self::Mul(operation) => operation.interpret(context, inputs),
-            Self::Div(operation) => operation.interpret(context, inputs),
-            Self::Sin(operation) => operation.interpret(context, inputs),
-            Self::Cos(operation) => operation.interpret(context, inputs),
-            Self::Compare(operation) => operation.interpret(context, inputs),
-            Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => operation.interpret(context, inputs),
-            Self::StopGradient(operation) => operation.interpret(context, inputs),
-            Self::RematerializationName(operation) => operation.interpret(context, inputs),
-            Self::CustomJvp(operation) => operation.interpret(context, inputs),
-            Self::CustomVjp(operation) => operation.interpret(context, inputs),
-        }
+        program.linearize(differentiable)
     }
 }
 
@@ -354,102 +296,6 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
     }
 }
 
-impl<V, C, F> InterpretableOperation<DataType, V> for LinearScalarOperation<V, C, F>
-where
-    V: Value<DataType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + BooleanLike
-        + SupportsConstantOperations<DataType>
-        + Select<Condition = <V as SelectCondition>::Condition>
-        + SelectCondition,
-    C: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>
-        + Zero<DataType, V>
-        + One<DataType, V>
-        + Constant<DataType, V, V, Input>,
-    F: CustomVjpResidual<DataType, V> + SelectCondition,
-    ScalarOperation<C>: InterpretableOperation<DataType, V>,
-    ScaleOperation<DataType, F, Input>: InterpretableOperation<DataType, V>,
-    ScaleOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
-    LinearSelectOperation<F>: InterpretableOperation<DataType, V>,
-    ConstantOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<DataType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        match self {
-            Self::CustomVjpCall(operation) => operation.interpret(context, inputs),
-            Self::Zero(operation) => operation.interpret(context, inputs),
-            Self::One(operation) => operation.interpret(context, inputs),
-            Self::Constant(operation) => operation.interpret(context, inputs),
-            Self::ZeroLike(operation) => operation.interpret(context, inputs),
-            Self::OneLike(operation) => operation.interpret(context, inputs),
-            Self::Add(operation) => operation.interpret(context, inputs),
-            Self::Sub(operation) => operation.interpret(context, inputs),
-            Self::Neg(operation) => operation.interpret(context, inputs),
-            Self::Scale(operation) => operation.interpret(context, inputs),
-            Self::Select(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => operation.interpret(context, inputs),
-        }
-    }
-}
-
-impl<V, C> InterpretableProgramOperation<DataType, V> for LinearScalarOperation<V, C, V>
-where
-    V: Value<DataType>
-        + Add<Output = V>
-        + Sub<Output = V>
-        + Neg<Output = V>
-        + BooleanLike
-        + SupportsConstantOperations<DataType>
-        + Select<Condition = <V as SelectCondition>::Condition>
-        + SelectCondition,
-    C: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>
-        + Zero<DataType, V>
-        + One<DataType, V>
-        + Constant<DataType, V, V, Input>,
-    ScaleOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
-    ConstantOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
-    ScalarOperation<C>: InterpretableOperation<DataType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
-{
-    fn interpret_program(
-        context: &V::InterpretationContext,
-        program: &Program<DataType, V, Self, Vec<V>, Vec<V>>,
-        input: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        Self: Sized,
-    {
-        program.interpret_with(
-            input,
-            |_, constant| Ok(constant.clone()),
-            |instruction, instruction_inputs| match instruction.operation() {
-                Self::CustomVjpCall(operation) => operation.interpret(context, instruction_inputs),
-                Self::Zero(operation) => operation.interpret(context, instruction_inputs),
-                Self::One(operation) => operation.interpret(context, instruction_inputs),
-                Self::Constant(operation) => operation.interpret(context, instruction_inputs),
-                Self::ZeroLike(operation) => operation.interpret(context, instruction_inputs),
-                Self::OneLike(operation) => operation.interpret(context, instruction_inputs),
-                Self::Add(operation) => operation.interpret(context, instruction_inputs),
-                Self::Sub(operation) => operation.interpret(context, instruction_inputs),
-                Self::Neg(operation) => operation.interpret(context, instruction_inputs),
-                Self::Scale(operation) => operation.interpret(context, instruction_inputs),
-                Self::Select(operation) => operation.interpret(context, instruction_inputs),
-                Self::Scan(operation) => operation.interpret(context, instruction_inputs),
-                Self::While(operation) => operation.interpret(context, instruction_inputs),
-            },
-        )
-    }
-}
-
 impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
@@ -473,9 +319,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::StagingContext;
-    use crate::operations::Operation;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::control_flow::Select;
+    use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::scalars::ScalarDomain;

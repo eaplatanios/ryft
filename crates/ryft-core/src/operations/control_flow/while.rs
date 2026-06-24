@@ -2,9 +2,9 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
 use crate::macros::{check_count, check_types};
-use crate::operations::constants::Constant;
-use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
-use crate::parameters::Parameterized;
+use crate::operations::{
+    BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter,
+};
 use crate::payloads::Captured;
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, DataType, Type, TypeError};
@@ -234,9 +234,7 @@ where
     T: WhileTypeSemantics,
     C: Value<T>,
     V: Value<T> + BooleanLike,
-    V::InterpretationContext: Constant<T, V, C, Payload>,
-    O: InterpretableOperation<T, V>,
-    Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    O: InterpretableProgramOperation<T, V, C>,
 {
     fn interpret(
         &self,
@@ -253,20 +251,12 @@ where
             if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
                 return Ok(state);
             }
-            let condition_outputs = self.condition.interpret_with(
-                state.clone(),
-                |_, constant| context.constant(constant.clone()),
-                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-            )?;
+            let condition_outputs = O::interpret_program(context, &self.condition, state.clone())?;
             check_count!("output", condition_outputs, 1, ProgramError);
             if !condition_outputs[0].boolean()? {
                 return Ok(state);
             }
-            state = self.body.interpret_with(
-                state,
-                |_, constant| context.constant(constant.clone()),
-                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-            )?;
+            state = O::interpret_program(context, &self.body, state)?;
             check_count!("output", state, self.state_types().len(), ProgramError);
             completed_iterations += 1;
         }

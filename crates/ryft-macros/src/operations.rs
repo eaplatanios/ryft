@@ -2,6 +2,7 @@
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
+use syn::visit_mut::VisitMut;
 
 use crate::helpers::attributes::Attribute;
 use crate::helpers::generics::GenericsHelpers;
@@ -164,6 +165,133 @@ impl CodeGenerator {
         let operation_self_type = conversion_self_type.clone();
         let operation_generics = self.operation_generics(&input.generics, &variants);
         let (operation_impl_generics, _, operation_where_clause) = operation_generics.split_for_impl();
+        let value_type_parameters = value_type_parameters(&input.generics, primary_type);
+        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
+            self.add_error(
+                &input.generics,
+                "could not infer the program constant value type for '#[derive(Operation)]'",
+            );
+            return TokenStream::new();
+        };
+        let has_separate_interpretation_value_type = value_type_parameters.len() == 1;
+        let interpretation_value_type: syn::Type = if has_separate_interpretation_value_type {
+            syn::parse_quote!(__InterpretationValue)
+        } else {
+            syn::parse_quote!(#program_constant_type)
+        };
+        let program_value_substitutions = value_type_parameters
+            .iter()
+            .skip(2)
+            .cloned()
+            .map(|parameter| {
+                let replacement: syn::Type = syn::parse_quote!(#program_constant_type);
+                (parameter, replacement)
+            })
+            .collect::<Vec<_>>();
+        let program_operation_self_type =
+            substitute_type_idents(&operation_self_type, program_value_substitutions.as_slice());
+        let mut interpretation_generics = self.operation_generics(&input.generics, &variants);
+        if has_separate_interpretation_value_type {
+            interpretation_generics.params.push(syn::parse_quote!(__InterpretationValue));
+        }
+        let interpretation_where_clause = interpretation_generics.make_where_clause();
+        if has_separate_interpretation_value_type {
+            interpretation_where_clause
+                .predicates
+                .push(syn::parse_quote!(#interpretation_value_type: #ryft::Value<#primary_type>));
+        }
+        interpretation_where_clause
+            .predicates
+            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
+        interpretation_where_clause.predicates.extend(variants.iter().map(|variant| {
+            let operation_type = &variant.operation_type;
+            let predicate: syn::WherePredicate = syn::parse_quote! {
+                #operation_type: #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
+            };
+            predicate
+        }));
+        let (interpretation_impl_generics, _, interpretation_where_clause) = interpretation_generics.split_for_impl();
+
+        let mut program_interpretation_generics = substitute_generics(
+            &self.operation_generics(&input.generics, &variants),
+            program_value_substitutions.as_slice(),
+        );
+        if has_separate_interpretation_value_type {
+            program_interpretation_generics.params.push(syn::parse_quote!(__InterpretationValue));
+        }
+        let program_interpretation_where_clause = program_interpretation_generics.make_where_clause();
+        if has_separate_interpretation_value_type {
+            program_interpretation_where_clause
+                .predicates
+                .push(syn::parse_quote!(#interpretation_value_type: #ryft::Value<#primary_type>));
+            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
+                <#interpretation_value_type as #ryft::Value<#primary_type>>::InterpretationContext:
+                    #ryft::Context<
+                        Type = #primary_type,
+                        Constant = #program_constant_type,
+                        Value = #interpretation_value_type,
+                    >
+            });
+        }
+        if variants.iter().any(|variant| variant.is_recursive_payload) {
+            add_recursive_interpretation_bounds(
+                program_interpretation_where_clause,
+                ryft,
+                primary_type,
+                &interpretation_value_type,
+            );
+        }
+        program_interpretation_where_clause
+            .predicates
+            .push(syn::parse_quote!(#program_operation_self_type: #ryft::Operation<#primary_type>));
+        program_interpretation_where_clause.predicates.extend(variants.iter().filter_map(|variant| {
+            if variant.is_recursive_payload {
+                None
+            } else {
+                let operation_type =
+                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+                let predicate: syn::WherePredicate = syn::parse_quote! {
+                    #operation_type: #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
+                };
+                Some(predicate)
+            }
+        }));
+        let program_constant_lift = if has_separate_interpretation_value_type {
+            quote! {
+                <<#interpretation_value_type as #ryft::Value<
+                    #primary_type,
+                >>::InterpretationContext as #ryft::Context>::lift(context, constant.clone())
+            }
+        } else {
+            quote!(Ok(constant.clone()))
+        };
+        let program_interpretation_arms = variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let operation_type =
+                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#operation_type as #ryft::InterpretableOperation<
+                        #primary_type,
+                        #interpretation_value_type,
+                    >>::interpret(#receiver, context, instruction_inputs)
+                },
+            }
+        });
+        let program_interpretation_body = quote! {
+            program.interpret_with(
+                input,
+                |_, constant| #program_constant_lift,
+                |instruction, instruction_inputs| {
+                    match instruction.operation() {
+                        #(#program_interpretation_arms)*
+                    }
+                },
+            )
+        };
+        let (program_interpretation_impl_generics, _, program_interpretation_where_clause) =
+            program_interpretation_generics.split_for_impl();
 
         let name_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
@@ -202,6 +330,19 @@ impl CodeGenerator {
                 },
             }
         });
+        let interpretation_arms = variants.iter().map(|variant| {
+            let variant_ident = &variant.ident;
+            let payload_operation_type = &variant.operation_type;
+            let receiver = variant.receiver();
+            quote! {
+                Self::#variant_ident(operation) => {
+                    <#payload_operation_type as #ryft::InterpretableOperation<
+                        #primary_type,
+                        #interpretation_value_type,
+                    >>::interpret(#receiver, context, inputs)
+                },
+            }
+        });
         let conversion_impls = variants
             .iter()
             .filter(|variant| !variant.skip_conversions)
@@ -235,6 +376,58 @@ impl CodeGenerator {
                     match self {
                         #(#render_arms)*
                     }
+                }
+            }
+
+            #[automatically_derived]
+            impl #interpretation_impl_generics
+                #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
+                for #operation_self_type
+            #interpretation_where_clause
+            {
+                fn interpret(
+                    &self,
+                    context: &<#interpretation_value_type as #ryft::Value<
+                        #primary_type,
+                    >>::InterpretationContext,
+                    inputs: &[#interpretation_value_type],
+                ) -> ::std::result::Result<
+                    ::std::vec::Vec<#interpretation_value_type>,
+                    #ryft::ProgramError,
+                > {
+                    match self {
+                        #(#interpretation_arms)*
+                    }
+                }
+            }
+
+            #[automatically_derived]
+            impl #program_interpretation_impl_generics
+                #ryft::InterpretableProgramOperation<
+                    #primary_type,
+                    #interpretation_value_type,
+                    #program_constant_type,
+                >
+                for #program_operation_self_type
+            #program_interpretation_where_clause
+            {
+                fn interpret_program(
+                    context: &<#interpretation_value_type as #ryft::Value<
+                        #primary_type,
+                    >>::InterpretationContext,
+                    program: &#ryft::Program<
+                        #primary_type,
+                        #program_constant_type,
+                        Self,
+                        ::std::vec::Vec<#program_constant_type>,
+                        ::std::vec::Vec<#program_constant_type>,
+                    >,
+                    input: ::std::vec::Vec<#interpretation_value_type>,
+                ) -> ::std::result::Result<
+                    ::std::vec::Vec<#interpretation_value_type>,
+                    #ryft::ProgramError,
+                > {
+                    #program_interpretation_body
                 }
             }
 
@@ -661,6 +854,53 @@ fn enum_type_ident(ty: &syn::Type) -> Option<&syn::Ident> {
     type_path.path.segments.first().map(|segment| &segment.ident)
 }
 
+/// Substitutes bare type identifiers in `ty`.
+fn substitute_type_idents(ty: &syn::Type, substitutions: &[(syn::Ident, syn::Type)]) -> syn::Type {
+    let mut ty = ty.clone();
+    TypeIdentSubstituter { substitutions }.visit_type_mut(&mut ty);
+    ty
+}
+
+/// Substitutes bare type identifiers in `generics` and removes substituted type parameters.
+fn substitute_generics(generics: &syn::Generics, substitutions: &[(syn::Ident, syn::Type)]) -> syn::Generics {
+    let mut generics = generics.clone();
+    generics.params = generics
+        .params
+        .into_iter()
+        .filter(|parameter| {
+            !matches!(
+                parameter,
+                syn::GenericParam::Type(parameter)
+                    if substitutions.iter().any(|(ident, _)| parameter.ident == *ident)
+            )
+        })
+        .collect();
+    TypeIdentSubstituter { substitutions }.visit_generics_mut(&mut generics);
+    generics
+}
+
+/// Visitor replacing bare type identifiers with concrete types.
+struct TypeIdentSubstituter<'a> {
+    /// Type identifier substitutions.
+    substitutions: &'a [(syn::Ident, syn::Type)],
+}
+
+impl VisitMut for TypeIdentSubstituter<'_> {
+    fn visit_type_mut(&mut self, ty: &mut syn::Type) {
+        if let syn::Type::Path(type_path) = ty
+            && type_path.qself.is_none()
+            && type_path.path.segments.len() == 1
+            && let Some(segment) = type_path.path.segments.first()
+            && matches!(segment.arguments, syn::PathArguments::None)
+            && let Some((_, replacement)) = self.substitutions.iter().find(|(ident, _)| segment.ident == *ident)
+        {
+            *ty = replacement.clone();
+            return;
+        }
+        syn::visit_mut::visit_type_mut(self, ty);
+    }
+}
+
 /// Infers the value type parameter used by generated transposition.
 fn transposed_value_type(generics: &syn::Generics, operation_type: &syn::Type) -> Option<syn::Ident> {
     generics
@@ -681,6 +921,64 @@ fn transposed_value_type(generics: &syn::Generics, operation_type: &syn::Type) -
             })
         })
         .map(|parameter| parameter.ident.clone())
+}
+
+/// Returns generic value parameters bounded by `Value<operation_type>`.
+fn value_type_parameters(generics: &syn::Generics, operation_type: &syn::Type) -> Vec<syn::Ident> {
+    generics
+        .type_params()
+        .filter(|parameter| {
+            parameter.bounds.iter().any(|bound| {
+                value_bound_argument(bound).is_some_and(|argument| type_tokens_equal(&argument, operation_type))
+            }) || generics.where_clause.iter().any(|where_clause| {
+                where_clause.predicates.iter().any(|predicate| match predicate {
+                    syn::WherePredicate::Type(predicate) if type_is_ident(&predicate.bounded_ty, &parameter.ident) => {
+                        predicate.bounds.iter().any(|bound| {
+                            value_bound_argument(bound)
+                                .is_some_and(|argument| type_tokens_equal(&argument, operation_type))
+                        })
+                    }
+                    _ => false,
+                })
+            })
+        })
+        .map(|parameter| parameter.ident.clone())
+        .collect()
+}
+
+/// Adds the value capabilities required by built-in recursive higher-order operation payloads.
+fn add_recursive_interpretation_bounds(
+    where_clause: &mut syn::WhereClause,
+    ryft: &syn::Path,
+    operation_type: &syn::Type,
+    value_type: &syn::Type,
+) {
+    // TODO(eaplatanios): This feels quite hacky. Should this be configurable somehow or can we pull these bounds
+    //  automatically in somehow via some other trait or something?
+    if type_path_ends_with(operation_type, "DataType") {
+        where_clause.predicates.push(syn::parse_quote!(#value_type: #ryft::BooleanLike));
+    } else if type_path_ends_with(operation_type, "ArrayType") {
+        where_clause.predicates.push(syn::parse_quote! {
+            #value_type:
+                #ryft::BooleanLike
+                + #ryft::Slice
+                + #ryft::UpdateSlice
+                + #ryft::Reshape
+        });
+        where_clause.predicates.push(syn::parse_quote! {
+            <#value_type as #ryft::Value<#operation_type>>::InterpretationContext:
+                #ryft::Zero<#operation_type, #value_type>
+        });
+    }
+}
+
+/// Returns whether `ty` is a type path ending with `ident`.
+fn type_path_ends_with(ty: &syn::Type, ident: &str) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(syn::TypePath { qself: None, path })
+            if path.segments.last().is_some_and(|segment| segment.ident == ident)
+    )
 }
 
 /// Returns whether two types have the same token representation.
@@ -736,7 +1034,10 @@ fn value_bound_argument(bound: &syn::TypeParamBound) -> Option<syn::Type> {
 mod tests {
     use quote::ToTokens;
 
-    use super::{bare_generic_parameter, boxed_inner_type, unique_value_bound_arguments, value_bound_arguments};
+    use super::{
+        bare_generic_parameter, boxed_inner_type, type_path_ends_with, unique_value_bound_arguments,
+        value_bound_arguments, value_type_parameters,
+    };
 
     #[test]
     fn test_boxed_inner_type() {
@@ -789,5 +1090,27 @@ mod tests {
         assert_eq!(arguments.len(), 2);
         assert_eq!(arguments[0].to_token_stream().to_string(), "ArrayType");
         assert_eq!(arguments[1].to_token_stream().to_string(), "DataType");
+    }
+
+    #[test]
+    fn test_value_type_parameters() {
+        let input: syn::DeriveInput = syn::parse_quote! {
+            enum Operation<V: Value<ArrayType>, C, F>
+            where
+                C: Value<ArrayType>,
+                F: Value<DataType>,
+            {}
+        };
+        let parameters = value_type_parameters(&input.generics, &syn::parse_quote!(ArrayType));
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(parameters[0].to_string(), "V");
+        assert_eq!(parameters[1].to_string(), "C");
+    }
+
+    #[test]
+    fn test_type_path_ends_with() {
+        assert!(type_path_ends_with(&syn::parse_quote!(ArrayType), "ArrayType"));
+        assert!(type_path_ends_with(&syn::parse_quote!(ryft_core::ArrayType), "ArrayType"));
+        assert!(!type_path_ends_with(&syn::parse_quote!(DataType), "ArrayType"));
     }
 }

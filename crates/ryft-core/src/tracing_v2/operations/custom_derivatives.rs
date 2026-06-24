@@ -7,7 +7,7 @@ use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::{MaybeZeroOperation, ZeroLike, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Transpose};
-use crate::operations::{InterpretableOperation, Operation};
+use crate::operations::{InterpretableOperation, InterpretableProgramOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, Tracer, TracingContext};
@@ -120,20 +120,14 @@ where
     T: Type,
     C: Value<T>,
     V: Value<T>,
-    V::InterpretationContext: Context<Type = T, Constant = C, Value = V>,
-    O: InterpretableOperation<T, V> + Operation<T>,
-    Vec<C>: Parameterized<C, ParameterStructure: Debug + PartialEq>,
+    O: InterpretableProgramOperation<T, V, C>,
 {
     fn interpret(
         &self,
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        self.primal.interpret_with(
-            inputs.to_vec(),
-            |_, constant| context.lift(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(context, inputs),
-        )
+        O::interpret_program(context, &self.primal, inputs.to_vec())
     }
 }
 
@@ -535,20 +529,14 @@ where
     T: Type,
     C: Value<T>,
     V: Value<T>,
-    V::InterpretationContext: Context<Type = T, Constant = C, Value = V>,
-    O: InterpretableOperation<T, V> + Operation<T>,
-    Vec<C>: Parameterized<C, ParameterStructure: Debug + PartialEq>,
+    O: InterpretableProgramOperation<T, V, C>,
 {
     fn interpret(
         &self,
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        self.primal.interpret_with(
-            inputs.to_vec(),
-            |_, constant| context.lift(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(context, inputs),
-        )
+        O::interpret_program(context, &self.primal, inputs.to_vec())
     }
 }
 

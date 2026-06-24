@@ -143,8 +143,8 @@ where
 /// statically, reverse mode through it is always total (`scan` and bounded `while` are the reverse-capable loops;
 /// unbounded `while` is forward-mode only — see the [`WhileOperation`] rule).
 ///
-///   1. The body is linearized *symbolically* once at the body slice types via [`linearize_program`](
-///      crate::tracing_v2::linearize_program) — no primal values are involved and no iteration runs here.
+///   1. The body is linearized *symbolically* once at the body slice types via [`Program::linearize`] — no primal values
+///      are involved and no iteration runs here.
 ///   2. The residual-extended primal body becomes the body of a new primal [`ScanOperation`] with the same carry
 ///      count, length, direction, and (lowering-only) unroll factor: the appended residual outputs become *extra
 ///      scanned outputs*, so the primal scan **stores** every per-iteration residual as a statically shaped
@@ -221,7 +221,7 @@ where
 
         // Linearize the body symbolically once at the body slice types.
         let NestedLinearization { primal_program, pushforward_program, residual_types } =
-            self.body().linearize(context.differentiable())?;
+            O::linearize_program(context.differentiable(), self.body())?;
         let residual_count = residual_types.len();
 
         // Bind the residual-extended primal scan: the appended residual outputs become extra scanned outputs, so
@@ -346,7 +346,7 @@ where
         }
 
         let NestedLinearization { primal_program, pushforward_program, residual_types } =
-            self.body().linearize(context.differentiable())?;
+            O::linearize_program(context.differentiable(), self.body())?;
         if !residual_types.is_empty() {
             return Err(ProgramError::UnsupportedOperation {
                 message: "scalar scan JVP with per-iteration residuals requires a scalar stack representation"

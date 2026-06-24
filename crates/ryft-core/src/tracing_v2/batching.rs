@@ -400,7 +400,6 @@ pub fn apply_with_axes<V: Value<ArrayType>, O: InterpretableOperation<ArrayType,
 /// Inputs whose mapped lane axis is at a different physical position from the first batched
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
-/// See [`broadcast_inputs_to_common`] for the exact broadcasting policy.
 pub(crate) fn apply_elementwise_batch<
     V: Value<ArrayType> + Broadcast + Transpose,
     O: Clone + InterpretableOperation<ArrayType, V>,
@@ -420,81 +419,63 @@ pub(crate) fn apply_elementwise_batch<
     let (lifted_op, output_axes) = lift_elementwise(operation, &per_lane_types, &input_axes, axis_size)?;
     let broadcasted_inputs = match common_axis {
         None => aligned_inputs,
-        Some(batch_axis) => broadcast_inputs_to_common(&aligned_inputs, &input_axes, batch_axis, axis_size)?,
+        Some(batch_axis) => {
+            // Mirroring JAX's `defbroadcasting` policy, every operand whose per-lane shape is narrower than the
+            // common per-lane shape of all operands (trailing-aligned) is broadcast to that common shape with the lane
+            // axis at `batch_axis`. When the operands' per-lane shapes are not broadcast-compatible, the operands are
+            // left at their lane-axis-inserted physical shapes so the operation surfaces its own shape error against
+            // the original shapes.
+            let per_lane_types =
+                aligned_inputs.iter().map(|input| input.logical_type()).collect::<Result<Vec<_>, _>>()?;
+            let common_per_lane = Broadcastable::broadcasted(per_lane_types.as_slice()).ok();
+            let broadcasted_physical_type = |per_lane_type: &ArrayType| -> Result<ArrayType, ProgramError> {
+                // The common per-lane target only contributes its shape: each operand keeps its own data type (e.g., a
+                // Boolean select condition broadcast against numeric branches stays Boolean).
+                let mut target = common_per_lane.as_ref().unwrap_or(per_lane_type).clone();
+                target.data_type = per_lane_type.data_type();
+                Ok(target.with_inserted_dimension(batch_axis, Size::Static(axis_size))?)
+            };
+            // Maps the operand's per-lane dimension `index` (trailing-aligned within the common per-lane shape) to its
+            // position in the broadcast target, accounting for the lane axis insertion.
+            let target_position = |per_lane_rank: usize, target_rank: usize, index: usize| {
+                let position = (target_rank - per_lane_rank) + index;
+                if position < batch_axis { position } else { position + 1 }
+            };
+            aligned_inputs
+                .iter()
+                .zip(input_axes.iter())
+                .zip(per_lane_types.iter())
+                .map(|((input, axis), per_lane_type)| {
+                    let physical_type = broadcasted_physical_type(per_lane_type)?;
+                    if physical_type == *input.r#type() {
+                        return Ok(input.clone());
+                    }
+                    let target_rank = physical_type.rank() - 1;
+                    let output_axes: Vec<usize> = match axis {
+                        // Mapped operand with a narrower per-lane shape: keep the lane axis fixed and trailing-align
+                        // the remaining dimensions.
+                        Some(_) => (0..input.r#type().rank())
+                            .map(|dimension| match dimension.cmp(&batch_axis) {
+                                std::cmp::Ordering::Equal => batch_axis,
+                                std::cmp::Ordering::Less => {
+                                    target_position(per_lane_type.rank(), target_rank, dimension)
+                                }
+                                std::cmp::Ordering::Greater => {
+                                    target_position(per_lane_type.rank(), target_rank, dimension - 1)
+                                }
+                            })
+                            .collect(),
+                        None => (0..per_lane_type.rank())
+                            .map(|dimension| target_position(per_lane_type.rank(), target_rank, dimension))
+                            .collect(),
+                    };
+                    let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
+                    ArrayBatch::new(physical_type, broadcasted, Some(batch_axis))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
     };
     apply_with_axes(context, &lifted_op, &broadcasted_inputs, &output_axes)
-}
-
-/// Broadcasts the operands of an elementwise application to the common batched physical shape.
-///
-/// Mirroring JAX's `defbroadcasting` policy, every operand whose per-lane shape is narrower than
-/// the common per-lane shape of all operands (trailing-aligned) is broadcast to that common shape
-/// with the lane axis at `batch_axis`. This covers both lane-uniform operands (a rank-0 bias
-/// batched against rank-2 lanes becomes a full `[lanes, ...]` operand rather than a bare `[lanes]`
-/// vector) and mapped operands with differing per-lane ranks (a mapped per-lane scalar batched
-/// against mapped per-lane vectors gains the vector dimensions). When the operands' per-lane
-/// shapes are not broadcast-compatible, the operands are left at their lane-axis-inserted
-/// physical shapes so the operation surfaces its own shape error against the original shapes.
-///
-/// Narrower operands are always materialized with an explicit [`BroadcastOperation`], even
-/// when the operation's own type inference would accept the unbroadcast shapes: staged programs
-/// must remain lowerable by every backend, and backends such as XLA lower elementwise operations
-/// to shape-congruent primitives (e.g., [`stablehlo.add`](
-/// https://openxla.org/stablehlo/spec#add)) with no implicit broadcasting.
-fn broadcast_inputs_to_common<V: Value<ArrayType> + Broadcast>(
-    inputs: &[ArrayBatch<V>],
-    input_axes: &[Option<usize>],
-    batch_axis: usize,
-    axis_size: usize,
-) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-    // Common per-lane broadcast target shared by all operands (mapped inputs drop their lane axis;
-    // lane-uniform inputs contribute their full type). `None` when the per-lane shapes are not
-    // broadcast-compatible, in which case the operation reports its own error downstream.
-    let per_lane_types = inputs.iter().map(|input| input.logical_type()).collect::<Result<Vec<_>, _>>()?;
-    let common_per_lane = Broadcastable::broadcasted(per_lane_types.as_slice()).ok();
-    let broadcasted_physical_type = |per_lane_type: &ArrayType| -> Result<ArrayType, ProgramError> {
-        // The common per-lane target only contributes its shape: each operand keeps its own data type (e.g., a
-        // Boolean select condition broadcast against numeric branches stays Boolean).
-        let mut target = common_per_lane.as_ref().unwrap_or(per_lane_type).clone();
-        target.data_type = per_lane_type.data_type();
-        Ok(target.with_inserted_dimension(batch_axis, Size::Static(axis_size))?)
-    };
-    // Maps the operand's per-lane dimension `index` (trailing-aligned within the common per-lane
-    // shape) to its position in the broadcast target, accounting for the lane axis insertion.
-    let target_position = |per_lane_rank: usize, target_rank: usize, index: usize| {
-        let position = (target_rank - per_lane_rank) + index;
-        if position < batch_axis { position } else { position + 1 }
-    };
-    inputs
-        .iter()
-        .zip(input_axes.iter())
-        .zip(per_lane_types.iter())
-        .map(|((input, axis), per_lane_type)| {
-            let physical_type = broadcasted_physical_type(per_lane_type)?;
-            if physical_type == *input.r#type() {
-                return Ok(input.clone());
-            }
-            let target_rank = physical_type.rank() - 1;
-            let output_axes: Vec<usize> = match axis {
-                // Mapped operand with a narrower per-lane shape: keep the lane axis fixed and
-                // trailing-align the remaining dimensions.
-                Some(_) => (0..input.r#type().rank())
-                    .map(|dimension| match dimension.cmp(&batch_axis) {
-                        std::cmp::Ordering::Equal => batch_axis,
-                        std::cmp::Ordering::Less => target_position(per_lane_type.rank(), target_rank, dimension),
-                        std::cmp::Ordering::Greater => {
-                            target_position(per_lane_type.rank(), target_rank, dimension - 1)
-                        }
-                    })
-                    .collect(),
-                None => (0..per_lane_type.rank())
-                    .map(|dimension| target_position(per_lane_type.rank(), target_rank, dimension))
-                    .collect(),
-            };
-            let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
-            ArrayBatch::new(physical_type, broadcasted, Some(batch_axis))
-        })
-        .collect()
 }
 
 /// Realigns a batched input by moving its mapped lane axis to `target_axis`.
@@ -595,11 +576,10 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
     }
 
     // For ops whose `infer_output_types` requires all inputs to share a shape (e.g.,
-    // `SelectOperation`), infer against the common per-lane shape with the lane axis inserted,
-    // matching the operand shapes that [`broadcast_inputs_to_common`] produces. Ops with built-in
-    // broadcasting semantics (e.g., `AddOperation`) accept the broadcasted shapes equally. When
-    // the per-lane shapes are not broadcast-compatible, fall back to the lane-axis-inserted
-    // physical types so the operation surfaces its own shape error.
+    // `SelectOperation`), infer against the common per-lane shape with the lane axis inserted.
+    // Ops with built-in broadcasting semantics (e.g., `AddOperation`) accept the broadcasted
+    // shapes equally. When the per-lane shapes are not broadcast-compatible, fall back to the
+    // lane-axis-inserted physical types so the operation surfaces its own shape error.
     let broadcasted_input_types: Vec<ArrayType> = match (common_axis, Broadcastable::broadcasted(input_types)) {
         (Some(axis), Ok(common)) => {
             let common = common.with_inserted_dimension(axis, Size::Static(axis_size))?;
@@ -699,7 +679,7 @@ impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V,
 
 /// Batches a captured program into a standalone program over lane-carrying physical types.
 ///
-/// This is the batching analog of [`linearize_program`](crate::tracing_v2::linearize_program): staged higher-order
+/// This is the batching analog of [`Program::linearize`](crate::Program::linearize): staged higher-order
 /// batching rules use it to batch captured programs *without* concretizing any lane values, so that batched
 /// control-flow and custom-derivative structure can be staged back into the enclosing trace. Unlike linearization,
 /// batching does not split value spaces — the batched replay stays in one tracer space — so the packaging is one

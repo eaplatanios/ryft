@@ -14,7 +14,9 @@ use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LinearDynamicSliceOperation,
     LinearDynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
-use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{
+    BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter,
+};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -789,7 +791,7 @@ where
 /// `[original_outputs..., true_branch_residuals..., false_branch_residuals...]`.
 ///
 /// `program` must already produce `[original_outputs..., own_residuals...]` (the shape produced by
-/// [`linearize_program`]). This helper appends one typed nullary zero instruction per peer-branch residual
+/// [`Program::linearize`]). This helper appends one typed nullary zero instruction per peer-branch residual
 /// slot and reorders the program outputs into the joined signature: the true branch (`own_residuals_first`) keeps its
 /// own residuals before the peer zeros, while the false branch moves its own residuals after them. This is the
 /// analog of JAX's `_join_cond_outputs`: both joined branches produce identical output signatures, with each branch
@@ -1217,7 +1219,7 @@ where
 ///
 /// The rule mirrors JAX's `cond` JVP plus partial evaluation:
 ///
-///   1. Both branches are linearized *symbolically* at the branch input types via [`linearize_program`] — no
+///   1. Both branches are linearized *symbolically* at the branch input types via [`Program::linearize`] — no
 ///      primal operand values are involved, so no branch computation is evaluated here.
 ///   2. The residual-extended primal branches are joined to a common output signature
 ///      `[outputs..., true_residuals..., false_residuals...]`, with each branch emitting typed zeros in the other
@@ -1276,12 +1278,12 @@ where
             primal_program: true_primal_program,
             pushforward_program: true_pushforward_program,
             residual_types: true_residual_types,
-        } = self.true_branch().linearize(context.differentiable())?;
+        } = O::linearize_program(context.differentiable(), self.true_branch())?;
         let NestedLinearization {
             primal_program: false_primal_program,
             pushforward_program: false_pushforward_program,
             residual_types: false_residual_types,
-        } = self.false_branch().linearize(context.differentiable())?;
+        } = O::linearize_program(context.differentiable(), self.false_branch())?;
         let output_count = self.true_branch().output_ids().len();
         let joined_true_branch =
             join_condition_branch_outputs(true_primal_program, output_count, false_residual_types.as_slice(), true);
@@ -1387,7 +1389,7 @@ where
             });
         }
 
-        let linearization = self.body().linearize(context.differentiable())?;
+        let linearization = O::linearize_program(context.differentiable(), self.body())?;
         let mut state_primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let mut state_tangents = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
         let mut completed_iterations = 0;
@@ -1467,8 +1469,8 @@ where
 /// instead of recomputing them — which makes the staged pushforward *transposable* and reverse mode
 /// (`vjp` / `value_and_grad`) through bounded loops total:
 ///
-///   1. The body is linearized *symbolically* once at the loop state types via [`linearize_program`](
-///      crate::tracing_v2::linearize_program), exactly like the unbounded staged path.
+///   1. The body is linearized *symbolically* once at the loop state types via [`Program::linearize`], exactly like the
+///      unbounded staged path.
 ///   2. An *augmented* primal while is bound over the state `[original_state..., counter (i64 scalar, starting at
 ///      zero), residual_stacks (one zero-initialized `[B, …]` stack per residual), mask_stack (a false-initialized
 ///      Boolean `[B]` stack)]` (see [`build_bounded_while_programs`]): each iteration runs the residual-extended
@@ -1491,9 +1493,8 @@ where
 /// stack exists, so the rule stages loop structure that recomputes instead, with full JAX
 /// [`while_loop`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.while_loop.html) parity:
 ///
-///   1. The body is linearized *symbolically* once at the loop state types via [`linearize_program`](
-///      crate::tracing_v2::linearize_program) — no primal state values are involved and no iteration runs
-///      here.
+///   1. The body is linearized *symbolically* once at the loop state types via [`Program::linearize`] — no primal state
+///      values are involved and no iteration runs here.
 ///   2. The primal [`WhileOperation`] is bound *unchanged* (original condition and body) in the primal domain,
 ///      recording one `while` operation.
 ///   3. One linear while loop is staged over the doubled state
@@ -1566,7 +1567,7 @@ where
         // Linearize the body symbolically once at the loop state types. The eager-unroll path below evaluates this
         // linearization's primal side at each iteration's concrete state and stages the per-iteration pushforward,
         // while the staged paths embed its programs into linear loop structure.
-        let linearization = self.body().linearize(context.differentiable())?;
+        let linearization = O::linearize_program(context.differentiable(), self.body())?;
 
         // Eager-unroll path (concretizing domains): drive the loop on the concrete primal state, evaluating the
         // condition and the body's primal side per iteration, and stage each iteration's body pushforward into the
@@ -1909,7 +1910,7 @@ where
 ///
 ///   - **Lane-uniform predicate.** Both branch programs are batched at the operand lane axes via
 ///     [`batch_program`](crate::tracing_v2::batching::batch_program) (the batching analog of
-///     [`linearize_program`](crate::tracing_v2::linearize_program)), their per-output lane axes are
+///     [`Program::linearize`]), their per-output lane axes are
 ///     normalized to a common layout by appending staged axis-moving operations at the branch tails when they
 ///     disagree (a transpose for a mismatched axis, a broadcast for a lane-uniform output paired with a batched
 ///     one), and one [`ConditionOperation`] over the batched branches is staged into the parent context with the
@@ -2485,8 +2486,7 @@ impl<V, F, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayT
 where
     V: Value<ArrayType> + BooleanLike,
     F: CustomVjpResidual<ArrayType, V>,
-    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+    O: InterpretableProgramOperation<ArrayType, V>,
 {
     fn interpret(
         &self,
@@ -2497,7 +2497,7 @@ where
         self.infer_output_types(input_types.as_slice())?;
         let branch =
             if self.predicate().residual_value()?.boolean()? { self.true_branch() } else { self.false_branch() };
-        branch.interpret_in_context(context, inputs.to_vec())
+        O::interpret_program(context, branch, inputs.to_vec())
     }
 }
 
@@ -2641,8 +2641,7 @@ where
 impl<V, O> InterpretableOperation<ArrayType, V> for LinearOperandConditionOperation<V, O>
 where
     V: Value<ArrayType> + BooleanLike,
-    O: Operation<ArrayType> + InterpretableOperation<ArrayType, V>,
-    Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
+    O: InterpretableProgramOperation<ArrayType, V>,
 {
     fn interpret(
         &self,
@@ -2652,7 +2651,7 @@ where
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         let branch = if inputs[0].boolean()? { self.true_branch() } else { self.false_branch() };
-        branch.interpret_in_context(context, inputs[1..].to_vec())
+        O::interpret_program(context, branch, inputs[1..].to_vec())
     }
 }
 
@@ -2694,7 +2693,6 @@ mod tests {
     use crate::contexts::ProvidesContext;
     use crate::contexts::{Context, EagerContext};
     use crate::domains::Domain;
-    use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{
         ADD_OPERATION_NAME, AddOperation, MulOperation, NegOperation, SUB_OPERATION_NAME, ScaleOperation, SubOperation,
     };
@@ -2704,6 +2702,7 @@ mod tests {
     };
     use crate::operations::control_flow::SelectOperation;
     use crate::operations::trigonometric::SinOperation;
+    use crate::operations::{InterpretableOperation, InterpretableProgramOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::payloads::Input;
     use crate::programs::{Program, ProgramBuilder, Value};
@@ -2888,6 +2887,20 @@ mod tests {
         }
     }
 
+    impl InterpretableProgramOperation<ArrayType, TestValue> for TestOperation {
+        fn interpret_program(
+            context: &<TestValue as Value<ArrayType>>::InterpretationContext,
+            program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            input: Vec<TestValue>,
+        ) -> Result<Vec<TestValue>, ProgramError> {
+            program.interpret_with(
+                input,
+                |_, constant| context.lift(constant.clone()),
+                |instruction, inputs| instruction.operation().interpret(context, inputs),
+            )
+        }
+    }
+
     #[derive(Clone, Debug)]
     enum TestLinearOperation {
         Zero(ZeroOperation<ArrayType>),
@@ -3037,6 +3050,20 @@ mod tests {
                     Ok(vec![if condition.boolean()? { inputs[0].clone() } else { inputs[1].clone() }])
                 }
             }
+        }
+    }
+
+    impl InterpretableProgramOperation<ArrayType, TestValue> for TestLinearOperation {
+        fn interpret_program(
+            context: &<TestValue as Value<ArrayType>>::InterpretationContext,
+            program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            input: Vec<TestValue>,
+        ) -> Result<Vec<TestValue>, ProgramError> {
+            program.interpret_with(
+                input,
+                |_, constant| context.lift(constant.clone()),
+                |instruction, inputs| instruction.operation().interpret(context, inputs),
+            )
         }
     }
 
@@ -3354,6 +3381,20 @@ mod tests {
         }
     }
 
+    impl InterpretableProgramOperation<ArrayType, TestValue> for TestDifferentiableOperation {
+        fn interpret_program(
+            context: &<TestValue as Value<ArrayType>>::InterpretationContext,
+            program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            input: Vec<TestValue>,
+        ) -> Result<Vec<TestValue>, ProgramError> {
+            program.interpret_with(
+                input,
+                |_, constant| context.lift(constant.clone()),
+                |instruction, inputs| instruction.operation().interpret(context, inputs),
+            )
+        }
+    }
+
     impl From<ZeroOperation<ArrayType>> for TestDifferentiableOperation {
         fn from(operation: ZeroOperation<ArrayType>) -> Self {
             Self::Zero(operation.r#type().clone())
@@ -3488,7 +3529,7 @@ mod tests {
             differentiable: &TestDomain,
             program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
         ) -> Result<NestedLinearization<TestDomain, Self>, ProgramError> {
-            crate::tracing_v2::differentiation::linearize_program(differentiable, program)
+            program.linearize(differentiable)
         }
     }
 

@@ -23,8 +23,51 @@ struct TypeError;
 #[derive(Debug, PartialEq, Eq)]
 struct ProgramError;
 
+/// Stand-in for `ryft_core::Context`.
+trait Context {
+    type Type: Type;
+    type Constant: Value<Self::Type>;
+    type Value: Value<Self::Type>;
+
+    fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError>;
+}
+
+/// Stand-in interpretation context that lifts constants by cloning them.
+struct TestContext<T: Type, V: Value<T>> {
+    marker: PhantomData<(T, V)>,
+}
+
+impl<T: Type, V: Value<T>> Context for TestContext<T, V> {
+    type Type = T;
+    type Constant = V;
+    type Value = V;
+
+    fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+        Ok(constant)
+    }
+}
+
 /// Stand-in for `ryft_core::Value`.
-trait Value<T: Type> {}
+trait Value<T: Type>: Clone {
+    type InterpretationContext: Context<Type = T, Value = Self>;
+}
+
+/// Stand-in for `ryft_core::BooleanLike`.
+trait BooleanLike {}
+
+/// Stand-in for `ryft_core::Slice`.
+trait Slice {}
+
+/// Stand-in for `ryft_core::UpdateSlice`.
+trait UpdateSlice {}
+
+/// Stand-in for `ryft_core::Reshape`.
+trait Reshape {}
+
+/// Stand-in for `ryft_core::Zero`.
+trait Zero<T: Type, V: Value<T>> {}
+
+impl<T: Type, V: Value<T>> Zero<T, V> for TestContext<T, V> {}
 
 /// Stand-in for `ryft_core::Operation`.
 trait Operation<T: Type> {
@@ -36,6 +79,11 @@ trait Operation<T: Type> {
         let _ = indentation;
         formatter.write_str(self.name())
     }
+}
+
+/// Stand-in for `ryft_core::InterpretableOperation`.
+trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
+    fn interpret(&self, context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
 }
 
 /// Stand-in for `ryft_core::AbstractTracingContext`.
@@ -69,7 +117,48 @@ impl<T: Type, O: Operation<T>> MaybeZeroOperation<T> for O {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Program<T: Type, V: Value<T>, O: Operation<T>, Input, Output> {
     label: &'static str,
+    constant: Option<V>,
+    operation: Option<O>,
     marker: PhantomData<(T, V, O, Input, Output)>,
+}
+
+/// Stand-in for `ryft_core::Instruction`.
+struct Instruction<'operation, O> {
+    operation: &'operation O,
+}
+
+impl<O> Instruction<'_, O> {
+    fn operation(&self) -> &O {
+        self.operation
+    }
+}
+
+impl<T, Constant, O, Input, Output> Program<T, Constant, O, Input, Output>
+where
+    T: Type,
+    Constant: Value<T>,
+    O: Operation<T>,
+{
+    fn interpret_with<V, LiftConstantFn, InterpretInstructionFn>(
+        &self,
+        mut input: Vec<V>,
+        mut lift_constant: LiftConstantFn,
+        mut interpret_instruction: InterpretInstructionFn,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        V: Value<T>,
+        LiftConstantFn: FnMut(usize, &Constant) -> Result<V, ProgramError>,
+        InterpretInstructionFn: FnMut(&Instruction<'_, O>, &[V]) -> Result<Vec<V>, ProgramError>,
+    {
+        if let Some(constant) = &self.constant {
+            input.push(lift_constant(0, constant)?);
+        }
+        if let Some(operation) = &self.operation {
+            interpret_instruction(&Instruction { operation }, &input)
+        } else {
+            Ok(input)
+        }
+    }
 }
 
 impl<T, V, O, Input, Output> Program<T, V, O, Input, Output>
@@ -79,8 +168,17 @@ where
     O: TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
 {
     fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
-        Ok(Program { label: "program_transpose", marker: PhantomData })
+        Ok(Program { label: "program_transpose", constant: None, operation: None, marker: PhantomData })
     }
+}
+
+/// Stand-in for `ryft_core::InterpretableProgramOperation`.
+trait InterpretableProgramOperation<T: Type, V: Value<T>, C: Value<T> = V>: Operation<T> + Sized {
+    fn interpret_program(
+        context: &V::InterpretationContext,
+        program: &Program<T, C, Self, Vec<C>, Vec<C>>,
+        input: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError>;
 }
 
 /// Stand-in for `ryft_core::TransposableProgramOperation`.
@@ -109,8 +207,21 @@ impl DifferentiableType for ArrayType {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Factor(i64);
 
-impl Value<DataType> for Factor {}
-impl Value<ArrayType> for Factor {}
+impl Value<DataType> for Factor {
+    type InterpretationContext = TestContext<DataType, Factor>;
+}
+
+impl Value<ArrayType> for Factor {
+    type InterpretationContext = TestContext<ArrayType, Factor>;
+}
+
+impl BooleanLike for Factor {}
+
+impl Slice for Factor {}
+
+impl UpdateSlice for Factor {}
+
+impl Reshape for Factor {}
 
 trait SpecialTransposableValue {}
 
@@ -128,6 +239,12 @@ impl<T: Clone + Type> Operation<T> for ZeroOperation<T> {
 
     fn infer_output_types(&self, _input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(vec![self.r#type.clone()])
+    }
+}
+
+impl<T: Clone + Type, V: Value<T>> InterpretableOperation<T, V> for ZeroOperation<T> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
     }
 }
 
@@ -152,6 +269,12 @@ impl Operation<DataType> for AddOperation {
 
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<DataType>> InterpretableOperation<DataType, V> for AddOperation {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
     }
 }
 
@@ -182,6 +305,12 @@ impl<T: Clone + Type, V> Operation<T> for ScaleOperation<T, V> {
     }
 }
 
+impl<T: Clone + Type, V: Value<T>, F> InterpretableOperation<T, V> for ScaleOperation<T, F> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
 impl<T: Clone + Type, V: Value<T>, O: Operation<T>, F> TransposableOperation<T, V, O> for ScaleOperation<T, F> {
     fn transpose<'transpose>(
         &self,
@@ -209,6 +338,12 @@ impl<T: Clone + Type, V> Operation<T> for ConstantOperation<T, V> {
     }
 }
 
+impl<T: Clone + Type, V: Value<T>, C> InterpretableOperation<T, V> for ConstantOperation<T, C> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
 impl<T: Clone + Type, V: Value<T>, O: Operation<T>, F> TransposableOperation<T, V, O> for ConstantOperation<T, F> {
     fn transpose<'transpose>(
         &self,
@@ -233,6 +368,12 @@ impl<T: Clone + Type, V> Operation<T> for CustomJvpOperation<T, V> {
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl<T: Clone + Type, V: Value<T>, C> InterpretableOperation<T, V> for CustomJvpOperation<T, C> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
     }
 }
 
@@ -284,6 +425,60 @@ fn test_scalar_operation() {
 }
 
 #[test]
+fn test_operation_generates_interpretation_forwarding() {
+    let context = TestContext::<DataType, Factor> { marker: PhantomData };
+    let operation = ScalarOperation::<Factor>::from(AddOperation);
+
+    assert_eq!(operation.interpret(&context, &[Factor(1), Factor(2)]), Ok(vec![Factor(1), Factor(2)]));
+}
+
+#[test]
+fn test_operation_generates_captured_program_interpretation_witness() {
+    type Operation = ScalarOperation<Factor>;
+
+    let context = TestContext::<DataType, Factor> { marker: PhantomData };
+    let program = Program::<DataType, Factor, Operation, Vec<Factor>, Vec<Factor>> {
+        label: "scalar",
+        constant: Some(Factor(3)),
+        operation: Some(Operation::from(AddOperation)),
+        marker: PhantomData,
+    };
+    let outputs = <Operation as InterpretableProgramOperation<DataType, Factor, Factor>>::interpret_program(
+        &context,
+        &program,
+        vec![Factor(1)],
+    )
+    .unwrap();
+
+    assert_eq!(outputs, vec![Factor(1), Factor(3)]);
+}
+
+#[test]
+fn test_operation_generates_direct_program_interpretation_witness() {
+    type Operation = LinearScalarOperation<Factor>;
+
+    let context = TestContext::<DataType, Factor> { marker: PhantomData };
+    let operation = Operation::from(ScaleOperation { factor: Factor(5), marker: PhantomData });
+
+    assert_eq!(operation.interpret(&context, &[Factor(8)]), Ok(vec![Factor(8)]));
+
+    let program = Program::<DataType, Factor, Operation, Vec<Factor>, Vec<Factor>> {
+        label: "linear",
+        constant: Some(Factor(13)),
+        operation: Some(Operation::from(AddOperation)),
+        marker: PhantomData,
+    };
+    let outputs = <Operation as InterpretableProgramOperation<DataType, Factor>>::interpret_program(
+        &context,
+        &program,
+        vec![Factor(8)],
+    )
+    .unwrap();
+
+    assert_eq!(outputs, vec![Factor(8), Factor(13)]);
+}
+
+#[test]
 fn test_transposable_operation_infers_value_type() {
     type Linear = LinearScalarOperation<Factor>;
 
@@ -329,6 +524,12 @@ impl Operation<ArrayType> for DotOperation {
     }
 }
 
+impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for DotOperation {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BackendPayload {}
 
@@ -338,6 +539,12 @@ impl Operation<ArrayType> for BackendPayload {
     }
 
     fn infer_output_types(&self, _input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        match *self {}
+    }
+}
+
+impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for BackendPayload {
+    fn interpret(&self, _context: &V::InterpretationContext, _inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         match *self {}
     }
 }
@@ -363,6 +570,12 @@ impl Operation<ArrayType> for SpecialOperation {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for SpecialOperation {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
     }
 }
 
@@ -438,6 +651,12 @@ impl<T: Clone + Type, V, O> Operation<T> for WhileOperation<T, V, O> {
     }
 }
 
+impl<T: Clone + Type, V: Value<T>, W, O> InterpretableOperation<T, V> for WhileOperation<T, W, O> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
 impl<T: Clone + Type, V: Value<T>, O: Operation<T>, W, P> TransposableOperation<T, V, O> for WhileOperation<T, W, P> {
     fn transpose<'transpose>(
         &self,
@@ -461,6 +680,12 @@ impl<V, O> Operation<ArrayType> for RecursiveOperation<V, O> {
 
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<ArrayType>, W, O> InterpretableOperation<ArrayType, V> for RecursiveOperation<W, O> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
     }
 }
 
@@ -505,6 +730,12 @@ impl<V, O> Operation<DataType> for ProgramRecursiveOperation<V, O> {
     }
 }
 
+impl<V: Value<DataType>, W, O> InterpretableOperation<DataType, V> for ProgramRecursiveOperation<W, O> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
 impl<V, O> TransposableOperation<DataType, V, O> for ProgramRecursiveOperation<V, O>
 where
     V: Value<DataType> + SpecialTransposableValue,
@@ -543,6 +774,12 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
     }
 }
 
+impl<V: Value<ArrayType>, O: Operation<ArrayType>> InterpretableOperation<ArrayType, V> for RecomputeOperation<O> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
 impl<V: Value<ArrayType>, O: Operation<ArrayType>, P: Operation<ArrayType>> TransposableOperation<ArrayType, V, O>
     for RecomputeOperation<P>
 {
@@ -568,6 +805,12 @@ impl<T: Clone + Type, C, O, F> Operation<T> for CustomVjpCallOperation<T, C, O, 
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         Ok(input_types.to_vec())
+    }
+}
+
+impl<T: Clone + Type, V: Value<T>, C, O, F> InterpretableOperation<T, V> for CustomVjpCallOperation<T, C, O, F> {
+    fn interpret(&self, _context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
     }
 }
 
@@ -707,8 +950,12 @@ fn test_transposable_operation_forwards_to_variant_payloads() {
 fn test_transposable_operation_generates_program_transposition_witness() {
     type Linear = LinearScalarOperation<Factor>;
 
-    let program =
-        Program::<DataType, Factor, Linear, Vec<Factor>, Vec<Factor>> { label: "linear", marker: PhantomData };
+    let program = Program::<DataType, Factor, Linear, Vec<Factor>, Vec<Factor>> {
+        label: "linear",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
     let transposed = <Linear as TransposableProgramOperation<DataType, Factor>>::transpose_program(&program).unwrap();
 
     assert_eq!(transposed.label, "program_transpose");
@@ -752,8 +999,12 @@ fn test_transposable_operation_inherits_enum_bounds_for_recursive_program_witnes
         vec![transposed::<DataType, Factor, Linear>("program_recursive")],
     );
 
-    let program =
-        Program::<DataType, Factor, Linear, Vec<Factor>, Vec<Factor>> { label: "linear", marker: PhantomData };
+    let program = Program::<DataType, Factor, Linear, Vec<Factor>, Vec<Factor>> {
+        label: "linear",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
     let transposed = <Linear as TransposableProgramOperation<DataType, Factor>>::transpose_program(&program).unwrap();
 
     assert_eq!(transposed.label, "program_transpose");

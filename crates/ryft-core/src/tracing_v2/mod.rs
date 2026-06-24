@@ -8,8 +8,8 @@ pub(crate) mod benchmark_support;
 pub mod benchmarking;
 /// Symbolic linearization core and the forward-mode automatic-differentiation transforms built on it.
 ///
-/// The heart of this module is [`linearize_program`](differentiation::linearize_program), which turns a staged
-/// primal [`Program`](crate::programs::Program) into a [`Linearization`](differentiation::Linearization): a
+/// The heart of this module is [`Program::linearize`](crate::Program::linearize), which turns a staged
+/// primal [`Program`](crate::Program) into a [`Linearization`](differentiation::Linearization): a
 /// residual-extended primal program paired with a residualized pushforward program, both kept symbolic so the
 /// artifact can be interpreted eagerly, spliced into an enclosing trace, or embedded as program data inside
 /// higher-order operations. The value-level entry points on
@@ -41,7 +41,7 @@ pub use differentiation::{
     CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, DifferentiationError,
     DirectLinearOperationOf, JvpTracer, LinearOperationOf, LinearizableProgramOperation, Linearization,
     LinearizationTracer, NestedLinearization, PrimalTracingContext, Pushforward, ResidualizedOperation, TangentContext,
-    ZeroTangentOperation, linearize_program,
+    ZeroTangentOperation,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
