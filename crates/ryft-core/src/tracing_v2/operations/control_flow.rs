@@ -1317,7 +1317,7 @@ where
     }
 }
 
-impl<T: Type, V: Value<T>, O> TransposableOperation<T, V, O> for WhileOperation<T, V, O>
+impl<T: Type, V: Value<T>, O, Payload> TransposableOperation<T, V, O> for WhileOperation<T, V, O, Payload>
 where
     O: Operation<T>,
 {
@@ -1531,7 +1531,7 @@ where
         + DefactorizableProgramOperation<D::Tangent, D::Value, O>
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<RecomputeOperation<O>>
-        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>>>
+        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     Vec<V>: Parameterized<
@@ -1793,7 +1793,7 @@ where
         }
 
         let linear_while =
-            WhileOperation::<ArrayType, D::Tangent, LinearOperationOf<D>>::new(extended_condition, fused_body)?;
+            WhileOperation::<ArrayType, D::Tangent, LinearOperationOf<D>, Input>::new(extended_condition, fused_body)?;
         let linear_outputs = context.stage_operation(linear_while, linear_inputs.as_slice())?;
         check_count!("output", linear_outputs, 2 * state_count, ProgramError);
 
@@ -1881,8 +1881,10 @@ where
         batch_condition_with_interpreter(self.true_branch(), self.false_branch(), inputs, |program, program_inputs| {
             program.interpret_with(
                 program_inputs,
-                |_, constant| Ok(ArrayBatch::unbatched(constant.clone())),
-                |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
+                |_, constant: &V| Ok(ArrayBatch::unbatched(constant.clone())),
+                |instruction: &Instruction<O>, instruction_inputs| {
+                    instruction.operation().batch(context, instruction_inputs)
+                },
             )
         })
     }
@@ -1989,8 +1991,8 @@ where
     }
 }
 
-pub(crate) fn batch_while_with_interpreter<VOperation, V, O, F>(
-    while_operation: &WhileOperation<ArrayType, VOperation, O>,
+pub(crate) fn batch_while_with_interpreter<VOperation, V, O, Payload, F>(
+    while_operation: &WhileOperation<ArrayType, VOperation, O, Payload>,
     inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<V>>, ProgramError>
@@ -2043,7 +2045,7 @@ where
     )
 }
 
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for WhileOperation<ArrayType, V, O>
+impl<V, O, Payload> BatchableOperation<V, EagerContext<ArrayType, V, O>> for WhileOperation<ArrayType, V, O, Payload>
 where
     V: Value<ArrayType>
         + BooleanLike
@@ -2901,7 +2903,7 @@ mod tests {
         Recompute(TestDifferentiableOperation),
 
         /// Fused doubled-state while loop staged by the [`WhileOperation`] JVP rule.
-        While(Box<WhileOperation<ArrayType, TestValue, TestLinearOperation>>),
+        While(Box<WhileOperation<ArrayType, TestValue, TestLinearOperation, Input>>),
 
         /// Masked scan staged by the bounded [`WhileOperation`] JVP rule. The `TestValue`-based tests only build
         /// unbounded loops, so this variant is present to satisfy the linear operation family's scan conversion
@@ -3161,8 +3163,8 @@ mod tests {
         }
     }
 
-    impl From<WhileOperation<ArrayType, TestValue, TestLinearOperation>> for TestLinearOperation {
-        fn from(operation: WhileOperation<ArrayType, TestValue, TestLinearOperation>) -> Self {
+    impl From<WhileOperation<ArrayType, TestValue, TestLinearOperation, Input>> for TestLinearOperation {
+        fn from(operation: WhileOperation<ArrayType, TestValue, TestLinearOperation, Input>) -> Self {
             Self::While(Box::new(operation))
         }
     }
@@ -3598,7 +3600,8 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
+        let while_operation: WhileOperation<ArrayType, TestValue, TestOperation> =
+            WhileOperation::new(condition, subtract_one_branch()).unwrap();
 
         assert_eq!(
             while_operation.interpret(&EagerContext::new(), &[TestValue::Number(3.0)]),
@@ -3615,7 +3618,8 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
+        let while_operation: WhileOperation<ArrayType, TestValue, TestOperation> =
+            WhileOperation::new(condition, subtract_one_branch()).unwrap();
         let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestOperation::While(Box::new(while_operation)), vec![input]).unwrap()[0];
@@ -3976,7 +3980,8 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let while_operation = WhileOperation::new(condition, subtract_one_branch()).unwrap();
+        let while_operation: WhileOperation<ArrayType, TestValue, TestOperation> =
+            WhileOperation::new(condition, subtract_one_branch()).unwrap();
 
         let domain = AbstractDomain::new();
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestValue, TestOperation>::new()));
@@ -4198,7 +4203,7 @@ mod tests {
     /// returns the staged doubled-state linear while for structural assertions.
     fn staged_linear_while_under_abstract_tracing(
         while_operation: WhileOperation<ArrayType, TestArray, TestArrayOperation>,
-    ) -> WhileOperation<ArrayType, AbstractTangentTracer, AbstractLinearOperation> {
+    ) -> WhileOperation<ArrayType, AbstractTangentTracer, AbstractLinearOperation, Input> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let outer_builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new()));
         let state_input = outer_builder.borrow_mut().add_input(scalar_f64.clone());

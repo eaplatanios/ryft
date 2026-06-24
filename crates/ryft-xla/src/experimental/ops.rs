@@ -14,8 +14,8 @@ use ryft_core::operations::arithmetic::{
 };
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::constants::{
-    ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
-    ZeroLikeOperation, ZeroOperation,
+    Constant, ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero,
+    ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
@@ -533,7 +533,7 @@ where
         >
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
         + From<RecomputeOperation<XlaOperation>>
-        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<E>>>,
+        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<E>, Input>>,
     LinearOperationOf<E>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, <E as Domain>::Value>,
@@ -777,7 +777,7 @@ pub enum LinearXlaOperation<
     OperandCondition(LinearOperandConditionOperation<V, Self>),
 
     /// Backend-owned while loop whose nested programs can contain XLA linear operations.
-    While(Box<WhileOperation<ArrayType, V, Self>>),
+    While(Box<WhileOperation<ArrayType, V, Self, Input>>),
 
     /// Backend-owned scan whose body can contain XLA linear operations.
     Scan(Box<ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
@@ -976,6 +976,7 @@ where
     C: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
     V::InterpretationContext: Zero<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
@@ -1000,26 +1001,7 @@ where
             let branch = if inputs[0].boolean()? { operation.true_branch() } else { operation.false_branch() };
             interpret_direct_linear_xla_program(context, branch, inputs[1..].to_vec())
         }
-        LinearXlaOperation::While(operation) => {
-            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            operation.infer_output_types(input_types.as_slice())?;
-            let mut state = inputs.to_vec();
-            let mut completed_iterations = 0;
-            loop {
-                if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                    break Ok(state);
-                }
-                let condition_outputs =
-                    interpret_direct_linear_xla_program(context, operation.condition(), state.clone())?;
-                check_count!("output", condition_outputs, 1, ProgramError);
-                if !condition_outputs[0].boolean()? {
-                    break Ok(state);
-                }
-                state = interpret_direct_linear_xla_program(context, operation.body(), state)?;
-                check_count!("output", state, operation.state_types().len(), ProgramError);
-                completed_iterations += 1;
-            }
-        }
+        LinearXlaOperation::While(operation) => operation.interpret(context, inputs),
         LinearXlaOperation::Scan(operation) => interpret_direct_linear_xla_scan(context, operation, inputs),
         LinearXlaOperation::LinearJitCall(operation) => operation.interpret(context, inputs),
         LinearXlaOperation::LinearShardMap(operation) => operation.interpret(context, inputs),
@@ -1037,6 +1019,7 @@ where
     C: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
     V::InterpretationContext: Zero<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
@@ -1077,6 +1060,7 @@ where
     C: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
     V::InterpretationContext: Zero<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
@@ -1096,6 +1080,7 @@ where
     C: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
     V::InterpretationContext: Zero<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
@@ -1115,6 +1100,7 @@ where
     C: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
+    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
     V::InterpretationContext: Zero<ArrayType, V>,
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,

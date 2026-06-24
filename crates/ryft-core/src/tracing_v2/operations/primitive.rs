@@ -19,8 +19,8 @@ use crate::operations::arithmetic::{
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, Fill, FillOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero,
-    ZeroLike, ZeroLikeOperation, ZeroOperation,
+    Constant, ConstantOperation, Fill, FillOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation,
+    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
 use crate::operations::control_flow::{
@@ -223,7 +223,7 @@ where
             >,
         > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<RecomputeOperation<ArrayOperation<V>>>
-        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>>>
+        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>, Input>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     LinearOperationOf<D>: CaptureParameterizedOperation<
             ArrayType,
@@ -345,7 +345,7 @@ pub enum LinearArrayOperation<
     Recompute(RecomputeOperation<P>),
     Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
     OperandCondition(LinearOperandConditionOperation<V, Self>),
-    While(Box<WhileOperation<ArrayType, V, Self>>),
+    While(Box<WhileOperation<ArrayType, V, Self, Input>>),
     Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
 }
@@ -392,7 +392,8 @@ where
     V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V>
         + Zero<ArrayType, V>
         + One<ArrayType, V>
-        + Fill<ArrayType, f64, V>,
+        + Fill<ArrayType, f64, V>
+        + Constant<ArrayType, V, V, Input>,
     ScaleOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
     ConstantOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
     LeftDotOperation<V, Input>: InterpretableOperation<ArrayType, V>,
@@ -815,6 +816,7 @@ where
         + Zero<ArrayType, V>
         + One<ArrayType, V>
         + Fill<ArrayType, f64, V>
+        + Constant<ArrayType, V, V, Input>
         + Scale<ArrayType, V, V, Input>
         + LeftDot<V, V, Input>
         + RightDot<V, V, Input>
@@ -867,7 +869,7 @@ where
             Self::Recompute(operation) => operation.interpret(context, inputs),
             Self::Condition(operation) => operation.interpret(context, inputs),
             Self::OperandCondition(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => operation.interpret_with_cloned_constants(context, inputs),
+            Self::While(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => context.interpret_linear_scan(operation, inputs),
         }
     }
@@ -1150,7 +1152,7 @@ where
         > + DefactorizableProgramOperation<E::Tangent, Tracer<LinearizationContextOf<E, Self>>, Self>
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<RecomputeOperation<Self>>
-        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<LinearizationContextOf<E, Self>>>>
+        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<LinearizationContextOf<E, Self>>, Input>>
         + LinearScanOperation<ArrayType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
             ArrayType,

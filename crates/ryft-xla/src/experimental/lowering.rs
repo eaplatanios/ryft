@@ -198,9 +198,9 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue, O>(
+    pub(crate) fn lower_while<V: MlirLowerableValue, O, Payload>(
         &mut self,
-        while_op: &WhileOperation<ArrayType, V, O>,
+        while_op: &WhileOperation<ArrayType, V, O, Payload>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -909,7 +909,7 @@ where
     }
 }
 
-impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for WhileOperation<ArrayType, V, O>
+impl<V: MlirLowerableValue, O, Payload> LowerableXlaOperation<V> for WhileOperation<ArrayType, V, O, Payload>
 where
     O: LowerableXlaOperation<V>,
 {
@@ -1762,9 +1762,9 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested while operation inside this lowering context.
-    pub(crate) fn lower_while<V: MlirLowerableValue, O>(
+    pub(crate) fn lower_while<V: MlirLowerableValue, O, Payload>(
         &mut self,
-        while_op: &WhileOperation<ArrayType, V, O>,
+        while_op: &WhileOperation<ArrayType, V, O, Payload>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
@@ -2452,8 +2452,8 @@ where
         .collect())
 }
 
-fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O>(
-    while_op: &WhileOperation<ArrayType, V, O>,
+fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O, Payload>(
+    while_op: &WhileOperation<ArrayType, V, O, Payload>,
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,

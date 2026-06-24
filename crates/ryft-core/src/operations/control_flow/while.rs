@@ -1,9 +1,11 @@
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
-use crate::contexts::Context;
 use crate::macros::{check_count, check_types};
+use crate::operations::constants::Constant;
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
+use crate::payloads::Captured;
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, DataType, Type, TypeError};
 
@@ -79,8 +81,13 @@ impl WhileTypeSemantics for DataType {
 ///   - **Unbounded staged (fused recompute loop, forward-only).** Without a bound, no statically shaped residual
 ///     stack exists, so the rule stages a doubled-state linear loop that recomputes its residuals forward; that loop
 ///     rejects transposition, exactly like JAX's `while_loop`.
-#[derive(Clone, Debug)]
-pub struct WhileOperation<T, V, O>
+///
+/// The `Payload` type parameter is a zero-sized semantic tag for nested program constants. The default
+/// [`Captured`] payload means nested constants are carried by the program and must be materialized through the active
+/// interpretation context. Direct linear programs use [`Input`](crate::payloads::Input) when their nested constants
+/// are already runtime tangent/cotangent values and should be reused rather than lifted as primal constants.
+#[derive(Clone)]
+pub struct WhileOperation<T, V, O, Payload = Captured>
 where
     T: Type,
     V: Value<T>,
@@ -95,9 +102,12 @@ where
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
     /// truncating even while the condition still produces true.
     pub(crate) iteration_bound: Option<usize>,
+
+    /// [`PhantomData`] marker tying this operation to the nested constant payload role.
+    marker: PhantomData<fn() -> Payload>,
 }
 
-impl<T: WhileTypeSemantics, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O> {
+impl<T: WhileTypeSemantics, V: Value<T>, O: Operation<T>, Payload> WhileOperation<T, V, O, Payload> {
     /// Creates a new [`WhileOperation`] with the provided condition and body programs.
     ///
     /// # Parameters
@@ -122,11 +132,11 @@ impl<T: WhileTypeSemantics, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O
         }
         T::validate_while_condition_output(&condition_output_types[0])?;
         check_types!("while body output", &state_types, &body.output_types());
-        Ok(Self { condition, body, iteration_bound: None })
+        Ok(Self { condition, body, iteration_bound: None, marker: PhantomData })
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>, Payload> WhileOperation<T, V, O, Payload> {
     /// Returns the condition [`Program`] of this [`WhileOperation`] that is evaluated before each loop iteration.
     #[inline]
     pub fn condition(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
@@ -170,71 +180,23 @@ impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O> {
         self.iteration_bound = bound;
         Ok(self)
     }
+}
 
-    /// Interprets this while loop by cloning nested program constants directly into the runtime value stream.
-    ///
-    /// This is the linear-program counterpart to the ordinary [`InterpretableOperation`] implementation below:
-    /// direct linear programs store tangent/cotangent constants in the nested while body, so those constants are
-    /// already runtime values and should not be lifted through a primal interpretation context.
-    pub(crate) fn interpret_with_cloned_constants(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        T: WhileTypeSemantics,
-        V: BooleanLike,
-        O: InterpretableOperation<T, V>,
-        Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    {
-        self.interpret_with_constant_lift(context, inputs, |constant| Ok(constant.clone()))
+impl<T: Type, V: Value<T>, O, Payload> Debug for WhileOperation<T, V, O, Payload>
+where
+    O: Debug,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WhileOperation")
+            .field("condition", &self.condition)
+            .field("body", &self.body)
+            .field("iteration_bound", &self.iteration_bound)
+            .finish()
     }
 }
 
-impl<T: WhileTypeSemantics, C: Value<T>, O: Operation<T>> WhileOperation<T, C, O> {
-    fn interpret_with_constant_lift<V, LiftFn>(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[V],
-        mut lift_constant: LiftFn,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        V: Value<T> + BooleanLike,
-        O: InterpretableOperation<T, V>,
-        Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-        LiftFn: FnMut(&C) -> Result<V, ProgramError>,
-    {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let mut state = inputs.to_vec();
-        let mut completed_iterations = 0;
-        loop {
-            // The iteration bound is semantic: a bounded loop runs at most `bound` iterations by definition, so the
-            // loop exits here even while the condition still produces true.
-            if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
-                return Ok(state);
-            }
-            let condition_outputs = self.condition.interpret_with(
-                state.clone(),
-                |_, constant| lift_constant(constant),
-                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-            )?;
-            check_count!("output", condition_outputs, 1, ProgramError);
-            if !condition_outputs[0].boolean()? {
-                return Ok(state);
-            }
-            state = self.body.interpret_with(
-                state,
-                |_, constant| lift_constant(constant),
-                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
-            )?;
-            check_count!("output", state, self.state_types().len(), ProgramError);
-            completed_iterations += 1;
-        }
-    }
-}
-
-impl<T: Type, V: Value<T>, O> Display for WhileOperation<T, V, O>
+impl<T: Type, V: Value<T>, O, Payload> Display for WhileOperation<T, V, O, Payload>
 where
     Self: Operation<T>,
 {
@@ -243,7 +205,7 @@ where
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<T, V, O> {
+impl<T: Type, V: Value<T>, O: Operation<T>, Payload> Operation<T> for WhileOperation<T, V, O, Payload> {
     #[inline]
     fn name(&self) -> &'static str {
         WHILE_OPERATION_NAME
@@ -267,12 +229,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<T, V
     }
 }
 
-impl<T, C, V, O> InterpretableOperation<T, V> for WhileOperation<T, C, O>
+impl<T, C, V, O, Payload> InterpretableOperation<T, V> for WhileOperation<T, C, O, Payload>
 where
     T: WhileTypeSemantics,
     C: Value<T>,
     V: Value<T> + BooleanLike,
-    V::InterpretationContext: Context<Type = T, Constant = C, Value = V>,
+    V::InterpretationContext: Constant<T, V, C, Payload>,
     O: InterpretableOperation<T, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -281,7 +243,33 @@ where
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        self.interpret_with_constant_lift(context, inputs, |constant| context.lift(constant.clone()))
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let mut state = inputs.to_vec();
+        let mut completed_iterations = 0;
+        loop {
+            // The iteration bound is semantic: a bounded loop runs at most `bound` iterations by definition, so the
+            // loop exits here even while the condition still produces true.
+            if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
+                return Ok(state);
+            }
+            let condition_outputs = self.condition.interpret_with(
+                state.clone(),
+                |_, constant| context.constant(constant.clone()),
+                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+            )?;
+            check_count!("output", condition_outputs, 1, ProgramError);
+            if !condition_outputs[0].boolean()? {
+                return Ok(state);
+            }
+            state = self.body.interpret_with(
+                state,
+                |_, constant| context.constant(constant.clone()),
+                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+            )?;
+            check_count!("output", state, self.state_types().len(), ProgramError);
+            completed_iterations += 1;
+        }
     }
 }
 
@@ -378,14 +366,22 @@ mod tests {
         let zero = builder.add_instruction(ZeroLikeOperation, vec![state]).unwrap()[0];
         let vector_body = builder.build(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            WhileOperation::new(greater_than_zero_condition(), vector_body).map(|_| ()),
+            WhileOperation::<ArrayType, TestArray, ArrayOperation<TestArray>>::new(
+                greater_than_zero_condition(),
+                vector_body,
+            )
+            .map(|_| ()),
             Err(TypeError {
                 message: "while condition/body input type signature mismatch: expected [f64[]] but got [f64[2]]"
                     .to_string(),
             }),
         );
         assert_eq!(
-            WhileOperation::new(subtract_one_body(), subtract_one_body()).map(|_| ()),
+            WhileOperation::<ArrayType, TestArray, ArrayOperation<TestArray>>::new(
+                subtract_one_body(),
+                subtract_one_body(),
+            )
+            .map(|_| ()),
             Err(TypeError {
                 message: "while condition output type must be a scalar boolean, but got f64[]".to_string(),
             }),
@@ -395,13 +391,21 @@ mod tests {
         let multi_output_condition =
             builder.build(vec![state, state], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
         assert_eq!(
-            WhileOperation::new(multi_output_condition, subtract_one_body()).map(|_| ()),
+            WhileOperation::<ArrayType, TestArray, ArrayOperation<TestArray>>::new(
+                multi_output_condition,
+                subtract_one_body(),
+            )
+            .map(|_| ()),
             Err(TypeError {
                 message: "while condition must return exactly one predicate leaf but returned 2".to_string(),
             }),
         );
         assert_eq!(
-            WhileOperation::new(greater_than_zero_condition(), greater_than_zero_condition()).map(|_| ()),
+            WhileOperation::<ArrayType, TestArray, ArrayOperation<TestArray>>::new(
+                greater_than_zero_condition(),
+                greater_than_zero_condition(),
+            )
+            .map(|_| ()),
             Err(TypeError {
                 message: "while body output type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
             }),
@@ -410,17 +414,21 @@ mod tests {
         // The semantic iteration bound defaults to absent, must be at least one, may be cleared with `None`, and is
         // reported by the accessor.
         assert_eq!(operation.iteration_bound(), None);
-        let bounded = WhileOperation::new(greater_than_zero_condition(), subtract_one_body())
-            .unwrap()
-            .with_iteration_bound(2)
-            .unwrap();
+        let bounded: WhileOperation<ArrayType, TestArray, ArrayOperation<TestArray>> =
+            WhileOperation::new(greater_than_zero_condition(), subtract_one_body())
+                .unwrap()
+                .with_iteration_bound(2)
+                .unwrap();
         assert_eq!(bounded.iteration_bound(), Some(2));
         assert_eq!(bounded.clone().with_iteration_bound(None).unwrap().iteration_bound(), None);
         assert_eq!(
-            WhileOperation::new(greater_than_zero_condition(), subtract_one_body())
-                .unwrap()
-                .with_iteration_bound(0)
-                .map(|_| ()),
+            WhileOperation::<ArrayType, TestArray, ArrayOperation<TestArray>>::new(
+                greater_than_zero_condition(),
+                subtract_one_body(),
+            )
+            .unwrap()
+            .with_iteration_bound(0)
+            .map(|_| ()),
             Err(ProgramError::Type(TypeError { message: "while iteration bound must be at least 1".to_string() })),
         );
 

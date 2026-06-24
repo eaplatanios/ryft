@@ -9,7 +9,7 @@ use crate::operations::arithmetic::{
 };
 use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::{
-    ConstantOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
+    Constant, ConstantOperation, MaybeZeroOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation};
@@ -203,7 +203,7 @@ impl<C, V> InterpretableOperation<DataType, V> for ScalarOperation<C>
 where
     C: Value<DataType>,
     V: Value<DataType> + BooleanLike,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Constant<DataType, V, C>,
     ZeroOperation<DataType>: InterpretableOperation<DataType, V>,
     ZeroLikeOperation: InterpretableOperation<DataType, V>,
     OneOperation<DataType>: InterpretableOperation<DataType, V>,
@@ -281,7 +281,7 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     Scale(ScaleOperation<DataType, F, Input>),
     Select(LinearSelectOperation<F>),
     Scan(Box<ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F>>),
-    While(Box<WhileOperation<DataType, V, Self>>),
+    While(Box<WhileOperation<DataType, V, Self, Input>>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
 
@@ -350,7 +350,10 @@ where
         + Select<Condition = <V as SelectCondition>::Condition>
         + SelectCondition,
     C: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Zero<DataType, V> + One<DataType, V>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>
+        + Zero<DataType, V>
+        + One<DataType, V>
+        + Constant<DataType, V, V, Input>,
     F: CustomVjpResidual<DataType, V> + SelectCondition,
     ScalarOperation<C>: InterpretableOperation<DataType, V>,
     ScaleOperation<DataType, F, Input>: InterpretableOperation<DataType, V>,
@@ -377,7 +380,7 @@ where
             Self::Scale(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => operation.interpret_with_cloned_constants(context, inputs),
+            Self::While(operation) => operation.interpret(context, inputs),
         }
     }
 }
@@ -393,7 +396,10 @@ where
         + Select<Condition = <V as SelectCondition>::Condition>
         + SelectCondition,
     C: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V> + Zero<DataType, V> + One<DataType, V>,
+    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>
+        + Zero<DataType, V>
+        + One<DataType, V>
+        + Constant<DataType, V, V, Input>,
     ScaleOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
     ConstantOperation<DataType, V, Input>: InterpretableOperation<DataType, V>,
     ScalarOperation<C>: InterpretableOperation<DataType, V>,
@@ -423,7 +429,7 @@ where
                 Self::Scale(operation) => operation.interpret(context, instruction_inputs),
                 Self::Select(operation) => operation.interpret(context, instruction_inputs),
                 Self::Scan(operation) => operation.interpret(context, instruction_inputs),
-                Self::While(operation) => operation.interpret_with_cloned_constants(context, instruction_inputs),
+                Self::While(operation) => operation.interpret(context, instruction_inputs),
             },
         )
     }
