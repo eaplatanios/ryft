@@ -1246,7 +1246,7 @@ mod tests {
         // constant (kept as a factor payload) rewrites its body so references to the moved stack become recomputed
         // operand-form products against a new trailing lane input, while references to the surviving constant stack
         // are re-indexed against the compacted constant-only stack list.
-        use crate::tracing_v2::{DefactorizedOperation, ResidualizedOperation, SupportsLinearWhile};
+        use crate::tracing_v2::{DefactorizableOperation, DefactorizedOperation, ResidualizedOperation};
 
         type ScanBodyOperation =
             LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>;

@@ -21,7 +21,9 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched, move_axis_permutation,
 };
 use crate::tracing_v2::differentiation::{LinearizableProgramOperation, NestedLinearization};
+use crate::tracing_v2::operations::captures::MaterializeCaptureOperation;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
+use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::tracing_v2::operations::scan::{LinearScanOperation, linear_scan_operation};
 use crate::tracing_v2::operations::select::LinearSelectOperation;
@@ -100,38 +102,31 @@ where
     context.tracer(output, None)
 }
 
-/// Trait that represents linear [`Operation`] types that support/include the staged doubled-state while loop. The
-/// staged while loop is the linear-program counterpart of [`WhileOperation`]: its state is the primal state followed
-/// by the tangent state, its body interleaves recomputed primal operations with the body pushforward (whose
-/// loop-varying residual references are rewritten into operand form), and its condition recomputes the original loop
-/// predicate from the primal half of the state. Linear operation enums implement this trait so that the JVP rule of
-/// [`WhileOperation`] can stage the fused loop without knowing which linear operation type is in use.
-pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Sized {
-    /// Wraps `operation` as a recomputed primal operation embedded in a linear program. Fused while bodies use
-    /// recomputed operations to rebuild the primal state (and the loop-varying residuals derived from it) inside the
-    /// loop instead of capturing residuals once at staging time.
-    fn recompute_operation(operation: O) -> Self;
-
-    /// Constructs the nullary linear operation that materializes the captured `factor` as a program value. The while
-    /// JVP rule uses residual injections to feed the loop-entry primal state into the staged linear loop, and fused
-    /// programs use them to materialize nested primal program constants.
-    fn residual_operation(factor: F) -> Self;
-
+/// Linear operation family that can rewrite loop-varying captures into explicit operands.
+///
+/// Unbounded [`WhileOperation`] JVPs build one fused doubled-state loop whose body recomputes the primal state and
+/// then replays the body pushforward. Pushforward operations can contain [`ValueOrCapture::Capture`] payloads that
+/// refer to residuals produced by the recomputed primal half of the same fused loop iteration. Those residuals are not
+/// closed-over constants anymore, so the operation family must rewrite such captures into ordinary operand atoms.
+///
+/// This trait is intentionally narrower than the rest of the while JVP machinery. Recomputed primal instructions,
+/// residual injections, and the final fused while operation are staged directly through their payload operation types
+/// and ordinary `From<...>` conversions. Implementors only own the operation-specific capture-to-operand rewrite.
+pub trait DefactorizableOperation: Clone + Sized {
     /// Rewrites this operation's loop-varying [`ValueOrCapture::Capture`] factors into operand form against
     /// `residual_atoms`, where `residual_atoms[i]` is the fused-body atom carrying residual `i`.
     ///
     /// Captured-factor linear maps whose factor is recomputed in-loop become recomputed multi-operand primal
     /// operations (for example, a scale by a referenced residual becomes a recomputed elementwise product and a
     /// select over a referenced condition becomes a recomputed operand-form select), with the residual atom spliced
-    /// into `inputs`. Every such rewrite is wrapped in the recomputed-primal form produced by
-    /// [`Self::recompute_operation`] so fused bodies carry uniform provenance. Higher-order payloads rewrite
-    /// recursively: a condition over a referenced predicate becomes an operand-form condition whose branches receive
-    /// the union of their referenced residuals as forwarded trailing operands, and a linear scan whose residual
-    /// stacks reference loop-varying residuals moves those stacks into extra scanned operands with its body
-    /// rewritten against the new trailing lane inputs. Operations carrying only closed [`ValueOrCapture::Value`]
-    /// factors pass through unchanged, and the remaining unsupported shapes (for example, custom VJP call residual
-    /// references or a constant-predicate condition whose branches reference loop-varying residuals) are rejected
-    /// with precise errors.
+    /// into `inputs`. Every such rewrite is normally wrapped in [`RecomputeOperation`] so fused bodies carry uniform
+    /// provenance. Higher-order payloads rewrite recursively: a condition over a referenced predicate becomes an
+    /// operand-form condition whose branches receive the union of their referenced residuals as forwarded trailing
+    /// operands, and a linear scan whose residual stacks reference loop-varying residuals moves those stacks into
+    /// extra scanned operands with its body rewritten against the new trailing lane inputs. Operations carrying only
+    /// closed [`ValueOrCapture::Value`] factors pass through unchanged, and the remaining unsupported shapes (for
+    /// example, custom VJP call residual references or a constant-predicate condition whose branches reference
+    /// loop-varying residuals) are rejected with precise errors.
     ///
     /// # Parameters
     ///
@@ -142,22 +137,10 @@ pub trait SupportsLinearWhile<T: Type, V: Value<T>, F: Value<T>, O>: Clone + Siz
         residual_atoms: &[AtomId],
         inputs: Vec<AtomId>,
     ) -> Result<DefactorizedOperation<Self>, ProgramError>;
-
-    /// Constructs the linear-operation representation of the fused doubled-state while loop.
-    ///
-    /// # Parameters
-    ///
-    ///   - `condition`: Extended condition [`Program`] recomputing the loop predicate from the primal half of the
-    ///     doubled state.
-    ///   - `body`: Fused body [`Program`] mapping `[primal_state..., tangent_state...]` to the next doubled state.
-    fn linear_while_operation(
-        condition: Program<T, V, Self, Vec<V>, Vec<V>>,
-        body: Program<T, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError>;
 }
 
 /// Result of rewriting one pushforward operation's residual references into operand form (see
-/// [`SupportsLinearWhile::defactorize`]).
+/// [`DefactorizableOperation::defactorize`]).
 pub enum DefactorizedOperation<O> {
     /// Defactorized operation to stage over `inputs`.
     Operation {
@@ -363,9 +346,9 @@ where
 /// Inlines a nested primal `program` into the linear `builder` as recomputed primal operations, mapping the
 /// program's input atoms onto `input_atoms` and returning the builder atoms carrying the program outputs.
 ///
-/// Each instruction is wrapped through [`SupportsLinearWhile::recompute_operation`] and each program constant is
-/// materialized through a nullary residual injection whose closed factor is the constant lifted into the enclosing
-/// context, since the linear program's value type generally differs from the primal constant type.
+/// Each instruction is wrapped through [`RecomputeOperation`] and each program constant is materialized through a
+/// nullary [`MaterializeCaptureOperation`] whose closed factor is the constant lifted into the enclosing context,
+/// since the linear program's value type generally differs from the primal constant type.
 fn inline_recomputed_primal_program<E, O>(
     differentiable: &E,
     builder: &mut ProgramBuilder<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>,
@@ -382,7 +365,7 @@ where
     E: DifferentiationContext,
     O: Clone + Operation<<E as Domain>::Type>,
     LinearOperationOf<E>:
-        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ValueOrCapture<<E as Domain>::Type, E::Value>, O>,
+        From<MaterializeCaptureOperation<ValueOrCapture<<E as Domain>::Type, E::Value>>> + From<RecomputeOperation<O>>,
 {
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
@@ -392,7 +375,7 @@ where
     for (atom_index, atom) in program.atoms().iter().enumerate() {
         if let Atom::Constant(constant) = atom {
             let factor = ValueOrCapture::Value(differentiable.lift(constant.clone())?);
-            let outputs = builder.add_instruction(LinearOperationOf::<E>::residual_operation(factor), vec![])?;
+            let outputs = builder.add_instruction(MaterializeCaptureOperation::new(factor), vec![])?;
             check_count!("output", outputs, 1, ProgramError);
             atom_map[atom_index] = Some(outputs[0]);
         }
@@ -406,7 +389,7 @@ where
             .iter()
             .map(|input| map_atom(atom_map.as_slice(), *input))
             .collect::<Result<Vec<_>, _>>()?;
-        let operation = LinearOperationOf::<E>::recompute_operation(instruction.operation().clone());
+        let operation = RecomputeOperation::new(instruction.operation().clone());
         let outputs = builder.add_instruction(operation, inputs)?.to_vec();
         check_count!("output", outputs, instruction.outputs().len(), ProgramError);
         for (program_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
@@ -418,7 +401,7 @@ where
 
 /// Inlines a body pushforward `program` into the linear `builder`, mapping the program's tangent input atoms onto
 /// `input_atoms` and rewriting loop-varying [`ValueOrCapture::Capture`] factors into operand form against
-/// `residual_atoms` through [`SupportsLinearWhile::defactorize`]. Returns the builder atoms carrying the program
+/// `residual_atoms` through [`DefactorizableOperation::defactorize`]. Returns the builder atoms carrying the program
 /// outputs.
 fn inline_defactorized_pushforward_program<E>(
     builder: &mut ProgramBuilder<<E as Domain>::Type, E::Tangent, LinearOperationOf<E>>,
@@ -428,12 +411,7 @@ fn inline_defactorized_pushforward_program<E>(
 ) -> Result<Vec<AtomId>, ProgramError>
 where
     E: DifferentiationContext,
-    LinearOperationOf<E>: SupportsLinearWhile<
-            <E as Domain>::Type,
-            E::Tangent,
-            ValueOrCapture<<E as Domain>::Type, E::Value>,
-            <E as Domain>::Operation,
-        >,
+    LinearOperationOf<E>: DefactorizableOperation,
 {
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
@@ -499,8 +477,9 @@ fn build_fused_while_programs<E, O>(
 where
     E: DifferentiationContext + Domain<Operation = O>,
     O: Clone + Operation<<E as Domain>::Type>,
-    LinearOperationOf<E>:
-        SupportsLinearWhile<<E as Domain>::Type, E::Tangent, ValueOrCapture<<E as Domain>::Type, E::Value>, O>,
+    LinearOperationOf<E>: DefactorizableOperation
+        + From<MaterializeCaptureOperation<ValueOrCapture<<E as Domain>::Type, E::Value>>>
+        + From<RecomputeOperation<O>>,
 {
     let state_types = condition.input_types();
     let state_count = state_types.len();
@@ -892,7 +871,7 @@ where
 ///      here.
 ///   2. The primal [`WhileOperation`] is bound *unchanged* (original condition and body) in the primal domain,
 ///      recording one `while` operation.
-///   3. One linear while loop ([`SupportsLinearWhile`]) is staged over the doubled state
+///   3. One linear while loop is staged over the doubled state
 ///      `[primal_state..., tangent_state...]`. Its fused body interleaves primal recomputation with tangent
 ///      propagation: the residual-extended primal body program is inlined as recomputed primal operations over the
 ///      primal half, and the body pushforward is inlined over the tangent half with its loop-varying
@@ -901,7 +880,7 @@ where
 ///      operand-form dots). Its condition recomputes the original loop predicate from the primal half and ignores
 ///      the tangent half.
 ///   4. The loop-entry primal state enters the linear program through nullary residual injections
-///      ([`SupportsLinearWhile::residual_operation`]), one per state element. Replaying the pushforward at the same
+///      ([`MaterializeCaptureOperation`]), one per state element. Replaying the pushforward at the same
 ///      primal point therefore genuinely re-runs the loop — the trip count comes from the captured primal point —
 ///      and fresh tangents propagate through the same iterations.
 ///
@@ -928,7 +907,10 @@ where
         + From<DynamicUpdateSliceOperation>,
     LinearOperationOf<D>: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>>
         + ResidualizedOperation<D>
-        + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, O>
+        + DefactorizableOperation
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
+        + From<RecomputeOperation<O>>
+        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>>>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     Vec<V>: Parameterized<
@@ -1181,7 +1163,7 @@ where
         let mut linear_inputs = Vec::with_capacity(2 * state_count);
         for input in inputs {
             let factor = input.factor(context);
-            let mut outputs = context.stage_nullary_operation(LinearOperationOf::<D>::residual_operation(factor))?;
+            let mut outputs = context.stage_nullary_operation(MaterializeCaptureOperation::new(factor))?;
             check_count!("output", outputs, 1, ProgramError);
             linear_inputs.push(outputs.remove(0));
         }
@@ -1189,7 +1171,8 @@ where
             linear_inputs.push(input.tangent().clone());
         }
 
-        let linear_while = LinearOperationOf::<D>::linear_while_operation(extended_condition, fused_body)?;
+        let linear_while =
+            WhileOperation::<ArrayType, D::Tangent, LinearOperationOf<D>>::new(extended_condition, fused_body)?;
         let linear_outputs = context.stage_operation(linear_while, linear_inputs.as_slice())?;
         check_count!("output", linear_outputs, 2 * state_count, ProgramError);
 
@@ -1924,7 +1907,7 @@ where
 }
 
 /// Operand-form conditional linear operation: the operand-form counterpart of captured-predicate
-/// [`ConditionOperation`] produced by [`SupportsLinearWhile::defactorize`] for fused while bodies.
+/// [`ConditionOperation`] produced by [`DefactorizableOperation::defactorize`] for fused while bodies.
 ///
 /// It is the counterpart of the `OperandCondition` variant of
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation): the Boolean predicate is operand `0` (recomputed
@@ -2544,17 +2527,25 @@ mod tests {
         }
     }
 
-    impl SupportsLinearWhile<ArrayType, TestValue, ValueOrCapture<ArrayType, TestValue>, TestDifferentiableOperation>
-        for TestLinearOperation
-    {
-        fn recompute_operation(operation: TestDifferentiableOperation) -> Self {
-            Self::Recompute(operation)
+    impl From<RecomputeOperation<TestDifferentiableOperation>> for TestLinearOperation {
+        fn from(operation: RecomputeOperation<TestDifferentiableOperation>) -> Self {
+            Self::Recompute(operation.into_operation())
         }
+    }
 
-        fn residual_operation(factor: ValueOrCapture<ArrayType, TestValue>) -> Self {
-            Self::Residual { factor }
+    impl From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, TestValue>>> for TestLinearOperation {
+        fn from(operation: MaterializeCaptureOperation<ValueOrCapture<ArrayType, TestValue>>) -> Self {
+            Self::Residual { factor: operation.capture().clone() }
         }
+    }
 
+    impl From<WhileOperation<ArrayType, TestValue, TestLinearOperation>> for TestLinearOperation {
+        fn from(operation: WhileOperation<ArrayType, TestValue, TestLinearOperation>) -> Self {
+            Self::While(Box::new(operation))
+        }
+    }
+
+    impl DefactorizableOperation for TestLinearOperation {
         fn defactorize(
             &self,
             residual_atoms: &[AtomId],
@@ -2572,13 +2563,6 @@ mod tests {
                 }
                 operation => Ok(DefactorizedOperation::Operation { operation: operation.clone(), inputs }),
             }
-        }
-
-        fn linear_while_operation(
-            condition: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
-            body: Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
-        ) -> Result<Self, TypeError> {
-            Ok(Self::While(Box::new(WhileOperation::new(condition, body)?)))
         }
     }
 

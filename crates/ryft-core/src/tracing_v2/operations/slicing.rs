@@ -640,7 +640,7 @@ mod tests {
     use crate::operations::manipulation::{LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation};
     use crate::programs::AtomId;
     use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing_v2::operations::control_flow::{DefactorizedOperation, SupportsLinearWhile};
+    use crate::tracing_v2::operations::control_flow::{DefactorizableOperation, DefactorizedOperation};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{

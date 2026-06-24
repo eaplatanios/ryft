@@ -46,7 +46,7 @@ use ryft_core::tracing_v2::operations::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsManipulationOperations,
     SupportsTrigonometricOperations,
 };
-use ryft_core::tracing_v2::operations::control_flow::{LinearOperandConditionOperation, SupportsLinearWhile};
+use ryft_core::tracing_v2::operations::control_flow::{DefactorizableOperation, LinearOperandConditionOperation};
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
@@ -528,7 +528,10 @@ where
                 Captured,
             >,
         >
-        + SupportsLinearWhile<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>, XlaOperation>,
+        + DefactorizableOperation
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<RecomputeOperation<XlaOperation>>
+        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<E>>>,
     Self: Clone + LinearizableProgramOperation<E>,
 {
     fn jvp<'jvp>(
@@ -1226,7 +1229,7 @@ where
     }
 }
 
-impl<V, C, R, P> SupportsLinearWhile<ArrayType, V, ValueOrCapture<ArrayType, R>, P>
+impl<V, C, R, P> DefactorizableOperation
     for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
 where
     V: Value<ArrayType>,
@@ -1241,14 +1244,6 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ConcatenateOperation>,
 {
-    fn recompute_operation(operation: P) -> Self {
-        Self::Recompute(RecomputeOperation::new(operation))
-    }
-
-    fn residual_operation(factor: ValueOrCapture<ArrayType, R>) -> Self {
-        Self::Residual(MaterializeCaptureOperation::new(factor))
-    }
-
     fn defactorize(
         &self,
         residual_atoms: &[ryft_core::programs::AtomId],
@@ -1285,13 +1280,6 @@ where
             }
             _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
         }
-    }
-
-    fn linear_while_operation(
-        condition: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        Ok(Self::While(Box::new(WhileOperation::new(condition, body)?)))
     }
 }
 

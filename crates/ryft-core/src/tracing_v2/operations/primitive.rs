@@ -63,7 +63,7 @@ use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{DifferentiableOperation, RematerializationName, ResidualizedOperation, ValueOrCapture};
-use crate::types::{ArrayType, Type, TypeError, Typed};
+use crate::types::{ArrayType, Type, Typed};
 
 use super::bounds::{
     SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
@@ -72,7 +72,7 @@ use super::bounds::{
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
-    DefactorizedOperation, LinearOperandConditionOperation, SupportsLinearWhile, batch_condition_with_interpreter,
+    DefactorizableOperation, DefactorizedOperation, LinearOperandConditionOperation, batch_condition_with_interpreter,
     batch_while_with_interpreter,
 };
 use super::dot::DotOps;
@@ -223,7 +223,10 @@ where
                 ValueOrCapture<ArrayType, D::Value>,
                 Captured,
             >,
-        > + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, ArrayOperation<V>>
+        > + DefactorizableOperation
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
+        + From<RecomputeOperation<ArrayOperation<V>>>
+        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<V>: Clone + LinearizableProgramOperation<D>,
@@ -382,7 +385,7 @@ enum NestedResidualDisposition {
 
 /// Rewrites a nested linear `program`'s residual references into operand form against new trailing inputs.
 ///
-/// This is the whole-program counterpart of [`SupportsLinearWhile::defactorize`], used by the higher-order
+/// This is the whole-program counterpart of [`DefactorizableOperation::defactorize`], used by the higher-order
 /// defactorization arms: operand-form condition branches receive their forwarded while-body residuals as trailing
 /// inputs, and operand-form scan bodies receive the lane slices of their moved residual stacks as trailing scanned
 /// inputs. The returned program consumes `[original_inputs..., forwarded_inputs...]` with one trailing input per
@@ -392,7 +395,7 @@ enum NestedResidualDisposition {
 ///   - Instructions whose references all map to [`NestedResidualDisposition::Factor`] keep their factor form with
 ///     the references re-indexed to the compacted factor positions.
 ///   - Instructions whose references all map to [`NestedResidualDisposition::Operand`] are rewritten into operand
-///     form against the trailing input atoms through [`SupportsLinearWhile::defactorize`] (a nested residual
+///     form against the trailing input atoms through [`DefactorizableOperation::defactorize`] (a nested residual
 ///     injection collapses to forwarding the trailing input).
 ///   - Instructions referencing both kinds are rejected, mirroring the mixed constant/reference index rejection of
 ///     the dynamic-slicing defactorization arms (defactorization stages exactly one instruction per source
@@ -512,9 +515,7 @@ where
     builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
-// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
-impl<V, C, R, P> SupportsLinearWhile<ArrayType, V, ValueOrCapture<ArrayType, R>, P>
-    for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
+impl<V, C, R, P> DefactorizableOperation for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
 where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
@@ -528,16 +529,6 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ConcatenateOperation>,
 {
-    #[inline]
-    fn recompute_operation(operation: P) -> Self {
-        LinearArrayOperation::Recompute(RecomputeOperation::new(operation))
-    }
-
-    #[inline]
-    fn residual_operation(factor: ValueOrCapture<ArrayType, R>) -> Self {
-        LinearArrayOperation::Residual(MaterializeCaptureOperation::new(factor))
-    }
-
     fn defactorize(
         &self,
         residual_atoms: &[AtomId],
@@ -761,13 +752,6 @@ where
                 Ok(DefactorizedOperation::Operation { operation: operation.clone(), inputs })
             }
         }
-    }
-
-    fn linear_while_operation(
-        condition: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Self, TypeError> {
-        Ok(LinearArrayOperation::While(Box::new(WhileOperation::new(condition, body)?)))
     }
 }
 
@@ -1586,12 +1570,11 @@ where
                 ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
                 Captured,
             >,
-        > + SupportsLinearWhile<
-            ArrayType,
-            E::Tangent,
-            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
-            Self,
-        > + LinearScanOperation<ArrayType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>,
+        > + DefactorizableOperation
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<RecomputeOperation<Self>>
+        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<LinearizationContextOf<E, Self>>>>
+        + LinearScanOperation<ArrayType, E::Tangent, Tracer<LinearizationContextOf<E, Self>>>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
