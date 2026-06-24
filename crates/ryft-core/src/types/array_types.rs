@@ -7,7 +7,6 @@ use ryft_macros::Parameter;
 use crate::Error;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
-use crate::operations::constants::ConstantOperation;
 use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
@@ -710,7 +709,7 @@ impl Typed<ArrayType> for ArrayType {
 // `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<ArrayType>` for metadata-only program
 // storage, lowering, and transformation.
 impl Value<ArrayType> for ArrayType {
-    type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
+    type InterpretationContext = EagerContext<ArrayType, Self>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

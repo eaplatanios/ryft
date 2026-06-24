@@ -1502,7 +1502,6 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
     use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
-    use crate::operations::constants::ConstantOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::tests::TestArray;
@@ -2078,7 +2077,7 @@ mod tests {
         }
 
         impl Value<DataType> for CloneCountingValue {
-            type InterpretationContext = EagerContext<DataType, Self, ConstantOperation<DataType, Self>>;
+            type InterpretationContext = EagerContext<DataType, Self>;
 
             #[inline]
             fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::domains::Domain;
 use crate::macros::check_builders;
-use crate::operations::constants::MaybeZeroOperation;
+use crate::operations::constants::{ConstantOperation, MaybeZeroOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -58,7 +58,12 @@ pub trait ProvidesContext<C: Context> {
 /// for those input values using the value type's default interpretation context. [`EagerContext`] exists to make direct
 /// interpretation contexts explicit in generic code that otherwise has no backend-owned eager context value to pass
 /// around.
-pub struct EagerContext<T: Type, V: Value<T>, O: Operation<T>> {
+///
+/// The default operation family is [`ConstantOperation<T, V>`](ConstantOperation), which is the minimal operation
+/// family needed by ordinary eager value contexts that only materialize constants and expose context capabilities such
+/// as zero, one, fill, and scale. Code that binds or batches a richer operation family should still specify `O`
+/// explicitly, such as `EagerContext<ArrayType, V, ArrayOperation<V>>`.
+pub struct EagerContext<T: Type, V: Value<T>, O: Operation<T> = ConstantOperation<T, V>> {
     /// [`PhantomData`] marker tying this zero-sized context to its associated types.
     marker: PhantomData<fn() -> (T, V, O)>,
 }

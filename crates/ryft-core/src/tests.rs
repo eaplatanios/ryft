@@ -25,7 +25,7 @@ use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, EagerContext, ProvidesContext};
 use crate::domains::Domain;
-use crate::operations::constants::{ConstantOperation, Fill, One, OneLike, Zero, ZeroLike};
+use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
@@ -135,7 +135,7 @@ impl Typed<ArrayType> for TestArray {
 }
 
 impl Value<ArrayType> for TestArray {
-    type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
+    type InterpretationContext = EagerContext<ArrayType, Self>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
@@ -986,7 +986,7 @@ mod tests {
         // instead of panicking.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
         let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
-        let context = EagerContext::<ArrayType, TestArray, ConstantOperation<ArrayType, TestArray>>::new();
+        let context = EagerContext::<ArrayType, TestArray>::new();
         assert!(matches!(
             context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,

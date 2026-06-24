@@ -2113,8 +2113,7 @@ mod tests {
     };
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{
-        ConstantOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation,
-        ZeroOperation,
+        One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
     };
     use crate::operations::control_flow::SelectOperation;
     use crate::operations::trigonometric::SinOperation;
@@ -2152,7 +2151,7 @@ mod tests {
     }
 
     impl Value<ArrayType> for TestValue {
-        type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
+        type InterpretationContext = EagerContext<ArrayType, Self>;
 
         #[inline]
         fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

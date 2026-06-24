@@ -78,8 +78,7 @@ use super::control_flow::{
 };
 use super::dot::DotOps;
 use super::scan::{
-    InterpretableNestedProgram, LinearScanBodyInstantiable, LinearScanBodyTransposable, LinearScanInterpretation,
-    LinearScanOperation,
+    InterpretableNestedProgram, LinearScanBodyTransposable, LinearScanInterpretation, LinearScanOperation,
 };
 use crate::operations::manipulation::Reshape;
 
@@ -520,6 +519,7 @@ where
     builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
 }
 
+// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, R, P> SupportsLinearWhile<ArrayType, V, ValueOrCapture<ArrayType, R>, P>
     for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
 where
@@ -778,19 +778,7 @@ where
     }
 }
 
-impl<V, C, P> LinearScanBodyInstantiable<ArrayType, V> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-{
-    type Instantiated = LinearArrayOperation<V, C, V, P>;
-
-    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError> {
-        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
-    }
-}
-
+// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, P> InterpretableNestedProgram<ArrayType, V> for LinearArrayOperation<V, C, V, P>
 where
     V: Value<ArrayType>
@@ -927,7 +915,9 @@ where
                                 .map(|stack| read_scan_lane(stack, lane))
                                 .collect::<Result<Vec<_>, _>>()?;
                             let lane_body = body.map_operations(|operation| {
-                                operation.instantiate_linear_scan_body_factors(lane_residuals.as_slice())
+                                operation.try_map_captures(&mut |capture: &ValueOrCapture<ArrayType, V>| {
+                                    capture.instantiate(lane_residuals.as_slice())
+                                })
                             })?;
                             Self::interpret_nested_program(context, &lane_body, lane_inputs)
                         },
@@ -938,6 +928,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, P> LinearScanBodyTransposable<ArrayType, V> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>
 where
     V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
@@ -956,6 +947,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, F, P> LinearConditionBranchTransposable<V> for LinearArrayOperation<V, C, F, P>
 where
     V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
@@ -1178,6 +1170,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, F, P>
 where
     V: Value<ArrayType>,
@@ -1209,7 +1202,7 @@ where
 /// trait.
 impl<V> InterpretableOperation<ArrayType, V> for ArrayOperation<V>
 where
-    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V, ConstantOperation<ArrayType, V>>>
+    V: Value<ArrayType, InterpretationContext = EagerContext<ArrayType, V>>
         + Parameter
         + SupportsArithmeticOperations
         + SupportsTrigonometricOperations

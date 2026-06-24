@@ -4,7 +4,7 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::macros::check_count;
+use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -16,7 +16,6 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -32,7 +31,7 @@ use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
 use crate::tracing_v2::operations::scan::{
-    InterpretableNestedProgram, LinearScanBodyInstantiable, LinearScanBodyTransposable, LinearScanOperation,
+    InterpretableNestedProgram, LinearScanBodyTransposable, LinearScanOperation,
 };
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
@@ -321,44 +320,6 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
                 Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
             }
         }
-    }
-}
-
-impl<V: Value<DataType>, C: Value<DataType>> LinearScanBodyInstantiable<DataType, V>
-    for LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>
-{
-    type Instantiated = LinearScalarOperation<V, C, V>;
-
-    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError> {
-        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
-    }
-}
-
-// TODO(eaplatanios): Why do we need this?
-impl<V, C, F> ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F>
-where
-    V: Value<DataType>,
-    C: Value<DataType>,
-    F: Value<DataType>,
-    LinearScalarOperation<V, C, V>: InterpretableNestedProgram<DataType, V>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<DataType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let body = self.body().map_operations(|operation| operation.instantiate_linear_scan_body_factors(&[]))?;
-        let mut state = inputs.to_vec();
-        for _ in 0..self.length() {
-            state =
-                <LinearScalarOperation<V, C, V> as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(
-                    context, &body, state,
-                )?;
-            check_count!("output", state, self.carry_count(), ProgramError);
-        }
-        Ok(state)
     }
 }
 

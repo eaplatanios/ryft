@@ -7,7 +7,7 @@ use ndarray::{ArrayD, IxDyn, Zip};
 use thiserror::Error;
 
 use ryft_core::EagerContext;
-use ryft_core::operations::constants::{ConstantOperation, Fill, One, OneLike, Zero, ZeroLike};
+use ryft_core::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use ryft_core::operations::control_flow::{Select, SelectCondition};
 use ryft_core::operations::manipulation::{
     Broadcast, Concatenate, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicSlice,
@@ -434,7 +434,7 @@ impl<T: NdArrayElement> Typed<ArrayType> for Array<T> {
 }
 
 impl<T: NdArrayElement> Value<ArrayType> for Array<T> {
-    type InterpretationContext = EagerContext<ArrayType, Self, ConstantOperation<ArrayType, Self>>;
+    type InterpretationContext = EagerContext<ArrayType, Self>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

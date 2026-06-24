@@ -56,9 +56,7 @@ use ryft_core::tracing_v2::operations::memory::{TransferToMemory, TransferToMemo
 use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
 use ryft_core::tracing_v2::operations::reshape::ReshapeValue;
-use ryft_core::tracing_v2::operations::scan::{
-    InterpretableNestedProgram, LinearScanBodyInstantiable, LinearScanBodyTransposable,
-};
+use ryft_core::tracing_v2::operations::scan::{InterpretableNestedProgram, LinearScanBodyTransposable};
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
     ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DefactorizedOperation, DifferentiableOperation,
@@ -1041,8 +1039,11 @@ where
         |lane, lane_inputs| {
             let lane_residuals =
                 stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
-            let lane_body =
-                body.map_operations(|operation| operation.instantiate_linear_scan_body_factors(&lane_residuals))?;
+            let lane_body = body.map_operations(|operation| {
+                operation.try_map_captures(&mut |capture: &ValueOrCapture<ArrayType, V>| {
+                    capture.instantiate(&lane_residuals)
+                })
+            })?;
             interpret_direct_linear_xla_program(context, &lane_body, lane_inputs)
         },
     )
@@ -1087,20 +1088,6 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         interpret_direct_linear_xla_operation(self, context, inputs)
-    }
-}
-
-impl<V, C, P> LinearScanBodyInstantiable<ArrayType, V>
-    for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P, ValueOrCapture<ArrayType, V>>
-where
-    V: Value<ArrayType>,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-{
-    type Instantiated = LinearXlaOperation<V, C, V, P, V>;
-
-    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError> {
-        self.try_map_captures(&mut |factor| factor.instantiate(residuals))
     }
 }
 

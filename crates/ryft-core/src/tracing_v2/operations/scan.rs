@@ -124,13 +124,14 @@ where
 
 /// Represents scan-local linear operation families that can transpose the captured linear scan body program.
 ///
-/// The body of a linear scan is always expressed over a scan-local residual-reference factor namespace. This trait
-/// names the recursive fixed point needed to transpose that body without making callers restate every variant-level
-/// transposition requirement of the operation family.
+/// The body of a linear scan is always expressed over a scan-local residual-reference namespace. This trait names the
+/// recursive fixed point needed to transpose that body without making callers restate every variant-level transposition
+/// requirement of the operation family. It intentionally acts as a trait-solver recursion breaker for operation enums
+/// that contain `Scan` variants.
 pub trait LinearScanBodyTransposable<T: Type, V: Value<T>>:
     Operation<T> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>
 {
-    /// Transposes a scan-local linear scan body program.
+    /// Transposes a scan-local linear body program.
     ///
     /// # Parameters
     ///
@@ -140,27 +141,6 @@ pub trait LinearScanBodyTransposable<T: Type, V: Value<T>>:
     ) -> Result<Program<T, V, Self, Vec<V>, Vec<V>>, ProgramError>
     where
         Self: Sized;
-}
-
-// TODO(eaplatanios): Is this actually necessary?
-/// Represents scan-local body operation families whose [`ValueOrCapture`] payloads can be instantiated into concrete
-/// lane values.
-///
-/// Captured linear scan bodies use a scan-local residual-reference namespace. Before interpreting a lane, the
-/// operation family maps those references to the residual slice values for that lane. This trait keeps that
-/// operation-family-specific mapping out of [`ScanOperation`], so backend/user linear operation enums can choose how
-/// their own payloads participate.
-pub trait LinearScanBodyInstantiable<T: Type, V: Value<T>>: Operation<T> {
-    /// Operation type produced after replacing scan-local captured factors with concrete lane values.
-    type Instantiated: Clone + Operation<T>;
-
-    /// Instantiates this operation's scan-local captured factors using `residuals`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `residuals`: Residual values for the current scan lane, indexed by
-    ///     [`ValueOrCapture::Capture`](crate::tracing_v2::ValueOrCapture::Capture).
-    fn instantiate_linear_scan_body_factors(&self, residuals: &[V]) -> Result<Self::Instantiated, ProgramError>;
 }
 
 /// Represents operation families that can recursively interpret nested flat programs.
@@ -184,6 +164,46 @@ pub trait InterpretableNestedProgram<T: Type, V: Value<T>>: Operation<T> {
     ) -> Result<Vec<V>, ProgramError>
     where
         Self: Sized;
+}
+
+impl<V, O, F> ScanOperation<DataType, V, O, F>
+where
+    V: Value<DataType>,
+    F: Value<DataType>,
+    O: CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>,
+    <O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<V>:
+        InterpretableNestedProgram<DataType, V>,
+{
+    /// Interprets a carry-only linear scalar scan whose body payloads use scan-local captured factors.
+    ///
+    /// Scalar scans currently have no scalar-stack representation, so this path only supports residual-free linear
+    /// scan bodies. The regular [`Operation::infer_output_types`] call enforces that any stored captures are rejected
+    /// before the body is replayed. The body operations are then instantiated into their ordinary value-payload form
+    /// and interpreted through the operation family's nested-program interpreter.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Interpretation context used for instantiated body operations.
+    ///   - `inputs`: Initial carry values.
+    pub(crate) fn interpret(
+        &self,
+        context: &<V as Value<DataType>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let body = self.body().map_operations(|operation| {
+            operation.try_map_captures(&mut |capture: &ValueOrCapture<DataType, V>| capture.instantiate(&[]))
+        })?;
+        let mut state = inputs.to_vec();
+        for _ in 0..self.length() {
+            state = <<O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<
+                V,
+            > as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(context, &body, state)?;
+            check_count!("output", state, self.carry_count(), ProgramError);
+        }
+        Ok(state)
+    }
 }
 
 // TODO(eaplatanios): Is this actually necessary?
@@ -210,8 +230,9 @@ where
     V: Value<ArrayType, InterpretationContext = ContextT> + Slice + UpdateSlice + Reshape,
     ContextT: Zero<ArrayType, V>,
     F: CustomVjpResidual<ArrayType, V>,
-    O: Clone + LinearScanBodyInstantiable<ArrayType, V>,
-    O::Instantiated: InterpretableNestedProgram<ArrayType, V>,
+    O: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>,
+    <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<V>:
+        InterpretableNestedProgram<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret_linear_scan(
@@ -236,9 +257,14 @@ where
             |lane, lane_inputs| {
                 let lane_residuals =
                     stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
-                let lane_body =
-                    body.map_operations(|operation| operation.instantiate_linear_scan_body_factors(&lane_residuals))?;
-                <O::Instantiated as InterpretableNestedProgram<ArrayType, V>>::interpret_nested_program(
+                let lane_body = body.map_operations(|operation| {
+                    operation.try_map_captures(&mut |capture: &ValueOrCapture<ArrayType, V>| {
+                        capture.instantiate(&lane_residuals)
+                    })
+                })?;
+                <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<
+                    V,
+                > as InterpretableNestedProgram<ArrayType, V>>::interpret_nested_program(
                     self,
                     &lane_body,
                     lane_inputs,
