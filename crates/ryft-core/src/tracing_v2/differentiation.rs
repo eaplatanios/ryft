@@ -531,7 +531,7 @@ pub trait DifferentiationContext:
         ProgramError,
     >
     where
-        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -676,7 +676,7 @@ pub trait DifferentiationContext:
         ProgramError,
     >
     where
-        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         <Self as Domain>::Type: DifferentiableType,
         DirectLinearOperationOf<Self>: TransposableOperation<<Self as Domain>::Type, Self::Tangent, DirectLinearOperationOf<Self>>
             + From<ZeroOperation<<Self as Domain>::Type>>
@@ -713,7 +713,7 @@ pub trait DifferentiationContext:
     where
         Self: ProvidesContext<<Self::Tangent as Value<<Self as Domain>::Type>>::InterpretationContext>
             + DifferentiationContext<Tangent = <Self as Domain>::Value>,
-        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
         <Self as Domain>::Type: DifferentiableType,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
@@ -756,7 +756,7 @@ pub trait DifferentiationContext:
     where
         Self: ProvidesContext<<Self::Tangent as Value<<Self as Domain>::Type>>::InterpretationContext>
             + DifferentiationContext<Tangent = <Self as Domain>::Value>,
-        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         <Self as Domain>::Operation: From<OneOperation<<Self as Domain>::Type>>,
         <Self as Domain>::Type: DifferentiableType,
         DirectLinearOperationOf<Self>: InterpretableOperation<<Self as Domain>::Type, Self::Tangent>
@@ -789,7 +789,7 @@ pub trait DifferentiationContext:
     ///     (unrolling the loop into a straight-line, transposable pushforward), so eager reverse mode works.
     ///   - **Staging contexts** ([`TracingContext`], abstract domains, gate `false`) cannot concretize primals, so the
     ///     program is linearized *symbolically* once through [`linearize_program`] (via the
-    ///     [`ProgramLinearizableOperation`] witness), producing a residual-extended primal program and a residualized
+    ///     [`LinearizableProgramOperation`] witness), producing a residual-extended primal program and a residualized
     ///     pushforward program, and the resulting [`Linearization`] is evaluated [`at`](Linearization::at)
     ///     `input_primals` against this context (splicing the primal program into the active trace).
     ///
@@ -810,7 +810,7 @@ pub trait DifferentiationContext:
     >
     where
         Self: Domain<Operation = O>,
-        O: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
+        O: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         Input: Parameterized<<Self as Domain>::Constant, Family: ParameterizedFamily<Self::Tangent>>,
         Output: Parameterized<
                 <Self as Domain>::Constant,
@@ -1430,22 +1430,25 @@ where
 }
 
 /// [`Linearization`] of a nested flat program whose inputs and outputs are plain [`Vec`]s, as produced by one
-/// nested symbolic linearization run through [`Program::linearize`] (see [`ProgramLinearizableOperation`]).
+/// nested symbolic linearization run through [`Program::linearize`] (see [`LinearizableProgramOperation`]).
 pub type NestedLinearization<E, O> = Linearization<E, O, Vec<<E as Domain>::Constant>, Vec<<E as Domain>::Constant>>;
 
 /// Operation types whose captured flat programs can be linearized symbolically on behalf of an enclosing
 /// differentiation context.
 ///
+/// Higher-order JVP rules, such as control-flow rules, need to linearize captured programs whose operation family is
+/// the same closed enum currently being proven differentiable. Writing that need directly as
+/// `O: DifferentiableOperation<LinearizationContextOf<C, O>>` at every recursive payload boundary can make Rust's
+/// trait solver repeatedly re-enter the same enum and overflow. [`LinearizableProgramOperation`] names that recursive
+/// fixed point once: a closed operation enum implements this trait by calling [`linearize_program`], while
+/// higher-order payloads depend on this semantic witness instead of reproducing the full derived linearization
+/// context obligation.
+///
 /// This is the forward-mode counterpart of
-/// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation), implemented by closed
-/// operation enums (via [`linearize_program`]) so that higher-order JVP rules can differentiate the programs they
-/// capture without concrete primal values. Routing nested linearization through a dedicated witness trait keeps the
-/// trait solver's recursion finite: the closed enum impl discharges every derived
-/// [`LinearizationContext`] obligation once, as a definition-time body check against the single
-/// [`LinearizationContextOf`] type derived from `E`, instead of each higher-order rule carrying a
-/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` where-clause whose re-instantiation at the
-/// derived context overflows.
-pub trait ProgramLinearizableOperation<C: DifferentiationContext>: Operation<<C as Domain>::Type> + Sized {
+/// [`BatchableProgramOperation`](crate::tracing_v2::batching::BatchableProgramOperation) and
+/// [`TransposableProgramOperation`](crate::differentiation::TransposableProgramOperation). It is intentionally about
+/// complete operation families, not individual primitive payloads.
+pub trait LinearizableProgramOperation<C: DifferentiationContext>: Operation<<C as Domain>::Type> + Sized {
     /// Linearizes `program` symbolically on behalf of `differentiable`; refer to the documentation of
     /// [`linearize_program`] for the returned packaging.
     fn linearize_program(
@@ -1469,7 +1472,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
         context: &C,
     ) -> Result<NestedLinearization<C, O>, ProgramError>
     where
-        O: ProgramLinearizableOperation<C>,
+        O: LinearizableProgramOperation<C>,
     {
         O::linearize_program(context, self)
     }

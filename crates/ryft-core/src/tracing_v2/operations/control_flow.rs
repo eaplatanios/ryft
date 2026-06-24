@@ -1,10 +1,10 @@
 use crate::batching::BatchingError;
 use crate::contexts::{Context, EagerContext, StagingContext};
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation, TransposableProgramOperation};
 use crate::domains::Domain;
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
+use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{CONDITION_OPERATION_NAME, ConditionOperation, SelectOperation, WhileOperation};
 use crate::operations::logical::AndOperation;
@@ -17,10 +17,10 @@ use crate::payloads::Captured;
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracer, AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingOutputAxes,
+    ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingOutputAxes,
     align_batch_axis, broadcast_to_batched, move_axis_permutation,
 };
-use crate::tracing_v2::differentiation::{NestedLinearization, ProgramLinearizableOperation};
+use crate::tracing_v2::differentiation::{LinearizableProgramOperation, NestedLinearization};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::tracing_v2::operations::scan::{LinearScanOperation, linear_scan_operation};
@@ -100,6 +100,7 @@ where
     context.tracer(output, None)
 }
 
+// TODO(eaplatanios): Replace with a `Condition` trait that has `fn condition(&self, on_true, on_false)`.
 /// Trait that represents linear [`Operation`] types that support/include a captured-predicate condition. The
 /// captured-predicate condition is the linear-program counterpart of [`ConditionOperation`]: the Boolean predicate is
 /// a primal value captured at linearization time as a residual factor, the operation inputs are exactly the branch
@@ -120,27 +121,6 @@ pub trait SupportsLinearCondition<T: Type, V: Value<T>, F>: Sized {
         true_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
         false_branch: Program<T, V, Self, Vec<V>, Vec<V>>,
     ) -> Self;
-}
-
-/// Represents linear array operation families that can transpose branch programs captured by a captured-predicate
-/// [`ConditionOperation`].
-///
-/// This trait keeps the self-referential condition requirement at the operation-family boundary: condition
-/// transposition needs to recursively transpose the selected branch programs, but callers should not have to spell the
-/// full fixed point of all operation variants that can appear inside those branches.
-pub trait LinearConditionBranchTransposable<V: Value<ArrayType>>:
-    Operation<ArrayType> + MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>
-{
-    /// Transposes a branch program captured by a captured-predicate [`ConditionOperation`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `branch`: Linear branch program to transpose.
-    fn transpose_linear_condition_branch(
-        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized;
 }
 
 /// Trait that represents linear [`Operation`] types that support/include the staged doubled-state while loop. The
@@ -779,7 +759,7 @@ where
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
         + From<ConditionOperation<ArrayType, V, O>>
-        + ProgramLinearizableOperation<D>,
+        + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>>
         + ResidualizedOperation<D>
         + SupportsLinearCondition<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>>,
@@ -956,7 +936,7 @@ where
         + Operation<ArrayType>
         + From<WhileOperation<ArrayType, V, O>>
         + DifferentiableOperation<D>
-        + ProgramLinearizableOperation<D>
+        + LinearizableProgramOperation<D>
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation>
@@ -1341,7 +1321,7 @@ where
     C::Constant: Value<ArrayType> + BooleanLike,
     Tracer<C>: crate::operations::control_flow::Select<Condition = Tracer<C>>,
     O: BatchableOperation<Tracer<C>, BatchingContext<C>>
-        + ProgramBatchableOperation<C::Constant>
+        + BatchableProgramOperation<C::Constant>
         + From<TransposeOperation>
         + From<BroadcastOperation>
         + From<ConditionOperation<ArrayType, C::Constant, O>>,
@@ -1531,7 +1511,7 @@ where
     C::Constant: Value<ArrayType> + BooleanLike,
     Tracer<C>: Broadcast + Transpose,
     O: Clone
-        + ProgramBatchableOperation<C::Constant>
+        + BatchableProgramOperation<C::Constant>
         + From<TransposeOperation>
         + From<BroadcastOperation>
         + From<ReduceOperation>
@@ -1922,12 +1902,15 @@ where
 /// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The predicate is a residual of the primal
 /// computation rather than a linear operand, so it has no cotangent and is carried verbatim into a transposed
 /// condition over the transposed branch programs, selected by the same predicate. Branch transposition goes through
-/// [`LinearConditionBranchTransposable`], keeping the branch fixed point owned by the operation family.
+/// [`TransposableProgramOperation`], keeping the branch fixed point owned by the operation family.
 impl<V, F, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<ArrayType, V, O, F, Captured>
 where
     V: Value<ArrayType>,
     F: Value<ArrayType>,
-    O: Operation<ArrayType> + SupportsLinearCondition<ArrayType, V, F> + LinearConditionBranchTransposable<V>,
+    O: Operation<ArrayType>
+        + SupportsLinearCondition<ArrayType, V, F>
+        + TransposableProgramOperation<ArrayType, V>
+        + From<ZeroOperation<ArrayType>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -1942,8 +1925,8 @@ where
         }
         let transposed_condition = O::linear_condition_operation(
             self.predicate().clone(),
-            <O as LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.true_branch())?,
-            <O as LinearConditionBranchTransposable<V>>::transpose_linear_condition_branch(self.false_branch())?,
+            <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(self.true_branch())?,
+            <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(self.false_branch())?,
         );
         let materialized = output_cotangents
             .iter()
@@ -2882,7 +2865,7 @@ mod tests {
         }
     }
 
-    impl ProgramLinearizableOperation<TestDomain> for TestDifferentiableOperation {
+    impl LinearizableProgramOperation<TestDomain> for TestDifferentiableOperation {
         fn linearize_program(
             differentiable: &TestDomain,
             program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,

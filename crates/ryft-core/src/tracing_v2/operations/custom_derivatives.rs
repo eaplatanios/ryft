@@ -12,7 +12,7 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingOutputAxes,
+    ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingOutputAxes,
     align_batch_axis, broadcast_to_batched,
 };
 use crate::tracing_v2::differentiation::{
@@ -20,7 +20,7 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation, ValueOrCapture,
+    DifferentiableOperation, DifferentiationContext, LinearizableProgramOperation, ValueOrCapture,
 };
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
@@ -153,7 +153,7 @@ pub(crate) fn custom_jvp_rule<'jvp, D, O>(
 where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     <D as Domain>::Value: ZeroLike,
-    O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
@@ -216,7 +216,7 @@ where
     V: Value<D::Type>,
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
     <D as Domain>::Value: ZeroLike,
-    O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<V>: Parameterized<
@@ -307,7 +307,7 @@ where
 }
 
 /// Batches `program` using the custom-derivative rewrapping convention: every input and output is mapped at axis `0`.
-fn batch_rewrapped_program<V: Value<ArrayType>, O: ProgramBatchableOperation<V>>(
+fn batch_rewrapped_program<V: Value<ArrayType>, O: BatchableProgramOperation<V>>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     axis_size: usize,
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, ProgramError> {
@@ -326,7 +326,7 @@ where
     O: Clone
         + Operation<ArrayType>
         + From<CustomJvpOperation<ArrayType, C::Constant, O>>
-        + ProgramBatchableOperation<C::Constant>,
+        + BatchableProgramOperation<C::Constant>,
     Tracer<C>: Broadcast + Transpose,
 {
     fn batch(
@@ -567,7 +567,7 @@ pub(crate) fn custom_vjp_rule<'jvp, D, O>(
 ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
 where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
-    O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
@@ -608,7 +608,7 @@ impl<V, O, D> DifferentiableOperation<D> for CustomVjpOperation<D::Type, V, O>
 where
     V: Value<D::Type>,
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
-    O: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, V, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
@@ -658,7 +658,7 @@ where
     O: Clone
         + Operation<ArrayType>
         + From<CustomVjpOperation<ArrayType, C::Constant, O>>
-        + ProgramBatchableOperation<C::Constant>,
+        + BatchableProgramOperation<C::Constant>,
     Tracer<C>: Broadcast + Transpose,
 {
     fn batch(

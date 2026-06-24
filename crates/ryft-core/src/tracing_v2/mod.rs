@@ -34,13 +34,13 @@ pub(crate) mod test_util;
 
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use batching::{
-    ArrayBatch, Batch, BatchAxes, BatchAxis, BatchContext, BatchableOperation, BatchingContext, BatchingTracer,
-    ProgramBatchableOperation, ProgramBatchingContext, ProgramBatchingOutputAxes, batch, batch_program,
+    ArrayBatch, Batch, BatchAxes, BatchAxis, BatchContext, BatchableOperation, BatchableProgramOperation,
+    BatchingContext, BatchingTracer, ProgramBatchingContext, ProgramBatchingOutputAxes, batch, batch_program,
 };
 pub use differentiation::{
     CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, DifferentiationError,
-    DirectLinearOperationOf, JvpTracer, LinearOperationOf, Linearization, LinearizationTracer, NestedLinearization,
-    PrimalTracingContext, ProgramLinearizableOperation, Pushforward, ResidualizedOperation, TangentContext,
+    DirectLinearOperationOf, JvpTracer, LinearOperationOf, LinearizableProgramOperation, Linearization,
+    LinearizationTracer, NestedLinearization, PrimalTracingContext, Pushforward, ResidualizedOperation, TangentContext,
     ZeroTangentOperation, linearize_program,
 };
 pub use linear::{

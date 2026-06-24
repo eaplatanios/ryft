@@ -38,18 +38,18 @@ use crate::operations::manipulation::{
 };
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{BooleanLike, InterpretableOperation, Operation};
+use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingContext,
+    ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingContext,
     ProgramBatchingOutputAxes,
 };
 use crate::tracing_v2::differentiation::{
-    CaptureParameterizedOperation, DifferentiationContext, JvpTracer, LinearOperationOf, LinearizationContextOf,
-    NestedLinearization, ProgramLinearizableOperation, TangentContext,
+    CaptureParameterizedOperation, DifferentiationContext, JvpTracer, LinearOperationOf, LinearizableProgramOperation,
+    LinearizationContextOf, NestedLinearization, TangentContext,
 };
 use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
@@ -73,13 +73,11 @@ use super::bounds::{
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
-    DefactorizedOperation, LinearConditionBranchTransposable, LinearOperandConditionOperation, SupportsLinearCondition,
-    SupportsLinearWhile, batch_condition_with_interpreter, batch_while_with_interpreter,
+    DefactorizedOperation, LinearOperandConditionOperation, SupportsLinearCondition, SupportsLinearWhile,
+    batch_condition_with_interpreter, batch_while_with_interpreter,
 };
 use super::dot::DotOps;
-use super::scan::{
-    InterpretableNestedProgram, LinearScanBodyTransposable, LinearScanInterpretation, LinearScanOperation,
-};
+use super::scan::{LinearScanInterpretation, LinearScanOperation};
 use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -205,8 +203,7 @@ where
         + Not<Output = D::Value>
         + Select<Condition = D::Value>
         + SelectCondition<Condition = D::Value>
-        + BooleanLike
-        + Parameterized<D::Value>,
+        + BooleanLike,
     D::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     LinearOperationOf<D>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, D::Value>>
@@ -223,7 +220,7 @@ where
         + SupportsLinearWhile<ArrayType, D::Tangent, ValueOrCapture<ArrayType, D::Value>, ArrayOperation<V>>
         + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
-    ArrayOperation<V>: Clone + ProgramLinearizableOperation<D>,
+    ArrayOperation<V>: Clone + LinearizableProgramOperation<D>,
 {
     fn jvp<'jvp>(
         &self,
@@ -298,6 +295,12 @@ where
 /// constant type of captured primal programs such as [`CustomVjpCall`](Self::CustomVjpCall), which are written over
 /// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
+// TODO(eaplatanios): Is there a more natural or more standard way to define bounds like these for Rust macros?
+//  The reason we end up needing this is because of how we avoid recursive `TransposableOperation` bounds.
+#[ryft(value_bounds = "
+        V: Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+        P: Clone
+    ")]
 pub enum LinearArrayOperation<V: Value<ArrayType>, C: Value<ArrayType>, F: Value<ArrayType>, P: Operation<ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
@@ -779,7 +782,7 @@ where
 }
 
 // TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
-impl<V, C, P> InterpretableNestedProgram<ArrayType, V> for LinearArrayOperation<V, C, V, P>
+impl<V, C, P> InterpretableProgramOperation<ArrayType, V> for LinearArrayOperation<V, C, V, P>
 where
     V: Value<ArrayType>
         + Parameter
@@ -806,7 +809,7 @@ where
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
     P: Clone + InterpretableOperation<ArrayType, V>,
 {
-    fn interpret_nested_program(
+    fn interpret_program(
         context: &V::InterpretationContext,
         program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         input: Vec<V>,
@@ -856,7 +859,7 @@ where
                     } else {
                         operation.false_branch()
                     };
-                    Self::interpret_nested_program(context, branch, instruction_inputs.to_vec())
+                    Self::interpret_program(context, branch, instruction_inputs.to_vec())
                 }
                 Self::OperandCondition(operation) => {
                     let input_types =
@@ -867,7 +870,7 @@ where
                     } else {
                         operation.false_branch()
                     };
-                    Self::interpret_nested_program(context, branch, instruction_inputs[1..].to_vec())
+                    Self::interpret_program(context, branch, instruction_inputs[1..].to_vec())
                 }
                 Self::While(operation) => {
                     let input_types =
@@ -879,13 +882,12 @@ where
                         if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
                             break Ok(state);
                         }
-                        let condition_outputs =
-                            Self::interpret_nested_program(context, operation.condition(), state.clone())?;
+                        let condition_outputs = Self::interpret_program(context, operation.condition(), state.clone())?;
                         check_count!("output", condition_outputs, 1, ProgramError);
                         if !condition_outputs[0].boolean()? {
                             break Ok(state);
                         }
-                        state = Self::interpret_nested_program(context, operation.body(), state)?;
+                        state = Self::interpret_program(context, operation.body(), state)?;
                         check_count!("output", state, operation.state_types().len(), ProgramError);
                         completed_iterations += 1;
                     }
@@ -919,51 +921,12 @@ where
                                     capture.instantiate(lane_residuals.as_slice())
                                 })
                             })?;
-                            Self::interpret_nested_program(context, &lane_body, lane_inputs)
+                            Self::interpret_program(context, &lane_body, lane_inputs)
                         },
                     )
                 }
             },
         )
-    }
-}
-
-// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
-impl<V, C, P> LinearScanBodyTransposable<ArrayType, V> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>
-where
-    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
-{
-    #[inline]
-    fn transpose_linear_scan_body(
-        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        body.transpose()
-    }
-}
-
-// TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
-impl<V, C, F, P> LinearConditionBranchTransposable<V> for LinearArrayOperation<V, C, F, P>
-where
-    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
-{
-    #[inline]
-    fn transpose_linear_condition_branch(
-        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        branch.transpose()
     }
 }
 
@@ -1464,7 +1427,7 @@ where
         + Broadcast
         + Transpose,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
-    Self: ProgramBatchableOperation<V>,
+    Self: BatchableProgramOperation<V>,
 {
     fn batch(
         &self,
@@ -1542,7 +1505,7 @@ where
 /// Blanket active batching impl for the [`ArrayOperation`] sum type.
 ///
 /// The `Operation = Self` projection equality and the
-/// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation) / lane-alignment bounds exist
+/// [`BatchableProgramOperation`](crate::tracing_v2::batching::BatchableProgramOperation) / lane-alignment bounds exist
 /// for the custom-derivative arms: their re-wrapping batch rules batch the captured programs and stage a new
 /// custom-derivative call into the parent context, which is only expressible when the staged operation type is this
 /// enum itself. Both extra bounds are leaf obligations (a structural type equality and a closed-enum capability
@@ -1550,15 +1513,15 @@ where
 /// another batching-context obligation.
 /// Program-level batching for the [`ArrayOperation`] sum type, backing the re-wrapping `batch` rules of
 /// [`CustomJvpOperation`] and [`CustomVjpOperation`]; see
-/// [`ProgramBatchableOperation`](crate::tracing_v2::batching::ProgramBatchableOperation).
+/// [`BatchableProgramOperation`](crate::tracing_v2::batching::BatchableProgramOperation).
 ///
 /// The where clauses here are deliberately the *leaf* closure of what `batch_program::<V, Self>` needs — the
 /// blanket traced batching impl's bounds instantiated at [`ProgramBatchingContext`] — rather than the
 /// `Self: BatchableOperation<..>` bound itself. Spelling out the leaves keeps instantiating this impl free of
 /// batching-context obligations, which is what lets the traced batching impl require
-/// `Self: ProgramBatchableOperation<..>` without sending the trait solver into an unbounded
+/// `Self: BatchableProgramOperation<..>` without sending the trait solver into an unbounded
 /// batching-context recursion.
-impl<V> ProgramBatchableOperation<V> for ArrayOperation<V>
+impl<V> BatchableProgramOperation<V> for ArrayOperation<V>
 where
     V: Value<ArrayType> + BooleanLike + 'static,
     Tracer<ProgramBatchingContext<V, Self>>: SupportsArithmeticOperations<V>
@@ -1589,7 +1552,7 @@ where
 }
 
 /// Nested symbolic linearization for the [`ArrayOperation`] sum type, backing the staged-condition JVP rule of
-/// [`ConditionOperation`]; see [`ProgramLinearizableOperation`](crate::tracing_v2::ProgramLinearizableOperation).
+/// [`ConditionOperation`]; see [`LinearizableProgramOperation`](crate::tracing_v2::LinearizableProgramOperation).
 ///
 /// The where clauses here are deliberately the *leaf* closure of what
 /// [`linearize_program`](crate::tracing_v2::linearize_program)`::<E, Self>` needs — the generic JVP
@@ -1597,11 +1560,11 @@ where
 /// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound itself. Spelling out the leaves keeps
 /// instantiating this impl free of derived-context differentiation obligations (the recursive obligation is
 /// discharged once, as a definition-time body check), which is what lets the JVP dispatch impl require
-/// `Self: ProgramLinearizableOperation<E>` without sending the trait solver into an unbounded nested-context
+/// `Self: LinearizableProgramOperation<E>` without sending the trait solver into an unbounded nested-context
 /// recursion. The `WithCapture<V> = ..` equality pins the canonical linear operation as a fixed point of factor
 /// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
-impl<V, E> ProgramLinearizableOperation<E> for ArrayOperation<V>
+impl<V, E> LinearizableProgramOperation<E> for ArrayOperation<V>
 where
     V: Value<ArrayType>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,

@@ -634,7 +634,7 @@ pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
 ///
 /// The `'static` lifetime keeps every trait bound mentioning this context lifetime-free, which is what lets the
 /// trait solver close the recursive cycle between the custom-derivative re-wrapping `batch` rules and the closed
-/// operation enums' [`ProgramBatchableOperation`] impls (a higher-ranked lifetime here would re-instantiate the
+/// operation enums' [`BatchableProgramOperation`] impls (a higher-ranked lifetime here would re-instantiate the
 /// cycle's goals in fresh placeholder universes and overflow). It is honest, not a hack: [`AbstractDomain`] is a
 /// zero-sized behavior-free token, so a `&'static` borrow of it is materialized for free. The capture parameter
 /// is pinned to `V` explicitly (rather than left at its `D::Value` projection default) so that bounds written
@@ -669,7 +669,7 @@ pub enum ProgramBatchingOutputAxes {
 /// trait keeps the trait solver's recursion finite: the closed enum impl discharges the derived batching-context
 /// obligations once, against the single [`ProgramBatchingContext`] type, instead of every batching rule re-deriving
 /// them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
-pub trait ProgramBatchableOperation<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
+pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
     /// Batches `program` into a standalone program over lane-carrying physical types; refer to
     /// [`batch_program`] for the input/output axis conventions.
     fn batch_program(
@@ -680,11 +680,11 @@ pub trait ProgramBatchableOperation<V: Value<ArrayType>>: Operation<ArrayType> +
     ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>;
 }
 
-impl<V: Value<ArrayType>, O: ProgramBatchableOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
+impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
     /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types.
     ///
     /// Refer to [`batch_program`] for the precise replay semantics. This method requires
-    /// [`ProgramBatchableOperation`] rather than a direct [`BatchableOperation`] bound on the operation type because
+    /// [`BatchableProgramOperation`] rather than a direct [`BatchableOperation`] bound on the operation type because
     /// the latter is self-referential through derived batching contexts and would overflow the trait solver at the
     /// recursive call sites of higher-order batching rules.
     pub fn batched(

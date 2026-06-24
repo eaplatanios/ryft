@@ -11,7 +11,8 @@ use crate::helpers::symbols::Symbol;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
+const VALUE_BOUNDS_ATTRIBUTE: Symbol = Symbol::new("value_bounds");
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, VALUE_BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_OPERATION_TYPE: Symbol = Symbol::new("__OperationType");
@@ -27,6 +28,9 @@ pub(crate) struct CodeGenerator {
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: syn::Type,
+
+    /// Additional value-dependent where-predicates for generated transform implementations.
+    value_bounds: Vec<syn::WherePredicate>,
 
     /// Errors accumulated while validating and generating the derive output.
     errors: Vec<syn::Error>,
@@ -44,6 +48,9 @@ struct OperationVariant {
 
     /// Whether conversion impls should be skipped for this variant.
     skip_conversions: bool,
+
+    /// Whether this payload recursively contains the enum type being derived.
+    is_recursive_payload: bool,
 }
 
 impl CodeGenerator {
@@ -58,6 +65,7 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
+            value_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -83,6 +91,7 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
+            value_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -115,9 +124,11 @@ impl CodeGenerator {
     /// Extracts supported top-level `#[ryft(...)]` attributes.
     fn extract_attributes(&mut self, input: &syn::DeriveInput) {
         let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
+        let mut value_bounds = Attribute::new(VALUE_BOUNDS_ATTRIBUTE);
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
+                path if path == &VALUE_BOUNDS_ATTRIBUTE => value_bounds.set(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
@@ -129,6 +140,9 @@ impl CodeGenerator {
 
         if let Some(ryft_crate) = ryft_crate.get() {
             self.ryft_crate = ryft_crate;
+        }
+        if let Some(value_bounds) = value_bounds.get() {
+            self.value_bounds = value_bounds;
         }
         let inferred_types = unique_value_bound_arguments(&input.generics);
         match inferred_types.as_slice() {
@@ -276,7 +290,21 @@ impl CodeGenerator {
             return TokenStream::new();
         };
 
-        let transpose_bounds = variants.iter().map(|variant| {
+        let transpose_bounds = variants
+            .iter()
+            .map(|variant| {
+                let operation_type = &variant.operation_type;
+                let predicate: syn::WherePredicate = syn::parse_quote! {
+                    #operation_type: #ryft::TransposableOperation<
+                        #primary_type,
+                        #transposed_value_type,
+                        #operation_self_type,
+                    >
+                };
+                predicate
+            })
+            .collect::<Vec<_>>();
+        let program_transpose_bounds = variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
             let operation_type = &variant.operation_type;
             let predicate: syn::WherePredicate = syn::parse_quote! {
                 #operation_type: #ryft::TransposableOperation<
@@ -291,9 +319,56 @@ impl CodeGenerator {
         where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
-        where_clause.predicates.extend(transpose_bounds);
+        where_clause.predicates.extend(self.value_bounds.iter().cloned());
+        where_clause.predicates.extend(transpose_bounds.iter().cloned());
+
+        let mut program_transposition_generics = self.operation_generics(&input.generics, &variants);
+        let program_where_clause = program_transposition_generics.make_where_clause();
+        program_where_clause
+            .predicates
+            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
+        program_where_clause.predicates.extend(self.value_bounds.iter().cloned());
+        program_where_clause.predicates.extend(program_transpose_bounds);
+        program_where_clause.predicates.push(syn::parse_quote!(#primary_type: #ryft::DifferentiableType));
+        program_where_clause.predicates.push(syn::parse_quote! {
+            #operation_self_type:
+                #ryft::MaybeZeroOperation<#primary_type>
+                + ::std::convert::From<#ryft::ZeroOperation<#primary_type>>
+                + ::std::convert::From<#ryft::AddOperation>
+        });
 
         let (transposition_impl_generics, _, transposition_where_clause) = transposition_generics.split_for_impl();
+        let (program_transposition_impl_generics, _, program_transposition_where_clause) =
+            program_transposition_generics.split_for_impl();
+        let program_transposition_impl = quote! {
+            #[automatically_derived]
+            impl #program_transposition_impl_generics
+                #ryft::TransposableProgramOperation<#primary_type, #transposed_value_type>
+                for #operation_self_type
+            #program_transposition_where_clause
+            {
+                fn transpose_program(
+                    program: &#ryft::Program<
+                        #primary_type,
+                        #transposed_value_type,
+                        Self,
+                        ::std::vec::Vec<#transposed_value_type>,
+                        ::std::vec::Vec<#transposed_value_type>,
+                    >,
+                ) -> ::std::result::Result<
+                    #ryft::Program<
+                        #primary_type,
+                        #transposed_value_type,
+                        Self,
+                        ::std::vec::Vec<#transposed_value_type>,
+                        ::std::vec::Vec<#transposed_value_type>,
+                    >,
+                    #ryft::ProgramError,
+                > {
+                    program.transpose()
+                }
+            }
+        };
         let transpose_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let operation_type = &variant.operation_type;
@@ -345,6 +420,8 @@ impl CodeGenerator {
                     }
                 }
             }
+
+            #program_transposition_impl
         })
     }
 
@@ -355,11 +432,19 @@ impl CodeGenerator {
             return Vec::new();
         };
 
-        data.variants.iter().filter_map(|variant| self.extract_variant(&input.generics, variant)).collect()
+        data.variants
+            .iter()
+            .filter_map(|variant| self.extract_variant(&input.ident, &input.generics, variant))
+            .collect()
     }
 
     /// Extracts one operation variant.
-    fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
+    fn extract_variant(
+        &mut self,
+        enum_name: &syn::Ident,
+        generics: &syn::Generics,
+        variant: &syn::Variant,
+    ) -> Option<OperationVariant> {
         self.reject_nested_attributes(&variant.attrs);
         let syn::Fields::Unnamed(fields) = &variant.fields else {
             self.add_error(&variant.ident, "operation enum variants must be tuple variants with one payload field");
@@ -377,8 +462,15 @@ impl CodeGenerator {
             .map(|operation_type| (operation_type, true))
             .unwrap_or_else(|| (payload_type.clone(), false));
         let skip_conversions = bare_generic_parameter(&payload_type, generics).is_some();
+        let is_recursive_payload = type_mentions_ident(&operation_type, enum_name);
 
-        Some(OperationVariant { ident: variant.ident.clone(), operation_type, is_boxed, skip_conversions })
+        Some(OperationVariant {
+            ident: variant.ident.clone(),
+            operation_type,
+            is_boxed,
+            skip_conversions,
+            is_recursive_payload,
+        })
     }
 
     /// Rejects nested `#[ryft(...)]` attributes.
@@ -508,6 +600,67 @@ fn bare_generic_parameter(ty: &syn::Type, generics: &syn::Generics) -> Option<sy
 /// Returns whether `ty` is exactly the provided identifier.
 fn type_is_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
     matches!(ty, syn::Type::Path(syn::TypePath { qself: None, path }) if path.is_ident(ident))
+}
+
+/// Returns whether `ty` mentions a path segment named `ident`.
+fn type_mentions_ident(ty: &syn::Type, ident: &syn::Ident) -> bool {
+    match ty {
+        syn::Type::Array(ty) => type_mentions_ident(&ty.elem, ident),
+        syn::Type::BareFn(ty) => {
+            ty.inputs.iter().any(|input| type_mentions_ident(&input.ty, ident))
+                || match &ty.output {
+                    syn::ReturnType::Default => false,
+                    syn::ReturnType::Type(_, ty) => type_mentions_ident(ty, ident),
+                }
+        }
+        syn::Type::Group(ty) => type_mentions_ident(&ty.elem, ident),
+        syn::Type::ImplTrait(ty) => ty.bounds.iter().any(|bound| type_param_bound_mentions_ident(bound, ident)),
+        syn::Type::TraitObject(ty) => ty.bounds.iter().any(|bound| type_param_bound_mentions_ident(bound, ident)),
+        syn::Type::Paren(ty) => type_mentions_ident(&ty.elem, ident),
+        syn::Type::Path(ty) => {
+            ty.qself.as_ref().is_some_and(|qself| type_mentions_ident(&qself.ty, ident))
+                || path_mentions_ident(&ty.path, ident)
+        }
+        syn::Type::Ptr(ty) => type_mentions_ident(&ty.elem, ident),
+        syn::Type::Reference(ty) => type_mentions_ident(&ty.elem, ident),
+        syn::Type::Slice(ty) => type_mentions_ident(&ty.elem, ident),
+        syn::Type::Tuple(ty) => ty.elems.iter().any(|ty| type_mentions_ident(ty, ident)),
+        _ => false,
+    }
+}
+
+/// Returns whether `bound` mentions a path segment named `ident`.
+fn type_param_bound_mentions_ident(bound: &syn::TypeParamBound, ident: &syn::Ident) -> bool {
+    match bound {
+        syn::TypeParamBound::Trait(bound) => path_mentions_ident(&bound.path, ident),
+        syn::TypeParamBound::Lifetime(_) => false,
+        _ => false,
+    }
+}
+
+/// Returns whether `path` mentions a segment named `ident`.
+fn path_mentions_ident(path: &syn::Path, ident: &syn::Ident) -> bool {
+    path.segments.iter().any(|segment| {
+        segment.ident == *ident
+            || match &segment.arguments {
+                syn::PathArguments::None => false,
+                syn::PathArguments::AngleBracketed(arguments) => arguments.args.iter().any(|argument| {
+                    matches!(argument, syn::GenericArgument::Type(ty) if type_mentions_ident(ty, ident))
+                        || matches!(
+                            argument,
+                            syn::GenericArgument::AssocType(argument)
+                                if type_mentions_ident(&argument.ty, ident)
+                        )
+                }),
+                syn::PathArguments::Parenthesized(arguments) => {
+                    arguments.inputs.iter().any(|ty| type_mentions_ident(ty, ident))
+                        || match &arguments.output {
+                            syn::ReturnType::Default => false,
+                            syn::ReturnType::Type(_, ty) => type_mentions_ident(ty, ident),
+                        }
+                }
+            }
+    })
 }
 
 /// Extracts the leading identifier from an enum self type.

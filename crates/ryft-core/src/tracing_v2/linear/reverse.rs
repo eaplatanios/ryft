@@ -6,7 +6,7 @@ use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
-    LinearizationTracer, ProgramLinearizableOperation, ResidualizedOperation,
+    LinearizableProgramOperation, LinearizationTracer, ResidualizedOperation,
 };
 use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, ProvidesContext, Type, Typed, Value, Zero};
 
@@ -24,7 +24,7 @@ pub fn value_and_grad<'domain, D, F, Input>(
 ) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), DifferentiationError>
 where
     D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -73,7 +73,7 @@ pub fn grad<'domain, D, F, Input>(
 ) -> Result<Input::To<D::Tangent>, DifferentiationError>
 where
     D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
     Input: Parameterized<
             <D as Domain>::Value,
@@ -130,7 +130,7 @@ where
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     <D as Domain>::Value: Parameterized<
             <D as Domain>::Value,
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
@@ -196,7 +196,7 @@ where
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     <D as Domain>::Value: Parameterized<
             <D as Domain>::Value,
             Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
@@ -567,7 +567,7 @@ mod tests {
     #[derive(Copy, Clone, Debug)]
     struct TestDomain;
 
-    impl crate::tracing_v2::ProgramLinearizableOperation<TestDomain> for TestDomainOperation {
+    impl crate::tracing_v2::LinearizableProgramOperation<TestDomain> for TestDomainOperation {
         fn linearize_program(
             differentiable: &TestDomain,
             program: &crate::programs::Program<TestType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,

@@ -30,13 +30,15 @@ use ryft_core::operations::manipulation::{
 };
 use ryft_core::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
-use ryft_core::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
+use ryft_core::operations::{
+    BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter,
+};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::payloads::{Captured, Input};
 use ryft_core::programs::{Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{AbstractTracingContext, Tracer, TracingContext};
 use ryft_core::tracing_v2::batching::{
-    ArrayBatch, BatchableOperation, BatchingContext, ProgramBatchableOperation, ProgramBatchingContext,
+    ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext, ProgramBatchingContext,
     ProgramBatchingOutputAxes, batch_input_metadata, batch_program,
 };
 use ryft_core::tracing_v2::differentiation::LinearizationContextOf;
@@ -46,7 +48,7 @@ use ryft_core::tracing_v2::operations::bounds::{
     SupportsTrigonometricOperations,
 };
 use ryft_core::tracing_v2::operations::control_flow::{
-    LinearConditionBranchTransposable, LinearOperandConditionOperation, SupportsLinearCondition, SupportsLinearWhile,
+    LinearOperandConditionOperation, SupportsLinearCondition, SupportsLinearWhile,
 };
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
@@ -56,12 +58,11 @@ use ryft_core::tracing_v2::operations::memory::{TransferToMemory, TransferToMemo
 use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
 use ryft_core::tracing_v2::operations::reshape::ReshapeValue;
-use ryft_core::tracing_v2::operations::scan::{InterpretableNestedProgram, LinearScanBodyTransposable};
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
     ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DefactorizedOperation, DifferentiableOperation,
     DifferentiationContext, DotOperation, JvpTracer, LinearArrayOperation, LinearOperationOf,
-    MaterializeCaptureOperation, NestedLinearization, ProgramLinearizableOperation, RematerializationNameOperation,
+    LinearizableProgramOperation, MaterializeCaptureOperation, NestedLinearization, RematerializationNameOperation,
     ResidualizedOperation, TangentContext, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
@@ -311,7 +312,7 @@ where
         + Transpose,
     Vec<Tracer<C>>:
         Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: std::fmt::Debug + PartialEq>,
-    Self: ProgramBatchableOperation<XlaConstant>,
+    Self: BatchableProgramOperation<XlaConstant>,
 {
     fn batch(
         &self,
@@ -382,7 +383,7 @@ where
     }
 }
 
-impl ProgramBatchableOperation<XlaConstant> for XlaOperation
+impl BatchableProgramOperation<XlaConstant> for XlaOperation
 where
     Tracer<ProgramBatchingContext<XlaConstant, Self>>: SupportsArithmeticOperations<XlaConstant>
         + SupportsTrigonometricOperations
@@ -524,7 +525,7 @@ where
         >
         + SupportsLinearCondition<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>>
         + SupportsLinearWhile<ArrayType, E::Tangent, ValueOrCapture<ArrayType, <E as Domain>::Value>, XlaOperation>,
-    Self: Clone + ProgramLinearizableOperation<E>,
+    Self: Clone + LinearizableProgramOperation<E>,
 {
     fn jvp<'jvp>(
         &self,
@@ -603,7 +604,7 @@ where
     }
 }
 
-impl<E> ProgramLinearizableOperation<E> for XlaOperation
+impl<E> LinearizableProgramOperation<E> for XlaOperation
 where
     E: DifferentiationContext<
         Type = ArrayType,
@@ -713,7 +714,13 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Linear staged-op universe owned by the XLA backend.
 #[derive(Clone, Debug, Operation, ryft_macros::TransposableOperation)]
-#[ryft(crate = "ryft_core")]
+#[ryft(
+    crate = "ryft_core",
+    value_bounds = "
+        V: Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
+        P: Clone
+    "
+)]
 pub enum LinearXlaOperation<
     V: Value<ArrayType>,
     C: Value<ArrayType> = XlaConstant,
@@ -1091,7 +1098,7 @@ where
     }
 }
 
-impl<V, C, P> InterpretableNestedProgram<ArrayType, V> for LinearXlaOperation<V, C, V, P, V>
+impl<V, C, P> InterpretableProgramOperation<ArrayType, V> for LinearXlaOperation<V, C, V, P, V>
 where
     V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     C: Value<ArrayType>,
@@ -1101,7 +1108,7 @@ where
     LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
     LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
 {
-    fn interpret_nested_program(
+    fn interpret_program(
         context: &V::InterpretationContext,
         program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         input: Vec<V>,
@@ -1305,44 +1312,6 @@ where
         body: Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
     ) -> Result<Self, TypeError> {
         Ok(Self::While(Box::new(WhileOperation::new(condition, body)?)))
-    }
-}
-
-impl<V, C, P> LinearScanBodyTransposable<ArrayType, V>
-    for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P, ValueOrCapture<ArrayType, V>>
-where
-    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
-{
-    fn transpose_linear_scan_body(
-        body: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        body.transpose()
-    }
-}
-
-impl<V, C, F, P, CaptureFactor> LinearConditionBranchTransposable<V> for LinearXlaOperation<V, C, F, P, CaptureFactor>
-where
-    V: Value<ArrayType> + Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-    C: Value<ArrayType>,
-    F: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    CaptureFactor: Value<ArrayType>,
-    Self: MaybeZeroOperation<ArrayType> + From<ZeroOperation<ArrayType>> + From<AddOperation>,
-{
-    #[inline]
-    fn transpose_linear_condition_branch(
-        branch: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<ArrayType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        branch.transpose()
     }
 }
 

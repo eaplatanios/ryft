@@ -12,6 +12,9 @@ use std::marker::PhantomData;
 /// Stand-in for `ryft_core::Type`.
 trait Type {}
 
+/// Stand-in for `ryft_core::DifferentiableType`.
+trait DifferentiableType: Type {}
+
 /// Stand-in for `ryft_core::TypeError`.
 #[derive(Debug, PartialEq, Eq)]
 struct TypeError;
@@ -57,6 +60,36 @@ trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operation<T>
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>;
 }
 
+/// Stand-in for `ryft_core::MaybeZeroOperation`.
+trait MaybeZeroOperation<T: Type>: Operation<T> {}
+
+impl<T: Type, O: Operation<T>> MaybeZeroOperation<T> for O {}
+
+/// Stand-in for `ryft_core::Program`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Program<T: Type, V: Value<T>, O: Operation<T>, Input, Output> {
+    label: &'static str,
+    marker: PhantomData<(T, V, O, Input, Output)>,
+}
+
+impl<T, V, O, Input, Output> Program<T, V, O, Input, Output>
+where
+    T: DifferentiableType,
+    V: Value<T>,
+    O: TransposableOperation<T, V, O> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>,
+{
+    fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
+        Ok(Program { label: "program_transpose", marker: PhantomData })
+    }
+}
+
+/// Stand-in for `ryft_core::TransposableProgramOperation`.
+trait TransposableProgramOperation<T: DifferentiableType, V: Value<T>>: Operation<T> + Sized {
+    fn transpose_program(
+        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<T, V, Self, Vec<V>, Vec<V>>, ProgramError>;
+}
+
 fn transposed<'context, T: Type, V: Value<T>, O: Operation<T>>(label: &'static str) -> Cotangent<'context, T, V, O> {
     Cotangent { label, marker: PhantomData }
 }
@@ -65,11 +98,13 @@ fn transposed<'context, T: Type, V: Value<T>, O: Operation<T>>(label: &'static s
 struct DataType;
 
 impl Type for DataType {}
+impl DifferentiableType for DataType {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ArrayType;
 
 impl Type for ArrayType {}
+impl DifferentiableType for ArrayType {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Factor(i64);
@@ -456,6 +491,44 @@ enum RecursiveLinearOperation<V: Value<ArrayType>> {
 impl<V: Value<ArrayType>> RecursiveOperationTransposable<V> for RecursiveLinearOperation<V> {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramRecursiveOperation<V, O> {
+    marker: PhantomData<(V, O)>,
+}
+
+impl<V, O> Operation<DataType> for ProgramRecursiveOperation<V, O> {
+    fn name(&self) -> &'static str {
+        "program_recursive"
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V, O> TransposableOperation<DataType, V, O> for ProgramRecursiveOperation<V, O>
+where
+    V: Value<DataType> + SpecialTransposableValue,
+    O: TransposableProgramOperation<DataType, V>,
+{
+    fn transpose<'transpose>(
+        &self,
+        _context: &mut AbstractTracingContext<'transpose, DataType, V, O>,
+        _input_types: &[&DataType],
+        _output_cotangents: &[Cotangent<'transpose, DataType, V, O>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, V, O>>, ProgramError> {
+        Ok(vec![transposed("program_recursive")])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate", value_bounds = "V: SpecialTransposableValue")]
+enum RecursiveProgramLinearOperation<V: Value<DataType>> {
+    Zero(ZeroOperation<DataType>),
+    Add(AddOperation),
+    Recursive(ProgramRecursiveOperation<V, Self>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RecomputeOperation<O> {
     operation: O,
 }
@@ -631,6 +704,17 @@ fn test_transposable_operation_forwards_to_variant_payloads() {
 }
 
 #[test]
+fn test_transposable_operation_generates_program_transposition_witness() {
+    type Linear = LinearScalarOperation<Factor>;
+
+    let program =
+        Program::<DataType, Factor, Linear, Vec<Factor>, Vec<Factor>> { label: "linear", marker: PhantomData };
+    let transposed = <Linear as TransposableProgramOperation<DataType, Factor>>::transpose_program(&program).unwrap();
+
+    assert_eq!(transposed.label, "program_transpose");
+}
+
+#[test]
 fn test_transposable_operation_generates_concrete_payload_bounds() {
     type Linear = SpecialLinearOperation<Factor>;
 
@@ -654,6 +738,25 @@ fn test_transposable_operation_supports_recursive_payload_helpers() {
         operation.transpose(&mut context, &[&ArrayType], &[]).unwrap(),
         vec![transposed::<ArrayType, Factor, Linear>("recursive")],
     );
+}
+
+#[test]
+fn test_transposable_operation_value_bounds_support_recursive_program_witness() {
+    type Linear = RecursiveProgramLinearOperation<Factor>;
+
+    let mut context = AbstractTracingContext::<DataType, Factor, Linear> { marker: PhantomData };
+    let operation = Linear::from(ProgramRecursiveOperation::<Factor, Linear> { marker: PhantomData });
+
+    assert_eq!(
+        operation.transpose(&mut context, &[&DataType], &[]).unwrap(),
+        vec![transposed::<DataType, Factor, Linear>("program_recursive")],
+    );
+
+    let program =
+        Program::<DataType, Factor, Linear, Vec<Factor>, Vec<Factor>> { label: "linear", marker: PhantomData };
+    let transposed = <Linear as TransposableProgramOperation<DataType, Factor>>::transpose_program(&program).unwrap();
+
+    assert_eq!(transposed.label, "program_transpose");
 }
 
 #[test]

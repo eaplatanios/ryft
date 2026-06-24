@@ -2,17 +2,16 @@ use std::fmt::{Debug, Display};
 
 use crate::batching::BatchingError;
 use crate::contexts::{EagerContext, StagingContext};
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::{Cotangent, TransposableOperation, TransposableProgramOperation};
 use crate::domains::Domain;
 use crate::macros::check_count;
-use crate::operations::Operation;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{MaybeZeroOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::ScanOperation;
 use crate::operations::control_flow::scan::{
     ScanTypeSemantics, interpret_scan_lanes, read_scan_lane, stacked_scan_type,
 };
 use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, UpdateSlice};
+use crate::operations::{InterpretableProgramOperation, Operation};
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
@@ -20,10 +19,10 @@ use crate::tracing_v2::ValueOrCapture;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::differentiation::{
     CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf,
-    NestedLinearization, ProgramLinearizableOperation, ResidualizedOperation, TangentContext,
+    LinearizableProgramOperation, NestedLinearization, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Renders a compact comma-separated list of capture-like payloads.
 pub(crate) fn render_factor_list<C: Display>(factors: &[C]) -> String {
@@ -122,57 +121,13 @@ where
     O::linear_scan_operation(body, residual_stacks, carry_count, length, reverse, unroll)
 }
 
-/// Represents scan-local linear operation families that can transpose the captured linear scan body program.
-///
-/// The body of a linear scan is always expressed over a scan-local residual-reference namespace. This trait names the
-/// recursive fixed point needed to transpose that body without making callers restate every variant-level transposition
-/// requirement of the operation family. It intentionally acts as a trait-solver recursion breaker for operation enums
-/// that contain `Scan` variants.
-pub trait LinearScanBodyTransposable<T: Type, V: Value<T>>:
-    Operation<T> + MaybeZeroOperation<T> + From<ZeroOperation<T>> + From<AddOperation>
-{
-    /// Transposes a scan-local linear body program.
-    ///
-    /// # Parameters
-    ///
-    ///   - `body`: Scan-local linear body program to transpose.
-    fn transpose_linear_scan_body(
-        body: &Program<T, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<T, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized;
-}
-
-/// Represents operation families that can recursively interpret nested flat programs.
-///
-/// This trait names the recursive fixed point needed by higher-order interpretation helpers without requiring the
-/// full operation enum's [`InterpretableOperation`](crate::operations::InterpretableOperation) impl while proving
-/// that impl. Operation families implement it by replaying a nested flat [`Program`] through their operation-owned
-/// interpretation rules.
-pub trait InterpretableNestedProgram<T: Type, V: Value<T>>: Operation<T> {
-    /// Interprets a nested flat program.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Interpretation context used for body operations.
-    ///   - `program`: Nested program to interpret.
-    ///   - `input`: Input values for `program`.
-    fn interpret_nested_program(
-        context: &V::InterpretationContext,
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
-        input: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        Self: Sized;
-}
-
 impl<V, O, F> ScanOperation<DataType, V, O, F>
 where
     V: Value<DataType>,
     F: Value<DataType>,
     O: CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>,
     <O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<V>:
-        InterpretableNestedProgram<DataType, V>,
+        InterpretableProgramOperation<DataType, V>,
 {
     /// Interprets a carry-only linear scalar scan whose body payloads use scan-local captured factors.
     ///
@@ -199,7 +154,7 @@ where
         for _ in 0..self.length() {
             state = <<O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<
                 V,
-            > as InterpretableNestedProgram<DataType, V>>::interpret_nested_program(context, &body, state)?;
+            > as InterpretableProgramOperation<DataType, V>>::interpret_program(context, &body, state)?;
             check_count!("output", state, self.carry_count(), ProgramError);
         }
         Ok(state)
@@ -232,7 +187,7 @@ where
     F: CustomVjpResidual<ArrayType, V>,
     O: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>,
     <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<V>:
-        InterpretableNestedProgram<ArrayType, V>,
+        InterpretableProgramOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret_linear_scan(
@@ -264,7 +219,7 @@ where
                 })?;
                 <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<
                     V,
-                > as InterpretableNestedProgram<ArrayType, V>>::interpret_nested_program(
+                > as InterpretableProgramOperation<ArrayType, V>>::interpret_program(
                     self,
                     &lane_body,
                     lane_inputs,
@@ -314,7 +269,7 @@ where
         + Operation<ArrayType>
         + From<BroadcastOperation>
         + From<ScanOperation<ArrayType, V, O>>
-        + ProgramLinearizableOperation<D>,
+        + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D> + LinearScanOperation<ArrayType, D::Tangent, D::Value>,
     LinearOperationOf<D>: From<ZeroOperation<ArrayType>> + MaybeZeroOperation<ArrayType>,
 {
@@ -425,7 +380,7 @@ impl<V, D, O> DifferentiableOperation<D> for ScanOperation<DataType, V, O>
 where
     V: Value<DataType>,
     D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = O>,
-    O: Clone + Operation<DataType> + From<ScanOperation<DataType, V, O>> + ProgramLinearizableOperation<D>,
+    O: Clone + Operation<DataType> + From<ScanOperation<DataType, V, O>> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D> + LinearScanOperation<DataType, D::Tangent, D::Value>,
     LinearOperationOf<D>: From<ZeroOperation<DataType>> + MaybeZeroOperation<DataType>,
 {
@@ -714,13 +669,13 @@ where
 /// `[carry_cotangent..., y_slice_cotangent...]` to `[carry_cotangent..., x_slice_cotangent...]` — the same scan-body
 /// signature with the same carry count. Flipping `reverse` pairs cotangent lane `i` with residual stack lane `i`
 /// exactly when the forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
-/// carry over verbatim. The body transpose recurses through [`LinearScanBodyTransposable`], keeping the scan-local
+/// carry over verbatim. The body transpose recurses through [`TransposableProgramOperation`], keeping the scan-local
 /// fixed point owned by the operation family.
 impl<V, F, O, Target> TransposableOperation<ArrayType, V, Target> for ScanOperation<ArrayType, V, O, F>
 where
     V: Value<ArrayType>,
     F: Value<ArrayType>,
-    O: Clone + LinearScanBodyTransposable<ArrayType, V>,
+    O: Clone + TransposableProgramOperation<ArrayType, V>,
     Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<ArrayType, V, O, F>>,
 {
     fn transpose<'transpose>(
@@ -736,7 +691,7 @@ where
         let body = self.body();
         let carry_count = self.carry_count();
         let length = self.length();
-        let transposed_body = <O as LinearScanBodyTransposable<ArrayType, V>>::transpose_linear_scan_body(body)?;
+        let transposed_body = <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(body)?;
         let transposed = ScanOperation::<ArrayType, V, O>::new(transposed_body, carry_count, length)?
             .with_reverse(!self.reverse())
             .with_unroll(self.unroll())?
@@ -762,7 +717,7 @@ impl<V, F, O, Target> TransposableOperation<DataType, V, Target> for ScanOperati
 where
     V: Value<DataType>,
     F: Value<DataType>,
-    O: Clone + LinearScanBodyTransposable<DataType, V>,
+    O: Clone + TransposableProgramOperation<DataType, V>,
     Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<DataType, V, O, F>>,
 {
     fn transpose<'transpose>(
@@ -783,7 +738,7 @@ where
         let body = self.body();
         let output_types = body.output_types();
         check_count!("output", output_cotangents, output_types.len(), ProgramError);
-        let transposed_body = <O as LinearScanBodyTransposable<DataType, V>>::transpose_linear_scan_body(body)?;
+        let transposed_body = <O as TransposableProgramOperation<DataType, V>>::transpose_program(body)?;
         let transposed = ScanOperation::<DataType, V, O>::new(transposed_body, self.carry_count(), self.length())?
             .with_reverse(!self.reverse())
             .with_unroll(self.unroll())?

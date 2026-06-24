@@ -460,7 +460,7 @@ mod tests {
     #[derive(Copy, Clone, Debug)]
     struct DistinctPrimalDomain;
 
-    impl crate::tracing_v2::ProgramLinearizableOperation<DistinctPrimalDomain> for DistinctPrimalOperation {
+    impl crate::tracing_v2::LinearizableProgramOperation<DistinctPrimalDomain> for DistinctPrimalOperation {
         fn linearize_program(
             differentiable: &DistinctPrimalDomain,
             program: &Program<DataType, DistinctPrimal, Self, Vec<DistinctPrimal>, Vec<DistinctPrimal>>,

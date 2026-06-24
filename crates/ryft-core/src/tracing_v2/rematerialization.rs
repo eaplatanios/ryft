@@ -34,7 +34,7 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiationContext, JvpTracer, ProgramLinearizableOperation, ResidualizedOperation,
+    DifferentiableOperation, DifferentiationContext, JvpTracer, LinearizableProgramOperation, ResidualizedOperation,
     TangentContext,
 };
 use crate::tracing_v2::operations::captures::ValueOrCapture;
@@ -839,7 +839,7 @@ where
         + From<ZeroOperation<D::Type>>
         + From<OneOperation<D::Type>>
         + DifferentiableOperation<TracingContext<'d, D>>
-        + ProgramLinearizableOperation<TracingContext<'d, D>>,
+        + LinearizableProgramOperation<TracingContext<'d, D>>,
     D::LinearOperation<DomainTracer<'d, D>, ValueOrCapture<D::Type, DomainTracer<'d, D>>>: ResidualizedOperation<TracingContext<'d, D>>
         + TransposableOperation<
             D::Type,

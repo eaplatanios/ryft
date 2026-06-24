@@ -4,7 +4,6 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -16,6 +15,7 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::{InterpretableOperation, InterpretableProgramOperation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -30,13 +30,11 @@ use crate::tracing_v2::operations::bounds::{
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
-use crate::tracing_v2::operations::scan::{
-    InterpretableNestedProgram, LinearScanBodyTransposable, LinearScanOperation,
-};
+use crate::tracing_v2::operations::scan::LinearScanOperation;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, ProgramLinearizableOperation, RematerializationName,
+    DifferentiableOperation, DifferentiationContext, LinearizableProgramOperation, RematerializationName,
     ResidualizedOperation, ValueOrCapture,
 };
 use crate::types::DataType;
@@ -109,7 +107,7 @@ where
     D::Value: Select<Condition = <D::Value as SelectCondition>::Condition>,
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
-    ScalarOperation<V>: Clone + ProgramLinearizableOperation<D>,
+    ScalarOperation<V>: Clone + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, D::Value>>
         + LinearScanOperation<DataType, D::Tangent, D::Value>
         + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
@@ -158,13 +156,14 @@ where
     }
 }
 
+// TODO(eaplatanios): Should this be generated for all `DifferentiableOperation`s? Why do we need it?
 /// Nested symbolic linearization for the [`ScalarOperation`] sum type.
 ///
 /// The where clauses spell the leaf closure required by
 /// [`linearize_program`](crate::tracing_v2::linearize_program) instead of the recursive
 /// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound, which avoids pushing that recursive
 /// obligation back into every consumer.
-impl<F, E> ProgramLinearizableOperation<E> for ScalarOperation<F>
+impl<F, E> LinearizableProgramOperation<E> for ScalarOperation<F>
 where
     F: Value<DataType>,
     E: DifferentiationContext<Type = DataType, Constant = F>,
@@ -364,7 +363,7 @@ where
     }
 }
 
-impl<V, C> InterpretableNestedProgram<DataType, V> for LinearScalarOperation<V, C, V>
+impl<V, C> InterpretableProgramOperation<DataType, V> for LinearScalarOperation<V, C, V>
 where
     V: Value<DataType>
         + Add<Output = V>
@@ -380,7 +379,7 @@ where
     ScalarOperation<C>: InterpretableOperation<DataType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: std::fmt::Debug + PartialEq>,
 {
-    fn interpret_nested_program(
+    fn interpret_program(
         context: &V::InterpretationContext,
         program: &Program<DataType, V, Self, Vec<V>, Vec<V>>,
         input: Vec<V>,
@@ -406,21 +405,6 @@ where
                 Self::Scan(operation) => operation.interpret(context, instruction_inputs),
             },
         )
-    }
-}
-
-impl<V, C> LinearScanBodyTransposable<DataType, V> for LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>
-where
-    V: Value<DataType>,
-    C: Value<DataType>,
-{
-    fn transpose_linear_scan_body(
-        body: &Program<DataType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<DataType, V, Self, Vec<V>, Vec<V>>, ProgramError>
-    where
-        Self: Sized,
-    {
-        body.transpose()
     }
 }
 

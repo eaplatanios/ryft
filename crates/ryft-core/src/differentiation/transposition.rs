@@ -49,20 +49,25 @@ use crate::types::{Type, Typed};
 ///     `Payload: TransposableOperation<T, V, Enum>` `where` predicate. Payload-specific capability requirements should
 ///     live on the payload's own [`TransposableOperation`] implementation; the enum derivation carries them through
 ///     this generated payload bound.
-///   - Recursive higher-order payloads that contain the enum itself as the operation-family fixed point should expose
-///     semantic helper bounds for their nested-program requirements, and their own [`TransposableOperation`]
-///     implementation should depend on those helper bounds. Helper-trait implementations should avoid spelling a
-///     direct `Enum: TransposableOperation<T, V, Enum>` super-bound when the helper only calls [`Program::transpose`];
-///     the generated payload bound already supplies the recursive transposition obligation at the enum-dispatch
-///     boundary.
+///   - `impl TransposableProgramOperation<T, V> for Enum`, using the same value-type inference and all non-recursive
+///     payload transposition bounds as the dispatcher implementation. The generated implementation is the standard
+///     operation-family witness for nested linear programs: it calls [`Program::transpose`] on the provided program.
+///     If a higher-order payload contains the enum type being derived (e.g., a branch or loop body whose operation
+///     family is `Self`), the macro does not restate that payload's direct transposition bound on this witness. That
+///     recursive payload should instead depend on [`TransposableProgramOperation`], which names the fixed point and
+///     keeps the trait solver finite. The implementation is additionally constrained by the zero/add capabilities
+///     that [`Program::transpose`] requires.
 ///   - Bare generic payload variants such as `Extension(Extension)` receive the same generated
 ///     `Extension: TransposableOperation<T, V, Enum>` bound, because the macro cannot know which concrete extension
 ///     type will be substituted by the caller.
 ///
-/// Recursive higher-order payloads should expose a semantic helper trait for the operation-family capability they need
-/// and make their own [`TransposableOperation`] implementation depend on that helper trait. This keeps the derived
-/// implementation a simple dispatcher while allowing the payload type that owns the recursion to name the fixed point
-/// directly.
+/// Recursive higher-order payloads that need to transpose captured linear programs should depend on
+/// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<T, V, Enum>` bound.
+/// When those recursive payload rules need value capabilities that are not visible through a non-recursive payload
+/// bound, add them to the enum with `#[ryft(value_bounds = "Predicate, ...")]`. The macro adds those predicates to the
+/// generated [`TransposableOperation`] dispatcher and to the generated [`TransposableProgramOperation`] witness. This
+/// is useful for closed linear operation families whose recursive higher-order payloads need capabilities such as dot
+/// products, reshaping, broadcasting, or sharding.
 ///
 /// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 /// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
@@ -100,6 +105,29 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
         input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, V, O>],
     ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError>;
+}
+
+/// Represents closed [`Operation`] families whose flat linear [`Program`]s can be transposed as nested programs.
+/// Higher-order transpose rules, such as the rules for linear condition branches and linear scan bodies, need to
+/// transpose captured programs whose operation family is the same closed enum that is currently being proven
+/// transposable. Writing that need directly as `O: TransposableOperation<T, V, O>` at every recursive payload boundary
+/// can send Rust's trait solver through the enum's higher-order variants indefinitely. [`TransposableProgramOperation`]
+/// names the recursive fixed point once: the closed operation enum implements this trait by calling
+/// [`Program::transpose`], while higher-order payloads depend on this semantic witness instead of
+/// reproducing all variant-level transposition bounds.
+///
+/// The trait is intentionally about complete operation families, not individual primitive payloads. Implementations
+/// that delegate to [`Program::transpose`] add that method's [`Zero`](crate::Zero)/[`Add`](std::ops::Add) bounds
+/// locally because those are requirements of the standard implementation strategy, not of this semantic witness itself.
+pub trait TransposableProgramOperation<T: DifferentiableType, V: Value<T>>: Operation<T> + Sized {
+    /// Transposes the provided flat linear [`Program`] in this operation family.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Flat linear [`Program`] whose inputs and outputs are flattened vectors of values.
+    fn transpose_program(
+        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<T, V, Self, Vec<V>, Vec<V>>, ProgramError>;
 }
 
 impl<

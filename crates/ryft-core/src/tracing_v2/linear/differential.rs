@@ -18,7 +18,7 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
-    LinearizationTracer, PrimalTracingContext, ProgramLinearizableOperation, Pushforward, ResidualizedOperation,
+    LinearizableProgramOperation, LinearizationTracer, PrimalTracingContext, Pushforward, ResidualizedOperation,
 };
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
@@ -136,7 +136,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
                 >,
         >,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
-        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + ProgramLinearizableOperation<Self>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         Self::Tangent: Broadcast + Transpose,
         DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
             + BatchableOperation<
@@ -212,8 +212,8 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             + InterpretableOperation<ArrayType, DomainValue<Self>>
             + DifferentiableOperation<Self>
             + DifferentiableOperation<TracingContext<'domain, Self>>
-            + ProgramLinearizableOperation<TracingContext<'domain, Self>>
-            + ProgramLinearizableOperation<Self>
+            + LinearizableProgramOperation<TracingContext<'domain, Self>>
+            + LinearizableProgramOperation<Self>
             + From<FillOperation<ArrayType, f64>>
             + From<ZeroOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
@@ -871,7 +871,7 @@ where
             ParameterStructure: Debug + PartialEq,
         >,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + ProgramLinearizableOperation<D>,
+    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
         + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, DirectLinearOperationOf<D>>>
         + TransposableOperation<ArrayType, D::Tangent, DirectLinearOperationOf<D>>

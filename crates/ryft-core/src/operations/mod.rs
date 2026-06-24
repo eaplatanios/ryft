@@ -200,9 +200,16 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     and `Value<ArrayType>`), the derivation macro cannot choose an operation type and reports a compilation error.
 ///     In those cases, the caller must split the enum by operation type or implement [`Operation`] manually.
 ///
-/// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
-/// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on
-/// the `ryft` crate normally do not need this attribute.
+/// The derivation macro supports these top-level `#[ryft(...)]` attributes:
+///
+///   - `crate = "path"` overrides the path used to reference Ryft traits and error types from generated code. The
+///     default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
+///     attribute.
+///   - `value_bounds = "Predicate, ..."` accepts extra Rust where-predicates that are needed by value-dependent
+///     companion derives on the same enum, such as `#[derive(TransposableOperation)]`. `#[derive(Operation)]` parses
+///     and validates this attribute so that shared enum attributes work naturally, but it does not add those predicates
+///     to the generated [`Operation`] or [`Display`] implementations because those implementations are
+///     value-independent.
 ///
 /// ## Example
 ///
@@ -266,6 +273,25 @@ pub trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
     /// which enables nullary operations (e.g., [`ZeroOperation`]) to stage themselves into that context rather than
     /// failing for lack of an operand from which to recover the context.
     fn interpret(&self, context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
+}
+
+/// Represents closed [`Operation`] families that can recursively interpret nested flat [`Program`]s. This trait names
+/// the recursive fixed point needed by higher-order interpretation helpers without requiring the full operation enum's
+/// [`InterpretableOperation`] implementation while proving that implementation. Operation families implement it by
+/// replaying nested flat [`Program`]s through their operation-owned interpretation rules.
+pub trait InterpretableProgramOperation<T: Type, V: Value<T>>: Operation<T> + Sized {
+    /// Interprets a nested flat [`Program`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Interpretation context to use.
+    ///   - `program`: Nested [`Program`] to interpret.
+    ///   - `input`: Input values to use for interpreting the provided [`Program`].
+    fn interpret_program(
+        context: &V::InterpretationContext,
+        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+        input: Vec<V>,
+    ) -> Result<Vec<V>, ProgramError>;
 }
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
