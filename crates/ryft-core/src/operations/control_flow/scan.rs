@@ -1,10 +1,12 @@
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use crate::contexts::Context;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::payloads::Captured;
 use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
 
@@ -41,9 +43,14 @@ pub const SCAN_OPERATION_NAME: &'static str = "scan";
 /// ignore it semantically but preserve it on whatever scan they re-stage, while lowerings emit `unroll` body copies
 /// per loop trip — and a fully unrolled straight-line lowering with no loop at all when `unroll` equals `length`.
 ///
+/// The `Payload` type parameter is a zero-sized semantic tag for how the scan's capture environment is interpreted.
+/// The default [`Captured`] payload treats body constants as ordinary nested program constants. Direct linear scans use
+/// [`Input`](crate::payloads::Input) so scan-local capture references are instantiated from lane-indexed residual
+/// stacks before each body iteration is interpreted.
+///
 /// [`WhileOperation`]: crate::operations::control_flow::WhileOperation
 #[derive(Clone, Debug)]
-pub struct ScanOperation<T, V, O, C = V>
+pub struct ScanOperation<T, V, O, C = V, Payload = Captured>
 where
     T: Type,
     V: Value<T>,
@@ -70,6 +77,9 @@ where
 
     /// Lowering-only unroll factor: the number of body copies emitted per loop trip (`1` keeps one body per trip).
     pub(crate) unroll: usize,
+
+    /// [`PhantomData`] marker tying this operation to the scan capture interpretation role.
+    marker: PhantomData<fn() -> Payload>,
 }
 
 /// Validates that every dimension of `r#type` is static, reporting a precise error that names the scan `role` (for
@@ -308,31 +318,41 @@ impl ScanTypeSemantics for DataType {
     }
 }
 
-/// Runtime value semantics for interpreting [`ScanOperation`] over a concrete value family.
+/// Payload-specific semantics for interpreting [`ScanOperation`] over a concrete value family.
 ///
-/// This trait mirrors [`ScanTypeSemantics`] at execution time. Array values must support slicing, updating, and
-/// reshaping so lanes can be read from and written to stacked values. Scalar values need no such capabilities because
-/// scalar scans are carry-only.
-pub(crate) trait ScanRuntime<T: ScanTypeSemantics, C: Value<T>>: Value<T> {
+/// Ordinary scans use [`Captured`] payloads: body constants are lifted from the nested program's constant table through
+/// the active context. Direct linear scans use a different payload implementation, defined next to the linear scan
+/// transform rules, because their capture list stores lane-indexed residual stacks that must be read and instantiated
+/// before each lane body is interpreted.
+pub(crate) trait ScanPayload<T, C, V, O, Capture>: Sized
+where
+    T: ScanTypeSemantics,
+    C: Value<T>,
+    V: Value<T>,
+    O: Operation<T>,
+    Capture: Value<T>,
+{
     /// Interprets `operation` in `context` using `inputs`.
-    fn interpret_scan<O: InterpretableOperation<T, Self>, Capture: Value<T>>(
-        operation: &ScanOperation<T, C, O, Capture>,
-        context: &Self::InterpretationContext,
-        inputs: &[Self],
-    ) -> Result<Vec<Self>, ProgramError>;
+    fn interpret_scan(
+        operation: &ScanOperation<T, C, O, Capture, Self>,
+        context: &V::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError>;
 }
 
-impl<C, V> ScanRuntime<ArrayType, C> for V
+impl<C, V, O, Capture> ScanPayload<ArrayType, C, V, O, Capture> for Captured
 where
     C: Value<ArrayType>,
     V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V> + Zero<ArrayType, V>,
+    O: InterpretableOperation<ArrayType, V>,
+    Capture: Value<ArrayType>,
 {
-    fn interpret_scan<O: InterpretableOperation<ArrayType, Self>, Capture: Value<ArrayType>>(
-        operation: &ScanOperation<ArrayType, C, O, Capture>,
-        context: &Self::InterpretationContext,
-        inputs: &[Self],
-    ) -> Result<Vec<Self>, ProgramError> {
+    fn interpret_scan(
+        operation: &ScanOperation<ArrayType, C, O, Capture, Self>,
+        context: &V::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let y_slice_types = operation.body.output_types().split_off(operation.carry_count);
         interpret_scan_lanes(
             operation.carry_count,
@@ -352,17 +372,19 @@ where
     }
 }
 
-impl<C, V> ScanRuntime<DataType, C> for V
+impl<C, V, O, Capture> ScanPayload<DataType, C, V, O, Capture> for Captured
 where
     C: Value<DataType>,
     V: Value<DataType>,
     V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
+    O: InterpretableOperation<DataType, V>,
+    Capture: Value<DataType>,
 {
-    fn interpret_scan<O: InterpretableOperation<DataType, Self>, Capture: Value<DataType>>(
-        operation: &ScanOperation<DataType, C, O, Capture>,
-        context: &Self::InterpretationContext,
-        inputs: &[Self],
-    ) -> Result<Vec<Self>, ProgramError> {
+    fn interpret_scan(
+        operation: &ScanOperation<DataType, C, O, Capture, Self>,
+        context: &V::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
         let mut state = inputs.to_vec();
         for _ in 0..operation.length {
             state = operation.body.interpret_with(
@@ -389,14 +411,28 @@ impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> 
     ///   - `carry_count`: Number of loop-carried state leaves at the front of the body's inputs and outputs.
     ///   - `length`: Static trip count.
     pub fn new(body: Program<T, V, O, Vec<V>, Vec<V>>, carry_count: usize, length: usize) -> Result<Self, TypeError> {
-        let input_types = body.input_types();
-        let output_types = body.output_types();
-        T::validate_scan_body(input_types.as_slice(), output_types.as_slice(), carry_count, length)?;
-        Ok(Self { body, captures: Vec::new(), carry_count, length, reverse: false, unroll: 1 })
+        Self::new_with_payload(body, carry_count, length)
     }
 }
 
-impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
+impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C: Value<T>, Payload> ScanOperation<T, V, O, C, Payload> {
+    /// Creates a new [`ScanOperation`] with an explicit capture and payload role.
+    ///
+    /// Use [`ScanOperation::new`] for ordinary scans. This constructor is for operation families that need a
+    /// non-default payload marker, such as direct linear scans whose captures are lane-indexed runtime inputs.
+    pub fn new_with_payload(
+        body: Program<T, V, O, Vec<V>, Vec<V>>,
+        carry_count: usize,
+        length: usize,
+    ) -> Result<Self, TypeError> {
+        let input_types = body.input_types();
+        let output_types = body.output_types();
+        T::validate_scan_body(input_types.as_slice(), output_types.as_slice(), carry_count, length)?;
+        Ok(Self { body, captures: Vec::new(), carry_count, length, reverse: false, unroll: 1, marker: PhantomData })
+    }
+}
+
+impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C, Payload> {
     /// Returns the input types of this [`ScanOperation`].
     pub fn input_types(&self) -> Vec<T> {
         T::scan_input_types(self.body.input_types().as_slice(), self.carry_count, self.length)
@@ -408,7 +444,7 @@ impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, 
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
+impl<T: Type, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C, Payload> {
     /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. For carry-only scalar scans this
     /// only preserves lowering metadata because all iterations consume and produce loop-carried state.
     #[inline]
@@ -434,7 +470,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
     /// preserves them; linear interpretation, transposition, and batching rules decide how to instantiate each
     /// captured value for a lane.
     #[inline]
-    pub fn with_captures<MappedCapture>(self, captures: Vec<MappedCapture>) -> ScanOperation<T, V, O, MappedCapture> {
+    pub fn with_captures<MappedCapture>(
+        self,
+        captures: Vec<MappedCapture>,
+    ) -> ScanOperation<T, V, O, MappedCapture, Payload> {
         ScanOperation {
             body: self.body,
             captures,
@@ -442,6 +481,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
             length: self.length,
             reverse: self.reverse,
             unroll: self.unroll,
+            marker: PhantomData,
         }
     }
 
@@ -483,7 +523,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> ScanOperation<T, V, O, C> {
     }
 }
 
-impl<T: Type, V: Value<T>, O, C> Display for ScanOperation<T, V, O, C>
+impl<T: Type, V: Value<T>, O, C, Payload> Display for ScanOperation<T, V, O, C, Payload>
 where
     Self: Operation<T>,
 {
@@ -504,7 +544,7 @@ fn render_capture_list<C: Display>(captures: &[C]) -> String {
     rendered
 }
 
-impl<T, V, O, C> Operation<T> for ScanOperation<T, V, O, C>
+impl<T, V, O, C, Payload> Operation<T> for ScanOperation<T, V, O, C, Payload>
 where
     T: ScanTypeSemantics,
     V: Value<T>,
@@ -653,8 +693,14 @@ where
     Ok(carries)
 }
 
-impl<T: ScanTypeSemantics, C: Value<T>, V: ScanRuntime<T, C>, O: InterpretableOperation<T, V>, Capture: Value<T>>
-    InterpretableOperation<T, V> for ScanOperation<T, C, O, Capture>
+impl<T, C, V, O, Capture, Payload> InterpretableOperation<T, V> for ScanOperation<T, C, O, Capture, Payload>
+where
+    T: ScanTypeSemantics,
+    C: Value<T>,
+    V: Value<T>,
+    O: Operation<T>,
+    Capture: Value<T>,
+    Payload: ScanPayload<T, C, V, O, Capture>,
 {
     fn interpret(
         &self,
@@ -663,7 +709,7 @@ impl<T: ScanTypeSemantics, C: Value<T>, V: ScanRuntime<T, C>, O: InterpretableOp
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
-        V::interpret_scan(self, context, inputs)
+        Payload::interpret_scan(self, context, inputs)
     }
 }
 

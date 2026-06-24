@@ -8,11 +8,12 @@ use crate::macros::check_count;
 use crate::operations::constants::{MaybeZeroOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::ScanOperation;
 use crate::operations::control_flow::scan::{
-    ScanTypeSemantics, interpret_scan_lanes, read_scan_lane, stacked_scan_type,
+    ScanPayload, ScanTypeSemantics, interpret_scan_lanes, read_scan_lane, stacked_scan_type,
 };
 use crate::operations::manipulation::{BroadcastOperation, Reshape, Slice, UpdateSlice};
 use crate::operations::{InterpretableProgramOperation, Operation};
 use crate::parameters::Parameterized;
+use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::ValueOrCapture;
@@ -68,6 +69,7 @@ where
                 V,
                 <O as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithCapture<ValueOrCapture<T, V>>,
                 ValueOrCapture<T, R>,
+                Input,
             >,
         >,
 {
@@ -95,7 +97,9 @@ where
             T,
             V,
             <Self as CaptureParameterizedOperation<T, ValueOrCapture<T, R>>>::WithCapture<ValueOrCapture<T, V>>,
-        >::new(body, carry_count, length)?
+            ValueOrCapture<T, R>,
+            Input,
+        >::new_with_payload(body, carry_count, length)?
         .with_reverse(reverse)
         .with_unroll(unroll)?
         .with_captures(residual_stacks);
@@ -121,82 +125,48 @@ where
     O::linear_scan_operation(body, residual_stacks, carry_count, length, reverse, unroll)
 }
 
-impl<V, O, F> ScanOperation<DataType, V, O, F>
+impl<V, O, Capture> ScanPayload<DataType, V, V, O, Capture> for Input
 where
     V: Value<DataType>,
-    F: Value<DataType>,
+    Capture: Value<DataType>,
     O: CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>,
     <O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<V>:
         InterpretableProgramOperation<DataType, V>,
 {
-    /// Interprets a carry-only linear scalar scan whose body payloads use scan-local captured factors.
-    ///
-    /// Scalar scans currently have no scalar-stack representation, so this path only supports residual-free linear
-    /// scan bodies. The regular [`Operation::infer_output_types`] call enforces that any stored captures are rejected
-    /// before the body is replayed. The body operations are then instantiated into their ordinary value-payload form
-    /// and interpreted through the operation family's nested-program interpreter.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Interpretation context used for instantiated body operations.
-    ///   - `inputs`: Initial carry values.
-    pub(crate) fn interpret(
-        &self,
+    fn interpret_scan(
+        operation: &ScanOperation<DataType, V, O, Capture, Self>,
         context: &<V as Value<DataType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let body = self.body().map_operations(|operation| {
+        let body = operation.body().map_operations(|operation| {
             operation.try_map_captures(&mut |capture: &ValueOrCapture<DataType, V>| capture.instantiate(&[]))
         })?;
         let mut state = inputs.to_vec();
-        for _ in 0..self.length() {
+        for _ in 0..operation.length() {
             state = <<O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<
                 V,
             > as InterpretableProgramOperation<DataType, V>>::interpret_program(context, &body, state)?;
-            check_count!("output", state, self.carry_count(), ProgramError);
+            check_count!("output", state, operation.carry_count(), ProgramError);
         }
         Ok(state)
     }
 }
 
-// TODO(eaplatanios): Is this actually necessary?
-/// Interprets a captured linear [`ScanOperation`] in an active interpretation context.
-///
-/// Linear scan interpretation is context-mediated because the operation owns a nested body program whose captures must
-/// be instantiated per lane before the body is replayed.
-pub trait LinearScanInterpretation<V: Value<ArrayType>, F: Value<ArrayType>, O: Operation<ArrayType>> {
-    /// Interprets `operation` over `inputs`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Linear scan operation to interpret.
-    ///   - `inputs`: Carry tangents followed by stacked input tangents.
-    fn interpret_linear_scan(
-        &self,
-        operation: &ScanOperation<ArrayType, V, O, F>,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError>;
-}
-
-impl<V, F, O, ContextT> LinearScanInterpretation<V, F, O> for ContextT
+impl<V, F, O> ScanPayload<ArrayType, V, V, O, F> for Input
 where
-    V: Value<ArrayType, InterpretationContext = ContextT> + Slice + UpdateSlice + Reshape,
-    ContextT: Zero<ArrayType, V>,
+    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     F: CustomVjpResidual<ArrayType, V>,
     O: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>,
     <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<V>:
         InterpretableProgramOperation<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret_linear_scan(
-        &self,
-        operation: &ScanOperation<ArrayType, V, O, F>,
+    fn interpret_scan(
+        operation: &ScanOperation<ArrayType, V, O, F, Self>,
+        context: &<V as Value<ArrayType>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        operation.infer_output_types(input_types.as_slice())?;
         let stack_values =
             operation.captures().iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
         let body = operation.body();
@@ -208,7 +178,7 @@ where
             operation.reverse(),
             y_slice_types.as_slice(),
             inputs,
-            |stacked_type| self.zero(stacked_type),
+            |stacked_type| context.zero(stacked_type),
             |lane, lane_inputs| {
                 let lane_residuals =
                     stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
@@ -220,7 +190,7 @@ where
                 <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<
                     V,
                 > as InterpretableProgramOperation<ArrayType, V>>::interpret_program(
-                    self,
+                    context,
                     &lane_body,
                     lane_inputs,
                 )
@@ -671,12 +641,13 @@ where
 /// exactly when the forward scan consumed them, so the same residual stacks (and the lowering-only unroll factor)
 /// carry over verbatim. The body transpose recurses through [`TransposableProgramOperation`], keeping the scan-local
 /// fixed point owned by the operation family.
-impl<V, F, O, Target> TransposableOperation<ArrayType, V, Target> for ScanOperation<ArrayType, V, O, F>
+impl<V, F, O, Payload, Target> TransposableOperation<ArrayType, V, Target>
+    for ScanOperation<ArrayType, V, O, F, Payload>
 where
     V: Value<ArrayType>,
     F: Value<ArrayType>,
     O: TransposableProgramOperation<ArrayType, V>,
-    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<ArrayType, V, O, F>>,
+    Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<ArrayType, V, O, F, Payload>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -692,10 +663,11 @@ where
         let carry_count = self.carry_count();
         let length = self.length();
         let transposed_body = <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(body)?;
-        let transposed = ScanOperation::<ArrayType, V, O>::new(transposed_body, carry_count, length)?
-            .with_reverse(!self.reverse())
-            .with_unroll(self.unroll())?
-            .with_captures(self.captures().to_vec());
+        let transposed =
+            ScanOperation::<ArrayType, V, O, F, Payload>::new_with_payload(transposed_body, carry_count, length)?
+                .with_reverse(!self.reverse())
+                .with_unroll(self.unroll())?
+                .with_captures(self.captures().to_vec());
         let mut output_types = body.output_types();
         let y_slice_types = output_types.split_off(carry_count);
         output_types.extend(y_slice_types.iter().map(|slice_type| stacked_scan_type(slice_type, length)));
@@ -713,12 +685,12 @@ where
     }
 }
 
-impl<V, F, O, Target> TransposableOperation<DataType, V, Target> for ScanOperation<DataType, V, O, F>
+impl<V, F, O, Payload, Target> TransposableOperation<DataType, V, Target> for ScanOperation<DataType, V, O, F, Payload>
 where
     V: Value<DataType>,
     F: Value<DataType>,
     O: TransposableProgramOperation<DataType, V>,
-    Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<DataType, V, O, F>>,
+    Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<DataType, V, O, F, Payload>>,
 {
     fn transpose<'transpose>(
         &self,
@@ -739,10 +711,14 @@ where
         let output_types = body.output_types();
         check_count!("output", output_cotangents, output_types.len(), ProgramError);
         let transposed_body = <O as TransposableProgramOperation<DataType, V>>::transpose_program(body)?;
-        let transposed = ScanOperation::<DataType, V, O>::new(transposed_body, self.carry_count(), self.length())?
-            .with_reverse(!self.reverse())
-            .with_unroll(self.unroll())?
-            .with_captures(self.captures().to_vec());
+        let transposed = ScanOperation::<DataType, V, O, F, Payload>::new_with_payload(
+            transposed_body,
+            self.carry_count(),
+            self.length(),
+        )?
+        .with_reverse(!self.reverse())
+        .with_unroll(self.unroll())?
+        .with_captures(self.captures().to_vec());
         let materialized = output_cotangents
             .iter()
             .zip(output_types.iter())
@@ -952,7 +928,10 @@ mod tests {
             )
             .unwrap();
         let linear_scan = DirectLinearOperation::Scan(Box::new(
-            ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(scan_body, 1, 3).unwrap(),
+            ScanOperation::<ArrayType, TestArray, ScanBodyOperation, TestArray, Input>::new_with_payload(
+                scan_body, 1, 3,
+            )
+            .unwrap(),
         ));
         let context = EagerContext::<ArrayType, TestArray, ConstantOperation<ArrayType, TestArray>>::new();
         let outputs = linear_scan
@@ -1124,11 +1103,12 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
         let tangent_init = builder.add_input(scalar_f64);
         let tangent_xs = builder.add_input(stacked_f64);
-        let linear_scan = ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(body, 1, 3)
-            .unwrap()
-            .with_unroll(3)
-            .unwrap()
-            .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
+        let linear_scan =
+            ScanOperation::<ArrayType, TestArray, ScanBodyOperation, TestArray, Input>::new_with_payload(body, 1, 3)
+                .unwrap()
+                .with_unroll(3)
+                .unwrap()
+                .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
         let outputs = builder
             .add_instruction(DirectLinearOperation::Scan(Box::new(linear_scan)), vec![tangent_init, tangent_xs])
             .unwrap()
@@ -1282,14 +1262,20 @@ mod tests {
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
         let tangent_input = builder.add_input(scalar_f64.clone());
         let moved_stack_atom = builder.add_input(stacked_f64.clone());
-        let scan_operation = ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(body, 1, 2)
-            .unwrap()
-            .with_unroll(2)
-            .unwrap()
-            .with_captures(vec![
-                ValueOrCapture::Capture { index: 0, r#type: stacked_f64 },
-                ValueOrCapture::Value(TestArray::vector(vec![5.0, 7.0])),
-            ]);
+        let scan_operation = ScanOperation::<
+            ArrayType,
+            TestArray,
+            ScanBodyOperation,
+            ValueOrCapture<ArrayType, TestArray>,
+            Input,
+        >::new_with_payload(body, 1, 2)
+        .unwrap()
+        .with_unroll(2)
+        .unwrap()
+        .with_captures(vec![
+            ValueOrCapture::Capture { index: 0, r#type: stacked_f64 },
+            ValueOrCapture::Value(TestArray::vector(vec![5.0, 7.0])),
+        ]);
         let scan = ScanBodyOperation::Scan(Box::new(scan_operation));
         let DefactorizedOperation::Operation { operation, inputs } =
             scan.defactorize_operation(&[moved_stack_atom], vec![tangent_input]).unwrap()
@@ -1368,9 +1354,10 @@ mod tests {
         let body = body_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![summed], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
-        let scan = ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(body, 1, 3)
-            .unwrap()
-            .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
+        let scan =
+            ScanOperation::<ArrayType, TestArray, ScanBodyOperation, TestArray, Input>::new_with_payload(body, 1, 3)
+                .unwrap()
+                .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
         let linear_scan = DirectLinearOperation::Scan(Box::new(scan));
 
         // Per batch lane: `c0 = 2 t + 1`, `c1 = 3 c0 + 1`, `c2 = 4 c1 + 1` so `c2 = 24 t + 17`.

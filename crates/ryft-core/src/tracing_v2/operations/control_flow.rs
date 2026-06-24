@@ -349,6 +349,7 @@ where
                     ValueOrCapture<ArrayType, V>,
                 >,
                 ValueOrCapture<ArrayType, R>,
+                Input,
             >,
         >,
     <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
@@ -379,6 +380,7 @@ where
                     ValueOrCapture<ArrayType, V>,
                 >,
                 ValueOrCapture<ArrayType, V>,
+                Input,
             >,
         >,
     for<'operation> &'operation ScaleOperation<ArrayType, ValueOrCapture<ArrayType, V>, Input>: TryFrom<
@@ -438,6 +440,7 @@ where
             ValueOrCapture<ArrayType, V>,
         >,
         ValueOrCapture<ArrayType, V>,
+        Input,
     >: TryFrom<
         &'operation <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
             ValueOrCapture<ArrayType, V>,
@@ -459,6 +462,7 @@ where
             ValueOrCapture<ArrayType, V>,
         >,
         ValueOrCapture<ArrayType, R>,
+        Input,
     >: TryFrom<&'operation O>,
 {
     let resolve_residual_atom = |index: usize| {
@@ -604,6 +608,7 @@ where
             ValueOrCapture<ArrayType, V>,
         >,
         ValueOrCapture<ArrayType, R>,
+        Input,
     >>::try_from(self_operation)
         && operation.captures().iter().any(|stack| matches!(stack, ValueOrCapture::Capture { .. }))
     {
@@ -638,7 +643,9 @@ where
             <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
                 ValueOrCapture<ArrayType, V>,
             >,
-        >::new(body, operation.carry_count(), operation.length())?
+            ValueOrCapture<ArrayType, R>,
+            Input,
+        >::new_with_payload(body, operation.carry_count(), operation.length())?
         .with_reverse(operation.reverse())
         .with_unroll(operation.unroll())?
         .with_captures(surviving_stacks);
@@ -2908,7 +2915,9 @@ mod tests {
         /// Masked scan staged by the bounded [`WhileOperation`] JVP rule. The `TestValue`-based tests only build
         /// unbounded loops, so this variant is present to satisfy the linear operation family's scan conversion
         /// contract without adding eager scan semantics to the test value type.
-        Scan(Box<ScanOperation<ArrayType, TestValue, TestLinearOperation, ValueOrCapture<ArrayType, TestValue>>>),
+        Scan(
+            Box<ScanOperation<ArrayType, TestValue, TestLinearOperation, ValueOrCapture<ArrayType, TestValue>, Input>>,
+        ),
 
         /// Captured-condition select required by the bounded staged while path's trait bounds. Like `Condition`,
         /// interpretation only supports closed [`ValueOrCapture::Value`] conditions because this test enum is
@@ -3141,11 +3150,17 @@ mod tests {
         }
     }
 
-    impl From<ScanOperation<ArrayType, TestValue, TestLinearOperation, ValueOrCapture<ArrayType, TestValue>>>
+    impl From<ScanOperation<ArrayType, TestValue, TestLinearOperation, ValueOrCapture<ArrayType, TestValue>, Input>>
         for TestLinearOperation
     {
         fn from(
-            operation: ScanOperation<ArrayType, TestValue, TestLinearOperation, ValueOrCapture<ArrayType, TestValue>>,
+            operation: ScanOperation<
+                ArrayType,
+                TestValue,
+                TestLinearOperation,
+                ValueOrCapture<ArrayType, TestValue>,
+                Input,
+            >,
         ) -> Self {
             Self::Scan(Box::new(operation))
         }

@@ -217,12 +217,13 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested scan operation inside this lowering context.
-    pub(crate) fn lower_scan<V: MlirLowerableValue, O>(
+    pub(crate) fn lower_scan<V: MlirLowerableValue, O, Capture, Payload>(
         &mut self,
-        scan_op: &ScanOperation<ArrayType, V, O>,
+        scan_op: &ScanOperation<ArrayType, V, O, Capture, Payload>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
+        Capture: Value<ArrayType>,
         O: LowerableXlaOperation<V>,
     {
         lower_scan_to_while(
@@ -924,8 +925,10 @@ where
     }
 }
 
-impl<V: MlirLowerableValue, O> LowerableXlaOperation<V> for ScanOperation<ArrayType, V, O>
+impl<V: MlirLowerableValue, O, Capture, Payload> LowerableXlaOperation<V>
+    for ScanOperation<ArrayType, V, O, Capture, Payload>
 where
+    Capture: Value<ArrayType>,
     O: LowerableXlaOperation<V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -1781,12 +1784,13 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
     }
 
     /// Lowers one nested scan operation inside this lowering context.
-    pub(crate) fn lower_scan<V: MlirLowerableValue, O>(
+    pub(crate) fn lower_scan<V: MlirLowerableValue, O, Capture, Payload>(
         &mut self,
-        scan_op: &ScanOperation<ArrayType, V, O>,
+        scan_op: &ScanOperation<ArrayType, V, O, Capture, Payload>,
         input_values: &[ValueRef<'b, 'c, 't>],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
     where
+        Capture: Value<ArrayType>,
         O: LowerableXlaOperation<V>,
     {
         lower_scan_to_while(

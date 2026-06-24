@@ -17,7 +17,6 @@ use ryft_core::operations::constants::{
     Constant, ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero,
     ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use ryft_core::operations::control_flow::scan::{interpret_scan_lanes, read_scan_lane};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use ryft_core::operations::differentiation::StopGradientOperation;
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
@@ -520,6 +519,7 @@ where
                 E::Tangent,
                 LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
                 ValueOrCapture<ArrayType, <E as Domain>::Value>,
+                Input,
             >,
         >
         + From<
@@ -780,7 +780,7 @@ pub enum LinearXlaOperation<
     While(Box<WhileOperation<ArrayType, V, Self, Input>>),
 
     /// Backend-owned scan whose body can contain XLA linear operations.
-    Scan(Box<ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
+    Scan(Box<ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>),
 
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
 
@@ -936,7 +936,7 @@ where
 }
 
 impl<V, C, F, P, CaptureFactor>
-    From<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>
+    From<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>
     for LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
     V: Value<ArrayType>,
@@ -946,17 +946,19 @@ where
     CaptureFactor: Value<ArrayType>,
 {
     fn from(
-        operation: ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>,
+        operation: ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>,
     ) -> Self {
         let body = operation
             .body()
             .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
             .unwrap();
-        let scan = ScanOperation::<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>>::new(
-            body,
-            operation.carry_count(),
-            operation.length(),
-        )
+        let scan = ScanOperation::<
+            ArrayType,
+            V,
+            LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>,
+            F,
+            Input,
+        >::new_with_payload(body, operation.carry_count(), operation.length())
         .unwrap()
         .with_reverse(operation.reverse())
         .with_unroll(operation.unroll())
@@ -1002,52 +1004,11 @@ where
             interpret_direct_linear_xla_program(context, branch, inputs[1..].to_vec())
         }
         LinearXlaOperation::While(operation) => operation.interpret(context, inputs),
-        LinearXlaOperation::Scan(operation) => interpret_direct_linear_xla_scan(context, operation, inputs),
+        LinearXlaOperation::Scan(operation) => operation.interpret(context, inputs),
         LinearXlaOperation::LinearJitCall(operation) => operation.interpret(context, inputs),
         LinearXlaOperation::LinearShardMap(operation) => operation.interpret(context, inputs),
         _ => unreachable!("linear XLA leaf operation should convert to a core linear operation"),
     }
-}
-
-fn interpret_direct_linear_xla_scan<V, C, P>(
-    context: &V::InterpretationContext,
-    operation: &ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, V>,
-    inputs: &[V],
-) -> Result<Vec<V>, ProgramError>
-where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    C: Value<ArrayType>,
-    P: Clone + Operation<ArrayType>,
-    LinearArrayOperation<V, C, V, P>: InterpretableOperation<ArrayType, V>,
-    V::InterpretationContext: Constant<ArrayType, V, V, Input>,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    LinearJitCallOperation<V>: InterpretableOperation<ArrayType, V>,
-    LinearShardMapOperation<V, V>: InterpretableOperation<ArrayType, V>,
-{
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    operation.infer_output_types(input_types.as_slice())?;
-    let stack_values = operation.captures().to_vec();
-    let body = operation.body();
-    let carry_count = operation.carry_count();
-    let y_slice_types = body.output_types().split_off(carry_count);
-    interpret_scan_lanes(
-        carry_count,
-        operation.length(),
-        operation.reverse(),
-        y_slice_types.as_slice(),
-        inputs,
-        |stacked_type| context.zero(stacked_type),
-        |lane, lane_inputs| {
-            let lane_residuals =
-                stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;
-            let lane_body = body.map_operations(|operation| {
-                operation.try_map_captures(&mut |capture: &ValueOrCapture<ArrayType, V>| {
-                    capture.instantiate(&lane_residuals)
-                })
-            })?;
-            interpret_direct_linear_xla_program(context, &lane_body, lane_inputs)
-        },
-    )
 }
 
 fn interpret_direct_linear_xla_program<V, C, P>(
@@ -1176,11 +1137,13 @@ where
             let body = operation.body().map_operations(|operation| {
                 map_linear_xla_operation_captures(operation, &mut clone_scan_local_capture)
             })?;
-            let scan = ScanOperation::<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>>::new(
-                body,
-                operation.carry_count(),
-                operation.length(),
-            )?
+            let scan = ScanOperation::<
+                ArrayType,
+                V,
+                LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>,
+                MappedFactor,
+                Input,
+            >::new_with_payload(body, operation.carry_count(), operation.length())?
             .with_reverse(operation.reverse())
             .with_unroll(operation.unroll())?
             .with_captures(operation.captures().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?);

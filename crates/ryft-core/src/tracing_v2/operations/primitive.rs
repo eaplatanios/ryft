@@ -74,7 +74,7 @@ use super::control_flow::{
     batch_condition_with_interpreter, batch_while_with_interpreter, defactorize_operation_default,
 };
 use super::dot::DotOps;
-use super::scan::{LinearScanInterpretation, LinearScanOperation};
+use super::scan::LinearScanOperation;
 use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -346,7 +346,7 @@ pub enum LinearArrayOperation<
     Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
     OperandCondition(LinearOperandConditionOperation<V, Self>),
     While(Box<WhileOperation<ArrayType, V, Self, Input>>),
-    Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F>>),
+    Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
 }
 
@@ -650,10 +650,14 @@ where
                 let body = operation.body().map_operations(|operation| {
                     map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, &mut clone_scan_local_factor)
                 })?;
-                let scan = ScanOperation::<ArrayType, _, _>::new(body, operation.carry_count(), operation.length())?
-                    .with_reverse(operation.reverse())
-                    .with_unroll(operation.unroll())?
-                    .with_captures(operation.captures().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?);
+                let scan = ScanOperation::<ArrayType, _, _, MappedFactor, Input>::new_with_payload(
+                    body,
+                    operation.carry_count(),
+                    operation.length(),
+                )?
+                .with_reverse(operation.reverse())
+                .with_unroll(operation.unroll())?
+                .with_captures(operation.captures().iter().map(&mut *map_factor).collect::<Result<Vec<_>, _>>()?);
                 Ok(LinearArrayOperation::Scan(Box::new(scan)))
             }
         }
@@ -819,8 +823,7 @@ where
         + Constant<ArrayType, V, V, Input>
         + Scale<ArrayType, V, V, Input>
         + LeftDot<V, V, Input>
-        + RightDot<V, V, Input>
-        + LinearScanInterpretation<V, F, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>>,
+        + RightDot<V, V, Input>,
     ScaleOperation<ArrayType, F, Input>: InterpretableOperation<ArrayType, V>,
     ConstantOperation<ArrayType, V, Input>: InterpretableOperation<ArrayType, V>,
     LeftDotOperation<F, Input>: InterpretableOperation<ArrayType, V>,
@@ -870,7 +873,7 @@ where
             Self::Condition(operation) => operation.interpret(context, inputs),
             Self::OperandCondition(operation) => operation.interpret(context, inputs),
             Self::While(operation) => operation.interpret(context, inputs),
-            Self::Scan(operation) => context.interpret_linear_scan(operation, inputs),
+            Self::Scan(operation) => operation.interpret(context, inputs),
         }
     }
 }

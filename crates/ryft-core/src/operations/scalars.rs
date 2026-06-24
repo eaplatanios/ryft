@@ -280,7 +280,7 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     Sub(SubOperation),
     Scale(ScaleOperation<DataType, F, Input>),
     Select(LinearSelectOperation<F>),
-    Scan(Box<ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F>>),
+    Scan(Box<ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F, Input>>),
     While(Box<WhileOperation<DataType, V, Self, Input>>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
@@ -311,7 +311,7 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
             }
             Self::Select(operation) => Ok(LinearSelectOperation::new(map_factor(operation.condition())?).into()),
             Self::Scan(operation) => {
-                let scan = ScanOperation::<DataType, _, _>::new(
+                let scan = ScanOperation::<DataType, _, _, MappedFactor, Input>::new_with_payload(
                     operation.body().clone(),
                     operation.carry_count(),
                     operation.length(),
