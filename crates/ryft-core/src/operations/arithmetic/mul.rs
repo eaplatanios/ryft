@@ -57,7 +57,7 @@ impl ElementwiseOperation for MulOperation {
         2
     }
 
-    // TODO(eaplatanios): Review this function.
+    // TODO(eaplatanios): Review this function. Also, tests.
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
         // state by the bilinear rule (JAX's `_mul_ur_rule`) rather than the congruent rule that generic elementwise
