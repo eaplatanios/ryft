@@ -867,7 +867,7 @@ where
             Self::Recompute(operation) => operation.interpret(context, inputs),
             Self::Condition(operation) => operation.interpret(context, inputs),
             Self::OperandCondition(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => operation.interpret(context, inputs),
+            Self::While(operation) => operation.interpret_with_cloned_constants(context, inputs),
             Self::Scan(operation) => context.interpret_linear_scan(operation, inputs),
         }
     }

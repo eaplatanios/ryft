@@ -4,7 +4,6 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::contexts::Context;
 use crate::domains::Domain;
-use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
@@ -16,7 +15,7 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation};
+use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -246,37 +245,7 @@ where
             Self::Compare(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let mut state = inputs.to_vec();
-                let mut completed_iterations = 0;
-                loop {
-                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                        return Ok(state);
-                    }
-                    let condition_outputs = operation.condition().interpret_with(
-                        state.clone(),
-                        |_, constant| context.lift(constant.clone()),
-                        |instruction, instruction_inputs| {
-                            instruction.operation().interpret(context, instruction_inputs)
-                        },
-                    )?;
-                    check_count!("output", condition_outputs, 1, ProgramError);
-                    if !condition_outputs[0].boolean()? {
-                        return Ok(state);
-                    }
-                    state = operation.body().interpret_with(
-                        state,
-                        |_, constant| context.lift(constant.clone()),
-                        |instruction, instruction_inputs| {
-                            instruction.operation().interpret(context, instruction_inputs)
-                        },
-                    )?;
-                    check_count!("output", state, operation.state_types().len(), ProgramError);
-                    completed_iterations += 1;
-                }
-            }
+            Self::While(operation) => operation.interpret(context, inputs),
             Self::StopGradient(operation) => operation.interpret(context, inputs),
             Self::RematerializationName(operation) => operation.interpret(context, inputs),
             Self::CustomJvp(operation) => operation.interpret(context, inputs),
@@ -408,25 +377,7 @@ where
             Self::Scale(operation) => operation.interpret(context, inputs),
             Self::Select(operation) => operation.interpret(context, inputs),
             Self::Scan(operation) => operation.interpret(context, inputs),
-            Self::While(operation) => {
-                let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                operation.infer_output_types(input_types.as_slice())?;
-                let mut state = inputs.to_vec();
-                let mut completed_iterations = 0;
-                loop {
-                    if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                        return Ok(state);
-                    }
-                    let condition_outputs = operation.condition().interpret_in_context(context, state.clone())?;
-                    check_count!("output", condition_outputs, 1, ProgramError);
-                    if !condition_outputs[0].boolean()? {
-                        return Ok(state);
-                    }
-                    state = operation.body().interpret_in_context(context, state)?;
-                    check_count!("output", state, operation.state_types().len(), ProgramError);
-                    completed_iterations += 1;
-                }
-            }
+            Self::While(operation) => operation.interpret_with_cloned_constants(context, inputs),
         }
     }
 }
@@ -472,26 +423,7 @@ where
                 Self::Scale(operation) => operation.interpret(context, instruction_inputs),
                 Self::Select(operation) => operation.interpret(context, instruction_inputs),
                 Self::Scan(operation) => operation.interpret(context, instruction_inputs),
-                Self::While(operation) => {
-                    let input_types =
-                        instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                    operation.infer_output_types(input_types.as_slice())?;
-                    let mut state = instruction_inputs.to_vec();
-                    let mut completed_iterations = 0;
-                    loop {
-                        if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
-                            return Ok(state);
-                        }
-                        let condition_outputs = operation.condition().interpret_in_context(context, state.clone())?;
-                        check_count!("output", condition_outputs, 1, ProgramError);
-                        if !condition_outputs[0].boolean()? {
-                            return Ok(state);
-                        }
-                        state = operation.body().interpret_in_context(context, state)?;
-                        check_count!("output", state, operation.state_types().len(), ProgramError);
-                        completed_iterations += 1;
-                    }
-                }
+                Self::While(operation) => operation.interpret_with_cloned_constants(context, instruction_inputs),
             },
         )
     }

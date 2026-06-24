@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 
+use crate::contexts::Context;
 use crate::macros::{check_count, check_types};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use crate::parameters::Parameterized;
@@ -169,6 +170,68 @@ impl<T: Type, V: Value<T>, O: Operation<T>> WhileOperation<T, V, O> {
         self.iteration_bound = bound;
         Ok(self)
     }
+
+    /// Interprets this while loop by cloning nested program constants directly into the runtime value stream.
+    ///
+    /// This is the linear-program counterpart to the ordinary [`InterpretableOperation`] implementation below:
+    /// direct linear programs store tangent/cotangent constants in the nested while body, so those constants are
+    /// already runtime values and should not be lifted through a primal interpretation context.
+    pub(crate) fn interpret_with_cloned_constants(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        T: WhileTypeSemantics,
+        V: BooleanLike,
+        O: InterpretableOperation<T, V>,
+        Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    {
+        self.interpret_with_constant_lift(context, inputs, |constant| Ok(constant.clone()))
+    }
+}
+
+impl<T: WhileTypeSemantics, C: Value<T>, O: Operation<T>> WhileOperation<T, C, O> {
+    fn interpret_with_constant_lift<V, LiftFn>(
+        &self,
+        context: &V::InterpretationContext,
+        inputs: &[V],
+        mut lift_constant: LiftFn,
+    ) -> Result<Vec<V>, ProgramError>
+    where
+        V: Value<T> + BooleanLike,
+        O: InterpretableOperation<T, V>,
+        Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+        LiftFn: FnMut(&C) -> Result<V, ProgramError>,
+    {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.infer_output_types(input_types.as_slice())?;
+        let mut state = inputs.to_vec();
+        let mut completed_iterations = 0;
+        loop {
+            // The iteration bound is semantic: a bounded loop runs at most `bound` iterations by definition, so the
+            // loop exits here even while the condition still produces true.
+            if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
+                return Ok(state);
+            }
+            let condition_outputs = self.condition.interpret_with(
+                state.clone(),
+                |_, constant| lift_constant(constant),
+                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+            )?;
+            check_count!("output", condition_outputs, 1, ProgramError);
+            if !condition_outputs[0].boolean()? {
+                return Ok(state);
+            }
+            state = self.body.interpret_with(
+                state,
+                |_, constant| lift_constant(constant),
+                |instruction, instruction_inputs| instruction.operation().interpret(context, instruction_inputs),
+            )?;
+            check_count!("output", state, self.state_types().len(), ProgramError);
+            completed_iterations += 1;
+        }
+    }
 }
 
 impl<T: Type, V: Value<T>, O> Display for WhileOperation<T, V, O>
@@ -204,10 +267,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for WhileOperation<T, V
     }
 }
 
-impl<T, V, O> InterpretableOperation<T, V> for WhileOperation<T, V, O>
+impl<T, C, V, O> InterpretableOperation<T, V> for WhileOperation<T, C, O>
 where
     T: WhileTypeSemantics,
+    C: Value<T>,
     V: Value<T> + BooleanLike,
+    V::InterpretationContext: Context<Type = T, Constant = C, Value = V>,
     O: InterpretableOperation<T, V>,
     Vec<V>: Parameterized<V, ParameterStructure: Debug + PartialEq>,
 {
@@ -216,25 +281,7 @@ where
         context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let mut state = inputs.to_vec();
-        let mut completed_iterations = 0;
-        loop {
-            // The iteration bound is semantic: a bounded loop runs at most `bound` iterations by definition, so the
-            // loop exits here even while the condition still produces true.
-            if self.iteration_bound.is_some_and(|bound| completed_iterations >= bound) {
-                return Ok(state);
-            }
-            let condition_outputs = self.condition.interpret_in_context(context, state.clone())?;
-            check_count!("output", condition_outputs, 1, ProgramError);
-            if !condition_outputs[0].boolean()? {
-                return Ok(state);
-            }
-            state = self.body.interpret_in_context(context, state)?;
-            check_count!("output", state, self.state_types().len(), ProgramError);
-            completed_iterations += 1;
-        }
+        self.interpret_with_constant_lift(context, inputs, |constant| context.lift(constant.clone()))
     }
 }
 
