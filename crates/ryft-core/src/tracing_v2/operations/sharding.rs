@@ -27,7 +27,7 @@ use crate::types::ArrayType;
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
 /// to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so the produced input
 /// cotangent is distributed like the input. An input that carries no sharding receives its cotangent unconstrained.
-impl<V: Value<ArrayType> + Reshard, O> TransposableOperation<ArrayType, V, O> for ReshardOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ReshardOperation
 where
     O: Operation<ArrayType> + From<ReshardOperation>,
 {
@@ -108,7 +108,7 @@ where
 /// Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of the output
 /// is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with `ad.deflinear2`).
 /// Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the operation's own.
-impl<V: Value<ArrayType> + ConstrainSharding, O> TransposableOperation<ArrayType, V, O> for ShardingConstraintOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ShardingConstraintOperation
 where
     O: Operation<ArrayType> + From<ShardingConstraintOperation>,
 {

@@ -200,16 +200,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     and `Value<ArrayType>`), the derivation macro cannot choose an operation type and reports a compilation error.
 ///     In those cases, the caller must split the enum by operation type or implement [`Operation`] manually.
 ///
-/// The derivation macro supports these top-level `#[ryft(...)]` attributes:
-///
-///   - `crate = "path"` overrides the path used to reference Ryft traits and error types from generated code. The
-///     default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
-///     attribute.
-///   - `value_bounds = "Predicate, ..."` accepts extra Rust where-predicates that are needed by value-dependent
-///     companion derives on the same enum, such as `#[derive(TransposableOperation)]`. `#[derive(Operation)]` parses
-///     and validates this attribute so that shared enum attributes work naturally, but it does not add those predicates
-///     to the generated [`Operation`] or [`Display`] implementations because those implementations are
-///     value-independent.
+/// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
+/// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on
+/// the `ryft` crate normally do not need this attribute.
 ///
 /// ## Example
 ///

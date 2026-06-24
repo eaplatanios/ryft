@@ -89,9 +89,8 @@ pub fn lift_reshape_shapes(
     Some((Shape::new(lifted_input_dimensions), Shape::new(lifted_output_dimensions), k_out))
 }
 
-impl<V, O> TransposableOperation<ArrayType, V, O> for ReshapeOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ReshapeOperation
 where
-    V: ReshapeValue,
     O: Operation<ArrayType> + From<ReshapeOperation>,
 {
     fn transpose<'transpose>(

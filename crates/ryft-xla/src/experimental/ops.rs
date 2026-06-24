@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::ops::Mul;
 use std::rc::Rc;
 
 use ryft_macros::Operation;
@@ -53,11 +52,10 @@ use ryft_core::tracing_v2::operations::control_flow::{
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
-use ryft_core::tracing_v2::operations::dot::{Dot, DotOps, LeftDotOperation, RightDotOperation};
+use ryft_core::tracing_v2::operations::dot::{DotOps, LeftDotOperation, RightDotOperation};
 use ryft_core::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
-use ryft_core::tracing_v2::operations::reshape::ReshapeValue;
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
     ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DefactorizedOperation, DifferentiableOperation,
@@ -714,18 +712,12 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 
 /// Linear staged-op universe owned by the XLA backend.
 #[derive(Clone, Debug, Operation, ryft_macros::TransposableOperation)]
-#[ryft(
-    crate = "ryft_core",
-    value_bounds = "
-        V: Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-        P: Clone
-    "
-)]
+#[ryft(crate = "ryft_core")]
 pub enum LinearXlaOperation<
     V: Value<ArrayType>,
     C: Value<ArrayType> = XlaConstant,
     F: Value<ArrayType> = V,
-    P: Operation<ArrayType> = XlaOperation,
+    P: Clone + Operation<ArrayType> = XlaOperation,
     CaptureFactor: Value<ArrayType> = F,
 > {
     Zero(ZeroOperation<ArrayType>),
@@ -1234,7 +1226,7 @@ where
     V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
-    P: Operation<ArrayType>,
+    P: Clone + Operation<ArrayType>,
     CaptureFactor: Value<ArrayType>,
 {
     fn linear_condition_operation(

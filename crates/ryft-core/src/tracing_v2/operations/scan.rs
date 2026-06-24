@@ -675,7 +675,7 @@ impl<V, F, O, Target> TransposableOperation<ArrayType, V, Target> for ScanOperat
 where
     V: Value<ArrayType>,
     F: Value<ArrayType>,
-    O: Clone + TransposableProgramOperation<ArrayType, V>,
+    O: TransposableProgramOperation<ArrayType, V>,
     Target: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScanOperation<ArrayType, V, O, F>>,
 {
     fn transpose<'transpose>(
@@ -717,7 +717,7 @@ impl<V, F, O, Target> TransposableOperation<DataType, V, Target> for ScanOperati
 where
     V: Value<DataType>,
     F: Value<DataType>,
-    O: Clone + TransposableProgramOperation<DataType, V>,
+    O: TransposableProgramOperation<DataType, V>,
     Target: Operation<DataType> + From<ZeroOperation<DataType>> + From<ScanOperation<DataType, V, O, F>>,
 {
     fn transpose<'transpose>(

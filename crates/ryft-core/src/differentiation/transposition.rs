@@ -63,11 +63,9 @@ use crate::types::{Type, Typed};
 ///
 /// Recursive higher-order payloads that need to transpose captured linear programs should depend on
 /// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<T, V, Enum>` bound.
-/// When those recursive payload rules need value capabilities that are not visible through a non-recursive payload
-/// bound, add them to the enum with `#[ryft(value_bounds = "Predicate, ...")]`. The macro adds those predicates to the
-/// generated [`TransposableOperation`] dispatcher and to the generated [`TransposableProgramOperation`] witness. This
-/// is useful for closed linear operation families whose recursive higher-order payloads need capabilities such as dot
-/// products, reshaping, broadcasting, or sharding.
+/// When those recursive payload rules need value capabilities, express those requirements on the enum's generic
+/// parameters or on the payload implementations themselves so the generated dispatcher and program-transposition
+/// witness inherit them through normal Rust bounds.
 ///
 /// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 /// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this

@@ -11,8 +11,7 @@ use crate::helpers::symbols::Symbol;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
-const VALUE_BOUNDS_ATTRIBUTE: Symbol = Symbol::new("value_bounds");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, VALUE_BOUNDS_ATTRIBUTE];
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_OPERATION_TYPE: Symbol = Symbol::new("__OperationType");
@@ -28,9 +27,6 @@ pub(crate) struct CodeGenerator {
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: syn::Type,
-
-    /// Additional value-dependent where-predicates for generated transform implementations.
-    value_bounds: Vec<syn::WherePredicate>,
 
     /// Errors accumulated while validating and generating the derive output.
     errors: Vec<syn::Error>,
@@ -65,7 +61,6 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
-            value_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -91,7 +86,6 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
-            value_bounds: Vec::new(),
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -124,11 +118,9 @@ impl CodeGenerator {
     /// Extracts supported top-level `#[ryft(...)]` attributes.
     fn extract_attributes(&mut self, input: &syn::DeriveInput) {
         let mut ryft_crate = Attribute::new(CRATE_ATTRIBUTE);
-        let mut value_bounds = Attribute::new(VALUE_BOUNDS_ATTRIBUTE);
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
-                path if path == &VALUE_BOUNDS_ATTRIBUTE => value_bounds.set(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
@@ -140,9 +132,6 @@ impl CodeGenerator {
 
         if let Some(ryft_crate) = ryft_crate.get() {
             self.ryft_crate = ryft_crate;
-        }
-        if let Some(value_bounds) = value_bounds.get() {
-            self.value_bounds = value_bounds;
         }
         let inferred_types = unique_value_bound_arguments(&input.generics);
         match inferred_types.as_slice() {
@@ -319,7 +308,6 @@ impl CodeGenerator {
         where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
-        where_clause.predicates.extend(self.value_bounds.iter().cloned());
         where_clause.predicates.extend(transpose_bounds.iter().cloned());
 
         let mut program_transposition_generics = self.operation_generics(&input.generics, &variants);
@@ -327,7 +315,6 @@ impl CodeGenerator {
         program_where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
-        program_where_clause.predicates.extend(self.value_bounds.iter().cloned());
         program_where_clause.predicates.extend(program_transpose_bounds);
         program_where_clause.predicates.push(syn::parse_quote!(#primary_type: #ryft::DifferentiableType));
         program_where_clause.predicates.push(syn::parse_quote! {

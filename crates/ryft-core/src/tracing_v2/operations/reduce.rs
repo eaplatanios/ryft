@@ -1,6 +1,3 @@
-use std::fmt::Display;
-use std::ops::Mul;
-
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
@@ -15,6 +12,7 @@ use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
+use std::fmt::Display;
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -423,7 +421,7 @@ impl<V: Value<ArrayType> + Reduce> InterpretableOperation<ArrayType, V> for Redu
 /// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
 /// only to the lane that produced the reduction's output, and `Any`/`All` are not
 /// differentiable.
-impl<V: Value<ArrayType> + Broadcast + Mul<Output = V>, O> TransposableOperation<ArrayType, V, O> for ReduceOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ReduceOperation
 where
     O: Operation<ArrayType>
         + From<BroadcastOperation>

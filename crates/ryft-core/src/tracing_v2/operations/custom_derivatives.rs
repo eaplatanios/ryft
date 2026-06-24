@@ -797,7 +797,6 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<T, V, O, F> {
     ) -> Result<CustomVjpCallOperation<T, V, O, MappedFactor>, ProgramError>
     where
         MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-        V: Clone,
         O: Clone,
     {
         Ok(CustomVjpCallOperation {
@@ -966,13 +965,13 @@ where
             .zip(cotangent_types.iter())
             .map(|(cotangent, r#type)| stage_cotangent(context, cotangent, r#type))
             .collect::<Vec<_>>();
-        let call = OLinear::from(CustomVjpCallOperation::new(
-            self.backward.clone(),
-            self.tangent.clone(),
-            self.residuals.to_vec(),
-            !self.transposed,
-            self.prevent_cse,
-        ));
+        let call = OLinear::from(CustomVjpCallOperation {
+            backward: self.backward.clone(),
+            tangent: self.tangent.clone(),
+            residuals: self.residuals.to_vec(),
+            transposed: !self.transposed,
+            prevent_cse: self.prevent_cse,
+        });
         let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
         Ok(outputs.into_iter().map(Cotangent::Staged).collect())
     }

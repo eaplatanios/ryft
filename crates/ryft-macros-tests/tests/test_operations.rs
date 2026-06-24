@@ -521,8 +521,8 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
-#[ryft(crate = "crate", value_bounds = "V: SpecialTransposableValue")]
-enum RecursiveProgramLinearOperation<V: Value<DataType>> {
+#[ryft(crate = "crate")]
+enum RecursiveProgramLinearOperation<V: Value<DataType> + SpecialTransposableValue> {
     Zero(ZeroOperation<DataType>),
     Add(AddOperation),
     Recursive(ProgramRecursiveOperation<V, Self>),
@@ -741,7 +741,7 @@ fn test_transposable_operation_supports_recursive_payload_helpers() {
 }
 
 #[test]
-fn test_transposable_operation_value_bounds_support_recursive_program_witness() {
+fn test_transposable_operation_inherits_enum_bounds_for_recursive_program_witness() {
     type Linear = RecursiveProgramLinearOperation<Factor>;
 
     let mut context = AbstractTracingContext::<DataType, Factor, Linear> { marker: PhantomData };

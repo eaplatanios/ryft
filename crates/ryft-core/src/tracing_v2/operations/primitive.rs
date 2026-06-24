@@ -55,11 +55,10 @@ use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
 };
-use crate::tracing_v2::operations::dot::{Dot, LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
+use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
-use crate::tracing_v2::operations::reshape::ReshapeValue;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
@@ -295,13 +294,12 @@ where
 /// constant type of captured primal programs such as [`CustomVjpCall`](Self::CustomVjpCall), which are written over
 /// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
-// TODO(eaplatanios): Is there a more natural or more standard way to define bounds like these for Rust macros?
-//  The reason we end up needing this is because of how we avoid recursive `TransposableOperation` bounds.
-#[ryft(value_bounds = "
-        V: Mul<Output = V> + Dot + ReshapeValue + Broadcast + Transpose + Reshard + ConstrainSharding,
-        P: Clone
-    ")]
-pub enum LinearArrayOperation<V: Value<ArrayType>, C: Value<ArrayType>, F: Value<ArrayType>, P: Operation<ArrayType>> {
+pub enum LinearArrayOperation<
+    V: Value<ArrayType>,
+    C: Value<ArrayType>,
+    F: Value<ArrayType>,
+    P: Clone + Operation<ArrayType>,
+> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
@@ -366,7 +364,7 @@ where
 impl<V: Value<ArrayType>, C: Value<ArrayType>, F: Value<ArrayType>, P> SupportsLinearCondition<ArrayType, V, F>
     for LinearArrayOperation<V, C, F, P>
 where
-    P: Operation<ArrayType>,
+    P: Clone + Operation<ArrayType>,
 {
     #[inline]
     fn linear_condition_operation(

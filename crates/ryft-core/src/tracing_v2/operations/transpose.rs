@@ -8,7 +8,7 @@ use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentCo
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
 use crate::types::ArrayType;
 
-impl<V: Value<ArrayType> + Transpose, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
+impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
 where
     O: Operation<ArrayType> + From<TransposeOperation>,
 {
