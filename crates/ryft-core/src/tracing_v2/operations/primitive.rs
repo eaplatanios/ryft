@@ -128,10 +128,10 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
 }
 
 // Differentiation (JVP) for the `ArrayOperation` sum type: each variant delegates to its backing operation's own
-// `DifferentiableOperation` rule. The per-variant `<Payload>: DifferentiableOperation<D>` bounds cover the
+// `DifferentiableOperation` rule. The per-variant `<Payload>: DifferentiableOperation<C>` bounds cover the
 // non-self-referential variants; the self-referential higher-order
 // `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
-// `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
+// `Self: DifferentiableOperation<C>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
 impl<
     C: DifferentiationContext<Type = ArrayType, Value: ZeroLike + BooleanLike>
@@ -228,16 +228,15 @@ where
                 Input,
             >,
         > + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
-        CaptureParameterizedOperation<
-                ArrayType,
-                ValueOrCapture<ArrayType, C::Value>,
-                WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
-                    C::Tangent,
-                    ValueOrCapture<C::Type, C::Value>,
-                >,
-                WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
-            > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<C::Constant>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
+            >,
+            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
+        > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<C::Constant>>,
     C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<C::Constant>: Clone + LinearizableProgramOperation<C>,
 {
@@ -310,14 +309,14 @@ where
 /// defined for [`ArrayType`].
 ///
 /// The `V` parameter is the linear program's value and constant-table type. It instantiates to concrete tangent
-/// values for eager linear execution and to tracers when one transform stages another. The `C` parameter is the
+/// values for eager linear execution and to tracers when one transform stages another. The `Constant` parameter is the
 /// constant type of captured primal programs such as [`CustomVjpCall`](Self::CustomVjpCall), which are written over
 /// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
 #[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]
 pub enum LinearArrayOperation<
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
 > {
@@ -355,8 +354,10 @@ pub enum LinearArrayOperation<
     Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
     WhileCondition(ConditionOperation<ArrayType, V, Self, V, Input>),
     While(Box<WhileOperation<ArrayType, V, Self, Input>>),
-    Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>),
-    CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
+    Scan(
+        Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>, F, Input>>,
+    ),
+    CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, Constant, P, F>>),
 }
 
 impl<V> MaybeRematerializationName for ArrayOperation<V>
@@ -387,13 +388,13 @@ where
 
 /// Shared payload-mapping core behind [`CaptureParameterizedOperation::try_map_captures`] for
 /// [`LinearArrayOperation`].
-fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
-    operation: &LinearArrayOperation<V, C, F, P>,
+fn map_linear_array_operation_factors<V, Constant, F, MappedFactor, P, MapFactorFn>(
+    operation: &LinearArrayOperation<V, Constant, F, P>,
     map_factor: &mut MapFactorFn,
-) -> Result<LinearArrayOperation<V, C, MappedFactor, P>, ProgramError>
+) -> Result<LinearArrayOperation<V, Constant, MappedFactor, P>, ProgramError>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -527,14 +528,14 @@ where
 }
 
 // TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
-impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, F, P>
+impl<V, Constant, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, Constant, F, P>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
 {
-    type WithCapture<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, C, MappedFactor, P>;
+    type WithCapture<MappedFactor: Value<ArrayType>> = LinearArrayOperation<V, Constant, MappedFactor, P>;
 
     fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -548,11 +549,12 @@ where
 }
 
 // TODO(eaplatanios): Fold this into our `TransposableOperation` derive macro.
-impl<V, C, R, P> DefactorizableProgramOperation<V, R, P> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
+impl<V, Constant, R, P> DefactorizableProgramOperation<V, R, P>
+    for LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, R>, P>
 where
     V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Zero<ArrayType, V>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
         + Operation<ArrayType>
@@ -892,13 +894,13 @@ where
 /// The where clauses here are deliberately the *leaf* closure of what
 /// [`Program::linearize`] needs — the generic JVP
 /// dispatch impl's bounds instantiated at [`LinearizationContextOf`] — rather than the
-/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound itself. Spelling out the leaves keeps
+/// `Self: DifferentiableOperation<LinearizationContextOf<C, Self>>` bound itself. Spelling out the leaves keeps
 /// instantiating this impl free of derived-context differentiation obligations (the recursive obligation is
 /// discharged once, as a definition-time body check), which is what lets the JVP dispatch impl require
-/// `Self: LinearizableProgramOperation<E>` without sending the trait solver into an unbounded nested-context
+/// `Self: LinearizableProgramOperation<C>` without sending the trait solver into an unbounded nested-context
 /// recursion. The `WithCapture<V> = ..` equality pins the canonical linear operation as a fixed point of factor
-/// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
-/// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
+/// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<C, ..>, ..>`
+/// to `LinearizationContextOf<C, ..>` and keeps the obligations finite for nested conditions.
 impl<V: Value<ArrayType>, C: DifferentiationContext<Type = ArrayType, Constant = V>, BodyOperation>
     LinearizableProgramOperation<C> for ArrayOperation<V>
 where
@@ -1042,16 +1044,16 @@ where
 }
 
 /// Dispatches non-control-flow [`LinearArrayOperation`] variants to their primitive batching rules.
-fn batch_linear_non_control_operation<F, C, V>(
-    operation: &LinearArrayOperation<F, C, F, ArrayOperation<C>>,
+fn batch_linear_non_control_operation<F, Constant, V>(
+    operation: &LinearArrayOperation<F, Constant, F, ArrayOperation<Constant>>,
     context: &V::InterpretationContext,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
     F: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     F::InterpretationContext: Zero<ArrayType, F>,
-    C: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    C::InterpretationContext: Zero<ArrayType, C>,
+    Constant: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    Constant::InterpretationContext: Zero<ArrayType, Constant>,
     V: Value<ArrayType>
         + Add<Output = V>
         + Sub<Output = V>

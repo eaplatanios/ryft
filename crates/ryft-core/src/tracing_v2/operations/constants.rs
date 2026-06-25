@@ -126,23 +126,23 @@ impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for Z
     }
 }
 
-impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
+impl<C> DifferentiableOperation<C> for ZeroOperation<C::Type>
 where
-    D: DifferentiationContext,
-    D::Operation: From<ZeroOperation<D::Type>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
-    ZeroOperation<D::Type>: Operation<D::Type>,
+    C: DifferentiationContext,
+    C::Operation: From<ZeroOperation<C::Type>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
+    ZeroOperation<C::Type>: Operation<C::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
-        let operation = D::Operation::from(ZeroOperation::new(self.r#type().clone()));
+        let operation = C::Operation::from(ZeroOperation::new(self.r#type().clone()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
         let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(self.r#type().clone()))?;
@@ -163,23 +163,23 @@ impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for O
     }
 }
 
-impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
+impl<C> DifferentiableOperation<C> for OneOperation<C::Type>
 where
-    D: DifferentiationContext,
-    D::Operation: From<OneOperation<D::Type>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
-    OneOperation<D::Type>: Operation<D::Type>,
+    C: DifferentiationContext,
+    C::Operation: From<OneOperation<C::Type>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
+    OneOperation<C::Type>: Operation<C::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
-        let operation = D::Operation::from(OneOperation::new(self.r#type().clone()));
+        let operation = C::Operation::from(OneOperation::new(self.r#type().clone()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
         let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(self.r#type().clone()))?;
@@ -206,20 +206,20 @@ where
     }
 }
 
-impl<D> DifferentiableOperation<D> for ConstantOperation<D::Type, D::Constant>
+impl<C> DifferentiableOperation<C> for ConstantOperation<C::Type, C::Constant>
 where
-    D: DifferentiationContext,
-    D::Constant: Clone + Typed<D::Type>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
-    ConstantOperation<D::Type, D::Constant>: Operation<D::Type>,
+    C: DifferentiationContext,
+    C::Constant: Clone + Typed<C::Type>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
+    ConstantOperation<C::Type, C::Constant>: Operation<C::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
         let output_type = self.value().r#type().into_owned();
@@ -242,20 +242,20 @@ impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for Z
     }
 }
 
-impl<D> DifferentiableOperation<D> for ZeroLikeOperation
+impl<C> DifferentiableOperation<C> for ZeroLikeOperation
 where
-    D: DifferentiationContext,
-    ZeroLikeOperation: Operation<D::Type>,
-    D::Value: ZeroLike,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
+    C: DifferentiationContext,
+    ZeroLikeOperation: Operation<C::Type>,
+    C::Value: ZeroLike,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().zero_like();
@@ -278,20 +278,20 @@ impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for O
     }
 }
 
-impl<D> DifferentiableOperation<D> for OneLikeOperation
+impl<C> DifferentiableOperation<C> for OneLikeOperation
 where
-    D: DifferentiationContext,
-    OneLikeOperation: Operation<D::Type>,
-    D::Value: OneLike,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
+    C: DifferentiationContext,
+    OneLikeOperation: Operation<C::Type>,
+    C::Value: OneLike,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().one_like();
@@ -320,23 +320,23 @@ where
     }
 }
 
-impl<D> DifferentiableOperation<D> for FillOperation<D::Type, f64>
+impl<C> DifferentiableOperation<C> for FillOperation<C::Type, f64>
 where
-    D: DifferentiationContext,
-    D::Operation: From<FillOperation<D::Type, f64>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
-    FillOperation<D::Type, f64>: Operation<D::Type>,
+    C: DifferentiationContext,
+    C::Operation: From<FillOperation<C::Type, f64>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
+    FillOperation<C::Type, f64>: Operation<C::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 0, ProgramError);
-        let operation = D::Operation::from(FillOperation::new(self.r#type().clone(), *self.value()));
+        let operation = C::Operation::from(FillOperation::new(self.r#type().clone(), *self.value()));
         let mut primals = context.bind_primal(operation, &[])?;
         check_count!("output", primals, 1, ProgramError);
         let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(self.r#type().clone()))?;

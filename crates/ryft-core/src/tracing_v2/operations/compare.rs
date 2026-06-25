@@ -25,26 +25,26 @@ where
 /// Comparison outputs are Boolean, so [`CompareOperation`] uses the zero-tangent forward-mode rule. The rule is
 /// generic over the context's metadata type and applies to every context whose values can be compared and
 /// interpreted, covering both array ([`ArrayType`]) and scalar ([`DataType`](crate::types::DataType)) programs.
-impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> ZeroTangentOperation<D> for CompareOperation where
-    Self: InterpretableOperation<D::Type, D::Value>
+impl<C: DifferentiationContext<Value: Compare<Output = C::Value>>> ZeroTangentOperation<C> for CompareOperation where
+    Self: InterpretableOperation<C::Type, C::Value>
 {
 }
 
 /// JVP rule for [`CompareOperation`]: the Boolean primal output is computed from the input primals and paired with a
 /// canonical staged zero tangent. Refer to the documentation of [`ZeroTangentOperation`] for why this is sound.
-impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> DifferentiableOperation<D> for CompareOperation
+impl<C: DifferentiationContext<Value: Compare<Output = C::Value>>> DifferentiableOperation<C> for CompareOperation
 where
-    Self: Operation<D::Type> + InterpretableOperation<D::Type, D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
+    Self: Operation<C::Type> + InterpretableOperation<C::Type, C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         self.zero_tangent_jvp(context, inputs)
     }

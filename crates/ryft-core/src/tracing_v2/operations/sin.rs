@@ -9,23 +9,23 @@ use crate::programs::ProgramError;
 use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 
-impl<D> DifferentiableOperation<D> for SinOperation
+impl<C> DifferentiableOperation<C> for SinOperation
 where
-    D: DifferentiationContext,
-    SinOperation: Operation<D::Type>,
-    D::Value: Sin + Cos,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
+    C: DifferentiationContext,
+    SinOperation: Operation<C::Type>,
+    C::Value: Sin + Cos,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<ScaleOperation<C::Type, ValueOrCapture<C::Type, C::Value>, Input>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];

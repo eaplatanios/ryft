@@ -26,21 +26,21 @@ use crate::types::{ArrayType, Typed};
 /// tangents (the [`LinearScatterAddOperation`] form). When both operand tangents are symbolic zeros the output tangent
 /// is a symbolic zero. The non-additive combiners are not linear: their JVP is only defined under `unique_indices`
 /// with a primal-domain mask and is not yet implemented, so a non-zero tangent through them is rejected.
-impl<D> DifferentiableOperation<D> for ScatterOperation
+impl<C> DifferentiableOperation<C> for ScatterOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Scatter,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<LinearScatterAddOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Scatter,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<LinearScatterAddOperation<ValueOrCapture<ArrayType, C::Value>>> + From<ZeroOperation<ArrayType>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let [operand, indices, updates] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() });

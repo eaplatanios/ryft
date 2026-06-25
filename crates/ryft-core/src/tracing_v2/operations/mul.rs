@@ -13,23 +13,23 @@ use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Typed};
 
-impl<D> DifferentiableOperation<D> for MulOperation
+impl<C> DifferentiableOperation<C> for MulOperation
 where
-    D: DifferentiationContext,
-    MulOperation: Operation<D::Type>,
-    D::Value: Mul<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<AddOperation>
-        + From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>
-        + From<ZeroOperation<D::Type>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
+    C: DifferentiationContext,
+    MulOperation: Operation<C::Type>,
+    C::Value: Mul<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<AddOperation>
+        + From<ScaleOperation<C::Type, ValueOrCapture<C::Type, C::Value>, Input>>
+        + From<ZeroOperation<C::Type>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];

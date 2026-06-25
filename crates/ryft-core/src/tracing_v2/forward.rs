@@ -441,24 +441,22 @@ mod tests {
         }
     }
 
-    impl<D> DifferentiableOperation<D> for DistinctPrimalOperation
+    impl<C> DifferentiableOperation<C> for DistinctPrimalOperation
     where
-        D: DifferentiationContext<Type = DataType>,
-        D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-            From<AddOperation> + From<ScaleOperation<DataType, ValueOrCapture<DataType, <D as Domain>::Value>, Input>>,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-            MaybeZeroOperation<DataType>,
+        C: DifferentiationContext<Type = DataType>,
+        C::Value: Add<Output = C::Value> + Mul<Output = C::Value>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+            From<AddOperation> + From<ScaleOperation<DataType, ValueOrCapture<DataType, <C as Domain>::Value>, Input>>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
             &self,
-            context: &mut TangentContext<'jvp, D>,
-            inputs: &[JvpTracer<'jvp, D>],
-        ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+            context: &mut TangentContext<'jvp, C>,
+            inputs: &[JvpTracer<'jvp, C>],
+        ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
         where
-            D: 'jvp,
-            D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-                From<ZeroOperation<DataType>>,
+            C: 'jvp,
+            C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<DataType>>,
         {
             match self {
                 Self::Add => AddOperation.jvp(context, inputs),

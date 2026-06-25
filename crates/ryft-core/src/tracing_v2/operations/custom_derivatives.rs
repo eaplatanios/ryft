@@ -115,12 +115,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomJvpOperation<
     }
 }
 
-impl<T, C, O, V> InterpretableOperation<T, V> for CustomJvpOperation<T, C, O>
+impl<T, Constant, O, V> InterpretableOperation<T, V> for CustomJvpOperation<T, Constant, O>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     V: Value<T>,
-    O: InterpretableProgramOperation<T, V, C>,
+    O: InterpretableProgramOperation<T, V, Constant>,
 {
     fn interpret(
         &self,
@@ -138,30 +138,30 @@ where
 /// The rule evaluates the JVP program's primal at `(x̂, 0)` (its first half yields the rule's primal outputs) and
 /// seeds its pushforward with `(0, t̂)` so that only the user-defined — and therefore necessarily linear — tangent
 /// map survives in the staged linear program.
-fn custom_jvp_rule<'jvp, D, O>(
-    operation: &CustomJvpOperation<D::Type, <D as Domain>::Constant, O>,
-    context: &mut TangentContext<'jvp, D>,
-    inputs: &[JvpTracer<'jvp, D>],
-) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+fn custom_jvp_rule<'jvp, C, O>(
+    operation: &CustomJvpOperation<C::Type, <C as Domain>::Constant, O>,
+    context: &mut TangentContext<'jvp, C>,
+    inputs: &[JvpTracer<'jvp, C>],
+) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
 where
-    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
-    <D as Domain>::Value: ZeroLike,
-    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: CaptureParameterizedOperation<
-            D::Type,
-            ValueOrCapture<D::Type, <D as Domain>::Value>,
-            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
+    <C as Domain>::Value: ZeroLike,
+    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
+            C::Type,
+            ValueOrCapture<C::Type, <C as Domain>::Value>,
+            WithCapture<ValueOrCapture<C::Type, <C as Domain>::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
         >,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
-    Vec<<D as Domain>::Constant>: Parameterized<
-            <D as Domain>::Constant,
-            Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
-            To<<D as Domain>::Value> = Vec<<D as Domain>::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
+    Vec<<C as Domain>::Constant>: Parameterized<
+            <C as Domain>::Constant,
+            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
+            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
@@ -194,7 +194,7 @@ where
     let residual_factors =
         pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
     let pushforward_program = pushforward.program().map_operations(|operation| {
-        operation.try_map_captures(&mut |factor: &ValueOrCapture<D::Type, <D as Domain>::Value>| match factor {
+        operation.try_map_captures(&mut |factor: &ValueOrCapture<C::Type, <C as Domain>::Value>| match factor {
             ValueOrCapture::Capture { index, .. } => residual_factors
                 .get(*index)
                 .cloned()
@@ -212,36 +212,36 @@ where
 }
 
 /// Differentiates a `custom_jvp` call by running its forward-derivative rule; see [`custom_jvp_rule`].
-impl<O, D> DifferentiableOperation<D> for CustomJvpOperation<D::Type, D::Constant, O>
+impl<O, C> DifferentiableOperation<C> for CustomJvpOperation<C::Type, C::Constant, O>
 where
-    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
-    <D as Domain>::Value: ZeroLike,
-    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
+    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
+    <C as Domain>::Value: ZeroLike,
+    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
         + CaptureParameterizedOperation<
-            D::Type,
-            ValueOrCapture<D::Type, <D as Domain>::Value>,
-            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+            C::Type,
+            ValueOrCapture<C::Type, <C as Domain>::Value>,
+            WithCapture<ValueOrCapture<C::Type, <C as Domain>::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
         >,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
-    Vec<D::Constant>: Parameterized<
-            D::Constant,
-            Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
-            To<<D as Domain>::Value> = Vec<<D as Domain>::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
+    Vec<C::Constant>: Parameterized<
+            C::Constant,
+            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
+            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         custom_jvp_rule(self, context, inputs)
     }
@@ -538,12 +538,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for CustomVjpOperation<
     }
 }
 
-impl<T, C, O, V> InterpretableOperation<T, V> for CustomVjpOperation<T, C, O>
+impl<T, Constant, O, V> InterpretableOperation<T, V> for CustomVjpOperation<T, Constant, O>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     V: Value<T>,
-    O: InterpretableProgramOperation<T, V, C>,
+    O: InterpretableProgramOperation<T, V, Constant>,
 {
     fn interpret(
         &self,
@@ -562,22 +562,22 @@ where
 /// forward body is never differentiated beyond what its primal evaluation requires — captures the trailing residual
 /// outputs as factors, and stages one opaque [`CustomVjpCallOperation`] mapping the input tangents to the output
 /// tangents. The staged call rejects forward-mode interpretation; its transpose replays the user's backward program.
-fn custom_vjp_rule<'jvp, D, O>(
-    operation: &CustomVjpOperation<D::Type, <D as Domain>::Constant, O>,
-    context: &mut TangentContext<'jvp, D>,
-    inputs: &[JvpTracer<'jvp, D>],
-) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+fn custom_vjp_rule<'jvp, C, O>(
+    operation: &CustomVjpOperation<C::Type, <C as Domain>::Constant, O>,
+    context: &mut TangentContext<'jvp, C>,
+    inputs: &[JvpTracer<'jvp, C>],
+) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
 where
-    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
-    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
-    Vec<<D as Domain>::Constant>: Parameterized<
-            <D as Domain>::Constant,
-            Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
-            To<<D as Domain>::Value> = Vec<<D as Domain>::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
+    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
+    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
+        + From<CustomVjpCallOperation<C::Type, <C as Domain>::Constant, O, ValueOrCapture<C::Type, <C as Domain>::Value>>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
+    Vec<<C as Domain>::Constant>: Parameterized<
+            <C as Domain>::Constant,
+            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
+            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
@@ -589,15 +589,13 @@ where
         context.differentiable().linearize_program(&operation.forward, primal_operands)?;
     let residuals = forward_values.split_off(output_count);
     let factors = residuals.into_iter().map(|residual| context.factor(residual)).collect::<Vec<_>>();
-    let call = <D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>>::from(
-        CustomVjpCallOperation::new(
-            operation.backward.clone(),
-            operation.tangent.clone(),
-            factors,
-            false,
-            operation.prevent_cse,
-        ),
-    );
+    let call = <C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>::from(CustomVjpCallOperation::new(
+        operation.backward.clone(),
+        operation.tangent.clone(),
+        factors,
+        false,
+        operation.prevent_cse,
+    ));
     let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
     Ok(forward_values
@@ -608,28 +606,28 @@ where
 }
 
 /// Differentiates a `custom_vjp` call by running its forward-derivative rule; see [`custom_vjp_rule`].
-impl<O, D> DifferentiableOperation<D> for CustomVjpOperation<D::Type, D::Constant, O>
+impl<O, C> DifferentiableOperation<C> for CustomVjpOperation<C::Type, C::Constant, O>
 where
-    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
-    O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<D::Type, D::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
-    Vec<D::Constant>: Parameterized<
-            D::Constant,
-            Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
-            To<<D as Domain>::Value> = Vec<<D as Domain>::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
+    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
+    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
+        + From<CustomVjpCallOperation<C::Type, C::Constant, O, ValueOrCapture<C::Type, <C as Domain>::Value>>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
+    Vec<C::Constant>: Parameterized<
+            C::Constant,
+            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
+            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         custom_vjp_rule(self, context, inputs)
     }
@@ -853,8 +851,8 @@ impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for Custom
 /// Custom-VJP calls are context-mediated because executing the call means replaying a captured tangent or backward
 /// program. Eager contexts replay the program into concrete values, while staging contexts replay it into tracer
 /// instructions by lifting constants and binding each captured instruction through the active context.
-pub trait CustomVjpCall<T: Type, C: Value<T>, O: Operation<T>, F: Value<T>, V: Value<T>>:
-    Context<Type = T, Constant = C, Value = V>
+pub trait CustomVjpCall<T: Type, Constant: Value<T>, O: Operation<T>, F: Value<T>, V: Value<T>>:
+    Context<Type = T, Constant = Constant, Value = V>
 {
     /// Interprets `operation` over `inputs`.
     ///
@@ -864,24 +862,24 @@ pub trait CustomVjpCall<T: Type, C: Value<T>, O: Operation<T>, F: Value<T>, V: V
     ///   - `inputs`: Runtime tangent or cotangent inputs for the selected captured program.
     fn interpret_custom_vjp_call(
         &self,
-        operation: &CustomVjpCallOperation<T, C, O, F>,
+        operation: &CustomVjpCallOperation<T, Constant, O, F>,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError>;
 }
 
-impl<T, C, O, F, V, ContextT> CustomVjpCall<T, C, O, F, V> for ContextT
+impl<T, Constant, O, F, V, ContextT> CustomVjpCall<T, Constant, O, F, V> for ContextT
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     V: Value<T, InterpretationContext = ContextT>,
     F: CustomVjpResidual<T, V>,
     O: InterpretableOperation<T, V> + Operation<T>,
-    ContextT: Context<Type = T, Constant = C, Value = V>,
-    Vec<C>: Parameterized<C, ParameterStructure: Debug + PartialEq>,
+    ContextT: Context<Type = T, Constant = Constant, Value = V>,
+    Vec<Constant>: Parameterized<Constant, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret_custom_vjp_call(
         &self,
-        operation: &CustomVjpCallOperation<T, C, O, F>,
+        operation: &CustomVjpCallOperation<T, Constant, O, F>,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let program = if operation.transposed {
@@ -910,14 +908,14 @@ where
     }
 }
 
-impl<T, C, O, F, V> InterpretableOperation<T, V> for CustomVjpCallOperation<T, C, O, F>
+impl<T, Constant, O, F, V> InterpretableOperation<T, V> for CustomVjpCallOperation<T, Constant, O, F>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     V: Value<T>,
     F: Value<T>,
     O: Operation<T>,
-    V::InterpretationContext: CustomVjpCall<T, C, O, F, V>,
+    V::InterpretationContext: CustomVjpCall<T, Constant, O, F, V>,
 {
     fn interpret(
         &self,

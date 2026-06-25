@@ -79,20 +79,20 @@ where
     }
 }
 
-impl<D> DifferentiableOperation<D> for BroadcastOperation
+impl<C> DifferentiableOperation<C> for BroadcastOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Broadcast,
-    D::Tangent: Broadcast,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<BroadcastOperation>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Broadcast,
+    C::Tangent: Broadcast,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<BroadcastOperation>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().broadcast(self.output_type().clone(), self.output_axes())?;

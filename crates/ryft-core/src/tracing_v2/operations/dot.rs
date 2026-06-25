@@ -201,7 +201,7 @@ macro_rules! impl_dot_for_scalar {
 
 impl_dot_for_scalar!(bf16, f16, f32, f64);
 
-/// Generalized N-D dot and transpose capability.
+/// Generalized N-C dot and transpose capability.
 ///
 /// This convenience trait groups the value-level [`Dot`] and [`Transpose`] operations used by the unified
 /// [`DotOperation`] and [`TransposeOperation`](crate::operations::manipulation::TransposeOperation) primitives.
@@ -665,29 +665,29 @@ where
 
 /// JVP rule for the generalized dot product.
 ///
-/// The pushforward of `dot(A, B; D)` is `dot(ΔA, B; D) + dot(A, ΔB; D)`: each operand's
+/// The pushforward of `dot(A, B; C)` is `dot(ΔA, B; C) + dot(A, ΔB; C)`: each operand's
 /// contribution is itself a dot with the same dimension numbers, holding the other operand
 /// constant. The two contributions are staged through [`RightDotOperation`] (holding the
 /// right primal `B` constant on the right) and [`LeftDotOperation`] (holding the left primal
 /// `A` constant on the left), respectively. A requested output sharding is forwarded to both
 /// tangent dots, since tangent shardings mirror their primals.
-impl<D> DifferentiableOperation<D> for DotOperation
+impl<C> DifferentiableOperation<C> for DotOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Dot,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<AddOperation>
-        + From<LeftDotOperation<ValueOrCapture<ArrayType, D::Value>, Input>>
-        + From<RightDotOperation<ValueOrCapture<ArrayType, D::Value>, Input>>
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Dot,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<AddOperation>
+        + From<LeftDotOperation<ValueOrCapture<ArrayType, C::Value>, Input>>
+        + From<RightDotOperation<ValueOrCapture<ArrayType, C::Value>, Input>>
         + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
@@ -704,9 +704,9 @@ where
             None
         } else {
             let factor = right.factor(context);
-            Some(<TangentContext<'jvp, D> as RightDot<
-                crate::tracing::Tracer<TangentContext<'jvp, D>>,
-                ValueOrCapture<ArrayType, D::Value>,
+            Some(<TangentContext<'jvp, C> as RightDot<
+                crate::tracing::Tracer<TangentContext<'jvp, C>>,
+                ValueOrCapture<ArrayType, C::Value>,
                 Input,
             >>::right_dot(
                 context, left.tangent(), factor, &self.dimensions, self.output_sharding.as_ref()
@@ -716,9 +716,9 @@ where
             None
         } else {
             let factor = left.factor(context);
-            Some(<TangentContext<'jvp, D> as LeftDot<
-                crate::tracing::Tracer<TangentContext<'jvp, D>>,
-                ValueOrCapture<ArrayType, D::Value>,
+            Some(<TangentContext<'jvp, C> as LeftDot<
+                crate::tracing::Tracer<TangentContext<'jvp, C>>,
+                ValueOrCapture<ArrayType, C::Value>,
                 Input,
             >>::left_dot(
                 context, right.tangent(), factor, &self.dimensions, self.output_sharding.as_ref()

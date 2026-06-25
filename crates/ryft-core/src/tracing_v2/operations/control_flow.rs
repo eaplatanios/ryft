@@ -38,10 +38,10 @@ use crate::types::{ArrayType, DataType, Size, Type, TypeError, Typed};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-impl<'domain, E> BooleanLike for JvpTracer<'domain, E>
+impl<'context, C> BooleanLike for JvpTracer<'context, C>
 where
-    E: DifferentiationContext<Type = ArrayType>,
-    E::Value: BooleanLike,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BooleanLike,
 {
     /// Returns this [`JvpTracer`] unchanged. A JVP tracer pairs a primal with a tangent, and reinterpreting only the
     /// primal payload as Boolean would silently sever that pairing, so a Boolean reinterpretation must be expressed
@@ -835,35 +835,35 @@ where
 /// Rewrites a branch pushforward's local [`ValueOrCapture::Capture`]s onto the enclosing linearization residual
 /// environment using `factors`, where `factors[i]` is the enclosing factor registered for the branch's residual `i`.
 /// Closed [`ValueOrCapture::Value`] factors are carried over unchanged.
-fn remap_branch_residual_factors<D>(
+fn remap_branch_residual_factors<C>(
     program: &Program<
         ArrayType,
-        D::Tangent,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
-        Vec<D::Tangent>,
-        Vec<D::Tangent>,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+        Vec<C::Tangent>,
+        Vec<C::Tangent>,
     >,
-    factors: &[ValueOrCapture<ArrayType, D::Value>],
+    factors: &[ValueOrCapture<ArrayType, C::Value>],
 ) -> Result<
     Program<
         ArrayType,
-        D::Tangent,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
-        Vec<D::Tangent>,
-        Vec<D::Tangent>,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+        Vec<C::Tangent>,
+        Vec<C::Tangent>,
     >,
     ProgramError,
 >
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: CaptureParameterizedOperation<
+    C: DifferentiationContext<Type = ArrayType>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, D::Value>,
-            WithCapture<ValueOrCapture<ArrayType, D::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
-        > + ResidualizedOperation<D>,
+        > + ResidualizedOperation<C>,
 {
     program.map_operations(|operation| {
         operation.try_map_captures(&mut |factor| match factor {
@@ -885,27 +885,27 @@ where
 /// Each instruction is wrapped through [`RecomputeOperation`] and each program constant is materialized through a
 /// nullary [`MaterializeCaptureOperation`] whose closed factor is the constant lifted into the enclosing context,
 /// since the linear program's value type generally differs from the primal constant type.
-fn inline_recomputed_primal_program<E, O>(
-    differentiable: &E,
+fn inline_recomputed_primal_program<C, O>(
+    differentiable: &C,
     builder: &mut ProgramBuilder<
-        <E as Domain>::Type,
-        E::Tangent,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
+        <C as Domain>::Type,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
     >,
     program: &Program<
-        <E as Domain>::Type,
-        <E as Domain>::Constant,
+        <C as Domain>::Type,
+        <C as Domain>::Constant,
         O,
-        Vec<<E as Domain>::Constant>,
-        Vec<<E as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
     >,
     input_atoms: &[AtomId],
 ) -> Result<Vec<AtomId>, ProgramError>
 where
-    E: DifferentiationContext,
-    O: Clone + Operation<<E as Domain>::Type>,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>:
-        From<MaterializeCaptureOperation<ValueOrCapture<<E as Domain>::Type, E::Value>>> + From<RecomputeOperation<O>>,
+    C: DifferentiationContext,
+    O: Clone + Operation<<C as Domain>::Type>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<MaterializeCaptureOperation<ValueOrCapture<<C as Domain>::Type, C::Value>>> + From<RecomputeOperation<O>>,
 {
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
@@ -941,36 +941,35 @@ where
 
 /// Defactorizes a body pushforward `program`, inlines it into the linear `builder`, and returns the builder atoms
 /// carrying the program outputs.
-fn inline_defactorized_pushforward_program<E, O>(
+fn inline_defactorized_pushforward_program<C, O>(
     builder: &mut ProgramBuilder<
-        <E as Domain>::Type,
-        E::Tangent,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
+        <C as Domain>::Type,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
     >,
     program: &Program<
-        <E as Domain>::Type,
-        E::Tangent,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-        Vec<E::Tangent>,
-        Vec<E::Tangent>,
+        <C as Domain>::Type,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+        Vec<C::Tangent>,
+        Vec<C::Tangent>,
     >,
     input_atoms: &[AtomId],
     residual_atoms: &[AtomId],
     residual_types: &[ArrayType],
 ) -> Result<Vec<AtomId>, ProgramError>
 where
-    E: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    C: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     O: Clone + Operation<ArrayType>,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>:
-        DefactorizableProgramOperation<E::Tangent, E::Value, O>
-            + CaptureParameterizedOperation<
-                ArrayType,
-                ValueOrCapture<ArrayType, E::Value>,
-                WithCapture<ValueOrCapture<ArrayType, E::Value>> = E::LinearOperation<
-                    E::Tangent,
-                    ValueOrCapture<E::Type, E::Value>,
-                >,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: DefactorizableProgramOperation<C::Tangent, C::Value, O>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
+        >,
 {
     if residual_atoms.len() != residual_types.len() {
         return Err(ProgramError::InvalidInputCount { expected: residual_types.len(), actual: residual_atoms.len() });
@@ -981,11 +980,11 @@ where
         .map(|(index, _)| Some(DefactorizationDisposition::Operand(index)))
         .collect::<Vec<_>>();
     let program =
-        <E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>> as DefactorizableProgramOperation<E::Tangent, E::Value, O>>::defactorize_program(
-            program,
-            dispositions.as_slice(),
-            residual_types,
-        )?;
+        <C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>> as DefactorizableProgramOperation<
+            C::Tangent,
+            C::Value,
+            O,
+        >>::defactorize_program(program, dispositions.as_slice(), residual_types)?;
     let input_atoms = input_atoms.iter().chain(residual_atoms.iter()).copied().collect::<Vec<_>>();
     check_count!("input", input_atoms, program.input_ids().len(), ProgramError);
     let mut atom_map: Vec<Option<AtomId>> = vec![None; program.atoms().len()];
@@ -1023,58 +1022,57 @@ where
 /// pushforward over the tangent half with its loop-varying residual references defactorized against the recomputed
 /// residual atoms, and outputs `[next_primal_state..., next_tangent_state...]`. The extended condition recomputes
 /// the original loop predicate from the primal half and ignores the tangent half.
-fn build_fused_while_programs<E, O>(
-    differentiable: &E,
+fn build_fused_while_programs<C, O>(
+    differentiable: &C,
     condition: &Program<
-        <E as Domain>::Type,
-        <E as Domain>::Constant,
+        <C as Domain>::Type,
+        <C as Domain>::Constant,
         O,
-        Vec<<E as Domain>::Constant>,
-        Vec<<E as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
     >,
-    linearization: &NestedLinearization<E, O>,
+    linearization: &NestedLinearization<C, O>,
 ) -> Result<
     (
         Program<
-            <E as Domain>::Type,
-            E::Tangent,
-            E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-            Vec<E::Tangent>,
-            Vec<E::Tangent>,
+            <C as Domain>::Type,
+            C::Tangent,
+            C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+            Vec<C::Tangent>,
+            Vec<C::Tangent>,
         >,
         Program<
-            <E as Domain>::Type,
-            E::Tangent,
-            E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-            Vec<E::Tangent>,
-            Vec<E::Tangent>,
+            <C as Domain>::Type,
+            C::Tangent,
+            C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+            Vec<C::Tangent>,
+            Vec<C::Tangent>,
         >,
     ),
     ProgramError,
 >
 where
-    E: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    C: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     O: Clone + Operation<ArrayType>,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>:
-        DefactorizableProgramOperation<E::Tangent, E::Value, O>
-            + CaptureParameterizedOperation<
-                ArrayType,
-                ValueOrCapture<ArrayType, E::Value>,
-                WithCapture<ValueOrCapture<ArrayType, E::Value>> = E::LinearOperation<
-                    E::Tangent,
-                    ValueOrCapture<E::Type, E::Value>,
-                >,
-            > + From<MaterializeCaptureOperation<ValueOrCapture<<E as Domain>::Type, E::Value>>>
-            + From<RecomputeOperation<O>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: DefactorizableProgramOperation<C::Tangent, C::Value, O>
+        + CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
+            >,
+        > + From<MaterializeCaptureOperation<ValueOrCapture<<C as Domain>::Type, C::Value>>>
+        + From<RecomputeOperation<O>>,
 {
     let state_types = condition.input_types();
     let state_count = state_types.len();
     let residual_count = linearization.residual_types.len();
 
     let mut body_builder = ProgramBuilder::<
-        <E as Domain>::Type,
-        E::Tangent,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
+        <C as Domain>::Type,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
     >::new();
     let primal_inputs =
         state_types.iter().map(|state_type| body_builder.add_input(state_type.clone())).collect::<Vec<_>>();
@@ -1087,7 +1085,7 @@ where
         primal_inputs.as_slice(),
     )?;
     check_count!("output", primal_outputs, state_count + residual_count, ProgramError);
-    let tangent_outputs = inline_defactorized_pushforward_program::<E, O>(
+    let tangent_outputs = inline_defactorized_pushforward_program::<C, O>(
         &mut body_builder,
         &linearization.pushforward_program,
         tangent_inputs.as_slice(),
@@ -1101,9 +1099,9 @@ where
         body_builder.build(body_outputs, vec![Placeholder; 2 * state_count], vec![Placeholder; 2 * state_count])?;
 
     let mut condition_builder = ProgramBuilder::<
-        <E as Domain>::Type,
-        E::Tangent,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
+        <C as Domain>::Type,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
     >::new();
     let condition_primal_inputs = state_types
         .iter()
@@ -1303,39 +1301,39 @@ where
 /// The predicate is the first operand and its tangent is ignored (Boolean predicates have no tangent space).
 /// Reverse mode composes through the total linear-condition transpose rule, which transposes both branch programs
 /// and carries the predicate factor verbatim.
-impl<D, O> DifferentiableOperation<D> for ConditionOperation<ArrayType, D::Constant, O>
+impl<C, O> DifferentiableOperation<C> for ConditionOperation<ArrayType, C::Constant, O>
 where
-    D: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    C: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<ArrayType, D::Constant, O>>
-        + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: CaptureParameterizedOperation<
+        + From<ConditionOperation<ArrayType, C::Constant, O>>
+        + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, D::Value>,
-            WithCapture<ValueOrCapture<ArrayType, D::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
-        > + ResidualizedOperation<D>
+        > + ResidualizedOperation<C>
         + From<
             ConditionOperation<
                 ArrayType,
-                D::Tangent,
-                D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
-                ValueOrCapture<ArrayType, D::Value>,
+                C::Tangent,
+                C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+                ValueOrCapture<ArrayType, C::Value>,
                 Captured,
             >,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, self.true_branch().input_types().len() + 1, ProgramError);
         let predicate = &inputs[0];
@@ -1377,8 +1375,8 @@ where
         let primal_outputs = bound_outputs;
         let residual_factors = residual_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
         let (true_residual_factors, false_residual_factors) = residual_factors.split_at(true_residual_types.len());
-        let true_branch = remap_branch_residual_factors::<D>(&true_pushforward_program, true_residual_factors)?;
-        let false_branch = remap_branch_residual_factors::<D>(&false_pushforward_program, false_residual_factors)?;
+        let true_branch = remap_branch_residual_factors::<C>(&true_pushforward_program, true_residual_factors)?;
+        let false_branch = remap_branch_residual_factors::<C>(&false_pushforward_program, false_residual_factors)?;
 
         // Stage one linear condition over the operand tangents, capturing the predicate primal as a residual factor.
         let predicate_factor = predicate.factor(context);
@@ -1421,34 +1419,34 @@ where
     }
 }
 
-impl<D, O> DifferentiableOperation<D> for WhileOperation<DataType, D::Constant, O>
+impl<C, O> DifferentiableOperation<C> for WhileOperation<DataType, C::Constant, O>
 where
-    D: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
-    D::Value: BooleanLike,
-    O: Clone + Operation<DataType> + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: CaptureParameterizedOperation<
+    C: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
+    C::Value: BooleanLike,
+    O: Clone + Operation<DataType> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
             DataType,
-            ValueOrCapture<DataType, D::Value>,
-            WithCapture<ValueOrCapture<DataType, D::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+            ValueOrCapture<DataType, C::Value>,
+            WithCapture<ValueOrCapture<DataType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
         >,
-    Vec<D::Constant>: Parameterized<
-            D::Constant,
-            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
+    Vec<C::Constant>: Parameterized<
+            C::Constant,
+            Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Tangent>,
+            To<C::Value> = Vec<C::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, ProgramError);
@@ -1587,59 +1585,58 @@ where
 /// loop therefore requires an iteration bound (the masked-scan pushforward above transposes totally). Concretizing
 /// domains are unaffected: their pushforwards are straight-line and contain no loop to transpose, so eager reverse
 /// mode works even for unbounded loops.
-impl<D, O, BodyOperation> DifferentiableOperation<D> for WhileOperation<ArrayType, D::Constant, O>
+impl<C, O, BodyOperation> DifferentiableOperation<C> for WhileOperation<ArrayType, C::Constant, O>
 where
-    D: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
-    D::Value: BooleanLike,
+    C: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    C::Value: BooleanLike,
     O: Clone
         + Operation<ArrayType>
-        + From<WhileOperation<ArrayType, D::Constant, O>>
-        + DifferentiableOperation<D>
-        + LinearizableProgramOperation<D>
+        + From<WhileOperation<ArrayType, C::Constant, O>>
+        + DifferentiableOperation<C>
+        + LinearizableProgramOperation<C>
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<AddOperation>
         + From<BroadcastOperation>
         + From<DynamicUpdateSliceOperation>,
-    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Tangent>>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        CaptureParameterizedOperation<
+    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Tangent>>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
+            >,
+            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
+        > + ResidualizedOperation<C>
+        + DefactorizableProgramOperation<C::Tangent, C::Value, O>
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, C::Value>>>
+        + From<RecomputeOperation<O>>
+        + From<
+            WhileOperation<
                 ArrayType,
-                ValueOrCapture<ArrayType, D::Value>,
-                WithCapture<ValueOrCapture<ArrayType, D::Value>> = D::LinearOperation<
-                    D::Tangent,
-                    ValueOrCapture<D::Type, D::Value>,
-                >,
-                WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
-            > + ResidualizedOperation<D>
-            + DefactorizableProgramOperation<D::Tangent, D::Value, O>
-            + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
-            + From<RecomputeOperation<O>>
-            + From<
-                WhileOperation<
-                    ArrayType,
-                    D::Tangent,
-                    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
-                    Input,
-                >,
-            > + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
-            + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
-    Vec<D::Constant>: Parameterized<
-            D::Constant,
-            Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
-            To<D::Constant> = Vec<D::Constant>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
+                C::Tangent,
+                C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+                Input,
+            >,
+        > + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Value>>>
+        + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
+    Vec<C::Constant>: Parameterized<
+            C::Constant,
+            Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Tangent>,
+            To<C::Constant> = Vec<C::Constant>,
+            To<C::Value> = Vec<C::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: Debug + PartialEq,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, ProgramError);
@@ -1762,7 +1759,7 @@ where
             let mut stack_factors = stack_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
             let pushforward_body = linearization.pushforward_program.map_operations(|operation| {
                 operation.try_map_captures(
-                    &mut |factor| -> Result<ValueOrCapture<ArrayType, D::Tangent>, ProgramError> {
+                    &mut |factor| -> Result<ValueOrCapture<ArrayType, C::Tangent>, ProgramError> {
                         match factor {
                             ValueOrCapture::Capture { index, r#type } => {
                                 Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
@@ -1801,7 +1798,7 @@ where
             stack_factors.push(context.factor(mask_value.clone()));
             let select_conditions = state_types
                 .iter()
-                .map(|state_type| -> Result<ValueOrCapture<ArrayType, D::Tangent>, ProgramError> {
+                .map(|state_type| -> Result<ValueOrCapture<ArrayType, C::Tangent>, ProgramError> {
                     if state_type.rank() == 0 {
                         return Ok(ValueOrCapture::Capture { index: mask_index, r#type: boolean_scalar_type.clone() });
                     }
@@ -1844,8 +1841,8 @@ where
             scan_body.output_ids = masked_outputs;
             scan_body.output_structure = vec![Placeholder; state_count];
             let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-            let linear_scan: D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>> =
-                linear_scan_operation::<ArrayType, D::Tangent, D::Value, BodyOperation>(
+            let linear_scan: C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>> =
+                linear_scan_operation::<ArrayType, C::Tangent, C::Value, BodyOperation>(
                     scan_body,
                     stack_factors,
                     state_count,
@@ -1890,8 +1887,8 @@ where
 
         let linear_while = WhileOperation::<
             ArrayType,
-            D::Tangent,
-            D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
+            C::Tangent,
+            C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
             Input,
         >::new(extended_condition, fused_body)?;
         let linear_outputs = context.stage_operation(linear_while, linear_inputs.as_slice())?;
@@ -3441,22 +3438,21 @@ mod tests {
     /// primal values are tracers). Primal results are produced through [`TangentContext::bind_primal`] so that they
     /// are interpreted eagerly or staged depending on the context. The `Condition` variant intentionally has no rule
     /// here: the tests below exercise [`ConditionOperation`]'s rule directly.
-    impl<D> DifferentiableOperation<D> for TestDifferentiableOperation
+    impl<C> DifferentiableOperation<C> for TestDifferentiableOperation
     where
-        D: DifferentiationContext<Type = ArrayType, Constant = TestValue>
+        C: DifferentiationContext<Type = ArrayType, Constant = TestValue>
             + Domain<Operation = TestDifferentiableOperation>,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
             From<ScaleOperation<ArrayType, TestValue, Input>>,
     {
         fn jvp<'jvp>(
             &self,
-            context: &mut TangentContext<'jvp, D>,
-            inputs: &[JvpTracer<'jvp, D>],
-        ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+            context: &mut TangentContext<'jvp, C>,
+            inputs: &[JvpTracer<'jvp, C>],
+        ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
         where
-            D: 'jvp,
-            D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-                From<ZeroOperation<ArrayType>>,
+            C: 'jvp,
+            C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
         {
             match self {
                 Self::Zero(value_type) => {
@@ -3487,12 +3483,13 @@ mod tests {
                     check_count!("input", inputs, 1, ProgramError);
                     let mut primals = context.bind_primal(self.clone(), &[inputs[0].primal().clone()])?;
                     check_count!("output", primals, 1, ProgramError);
-                    let tangent_outputs = context.stage_operation(
-                        <D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>>::from(
-                            ScaleOperation::<ArrayType, TestValue, Input>::new(factor.clone()),
-                        ),
-                        &[inputs[0].tangent()],
-                    )?;
+                    let tangent_outputs =
+                        context.stage_operation(
+                            <C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>::from(
+                                ScaleOperation::<ArrayType, TestValue, Input>::new(factor.clone()),
+                            ),
+                            &[inputs[0].tangent()],
+                        )?;
                     check_count!("output", tangent_outputs, 1, ProgramError);
                     Ok(vec![JvpTracer::from_value(primals.pop().unwrap(), tangent_outputs[0].clone())])
                 }

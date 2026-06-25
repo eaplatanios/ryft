@@ -22,21 +22,21 @@ use crate::types::{ArrayType, Typed};
 /// JVP rule for [`GatherOperation`]: the primal output is the gather of the operand primal at the index primals, and
 /// the tangent is a captured-index gather of the operand tangent whose indices are the index primals captured as a
 /// residual factor (the [`LinearGatherOperation`] form). A symbolic-zero operand tangent yields a symbolic-zero output.
-impl<D> DifferentiableOperation<D> for GatherOperation
+impl<C> DifferentiableOperation<C> for GatherOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Gather,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<LinearGatherOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Gather,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<LinearGatherOperation<ValueOrCapture<ArrayType, C::Value>>> + From<ZeroOperation<ArrayType>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let [operand, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });

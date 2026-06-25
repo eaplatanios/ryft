@@ -16,13 +16,13 @@ use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing_v2::ValueOrCapture;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::differentiation::{
     CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer,
     LinearizableProgramOperation, NestedLinearization, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::tracing_v2::ValueOrCapture;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Renders a compact comma-separated list of capture-like payloads.
@@ -167,31 +167,31 @@ where
 /// processed. Transposing the linear scan flips `reverse` (and transposes the body program), which pairs cotangent
 /// lane `i` with residual lane `i` in the opposite visit order — making reverse-mode differentiation through `scan`
 /// total, with no array-reversal operation anywhere.
-impl<D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<ArrayType, D::Constant, O>
+impl<C, O, BodyOperation> DifferentiableOperation<C> for ScanOperation<ArrayType, C::Constant, O>
 where
-    D: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
+    C: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
         + From<BroadcastOperation>
-        + From<ScanOperation<ArrayType, D::Constant, O>>
-        + LinearizableProgramOperation<D>,
+        + From<ScanOperation<ArrayType, C::Constant, O>>
+        + LinearizableProgramOperation<C>,
     BodyOperation: Operation<ArrayType>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
         + CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, D::Value>,
-            WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
-        > + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
+        > + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
         From<ZeroOperation<ArrayType>> + MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let carry_count = self.carry_count();
         let length = self.length();
@@ -229,7 +229,7 @@ where
         // Bind the residual-extended primal scan: the appended residual outputs become extra scanned outputs, so
         // the primal scan stores every per-iteration residual as a statically shaped stack. The lowering-only
         // unroll factor carries over from the differentiated scan.
-        let extended_scan = ScanOperation::<ArrayType, D::Constant, O>::new(primal_program, carry_count, length)?
+        let extended_scan = ScanOperation::<ArrayType, C::Constant, O>::new(primal_program, carry_count, length)?
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -244,7 +244,7 @@ where
         let mut stack_factors =
             residual_stack_values.into_iter().map(|value| context.factor(value)).collect::<Vec<_>>();
         let body = pushforward_program.map_operations(|operation| {
-            operation.try_map_captures(&mut |factor| -> Result<ValueOrCapture<ArrayType, D::Tangent>, ProgramError> {
+            operation.try_map_captures(&mut |factor| -> Result<ValueOrCapture<ArrayType, C::Tangent>, ProgramError> {
                 match factor {
                     ValueOrCapture::Capture { index, r#type } => {
                         Ok(ValueOrCapture::Capture { index: *index, r#type: r#type.clone() })
@@ -277,8 +277,8 @@ where
         // Stage one linear scan over the operand tangents and pair its outputs with the primal outputs of the
         // residual-extended scan.
         let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-        let linear_scan: D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>> =
-            linear_scan_operation::<ArrayType, D::Tangent, D::Value, BodyOperation>(
+        let linear_scan: C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>> =
+            linear_scan_operation::<ArrayType, C::Tangent, C::Value, BodyOperation>(
                 body,
                 stack_factors,
                 carry_count,
@@ -297,27 +297,27 @@ where
     }
 }
 
-impl<D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<DataType, D::Constant, O>
+impl<C, O, BodyOperation> DifferentiableOperation<C> for ScanOperation<DataType, C::Constant, O>
 where
-    D: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
-    O: Clone + Operation<DataType> + From<ScanOperation<DataType, D::Constant, O>> + LinearizableProgramOperation<D>,
+    C: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
+    O: Clone + Operation<DataType> + From<ScanOperation<DataType, C::Constant, O>> + LinearizableProgramOperation<C>,
     BodyOperation: Operation<DataType>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
         + CaptureParameterizedOperation<
             DataType,
-            ValueOrCapture<DataType, D::Value>,
-            WithCapture<ValueOrCapture<DataType, D::Tangent>> = BodyOperation,
-        > + From<ScanOperation<DataType, D::Tangent, BodyOperation, ValueOrCapture<DataType, D::Value>, Input>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+            ValueOrCapture<DataType, C::Value>,
+            WithCapture<ValueOrCapture<DataType, C::Tangent>> = BodyOperation,
+        > + From<ScanOperation<DataType, C::Tangent, BodyOperation, ValueOrCapture<DataType, C::Value>, Input>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
         From<ZeroOperation<DataType>> + MaybeZeroOperation<DataType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let carry_count = self.carry_count();
         let length = self.length();
@@ -356,7 +356,7 @@ where
             });
         }
 
-        let extended_scan = ScanOperation::<DataType, D::Constant, O>::new(primal_program, carry_count, length)?
+        let extended_scan = ScanOperation::<DataType, C::Constant, O>::new(primal_program, carry_count, length)?
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -364,15 +364,15 @@ where
         check_count!("output", primal_outputs, output_count, ProgramError);
 
         let body = pushforward_program.map_operations(|operation| {
-            operation.try_map_captures(&mut |_| -> Result<ValueOrCapture<DataType, D::Tangent>, ProgramError> {
+            operation.try_map_captures(&mut |_| -> Result<ValueOrCapture<DataType, C::Tangent>, ProgramError> {
                 Err(ProgramError::UnsupportedOperation {
                     message: "scalar scan JVP with captured factors requires a scalar stack representation".to_string(),
                 })
             })
         })?;
         let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-        let linear_scan: D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>> =
-            linear_scan_operation::<DataType, D::Tangent, D::Value, BodyOperation>(
+        let linear_scan: C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>> =
+            linear_scan_operation::<DataType, C::Tangent, C::Value, BodyOperation>(
                 body,
                 vec![],
                 carry_count,

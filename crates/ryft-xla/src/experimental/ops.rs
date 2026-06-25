@@ -74,17 +74,17 @@ pub type XlaConstant = CapturedConstant<ArrayType>;
 #[derive(Clone, Debug, Operation)]
 #[ryft(crate = "ryft_core")]
 #[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]
-pub enum XlaOperation<C: Value<ArrayType> = XlaConstant> {
+pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<ArrayType, C>),
+    Constant(ConstantOperation<ArrayType, V>),
     Fill(FillOperation<ArrayType, f64>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
-    Scale(ScaleOperation<ArrayType, C>),
+    Scale(ScaleOperation<ArrayType, V>),
     Mul(MulOperation),
     Div(DivOperation),
     Sin(SinOperation),
@@ -115,28 +115,28 @@ pub enum XlaOperation<C: Value<ArrayType> = XlaConstant> {
     Collective(CollectiveOperation),
     Select(SelectOperation),
     /// Backend-owned condition whose branch bodies can contain XLA operations.
-    Condition(Box<ConditionOperation<ArrayType, C, Self>>),
+    Condition(Box<ConditionOperation<ArrayType, V, Self>>),
 
     /// Backend-owned loop whose condition and body programs can contain XLA operations.
-    While(Box<WhileOperation<ArrayType, C, Self>>),
+    While(Box<WhileOperation<ArrayType, V, Self>>),
 
     /// Backend-owned scan whose body program can contain XLA operations.
-    Scan(Box<ScanOperation<ArrayType, C, Self>>),
+    Scan(Box<ScanOperation<ArrayType, V, Self>>),
 
     /// Backend-owned custom JVP call whose nested programs can contain XLA operations.
-    CustomJvp(Box<CustomJvpOperation<ArrayType, C, Self>>),
+    CustomJvp(Box<CustomJvpOperation<ArrayType, V, Self>>),
 
     /// Backend-owned custom VJP call whose nested programs can contain XLA operations.
-    CustomVjp(Box<CustomVjpOperation<ArrayType, C, Self>>),
+    CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
 
     /// Call to a flat jitted XLA sub-program.
     JitCall(Box<JitCallOperation>),
 
     /// XLA-specific `shard_map`.
-    ShardMap(Box<ShardMapOperation<C>>),
+    ShardMap(Box<ShardMapOperation<V>>),
 
     /// XLA-specific `linear_shard_map` staged in an ordinary traced program.
-    LinearShardMap(Box<LinearShardMapOperation<C>>),
+    LinearShardMap(Box<LinearShardMapOperation<V>>),
 }
 
 fn map_core_xla_program<V>(
@@ -485,103 +485,103 @@ where
     }
 }
 
-impl<E> DifferentiableOperation<E> for XlaOperation
+impl<C> DifferentiableOperation<C> for XlaOperation
 where
-    E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+    C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
         + DifferentiationContext<
             LinearOperation<
-                <E as DifferentiationContext>::Tangent,
-                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+                <C as DifferentiationContext>::Tangent,
+                ValueOrCapture<ArrayType, <C as Domain>::Value>,
             > = LinearXlaOperation<
-                <E as DifferentiationContext>::Tangent,
+                <C as DifferentiationContext>::Tangent,
                 XlaConstant,
-                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+                ValueOrCapture<ArrayType, <C as Domain>::Value>,
             >,
             LinearOperation<
-                <E as DifferentiationContext>::Tangent,
-                ValueOrCapture<ArrayType, Tracer<E>>,
+                <C as DifferentiationContext>::Tangent,
+                ValueOrCapture<ArrayType, Tracer<C>>,
             > = LinearXlaOperation<
-                <E as DifferentiationContext>::Tangent,
+                <C as DifferentiationContext>::Tangent,
                 XlaConstant,
-                ValueOrCapture<ArrayType, Tracer<E>>,
+                ValueOrCapture<ArrayType, Tracer<C>>,
             >,
         >,
-    ZeroOperation<ArrayType>: DifferentiableOperation<E>,
-    ZeroLikeOperation: DifferentiableOperation<E>,
-    OneOperation<ArrayType>: DifferentiableOperation<E>,
-    OneLikeOperation: DifferentiableOperation<E>,
-    ConstantOperation<ArrayType, XlaConstant>: DifferentiableOperation<E>,
-    FillOperation<ArrayType, f64>: DifferentiableOperation<E>,
-    NegOperation: DifferentiableOperation<E>,
-    AddOperation: DifferentiableOperation<E>,
-    SubOperation: DifferentiableOperation<E>,
-    ScaleOperation<ArrayType, XlaConstant>: DifferentiableOperation<E>,
-    MulOperation: DifferentiableOperation<E>,
-    DivOperation: DifferentiableOperation<E>,
-    SinOperation: DifferentiableOperation<E>,
-    CosOperation: DifferentiableOperation<E>,
-    StopGradientOperation: DifferentiableOperation<E>,
-    RematerializationNameOperation: DifferentiableOperation<E>,
-    TransferToMemoryOperation: DifferentiableOperation<E>,
-    DotOperation: DifferentiableOperation<E>,
-    TransposeOperation: DifferentiableOperation<E>,
-    ReshapeOperation: DifferentiableOperation<E>,
-    ReshardOperation: DifferentiableOperation<E>,
-    ShardingConstraintOperation: DifferentiableOperation<E>,
-    BroadcastOperation: DifferentiableOperation<E>,
-    SliceOperation: DifferentiableOperation<E>,
-    UpdateSliceOperation: DifferentiableOperation<E>,
-    DynamicSliceOperation: DifferentiableOperation<E>,
-    DynamicUpdateSliceOperation: DifferentiableOperation<E>,
-    PadOperation: DifferentiableOperation<E>,
-    ConcatenateOperation: DifferentiableOperation<E>,
-    GatherOperation: DifferentiableOperation<E>,
-    ScatterOperation: DifferentiableOperation<E>,
-    ReduceOperation: DifferentiableOperation<E>,
-    CompareOperation: DifferentiableOperation<E>,
-    NotOperation: DifferentiableOperation<E>,
-    AndOperation: DifferentiableOperation<E>,
-    OrOperation: DifferentiableOperation<E>,
-    XorOperation: DifferentiableOperation<E>,
-    CollectiveOperation: DifferentiableOperation<E>,
-    SelectOperation: DifferentiableOperation<E>,
+    ZeroOperation<ArrayType>: DifferentiableOperation<C>,
+    ZeroLikeOperation: DifferentiableOperation<C>,
+    OneOperation<ArrayType>: DifferentiableOperation<C>,
+    OneLikeOperation: DifferentiableOperation<C>,
+    ConstantOperation<ArrayType, XlaConstant>: DifferentiableOperation<C>,
+    FillOperation<ArrayType, f64>: DifferentiableOperation<C>,
+    NegOperation: DifferentiableOperation<C>,
+    AddOperation: DifferentiableOperation<C>,
+    SubOperation: DifferentiableOperation<C>,
+    ScaleOperation<ArrayType, XlaConstant>: DifferentiableOperation<C>,
+    MulOperation: DifferentiableOperation<C>,
+    DivOperation: DifferentiableOperation<C>,
+    SinOperation: DifferentiableOperation<C>,
+    CosOperation: DifferentiableOperation<C>,
+    StopGradientOperation: DifferentiableOperation<C>,
+    RematerializationNameOperation: DifferentiableOperation<C>,
+    TransferToMemoryOperation: DifferentiableOperation<C>,
+    DotOperation: DifferentiableOperation<C>,
+    TransposeOperation: DifferentiableOperation<C>,
+    ReshapeOperation: DifferentiableOperation<C>,
+    ReshardOperation: DifferentiableOperation<C>,
+    ShardingConstraintOperation: DifferentiableOperation<C>,
+    BroadcastOperation: DifferentiableOperation<C>,
+    SliceOperation: DifferentiableOperation<C>,
+    UpdateSliceOperation: DifferentiableOperation<C>,
+    DynamicSliceOperation: DifferentiableOperation<C>,
+    DynamicUpdateSliceOperation: DifferentiableOperation<C>,
+    PadOperation: DifferentiableOperation<C>,
+    ConcatenateOperation: DifferentiableOperation<C>,
+    GatherOperation: DifferentiableOperation<C>,
+    ScatterOperation: DifferentiableOperation<C>,
+    ReduceOperation: DifferentiableOperation<C>,
+    CompareOperation: DifferentiableOperation<C>,
+    NotOperation: DifferentiableOperation<C>,
+    AndOperation: DifferentiableOperation<C>,
+    OrOperation: DifferentiableOperation<C>,
+    XorOperation: DifferentiableOperation<C>,
+    CollectiveOperation: DifferentiableOperation<C>,
+    SelectOperation: DifferentiableOperation<C>,
     Vec<XlaConstant>: Parameterized<
             XlaConstant,
-            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>
-                + ParameterizedFamily<<E as Domain>::Value, To = Vec<<E as Domain>::Value>>,
+            Family: ParameterizedFamily<C::Tangent, To = Vec<C::Tangent>>
+                + ParameterizedFamily<<C as Domain>::Value, To = Vec<<C as Domain>::Value>>,
             To<XlaConstant> = Vec<XlaConstant>,
-            To<E::Tangent> = Vec<E::Tangent>,
-            To<<E as Domain>::Value> = Vec<<E as Domain>::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
+            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    Vec<<E as Domain>::Value>: Parameterized<
-            <E as Domain>::Value,
-            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>,
-            To<E::Tangent> = Vec<E::Tangent>,
+    Vec<<C as Domain>::Value>: Parameterized<
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<C::Tangent, To = Vec<C::Tangent>>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    Vec<Tracer<E>>: Parameterized<
-            Tracer<E>,
-            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>,
-            To<E::Tangent> = Vec<E::Tangent>,
+    Vec<Tracer<C>>: Parameterized<
+            Tracer<C>,
+            Family: ParameterizedFamily<C::Tangent, To = Vec<C::Tangent>>,
+            To<C::Tangent> = Vec<C::Tangent>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    E::Tangent: Slice + UpdateSlice + Reshape,
-    <E::Tangent as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, E::Tangent>,
-    LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, Tracer<E>>>:
+    C::Tangent: Slice + UpdateSlice + Reshape,
+    <C::Tangent as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, C::Tangent>,
+    LinearXlaOperation<C::Tangent, XlaConstant, ValueOrCapture<ArrayType, Tracer<C>>>:
         CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, Tracer<E>>,
-            WithCapture<ValueOrCapture<ArrayType, E::Tangent>> =
-                LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
+            ValueOrCapture<ArrayType, Tracer<C>>,
+            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> =
+                LinearXlaOperation<C::Tangent, XlaConstant, ValueOrCapture<ArrayType, C::Tangent>>,
         >,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<AddOperation>
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
-        + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, <E as Domain>::Value>, Input>>
-        + From<LeftDotOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>, Input>>
-        + From<RightDotOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>, Input>>
+        + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, <C as Domain>::Value>, Input>>
+        + From<LeftDotOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>, Input>>
+        + From<RightDotOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>, Input>>
         + From<TransposeOperation>
         + From<ReshapeOperation>
         + From<BroadcastOperation>
@@ -591,51 +591,51 @@ where
         + From<UpdateSliceOperation>
         + From<ReshardOperation>
         + From<ShardingConstraintOperation>
-        + ResidualizedOperation<E>
-        + From<CustomVjpCallOperation<ArrayType, XlaConstant, XlaOperation, ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + ResidualizedOperation<C>
+        + From<CustomVjpCallOperation<ArrayType, XlaConstant, XlaOperation, ValueOrCapture<ArrayType, <C as Domain>::Value>>>
         + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
-        + From<LinearSelectOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
-        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
-        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
-        + From<LinearGatherOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
-        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<LinearSelectOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
+        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
+        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
+        + From<LinearGatherOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
+        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
         + From<
             ScanOperation<
                 ArrayType,
-                E::Tangent,
-                LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
-                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+                C::Tangent,
+                LinearXlaOperation<C::Tangent, XlaConstant, ValueOrCapture<ArrayType, C::Tangent>>,
+                ValueOrCapture<ArrayType, <C as Domain>::Value>,
                 Input,
             >,
         >
         + From<
             ConditionOperation<
                 ArrayType,
-                E::Tangent,
-                E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-                ValueOrCapture<ArrayType, <E as Domain>::Value>,
+                C::Tangent,
+                C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+                ValueOrCapture<ArrayType, <C as Domain>::Value>,
                 Captured,
             >,
         >
-        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
         + From<RecomputeOperation<XlaOperation>>
-        + From<WhileOperation<ArrayType, E::Tangent, E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>, Input>>,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: CaptureParameterizedOperation<
+        + From<WhileOperation<ArrayType, C::Tangent, C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>, Input>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, <E as Domain>::Value>,
-            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-        > + DefactorizableProgramOperation<E::Tangent, <E as Domain>::Value, XlaOperation>,
-    Self: Clone + LinearizableProgramOperation<E>,
+            ValueOrCapture<ArrayType, <C as Domain>::Value>,
+            WithCapture<ValueOrCapture<ArrayType, <C as Domain>::Value>> = C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+        > + DefactorizableProgramOperation<C::Tangent, <C as Domain>::Value, XlaOperation>,
+    Self: Clone + LinearizableProgramOperation<C>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        E: 'jvp,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
+        C: 'jvp,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
     {
         match self {
             Self::Zero(operation) => operation.jvp(context, inputs),
@@ -678,23 +678,23 @@ where
             Self::Collective(operation) => operation.jvp(context, inputs),
             Self::Select(operation) => operation.jvp(context, inputs),
             Self::Condition(operation) => {
-                <ConditionOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                <ConditionOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
                     operation, context, inputs,
                 )
             }
-            Self::While(operation) => <WhileOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+            Self::While(operation) => <WhileOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
                 operation, context, inputs,
             ),
-            Self::Scan(operation) => <ScanOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+            Self::Scan(operation) => <ScanOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
                 operation, context, inputs,
             ),
             Self::CustomJvp(operation) => {
-                <CustomJvpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                <CustomJvpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
                     operation, context, inputs,
                 )
             }
             Self::CustomVjp(operation) => {
-                <CustomVjpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<E>>::jvp(
+                <CustomVjpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
                     operation, context, inputs,
                 )
             }
@@ -705,111 +705,111 @@ where
     }
 }
 
-impl<E> LinearizableProgramOperation<E> for XlaOperation
+impl<C> LinearizableProgramOperation<C> for XlaOperation
 where
-    E: DifferentiationContext<
+    C: DifferentiationContext<
         Type = ArrayType,
         Constant = XlaConstant,
         LinearOperation<
-            <E as DifferentiationContext>::Tangent,
-            ValueOrCapture<ArrayType, <E as Domain>::Value>,
+            <C as DifferentiationContext>::Tangent,
+            ValueOrCapture<ArrayType, <C as Domain>::Value>,
         > = LinearXlaOperation<
-            <E as DifferentiationContext>::Tangent,
+            <C as DifferentiationContext>::Tangent,
             XlaConstant,
-            ValueOrCapture<ArrayType, <E as Domain>::Value>,
+            ValueOrCapture<ArrayType, <C as Domain>::Value>,
         >,
     >,
     Self: Clone + Operation<ArrayType>,
-    ZeroOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ZeroLikeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    OneOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    OneLikeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ConstantOperation<ArrayType, XlaConstant>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    FillOperation<ArrayType, f64>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    NegOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    AddOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    SubOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ScaleOperation<ArrayType, XlaConstant>: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    MulOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    DivOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    SinOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    CosOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    StopGradientOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    RematerializationNameOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    TransferToMemoryOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    DotOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    TransposeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ReshapeOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ReshardOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ShardingConstraintOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    BroadcastOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    SliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    UpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    DynamicSliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    DynamicUpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    PadOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ConcatenateOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    GatherOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ScatterOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    ReduceOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    CompareOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    NotOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    AndOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    OrOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    XorOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    CollectiveOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    SelectOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    JitCallOperation: DifferentiableOperation<LinearizationContextOf<E, Self>>,
-    E::Tangent: Transpose + Broadcast + ReduceValue + Slice + UpdateSlice + Reshape + Reshard + ConstrainSharding,
-    <E::Tangent as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, E::Tangent>,
+    ZeroOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ZeroLikeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    OneOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    OneLikeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ConstantOperation<ArrayType, XlaConstant>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    FillOperation<ArrayType, f64>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    NegOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    AddOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    SubOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ScaleOperation<ArrayType, XlaConstant>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    MulOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    DivOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    SinOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    CosOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    StopGradientOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    RematerializationNameOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    TransferToMemoryOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    DotOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    TransposeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ReshapeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ReshardOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ShardingConstraintOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    BroadcastOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    SliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    UpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    DynamicSliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    DynamicUpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    PadOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ConcatenateOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    GatherOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ScatterOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    ReduceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    CompareOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    NotOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    AndOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    OrOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    XorOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    CollectiveOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    SelectOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    JitCallOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    C::Tangent: Transpose + Broadcast + ReduceValue + Slice + UpdateSlice + Reshape + Reshard + ConstrainSharding,
+    <C::Tangent as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, C::Tangent>,
     Vec<XlaConstant>: Parameterized<
             XlaConstant,
-            Family: ParameterizedFamily<E::Tangent, To = Vec<E::Tangent>>
+            Family: ParameterizedFamily<C::Tangent, To = Vec<C::Tangent>>
                 + ParameterizedFamily<
-                    Tracer<LinearizationContextOf<E, Self>>,
-                    To = Vec<Tracer<LinearizationContextOf<E, Self>>>,
+                    Tracer<LinearizationContextOf<C, Self>>,
+                    To = Vec<Tracer<LinearizationContextOf<C, Self>>>,
                 >,
             To<XlaConstant> = Vec<XlaConstant>,
-            To<E::Tangent> = Vec<E::Tangent>,
-            To<Tracer<LinearizationContextOf<E, Self>>> = Vec<Tracer<LinearizationContextOf<E, Self>>>,
+            To<C::Tangent> = Vec<C::Tangent>,
+            To<Tracer<LinearizationContextOf<C, Self>>> = Vec<Tracer<LinearizationContextOf<C, Self>>>,
             ParameterStructure: std::fmt::Debug + PartialEq,
         >,
-    E::LinearOperation<E::Tangent, XlaConstant>: CaptureParameterizedOperation<
+    C::LinearOperation<C::Tangent, XlaConstant>: CaptureParameterizedOperation<
             ArrayType,
             XlaConstant,
-            WithCapture<XlaConstant> = E::LinearOperation<E::Tangent, XlaConstant>,
-            WithCapture<Tracer<LinearizationContextOf<E, Self>>> = LinearXlaOperation<
-                E::Tangent,
+            WithCapture<XlaConstant> = C::LinearOperation<C::Tangent, XlaConstant>,
+            WithCapture<Tracer<LinearizationContextOf<C, Self>>> = LinearXlaOperation<
+                C::Tangent,
                 XlaConstant,
-                Tracer<LinearizationContextOf<E, Self>>,
+                Tracer<LinearizationContextOf<C, Self>>,
             >,
-            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = LinearXlaOperation<
-                E::Tangent,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>> = LinearXlaOperation<
+                C::Tangent,
                 XlaConstant,
-                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
             >,
         >,
-    <LinearizationContextOf<E, Self> as DifferentiationContext>::LinearOperation<
-        E::Tangent,
-        ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
-    >: ResidualizedOperation<LinearizationContextOf<E, Self>>
+    <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
+        C::Tangent,
+        ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+    >: ResidualizedOperation<LinearizationContextOf<C, Self>>
         + CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = <LinearizationContextOf<
-                E,
+            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>> = <LinearizationContextOf<
+                C,
                 Self,
             > as DifferentiationContext>::LinearOperation<
-                E::Tangent,
-                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                C::Tangent,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
             >,
-            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
+            WithCapture<ValueOrCapture<ArrayType, <C as Domain>::Value>> = C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
         > + MaybeZeroOperation<ArrayType>,
 {
     fn linearize_program(
-        differentiable: &E,
+        differentiable: &C,
         program: &Program<ArrayType, XlaConstant, Self, Vec<XlaConstant>, Vec<XlaConstant>>,
-    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
+    ) -> Result<NestedLinearization<C, Self>, ProgramError> {
         program.linearize(differentiable)
     }
 }
@@ -829,7 +829,7 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 #[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]
 pub enum LinearXlaOperation<
     V: Value<ArrayType>,
-    C: Value<ArrayType> = XlaConstant,
+    Constant: Value<ArrayType> = XlaConstant,
     F: Value<ArrayType> = V,
     P: Clone + Operation<ArrayType> = XlaOperation,
     CaptureFactor: Value<ArrayType> = F,
@@ -875,9 +875,9 @@ pub enum LinearXlaOperation<
     While(Box<WhileOperation<ArrayType, V, Self, Input>>),
 
     /// Backend-owned scan whose body can contain XLA linear operations.
-    Scan(Box<ScanOperation<ArrayType, V, LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>),
+    Scan(Box<ScanOperation<ArrayType, V, LinearXlaOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>, F, Input>>),
 
-    CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
+    CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, Constant, P, F>>),
 
     /// Linearized call to a jitted XLA sub-program.
     LinearJitCall(Box<LinearJitCallOperation<CaptureFactor>>),
@@ -886,15 +886,15 @@ pub enum LinearXlaOperation<
     LinearShardMap(Box<LinearShardMapOperation<V, CaptureFactor>>),
 }
 
-impl<V, C, F, P, CaptureFactor> LinearXlaOperation<V, C, F, P, CaptureFactor>
+impl<V, Constant, F, P, CaptureFactor> LinearXlaOperation<V, Constant, F, P, CaptureFactor>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     CaptureFactor: Value<ArrayType>,
 {
-    fn to_core_linear_array_operation(&self) -> Option<LinearArrayOperation<V, C, F, P>> {
+    fn to_core_linear_array_operation(&self) -> Option<LinearArrayOperation<V, Constant, F, P>> {
         Some(match self {
             Self::Zero(operation) => LinearArrayOperation::from(operation.clone()),
             Self::ZeroLike(operation) => LinearArrayOperation::from(operation.clone()),
@@ -938,15 +938,16 @@ where
     }
 }
 
-impl<V, C, F, P, CaptureFactor> From<LinearArrayOperation<V, C, F, P>> for LinearXlaOperation<V, C, F, P, CaptureFactor>
+impl<V, Constant, F, P, CaptureFactor> From<LinearArrayOperation<V, Constant, F, P>>
+    for LinearXlaOperation<V, Constant, F, P, CaptureFactor>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     CaptureFactor: Value<ArrayType>,
 {
-    fn from(operation: LinearArrayOperation<V, C, F, P>) -> Self {
+    fn from(operation: LinearArrayOperation<V, Constant, F, P>) -> Self {
         match operation {
             LinearArrayOperation::Zero(operation) => Self::Zero(operation),
             LinearArrayOperation::ZeroLike(operation) => Self::ZeroLike(operation),
@@ -1027,18 +1028,24 @@ where
     }
 }
 
-impl<V, C, F, P, CaptureFactor>
-    From<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>
-    for LinearXlaOperation<V, C, F, P, CaptureFactor>
+impl<V, Constant, F, P, CaptureFactor>
+    From<ScanOperation<ArrayType, V, LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>, F, Input>>
+    for LinearXlaOperation<V, Constant, F, P, CaptureFactor>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
     CaptureFactor: Value<ArrayType>,
 {
     fn from(
-        operation: ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>,
+        operation: ScanOperation<
+            ArrayType,
+            V,
+            LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>,
+            F,
+            Input,
+        >,
     ) -> Self {
         let body = operation
             .body()
@@ -1047,7 +1054,7 @@ where
         let scan = ScanOperation::<
             ArrayType,
             V,
-            LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>,
+            LinearXlaOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>,
             F,
             Input,
         >::new_with_payload(body, operation.carry_count(), operation.length())
@@ -1064,13 +1071,13 @@ fn clone_capture<F: Clone>(factor: &F) -> Result<F, ProgramError> {
     Ok(factor.clone())
 }
 
-fn map_linear_xla_operation_captures<V, C, F, MappedFactor, P, MapFactorFn>(
-    operation: &LinearXlaOperation<V, C, F, P, F>,
+fn map_linear_xla_operation_captures<V, Constant, F, MappedFactor, P, MapFactorFn>(
+    operation: &LinearXlaOperation<V, Constant, F, P, F>,
     map_factor: &mut MapFactorFn,
-) -> Result<LinearXlaOperation<V, C, MappedFactor, P, MappedFactor>, ProgramError>
+) -> Result<LinearXlaOperation<V, Constant, MappedFactor, P, MappedFactor>, ProgramError>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -1121,7 +1128,7 @@ where
             let scan = ScanOperation::<
                 ArrayType,
                 V,
-                LinearXlaOperation<V, C, ValueOrCapture<ArrayType, V>, P>,
+                LinearXlaOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>,
                 MappedFactor,
                 Input,
             >::new_with_payload(body, operation.carry_count(), operation.length())?
@@ -1140,14 +1147,14 @@ where
     }
 }
 
-impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearXlaOperation<V, C, F, P, F>
+impl<V, Constant, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearXlaOperation<V, Constant, F, P, F>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
 {
-    type WithCapture<MappedFactor: Value<ArrayType>> = LinearXlaOperation<V, C, MappedFactor, P, MappedFactor>;
+    type WithCapture<MappedFactor: Value<ArrayType>> = LinearXlaOperation<V, Constant, MappedFactor, P, MappedFactor>;
 
     fn try_map_captures<MappedFactor: Value<ArrayType>, MapFactorFn>(
         &self,
@@ -1160,11 +1167,11 @@ where
     }
 }
 
-impl<V, C, R, P> DefactorizableProgramOperation<V, R, P>
-    for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
+impl<V, Constant, R, P> DefactorizableProgramOperation<V, R, P>
+    for LinearXlaOperation<V, Constant, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
 where
     V: Value<ArrayType>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
         + Operation<ArrayType>
@@ -1452,17 +1459,17 @@ impl JitCallOperation {
     /// participates in residual compaction, rebasing, and instantiation. The primal and tangent carriers are kept
     /// separate so the rule also serves nested symbolic linearization contexts, whose primal values are nested
     /// tracers while tangents stay in the enclosing context's representation.
-    fn jvp_from_primal_outputs<'jvp, E, PrimalValue, TangentValue>(
+    fn jvp_from_primal_outputs<'jvp, C, PrimalValue, TangentValue>(
         &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
         primal_outputs: Vec<PrimalValue>,
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
         PrimalValue: Value<ArrayType>,
         TangentValue: Value<ArrayType> + Slice + UpdateSlice + Reshape,
         TangentValue::InterpretationContext: Zero<ArrayType, TangentValue>,
-        E: DifferentiationContext<
+        C: DifferentiationContext<
                 Tangent = TangentValue,
                 LinearOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>> = LinearXlaOperation<
                     TangentValue,
@@ -1471,7 +1478,7 @@ impl JitCallOperation {
                 >,
             > + Domain<Type = ArrayType, Value = PrimalValue>
             + 'jvp,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
@@ -1530,30 +1537,30 @@ where
 /// staged into the context's primal program through [`TangentContext::bind_primal`] and the linear call captures
 /// the primal inputs as residual factors. This serves both ordinary XLA tracing contexts and nested symbolic
 /// linearization contexts.
-impl<E> DifferentiableOperation<E> for JitCallOperation
+impl<C> DifferentiableOperation<C> for JitCallOperation
 where
-    E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+    C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
         + DifferentiationContext<
             LinearOperation<
-                <E as DifferentiationContext>::Tangent,
-                ValueOrCapture<ArrayType, Tracer<E>>,
+                <C as DifferentiationContext>::Tangent,
+                ValueOrCapture<ArrayType, Tracer<C>>,
             > = LinearXlaOperation<
-                <E as DifferentiationContext>::Tangent,
+                <C as DifferentiationContext>::Tangent,
                 XlaConstant,
-                ValueOrCapture<ArrayType, Tracer<E>>,
+                ValueOrCapture<ArrayType, Tracer<C>>,
             >,
         >,
-    E::Tangent: Slice + UpdateSlice + Reshape,
-    <E::Tangent as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, E::Tangent>,
+    C::Tangent: Slice + UpdateSlice + Reshape,
+    <C::Tangent as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, C::Tangent>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        E: 'jvp,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
+        C: 'jvp,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();

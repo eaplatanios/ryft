@@ -17,47 +17,47 @@ use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Provi
 /// leaf. Use [`DifferentiationContext::vjp`] directly for vector-valued functions that need an explicit output
 /// cotangent.
 #[allow(private_bounds)]
-pub fn value_and_grad<'domain, D, F, Input>(
-    domain: &'domain D,
+pub fn value_and_grad<'context, C, F, Input>(
+    context: &'context C,
     function: F,
     primals: Input,
-) -> Result<(<D as Domain>::Value, Input::To<D::Tangent>), DifferentiationError>
+) -> Result<(<C as Domain>::Value, Input::To<C::Tangent>), DifferentiationError>
 where
-    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
+    C: DifferentiationContext + ProvidesContext<<C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext>,
+    <C as Domain>::Operation: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    F: FnOnce(Input::To<LinearizationTracer<'context, C>>) -> LinearizationTracer<'context, C>,
     Input: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
-            To<<D as Domain>::Value> = Input,
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>> + ParameterizedFamily<C::Tangent>,
+            To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Value: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
-            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
-            To<<D as Domain>::Value> = <D as Domain>::Value,
+    <C as Domain>::Value: Parameterized<
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>> + ParameterizedFamily<C::Tangent>,
+            To<LinearizationTracer<'context, C>> = LinearizationTracer<'context, C>,
+            To<<C as Domain>::Value> = <C as Domain>::Value,
             ParameterStructure: Debug + PartialEq,
-        > + 'domain,
-    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext: One<<D as Domain>::Type, D::Tangent>,
-    <D as Domain>::Type: DifferentiableType,
-    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
-        + From<ZeroOperation<<D as Domain>::Type>>
+        > + 'context,
+    <C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext: One<<C as Domain>::Type, C::Tangent>,
+    <C as Domain>::Type: DifferentiableType,
+    C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<<C as Domain>::Type, C::Tangent>
+        + TransposableOperation<<C as Domain>::Type, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>
+        + From<ZeroOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + MaybeZeroOperation<<D as Domain>::Type>,
-    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
-        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
+        + MaybeZeroOperation<<C as Domain>::Type>,
+    C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>:
+        ResidualizedOperation<C> + MaybeZeroOperation<<C as Domain>::Type>,
 {
-    let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
+    let (output, pullback) = context.vjp(|input| Ok(function(input)), primals)?;
     // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
     // (see `DifferentiationError::NonScalarGradientOutput`).
     if !output.r#type().is_scalar() {
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
-    let context: <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext = domain.context();
-    let seed = context.one(output.r#type().as_ref())?;
-    Ok((output, pullback.interpret_in_context(&context, seed)?))
+    let interpretation_context: <C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext = context.context();
+    let seed = interpretation_context.one(output.r#type().as_ref())?;
+    Ok((output, pullback.interpret_in_context(&interpretation_context, seed)?))
 }
 
 /// Computes the reverse-mode gradient of a scalar-output function.
@@ -67,39 +67,39 @@ where
 /// exactly one rank-0 scalar array leaf. Use [`value_and_grad`] when the function value is also
 /// needed, and [`grad_with_aux`] when the function carries auxiliary outputs.
 #[allow(private_bounds)]
-pub fn grad<'domain, D, F, Input>(
-    domain: &'domain D,
+pub fn grad<'context, C, F, Input>(
+    context: &'context C,
     function: F,
     primals: Input,
-) -> Result<Input::To<D::Tangent>, DifferentiationError>
+) -> Result<Input::To<C::Tangent>, DifferentiationError>
 where
-    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> LinearizationTracer<'domain, D>,
+    C: DifferentiationContext + ProvidesContext<<C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext>,
+    <C as Domain>::Operation: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    F: FnOnce(Input::To<LinearizationTracer<'context, C>>) -> LinearizationTracer<'context, C>,
     Input: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
-            To<<D as Domain>::Value> = Input,
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>> + ParameterizedFamily<C::Tangent>,
+            To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Value: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>> + ParameterizedFamily<D::Tangent>,
-            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
-            To<<D as Domain>::Value> = <D as Domain>::Value,
+    <C as Domain>::Value: Parameterized<
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>> + ParameterizedFamily<C::Tangent>,
+            To<LinearizationTracer<'context, C>> = LinearizationTracer<'context, C>,
+            To<<C as Domain>::Value> = <C as Domain>::Value,
             ParameterStructure: Debug + PartialEq,
-        > + 'domain,
-    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext: One<<D as Domain>::Type, D::Tangent>,
-    <D as Domain>::Type: DifferentiableType,
-    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
-        + From<ZeroOperation<<D as Domain>::Type>>
+        > + 'context,
+    <C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext: One<<C as Domain>::Type, C::Tangent>,
+    <C as Domain>::Type: DifferentiableType,
+    C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<<C as Domain>::Type, C::Tangent>
+        + TransposableOperation<<C as Domain>::Type, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>
+        + From<ZeroOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + MaybeZeroOperation<<D as Domain>::Type>,
-    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
-        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
+        + MaybeZeroOperation<<C as Domain>::Type>,
+    C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>:
+        ResidualizedOperation<C> + MaybeZeroOperation<<C as Domain>::Type>,
 {
-    value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
+    value_and_grad(context, function, primals).map(|(_, gradient)| gradient)
 }
 
 /// Computes a scalar-output value, auxiliary outputs, and the reverse-mode gradient.
@@ -111,64 +111,69 @@ where
 /// This mirrors the semantics of a `has_aux` transform while keeping the Rust API explicit: the
 /// primal value and auxiliary data are returned as `((value, aux), gradient)`.
 #[allow(private_bounds)]
-pub fn value_and_grad_with_aux<'domain, D, F, Input, Aux>(
-    domain: &'domain D,
+pub fn value_and_grad_with_aux<'context, C, F, Input, Aux>(
+    context: &'context C,
     function: F,
     primals: Input,
-) -> Result<((<D as Domain>::Value, Aux), Input::To<D::Tangent>), DifferentiationError>
+) -> Result<((<C as Domain>::Value, Aux), Input::To<C::Tangent>), DifferentiationError>
 where
-    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
+    C: DifferentiationContext + ProvidesContext<<C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext>,
     F: FnOnce(
-        Input::To<LinearizationTracer<'domain, D>>,
-    ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
+        Input::To<LinearizationTracer<'context, C>>,
+    ) -> (LinearizationTracer<'context, C>, Aux::To<LinearizationTracer<'context, C>>),
     Input: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>>,
-            To<<D as Domain>::Value> = Input,
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>>,
+            To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<
+                LinearizationTracer<'context, C>,
+                To = Aux::To<LinearizationTracer<'context, C>>,
+            >,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    <D as Domain>::Value: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
-            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
+    <C as Domain>::Operation: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    <C as Domain>::Value: Parameterized<
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>, To = LinearizationTracer<'context, C>>,
+            To<LinearizationTracer<'context, C>> = LinearizationTracer<'context, C>,
             ParameterStructure: Debug + PartialEq,
-        > + 'domain,
-    Aux::To<LinearizationTracer<'domain, D>>:
-        Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
-    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext:
-        One<<D as Domain>::Type, D::Tangent> + Zero<<D as Domain>::Type, D::Tangent>,
-    <D as Domain>::Type: DifferentiableType,
-    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
-        + From<ZeroOperation<<D as Domain>::Type>>
+        > + 'context,
+    Aux::To<LinearizationTracer<'context, C>>:
+        Parameterized<LinearizationTracer<'context, C>, To<C::Tangent> = Aux::To<C::Tangent>>,
+    <C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext:
+        One<<C as Domain>::Type, C::Tangent> + Zero<<C as Domain>::Type, C::Tangent>,
+    <C as Domain>::Type: DifferentiableType,
+    C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<<C as Domain>::Type, C::Tangent>
+        + TransposableOperation<<C as Domain>::Type, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>
+        + From<ZeroOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + MaybeZeroOperation<<D as Domain>::Type>,
-    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
-        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
-    Input::Family: ParameterizedFamily<D::Tangent>,
-    Aux::Family: ParameterizedFamily<D::Tangent>,
+        + MaybeZeroOperation<<C as Domain>::Type>,
+    C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>:
+        ResidualizedOperation<C> + MaybeZeroOperation<<C as Domain>::Type>,
+    Input::Family: ParameterizedFamily<C::Tangent>,
+    Aux::Family: ParameterizedFamily<C::Tangent>,
 {
-    let ((output, aux), pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
+    let ((output, aux), pullback) = context.vjp(|input| Ok(function(input)), primals)?;
     // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
     // (see `DifferentiationError::NonScalarGradientOutput`).
     if !output.r#type().is_scalar() {
         return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
     }
-    let context: <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext = domain.context();
-    let seed = context.one(output.r#type().as_ref())?;
-    let aux_zeros =
-        aux.parameters().map(|value| context.zero(value.r#type().as_ref())).collect::<Result<Vec<_>, _>>()?;
+    let interpretation_context: <C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext = context.context();
+    let seed = interpretation_context.one(output.r#type().as_ref())?;
+    let aux_zeros = aux
+        .parameters()
+        .map(|value| interpretation_context.zero(value.r#type().as_ref()))
+        .collect::<Result<Vec<_>, _>>()?;
     let aux_cotangent =
-        <Aux::Family as ParameterizedFamily<D::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)
+        <Aux::Family as ParameterizedFamily<C::Tangent>>::To::from_parameters(aux.parameter_structure(), aux_zeros)
             .map_err(ProgramError::from)?;
     let output_cotangent = (seed, aux_cotangent);
-    let gradient = pullback.interpret_in_context(&context, output_cotangent)?;
+    let gradient = pullback.interpret_in_context(&interpretation_context, output_cotangent)?;
     Ok(((output, aux), gradient))
 }
 
@@ -178,50 +183,53 @@ where
 /// `(gradient, aux)`, matching the common use case where auxiliary outputs are diagnostics or
 /// cached intermediates and the gradient remains the primary result.
 #[allow(private_bounds)]
-pub fn grad_with_aux<'domain, D, F, Input, Aux>(
-    domain: &'domain D,
+pub fn grad_with_aux<'context, C, F, Input, Aux>(
+    context: &'context C,
     function: F,
     primals: Input,
-) -> Result<(Input::To<D::Tangent>, Aux), DifferentiationError>
+) -> Result<(Input::To<C::Tangent>, Aux), DifferentiationError>
 where
-    D: DifferentiationContext + ProvidesContext<<D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext>,
+    C: DifferentiationContext + ProvidesContext<<C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext>,
     F: FnOnce(
-        Input::To<LinearizationTracer<'domain, D>>,
-    ) -> (LinearizationTracer<'domain, D>, Aux::To<LinearizationTracer<'domain, D>>),
+        Input::To<LinearizationTracer<'context, C>>,
+    ) -> (LinearizationTracer<'context, C>, Aux::To<LinearizationTracer<'context, C>>),
     Input: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>>,
-            To<<D as Domain>::Value> = Input,
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>>,
+            To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = Aux::To<LinearizationTracer<'domain, D>>>,
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<
+                LinearizationTracer<'context, C>,
+                To = Aux::To<LinearizationTracer<'context, C>>,
+            >,
             ParameterStructure: Debug + PartialEq,
         >,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    <D as Domain>::Value: Parameterized<
-            <D as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<'domain, D>, To = LinearizationTracer<'domain, D>>,
-            To<LinearizationTracer<'domain, D>> = LinearizationTracer<'domain, D>,
+    <C as Domain>::Operation: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    <C as Domain>::Value: Parameterized<
+            <C as Domain>::Value,
+            Family: ParameterizedFamily<LinearizationTracer<'context, C>, To = LinearizationTracer<'context, C>>,
+            To<LinearizationTracer<'context, C>> = LinearizationTracer<'context, C>,
             ParameterStructure: Debug + PartialEq,
-        > + 'domain,
-    Aux::To<LinearizationTracer<'domain, D>>:
-        Parameterized<LinearizationTracer<'domain, D>, To<D::Tangent> = Aux::To<D::Tangent>>,
-    <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext:
-        One<<D as Domain>::Type, D::Tangent> + Zero<<D as Domain>::Type, D::Tangent>,
-    <D as Domain>::Type: DifferentiableType,
-    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
-        + From<ZeroOperation<<D as Domain>::Type>>
+        > + 'context,
+    Aux::To<LinearizationTracer<'context, C>>:
+        Parameterized<LinearizationTracer<'context, C>, To<C::Tangent> = Aux::To<C::Tangent>>,
+    <C::Tangent as Value<<C as Domain>::Type>>::InterpretationContext:
+        One<<C as Domain>::Type, C::Tangent> + Zero<<C as Domain>::Type, C::Tangent>,
+    <C as Domain>::Type: DifferentiableType,
+    C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<<C as Domain>::Type, C::Tangent>
+        + TransposableOperation<<C as Domain>::Type, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>
+        + From<ZeroOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + MaybeZeroOperation<<D as Domain>::Type>,
-    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
-        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
-    Input::Family: ParameterizedFamily<D::Tangent>,
-    Aux::Family: ParameterizedFamily<D::Tangent>,
+        + MaybeZeroOperation<<C as Domain>::Type>,
+    C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>:
+        ResidualizedOperation<C> + MaybeZeroOperation<<C as Domain>::Type>,
+    Input::Family: ParameterizedFamily<C::Tangent>,
+    Aux::Family: ParameterizedFamily<C::Tangent>,
 {
-    value_and_grad_with_aux(domain, function, primals).map(|((_, aux), gradient)| (gradient, aux))
+    value_and_grad_with_aux(context, function, primals).map(|((_, aux), gradient)| (gradient, aux))
 }
 
 #[cfg(test)]
@@ -415,20 +423,20 @@ mod tests {
     /// also differentiate against derived contexts such as the nested symbolic-linearization context (whose primal
     /// values are tracers). Primal results are produced through [`TangentContext::bind_primal`] so that they are
     /// interpreted eagerly or staged depending on the context.
-    impl<D> DifferentiableOperation<D> for TestDomainOperation
+    impl<C> DifferentiableOperation<C> for TestDomainOperation
     where
-        D: DifferentiationContext<Type = TestType, Constant = TestValue> + Domain<Operation = TestDomainOperation>,
-        D::Value: Add<Output = D::Value>,
-        D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
+        C: DifferentiationContext<Type = TestType, Constant = TestValue> + Domain<Operation = TestDomainOperation>,
+        C::Value: Add<Output = C::Value>,
+        C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>:
             From<AddOperation> + From<ZeroOperation<TestType>>,
     {
         fn jvp<'jvp>(
             &self,
-            context: &mut TangentContext<'jvp, D>,
-            inputs: &[JvpTracer<'jvp, D>],
-        ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+            context: &mut TangentContext<'jvp, C>,
+            inputs: &[JvpTracer<'jvp, C>],
+        ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
         where
-            D: 'jvp,
+            C: 'jvp,
         {
             match self {
                 Self::Zero(r#type) => {

@@ -209,28 +209,28 @@ where
 /// output tangent is a canonical staged zero of the output type and no linear operation is staged;
 /// otherwise the rule captures the condition as a residual factor and stages the captured-condition select provided
 /// by [`LinearSelectOperation`].
-impl<D> DifferentiableOperation<D> for SelectOperation
+impl<C> DifferentiableOperation<C> for SelectOperation
 where
-    D: DifferentiationContext,
-    SelectOperation: Operation<D::Type>,
-    D::Value: SelectCondition + Select<Condition = <D::Value as SelectCondition>::Condition>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<LinearSelectOperation<ValueOrCapture<D::Type, D::Value>>> + From<ZeroOperation<D::Type>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
+    C: DifferentiationContext,
+    SelectOperation: Operation<C::Type>,
+    C::Value: SelectCondition + Select<Condition = <C::Value as SelectCondition>::Condition>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<LinearSelectOperation<ValueOrCapture<C::Type, C::Value>>> + From<ZeroOperation<C::Type>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
         let on_true = &inputs[1];
         let on_false = &inputs[2];
-        let primal = D::Value::select(&condition.primal().select_condition()?, on_true.primal(), on_false.primal())?;
+        let primal = C::Value::select(&condition.primal().select_condition()?, on_true.primal(), on_false.primal())?;
         if context.is_zero(on_true.tangent())? && context.is_zero(on_false.tangent())? {
             let tangent_type = primal.r#type().into_owned();
             let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;

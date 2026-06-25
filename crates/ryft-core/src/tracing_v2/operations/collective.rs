@@ -171,14 +171,14 @@ impl<V: Value<ArrayType>> InterpretableOperation<ArrayType, V> for CollectiveOpe
 /// named batched axis, which the differentiation transform does not model. This behavior-preserving erroring impl keeps
 /// the operation non-differentiable while letting the macro-generated [`ArrayOperation`](super::primitive::ArrayOperation)
 /// JVP dispatch delegate uniformly to every variant's backing operation.
-impl<D: DifferentiationContext<Type = ArrayType>> DifferentiableOperation<D> for CollectiveOperation {
+impl<C: DifferentiationContext<Type = ArrayType>> DifferentiableOperation<C> for CollectiveOperation {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        _inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        _inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         Err(TypeError { message: format!("{} does not support generic array jvp dispatch", self.name()) }.into())
     }

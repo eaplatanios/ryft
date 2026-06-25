@@ -73,7 +73,7 @@ impl Display for ReductionKind {
 
 /// Value-level reduction capability.
 ///
-/// [`Reduce`] is the receiver-style entry point for staging or executing N-D
+/// [`Reduce`] is the receiver-style entry point for staging or executing N-C
 /// [`ReduceOperation`]. Reduces the receiver along `axes` using the operator/identity pair
 /// described by `kind`, returning a value whose rank is `self.rank() - axes.len()`.
 pub trait Reduce: Sized {
@@ -498,21 +498,21 @@ where
 /// `reduce_max(x)` along axis `a` is `reduce_sum(mask * Δx)` along the same axis, where
 /// `mask[i] = 1` exactly when `x[i]` equals the per-axis maximum (ties are split evenly,
 /// matching the JAX convention). `Any`/`All` are not differentiable.
-impl<D> DifferentiableOperation<D> for ReduceOperation
+impl<C> DifferentiableOperation<C> for ReduceOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Reduce + Broadcast + Compare<Output = D::Value>,
-    D::Tangent: Reduce,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ReduceOperation> + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>, Input>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Reduce + Broadcast + Compare<Output = C::Value>,
+    C::Tangent: Reduce,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<ReduceOperation> + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, C::Value>, Input>>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         match self.kind {
@@ -617,7 +617,7 @@ where
     }
 }
 
-/// N-D reduce helper that operates on a flat row-major payload and shape.
+/// N-C reduce helper that operates on a flat row-major payload and shape.
 ///
 /// Returns `(reduced_values, reduced_shape)`. `axes` may be in any order; duplicates are not
 /// permitted (callers should validate beforehand). The `combiner` function applies the reduction

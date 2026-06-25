@@ -123,21 +123,21 @@ where
 /// tangent is the pad of the input tangent that uses the padding-value tangent as its padding value, at the same
 /// padding geometry. When both operand tangents are canonical staged zeros, the output tangent is a canonical staged
 /// zero of the output type and no linear operation is staged.
-impl<D> DifferentiableOperation<D> for PadOperation
+impl<C> DifferentiableOperation<C> for PadOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Pad,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Pad,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
         From<PadOperation> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];

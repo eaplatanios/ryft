@@ -63,62 +63,62 @@ pub enum ScalarOperation<V: Value<DataType>> {
 }
 
 impl<
-    D: DifferentiationContext<
+    C: DifferentiationContext<
             Type = DataType,
             Value: ZeroLike + BooleanLike,
-            Operation = ScalarOperation<<D as Domain>::Constant>,
+            Operation = ScalarOperation<<C as Domain>::Constant>,
         >,
-> DifferentiableOperation<D> for ScalarOperation<D::Constant>
+> DifferentiableOperation<C> for ScalarOperation<C::Constant>
 where
-    ZeroOperation<DataType>: DifferentiableOperation<D>,
-    ZeroLikeOperation: DifferentiableOperation<D>,
-    OneOperation<DataType>: DifferentiableOperation<D>,
-    OneLikeOperation: DifferentiableOperation<D>,
-    ConstantOperation<DataType, D::Constant>: DifferentiableOperation<D>,
-    NegOperation: DifferentiableOperation<D>,
-    AddOperation: DifferentiableOperation<D>,
-    SubOperation: DifferentiableOperation<D>,
-    ScaleOperation<DataType, D::Constant>: DifferentiableOperation<D>,
-    MulOperation: DifferentiableOperation<D>,
-    DivOperation: DifferentiableOperation<D>,
-    SinOperation: DifferentiableOperation<D>,
-    CosOperation: DifferentiableOperation<D>,
-    CompareOperation: DifferentiableOperation<D>,
-    SelectOperation: DifferentiableOperation<D>,
-    StopGradientOperation: DifferentiableOperation<D>,
-    RematerializationNameOperation: DifferentiableOperation<D>,
-    ScalarOperation<D::Constant>: Clone + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<DataType>
+    ZeroOperation<DataType>: DifferentiableOperation<C>,
+    ZeroLikeOperation: DifferentiableOperation<C>,
+    OneOperation<DataType>: DifferentiableOperation<C>,
+    OneLikeOperation: DifferentiableOperation<C>,
+    ConstantOperation<DataType, C::Constant>: DifferentiableOperation<C>,
+    NegOperation: DifferentiableOperation<C>,
+    AddOperation: DifferentiableOperation<C>,
+    SubOperation: DifferentiableOperation<C>,
+    ScaleOperation<DataType, C::Constant>: DifferentiableOperation<C>,
+    MulOperation: DifferentiableOperation<C>,
+    DivOperation: DifferentiableOperation<C>,
+    SinOperation: DifferentiableOperation<C>,
+    CosOperation: DifferentiableOperation<C>,
+    CompareOperation: DifferentiableOperation<C>,
+    SelectOperation: DifferentiableOperation<C>,
+    StopGradientOperation: DifferentiableOperation<C>,
+    RematerializationNameOperation: DifferentiableOperation<C>,
+    ScalarOperation<C::Constant>: Clone + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<DataType>
         + From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
-        + From<ScaleOperation<DataType, ValueOrCapture<DataType, D::Value>, Input>>
-        + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
-        + ResidualizedOperation<D>
+        + From<ScaleOperation<DataType, ValueOrCapture<DataType, C::Value>, Input>>
+        + From<LinearSelectOperation<ValueOrCapture<DataType, C::Value>>>
+        + ResidualizedOperation<C>
         + From<
             CustomVjpCallOperation<
                 DataType,
-                D::Constant,
-                ScalarOperation<D::Constant>,
-                ValueOrCapture<DataType, D::Value>,
+                C::Constant,
+                ScalarOperation<C::Constant>,
+                ValueOrCapture<DataType, C::Value>,
             >,
         > + CaptureParameterizedOperation<
             DataType,
-            ValueOrCapture<DataType, D::Value>,
-            WithCapture<ValueOrCapture<DataType, D::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+            ValueOrCapture<DataType, C::Value>,
+            WithCapture<ValueOrCapture<DataType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
         >,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         match self {
             Self::Zero(operation) => operation.jvp(context, inputs),
@@ -150,53 +150,53 @@ where
 ///
 /// The where clauses spell the leaf closure required by
 /// [`Program::linearize`] instead of the recursive
-/// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound, which avoids pushing that recursive
+/// `Self: DifferentiableOperation<LinearizationContextOf<C, Self>>` bound, which avoids pushing that recursive
 /// obligation back into every consumer.
-impl<F, E> LinearizableProgramOperation<E> for ScalarOperation<F>
+impl<F, C> LinearizableProgramOperation<C> for ScalarOperation<F>
 where
     F: Value<DataType>,
-    E: DifferentiationContext<Type = DataType, Constant = F>,
-    E::LinearOperation<E::Tangent, F>:
-        CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
-    <LinearizationContextOf<E, Self> as DifferentiationContext>::LinearOperation<
-        E::Tangent,
-        ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+    C: DifferentiationContext<Type = DataType, Constant = F>,
+    C::LinearOperation<C::Tangent, F>:
+        CaptureParameterizedOperation<DataType, F, WithCapture<F> = C::LinearOperation<C::Tangent, F>>,
+    <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
+        C::Tangent,
+        ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
     >: MaybeZeroOperation<DataType>
         + From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
-        + From<ScaleOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>, Input>>
-        + ResidualizedOperation<LinearizationContextOf<E, Self>>
+        + From<ScaleOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>, Input>>
+        + ResidualizedOperation<LinearizationContextOf<C, Self>>
         + From<ZeroOperation<DataType>>
-        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>>>
         + From<
             CustomVjpCallOperation<
                 DataType,
                 F,
                 Self,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+                ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
             >,
         > + CaptureParameterizedOperation<
             DataType,
-            ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>> = <LinearizationContextOf<
-                E,
+            ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
+            WithCapture<ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>> = <LinearizationContextOf<
+                C,
                 Self,
             > as DifferentiationContext>::LinearOperation<
-                E::Tangent,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+                C::Tangent,
+                ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
             >,
-            WithCapture<ValueOrCapture<DataType, E::Value>> = E::LinearOperation<
-                E::Tangent,
-                ValueOrCapture<E::Type, E::Value>,
+            WithCapture<ValueOrCapture<DataType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
         >,
 {
     fn linearize_program(
-        differentiable: &E,
+        differentiable: &C,
         program: &Program<DataType, F, Self, Vec<F>, Vec<F>>,
-    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
+    ) -> Result<NestedLinearization<C, Self>, ProgramError> {
         program.linearize(differentiable)
     }
 }
@@ -204,7 +204,7 @@ where
 /// Closed scalar operation type for staged linear scalar programs.
 ///
 /// The `V` parameter is the scalar tangent/cotangent value type carried by the linear program. It is also the linear
-/// program's constant-table type, so linear constants are typed as `V`. The `C` parameter is the primal context
+/// program's constant-table type, so linear constants are typed as `V`. The `Constant` parameter is the primal context
 /// constant type used by user-supplied programs captured by [`CustomVjpCall`](Self::CustomVjpCall), which are written
 /// over context constants rather than over the linear value type `V` or captured-factor type `F`.
 ///
@@ -217,7 +217,7 @@ where
 /// backward program).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
 #[ryft(bounds(interpretation(BooleanLike)))]
-pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Value<DataType> = C> {
+pub enum LinearScalarOperation<V: Value<DataType>, Constant: Value<DataType> = V, F: Value<DataType> = Constant> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
@@ -229,13 +229,13 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     Scale(ScaleOperation<DataType, F, Input>),
     Select(LinearSelectOperation<F>),
     While(Box<WhileOperation<DataType, V, Self, Input>>),
-    CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
+    CustomVjpCall(Box<CustomVjpCallOperation<DataType, Constant, ScalarOperation<Constant>, F>>),
 }
 
-impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
-    for LinearScalarOperation<V, C, F>
+impl<V: Value<DataType>, Constant: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
+    for LinearScalarOperation<V, Constant, F>
 {
-    type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, C, MappedFactor>;
+    type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, Constant, MappedFactor>;
 
     fn try_map_captures<MappedFactor: Value<DataType>, MapFactorFn>(
         &self,

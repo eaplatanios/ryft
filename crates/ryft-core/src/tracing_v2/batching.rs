@@ -25,85 +25,85 @@ use crate::types::{ArrayType, Size, Typed};
 ///
 /// # Parameters
 ///
-///   - `domain`: [`Domain`] that provides the traced operation, type, and constant representations.
+///   - `context`: [`Context`] that provides the traced operation, type, and constant representations.
 ///   - `function`: Function/closure to map over the batched lanes.
 ///   - `input`: Input value whose mapped leaves drive the batched lanes.
 ///   - `in_axes`: Per-leaf mapped-axis selection for `input`, or one uniform leaf specification.
 ///   - `out_axes`: Per-leaf mapped-axis placement for the output, or one uniform leaf specification.
 ///   - `axis`: Mapped-axis specification carrying an optional explicit lane size and an optional axis name.
 #[inline]
-pub fn batch<'domain, D, F, I, O>(
-    domain: &'domain D,
+pub fn batch<'context, C, F, I, O>(
+    context: &'context C,
     function: F,
     input: I,
     in_axes: impl Into<BatchAxes<I::To<Option<usize>>>>,
     out_axes: impl Into<BatchAxes<O::To<Option<usize>>>>,
     axis: impl Into<BatchAxis>,
-) -> Result<O::To<D::Value>, BatchingError>
+) -> Result<O::To<C::Value>, BatchingError>
 where
-    D: Context<Type = ArrayType> + 'domain,
-    D::Value: 'domain,
-    D::Constant: 'domain,
+    C: Context<Type = ArrayType> + 'context,
+    C::Value: 'context,
+    C::Constant: 'context,
     I: Parameterized<
-            D::Value,
+            C::Value,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<D::Constant>
+                        + ParameterizedFamily<C::Constant>
                         + ParameterizedFamily<Option<usize>>
-                        + ParameterizedFamily<DomainTracer<'domain, D>>
-                        + ParameterizedFamily<BatchingTracer<'domain, D>>,
+                        + ParameterizedFamily<DomainTracer<'context, C>>
+                        + ParameterizedFamily<BatchingTracer<'context, C>>,
         >,
     O: Parameterized<
-            BatchingTracer<'domain, D>,
+            BatchingTracer<'context, C>,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<ArrayType>
-                        + ParameterizedFamily<D::Value>
-                        + ParameterizedFamily<D::Constant>
+                        + ParameterizedFamily<C::Value>
+                        + ParameterizedFamily<C::Constant>
                         + ParameterizedFamily<Option<usize>>
-                        + ParameterizedFamily<DomainTracer<'domain, D>>
-                        + ParameterizedFamily<BatchingTracer<'domain, D>>,
+                        + ParameterizedFamily<DomainTracer<'context, C>>
+                        + ParameterizedFamily<BatchingTracer<'context, C>>,
         >,
     I::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = I::ParameterStructure>,
     O::To<Option<usize>>: Parameterized<Option<usize>, ParameterStructure = O::ParameterStructure>,
-    I::To<DomainTracer<'domain, D>>: Parameterized<
-            DomainTracer<'domain, D>,
+    I::To<DomainTracer<'context, C>>: Parameterized<
+            DomainTracer<'context, C>,
             ParameterStructure = I::ParameterStructure,
             To<ArrayType> = I::To<ArrayType>,
-            To<D::Value> = I,
-            To<D::Constant> = I::To<D::Constant>,
+            To<C::Value> = I,
+            To<C::Constant> = I::To<C::Constant>,
             To<Option<usize>> = I::To<Option<usize>>,
-            To<BatchingTracer<'domain, D>> = I::To<BatchingTracer<'domain, D>>,
+            To<BatchingTracer<'context, C>> = I::To<BatchingTracer<'context, C>>,
         >,
-    O::To<DomainTracer<'domain, D>>: Parameterized<
-            DomainTracer<'domain, D>,
+    O::To<DomainTracer<'context, C>>: Parameterized<
+            DomainTracer<'context, C>,
             ParameterStructure = O::ParameterStructure,
             To<ArrayType> = O::To<ArrayType>,
-            To<D::Value> = O::To<D::Value>,
-            To<D::Constant> = O::To<D::Constant>,
+            To<C::Value> = O::To<C::Value>,
+            To<C::Constant> = O::To<C::Constant>,
             To<Option<usize>> = O::To<Option<usize>>,
-            To<BatchingTracer<'domain, D>> = O,
+            To<BatchingTracer<'context, C>> = O,
         >,
     I::To<ArrayType>: Parameterized<
             ArrayType,
-            To<D::Value> = I,
-            To<D::Constant> = I::To<D::Constant>,
-            To<DomainTracer<'domain, D>> = I::To<DomainTracer<'domain, D>>,
-            To<BatchingTracer<'domain, D>> = I::To<BatchingTracer<'domain, D>>,
+            To<C::Value> = I,
+            To<C::Constant> = I::To<C::Constant>,
+            To<DomainTracer<'context, C>> = I::To<DomainTracer<'context, C>>,
+            To<BatchingTracer<'context, C>> = I::To<BatchingTracer<'context, C>>,
         >,
     O::To<ArrayType>: Parameterized<
             ArrayType,
-            To<D::Value> = O::To<D::Value>,
-            To<D::Constant> = O::To<D::Constant>,
-            To<DomainTracer<'domain, D>> = O::To<DomainTracer<'domain, D>>,
-            To<BatchingTracer<'domain, D>> = O,
+            To<C::Value> = O::To<C::Value>,
+            To<C::Constant> = O::To<C::Constant>,
+            To<DomainTracer<'context, C>> = O::To<DomainTracer<'context, C>>,
+            To<BatchingTracer<'context, C>> = O,
         >,
-    D::Operation: Clone
-        + InterpretableOperation<ArrayType, D::Value>
+    C::Operation: Clone
+        + InterpretableOperation<ArrayType, C::Value>
         + From<TransposeOperation>
-        + for<'context> BatchableOperation<DomainTracer<'context, D>, BatchingContext<TracingContext<'context, D>>>,
-    F: FnOnce(I::To<BatchingTracer<'domain, D>>) -> Result<O, ProgramError>,
+        + for<'trace> BatchableOperation<DomainTracer<'trace, C>, BatchingContext<TracingContext<'trace, C>>>,
+    F: FnOnce(I::To<BatchingTracer<'context, C>>) -> Result<O, ProgramError>,
 {
-    domain.batch(function, input, in_axes, out_axes, axis)
+    context.batch(function, input, in_axes, out_axes, axis)
 }
 
 /// Packed array value carrying lane metadata for one batching transform.

@@ -11,19 +11,19 @@ use crate::types::Typed;
 /// JVP rule for [`StopGradientOperation`]: the primal passes through unchanged and the tangent is
 /// replaced with a canonical staged zero, severing derivative flow in both forward and reverse
 /// mode.
-impl<D: DifferentiationContext> DifferentiableOperation<D> for StopGradientOperation
+impl<C: DifferentiationContext> DifferentiableOperation<C> for StopGradientOperation
 where
-    StopGradientOperation: Operation<D::Type>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
+    StopGradientOperation: Operation<C::Type>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone();

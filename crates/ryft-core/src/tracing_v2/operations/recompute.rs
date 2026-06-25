@@ -89,24 +89,24 @@ where
     }
 }
 
-impl<D: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, D::Value>>
-    ZeroTangentOperation<D> for RecomputeOperation<O>
+impl<C: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, C::Value>>
+    ZeroTangentOperation<C> for RecomputeOperation<O>
 {
 }
 
-impl<D: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, D::Value>>
-    DifferentiableOperation<D> for RecomputeOperation<O>
+impl<C: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, C::Value>>
+    DifferentiableOperation<C> for RecomputeOperation<O>
 where
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<ArrayType>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         self.zero_tangent_jvp(context, inputs)
     }
@@ -146,7 +146,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::Domain;
-use std::cell::RefCell;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::contexts::StagingContext;

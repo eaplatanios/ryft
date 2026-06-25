@@ -29,20 +29,20 @@ where
     }
 }
 
-impl<D: DifferentiationContext> DifferentiableOperation<D> for NegOperation
+impl<C: DifferentiationContext> DifferentiableOperation<C> for NegOperation
 where
-    D::Value: Neg<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<NegOperation>,
-    NegOperation: Operation<D::Type>,
+    C::Value: Neg<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<NegOperation>,
+    NegOperation: Operation<C::Type>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![JvpTracer::new(-inputs[0].primal().clone(), -inputs[0].tangent().clone())])

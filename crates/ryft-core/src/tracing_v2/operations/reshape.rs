@@ -110,19 +110,19 @@ where
     }
 }
 
-impl<D> DifferentiableOperation<D> for ReshapeOperation
+impl<C> DifferentiableOperation<C> for ReshapeOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: ReshapeValue,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ReshapeOperation>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: ReshapeValue,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ReshapeOperation>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().reshape(self.output_shape().clone())?;

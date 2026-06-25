@@ -172,20 +172,20 @@ pub(crate) fn static_update_sizes(context: &str, update_type: &ArrayType) -> Res
 
 /// JVP rule for [`SliceOperation`]: slicing is a linear map, so the primal output is the slice of the input primal
 /// and the tangent is the same slice of the input tangent.
-impl<D> DifferentiableOperation<D> for SliceOperation
+impl<C> DifferentiableOperation<C> for SliceOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Slice,
-    D::Tangent: Slice,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<SliceOperation>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Slice,
+    C::Tangent: Slice,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<SliceOperation>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().slice(self.start_indices(), self.limit_indices(), self.strides())?;
@@ -198,21 +198,21 @@ where
 /// tangent is the update-slice of the two operand tangents at the same static offsets. When both operand tangents
 /// are canonical staged zeros, the output tangent is a canonical staged zero of the output type and no linear
 /// operation is staged.
-impl<D> DifferentiableOperation<D> for UpdateSliceOperation
+impl<C> DifferentiableOperation<C> for UpdateSliceOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: UpdateSlice,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: UpdateSlice,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
         From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 2, ProgramError);
         let input = &inputs[0];
@@ -239,26 +239,26 @@ where
 /// the input tangent whose start indices are the index primals captured as residual factors (the
 /// [`LinearDynamicSliceOperation`] form). When the input tangent is a canonical staged zero, the output tangent is a
 /// canonical staged zero of the output type and no linear operation is staged.
-impl<D> DifferentiableOperation<D> for DynamicSliceOperation
+impl<C> DifferentiableOperation<C> for DynamicSliceOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: DynamicSlice,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: DynamicSlice,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, C::Value>>> + From<ZeroOperation<ArrayType>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let [input, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 });
         };
-        let index_primals: Vec<D::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
+        let index_primals: Vec<C::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
         let primal = input.primal().dynamic_slice(&index_primals, self.sizes())?;
         if context.is_zero(input.tangent())? {
             let tangent_type = primal.r#type().into_owned();
@@ -283,26 +283,26 @@ where
 /// primals captured as residual factors (the [`LinearDynamicUpdateSliceOperation`] form). When both operand tangents
 /// are canonical staged zeros, the output tangent is a canonical staged zero of the output type and no linear
 /// operation is staged.
-impl<D> DifferentiableOperation<D> for DynamicUpdateSliceOperation
+impl<C> DifferentiableOperation<C> for DynamicUpdateSliceOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: DynamicUpdateSlice,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: DynamicUpdateSlice,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, C::Value>>> + From<ZeroOperation<ArrayType>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let [input, update, start_indices @ ..] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
         };
-        let index_primals: Vec<D::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
+        let index_primals: Vec<C::Value> = start_indices.iter().map(|index| index.primal().clone()).collect();
         let primal = input.primal().dynamic_update_slice(update.primal(), &index_primals)?;
         if context.is_zero(input.tangent())? && context.is_zero(update.tangent())? {
             let tangent_type = primal.r#type().into_owned();

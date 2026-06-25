@@ -127,22 +127,22 @@ impl<C: StagingContext<Operation: From<TransferToMemoryOperation>>> TransferToMe
 /// are both transferred to the destination (mirroring the JVP of `jax.device_put`). Canonical staged zero tangents
 /// stay canonical with their types re-placed, so no transfer is staged for them. The staged linear transfer transposes
 /// into a transfer that moves the cotangent back to the operand's source memory.
-impl<D> DifferentiableOperation<D> for TransferToMemoryOperation
+impl<C> DifferentiableOperation<C> for TransferToMemoryOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: TransferToMemory,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: TransferToMemory,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
         From<TransferToMemoryOperation> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];

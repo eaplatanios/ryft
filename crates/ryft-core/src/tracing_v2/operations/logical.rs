@@ -8,132 +8,124 @@ use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOr
 use crate::types::ArrayType;
 
 /// Logical inputs and outputs are Boolean, so [`NotOperation`] uses the zero-tangent forward-mode rule.
-impl<D> ZeroTangentOperation<D> for NotOperation
+impl<C> ZeroTangentOperation<C> for NotOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Not<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Not<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`NotOperation`]: the Boolean primal output is computed from the input primals and paired with a
 /// canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
-impl<D> DifferentiableOperation<D> for NotOperation
+impl<C> DifferentiableOperation<C> for NotOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Not<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Not<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         self.zero_tangent_jvp(context, inputs)
     }
 }
 
 /// Logical inputs and outputs are Boolean, so [`AndOperation`] uses the zero-tangent forward-mode rule.
-impl<D> ZeroTangentOperation<D> for AndOperation
+impl<C> ZeroTangentOperation<C> for AndOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BitAnd<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BitAnd<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`AndOperation`]: the Boolean primal output is computed from the input primals and paired with a
 /// canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
-impl<D> DifferentiableOperation<D> for AndOperation
+impl<C> DifferentiableOperation<C> for AndOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BitAnd<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BitAnd<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         self.zero_tangent_jvp(context, inputs)
     }
 }
 
 /// Logical inputs and outputs are Boolean, so [`OrOperation`] uses the zero-tangent forward-mode rule.
-impl<D> ZeroTangentOperation<D> for OrOperation
+impl<C> ZeroTangentOperation<C> for OrOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BitOr<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BitOr<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`OrOperation`]: the Boolean primal output is computed from the input primals and paired with a
 /// canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
-impl<D> DifferentiableOperation<D> for OrOperation
+impl<C> DifferentiableOperation<C> for OrOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BitOr<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BitOr<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         self.zero_tangent_jvp(context, inputs)
     }
 }
 
 /// Logical inputs and outputs are Boolean, so [`XorOperation`] uses the zero-tangent forward-mode rule.
-impl<D> ZeroTangentOperation<D> for XorOperation
+impl<C> ZeroTangentOperation<C> for XorOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BitXor<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BitXor<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
 }
 
 /// JVP rule for [`XorOperation`]: the Boolean primal output is computed from the input primals and paired
 /// with a canonical staged zero tangent. Refer to the documentation of
 /// [`ZeroTangentOperation`] for why this is sound.
-impl<D> DifferentiableOperation<D> for XorOperation
+impl<C> DifferentiableOperation<C> for XorOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: BitXor<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ZeroOperation<ArrayType>>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: BitXor<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         self.zero_tangent_jvp(context, inputs)
     }

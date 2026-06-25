@@ -94,21 +94,21 @@ where
 /// JVP rule for [`ConcatenateOperation`]: concatenation is jointly linear in all of its operands, so the tangent is
 /// the concatenation of the operand tangents along the same axis. When every operand tangent is a canonical staged
 /// zero, the output tangent is a canonical staged zero of the output type and no linear operation is staged.
-impl<D> DifferentiableOperation<D> for ConcatenateOperation
+impl<C> DifferentiableOperation<C> for ConcatenateOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Concatenate,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Concatenate,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
         From<ConcatenateOperation> + From<ZeroOperation<ArrayType>>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         if inputs.is_empty() {
             return Err(

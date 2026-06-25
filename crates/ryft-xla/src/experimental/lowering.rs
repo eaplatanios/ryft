@@ -1468,15 +1468,15 @@ where
     }
 }
 
-impl<V, C, P> LowerableXlaOperation<V> for LinearArrayOperation<V, C, V, P>
+impl<V, Constant, P> LowerableXlaOperation<V> for LinearArrayOperation<V, Constant, V, P>
 where
     V: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Zero<ArrayType, V>,
-    C: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
-    C::InterpretationContext: Zero<ArrayType, C>,
+    Constant: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
+    Constant::InterpretationContext: Zero<ArrayType, Constant>,
     P: Clone
         + Operation<ArrayType>
-        + LowerableXlaOperation<C>
+        + LowerableXlaOperation<Constant>
         + From<MulOperation>
         + From<DotOperation>
         + From<SelectOperation>
@@ -3075,14 +3075,14 @@ where
 /// [`DefactorizableProgramOperation::defactorize_operation`] (a scale by a referenced residual becomes a recomputed
 /// elementwise product, exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads,
 /// so the result lowers through the ordinary direct linear operation path.
-fn operand_form_scan_body<V, C, P>(
-    body: &Program<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, Vec<V>, Vec<V>>,
+fn operand_form_scan_body<V, Constant, P>(
+    body: &Program<ArrayType, V, LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>, Vec<V>, Vec<V>>,
     residual_slice_types: &[ArrayType],
-) -> Result<Program<ArrayType, V, LinearArrayOperation<V, C, V, P>, Vec<V>, Vec<V>>, LoweringError>
+) -> Result<Program<ArrayType, V, LinearArrayOperation<V, Constant, V, P>, Vec<V>, Vec<V>>, LoweringError>
 where
     V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Zero<ArrayType, V>,
-    C: Value<ArrayType>,
+    Constant: Value<ArrayType>,
     P: Clone
         + Operation<ArrayType>
         + From<MulOperation>
@@ -3092,7 +3092,7 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ConcatenateOperation>,
 {
-    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, C, V, P>>::new();
+    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, Constant, V, P>>::new();
     let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
     let body_input_types = body.input_types();
     for (body_atom, input_type) in body.input_ids().iter().zip(body_input_types.iter()) {

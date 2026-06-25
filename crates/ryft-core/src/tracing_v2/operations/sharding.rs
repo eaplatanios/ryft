@@ -54,20 +54,20 @@ where
 
 /// JVP rule for [`ReshardOperation`]. Resharding is linear, so the pushforward reshards both the primal and the
 /// tangent to the same target sharding.
-impl<D> DifferentiableOperation<D> for ReshardOperation
+impl<C> DifferentiableOperation<C> for ReshardOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Reshard,
-    D::Tangent: Reshard,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ReshardOperation>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Reshard,
+    C::Tangent: Reshard,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ReshardOperation>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().reshard(self.sharding());
@@ -129,21 +129,20 @@ where
 
 /// JVP rule for [`ShardingConstraintOperation`]. The hint is linear, so the pushforward applies the same hint to the
 /// primal and the tangent.
-impl<D> DifferentiableOperation<D> for ShardingConstraintOperation
+impl<C> DifferentiableOperation<C> for ShardingConstraintOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: ConstrainSharding,
-    D::Tangent: ConstrainSharding,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ShardingConstraintOperation>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: ConstrainSharding,
+    C::Tangent: ConstrainSharding,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ShardingConstraintOperation>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().constrain_sharding(self.sharding());

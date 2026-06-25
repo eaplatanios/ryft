@@ -76,16 +76,16 @@ pub trait CaptureParameterizedOperation<T: Type, F: Value<T>>: Clone + Operation
 /// conversion at each operation boundary. It is declared on this residual-aware specialization — implemented only by
 /// whole linear-operation algebras — rather than on lower-level capture mapping hooks, which component backend
 /// extensions that have no standalone zero may still use internally.
-pub trait ResidualizedOperation<D: DifferentiationContext>:
+pub trait ResidualizedOperation<C: DifferentiationContext>:
     CaptureParameterizedOperation<
-        D::Type,
-        ValueOrCapture<D::Type, D::Value>,
-        WithCapture<D::Value> = D::LinearOperation<D::Tangent, D::Value>,
-        WithCapture<ValueOrCapture<D::Type, D::Value>> = D::LinearOperation<
-            D::Tangent,
-            ValueOrCapture<D::Type, D::Value>,
+        C::Type,
+        ValueOrCapture<C::Type, C::Value>,
+        WithCapture<C::Value> = C::LinearOperation<C::Tangent, C::Value>,
+        WithCapture<ValueOrCapture<C::Type, C::Value>> = C::LinearOperation<
+            C::Tangent,
+            ValueOrCapture<C::Type, C::Value>,
         >,
-    > + From<ZeroOperation<D::Type>>
+    > + From<ZeroOperation<C::Type>>
 {
     /// Appends residual indices referenced by this operation to `indices`.
     fn append_residual_indices(&self, indices: &mut Vec<usize>) -> Result<(), ProgramError> {
@@ -102,32 +102,31 @@ pub trait ResidualizedOperation<D: DifferentiationContext>:
     fn remap_residuals(
         &self,
         mapping: &[Option<usize>],
-    ) -> Result<D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>, ProgramError>
-    {
+    ) -> Result<C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>, ProgramError> {
         self.try_map_captures(&mut |factor| factor.remap_residuals(mapping))
     }
 
     /// Instantiates residual references using `residuals`, producing a direct linear operation.
     fn instantiate_residuals(
         &self,
-        residuals: &[D::Value],
-    ) -> Result<D::LinearOperation<D::Tangent, D::Value>, ProgramError> {
+        residuals: &[C::Value],
+    ) -> Result<C::LinearOperation<C::Tangent, C::Value>, ProgramError> {
         self.try_map_captures(&mut |factor| factor.instantiate(residuals))
     }
 }
 
-impl<D, O> ResidualizedOperation<D> for O
+impl<C, O> ResidualizedOperation<C> for O
 where
-    D: DifferentiationContext,
+    C: DifferentiationContext,
     O: CaptureParameterizedOperation<
-            D::Type,
-            ValueOrCapture<D::Type, D::Value>,
-            WithCapture<D::Value> = D::LinearOperation<D::Tangent, D::Value>,
-            WithCapture<ValueOrCapture<D::Type, D::Value>> = D::LinearOperation<
-                D::Tangent,
-                ValueOrCapture<D::Type, D::Value>,
+            C::Type,
+            ValueOrCapture<C::Type, C::Value>,
+            WithCapture<C::Value> = C::LinearOperation<C::Tangent, C::Value>,
+            WithCapture<ValueOrCapture<C::Type, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
             >,
-        > + From<ZeroOperation<D::Type>>,
+        > + From<ZeroOperation<C::Type>>,
 {
 }
 
@@ -139,39 +138,34 @@ where
 /// [`Self::instantiate_program`] when a direct, residual-free [`Program`] is needed for debugging, transposition, or
 /// APIs that require ordinary linear operations.
 #[derive(Clone)]
-pub struct Pushforward<D, Input, Output>
+pub struct Pushforward<C, Input, Output>
 where
-    D: DifferentiationContext,
-    Input: Parameterized<D::Tangent>,
-    Output: Parameterized<D::Tangent>,
+    C: DifferentiationContext,
+    Input: Parameterized<C::Tangent>,
+    Output: Parameterized<C::Tangent>,
 {
     /// Residual primal values captured by the linearization run.
-    residuals: Vec<D::Value>,
+    residuals: Vec<C::Value>,
 
     /// Residualized linear program.
-    program: Program<
-        D::Type,
-        D::Tangent,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
-        Input,
-        Output,
-    >,
+    program:
+        Program<C::Type, C::Tangent, C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>, Input, Output>,
 }
 
-impl<D, Input, Output> Pushforward<D, Input, Output>
+impl<C, Input, Output> Pushforward<C, Input, Output>
 where
-    D: DifferentiationContext,
-    Input: Parameterized<D::Tangent>,
-    Output: Parameterized<D::Tangent>,
+    C: DifferentiationContext,
+    Input: Parameterized<C::Tangent>,
+    Output: Parameterized<C::Tangent>,
 {
     /// Creates a new [`Pushforward`].
     #[inline]
     fn new(
-        residuals: Vec<D::Value>,
+        residuals: Vec<C::Value>,
         program: Program<
-            D::Type,
-            D::Tangent,
-            D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
+            C::Type,
+            C::Tangent,
+            C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
             Input,
             Output,
         >,
@@ -181,7 +175,7 @@ where
 
     /// Returns the residual values captured by this pushforward.
     #[inline]
-    pub fn residuals(&self) -> &[D::Value] {
+    pub fn residuals(&self) -> &[C::Value] {
         self.residuals.as_slice()
     }
 
@@ -189,20 +183,15 @@ where
     #[inline]
     pub fn program(
         &self,
-    ) -> &Program<
-        D::Type,
-        D::Tangent,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>,
-        Input,
-        Output,
-    > {
+    ) -> &Program<C::Type, C::Tangent, C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>, Input, Output>
+    {
         &self.program
     }
 
     /// Drops residual values that are no longer referenced by this pushforward's program.
     fn compact_residuals(self) -> Result<Self, ProgramError>
     where
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
     {
         let mut referenced_indices = Vec::new();
         for instruction in self.program.instructions() {
@@ -242,9 +231,9 @@ where
     /// Instantiates this pushforward into a direct linear program with concrete factor payloads.
     pub fn instantiate_program(
         &self,
-    ) -> Result<Program<D::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>, Input, Output>, ProgramError>
+    ) -> Result<Program<C::Type, C::Tangent, C::LinearOperation<C::Tangent, C::Value>, Input, Output>, ProgramError>
     where
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
     {
         self.program.map_operations(|operation| operation.instantiate_residuals(self.residuals.as_slice()))
     }
@@ -252,13 +241,13 @@ where
     /// Applies this pushforward to `tangents` by interpreting its linear program through `context`.
     pub fn apply(
         &self,
-        context: &<D::Tangent as Value<D::Type>>::InterpretationContext,
+        context: &<C::Tangent as Value<C::Type>>::InterpretationContext,
         tangents: Input,
     ) -> Result<Output, ProgramError>
     where
         Input::ParameterStructure: Debug + PartialEq,
-        D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<D::Type, D::Tangent>,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
+        C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<C::Type, C::Tangent>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
     {
         let tangent_structure = tangents.parameter_structure();
         if tangent_structure != *self.program.input_structure() {
@@ -286,9 +275,9 @@ where
 /// ([`DifferentiationContext::linearize`], [`DifferentiationContext::jvp`], [`DifferentiationContext::vjp`], and the
 /// forward/reverse Jacobian helpers built on them). All of them trace the closure into a primal [`Program`] through a
 /// [`PrimalTracingContext`] before differentiating it symbolically, so every closure sees the same primal-staging
-/// tracer. The `'domain` lifetime parameter is unused (the tracer owns a clone of the enclosing context rather than
+/// tracer. The `'context` lifetime parameter is unused (the tracer owns a clone of the enclosing context rather than
 /// borrowing it) and retained only so that annotated closure signatures across the crate keep compiling.
-pub type LinearizationTracer<'domain, D> = Tracer<PrimalTracingContext<D>>;
+pub type LinearizationTracer<'context, C> = Tracer<PrimalTracingContext<C>>;
 
 /// Plain primal-staging [`Context`] used by [`DifferentiationContext::linearize`] to trace a user closure into a
 /// primal [`Program`] over the enclosing context's types before linearizing that program symbolically.
@@ -297,7 +286,7 @@ pub type LinearizationTracer<'domain, D> = Tracer<PrimalTracingContext<D>>;
 /// [`TracingContext`], but it is the *nesting* trace context for differentiation — the direct analog of
 /// [`BatchingContext`](crate::tracing_v2::batching::BatchingContext) on the batching side. Where [`TracingContext`]
 /// is a *root* trace context (it borrows a backend [`Domain`](crate::domains::Domain) and owns its own capture
-/// table), this context is keyed by the *enclosing* [`Context`] `E`: it owns a clone of `E` (cheap, since contexts
+/// table), this context is keyed by the *enclosing* [`Context`] `C`: it owns a clone of `C` (cheap, since contexts
 /// are [`Rc`]-based) and delegates runtime-capture registration through
 /// [`CapturingContext`](crate::compilation::context::CapturingContext) to that enclosing context rather than owning
 /// a capture table of its own.
@@ -311,50 +300,50 @@ pub type LinearizationTracer<'domain, D> = Tracer<PrimalTracingContext<D>>;
 /// lifetime-free. No differentiation work happens while the closure runs; the traced program is differentiated
 /// afterwards — symbolically by [`Program::linearize`] for [`linearize`](DifferentiationContext::linearize) and the
 /// reverse-mode entry points, or through the value-level JVP replay for [`jvp`](DifferentiationContext::jvp).
-pub struct PrimalTracingContext<E: Context> {
+pub struct PrimalTracingContext<C: Context> {
     /// Enclosing [`Context`] on whose behalf the closure is being traced.
-    parent: E,
+    parent: C,
 
     /// [`ProgramBuilder`] that owns the staged primal [`Program`].
-    builder: Rc<RefCell<ProgramBuilder<E::Type, E::Constant, E::Operation>>>,
+    builder: Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>>,
 }
 
-impl<E: Context> PrimalTracingContext<E> {
+impl<C: Context> PrimalTracingContext<C> {
     /// Creates a new [`PrimalTracingContext`] that owns a fresh [`ProgramBuilder`] and traces on behalf of `parent`.
-    fn new(parent: E) -> Self {
+    fn new(parent: C) -> Self {
         Self { parent, builder: Rc::new(RefCell::new(ProgramBuilder::new())) }
     }
 
     /// Returns the enclosing [`Context`] this closure trace runs on behalf of.
     #[inline]
-    pub(crate) fn parent(&self) -> &E {
+    pub(crate) fn parent(&self) -> &C {
         &self.parent
     }
 }
 
-impl<E: Context> Clone for PrimalTracingContext<E> {
+impl<C: Context> Clone for PrimalTracingContext<C> {
     fn clone(&self) -> Self {
         Self { parent: self.parent.clone(), builder: self.builder.clone() }
     }
 }
 
-impl<E: Context> Debug for PrimalTracingContext<E> {
+impl<C: Context> Debug for PrimalTracingContext<C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("PrimalTracingContext").finish_non_exhaustive()
     }
 }
 
-impl<E: Context> Domain for PrimalTracingContext<E> {
-    type Type = E::Type;
+impl<C: Context> Domain for PrimalTracingContext<C> {
+    type Type = C::Type;
     type Value = Tracer<Self>;
-    type Constant = E::Constant;
-    type Operation = E::Operation;
+    type Constant = C::Constant;
+    type Operation = C::Operation;
 }
 
-impl<E: Context> Context for PrimalTracingContext<E> {
+impl<C: Context> Context for PrimalTracingContext<C> {
     /// Lifts a constant payload into this context by recording it as a constant primal [`Tracer`].
     #[inline]
-    fn lift(&self, constant: E::Constant) -> Result<Tracer<Self>, ProgramError> {
+    fn lift(&self, constant: C::Constant) -> Result<Tracer<Self>, ProgramError> {
         Ok(self.constant(constant))
     }
 
@@ -370,7 +359,7 @@ impl<E: Context> Context for PrimalTracingContext<E> {
     }
 }
 
-impl<E: Context> StagingContext for PrimalTracingContext<E> {
+impl<C: Context> StagingContext for PrimalTracingContext<C> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
         &self.builder
@@ -574,8 +563,7 @@ pub trait DifferentiationContext:
                 Tracer<PrimalTracingContext<Self>>,
                 Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
-        Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>:
-            ResidualizedOperation<Self>,
+        Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>: ResidualizedOperation<Self>,
         Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>:
             MaybeZeroOperation<<Self as Domain>::Type>,
     {
@@ -623,8 +611,7 @@ pub trait DifferentiationContext:
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self>,
         Self::LinearOperation<Self::Tangent, Self::Value>:
             InterpretableOperation<<Self as Domain>::Type, Self::Tangent>,
-        Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>:
-            ResidualizedOperation<Self>,
+        Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>: ResidualizedOperation<Self>,
         Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>:
             MaybeZeroOperation<<Self as Domain>::Type>,
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> TracedOutput,
@@ -866,8 +853,7 @@ pub trait DifferentiationContext:
                 <Self as Domain>::Constant,
                 Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
             >,
-        Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>:
-            ResidualizedOperation<Self>,
+        Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>: ResidualizedOperation<Self>,
         Self::LinearOperation<Self::Tangent, ValueOrCapture<Self::Type, Self::Value>>:
             MaybeZeroOperation<<Self as Domain>::Type>,
     {
@@ -903,33 +889,34 @@ pub trait DifferentiationContext:
 /// [`linearize_program`](DifferentiationContext::linearize_program) run it against a concretizing context; the
 /// symbolic core ([`Program::linearize`]) runs it against a nested [`LinearizationContext`]. The contexts
 /// represent structural zero tangents uniformly as canonical staged zero operations.
-fn linearize_program_by_replay<E, O, Input, Output>(
-    context: &E,
-    program: &Program<<E as Domain>::Type, <E as Domain>::Constant, O, Input, Output>,
-    input_primals: Vec<<E as Domain>::Value>,
-) -> Result<(Output::To<<E as Domain>::Value>, Pushforward<E, Input::To<E::Tangent>, Output::To<E::Tangent>>), ProgramError>
+fn linearize_program_by_replay<C, O, Input, Output>(
+    context: &C,
+    program: &Program<<C as Domain>::Type, <C as Domain>::Constant, O, Input, Output>,
+    input_primals: Vec<<C as Domain>::Value>,
+) -> Result<
+    (Output::To<<C as Domain>::Value>, Pushforward<C, Input::To<C::Tangent>, Output::To<C::Tangent>>),
+    ProgramError,
+>
 where
-    E: DifferentiationContext + Domain<Operation = O>,
-    O: Clone + DifferentiableOperation<E>,
-    Input: Parameterized<<E as Domain>::Constant, Family: ParameterizedFamily<E::Tangent>>,
+    C: DifferentiationContext + Domain<Operation = O>,
+    O: Clone + DifferentiableOperation<C>,
+    Input: Parameterized<<C as Domain>::Constant, Family: ParameterizedFamily<C::Tangent>>,
     Output: Parameterized<
-            <E as Domain>::Constant,
-            Family: ParameterizedFamily<<E as Domain>::Value> + ParameterizedFamily<E::Tangent>,
+            <C as Domain>::Constant,
+            Family: ParameterizedFamily<<C as Domain>::Value> + ParameterizedFamily<C::Tangent>,
         >,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: ResidualizedOperation<E>,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>:
-        MaybeZeroOperation<<E as Domain>::Type>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<<C as Domain>::Type>,
 {
-    fn tangent_for_atom<'jvp, D>(
-        context: &TangentContext<'jvp, D>,
-        primal_values: &[Option<<D as Domain>::Value>],
-        tangents: &mut [Option<Tracer<TangentContext<'jvp, D>>>],
+    fn tangent_for_atom<'jvp, C>(
+        context: &TangentContext<'jvp, C>,
+        primal_values: &[Option<<C as Domain>::Value>],
+        tangents: &mut [Option<Tracer<TangentContext<'jvp, C>>>],
         atom_id: AtomId,
-    ) -> Result<Tracer<TangentContext<'jvp, D>>, ProgramError>
+    ) -> Result<Tracer<TangentContext<'jvp, C>>, ProgramError>
     where
-        D: DifferentiationContext,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-            From<ZeroOperation<<D as Domain>::Type>>,
+        C: DifferentiationContext,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<<C as Domain>::Type>>,
     {
         if let Some(tangent) = &tangents[atom_id.index()] {
             return Ok(tangent.clone());
@@ -951,8 +938,8 @@ where
     // Keep every tracer and context that holds a clone of `builder` inside this scope. Only raw output atom IDs
     // escape, making `Rc::try_unwrap(builder)` below a real ownership check instead of depending on manual drops.
     let (output_primal_values, output_tangent_atoms) = {
-        let mut primal_values: Vec<Option<<E as Domain>::Value>> = vec![None; program.atoms().len()];
-        let mut tangent_values: Vec<Option<Tracer<TangentContext<'_, E>>>> = vec![None; program.atoms().len()];
+        let mut primal_values: Vec<Option<<C as Domain>::Value>> = vec![None; program.atoms().len()];
+        let mut tangent_values: Vec<Option<Tracer<TangentContext<'_, C>>>> = vec![None; program.atoms().len()];
         let mut tangent_context =
             TangentContext::new_with_residuals(context, builder.clone(), residuals.clone(), residual_atoms.clone());
 
@@ -989,7 +976,7 @@ where
                         primal_values[input_atom.index()]
                             .clone()
                             .ok_or(ProgramError::UnboundAtomId { id: input_atom })?,
-                        tangent_for_atom::<E>(
+                        tangent_for_atom::<C>(
                             &tangent_context,
                             primal_values.as_slice(),
                             tangent_values.as_mut_slice(),
@@ -1043,7 +1030,7 @@ where
         let mut output_primal_values = Vec::with_capacity(program.output_ids().len());
         let mut output_tangent_atoms = Vec::with_capacity(program.output_ids().len());
         for output_atom in program.output_ids().iter().copied() {
-            let tangent = tangent_for_atom::<E>(
+            let tangent = tangent_for_atom::<C>(
                 &tangent_context,
                 primal_values.as_slice(),
                 tangent_values.as_mut_slice(),
@@ -1078,7 +1065,7 @@ where
         .build(output_tangent_atoms, program.input_structure().clone(), program.output_structure().clone())?
         .simplified()?;
     Ok((
-        Output::To::<<E as Domain>::Value>::from_parameters(program.output_structure().clone(), output_primal_values)?,
+        Output::To::<<C as Domain>::Value>::from_parameters(program.output_structure().clone(), output_primal_values)?,
         Pushforward::new(residuals.borrow().clone(), pushforward).compact_residuals()?,
     ))
 }
@@ -1140,42 +1127,42 @@ impl<'domain, D: Domain + 'domain, Capture> ProvidesContext<TracingContext<'doma
 /// The parameters are deliberately the *components* of the enclosing context rather than the context itself, and
 /// every component is a fixed point under nesting (see [`LinearizationContextOf`]): the nested context derived
 /// from a [`LinearizationContext`] is the same type again. This keeps the trait-solver obligations finite when
-/// condition rules require `O: DifferentiableOperation<LinearizationContextOf<D, O>>` for branches that
+/// condition rules require `O: DifferentiableOperation<LinearizationContextOf<C, O>>` for branches that
 /// themselves contain conditions.
 ///
-/// `CanonicalLinearOperation` is the enclosing context's linear operation family pinned at the factor type
-/// `C` (the constant type): `E::LinearOperation<E::Tangent, E::Constant>`. Because
+/// `CanonicalLinearOperation` is the enclosing context's linear operation family pinned at the enclosing constant
+/// type (`C::LinearOperation<C::Tangent, C::Constant>`). Because
 /// [`CaptureParameterizedOperation::try_map_captures`] maps only the factor parameter,
-/// `CanonicalLinearOperation::WithCapture<F>` recovers `E::LinearOperation<E::Tangent, F>` for every factor type `F`,
-/// which is how this context defines its own [`LinearOperation`](DifferentiationContext::LinearOperation) family
-/// without referring to `E`.
+/// `CanonicalLinearOperation::WithCapture<F>` recovers the same family for every factor type `F`, which is how this
+/// context defines its own [`LinearOperation`](DifferentiationContext::LinearOperation) family without carrying the
+/// enclosing context as a type parameter.
 ///
 /// This context represents structural zeros as nullary linear zero operations.
 #[doc(hidden)]
-pub struct LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+pub struct LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     /// [`ProgramBuilder`] that owns the nested primal [`Program`] staged by this context.
-    builder: Rc<RefCell<ProgramBuilder<T, C, O>>>,
+    builder: Rc<RefCell<ProgramBuilder<T, Constant, O>>>,
 
     /// [`PhantomData`] marker tying this context to the enclosing context's tangent value and canonical linear
     /// operation types.
     marker: PhantomData<(TangentValue, CanonicalLinearOperation)>,
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation>
-    LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation>
+    LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     /// Creates a new [`LinearizationContext`] that owns a fresh [`ProgramBuilder`].
     fn new() -> Self {
@@ -1183,61 +1170,61 @@ where
     }
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation> Clone
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation> Clone
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     fn clone(&self) -> Self {
         Self { builder: self.builder.clone(), marker: PhantomData }
     }
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation> Debug
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation> Debug
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LinearizationContext").finish_non_exhaustive()
     }
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation> Domain
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation> Domain
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     type Type = T;
     type Value = Tracer<Self>;
-    type Constant = C;
+    type Constant = Constant;
     type Operation = O;
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation> Context
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation> Context
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     /// Lifts a constant payload into this context by recording it as a constant primal [`Tracer`].
     #[inline]
-    fn lift(&self, constant: C) -> Result<Tracer<Self>, ProgramError> {
+    fn lift(&self, constant: Constant) -> Result<Tracer<Self>, ProgramError> {
         Ok(self.constant(constant))
     }
 
@@ -1253,49 +1240,49 @@ where
     }
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation> StagingContext
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation> StagingContext
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     #[inline]
-    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, C, O>>> {
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, Constant, O>>> {
         &self.builder
     }
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation>
-    ProvidesContext<LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>>
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation>
+    ProvidesContext<LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>>
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     #[inline]
-    fn context(&self) -> LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation> {
+    fn context(&self) -> LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation> {
         self.clone()
     }
 }
 
-impl<T, C, O, TangentValue, CanonicalLinearOperation> DifferentiationContext
-    for LinearizationContext<T, C, O, TangentValue, CanonicalLinearOperation>
+impl<T, Constant, O, TangentValue, CanonicalLinearOperation> DifferentiationContext
+    for LinearizationContext<T, Constant, O, TangentValue, CanonicalLinearOperation>
 where
     T: Type,
-    C: Value<T>,
+    Constant: Value<T>,
     O: Operation<T>,
     TangentValue: Value<T>,
-    CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
+    CanonicalLinearOperation: CaptureParameterizedOperation<T, Constant>,
 {
     type Tangent = TangentValue;
     type LinearOperation<V: Value<T>, F: Value<T>> =
-        <CanonicalLinearOperation as CaptureParameterizedOperation<T, C>>::WithCapture<F>;
+        <CanonicalLinearOperation as CaptureParameterizedOperation<T, Constant>>::WithCapture<F>;
 
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
@@ -1310,22 +1297,22 @@ where
     }
 }
 
-/// [`LinearizationContext`] derived from the enclosing differentiation context `E` for nested programs over
+/// [`LinearizationContext`] derived from the enclosing differentiation context `C` for nested programs over
 /// operations `O`.
 ///
 /// Every component of this instantiation is a fixed point under nesting: the nested context's type, constant, and
-/// tangent associated types equal `E`'s, its operation type is `O` again, and its canonical linear operation
-/// `E::LinearOperation<E::Tangent, E::Constant>` maps to itself under `WithCapture<E::Constant>`. Consequently
-/// `LinearizationContextOf<LinearizationContextOf<E, O>, O>` normalizes to
-/// `LinearizationContextOf<E, O>`, which keeps `DifferentiableOperation` bounds for nested control flow
+/// tangent associated types equal `C`'s, its operation type is `O` again, and its canonical linear operation
+/// `C::LinearOperation<C::Tangent, C::Constant>` maps to itself under `WithCapture<C::Constant>`. Consequently
+/// `LinearizationContextOf<LinearizationContextOf<C, O>, O>` normalizes to
+/// `LinearizationContextOf<C, O>`, which keeps `DifferentiableOperation` bounds for nested control flow
 /// finite for the trait solver.
 #[doc(hidden)]
-pub type LinearizationContextOf<E, O> = LinearizationContext<
-    <E as Domain>::Type,
-    <E as Domain>::Constant,
+pub type LinearizationContextOf<C, O> = LinearizationContext<
+    <C as Domain>::Type,
+    <C as Domain>::Constant,
     O,
-    <E as DifferentiationContext>::Tangent,
-    <E as DifferentiationContext>::LinearOperation<<E as DifferentiationContext>::Tangent, <E as Domain>::Constant>,
+    <C as DifferentiationContext>::Tangent,
+    <C as DifferentiationContext>::LinearOperation<<C as DifferentiationContext>::Tangent, <C as Domain>::Constant>,
 >;
 
 /// Result of one symbolic linearization run: a pair of programs that together represent a function and its
@@ -1334,7 +1321,7 @@ pub type LinearizationContextOf<E, O> = LinearizationContext<
 /// A [`Linearization`] is the fully program-level form of forward-mode differentiation. Where a [`Pushforward`]
 /// pairs a residualized linear program with the concrete residual values saved by one primal execution, a
 /// [`Linearization`] keeps the primal side symbolic too, so the same artifact can be interpreted eagerly in a
-/// concrete domain, spliced into an enclosing trace when `E`'s values are [`Tracer`]s, or embedded as program data
+/// concrete domain, spliced into an enclosing trace when `C`'s values are [`Tracer`]s, or embedded as program data
 /// inside higher-order operations such as linear `condition` branches and `scan`/`while` bodies.
 ///
 /// The two programs obey the following shape contract:
@@ -1352,24 +1339,24 @@ pub type LinearizationContextOf<E, O> = LinearizationContext<
 ///     primal outputs and the pushforward's residual references.
 ///
 /// The `Input` and `Output` type parameters are the linearized program's input and output [`Parameterized`]
-/// families over `E`'s constant type, exactly as they appear on the source [`Program`]; the pushforward program
-/// reuses them reparameterized to `E`'s tangent type. [`NestedLinearization`] fixes both to flat [`Vec`]s, which is
+/// families over `C`'s constant type, exactly as they appear on the source [`Program`]; the pushforward program
+/// reuses them reparameterized to `C`'s tangent type. [`NestedLinearization`] fixes both to flat [`Vec`]s, which is
 /// the shape used by higher-order JVP rules that linearize captured branch and body programs.
 ///
 /// Use [`interpret_primal`](Self::interpret_primal) to evaluate the primal side at concrete primal values and
 /// recover the residual environment, or [`at`](Self::at) to do that and bind the residuals into a reusable
 /// value-level [`Pushforward`].
-pub struct Linearization<E, O, Input, Output>
+pub struct Linearization<C, O, Input, Output>
 where
-    E: DifferentiationContext,
-    O: Operation<E::Type>,
-    Input: Parameterized<E::Constant, Family: ParameterizedFamily<E::Tangent>>,
-    Output: Parameterized<E::Constant, Family: ParameterizedFamily<E::Tangent>>,
+    C: DifferentiationContext,
+    O: Operation<C::Type>,
+    Input: Parameterized<C::Constant, Family: ParameterizedFamily<C::Tangent>>,
+    Output: Parameterized<C::Constant, Family: ParameterizedFamily<C::Tangent>>,
 {
     /// Staged primal program, extended so that the residual values captured by the pushforward become extra
     /// outputs appended after the original outputs. Residual index `i` of
     /// [`pushforward_program`](Self::pushforward_program) corresponds to appended output `i`.
-    pub primal_program: Program<E::Type, E::Constant, O, Input, Vec<E::Constant>>,
+    pub primal_program: Program<C::Type, C::Constant, O, Input, Vec<C::Constant>>,
 
     /// Residualized pushforward program, expressed directly in the enclosing context's linear representation. Its
     /// [`ValueOrCapture::Capture`] factors index the residual outputs appended to
@@ -1377,23 +1364,23 @@ where
     // The `tangent_program` name is reserved for this field once the remaining `pushforward_program` consumers are
     // migrated; renaming now would break the `NestedLinearization` alias's field accesses.
     pub pushforward_program: Program<
-        E::Type,
-        E::Tangent,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-        Input::To<E::Tangent>,
-        Output::To<E::Tangent>,
+        C::Type,
+        C::Tangent,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+        Input::To<C::Tangent>,
+        Output::To<C::Tangent>,
     >,
 
     /// Types of the residual values, aligned with the outputs appended to [`primal_program`](Self::primal_program).
-    pub residual_types: Vec<E::Type>,
+    pub residual_types: Vec<C::Type>,
 }
 
-impl<E, O, Input, Output> Linearization<E, O, Input, Output>
+impl<C, O, Input, Output> Linearization<C, O, Input, Output>
 where
-    E: DifferentiationContext,
-    O: Operation<E::Type>,
-    Input: Parameterized<E::Constant, Family: ParameterizedFamily<E::Tangent>>,
-    Output: Parameterized<E::Constant, Family: ParameterizedFamily<E::Tangent>>,
+    C: DifferentiationContext,
+    O: Operation<C::Type>,
+    Input: Parameterized<C::Constant, Family: ParameterizedFamily<C::Tangent>>,
+    Output: Parameterized<C::Constant, Family: ParameterizedFamily<C::Tangent>>,
 {
     /// Interprets [`primal_program`](Self::primal_program) at `primals` through `context` and returns the original
     /// primal outputs together with the captured residual values.
@@ -1412,14 +1399,14 @@ where
     ///   - `primals`: Structured primal input values matching the program's input structure.
     pub fn interpret_primal(
         &self,
-        context: &E,
-        primals: Input::To<<E as Domain>::Value>,
-    ) -> Result<(Output::To<<E as Domain>::Value>, Vec<<E as Domain>::Value>), ProgramError>
+        context: &C,
+        primals: Input::To<<C as Domain>::Value>,
+    ) -> Result<(Output::To<<C as Domain>::Value>, Vec<<C as Domain>::Value>), ProgramError>
     where
-        E: Domain<Operation = O>,
+        C: Domain<Operation = O>,
         O: Clone,
-        Input::Family: ParameterizedFamily<<E as Domain>::Value>,
-        Output::Family: ParameterizedFamily<<E as Domain>::Value>,
+        Input::Family: ParameterizedFamily<<C as Domain>::Value>,
+        Output::Family: ParameterizedFamily<<C as Domain>::Value>,
         Input::ParameterStructure: Debug + PartialEq,
     {
         let primal_structure = primals.parameter_structure();
@@ -1446,7 +1433,7 @@ where
             )));
         };
         let residual_values = outputs.split_off(output_count);
-        let outputs = Output::To::<<E as Domain>::Value>::from_parameters(
+        let outputs = Output::To::<<C as Domain>::Value>::from_parameters(
             self.pushforward_program.output_structure().clone(),
             outputs,
         )?;
@@ -1467,17 +1454,17 @@ where
     ///   - `primals`: Structured primal input values matching the program's input structure.
     pub fn at(
         &self,
-        context: &E,
-        primals: Input::To<<E as Domain>::Value>,
+        context: &C,
+        primals: Input::To<<C as Domain>::Value>,
     ) -> Result<
-        (Output::To<<E as Domain>::Value>, Pushforward<E, Input::To<E::Tangent>, Output::To<E::Tangent>>),
+        (Output::To<<C as Domain>::Value>, Pushforward<C, Input::To<C::Tangent>, Output::To<C::Tangent>>),
         ProgramError,
     >
     where
-        E: Domain<Operation = O>,
+        C: Domain<Operation = O>,
         O: Clone,
-        Input::Family: ParameterizedFamily<<E as Domain>::Value>,
-        Output::Family: ParameterizedFamily<<E as Domain>::Value>,
+        Input::Family: ParameterizedFamily<<C as Domain>::Value>,
+        Output::Family: ParameterizedFamily<<C as Domain>::Value>,
         Input::ParameterStructure: Debug + PartialEq,
     {
         let (outputs, residual_values) = self.interpret_primal(context, primals)?;
@@ -1487,7 +1474,7 @@ where
 
 /// [`Linearization`] of a nested flat program whose inputs and outputs are plain [`Vec`]s, as produced by one
 /// nested symbolic linearization run through [`Program::linearize`] (see [`LinearizableProgramOperation`]).
-pub type NestedLinearization<E, O> = Linearization<E, O, Vec<<E as Domain>::Constant>, Vec<<E as Domain>::Constant>>;
+pub type NestedLinearization<C, O> = Linearization<C, O, Vec<<C as Domain>::Constant>, Vec<<C as Domain>::Constant>>;
 
 /// Operation types whose captured flat programs can be linearized symbolically on behalf of an enclosing
 /// differentiation context.
@@ -1636,7 +1623,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
 /// Primitive rules usually stage tangent operations through [`TangentContext::stage_operation`].
 /// Higher-order rules use [`TangentContext::differentiable`] to recurse into nested programs with the same
 /// [`DifferentiationContext`] implementation.
-pub trait DifferentiableOperation<E: DifferentiationContext>: Operation<E::Type> {
+pub trait DifferentiableOperation<C: DifferentiationContext>: Operation<C::Type> {
     /// Applies this operation's forward-mode Jacobian-Vector Product (JVP) rule.
     ///
     /// The returned vector must be aligned with this operation's outputs and must carry both the
@@ -1649,13 +1636,12 @@ pub trait DifferentiableOperation<E: DifferentiationContext>: Operation<E::Type>
     ///   - `inputs`: Traced inputs aligned with this operation's inputs.
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        E: 'jvp,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>:
-            From<ZeroOperation<E::Type>>;
+        C: 'jvp,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>;
 }
 
 /// Forward-mode rule for operations whose outputs have no tangent space.
@@ -1686,8 +1672,7 @@ pub trait ZeroTangentOperation<C: DifferentiationContext>: InterpretableOperatio
     ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
         C: 'jvp,
-        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
-            From<ZeroOperation<C::Type>>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_context = context.differentiable().primal_interpretation_context();
@@ -1711,41 +1696,31 @@ pub trait ZeroTangentOperation<C: DifferentiationContext>: InterpretableOperatio
 /// call [`stage_operation`](Self::stage_operation) to stage tangent ops and
 /// [`differentiable`](Self::differentiable) to access primal constants or recursively linearize nested programs.
 #[doc(hidden)]
-pub struct TangentContext<'domain, E: DifferentiationContext> {
+pub struct TangentContext<'context, C: DifferentiationContext> {
     /// [`DifferentiationContext`] implementation borrowed by this [`TangentContext`] for primal semantics.
-    differentiable: &'domain E,
+    differentiable: &'context C,
 
     /// [`ProgramBuilder`] that owns the staged linear [`Program`](crate::programs::Program) that is currently being
     /// traced.
     builder: Rc<
-        RefCell<
-            ProgramBuilder<
-                E::Type,
-                E::Tangent,
-                E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-            >,
-        >,
+        RefCell<ProgramBuilder<C::Type, C::Tangent, C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>>,
     >,
 
     /// Residual values captured by product-rule factors in this tangent context.
-    residuals: Rc<RefCell<Vec<E::Value>>>,
+    residuals: Rc<RefCell<Vec<C::Value>>>,
 
     /// Residual indices keyed by primal atom id.
     residual_atoms: Rc<RefCell<HashMap<AtomId, usize>>>,
 }
 
-impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
+impl<'context, C: DifferentiationContext> TangentContext<'context, C> {
     /// Creates a tangent context that stages into `builder`.
     #[doc(hidden)]
     pub fn new(
-        differentiable: &'domain E,
+        differentiable: &'context C,
         builder: Rc<
             RefCell<
-                ProgramBuilder<
-                    E::Type,
-                    E::Tangent,
-                    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-                >,
+                ProgramBuilder<C::Type, C::Tangent, C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>,
             >,
         >,
     ) -> Self {
@@ -1760,17 +1735,13 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     /// Creates a tangent context that shares residual storage with an enclosing linearization context.
     #[doc(hidden)]
     pub(crate) fn new_with_residuals(
-        differentiable: &'domain E,
+        differentiable: &'context C,
         builder: Rc<
             RefCell<
-                ProgramBuilder<
-                    E::Type,
-                    E::Tangent,
-                    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
-                >,
+                ProgramBuilder<C::Type, C::Tangent, C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>,
             >,
         >,
-        residuals: Rc<RefCell<Vec<E::Value>>>,
+        residuals: Rc<RefCell<Vec<C::Value>>>,
         residual_atoms: Rc<RefCell<HashMap<AtomId, usize>>>,
     ) -> Self {
         Self { differentiable, builder, residuals, residual_atoms }
@@ -1778,7 +1749,7 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
 
     /// Returns the [`DifferentiationContext`] implementation borrowed by this tangent context.
     #[inline]
-    pub fn differentiable(&self) -> &'domain E {
+    pub fn differentiable(&self) -> &'context C {
         self.differentiable
     }
 
@@ -1787,7 +1758,7 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     /// Convenience delegation to [`Context::bind`] on the borrowed implementation, used by nullary-operation JVP
     /// rules to stage their primal without reaching through [`differentiable`](Self::differentiable) explicitly.
     #[inline]
-    pub fn bind_primal(&self, operation: E::Operation, inputs: &[E::Value]) -> Result<Vec<E::Value>, ProgramError> {
+    pub fn bind_primal(&self, operation: C::Operation, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError> {
         self.differentiable.bind(operation, inputs)
     }
 
@@ -1796,7 +1767,7 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     /// Higher-order JVP rules also use this to register primal values they computed themselves — for example, the
     /// residual outputs of a staged primal condition — in the active linearization residual environment, obtaining
     /// [`ValueOrCapture::Capture`] factors that reusable pushforwards instantiate later.
-    pub fn factor(&mut self, value: E::Value) -> ValueOrCapture<E::Type, E::Value> {
+    pub fn factor(&mut self, value: C::Value) -> ValueOrCapture<C::Type, C::Value> {
         let r#type = value.r#type().into_owned();
         let mut residuals = self.residuals.borrow_mut();
         let index = residuals.len();
@@ -1805,7 +1776,7 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     }
 
     /// Captures `value` as a residual factor, deduplicating by `atom` when one is available.
-    fn factor_for_atom(&mut self, atom: AtomId, value: E::Value) -> ValueOrCapture<E::Type, E::Value> {
+    fn factor_for_atom(&mut self, atom: AtomId, value: C::Value) -> ValueOrCapture<C::Type, C::Value> {
         let r#type = value.r#type().into_owned();
         if let Some(index) = self.residual_atoms.borrow().get(&atom).copied() {
             return ValueOrCapture::Capture { index, r#type };
@@ -1818,7 +1789,7 @@ impl<'domain, E: DifferentiationContext> TangentContext<'domain, E> {
     }
 }
 
-impl<'domain, E: DifferentiationContext> Clone for TangentContext<'domain, E> {
+impl<'context, C: DifferentiationContext> Clone for TangentContext<'context, C> {
     fn clone(&self) -> Self {
         Self {
             differentiable: self.differentiable,
@@ -1829,23 +1800,23 @@ impl<'domain, E: DifferentiationContext> Clone for TangentContext<'domain, E> {
     }
 }
 
-impl<'domain, E: DifferentiationContext> Debug for TangentContext<'domain, E> {
+impl<'context, C: DifferentiationContext> Debug for TangentContext<'context, C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TangentContext").finish_non_exhaustive()
     }
 }
 
-impl<'domain, E: DifferentiationContext> Domain for TangentContext<'domain, E> {
-    type Type = E::Type;
+impl<'context, C: DifferentiationContext> Domain for TangentContext<'context, C> {
+    type Type = C::Type;
     type Value = Tracer<Self>;
-    type Constant = E::Tangent;
-    type Operation = E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>;
+    type Constant = C::Tangent;
+    type Operation = C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>;
 }
 
-impl<'domain, E: DifferentiationContext> Context for TangentContext<'domain, E> {
+impl<'context, C: DifferentiationContext> Context for TangentContext<'context, C> {
     /// Lifts a tangent payload into this tangent context by recording it as a constant tangent [`Tracer`].
     #[inline]
-    fn lift(&self, constant: E::Tangent) -> Result<Tracer<Self>, ProgramError> {
+    fn lift(&self, constant: C::Tangent) -> Result<Tracer<Self>, ProgramError> {
         Ok(self.constant(constant))
     }
 
@@ -1861,7 +1832,7 @@ impl<'domain, E: DifferentiationContext> Context for TangentContext<'domain, E> 
     }
 }
 
-impl<'domain, E: DifferentiationContext> StagingContext for TangentContext<'domain, E> {
+impl<'context, C: DifferentiationContext> StagingContext for TangentContext<'context, C> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
         &self.builder
@@ -1911,20 +1882,20 @@ impl<'domain, E: DifferentiationContext> StagingContext for TangentContext<'doma
 /// flowing alongside it as an atom in the active tangent program. Structurally zero tangents are represented by
 /// canonical typed [`ZeroOperation`] instructions, so rules use [`StagingContext::is_zero`] when they need local zero
 /// propagation.
-pub struct JvpTracer<'domain, E: DifferentiationContext> {
+pub struct JvpTracer<'context, C: DifferentiationContext> {
     /// The primal value.
-    primal: E::Value,
+    primal: C::Value,
 
     /// The tangent associated with the primal.
-    tangent: Tracer<TangentContext<'domain, E>>,
+    tangent: Tracer<TangentContext<'context, C>>,
 
     /// Primal atom that can be used to deduplicate residual factors for this value.
     residual_atom: Option<AtomId>,
 }
 
-impl<'domain, E> Clone for JvpTracer<'domain, E>
+impl<'context, C> Clone for JvpTracer<'context, C>
 where
-    E: DifferentiationContext,
+    C: DifferentiationContext,
 {
     #[inline]
     fn clone(&self) -> Self {
@@ -1932,9 +1903,9 @@ where
     }
 }
 
-impl<'domain, E> Debug for JvpTracer<'domain, E>
+impl<'context, C> Debug for JvpTracer<'context, C>
 where
-    E: DifferentiationContext,
+    C: DifferentiationContext,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1946,23 +1917,23 @@ where
     }
 }
 
-impl<'domain, E: DifferentiationContext> Parameter for JvpTracer<'domain, E> {}
+impl<'context, C: DifferentiationContext> Parameter for JvpTracer<'context, C> {}
 
-impl<'domain, E> JvpTracer<'domain, E>
+impl<'context, C> JvpTracer<'context, C>
 where
-    E: DifferentiationContext + 'domain,
+    C: DifferentiationContext + 'context,
 {
     /// Constructs a [`JvpTracer`] from an explicit primal value and staged tangent.
     #[inline]
-    pub fn new(primal: E::Value, tangent: Tracer<TangentContext<'domain, E>>) -> Self {
+    pub fn new(primal: C::Value, tangent: Tracer<TangentContext<'context, C>>) -> Self {
         Self { primal, tangent, residual_atom: None }
     }
 
     /// Constructs a [`JvpTracer`] with an optional primal atom used for residual deduplication.
     #[inline]
     fn new_with_residual_atom(
-        primal: E::Value,
-        tangent: Tracer<TangentContext<'domain, E>>,
+        primal: C::Value,
+        tangent: Tracer<TangentContext<'context, C>>,
         residual_atom: Option<AtomId>,
     ) -> Self {
         Self { primal, tangent, residual_atom }
@@ -1970,25 +1941,25 @@ where
 
     /// Constructs a [`JvpTracer`] with a concrete staged tangent.
     #[inline]
-    pub fn from_value(primal: E::Value, tangent: Tracer<TangentContext<'domain, E>>) -> Self {
+    pub fn from_value(primal: C::Value, tangent: Tracer<TangentContext<'context, C>>) -> Self {
         Self { primal, tangent, residual_atom: None }
     }
 
     /// Returns the primal value carried by this JVP tracer.
     #[inline]
-    pub fn primal(&self) -> &E::Value {
+    pub fn primal(&self) -> &C::Value {
         &self.primal
     }
 
     /// Returns the tangent carried by this JVP tracer.
     #[inline]
-    pub fn tangent(&self) -> &Tracer<TangentContext<'domain, E>> {
+    pub fn tangent(&self) -> &Tracer<TangentContext<'context, C>> {
         &self.tangent
     }
 
     /// Returns this tracer's primal value as a residual factor.
     #[inline]
-    pub fn factor(&self, context: &mut TangentContext<'domain, E>) -> ValueOrCapture<E::Type, E::Value> {
+    pub fn factor(&self, context: &mut TangentContext<'context, C>) -> ValueOrCapture<C::Type, C::Value> {
         match self.residual_atom {
             Some(atom) => context.factor_for_atom(atom, self.primal.clone()),
             None => ValueOrCapture::Value(self.primal.clone()),
@@ -1997,26 +1968,26 @@ where
 
     /// Consumes this JVP tracer and returns its primal and tangent components.
     #[inline]
-    pub fn into_parts(self) -> (E::Value, Tracer<TangentContext<'domain, E>>) {
+    pub fn into_parts(self) -> (C::Value, Tracer<TangentContext<'context, C>>) {
         (self.primal, self.tangent)
     }
 }
 
-impl<'domain, E: DifferentiationContext> Typed<E::Type> for JvpTracer<'domain, E> {
+impl<'context, C: DifferentiationContext> Typed<C::Type> for JvpTracer<'context, C> {
     #[inline]
-    fn r#type(&self) -> Cow<'_, E::Type> {
+    fn r#type(&self) -> Cow<'_, C::Type> {
         self.primal.r#type()
     }
 }
 
-impl<'domain, E: DifferentiationContext> Display for JvpTracer<'domain, E> {
+impl<'context, C: DifferentiationContext> Display for JvpTracer<'context, C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self.primal, formatter)
     }
 }
 
-impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E> {
-    type InterpretationContext = EagerContext<E::Type, Self>;
+impl<'context, C: DifferentiationContext> Value<C::Type> for JvpTracer<'context, C> {
+    type InterpretationContext = EagerContext<C::Type, Self>;
 
     #[inline]
     fn interpretation_context(&self) -> Option<Self::InterpretationContext> {

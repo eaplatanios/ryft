@@ -167,19 +167,19 @@ impl<C: StagingContext<Operation: From<RematerializationNameOperation>>> Remater
 /// [`RematerializationName`], so the tag stays visible on the instructions that define linearization residuals (which is
 /// what the name-based rematerialization policies classify). The rule stages no linear operation, so `rematerialization_name`
 /// never appears in a pushforward program and needs no transpose rule.
-impl<D: DifferentiationContext> DifferentiableOperation<D> for RematerializationNameOperation
+impl<C: DifferentiationContext> DifferentiableOperation<C> for RematerializationNameOperation
 where
-    RematerializationNameOperation: Operation<D::Type>,
-    D::Value: RematerializationName,
+    RematerializationNameOperation: Operation<C::Type>,
+    C::Value: RematerializationName,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().rematerialization_name(self.tag());

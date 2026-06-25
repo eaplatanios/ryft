@@ -45,32 +45,32 @@ pub fn trace<
 ///
 /// # Parameters
 ///
-///   - `domain`: [`Domain`] that provides the traced operation, type, and constant representations.
+///   - `context`: [`Context`] that provides the traced operation, type, and constant representations.
 ///   - `function`: Function/closure to trace and interpret/execute.
 ///   - `input`: Input value to use for tracing and interpreting the provided function.
 #[inline]
 pub fn interpret_and_trace<
-    'domain,
-    D: Context<Operation: Clone + InterpretableOperation<D::Type, D::Value>>,
-    F: FnOnce(I::To<DomainTracer<'domain, D>>) -> Result<O, ProgramError>,
+    'context,
+    C: Context<Operation: Clone + InterpretableOperation<C::Type, C::Value>>,
+    F: FnOnce(I::To<DomainTracer<'context, C>>) -> Result<O, ProgramError>,
     I: Parameterized<
-            D::Value,
-            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<DomainTracer<'domain, D>>,
+            C::Value,
+            Family: ParameterizedFamily<C::Constant> + ParameterizedFamily<DomainTracer<'context, C>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    O: Parameterized<DomainTracer<'domain, D>, Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Constant>>,
+    O: Parameterized<DomainTracer<'context, C>, Family: ParameterizedFamily<C::Value> + ParameterizedFamily<C::Constant>>,
 >(
-    domain: &'domain D,
+    context: &'context C,
     function: F,
     input: I,
 ) -> Result<
-    (O::To<D::Value>, Program<D::Type, D::Constant, D::Operation, I::To<D::Constant>, O::To<D::Constant>>),
+    (O::To<C::Value>, Program<C::Type, C::Constant, C::Operation, I::To<C::Constant>, O::To<C::Constant>>),
     ProgramError,
 >
 where
-    <D::Value as Value<D::Type>>::InterpretationContext: Default,
+    <C::Value as Value<C::Type>>::InterpretationContext: Default,
 {
-    TracingContext::interpret_and_trace(domain, function, input)
+    TracingContext::interpret_and_trace(context, function, input)
 }
 
 /// Traces the provided `function` against `input_type` and returns its inferred output type. This is the module-level

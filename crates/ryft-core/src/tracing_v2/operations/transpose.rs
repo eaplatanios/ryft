@@ -27,20 +27,20 @@ where
     }
 }
 
-impl<D> DifferentiableOperation<D> for TransposeOperation
+impl<C> DifferentiableOperation<C> for TransposeOperation
 where
-    D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Transpose,
-    D::Tangent: Transpose,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<TransposeOperation>,
+    C: DifferentiationContext<Type = ArrayType>,
+    C::Value: Transpose,
+    C::Tangent: Transpose,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<TransposeOperation>,
 {
     fn jvp<'jvp>(
         &self,
-        _context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        _context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().clone().transpose(self.permutation().to_vec())?;

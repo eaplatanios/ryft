@@ -199,11 +199,7 @@ where
     }
 }
 
-impl<E, Capture> CapturingContext<Capture> for PrimalTracingContext<E>
-where
-    E: CapturingContext<Capture>,
-    Capture: Value<E::Type>,
-{
+impl<C: CapturingContext<Capture>, Capture: Value<C::Type>> CapturingContext<Capture> for PrimalTracingContext<C> {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)

@@ -571,42 +571,42 @@ where
     ///     shape and the static shapes of its output leaves.
     ///   - `pushforward`: Staged pushforward program whose inputs and outputs mirror `Input` and
     ///     `Output` reparameterized to the domain's tangent leaf type.
-    pub(crate) fn from_pushforward<D, Input, Output, V>(
+    pub(crate) fn from_pushforward<C, Input, Output, V>(
         input_structure: Input::ParameterStructure,
         input_parameters: Vec<V>,
         output: Output,
-        pushforward: Pushforward<D, Input::To<D::Tangent>, Output::To<D::Tangent>>,
+        pushforward: Pushforward<C, Input::To<C::Tangent>, Output::To<C::Tangent>>,
     ) -> Result<Self, ProgramError>
     where
         S: Clone,
-        D: Domain<Type = ArrayType, Value = V> + DifferentiationContext,
+        C: Domain<Type = ArrayType, Value = V> + DifferentiationContext,
         V: CoordinateValue<Coordinate = S>,
-        D::Tangent: CoordinateValue<Coordinate = S>,
+        C::Tangent: CoordinateValue<Coordinate = S>,
         Input:
             Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
         Output:
             Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, S>> = Rows, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialBlock<S>>,
-        Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
+        Input::Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<DifferentialBlock<S>>,
+        Output::Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-        D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<ArrayType, D::Tangent>
+        C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<ArrayType, C::Tangent>
             + BatchableOperation<
-                D::Tangent,
-                EagerContext<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>,
+                C::Tangent,
+                EagerContext<ArrayType, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>,
             >,
-        D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
-        <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,
+        C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
+        <C::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, C::Tangent>,
     {
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
         let lane_count: usize = input_coordinate_counts.iter().sum();
-        let tangent_context = <D::Tangent as Value<ArrayType>>::InterpretationContext::default();
+        let tangent_context = <C::Tangent as Value<ArrayType>>::InterpretationContext::default();
 
         let tangent_parameters = input_parameters
             .iter()
             .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let batched_basis_parameters = batched_standard_basis::<D::Tangent>(tangent_parameters.as_slice(), lane_count)?;
+        let batched_basis_parameters = batched_standard_basis::<C::Tangent>(tangent_parameters.as_slice(), lane_count)?;
 
         let output_structure = output.parameter_structure();
         let output_parameters = output.into_parameters().collect::<Vec<_>>();
@@ -621,12 +621,12 @@ where
             let pushforward_program = pushforward.instantiate_program()?;
             let batched_output = pushforward_program.interpret_with(
                 batched_basis_parameters,
-                |_, constant: &D::Tangent| Ok::<_, ProgramError>(ArrayBatch::unbatched(constant.clone())),
-                |instruction, inputs: &[ArrayBatch<D::Tangent>]| {
+                |_, constant: &C::Tangent| Ok::<_, ProgramError>(ArrayBatch::unbatched(constant.clone())),
+                |instruction, inputs: &[ArrayBatch<C::Tangent>]| {
                     batch_linear_program_instruction(instruction.operation(), inputs)
                 },
             )?;
-            unstack_batched_coordinates::<D::Tangent>(batched_output, tangent_output_parameters.as_slice(), lane_count)?
+            unstack_batched_coordinates::<C::Tangent>(batched_output, tangent_output_parameters.as_slice(), lane_count)?
         };
 
         Self::from_coordinate_columns::<Input, Output, V>(
@@ -838,59 +838,59 @@ where
 /// [`jacrev`] replays all output-coordinate basis cotangents through the pullback and reassembles
 /// the resulting input coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
 #[allow(private_bounds)]
-pub fn jacrev<'domain, D, F, Input, TracedOutput>(
-    domain: &'domain D,
+pub fn jacrev<'context, C, F, Input, TracedOutput>(
+    context: &'context C,
     function: F,
     primals: Input,
-) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<D>>, DomainValue<D>>, ProgramError>
+) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<C>>, DomainValue<C>>, ProgramError>
 where
-    D: Domain<Type = ArrayType> + DifferentiationContext,
-    DomainValue<D>: CoordinateValue + 'domain,
-    D::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<D>>>,
-    Input: Parameterized<DomainValue<D>, To<DomainValue<D>> = Input, ParameterStructure: Debug + PartialEq>,
-    TracedOutput: Parameterized<LinearizationTracer<'domain, D>, ParameterStructure: Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<LinearizationTracer<'domain, D>>
-        + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
-    TracedOutput::Family: ParameterizedFamily<DomainValue<D>>
-        + ParameterizedFamily<D::Tangent>
-        + ParameterizedFamily<LinearizationTracer<'domain, D>>
+    C: Domain<Type = ArrayType> + DifferentiationContext,
+    DomainValue<C>: CoordinateValue + 'context,
+    C::Tangent: CoordinateValue<Coordinate = CoordinateScalar<DomainValue<C>>>,
+    Input: Parameterized<DomainValue<C>, To<DomainValue<C>> = Input, ParameterStructure: Debug + PartialEq>,
+    TracedOutput: Parameterized<LinearizationTracer<'context, C>, ParameterStructure: Debug + PartialEq>,
+    Input::Family: ParameterizedFamily<C::Tangent>
+        + ParameterizedFamily<LinearizationTracer<'context, C>>
+        + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
+    TracedOutput::Family: ParameterizedFamily<DomainValue<C>>
+        + ParameterizedFamily<C::Tangent>
+        + ParameterizedFamily<LinearizationTracer<'context, C>>
         + ParameterizedFamily<
             DifferentialRow<
-                Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
-                CoordinateScalar<DomainValue<D>>,
+                Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
+                CoordinateScalar<DomainValue<C>>,
             >,
         >,
-    TracedOutput::To<DomainValue<D>>: Parameterized<
-            DomainValue<D>,
-            To<DomainValue<D>> = TracedOutput::To<DomainValue<D>>,
-            To<D::Tangent> = TracedOutput::To<D::Tangent>,
+    TracedOutput::To<DomainValue<C>>: Parameterized<
+            DomainValue<C>,
+            To<DomainValue<C>> = TracedOutput::To<DomainValue<C>>,
+            To<C::Tangent> = TracedOutput::To<C::Tangent>,
             To<
                 DifferentialRow<
-                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
-                    CoordinateScalar<DomainValue<D>>,
+                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
+                    CoordinateScalar<DomainValue<C>>,
                 >,
             > = TracedOutput::To<
                 DifferentialRow<
-                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
-                    CoordinateScalar<DomainValue<D>>,
+                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
+                    CoordinateScalar<DomainValue<C>>,
                 >,
             >,
             ParameterStructure: Debug + PartialEq,
         >,
-    F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
-    <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<ArrayType, D::Tangent>
-        + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>>
-        + TransposableOperation<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
+    F: FnOnce(Input::To<LinearizationTracer<'context, C>>) -> Result<TracedOutput, ProgramError>,
+    <C as Domain>::Operation: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, C::Value>: InterpretableOperation<ArrayType, C::Tangent>
+        + BatchableOperation<C::Tangent, EagerContext<ArrayType, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>>
+        + TransposableOperation<ArrayType, C::Tangent, C::LinearOperation<C::Tangent, C::Value>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
-    D::LinearOperation<D::Tangent, D::Value>: MaybeZeroOperation<ArrayType>,
-    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
-        + TransposableOperation<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>>
+    C::LinearOperation<C::Tangent, C::Value>: MaybeZeroOperation<ArrayType>,
+    C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
+        + TransposableOperation<ArrayType, C::Tangent, C::LinearOperation<C::Tangent, crate::tracing_v2::ValueOrCapture<C::Type, C::Value>>>
         + From<AddOperation>
         + MaybeZeroOperation<ArrayType>,
-    <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,
+    <C::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, C::Tangent>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -900,14 +900,14 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let input_offsets = coordinate_offsets(&input_coordinate_counts);
-    let tangent_context = <D::Tangent as Value<ArrayType>>::InterpretationContext::default();
+    let tangent_context = <C::Tangent as Value<ArrayType>>::InterpretationContext::default();
     let tangent_input_parameters = input_parameters
         .iter()
         .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
-    let (output, pullback) = domain.vjp(function, primals)?;
+    let (output, pullback) = context.vjp(function, primals)?;
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_shapes = output_parameters
@@ -921,19 +921,19 @@ where
         .iter()
         .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let batched_basis_parameters = batched_standard_basis::<D::Tangent>(cotangent_parameters.as_slice(), lane_count)?;
+    let batched_basis_parameters = batched_standard_basis::<C::Tangent>(cotangent_parameters.as_slice(), lane_count)?;
 
     let rows = if lane_count == 0 {
         Vec::new()
     } else {
         let batched_input = pullback.interpret_with(
             batched_basis_parameters,
-            |_, constant: &D::Tangent| Ok::<_, ProgramError>(ArrayBatch::unbatched(constant.clone())),
-            |instruction, inputs: &[ArrayBatch<D::Tangent>]| {
+            |_, constant: &C::Tangent| Ok::<_, ProgramError>(ArrayBatch::unbatched(constant.clone())),
+            |instruction, inputs: &[ArrayBatch<C::Tangent>]| {
                 batch_linear_program_instruction(instruction.operation(), inputs)
             },
         )?;
-        unstack_batched_coordinates::<D::Tangent>(batched_input, tangent_input_parameters.as_slice(), lane_count)?
+        unstack_batched_coordinates::<C::Tangent>(batched_input, tangent_input_parameters.as_slice(), lane_count)?
     };
 
     let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
@@ -958,7 +958,7 @@ where
             blocks.push(DifferentialBlock::new(output_shape.clone(), input_shape.clone(), values));
         }
 
-        let partials = <Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>>::from_parameters(
+        let partials = <Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>>::from_parameters(
             input_structure.clone(),
             blocks,
         )?;
@@ -967,8 +967,8 @@ where
 
     let outer_rows = <TracedOutput::To<
         DifferentialRow<
-            Input::To<DifferentialBlock<CoordinateScalar<DomainValue<D>>>>,
-            CoordinateScalar<DomainValue<D>>,
+            Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
+            CoordinateScalar<DomainValue<C>>,
         >,
     >>::from_parameters(output_structure, rows_list)?;
 

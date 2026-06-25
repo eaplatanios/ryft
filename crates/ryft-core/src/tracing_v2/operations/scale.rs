@@ -68,28 +68,28 @@ impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T> + From<ScaleOperation<T,
     }
 }
 
-impl<T: Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
+impl<T: Type, C> DifferentiableOperation<C> for ScaleOperation<T, C::Constant>
 where
-    D: DifferentiationContext<Type = T>,
-    D::Value: Mul<Output = D::Value>,
-    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
-        From<ScaleOperation<T, ValueOrCapture<T, D::Value>, Input>>,
-    ScaleOperation<T, D::Constant>: Operation<T>,
+    C: DifferentiationContext<Type = T>,
+    C::Value: Mul<Output = C::Value>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        From<ScaleOperation<T, ValueOrCapture<T, C::Value>, Input>>,
+    ScaleOperation<T, C::Constant>: Operation<T>,
 {
     #[inline]
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let factor = context.differentiable().lift(self.factor().clone())?;
         let mut tangent_outputs = context.stage_operation(
-            ScaleOperation::<T, ValueOrCapture<T, D::Value>, Input>::new(ValueOrCapture::Value(factor.clone())),
+            ScaleOperation::<T, ValueOrCapture<T, C::Value>, Input>::new(ValueOrCapture::Value(factor.clone())),
             &[input.tangent().clone()],
         )?;
         check_count!("output", tangent_outputs, 1, ProgramError);

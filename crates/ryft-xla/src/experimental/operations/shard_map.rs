@@ -362,17 +362,17 @@ impl<V, C: Context<Type = ArrayType>> LinearShardMapOperation<V, Tracer<C>> {
 /// operation, whose captured global primals are factors over the context's primal value type. The primal and
 /// tangent carriers are kept separate so the helper also serves nested symbolic linearization contexts, whose
 /// primal values are nested tracers while tangents stay in the enclosing context's representation.
-fn complete_shard_map_jvp<'jvp, E, PrimalValue, TangentValue>(
-    context: &mut TangentContext<'jvp, E>,
-    inputs: &[JvpTracer<'jvp, E>],
+fn complete_shard_map_jvp<'jvp, C, PrimalValue, TangentValue>(
+    context: &mut TangentContext<'jvp, C>,
+    inputs: &[JvpTracer<'jvp, C>],
     primal_outputs: Vec<PrimalValue>,
     output_count: usize,
     linear_operation: LinearShardMapOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>>,
-) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
 where
     PrimalValue: Value<ArrayType>,
     TangentValue: Value<ArrayType>,
-    E: DifferentiationContext<
+    C: DifferentiationContext<
             Tangent = TangentValue,
             LinearOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>> = LinearXlaOperation<
                 TangentValue,
@@ -381,7 +381,7 @@ where
             >,
         > + Domain<Type = ArrayType, Value = PrimalValue>
         + 'jvp,
-    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
 {
     check_count!("output", primal_outputs, output_count, ProgramError);
     let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
@@ -402,24 +402,24 @@ impl<LeafV> ShardMapOperation<LeafV> {
     /// captured as residual factors through [`JvpTracer::factor`], and the matching linear shard-map op is staged
     /// into the tangent program. This serves both ordinary XLA tracing contexts and nested symbolic linearization
     /// contexts (whose primal values are nested tracers while tangents stay in the enclosing representation).
-    pub(crate) fn jvp_with_staging_context<'jvp, E>(
+    pub(crate) fn jvp_with_staging_context<'jvp, C>(
         &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+        C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
             + DifferentiationContext<
                 LinearOperation<
-                    <E as DifferentiationContext>::Tangent,
-                    ValueOrCapture<ArrayType, Tracer<E>>,
+                    <C as DifferentiationContext>::Tangent,
+                    ValueOrCapture<ArrayType, Tracer<C>>,
                 > = LinearXlaOperation<
-                    <E as DifferentiationContext>::Tangent,
+                    <C as DifferentiationContext>::Tangent,
                     XlaConstant,
-                    ValueOrCapture<ArrayType, Tracer<E>>,
+                    ValueOrCapture<ArrayType, Tracer<C>>,
                 >,
             > + 'jvp,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.bind_primal(
@@ -448,14 +448,14 @@ impl ShardMapOperation<ShardMapTracer> {
 
     /// Applies this traced-leaf shard-map JVP using an explicit outer tracing builder and a
     /// [`TangentContext`] for the linear builder.
-    pub(crate) fn jvp_with_builders<'jvp, D>(
+    pub(crate) fn jvp_with_builders<'jvp, C>(
         &self,
         tracing_builder: Rc<RefCell<XlaProgramBuilder>>,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: Domain<Type = ArrayType, Value = ShardMapTracer>
+        C: Domain<Type = ArrayType, Value = ShardMapTracer>
             + Domain<Type = ArrayType>
             + DifferentiationContext<
                 Tangent = ShardMapTracer,
@@ -465,7 +465,7 @@ impl ShardMapOperation<ShardMapTracer> {
                     ValueOrCapture<ArrayType, ShardMapTracer>,
                 >,
             > + 'jvp,
-        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<ArrayType>>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -481,24 +481,24 @@ impl LinearShardMapOperation<XlaConstant> {
     /// (ordinary) linear shard-map op is staged into `context`'s primal program through
     /// [`TangentContext::bind_primal`] and the tangent op rebinds the current primal inputs as captured residual
     /// factors through [`JvpTracer::factor`].
-    pub(crate) fn jvp_with_staging_context<'jvp, E>(
+    pub(crate) fn jvp_with_staging_context<'jvp, C>(
         &self,
-        context: &mut TangentContext<'jvp, E>,
-        inputs: &[JvpTracer<'jvp, E>],
-    ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        E: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+        C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
             + DifferentiationContext<
                 LinearOperation<
-                    <E as DifferentiationContext>::Tangent,
-                    ValueOrCapture<ArrayType, Tracer<E>>,
+                    <C as DifferentiationContext>::Tangent,
+                    ValueOrCapture<ArrayType, Tracer<C>>,
                 > = LinearXlaOperation<
-                    <E as DifferentiationContext>::Tangent,
+                    <C as DifferentiationContext>::Tangent,
                     XlaConstant,
-                    ValueOrCapture<ArrayType, Tracer<E>>,
+                    ValueOrCapture<ArrayType, Tracer<C>>,
                 >,
             > + 'jvp,
-        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
+        C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs =
@@ -730,9 +730,9 @@ where
     context.tracer(output, None)
 }
 
-impl<D> DifferentiableOperation<D> for ShardMapOperation<ShardMapTracer>
+impl<C> DifferentiableOperation<C> for ShardMapOperation<ShardMapTracer>
 where
-    D: Domain<Type = ArrayType, Value = ShardMapTracer>
+    C: Domain<Type = ArrayType, Value = ShardMapTracer>
         + Domain<Type = ArrayType>
         + DifferentiationContext<
             Tangent = ShardMapTracer,
@@ -745,11 +745,11 @@ where
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         let Some(first_input) = inputs.first() else {
             return if self.output_types.is_empty() {
