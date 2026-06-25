@@ -16,7 +16,7 @@ use crate::payloads::{Captured, Input};
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
@@ -675,11 +675,11 @@ impl<D> DifferentiableOperation<D> for DotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Dot,
-    LinearOperationOf<D>: From<AddOperation>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<AddOperation>
         + From<LeftDotOperation<ValueOrCapture<ArrayType, D::Value>, Input>>
         + From<RightDotOperation<ValueOrCapture<ArrayType, D::Value>, Input>>
         + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

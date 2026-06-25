@@ -45,7 +45,7 @@ use crate::tracing_v2::batching::{
     ProgramBatchingOutputAxes,
 };
 use crate::tracing_v2::differentiation::{
-    CaptureParameterizedOperation, DifferentiationContext, JvpTracer, LinearOperationOf, LinearizableProgramOperation,
+    CaptureParameterizedOperation, DifferentiationContext, JvpTracer, LinearizableProgramOperation,
     LinearizationContextOf, NestedLinearization, TangentContext,
 };
 use crate::tracing_v2::operations::collective::CollectiveOperation;
@@ -179,7 +179,7 @@ where
     CollectiveOperation: DifferentiableOperation<C>,
     SelectOperation: DifferentiableOperation<C>,
     BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Tangent>>>,
-    LinearOperationOf<C>: From<AddOperation>
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
@@ -214,21 +214,31 @@ where
             ConditionOperation<
                 ArrayType,
                 C::Tangent,
-                LinearOperationOf<C>,
+                C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
                 ValueOrCapture<ArrayType, C::Value>,
                 Captured,
             >,
         > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, C::Value>>>
         + From<RecomputeOperation<ArrayOperation<C::Constant>>>
-        + From<WhileOperation<ArrayType, C::Tangent, LinearOperationOf<C>, Input>>
-        + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
-    LinearOperationOf<C>: CaptureParameterizedOperation<
-            ArrayType,
-            ValueOrCapture<ArrayType, C::Value>,
-            WithCapture<ValueOrCapture<ArrayType, C::Value>> = LinearOperationOf<C>,
-            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
-        > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<C::Constant>>,
-    LinearOperationOf<C>: MaybeZeroOperation<ArrayType>,
+        + From<
+            WhileOperation<
+                ArrayType,
+                C::Tangent,
+                C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>,
+                Input,
+            >,
+        > + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
+        CaptureParameterizedOperation<
+                ArrayType,
+                ValueOrCapture<ArrayType, C::Value>,
+                WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                    C::Tangent,
+                    ValueOrCapture<C::Type, C::Value>,
+                >,
+                WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
+            > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<C::Constant>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
     ArrayOperation<C::Constant>: Clone + LinearizableProgramOperation<C>,
 {
     fn jvp<'jvp>(
@@ -935,7 +945,10 @@ where
     // CollectiveOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
     // SelectOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
     BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Tangent>>>,
-    LinearOperationOf<LinearizationContextOf<C, Self>>: From<AddOperation>
+    <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
+        C::Tangent,
+        ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+    >: From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
@@ -971,15 +984,27 @@ where
             ConditionOperation<
                 ArrayType,
                 C::Tangent,
-                LinearOperationOf<LinearizationContextOf<C, Self>>,
+                <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
+                    C::Tangent,
+                    ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+                >,
                 ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
                 Captured,
             >,
         > + DefactorizableProgramOperation<C::Tangent, Tracer<LinearizationContextOf<C, Self>>, Self>
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
         + From<RecomputeOperation<Self>>
-        + From<WhileOperation<ArrayType, C::Tangent, LinearOperationOf<LinearizationContextOf<C, Self>>, Input>>
         + From<
+            WhileOperation<
+                ArrayType,
+                C::Tangent,
+                <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
+                    C::Tangent,
+                    ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+                >,
+                Input,
+            >,
+        > + From<
             ScanOperation<
                 ArrayType,
                 C::Tangent,
@@ -988,13 +1013,23 @@ where
                 Input,
             >,
         >,
-    LinearOperationOf<LinearizationContextOf<C, Self>>: CaptureParameterizedOperation<
+    <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
+        C::Tangent,
+        ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+    >: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
-            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>> = LinearOperationOf<
-                LinearizationContextOf<C, Self>,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>> = <LinearizationContextOf<
+                C,
+                Self,
+            > as DifferentiationContext>::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
             >,
-            WithCapture<ValueOrCapture<ArrayType, C::Value>> = LinearOperationOf<C>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = C::LinearOperation<
+                C::Tangent,
+                ValueOrCapture<C::Type, C::Value>,
+            >,
             WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
         > + MaybeZeroOperation<ArrayType>,
 {

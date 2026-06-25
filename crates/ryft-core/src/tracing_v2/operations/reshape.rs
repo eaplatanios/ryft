@@ -4,8 +4,8 @@ use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Shape, Size};
 
 /// Convenience trait for values that support reshape.
@@ -114,7 +114,7 @@ impl<D> DifferentiableOperation<D> for ReshapeOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: ReshapeValue,
-    LinearOperationOf<D>: From<ReshapeOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ReshapeOperation>,
 {
     fn jvp<'jvp>(
         &self,

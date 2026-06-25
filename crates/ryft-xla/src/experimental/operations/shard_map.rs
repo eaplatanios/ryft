@@ -15,8 +15,7 @@ use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
 use ryft_core::tracing::{AbstractTracer, AbstractTracingContext, DomainTracer, Tracer, TracingContext};
 use ryft_core::tracing_v2::differentiation::JvpTracer;
 use ryft_core::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, LinearOperationOf, ResidualizedOperation, TangentContext,
-    ValueOrCapture,
+    DifferentiableOperation, DifferentiationContext, ResidualizedOperation, TangentContext, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
@@ -382,7 +381,7 @@ where
             >,
         > + Domain<Type = ArrayType, Value = PrimalValue>
         + 'jvp,
-    LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
 {
     check_count!("output", primal_outputs, output_count, ProgramError);
     let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
@@ -420,7 +419,7 @@ impl<LeafV> ShardMapOperation<LeafV> {
                     ValueOrCapture<ArrayType, Tracer<E>>,
                 >,
             > + 'jvp,
-        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = context.bind_primal(
@@ -466,7 +465,7 @@ impl ShardMapOperation<ShardMapTracer> {
                     ValueOrCapture<ArrayType, ShardMapTracer>,
                 >,
             > + 'jvp,
-        LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs = self.interpret_with_tracing_builder(tracing_builder, primal_inputs.as_slice())?;
@@ -499,7 +498,7 @@ impl LinearShardMapOperation<XlaConstant> {
                     ValueOrCapture<ArrayType, Tracer<E>>,
                 >,
             > + 'jvp,
-        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_outputs =

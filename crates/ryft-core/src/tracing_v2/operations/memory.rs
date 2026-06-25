@@ -9,8 +9,8 @@ use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Memory, TypeError, Typed};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
@@ -131,8 +131,9 @@ impl<D> DifferentiableOperation<D> for TransferToMemoryOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: TransferToMemory,
-    LinearOperationOf<D>: From<TransferToMemoryOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<TransferToMemoryOperation> + From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     #[inline]
     fn jvp<'jvp>(

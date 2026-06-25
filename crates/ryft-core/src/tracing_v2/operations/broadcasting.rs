@@ -4,8 +4,8 @@ use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
@@ -84,7 +84,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Broadcast,
     D::Tangent: Broadcast,
-    LinearOperationOf<D>: From<BroadcastOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<BroadcastOperation>,
 {
     fn jvp<'jvp>(
         &self,

@@ -16,13 +16,13 @@ use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::ValueOrCapture;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchingContext};
 use crate::tracing_v2::differentiation::{
-    CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer, LinearOperationOf,
+    CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, JvpTracer,
     LinearizableProgramOperation, NestedLinearization, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
+use crate::tracing_v2::ValueOrCapture;
 use crate::types::{ArrayType, DataType, Shape, Size, TypeError, Typed};
 
 /// Renders a compact comma-separated list of capture-like payloads.
@@ -176,13 +176,14 @@ where
         + From<ScanOperation<ArrayType, D::Constant, O>>
         + LinearizableProgramOperation<D>,
     BodyOperation: Operation<ArrayType>,
-    LinearOperationOf<D>: ResidualizedOperation<D>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
         + CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, D::Value>,
             WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
         > + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>> + MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>> + MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -276,7 +277,7 @@ where
         // Stage one linear scan over the operand tangents and pair its outputs with the primal outputs of the
         // residual-extended scan.
         let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-        let linear_scan: LinearOperationOf<D> =
+        let linear_scan: D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>> =
             linear_scan_operation::<ArrayType, D::Tangent, D::Value, BodyOperation>(
                 body,
                 stack_factors,
@@ -301,13 +302,14 @@ where
     D: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
     O: Clone + Operation<DataType> + From<ScanOperation<DataType, D::Constant, O>> + LinearizableProgramOperation<D>,
     BodyOperation: Operation<DataType>,
-    LinearOperationOf<D>: ResidualizedOperation<D>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
         + CaptureParameterizedOperation<
             DataType,
             ValueOrCapture<DataType, D::Value>,
             WithCapture<ValueOrCapture<DataType, D::Tangent>> = BodyOperation,
         > + From<ScanOperation<DataType, D::Tangent, BodyOperation, ValueOrCapture<DataType, D::Value>, Input>>,
-    LinearOperationOf<D>: From<ZeroOperation<DataType>> + MaybeZeroOperation<DataType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<DataType>> + MaybeZeroOperation<DataType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -369,15 +371,16 @@ where
             })
         })?;
         let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-        let linear_scan: LinearOperationOf<D> = linear_scan_operation::<DataType, D::Tangent, D::Value, BodyOperation>(
-            body,
-            vec![],
-            carry_count,
-            length,
-            reverse,
-            unroll,
-        )?
-        .into();
+        let linear_scan: D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>> =
+            linear_scan_operation::<DataType, D::Tangent, D::Value, BodyOperation>(
+                body,
+                vec![],
+                carry_count,
+                length,
+                reverse,
+                unroll,
+            )?
+            .into();
         let tangent_outputs = context.stage_operation(linear_scan, tangent_operands.as_slice())?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
         Ok(primal_outputs

@@ -54,9 +54,9 @@ use ryft_core::tracing_v2::operations::reshape::ReshapeOps;
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
     ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DifferentiableOperation,
-    DifferentiationContext, DotOperation, JvpTracer, LinearArrayOperation, LinearOperationOf,
-    LinearizableProgramOperation, MaterializeCaptureOperation, NestedLinearization, RematerializationNameOperation,
-    ResidualizedOperation, TangentContext, ValueOrCapture,
+    DifferentiationContext, DotOperation, JvpTracer, LinearArrayOperation, LinearizableProgramOperation,
+    MaterializeCaptureOperation, NestedLinearization, RematerializationNameOperation, ResidualizedOperation,
+    TangentContext, ValueOrCapture,
 };
 use ryft_core::types::{ArrayType, Size, TypeError, Typed};
 
@@ -575,7 +575,7 @@ where
             WithCapture<ValueOrCapture<ArrayType, E::Tangent>> =
                 LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
         >,
-    LinearOperationOf<E>: From<AddOperation>
+    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
@@ -613,18 +613,18 @@ where
             ConditionOperation<
                 ArrayType,
                 E::Tangent,
-                LinearOperationOf<E>,
+                E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
                 ValueOrCapture<ArrayType, <E as Domain>::Value>,
                 Captured,
             >,
         >
         + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>>
         + From<RecomputeOperation<XlaOperation>>
-        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<E>, Input>>,
-    LinearOperationOf<E>: CaptureParameterizedOperation<
+        + From<WhileOperation<ArrayType, E::Tangent, E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>, Input>>,
+    E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, <E as Domain>::Value>,
-            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = LinearOperationOf<E>,
+            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
         > + DefactorizableProgramOperation<E::Tangent, <E as Domain>::Value, XlaOperation>,
     Self: Clone + LinearizableProgramOperation<E>,
 {
@@ -635,7 +635,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
-        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
     {
         match self {
             Self::Zero(operation) => operation.jvp(context, inputs),
@@ -789,15 +789,21 @@ where
                 ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             >,
         >,
-    LinearOperationOf<LinearizationContextOf<E, Self>>:
-        ResidualizedOperation<LinearizationContextOf<E, Self>>
+    <LinearizationContextOf<E, Self> as DifferentiationContext>::LinearOperation<
+        E::Tangent,
+        ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+    >: ResidualizedOperation<LinearizationContextOf<E, Self>>
         + CaptureParameterizedOperation<
             ArrayType,
             ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = LinearOperationOf<
-                LinearizationContextOf<E, Self>,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = <LinearizationContextOf<
+                E,
+                Self,
+            > as DifferentiationContext>::LinearOperation<
+                E::Tangent,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
             >,
-            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = LinearOperationOf<E>,
+            WithCapture<ValueOrCapture<ArrayType, <E as Domain>::Value>> = E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>,
         > + MaybeZeroOperation<ArrayType>,
 {
     fn linearize_program(
@@ -1465,7 +1471,7 @@ impl JitCallOperation {
                 >,
             > + Domain<Type = ArrayType, Value = PrimalValue>
             + 'jvp,
-        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
     {
         let captured_inputs = inputs.iter().map(|input| input.factor(context)).collect::<Vec<_>>();
         let tangent_inputs = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
@@ -1547,7 +1553,7 @@ where
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         E: 'jvp,
-        LinearOperationOf<E>: From<ZeroOperation<ArrayType>>,
+        E::LinearOperation<E::Tangent, ValueOrCapture<E::Type, E::Value>>: From<ZeroOperation<ArrayType>>,
     {
         check_count!("input", inputs, self.program.input_types().len(), ProgramError);
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();

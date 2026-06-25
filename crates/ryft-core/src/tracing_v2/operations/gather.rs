@@ -14,7 +14,7 @@ use crate::operations::manipulation::{
 };
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_input_metadata};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::operations::slicing::batch_by_lane_expansion;
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Typed};
@@ -26,9 +26,9 @@ impl<D> DifferentiableOperation<D> for GatherOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Gather,
-    LinearOperationOf<D>:
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
         From<LinearGatherOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

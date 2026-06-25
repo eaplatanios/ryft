@@ -10,9 +10,9 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_input_metadata};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, TypeError, Typed};
 
 use super::control_flow::stage_cotangent;
@@ -127,8 +127,9 @@ impl<D> DifferentiableOperation<D> for PadOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Pad,
-    LinearOperationOf<D>: From<PadOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<PadOperation> + From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

@@ -24,9 +24,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
     use crate::scalars::ScalarDomain;
     use crate::tracing::{AbstractTracingContext, DomainTracer, TracingContext};
-    use crate::tracing_v2::differentiation::{
-        CaptureParameterizedOperation, JvpTracer, LinearOperationOf, TangentContext,
-    };
+    use crate::tracing_v2::differentiation::{CaptureParameterizedOperation, JvpTracer, TangentContext};
     use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
     use crate::types::{DataType, Typed};
 
@@ -447,9 +445,10 @@ mod tests {
     where
         D: DifferentiationContext<Type = DataType>,
         D::Value: Add<Output = D::Value> + Mul<Output = D::Value>,
-        LinearOperationOf<D>:
+        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
             From<AddOperation> + From<ScaleOperation<DataType, ValueOrCapture<DataType, <D as Domain>::Value>, Input>>,
-        LinearOperationOf<D>: MaybeZeroOperation<DataType>,
+        D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+            MaybeZeroOperation<DataType>,
     {
         fn jvp<'jvp>(
             &self,
@@ -458,7 +457,8 @@ mod tests {
         ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
         where
             D: 'jvp,
-            LinearOperationOf<D>: From<ZeroOperation<DataType>>,
+            D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+                From<ZeroOperation<DataType>>,
         {
             match self {
                 Self::Add => AddOperation.jvp(context, inputs),

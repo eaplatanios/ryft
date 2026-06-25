@@ -16,7 +16,7 @@ use crate::tracing_v2::batching::{
     align_batch_axis, broadcast_to_batched,
 };
 use crate::tracing_v2::differentiation::{
-    CaptureParameterizedOperation, JvpTracer, LinearOperationOf, ResidualizedOperation, TangentContext,
+    CaptureParameterizedOperation, JvpTracer, ResidualizedOperation, TangentContext,
 };
 use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::{
@@ -147,13 +147,16 @@ where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
-    LinearOperationOf<D>: CaptureParameterizedOperation<
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: CaptureParameterizedOperation<
             D::Type,
             ValueOrCapture<D::Type, <D as Domain>::Value>,
-            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = LinearOperationOf<D>,
+            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = D::LinearOperation<
+                D::Tangent,
+                ValueOrCapture<D::Type, D::Value>,
+            >,
         >,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -214,13 +217,16 @@ where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
         + CaptureParameterizedOperation<
             D::Type,
             ValueOrCapture<D::Type, <D as Domain>::Value>,
-            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = LinearOperationOf<D>,
+            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = D::LinearOperation<
+                D::Tangent,
+                ValueOrCapture<D::Type, D::Value>,
+            >,
         >,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
     Vec<D::Constant>: Parameterized<
             D::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -564,9 +570,9 @@ fn custom_vjp_rule<'jvp, D, O>(
 where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, <D as Domain>::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
@@ -583,13 +589,15 @@ where
         context.differentiable().linearize_program(&operation.forward, primal_operands)?;
     let residuals = forward_values.split_off(output_count);
     let factors = residuals.into_iter().map(|residual| context.factor(residual)).collect::<Vec<_>>();
-    let call = LinearOperationOf::<D>::from(CustomVjpCallOperation::new(
-        operation.backward.clone(),
-        operation.tangent.clone(),
-        factors,
-        false,
-        operation.prevent_cse,
-    ));
+    let call = <D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>>::from(
+        CustomVjpCallOperation::new(
+            operation.backward.clone(),
+            operation.tangent.clone(),
+            factors,
+            false,
+            operation.prevent_cse,
+        ),
+    );
     let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
     check_count!("output", tangent_outputs, output_count, ProgramError);
     Ok(forward_values
@@ -604,9 +612,9 @@ impl<O, D> DifferentiableOperation<D> for CustomVjpOperation<D::Type, D::Constan
 where
     D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
         + From<CustomVjpCallOperation<D::Type, D::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
     Vec<D::Constant>: Parameterized<
             D::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,

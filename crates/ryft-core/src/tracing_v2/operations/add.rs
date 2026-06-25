@@ -6,8 +6,8 @@ use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::Type;
 
 impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for AddOperation
@@ -29,7 +29,7 @@ where
 impl<D: DifferentiationContext> DifferentiableOperation<D> for AddOperation
 where
     D::Value: Add<Output = D::Value>,
-    LinearOperationOf<D>: From<AddOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<AddOperation>,
     AddOperation: Operation<D::Type>,
 {
     #[inline]

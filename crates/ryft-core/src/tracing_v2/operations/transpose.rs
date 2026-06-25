@@ -4,8 +4,8 @@ use crate::operations::manipulation::{Transpose, TransposeOperation, inverse_per
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::ArrayType;
 
 impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
@@ -32,7 +32,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Transpose,
     D::Tangent: Transpose,
-    LinearOperationOf<D>: From<TransposeOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<TransposeOperation>,
 {
     fn jvp<'jvp>(
         &self,

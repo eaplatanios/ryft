@@ -11,8 +11,8 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_elementwise_batch};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Type, Typed};
 
 impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
@@ -130,7 +130,7 @@ impl<D> DifferentiableOperation<D> for ZeroOperation<D::Type>
 where
     D: DifferentiationContext,
     D::Operation: From<ZeroOperation<D::Type>>,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
     ZeroOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -167,7 +167,7 @@ impl<D> DifferentiableOperation<D> for OneOperation<D::Type>
 where
     D: DifferentiationContext,
     D::Operation: From<OneOperation<D::Type>>,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
     OneOperation<D::Type>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -210,7 +210,7 @@ impl<D> DifferentiableOperation<D> for ConstantOperation<D::Type, D::Constant>
 where
     D: DifferentiationContext,
     D::Constant: Clone + Typed<D::Type>,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
     ConstantOperation<D::Type, D::Constant>: Operation<D::Type>,
 {
     fn jvp<'jvp>(
@@ -247,7 +247,7 @@ where
     D: DifferentiationContext,
     ZeroLikeOperation: Operation<D::Type>,
     D::Value: ZeroLike,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -283,7 +283,7 @@ where
     D: DifferentiationContext,
     OneLikeOperation: Operation<D::Type>,
     D::Value: OneLike,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
 {
     fn jvp<'jvp>(
         &self,
@@ -324,7 +324,7 @@ impl<D> DifferentiableOperation<D> for FillOperation<D::Type, f64>
 where
     D: DifferentiationContext,
     D::Operation: From<FillOperation<D::Type, f64>>,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
     FillOperation<D::Type, f64>: Operation<D::Type>,
 {
     fn jvp<'jvp>(

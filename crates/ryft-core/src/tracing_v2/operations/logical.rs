@@ -3,8 +3,8 @@ use std::ops::{BitAnd, BitOr, BitXor, Not};
 use crate::operations::constants::ZeroOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture, ZeroTangentOperation};
 use crate::types::ArrayType;
 
 /// Logical inputs and outputs are Boolean, so [`NotOperation`] uses the zero-tangent forward-mode rule.
@@ -12,7 +12,8 @@ impl<D> ZeroTangentOperation<D> for NotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Not<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
 }
 
@@ -23,7 +24,8 @@ impl<D> DifferentiableOperation<D> for NotOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Not<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -43,7 +45,8 @@ impl<D> ZeroTangentOperation<D> for AndOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitAnd<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
 }
 
@@ -54,7 +57,8 @@ impl<D> DifferentiableOperation<D> for AndOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitAnd<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -74,7 +78,8 @@ impl<D> ZeroTangentOperation<D> for OrOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitOr<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
 }
 
@@ -85,7 +90,8 @@ impl<D> DifferentiableOperation<D> for OrOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitOr<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -105,7 +111,8 @@ impl<D> ZeroTangentOperation<D> for XorOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitXor<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
 }
 
@@ -116,7 +123,8 @@ impl<D> DifferentiableOperation<D> for XorOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: BitXor<Output = D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(

@@ -14,7 +14,7 @@ use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{
     ArrayBatch, BatchableOperation, align_batch_axis, apply_with_axes, batch_input_metadata,
 };
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
@@ -177,7 +177,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Slice,
     D::Tangent: Slice,
-    LinearOperationOf<D>: From<SliceOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<SliceOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -202,8 +202,9 @@ impl<D> DifferentiableOperation<D> for UpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: UpdateSlice,
-    LinearOperationOf<D>: From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -242,9 +243,9 @@ impl<D> DifferentiableOperation<D> for DynamicSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicSlice,
-    LinearOperationOf<D>:
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
         From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -286,9 +287,9 @@ impl<D> DifferentiableOperation<D> for DynamicUpdateSliceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: DynamicUpdateSlice,
-    LinearOperationOf<D>:
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
         From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, D::Value>>> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

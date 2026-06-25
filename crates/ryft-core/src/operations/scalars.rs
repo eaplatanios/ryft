@@ -16,8 +16,7 @@ use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{
-    CaptureParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContextOf, NestedLinearization,
-    TangentContext,
+    CaptureParameterizedOperation, JvpTracer, LinearizationContextOf, NestedLinearization, TangentContext,
 };
 use crate::tracing_v2::operations::MaybeDot;
 use crate::tracing_v2::operations::custom_derivatives::{
@@ -89,7 +88,8 @@ where
     StopGradientOperation: DifferentiableOperation<D>,
     RematerializationNameOperation: DifferentiableOperation<D>,
     ScalarOperation<D::Constant>: Clone + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: From<AddOperation>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<DataType>
+        + From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
@@ -103,13 +103,14 @@ where
                 ScalarOperation<D::Constant>,
                 ValueOrCapture<DataType, D::Value>,
             >,
-        >,
-    LinearOperationOf<D>: CaptureParameterizedOperation<
+        > + CaptureParameterizedOperation<
             DataType,
             ValueOrCapture<DataType, D::Value>,
-            WithCapture<ValueOrCapture<DataType, D::Value>> = LinearOperationOf<D>,
+            WithCapture<ValueOrCapture<DataType, D::Value>> = D::LinearOperation<
+                D::Tangent,
+                ValueOrCapture<D::Type, D::Value>,
+            >,
         >,
-    LinearOperationOf<D>: MaybeZeroOperation<DataType>,
 {
     fn jvp<'jvp>(
         &self,
@@ -157,7 +158,11 @@ where
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: From<AddOperation>
+    <LinearizationContextOf<E, Self> as DifferentiationContext>::LinearOperation<
+        E::Tangent,
+        ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+    >: MaybeZeroOperation<DataType>
+        + From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
         + From<SubOperation>
@@ -172,15 +177,21 @@ where
                 Self,
                 ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
             >,
-        >,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
+        > + CaptureParameterizedOperation<
             DataType,
             ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>> = LinearOperationOf<
-                LinearizationContextOf<E, Self>,
+            WithCapture<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>> = <LinearizationContextOf<
+                E,
+                Self,
+            > as DifferentiationContext>::LinearOperation<
+                E::Tangent,
+                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
             >,
-            WithCapture<ValueOrCapture<DataType, E::Value>> = LinearOperationOf<E>,
-        > + MaybeZeroOperation<DataType>,
+            WithCapture<ValueOrCapture<DataType, E::Value>> = E::LinearOperation<
+                E::Tangent,
+                ValueOrCapture<E::Type, E::Value>,
+            >,
+        >,
 {
     fn linearize_program(
         differentiable: &E,

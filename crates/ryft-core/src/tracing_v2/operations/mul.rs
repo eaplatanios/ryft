@@ -9,7 +9,7 @@ use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Typed};
 
@@ -18,10 +18,10 @@ where
     D: DifferentiationContext,
     MulOperation: Operation<D::Type>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: From<AddOperation>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<AddOperation>
         + From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>
         + From<ZeroOperation<D::Type>>,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
 {
     fn jvp<'jvp>(
         &self,

@@ -4,8 +4,8 @@ use crate::operations::Operation;
 use crate::operations::constants::ZeroOperation;
 use crate::operations::stop_gradient::StopGradientOperation;
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::Typed;
 
 /// JVP rule for [`StopGradientOperation`]: the primal passes through unchanged and the tangent is
@@ -14,7 +14,7 @@ use crate::types::Typed;
 impl<D: DifferentiationContext> DifferentiableOperation<D> for StopGradientOperation
 where
     StopGradientOperation: Operation<D::Type>,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
 {
     #[inline]
     fn jvp<'jvp>(

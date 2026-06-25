@@ -3,8 +3,8 @@ use crate::operations::compare::{Compare, CompareOperation};
 use crate::operations::constants::ZeroOperation;
 use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture, ZeroTangentOperation};
 use crate::types::ArrayType;
 
 impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
@@ -35,7 +35,7 @@ impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> ZeroTangentOp
 impl<D: DifferentiationContext<Value: Compare<Output = D::Value>>> DifferentiableOperation<D> for CompareOperation
 where
     Self: Operation<D::Type> + InterpretableOperation<D::Type, D::Value>,
-    LinearOperationOf<D>: From<ZeroOperation<D::Type>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<D::Type>>,
 {
     #[inline]
     fn jvp<'jvp>(

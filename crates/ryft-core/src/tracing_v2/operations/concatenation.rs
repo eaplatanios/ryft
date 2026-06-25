@@ -7,8 +7,8 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, batch_input_metadata};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 use super::slicing::materialize_lane_axis;
@@ -98,8 +98,9 @@ impl<D> DifferentiableOperation<D> for ConcatenateOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Concatenate,
-    LinearOperationOf<D>: From<ConcatenateOperation> + From<ZeroOperation<ArrayType>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ConcatenateOperation> + From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<ArrayType>,
 {
     fn jvp<'jvp>(
         &self,

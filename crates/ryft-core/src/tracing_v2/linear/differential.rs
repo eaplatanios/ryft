@@ -17,8 +17,8 @@ use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
-    LinearizableProgramOperation, LinearizationTracer, PrimalTracingContext, Pushforward, ResidualizedOperation,
+    DifferentiableOperation, DifferentiationContext, DifferentiationError, LinearizableProgramOperation,
+    LinearizationTracer, PrimalTracingContext, Pushforward, ResidualizedOperation,
 };
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
@@ -138,13 +138,13 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         F: FnOnce(Input::To<Tracer<PrimalTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self> + LinearizableProgramOperation<Self>,
         Self::Tangent: Broadcast + Transpose,
-        DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
+        Self::LinearOperation<Self::Tangent, Self::Value>: InterpretableOperation<ArrayType, Self::Tangent>
             + BatchableOperation<
                 Self::Tangent,
-                EagerContext<ArrayType, Self::Tangent, DirectLinearOperationOf<Self>>,
+                EagerContext<ArrayType, Self::Tangent, Self::LinearOperation<Self::Tangent, Self::Value>>,
             >,
-        LinearOperationOf<Self>: ResidualizedOperation<Self>,
-        LinearOperationOf<Self>: MaybeZeroOperation<ArrayType>,
+        Self::LinearOperation<Self::Tangent, crate::tracing_v2::ValueOrCapture<Self::Type, Self::Value>>: ResidualizedOperation<Self>,
+        Self::LinearOperation<Self::Tangent, crate::tracing_v2::ValueOrCapture<Self::Type, Self::Value>>: MaybeZeroOperation<ArrayType>,
         <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, Self::Tangent>,
     {
         let input_structure = primal.parameter_structure();
@@ -220,9 +220,13 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             + From<ZeroLikeOperation>
             + From<AddOperation>
             + 'static,
-        DirectLinearOperationOf<Self>: InterpretableOperation<ArrayType, Self::Tangent>
-            + BatchableOperation<Self::Tangent, EagerContext<ArrayType, Self::Tangent, DirectLinearOperationOf<Self>>>,
-        LinearOperationOf<Self>: ResidualizedOperation<Self>,
+        Self::LinearOperation<Self::Tangent, Self::Value>: InterpretableOperation<ArrayType, Self::Tangent>
+            + BatchableOperation<
+                Self::Tangent,
+                EagerContext<ArrayType, Self::Tangent, Self::LinearOperation<Self::Tangent, Self::Value>>,
+            >,
+        Self::LinearOperation<Self::Tangent, crate::tracing_v2::ValueOrCapture<Self::Type, Self::Value>>:
+            ResidualizedOperation<Self>,
         <Self as DifferentiationContext>::LinearOperation<
             Tracer<TracingContext<'domain, Self>>,
             crate::tracing_v2::ValueOrCapture<ArrayType, Tracer<TracingContext<'domain, Self>>>,
@@ -252,7 +256,8 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
             + MaybeZeroOperation<ArrayType>,
         <<Self as Domain>::Value as Value<<Self as Domain>::Type>>::InterpretationContext: Default,
         <Self::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, Self::Tangent>,
-        LinearOperationOf<Self>: MaybeZeroOperation<ArrayType>,
+        Self::LinearOperation<Self::Tangent, crate::tracing_v2::ValueOrCapture<Self::Type, Self::Value>>:
+            MaybeZeroOperation<ArrayType>,
     {
         let input_structure = primals.parameter_structure();
         let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -585,9 +590,12 @@ where
         Output::Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-        DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
-            + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, DirectLinearOperationOf<D>>>,
-        LinearOperationOf<D>: ResidualizedOperation<D>,
+        D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<ArrayType, D::Tangent>
+            + BatchableOperation<
+                D::Tangent,
+                EagerContext<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>,
+            >,
+        D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>,
         <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,
     {
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
@@ -872,14 +880,14 @@ where
         >,
     F: FnOnce(Input::To<LinearizationTracer<'domain, D>>) -> Result<TracedOutput, ProgramError>,
     <D as Domain>::Operation: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    DirectLinearOperationOf<D>: InterpretableOperation<ArrayType, D::Tangent>
-        + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, DirectLinearOperationOf<D>>>
-        + TransposableOperation<ArrayType, D::Tangent, DirectLinearOperationOf<D>>
+    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<ArrayType, D::Tangent>
+        + BatchableOperation<D::Tangent, EagerContext<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>>
+        + TransposableOperation<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>,
-    DirectLinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
-    LinearOperationOf<D>: ResidualizedOperation<D>
-        + TransposableOperation<ArrayType, D::Tangent, LinearOperationOf<D>>
+    D::LinearOperation<D::Tangent, D::Value>: MaybeZeroOperation<ArrayType>,
+    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>: ResidualizedOperation<D>
+        + TransposableOperation<ArrayType, D::Tangent, D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>>
         + From<AddOperation>
         + MaybeZeroOperation<ArrayType>,
     <D::Tangent as Value<ArrayType>>::InterpretationContext: Default + Zero<ArrayType, D::Tangent>,

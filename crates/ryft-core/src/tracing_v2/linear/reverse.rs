@@ -5,8 +5,8 @@ use crate::operations::InterpretableOperation;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationError, DirectLinearOperationOf, LinearOperationOf,
-    LinearizableProgramOperation, LinearizationTracer, ResidualizedOperation,
+    DifferentiableOperation, DifferentiationContext, DifferentiationError, LinearizableProgramOperation,
+    LinearizationTracer, ResidualizedOperation,
 };
 use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, ProvidesContext, Type, Typed, Value, Zero};
 
@@ -41,12 +41,13 @@ where
         > + 'domain,
     <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext: One<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
-    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>
         + MaybeZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
+    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
+        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
 {
     let (output, pullback) = domain.vjp(|input| Ok(function(input)), primals)?;
     // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
@@ -90,12 +91,13 @@ where
         > + 'domain,
     <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext: One<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
-    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>
         + MaybeZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
+    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
+        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
 {
     value_and_grad(domain, function, primals).map(|(_, gradient)| gradient)
 }
@@ -142,12 +144,13 @@ where
     <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext:
         One<<D as Domain>::Type, D::Tangent> + Zero<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
-    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>
         + MaybeZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
+    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
+        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -208,12 +211,13 @@ where
     <D::Tangent as Value<<D as Domain>::Type>>::InterpretationContext:
         One<<D as Domain>::Type, D::Tangent> + Zero<<D as Domain>::Type, D::Tangent>,
     <D as Domain>::Type: DifferentiableType,
-    DirectLinearOperationOf<D>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
-        + TransposableOperation<<D as Domain>::Type, D::Tangent, DirectLinearOperationOf<D>>
+    D::LinearOperation<D::Tangent, D::Value>: InterpretableOperation<<D as Domain>::Type, D::Tangent>
+        + TransposableOperation<<D as Domain>::Type, D::Tangent, D::LinearOperation<D::Tangent, D::Value>>
         + From<ZeroOperation<<D as Domain>::Type>>
         + From<AddOperation>
         + MaybeZeroOperation<<D as Domain>::Type>,
-    LinearOperationOf<D>: ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
+    D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
+        ResidualizedOperation<D> + MaybeZeroOperation<<D as Domain>::Type>,
     Input::Family: ParameterizedFamily<D::Tangent>,
     Aux::Family: ParameterizedFamily<D::Tangent>,
 {
@@ -415,7 +419,8 @@ mod tests {
     where
         D: DifferentiationContext<Type = TestType, Constant = TestValue> + Domain<Operation = TestDomainOperation>,
         D::Value: Add<Output = D::Value>,
-        LinearOperationOf<D>: From<AddOperation> + From<ZeroOperation<TestType>>,
+        D::LinearOperation<D::Tangent, crate::tracing_v2::ValueOrCapture<D::Type, D::Value>>:
+            From<AddOperation> + From<ZeroOperation<TestType>>,
     {
         fn jvp<'jvp>(
             &self,

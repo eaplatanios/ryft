@@ -6,7 +6,7 @@ use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::payloads::Input;
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 
 impl<D> DifferentiableOperation<D> for SinOperation
@@ -14,8 +14,9 @@ where
     D: DifferentiationContext,
     SinOperation: Operation<D::Type>,
     D::Value: Sin + Cos,
-    LinearOperationOf<D>: From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>,
 {
     #[inline]
     fn jvp<'jvp>(

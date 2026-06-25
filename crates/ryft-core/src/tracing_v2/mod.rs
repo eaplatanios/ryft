@@ -38,10 +38,9 @@ pub use batching::{
     BatchingContext, BatchingTracer, ProgramBatchingContext, ProgramBatchingOutputAxes, batch, batch_program,
 };
 pub use differentiation::{
-    CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, DifferentiationError,
-    DirectLinearOperationOf, JvpTracer, LinearOperationOf, LinearizableProgramOperation, Linearization,
-    LinearizationTracer, NestedLinearization, PrimalTracingContext, Pushforward, ResidualizedOperation, TangentContext,
-    ZeroTangentOperation,
+    CaptureParameterizedOperation, DifferentiableOperation, DifferentiationContext, DifferentiationError, JvpTracer,
+    LinearizableProgramOperation, Linearization, LinearizationTracer, NestedLinearization, PrimalTracingContext,
+    Pushforward, ResidualizedOperation, TangentContext, ZeroTangentOperation,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

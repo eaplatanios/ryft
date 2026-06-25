@@ -8,7 +8,7 @@ use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::trigonometric::{Cos, CosOperation, Sin};
 use crate::payloads::Input;
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 
 impl<D> DifferentiableOperation<D> for CosOperation
@@ -16,7 +16,7 @@ where
     D: DifferentiationContext,
     CosOperation: Operation<D::Type>,
     D::Value: Cos + Sin + Neg<Output = D::Value>,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>
         + From<NegOperation>
         + From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>,
 {

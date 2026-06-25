@@ -20,8 +20,8 @@ use crate::programs::{ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, apply_with_axes, batch_dimension_sharding};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::ArrayType;
 
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
@@ -59,7 +59,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Reshard,
     D::Tangent: Reshard,
-    LinearOperationOf<D>: From<ReshardOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ReshardOperation>,
 {
     fn jvp<'jvp>(
         &self,
@@ -134,7 +134,8 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: ConstrainSharding,
     D::Tangent: ConstrainSharding,
-    LinearOperationOf<D>: From<ShardingConstraintOperation>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ShardingConstraintOperation>,
 {
     fn jvp<'jvp>(
         &self,

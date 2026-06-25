@@ -12,7 +12,7 @@ use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
 
@@ -503,7 +503,7 @@ where
     D: DifferentiationContext<Type = ArrayType>,
     D::Value: Reduce + Broadcast + Compare<Output = D::Value>,
     D::Tangent: Reduce,
-    LinearOperationOf<D>:
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
         From<ReduceOperation> + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>, Input>>,
 {
     fn jvp<'jvp>(

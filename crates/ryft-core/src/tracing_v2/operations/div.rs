@@ -7,7 +7,7 @@ use crate::operations::arithmetic::{AddOperation, DivOperation, Scalable, ScaleO
 use crate::operations::constants::{MaybeZeroOperation, OneLike, ZeroOperation};
 use crate::payloads::Input;
 use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::Typed;
 
@@ -16,7 +16,7 @@ where
     D: DifferentiationContext,
     DivOperation: Operation<D::Type>,
     D::Value: Clone + Div<Output = D::Value> + Mul<Output = D::Value> + Neg<Output = D::Value> + OneLike,
-    LinearOperationOf<D>: MaybeZeroOperation<D::Type>
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: MaybeZeroOperation<D::Type>
         + From<AddOperation>
         + From<ScaleOperation<D::Type, ValueOrCapture<D::Type, D::Value>, Input>>
         + From<ZeroOperation<D::Type>>,

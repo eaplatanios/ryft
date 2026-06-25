@@ -11,7 +11,7 @@ use crate::operations::arithmetic::{Scalable, Scale, ScaleOperation};
 use crate::payloads::Input;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::differentiation::{DifferentiationContext, JvpTracer, LinearOperationOf, TangentContext};
+use crate::tracing_v2::differentiation::{DifferentiationContext, JvpTracer, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, ValueOrCapture};
 use crate::types::Type;
 
@@ -72,7 +72,8 @@ impl<T: Type, D> DifferentiableOperation<D> for ScaleOperation<T, D::Constant>
 where
     D: DifferentiationContext<Type = T>,
     D::Value: Mul<Output = D::Value>,
-    LinearOperationOf<D>: From<ScaleOperation<T, ValueOrCapture<T, D::Value>, Input>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>:
+        From<ScaleOperation<T, ValueOrCapture<T, D::Value>, Input>>,
     ScaleOperation<T, D::Constant>: Operation<T>,
 {
     #[inline]

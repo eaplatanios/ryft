@@ -7,8 +7,8 @@ use crate::operations::{InterpretableOperation, Operation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::AbstractTracingContext;
 use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ZeroTangentOperation};
+use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
+use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture, ZeroTangentOperation};
 use crate::types::{ArrayType, TypeError};
 
 /// Linear-program payload for recomputing a primal operation without differentiating through it.
@@ -97,7 +97,7 @@ impl<D: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<Arra
 impl<D: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, D::Value>>
     DifferentiableOperation<D> for RecomputeOperation<O>
 where
-    LinearOperationOf<D>: From<ZeroOperation<ArrayType>>,
+    D::LinearOperation<D::Tangent, ValueOrCapture<D::Type, D::Value>>: From<ZeroOperation<ArrayType>>,
 {
     #[inline]
     fn jvp<'jvp>(
@@ -145,7 +145,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use crate::Domain;
+use std::cell::RefCell;
     use std::rc::Rc;
 
     use crate::contexts::StagingContext;
@@ -153,7 +154,6 @@ mod tests {
     use crate::operations::arithmetic::AddOperation;
     use crate::programs::ProgramBuilder;
     use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing_v2::LinearOperationOf;
     use crate::tracing_v2::operations::{ArrayOperation, LinearArrayOperation};
     use crate::types::{DataType, Typed};
 
@@ -161,7 +161,10 @@ mod tests {
 
     #[test]
     fn test_recompute_jvp_replays_primal_with_zero_tangent() {
-        type LinearOperation = LinearOperationOf<TestArrayDomain>;
+        type LinearOperation = <TestArrayDomain as DifferentiationContext>::LinearOperation<
+            <TestArrayDomain as DifferentiationContext>::Tangent,
+            ValueOrCapture<<TestArrayDomain as Domain>::Type, <TestArrayDomain as Domain>::Value>,
+        >;
 
         let scalar_type = ArrayType::scalar(DataType::F64);
         let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, LinearOperation>::new()));
