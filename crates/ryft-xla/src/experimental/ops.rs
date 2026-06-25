@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
 use std::rc::Rc;
 
 use ryft_macros::Operation;
@@ -12,7 +13,7 @@ use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
-use ryft_core::operations::compare::CompareOperation;
+use ryft_core::operations::compare::{Compare, CompareOperation};
 use ryft_core::operations::constants::{
     ConstantOperation, FillOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike,
     ZeroLikeOperation, ZeroOperation,
@@ -21,13 +22,14 @@ use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, Sel
 use ryft_core::operations::differentiation::StopGradientOperation;
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation,
-    LinearScatterAddOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
-    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, DynamicSlice, DynamicSliceOperation,
+    DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation, LinearDynamicSliceOperation,
+    LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation, Pad, PadOperation, Reshape,
+    ReshapeOperation, Scatter, ScatterOperation, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation,
 };
 use ryft_core::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
-use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
+use ryft_core::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
 use ryft_core::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::payloads::{Captured, Input};
@@ -38,11 +40,6 @@ use ryft_core::tracing_v2::batching::{
     ProgramBatchingOutputAxes, batch_input_metadata, batch_program,
 };
 use ryft_core::tracing_v2::differentiation::LinearizationContextOf;
-use ryft_core::tracing_v2::operations::SupportsLinearArrayOperation;
-use ryft_core::tracing_v2::operations::bounds::{
-    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsManipulationOperations,
-    SupportsTrigonometricOperations,
-};
 use ryft_core::tracing_v2::operations::control_flow::{
     DefactorizableProgramOperation, DefactorizedOperation, defactorize_operation_default,
 };
@@ -53,6 +50,7 @@ use ryft_core::tracing_v2::operations::dot::{DotOps, LeftDotOperation, RightDotO
 use ryft_core::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
+use ryft_core::tracing_v2::operations::reshape::ReshapeOps;
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
 use ryft_core::tracing_v2::{
     ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DifferentiableOperation,
@@ -329,16 +327,36 @@ impl<'domain, 'context> InterpretableOperation<ArrayType, XlaTracer<'domain, 'co
 impl<C> BatchableOperation<Tracer<C>, BatchingContext<C>> for XlaOperation
 where
     C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>,
-    Tracer<C>: SupportsArithmeticOperations<XlaConstant>
-        + SupportsTrigonometricOperations
+    Tracer<C>: Add<Output = Tracer<C>>
+        + Sub<Output = Tracer<C>>
+        + Neg<Output = Tracer<C>>
+        + Mul<Output = Tracer<C>>
+        + Div<Output = Tracer<C>>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
+        + ReshapeOps
+        + Broadcast
+        + ReduceValue
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
+        + Compare<Output = Tracer<C>>
+        + BitAnd<Output = Tracer<C>>
+        + BitOr<Output = Tracer<C>>
+        + BitXor<Output = Tracer<C>>
+        + Not<Output = Tracer<C>>
         + Select<Condition = Tracer<C>>
         + BooleanLike
-        + Broadcast
         + Transpose,
     Vec<Tracer<C>>:
         Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: std::fmt::Debug + PartialEq>,
@@ -415,16 +433,36 @@ where
 
 impl BatchableProgramOperation<XlaConstant> for XlaOperation
 where
-    Tracer<ProgramBatchingContext<XlaConstant, Self>>: SupportsArithmeticOperations<XlaConstant>
-        + SupportsTrigonometricOperations
+    Tracer<ProgramBatchingContext<XlaConstant, Self>>: Add<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + Sub<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + Neg<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + Mul<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + Div<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
+        + ReshapeOps
+        + Broadcast
+        + ReduceValue
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
+        + Compare<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + BitAnd<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + BitOr<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + BitXor<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
+        + Not<Output = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
         + Select<Condition = Tracer<ProgramBatchingContext<XlaConstant, Self>>>
         + BooleanLike
-        + Broadcast
         + Transpose,
     Vec<Tracer<ProgramBatchingContext<XlaConstant, Self>>>: Parameterized<
             Tracer<ProgramBatchingContext<XlaConstant, Self>>,
@@ -537,7 +575,22 @@ where
             WithCapture<ValueOrCapture<ArrayType, E::Tangent>> =
                 LinearXlaOperation<E::Tangent, XlaConstant, ValueOrCapture<ArrayType, E::Tangent>>,
         >,
-    LinearOperationOf<E>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>>
+    LinearOperationOf<E>: From<AddOperation>
+        + From<ZeroLikeOperation>
+        + From<NegOperation>
+        + From<SubOperation>
+        + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, <E as Domain>::Value>, Input>>
+        + From<LeftDotOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>, Input>>
+        + From<RightDotOperation<ValueOrCapture<ArrayType, <E as Domain>::Value>, Input>>
+        + From<TransposeOperation>
+        + From<ReshapeOperation>
+        + From<BroadcastOperation>
+        + From<ReduceOperation>
+        + From<PadOperation>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ReshardOperation>
+        + From<ShardingConstraintOperation>
         + ResidualizedOperation<E>
         + From<CustomVjpCallOperation<ArrayType, XlaConstant, XlaOperation, ValueOrCapture<ArrayType, <E as Domain>::Value>>>
         + From<TransferToMemoryOperation>

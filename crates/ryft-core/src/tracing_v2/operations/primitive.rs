@@ -12,7 +12,6 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::batching::BatchingError;
 use crate::contexts::{EagerContext, StagingContext};
-use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
@@ -23,19 +22,18 @@ use crate::operations::constants::{
     ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::scan::read_scan_lane;
-use crate::operations::control_flow::{
-    ConditionOperation, ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation,
-};
+use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation,
-    LinearScatterAddOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
-    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    Broadcast, BroadcastOperation, Concatenate, ConcatenateOperation, DynamicSlice, DynamicSliceOperation,
+    DynamicUpdateSlice, DynamicUpdateSliceOperation, Gather, GatherOperation, LinearDynamicSliceOperation,
+    LinearDynamicUpdateSliceOperation, LinearGatherOperation, LinearScatterAddOperation, Pad, PadOperation, Reshape,
+    ReshapeOperation, Scatter, ScatterOperation, Slice, SliceOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation,
 };
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
-use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameterized;
 use crate::payloads::{Captured, Input};
@@ -57,17 +55,13 @@ use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, Ri
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::tracing_v2::operations::recompute::RecomputeOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
+use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
-use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation};
+use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, Reduce};
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
-use crate::tracing_v2::{DifferentiableOperation, RematerializationName, ResidualizedOperation, ValueOrCapture};
+use crate::tracing_v2::{DifferentiableOperation, ResidualizedOperation, ValueOrCapture};
 use crate::types::{ArrayType, Typed};
 
-use super::bounds::{
-    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsLinearAlgebraOperations,
-    SupportsLinearArithmeticOperations, SupportsLinearArrayOperation, SupportsManipulationOperations,
-    SupportsTrigonometricOperations,
-};
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
     DefactorizableProgramOperation, DefactorizedOperation, batch_condition_with_interpreter,
@@ -138,110 +132,110 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
 // `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
 // `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
-impl<V, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
-where
+impl<
     V: Value<ArrayType>,
-    ZeroOperation<ArrayType>: DifferentiableOperation<D>,
-    ZeroLikeOperation: DifferentiableOperation<D>,
-    OneOperation<ArrayType>: DifferentiableOperation<D>,
-    OneLikeOperation: DifferentiableOperation<D>,
-    ConstantOperation<ArrayType, V>: DifferentiableOperation<D>,
-    FillOperation<ArrayType, f64>: DifferentiableOperation<D>,
-    NegOperation: DifferentiableOperation<D>,
-    AddOperation: DifferentiableOperation<D>,
-    SubOperation: DifferentiableOperation<D>,
-    ScaleOperation<ArrayType, V>: DifferentiableOperation<D>,
-    MulOperation: DifferentiableOperation<D>,
-    DivOperation: DifferentiableOperation<D>,
-    SinOperation: DifferentiableOperation<D>,
-    CosOperation: DifferentiableOperation<D>,
-    StopGradientOperation: DifferentiableOperation<D>,
-    RematerializationNameOperation: DifferentiableOperation<D>,
-    TransferToMemoryOperation: DifferentiableOperation<D>,
-    DotOperation: DifferentiableOperation<D>,
-    TransposeOperation: DifferentiableOperation<D>,
-    ReshapeOperation: DifferentiableOperation<D>,
-    ReshardOperation: DifferentiableOperation<D>,
-    ShardingConstraintOperation: DifferentiableOperation<D>,
-    BroadcastOperation: DifferentiableOperation<D>,
-    SliceOperation: DifferentiableOperation<D>,
-    UpdateSliceOperation: DifferentiableOperation<D>,
-    DynamicSliceOperation: DifferentiableOperation<D>,
-    DynamicUpdateSliceOperation: DifferentiableOperation<D>,
-    PadOperation: DifferentiableOperation<D>,
-    ConcatenateOperation: DifferentiableOperation<D>,
-    GatherOperation: DifferentiableOperation<D>,
-    ScatterOperation: DifferentiableOperation<D>,
-    ReduceOperation: DifferentiableOperation<D>,
-    CompareOperation: DifferentiableOperation<D>,
-    NotOperation: DifferentiableOperation<D>,
-    AndOperation: DifferentiableOperation<D>,
-    OrOperation: DifferentiableOperation<D>,
-    XorOperation: DifferentiableOperation<D>,
-    CollectiveOperation: DifferentiableOperation<D>,
-    SelectOperation: DifferentiableOperation<D>,
-    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Tangent>>>,
-    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = ArrayOperation<V>>,
-    D::Operation: From<ZeroOperation<ArrayType>> + From<OneOperation<ArrayType>> + From<FillOperation<ArrayType, f64>>,
-    D::Value: RematerializationName + TransferToMemory,
-    D::Value: Add<Output = D::Value>
-        + Sub<Output = D::Value>
-        + Mul<Output = D::Value>
-        + Div<Output = D::Value>
-        + Neg<Output = D::Value>
-        + SupportsTrigonometricOperations
-        + ZeroLike
-        + OneLike
-        + DotOps
-        + SupportsManipulationOperations
-        + Compare<Output = D::Value>
-        + BitAnd<Output = D::Value>
-        + BitOr<Output = D::Value>
-        + BitXor<Output = D::Value>
-        + Not<Output = D::Value>
-        + Select<Condition = D::Value>
-        + SelectCondition<Condition = D::Value>
-        + BooleanLike,
-    D::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
-    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    LinearOperationOf<D>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, D::Value>>
-        + ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<ArrayType, V, ArrayOperation<V>, ValueOrCapture<ArrayType, D::Value>>>
+    C: DifferentiationContext<
+            Type = ArrayType,
+            Value: ZeroLike + BooleanLike,
+            Constant = V,
+            Operation = ArrayOperation<V>,
+        >,
+    BodyOperation,
+> DifferentiableOperation<C> for ArrayOperation<V>
+where
+    ZeroOperation<ArrayType>: DifferentiableOperation<C>,
+    ZeroLikeOperation: DifferentiableOperation<C>,
+    OneOperation<ArrayType>: DifferentiableOperation<C>,
+    OneLikeOperation: DifferentiableOperation<C>,
+    ConstantOperation<ArrayType, V>: DifferentiableOperation<C>,
+    FillOperation<ArrayType, f64>: DifferentiableOperation<C>,
+    NegOperation: DifferentiableOperation<C>,
+    AddOperation: DifferentiableOperation<C>,
+    SubOperation: DifferentiableOperation<C>,
+    ScaleOperation<ArrayType, V>: DifferentiableOperation<C>,
+    MulOperation: DifferentiableOperation<C>,
+    DivOperation: DifferentiableOperation<C>,
+    SinOperation: DifferentiableOperation<C>,
+    CosOperation: DifferentiableOperation<C>,
+    StopGradientOperation: DifferentiableOperation<C>,
+    RematerializationNameOperation: DifferentiableOperation<C>,
+    TransferToMemoryOperation: DifferentiableOperation<C>,
+    DotOperation: DifferentiableOperation<C>,
+    TransposeOperation: DifferentiableOperation<C>,
+    ReshapeOperation: DifferentiableOperation<C>,
+    ReshardOperation: DifferentiableOperation<C>,
+    ShardingConstraintOperation: DifferentiableOperation<C>,
+    BroadcastOperation: DifferentiableOperation<C>,
+    SliceOperation: DifferentiableOperation<C>,
+    UpdateSliceOperation: DifferentiableOperation<C>,
+    DynamicSliceOperation: DifferentiableOperation<C>,
+    DynamicUpdateSliceOperation: DifferentiableOperation<C>,
+    PadOperation: DifferentiableOperation<C>,
+    ConcatenateOperation: DifferentiableOperation<C>,
+    GatherOperation: DifferentiableOperation<C>,
+    ScatterOperation: DifferentiableOperation<C>,
+    ReduceOperation: DifferentiableOperation<C>,
+    CompareOperation: DifferentiableOperation<C>,
+    NotOperation: DifferentiableOperation<C>,
+    AndOperation: DifferentiableOperation<C>,
+    OrOperation: DifferentiableOperation<C>,
+    XorOperation: DifferentiableOperation<C>,
+    CollectiveOperation: DifferentiableOperation<C>,
+    SelectOperation: DifferentiableOperation<C>,
+    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Tangent>>>,
+    LinearOperationOf<C>: From<AddOperation>
+        + From<ZeroLikeOperation>
+        + From<NegOperation>
+        + From<SubOperation>
+        + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, C::Value>, Input>>
+        + From<LeftDotOperation<ValueOrCapture<ArrayType, C::Value>, Input>>
+        + From<RightDotOperation<ValueOrCapture<ArrayType, C::Value>, Input>>
+        + From<TransposeOperation>
+        + From<ReshapeOperation>
+        + From<BroadcastOperation>
+        + From<ReduceOperation>
+        + From<PadOperation>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ReshardOperation>
+        + From<ShardingConstraintOperation>
+        + ResidualizedOperation<C>
+        + From<CustomVjpCallOperation<ArrayType, V, ArrayOperation<V>, ValueOrCapture<ArrayType, C::Value>>>
         + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
-        + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
-        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, D::Value>>>
-        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, D::Value>>>
-        + From<LinearGatherOperation<ValueOrCapture<ArrayType, D::Value>>>
-        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, D::Value>>>
+        + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Value>>>
+        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, C::Value>>>
+        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, C::Value>>>
+        + From<LinearGatherOperation<ValueOrCapture<ArrayType, C::Value>>>
+        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, C::Value>>>
         + From<
             ConditionOperation<
                 ArrayType,
-                D::Tangent,
-                LinearOperationOf<D>,
-                ValueOrCapture<ArrayType, D::Value>,
+                C::Tangent,
+                LinearOperationOf<C>,
+                ValueOrCapture<ArrayType, C::Value>,
                 Captured,
             >,
-        > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, D::Value>>>
+        > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, C::Value>>>
         + From<RecomputeOperation<ArrayOperation<V>>>
-        + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>, Input>>
-        + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
-    LinearOperationOf<D>: CaptureParameterizedOperation<
+        + From<WhileOperation<ArrayType, C::Tangent, LinearOperationOf<C>, Input>>
+        + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
+    LinearOperationOf<C>: CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, D::Value>,
-            WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
-            WithCapture<ValueOrCapture<ArrayType, D::Tangent>> = BodyOperation,
-        > + DefactorizableProgramOperation<D::Tangent, D::Value, ArrayOperation<V>>,
-    LinearOperationOf<D>: MaybeZeroOperation<ArrayType>,
-    ArrayOperation<V>: Clone + LinearizableProgramOperation<D>,
+            ValueOrCapture<ArrayType, C::Value>,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = LinearOperationOf<C>,
+            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
+        > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<V>>,
+    LinearOperationOf<C>: MaybeZeroOperation<ArrayType>,
+    ArrayOperation<V>: Clone + LinearizableProgramOperation<C>,
 {
     fn jvp<'jvp>(
         &self,
-        context: &mut TangentContext<'jvp, D>,
-        inputs: &[JvpTracer<'jvp, D>],
-    ) -> Result<Vec<JvpTracer<'jvp, D>>, ProgramError>
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
     where
-        D: 'jvp,
+        C: 'jvp,
     {
         match self {
             Self::Zero(operation) => operation.jvp(context, inputs),
@@ -589,13 +583,34 @@ where
     F: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     F::InterpretationContext: Zero<ArrayType, F>,
     V: Value<ArrayType>
-        + SupportsArithmeticOperations<F>
-        + SupportsTrigonometricOperations
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Div<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
+        + Compare<Output = V>
+        + BitAnd<Output = V>
+        + BitOr<Output = V>
+        + BitXor<Output = V>
+        + Not<Output = V>
         + Select<Condition = V>,
     V::InterpretationContext: Scale<ArrayType, V, F>,
 {
@@ -659,16 +674,36 @@ where
     V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Zero<ArrayType, V>,
     C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
-    Tracer<C>: SupportsArithmeticOperations<V>
-        + SupportsTrigonometricOperations
+    Tracer<C>: Add<Output = Tracer<C>>
+        + Sub<Output = Tracer<C>>
+        + Neg<Output = Tracer<C>>
+        + Mul<Output = Tracer<C>>
+        + Div<Output = Tracer<C>>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
+        + Compare<Output = Tracer<C>>
+        + BitAnd<Output = Tracer<C>>
+        + BitOr<Output = Tracer<C>>
+        + BitXor<Output = Tracer<C>>
+        + Not<Output = Tracer<C>>
         + Select<Condition = Tracer<C>>
         + BooleanLike
-        + Broadcast
         + Transpose,
     Vec<Tracer<C>>: Parameterized<Tracer<C>, To<Tracer<C>> = Vec<Tracer<C>>, ParameterStructure: Debug + PartialEq>,
     Self: BatchableProgramOperation<V>,
@@ -709,13 +744,34 @@ where
     V::InterpretationContext: Default,
     V::InterpretationContext: Scale<ArrayType, V, V>,
     V: Value<ArrayType>
-        + SupportsArithmeticOperations
-        + SupportsTrigonometricOperations
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
+        + Div<Output = V>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
+        + Compare<Output = V>
+        + BitAnd<Output = V>
+        + BitOr<Output = V>
+        + BitXor<Output = V>
+        + Not<Output = V>
         + Select<Condition = V>
         + BooleanLike,
     V::InterpretationContext: Zero<ArrayType, V>,
@@ -771,16 +827,36 @@ impl<V> BatchableProgramOperation<V> for ArrayOperation<V>
 where
     V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape + 'static,
     V::InterpretationContext: Zero<ArrayType, V>,
-    Tracer<ProgramBatchingContext<V, Self>>: SupportsArithmeticOperations<V>
-        + SupportsTrigonometricOperations
+    Tracer<ProgramBatchingContext<V, Self>>: Add<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Sub<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Neg<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Mul<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Div<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + DotOps
-        + SupportsManipulationOperations
-        + SupportsComparisonOperations
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
+        + Compare<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + BitAnd<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + BitOr<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + BitXor<Output = Tracer<ProgramBatchingContext<V, Self>>>
+        + Not<Output = Tracer<ProgramBatchingContext<V, Self>>>
         + Select<Condition = Tracer<ProgramBatchingContext<V, Self>>>
         + BooleanLike
-        + Broadcast
         + Transpose,
     Vec<Tracer<ProgramBatchingContext<V, Self>>>: Parameterized<
             Tracer<ProgramBatchingContext<V, Self>>,
@@ -811,67 +887,119 @@ where
 /// recursion. The `WithCapture<V> = ..` equality pins the canonical linear operation as a fixed point of factor
 /// reparameterization, which is what collapses `LinearizationContextOf<LinearizationContextOf<E, ..>, ..>`
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
-impl<V, E, BodyOperation> LinearizableProgramOperation<E> for ArrayOperation<V>
+impl<V: Value<ArrayType>, C: DifferentiationContext<Type = ArrayType, Constant = V>, BodyOperation>
+    LinearizableProgramOperation<C> for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    E: DifferentiationContext<Type = ArrayType, Constant = V>,
-    E::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
-    E::LinearOperation<E::Tangent, V>:
-        CaptureParameterizedOperation<ArrayType, V, WithCapture<V> = E::LinearOperation<E::Tangent, V>>,
-    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, E::Tangent>>>,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearArrayOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>
-        + crate::tracing_v2::ResidualizedOperation<LinearizationContextOf<E, Self>>
+    C::Tangent: Transpose + Broadcast + Reduce + Slice + Reshard + ConstrainSharding,
+    C::LinearOperation<C::Tangent, V>:
+        CaptureParameterizedOperation<ArrayType, V, WithCapture<V> = C::LinearOperation<C::Tangent, V>>,
+    // ZeroOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ZeroLikeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // OneOperation<ArrayType>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // OneLikeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ConstantOperation<ArrayType, V>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // FillOperation<ArrayType, f64>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // NegOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // AddOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // SubOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ScaleOperation<ArrayType, V>: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // MulOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // DivOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // SinOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // CosOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // StopGradientOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // RematerializationNameOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // TransferToMemoryOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // DotOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // TransposeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ReshapeOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ReshardOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ShardingConstraintOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // BroadcastOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // SliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // UpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // DynamicSliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // DynamicUpdateSliceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // PadOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ConcatenateOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // GatherOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ScatterOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // ReduceOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // CompareOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // NotOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // AndOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // OrOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // XorOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // CollectiveOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    // SelectOperation: DifferentiableOperation<LinearizationContextOf<C, Self>>,
+    BodyOperation: Operation<ArrayType> + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Tangent>>>,
+    LinearOperationOf<LinearizationContextOf<C, Self>>: From<AddOperation>
+        + From<ZeroLikeOperation>
+        + From<NegOperation>
+        + From<SubOperation>
+        + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>, Input>>
+        + From<LeftDotOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>, Input>>
+        + From<RightDotOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>, Input>>
+        + From<TransposeOperation>
+        + From<ReshapeOperation>
+        + From<BroadcastOperation>
+        + From<ReduceOperation>
+        + From<PadOperation>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ReshardOperation>
+        + From<ShardingConstraintOperation>
+        + ResidualizedOperation<LinearizationContextOf<C, Self>>
         + From<ZeroOperation<ArrayType>>
         + From<
             CustomVjpCallOperation<
                 ArrayType,
                 V,
                 Self,
-                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
             >,
         > + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
-        + From<LinearSelectOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
-        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
-        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
-        + From<LinearGatherOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
-        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearSelectOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
+        + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
+        + From<LinearDynamicUpdateSliceOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
+        + From<LinearGatherOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
+        + From<LinearScatterAddOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
         + From<
             ConditionOperation<
                 ArrayType,
-                E::Tangent,
-                LinearOperationOf<LinearizationContextOf<E, Self>>,
-                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                C::Tangent,
+                LinearOperationOf<LinearizationContextOf<C, Self>>,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
                 Captured,
             >,
-        > + DefactorizableProgramOperation<E::Tangent, Tracer<LinearizationContextOf<E, Self>>, Self>
-        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>>>
+        > + DefactorizableProgramOperation<C::Tangent, Tracer<LinearizationContextOf<C, Self>>, Self>
+        + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>>>
         + From<RecomputeOperation<Self>>
-        + From<WhileOperation<ArrayType, E::Tangent, LinearOperationOf<LinearizationContextOf<E, Self>>, Input>>
+        + From<WhileOperation<ArrayType, C::Tangent, LinearOperationOf<LinearizationContextOf<C, Self>>, Input>>
         + From<
             ScanOperation<
                 ArrayType,
-                E::Tangent,
+                C::Tangent,
                 BodyOperation,
-                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
                 Input,
             >,
         >,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
+    LinearOperationOf<LinearizationContextOf<C, Self>>: CaptureParameterizedOperation<
             ArrayType,
-            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<E, Self>>>> = LinearOperationOf<
-                LinearizationContextOf<E, Self>,
+            ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+            WithCapture<ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>> = LinearOperationOf<
+                LinearizationContextOf<C, Self>,
             >,
-            WithCapture<ValueOrCapture<ArrayType, E::Value>> = LinearOperationOf<E>,
-            WithCapture<ValueOrCapture<ArrayType, E::Tangent>> = BodyOperation,
+            WithCapture<ValueOrCapture<ArrayType, C::Value>> = LinearOperationOf<C>,
+            WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
         > + MaybeZeroOperation<ArrayType>,
 {
     fn linearize_program(
-        differentiable: &E,
+        differentiable: &C,
         program: &crate::programs::Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<NestedLinearization<E, Self>, ProgramError> {
+    ) -> Result<NestedLinearization<C, Self>, ProgramError> {
         program.linearize(differentiable)
     }
 }
@@ -888,11 +1016,26 @@ where
     C: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     C::InterpretationContext: Zero<ArrayType, C>,
     V: Value<ArrayType>
-        + SupportsLinearArithmeticOperations<F>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
         + ZeroLike
         + OneLike
-        + SupportsLinearAlgebraOperations<F>
-        + SupportsManipulationOperations
+        + DotOps
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
         + BitAnd<Output = V>
         + Select<Condition = V>,
     V::InterpretationContext: Scale<ArrayType, V, F> + LeftDot<V, F, Captured> + RightDot<V, F, Captured>,
@@ -986,11 +1129,26 @@ where
     V::InterpretationContext: Default,
     V::InterpretationContext: Scale<ArrayType, V, V> + LeftDot<V, V, Captured> + RightDot<V, V, Captured>,
     V: Value<ArrayType>
-        + SupportsLinearArithmeticOperations
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Neg<Output = V>
+        + Mul<Output = V>
         + ZeroLike
         + OneLike
-        + SupportsLinearAlgebraOperations
-        + SupportsManipulationOperations
+        + DotOps
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
@@ -1157,11 +1315,26 @@ where
     C::Constant: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     <C::Constant as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, C::Constant>,
     C::Operation: From<ZeroOperation<ArrayType>>,
-    Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
+    Tracer<C>: Add<Output = Tracer<C>>
+        + Sub<Output = Tracer<C>>
+        + Neg<Output = Tracer<C>>
+        + Mul<Output = Tracer<C>>
         + ZeroLike
         + OneLike
-        + SupportsLinearAlgebraOperations<C::Constant>
-        + SupportsManipulationOperations
+        + DotOps
+        + ReshapeOps
+        + Broadcast
+        + Reduce
+        + Pad
+        + Concatenate
+        + Slice
+        + UpdateSlice
+        + DynamicSlice
+        + DynamicUpdateSlice
+        + Gather
+        + Scatter
+        + Reshard
+        + ConstrainSharding
         + BitAnd<Output = Tracer<C>>
         + Select<Condition = Tracer<C>>
         + BooleanLike

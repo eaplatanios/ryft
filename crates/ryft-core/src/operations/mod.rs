@@ -238,8 +238,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Bounds provided through `#[ryft(bounds(interpretation(...)))]` are applied to the same generated interpretation
 ///     value type. For example, one-value-parameter enums apply them to the generated runtime value parameter, while
 ///     direct linear enums apply them to their first value parameter. When any interpretation bounds are provided, the
-///     macro also adds the standard companion requirements `V::InterpretationContext: Zero<T, V>` and
-///     `Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>` for that generated value type.
+///     macro also adds the standard companion requirement `V::InterpretationContext: Zero<T, V>` for the generated
+///     implementation value type.
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the

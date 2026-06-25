@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use ryft_core::EagerContext;
 use ryft_core::contexts::{Context, ProvidesContext};
 use ryft_core::domains::Domain;
-use ryft_core::operations::{BooleanLike, InterpretableOperation};
+use ryft_core::operations::InterpretableOperation;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::tracing_v2::DifferentiationContext;
 use ryft_core::types::ArrayType;
@@ -55,8 +55,7 @@ impl<T: NdArrayElement> Context for NdArrayDomain<T> {
 
 impl<T: NdArrayElement> DifferentiationContext for NdArrayDomain<T> {
     type Tangent = Array<T>;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-        LinearNdarrayOperation<V, Array<T>, F>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearNdarrayOperation<V, Array<T>, F>;
 }
 
 impl<T: NdArrayElement> ProvidesContext<<Array<T> as Value<ArrayType>>::InterpretationContext> for NdArrayDomain<T> {

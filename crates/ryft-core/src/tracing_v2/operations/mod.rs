@@ -1,9 +1,6 @@
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
 
-/// Value-capability bundles aggregating the repeated trait-bound clusters used by the primitive operation enums.
-pub mod bounds;
-
 /// N-dimensional broadcast differentiation and batching rules.
 pub mod broadcasting;
 
@@ -97,11 +94,6 @@ pub mod sub;
 /// N-dimensional axis-permutation differentiation and batching rules.
 pub mod transpose;
 
-pub use bounds::{
-    SupportsArithmeticOperations, SupportsComparisonOperations, SupportsConstantOperations,
-    SupportsLinearAlgebraOperations, SupportsLinearArithmeticOperations, SupportsLinearArrayOperation,
-    SupportsLinearScalarOperation, SupportsManipulationOperations, SupportsTrigonometricOperations,
-};
 pub use broadcasting::lift_broadcast;
 pub use captures::{MaterializeCaptureOperation, ValueOrCapture};
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};

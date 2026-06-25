@@ -1,3 +1,6 @@
+use std::fmt::Display;
+
+use crate::Compare;
 use crate::contexts::StagingContext;
 use crate::differentiation::{Cotangent, TransposableOperation};
 use crate::macros::check_count;
@@ -12,7 +15,6 @@ use crate::tracing::{AbstractTracingContext, Tracer};
 use crate::tracing_v2::differentiation::{JvpTracer, LinearOperationOf, TangentContext};
 use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
-use std::fmt::Display;
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -499,7 +501,7 @@ where
 impl<D> DifferentiableOperation<D> for ReduceOperation
 where
     D: DifferentiationContext<Type = ArrayType>,
-    D::Value: Reduce + Broadcast + crate::operations::compare::Compare<Output = D::Value>,
+    D::Value: Reduce + Broadcast + Compare<Output = D::Value>,
     D::Tangent: Reduce,
     LinearOperationOf<D>:
         From<ReduceOperation> + From<ScaleOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>, Input>>,

@@ -1100,13 +1100,6 @@ fn add_interpretation_value_bounds(
         <#interpretation_value_type as #ryft::Value<#operation_type>>::InterpretationContext:
             #ryft::Zero<#operation_type, #interpretation_value_type>
     });
-    where_clause.predicates.push(syn::parse_quote! {
-        ::std::vec::Vec<#interpretation_value_type>: #ryft::Parameterized<
-            #interpretation_value_type,
-            To<#interpretation_value_type> = ::std::vec::Vec<#interpretation_value_type>,
-            ParameterStructure: ::std::fmt::Debug + ::std::cmp::PartialEq,
-        >
-    });
 }
 
 /// Visitor replacing bare type identifiers with concrete types.

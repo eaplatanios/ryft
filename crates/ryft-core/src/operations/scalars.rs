@@ -14,7 +14,7 @@ use crate::operations::constants::{
 };
 use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
-use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -24,7 +24,6 @@ use crate::tracing_v2::differentiation::{
     TangentContext,
 };
 use crate::tracing_v2::operations::MaybeDot;
-use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, custom_jvp_rule, custom_vjp_rule,
 };
@@ -95,7 +94,8 @@ where
         + Mul<Output = D::Value>
         + Div<Output = D::Value>
         + Neg<Output = D::Value>
-        + SupportsTrigonometricOperations
+        + Sin
+        + Cos
         + ZeroLike
         + OneLike
         + Compare<Output = D::Value>
@@ -106,7 +106,11 @@ where
     <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScalarOperation<V>: Clone + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, D::Value>>
+    LinearOperationOf<D>: From<AddOperation>
+        + From<ZeroLikeOperation>
+        + From<NegOperation>
+        + From<SubOperation>
+        + From<ScaleOperation<DataType, ValueOrCapture<DataType, D::Value>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
         + ResidualizedOperation<D>
         + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, ValueOrCapture<DataType, D::Value>>>,
@@ -171,7 +175,11 @@ where
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
-    LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>
+    LinearOperationOf<LinearizationContextOf<E, Self>>: From<AddOperation>
+        + From<ZeroLikeOperation>
+        + From<NegOperation>
+        + From<SubOperation>
+        + From<ScaleOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>, Input>>
         + ResidualizedOperation<LinearizationContextOf<E, Self>>
         + From<ZeroOperation<DataType>>
         + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
