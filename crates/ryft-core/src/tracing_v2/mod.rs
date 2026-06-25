@@ -58,5 +58,5 @@ pub use operations::{ArrayOperation, LinearArrayOperation, RecomputeOperation};
 pub use rematerialization::{
     MaybeRematerializationName, OffloadingRematerializationPolicy, REMATERIALIZATION_NAME_OPERATION_NAME,
     RematerializationName, RematerializationNameOperation, RematerializationPolicy, RematerializationVerdict,
-    Rematerialize, ResidualHandling, rematerialize,
+    Rematerialize, RematerializeCallOperation, RematerializeOperation, ResidualHandling, rematerialize,
 };

@@ -52,6 +52,7 @@ use ryft_core::tracing_v2::operations::recompute::RecomputeOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
 use ryft_core::tracing_v2::operations::reshape::ReshapeOps;
 use ryft_core::tracing_v2::operations::select::LinearSelectOperation;
+use ryft_core::tracing_v2::rematerialization::{RematerializeCallOperation, RematerializeOperation};
 use ryft_core::tracing_v2::{
     ArrayOperation, CaptureParameterizedOperation, CollectiveOperation, DifferentiableOperation,
     DifferentiationContext, DotOperation, JvpTracer, LinearArrayOperation, LinearizableProgramOperation,
@@ -129,6 +130,9 @@ pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
     /// Backend-owned custom VJP call whose nested programs can contain XLA operations.
     CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
 
+    /// Backend-owned rematerialized call whose nested programs can contain XLA operations.
+    Rematerialize(Box<RematerializeOperation<ArrayType, V, Self>>),
+
     /// Call to a flat jitted XLA sub-program.
     JitCall(Box<JitCallOperation>),
 
@@ -200,6 +204,7 @@ where
             ArrayOperation::Scan(operation) => XlaOperation::from(*operation),
             ArrayOperation::CustomJvp(operation) => XlaOperation::from(*operation),
             ArrayOperation::CustomVjp(operation) => XlaOperation::from(*operation),
+            ArrayOperation::Rematerialize(operation) => XlaOperation::from(*operation),
         }
     }
 }
@@ -273,18 +278,34 @@ where
     V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
     V::InterpretationContext: Zero<ArrayType, V>,
 {
-    fn from(core_operation: CustomVjpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
-        let mut operation = CustomVjpOperation::new(
-            map_core_xla_program(core_operation.primal()),
-            map_core_xla_program(core_operation.forward()),
-            map_core_xla_program(core_operation.backward()),
-        )
-        .unwrap()
-        .with_prevent_cse(core_operation.prevent_cse());
-        if let Some(tangent) = core_operation.tangent_program() {
-            operation = operation.with_tangent_program(map_core_xla_program(tangent)).unwrap();
-        }
-        Self::CustomVjp(Box::new(operation))
+    fn from(operation: CustomVjpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        Self::CustomVjp(Box::new(
+            CustomVjpOperation::new(
+                map_core_xla_program(operation.primal()),
+                map_core_xla_program(operation.forward()),
+                map_core_xla_program(operation.backward()),
+            )
+            .unwrap(),
+        ))
+    }
+}
+
+impl<V> From<RematerializeOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
+{
+    fn from(operation: RematerializeOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+        Self::Rematerialize(Box::new(
+            RematerializeOperation::new(
+                map_core_xla_program(operation.primal()),
+                map_core_xla_program(operation.forward()),
+                map_core_xla_program(operation.backward()),
+                map_core_xla_program(operation.tangent()),
+            )
+            .unwrap()
+            .with_prevent_cse(operation.prevent_cse()),
+        ))
     }
 }
 
@@ -422,6 +443,7 @@ where
             Self::Scan(operation) => operation.batch(context, inputs),
             Self::CustomJvp(operation) => operation.batch(context, inputs),
             Self::CustomVjp(operation) => operation.batch(context, inputs),
+            Self::Rematerialize(operation) => operation.batch(context, inputs),
             Self::JitCall(operation) => operation.batch(context, inputs),
             Self::ShardMap(_) | Self::LinearShardMap(_) => Err(BatchingError::UnsupportedOperation {
                 message: format!("missing batching rule for operation '{}'", self.name()),
@@ -593,6 +615,7 @@ where
         + From<ShardingConstraintOperation>
         + ResidualizedOperation<C>
         + From<CustomVjpCallOperation<ArrayType, XlaConstant, XlaOperation, ValueOrCapture<ArrayType, <C as Domain>::Value>>>
+        + From<RematerializeCallOperation<ArrayType, XlaConstant, XlaOperation, ValueOrCapture<ArrayType, <C as Domain>::Value>>>
         + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, <C as Domain>::Value>>>
@@ -695,6 +718,11 @@ where
             }
             Self::CustomVjp(operation) => {
                 <CustomVjpOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
+                    operation, context, inputs,
+                )
+            }
+            Self::Rematerialize(operation) => {
+                <RematerializeOperation<ArrayType, XlaConstant, Self> as DifferentiableOperation<C>>::jvp(
                     operation, context, inputs,
                 )
             }
@@ -879,6 +907,8 @@ pub enum LinearXlaOperation<
 
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, Constant, P, F>>),
 
+    RematerializeCall(Box<RematerializeCallOperation<ArrayType, Constant, P, F>>),
+
     /// Linearized call to a jitted XLA sub-program.
     LinearJitCall(Box<LinearJitCallOperation<CaptureFactor>>),
 
@@ -928,6 +958,7 @@ where
             Self::Residual(operation) => LinearArrayOperation::from(operation.clone()),
             Self::Recompute(operation) => LinearArrayOperation::from(operation.clone()),
             Self::CustomVjpCall(operation) => LinearArrayOperation::from((**operation).clone()),
+            Self::RematerializeCall(operation) => LinearArrayOperation::from((**operation).clone()),
             Self::Condition(_)
             | Self::WhileCondition(_)
             | Self::While(_)
@@ -1024,6 +1055,7 @@ where
             )),
             LinearArrayOperation::Scan(operation) => LinearXlaOperation::from(*operation),
             LinearArrayOperation::CustomVjpCall(operation) => Self::CustomVjpCall(operation),
+            LinearArrayOperation::RematerializeCall(operation) => Self::RematerializeCall(operation),
         }
     }
 }

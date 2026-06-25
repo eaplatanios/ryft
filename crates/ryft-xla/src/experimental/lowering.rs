@@ -1026,6 +1026,15 @@ where
                 false,
                 lowerer.nested_functions.as_ref(),
             ),
+            Self::Rematerialize(operation) => lower_nested_program_inline(
+                operation.primal(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+                lowerer.nested_functions.as_ref(),
+            ),
             Self::JitCall(jit_call_op) => lower_jit_call(
                 jit_call_op.program_rc(),
                 input_values,
@@ -1246,6 +1255,15 @@ where
                 lowerer.nested_functions.as_ref(),
             ),
             ArrayOperation::CustomVjp(operation) => lower_nested_program_inline(
+                operation.primal(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+                false,
+                lowerer.nested_functions.as_ref(),
+            ),
+            ArrayOperation::Rematerialize(operation) => lower_nested_program_inline(
                 operation.primal(),
                 input_values,
                 &mut lowerer.block,
@@ -1493,20 +1511,31 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
             LinearArrayOperation::CustomVjpCall(call) => {
-                // The transposed call lowers its backward program; the un-transposed call lowers its tangent program
-                // when one was derived (rematerialization) and rejects forward mode otherwise (user custom VJPs).
-                let program = if call.transposed() {
-                    call.backward()
-                } else if let Some(tangent) = call.tangent_program() {
-                    tangent
-                } else {
+                if !call.transposed() {
                     return Err(ProgramError::from(ryft_core::TypeError {
                         message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                             value_and_grad, or jacrev) instead"
                             .to_string(),
                     })
                     .into());
-                };
+                }
+                let mut values = Vec::with_capacity(call.residuals().len() + input_values.len());
+                for residual in call.residuals() {
+                    values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
+                }
+                values.extend_from_slice(input_values);
+                lower_nested_program_inline(
+                    call.backward(),
+                    values.as_slice(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                    false,
+                    lowerer.nested_functions.as_ref(),
+                )
+            }
+            LinearArrayOperation::RematerializeCall(call) => {
+                let program = if call.transposed() { call.backward() } else { call.tangent() };
                 let mut values = Vec::with_capacity(call.residuals().len() + input_values.len());
                 for residual in call.residuals() {
                     values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
@@ -3210,6 +3239,7 @@ where
                 | XlaOperation::Scan(_)
                 | XlaOperation::CustomJvp(_)
                 | XlaOperation::CustomVjp(_)
+                | XlaOperation::Rematerialize(_)
                 | XlaOperation::JitCall(_)
                 | XlaOperation::ShardMap(_)
                 | XlaOperation::LinearShardMap(_)
@@ -3290,6 +3320,7 @@ fn count_jit_calls<Input, Output>(
             XlaOperation::Scan(scan) => count_jit_calls(scan.body(), counts, order, memo),
             XlaOperation::CustomJvp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
             XlaOperation::CustomVjp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
+            XlaOperation::Rematerialize(operation) => count_jit_calls(operation.primal(), counts, order, memo),
             XlaOperation::JitCall(call) => {
                 let program = call.program_rc();
                 let pointer = Rc::as_ptr(program) as *const () as usize;
@@ -4002,6 +4033,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.nested_functions.as_ref(),
         ),
         XlaOperation::CustomVjp(operation) => lower_nested_program_inline(
+            operation.primal(),
+            input_values,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+            false,
+            lowerer.nested_functions.as_ref(),
+        ),
+        XlaOperation::Rematerialize(operation) => lower_nested_program_inline(
             operation.primal(),
             input_values,
             &mut lowerer.block,

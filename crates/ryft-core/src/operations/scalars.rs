@@ -23,7 +23,9 @@ use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
 };
 use crate::tracing_v2::operations::select::LinearSelectOperation;
-use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
+use crate::tracing_v2::rematerialization::{
+    MaybeRematerializationName, RematerializationNameOperation, RematerializeCallOperation, RematerializeOperation,
+};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DotDimensionNumbers, LinearizableProgramOperation,
     ResidualizedOperation, ValueOrCapture,
@@ -60,6 +62,7 @@ pub enum ScalarOperation<V: Value<DataType>> {
     RematerializationName(RematerializationNameOperation),
     CustomJvp(Box<CustomJvpOperation<DataType, V, Self>>),
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
+    Rematerialize(Box<RematerializeOperation<DataType, V, Self>>),
 }
 
 impl<
@@ -111,6 +114,14 @@ where
                 ValueOrCapture<C::Type, C::Value>,
             >,
         >,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<
+        RematerializeCallOperation<
+            DataType,
+            C::Constant,
+            ScalarOperation<C::Constant>,
+            ValueOrCapture<DataType, C::Value>,
+        >,
+    >,
 {
     fn jvp<'jvp>(
         &self,
@@ -141,6 +152,7 @@ where
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
             Self::CustomJvp(operation) => operation.jvp(context, inputs),
             Self::CustomVjp(operation) => operation.jvp(context, inputs),
+            Self::Rematerialize(operation) => operation.jvp(context, inputs),
         }
     }
 }
@@ -172,6 +184,13 @@ where
         + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>>>
         + From<
             CustomVjpCallOperation<
+                DataType,
+                F,
+                Self,
+                ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
+            >,
+        > + From<
+            RematerializeCallOperation<
                 DataType,
                 F,
                 Self,
@@ -230,6 +249,7 @@ pub enum LinearScalarOperation<V: Value<DataType>, Constant: Value<DataType> = V
     Select(LinearSelectOperation<F>),
     While(Box<WhileOperation<DataType, V, Self, Input>>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, Constant, ScalarOperation<Constant>, F>>),
+    RematerializeCall(Box<RematerializeCallOperation<DataType, Constant, ScalarOperation<Constant>, F>>),
 }
 
 impl<V: Value<DataType>, Constant: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
@@ -270,6 +290,9 @@ impl<V: Value<DataType>, Constant: Value<DataType>, F: Value<DataType>> CaptureP
             }
             Self::CustomVjpCall(call) => {
                 Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
+            }
+            Self::RematerializeCall(call) => {
+                Ok(LinearScalarOperation::RematerializeCall(Box::new(call.map_captures(map_factor)?)))
             }
         }
     }

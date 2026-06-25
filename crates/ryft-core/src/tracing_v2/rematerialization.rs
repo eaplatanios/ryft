@@ -6,12 +6,10 @@
 //! (plus any values selected by a [`RematerializationPolicy`]) are saved, and everything else is recomputed from them in
 //! the backward pass.
 //!
-//! Rematerializeing is not a primitive operation in `ryft`. Each [`Rematerialize::call`] expands into a
-//! [`CustomVjpOperation`] — the same reduction JAX documents for `jax.checkpoint` — by deriving the forward and
-//! backward programs symbolically: the forward program computes the region outputs plus the saved values, and the
-//! backward program recomputes the remaining linearization residuals from the saved values before replaying the
-//! transposed tangent map. All downstream behavior (interpretation, batching, lowering, the reverse-mode rule)
-//! therefore reuses the custom-derivative machinery unchanged.
+//! Each [`Rematerialize::call`] stages a [`RematerializeOperation`] by deriving forward, backward, and tangent
+//! programs symbolically: the forward program computes the region outputs plus the saved values, the backward program
+//! recomputes the remaining linearization residuals before replaying the transposed tangent map, and the tangent
+//! program replays the pushforward for forward mode.
 //!
 //! This module also owns the [`rematerialization_name`](RematerializationName) value-tagging primitive
 //! ([`RematerializationNameOperation`]) consumed by the name-based [`RematerializationPolicy`] members.
@@ -23,22 +21,27 @@ use std::rc::Rc;
 
 use half::{bf16, f16};
 
-use crate::contexts::StagingContext;
-use crate::differentiation::{DifferentiableType, TransposableOperation};
+use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::differentiation::{Cotangent, DifferentiableType, TransposableOperation};
 use crate::domains::Domain;
-use crate::macros::check_count;
+use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::manipulation::{Broadcast, Transpose};
+use crate::operations::{ElementwiseOperation, InterpretableOperation, InterpretableProgramOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::{DomainTracer, Tracer, TracingContext};
+use crate::programs::{Program, ProgramError, Value};
+use crate::tracing::{AbstractTracingContext, DomainTracer, Tracer, TracingContext};
+use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext};
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiationContext, JvpTracer, LinearizableProgramOperation, ResidualizedOperation,
     TangentContext,
 };
 use crate::tracing_v2::operations::captures::ValueOrCapture;
-use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
+use crate::tracing_v2::operations::control_flow::stage_cotangent;
+use crate::tracing_v2::operations::custom_derivatives::{
+    CustomVjpResidual, batch_program_inline, batch_rewrapped_program, stage_rewrapped_custom_call,
+};
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::types::{ArrayType, DataType, Memory, Type, TypeError, Typed};
@@ -123,6 +126,477 @@ where
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
+    }
+}
+
+/// Higher-order operation used by checkpointing/rematerialization.
+///
+/// [`RematerializeOperation`] has the same primal/forward/backward structure as
+/// [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation), but it also carries
+/// a derived tangent program. That extra program is not user-authored custom-VJP state: it is produced by
+/// [`Rematerialize`] so forward-mode differentiation can replay the rematerialized pushforward while reverse mode
+/// replays the rematerialized pullback.
+///
+/// The `prevent_cse` flag is likewise rematerialization-specific. Backends may lower it as an optimization barrier
+/// around rematerialized tangent/pullback outputs so compiler common-subexpression elimination does not undo the
+/// requested memory/computation tradeoff.
+#[derive(Clone, Debug)]
+pub struct RematerializeOperation<T, V, O>
+where
+    T: Type,
+    V: Value<T>,
+{
+    /// Program computing the primal outputs from the primal inputs.
+    primal: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Program computing `(outputs..., residuals...)` from the primal inputs.
+    forward: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
+    backward: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Program computing one output tangent per primal output from `(residuals..., input_tangents...)`.
+    tangent: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Backend lowering hint requesting an optimization barrier around rematerialized backward/tangent outputs.
+    prevent_cse: bool,
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> RematerializeOperation<T, V, O> {
+    /// Creates a rematerialization operation after validating the forward, backward, and tangent program signatures.
+    pub fn new(
+        primal: Program<T, V, O, Vec<V>, Vec<V>>,
+        forward: Program<T, V, O, Vec<V>, Vec<V>>,
+        backward: Program<T, V, O, Vec<V>, Vec<V>>,
+        tangent: Program<T, V, O, Vec<V>, Vec<V>>,
+    ) -> Result<Self, TypeError> {
+        let input_types = primal.input_types();
+        let output_types = primal.output_types();
+        check_types!("rematerialize forward input", &input_types, &forward.input_types());
+        let forward_output_types = forward.output_types();
+        if forward_output_types.len() < output_types.len() {
+            return Err(TypeError {
+                message: format!(
+                    "rematerialize forward must produce at least the {} primal output(s) but produced {} value(s)",
+                    output_types.len(),
+                    forward_output_types.len(),
+                ),
+            });
+        }
+        check_types!("rematerialize forward output", &output_types, &forward_output_types[..output_types.len()]);
+        let residual_types = &forward_output_types[output_types.len()..];
+        let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
+        check_types!("rematerialize backward input", &expected_backward_input_types, &backward.input_types(),);
+        check_types!("rematerialize backward output", &input_types, &backward.output_types());
+        let expected_tangent_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
+        check_types!("rematerialize tangent input", &expected_tangent_input_types, &tangent.input_types());
+        check_types!("rematerialize tangent output", &output_types, &tangent.output_types());
+        Ok(Self { primal, forward, backward, tangent, prevent_cse: false })
+    }
+
+    /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
+    /// (e.g., StableHLO's `optimization_barrier`). Without a barrier, a compiler may common-subexpression-eliminate
+    /// values recomputed by the backward or tangent program against the forward pass, silently restoring the memory
+    /// cost the rematerialization was meant to avoid.
+    pub fn with_prevent_cse(mut self, prevent_cse: bool) -> Self {
+        self.prevent_cse = prevent_cse;
+        self
+    }
+
+    /// Returns whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier.
+    #[inline]
+    pub fn prevent_cse(&self) -> bool {
+        self.prevent_cse
+    }
+
+    /// Returns the primal program.
+    #[inline]
+    pub fn primal(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.primal
+    }
+
+    /// Returns the forward (residual-producing) program.
+    #[inline]
+    pub fn forward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.forward
+    }
+
+    /// Returns the backward (cotangent-producing) program.
+    #[inline]
+    pub fn backward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.backward
+    }
+
+    /// Returns the tangent-producing program.
+    #[inline]
+    pub fn tangent(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.tangent
+    }
+
+    /// Returns the primal input types.
+    #[inline]
+    pub fn input_types(&self) -> Vec<T> {
+        self.primal.input_types()
+    }
+
+    /// Returns the primal output types.
+    #[inline]
+    pub fn output_types(&self) -> Vec<T> {
+        self.primal.output_types()
+    }
+}
+
+impl<T: Type, V: Value<T>, O> Display for RematerializeOperation<T, V, O>
+where
+    Self: Operation<T>,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for RematerializeOperation<T, V, O> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        "rematerialize"
+    }
+
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        check_types!("rematerialize input", &self.input_types(), input_types);
+        Ok(self.output_types())
+    }
+}
+
+impl<T, Constant, O, V> InterpretableOperation<T, V> for RematerializeOperation<T, Constant, O>
+where
+    T: Type,
+    Constant: Value<T>,
+    V: Value<T>,
+    O: InterpretableProgramOperation<T, V, Constant>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        O::interpret_program(context, &self.primal, inputs.to_vec())
+    }
+}
+
+/// Differentiates a rematerialized call by deriving residuals from its forward program and staging the remat-owned
+/// tangent call.
+impl<O, C> DifferentiableOperation<C> for RematerializeOperation<C::Type, C::Constant, O>
+where
+    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
+    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
+        + From<RematerializeCallOperation<C::Type, C::Constant, O, ValueOrCapture<C::Type, <C as Domain>::Value>>>,
+    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
+    Vec<C::Constant>: Parameterized<
+            C::Constant,
+            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
+            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
+            To<C::Tangent> = Vec<C::Tangent>,
+            ParameterStructure: Debug + PartialEq,
+        >,
+{
+    fn jvp<'jvp>(
+        &self,
+        context: &mut TangentContext<'jvp, C>,
+        inputs: &[JvpTracer<'jvp, C>],
+    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
+    where
+        C: 'jvp,
+    {
+        let output_count = self.output_types().len();
+        check_count!("input", inputs, self.input_types().len(), ProgramError);
+        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
+        let (mut forward_values, _pushforward) =
+            context.differentiable().linearize_program(&self.forward, primal_operands)?;
+        let residuals = forward_values.split_off(output_count);
+        let factors = residuals.into_iter().map(|residual| context.factor(residual)).collect::<Vec<_>>();
+        let call =
+            <C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>::from(RematerializeCallOperation::new(
+                self.backward.clone(),
+                self.tangent.clone(),
+                factors,
+                false,
+                self.prevent_cse,
+            ));
+        let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
+        check_count!("output", tangent_outputs, output_count, ProgramError);
+        Ok(forward_values
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
+            .collect())
+    }
+}
+
+/// Value-level batching for [`RematerializeOperation`]: inlines the primal program.
+impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for RematerializeOperation<ArrayType, V, O>
+where
+    V: Value<ArrayType>,
+    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<ArrayType, V, O>>,
+{
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, O>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        batch_program_inline(context, &self.primal, inputs)
+    }
+}
+
+/// Traced batching for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
+/// programs so the rematerialization boundary survives `batch`; see [`stage_rewrapped_custom_call`].
+impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for RematerializeOperation<ArrayType, C::Constant, O>
+where
+    C: StagingContext<Type = ArrayType, Operation = O>,
+    C::Constant: Value<ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + From<RematerializeOperation<ArrayType, C::Constant, O>>
+        + BatchableProgramOperation<C::Constant>,
+    Tracer<C>: Broadcast + Transpose,
+{
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<Tracer<C>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
+        stage_rewrapped_custom_call(context, inputs, |batched| match batched {
+            None => Ok(O::from(self.clone())),
+            Some(axis_size) => Ok(O::from(
+                RematerializeOperation::new(
+                    batch_rewrapped_program(&self.primal, axis_size)?,
+                    batch_rewrapped_program(&self.forward, axis_size)?,
+                    batch_rewrapped_program(&self.backward, axis_size)?,
+                    batch_rewrapped_program(&self.tangent, axis_size)?,
+                )?
+                .with_prevent_cse(self.prevent_cse),
+            )),
+        })
+    }
+}
+
+/// Linear operation staged by [`RematerializeOperation`]'s JVP rule.
+///
+/// Unlike [`CustomVjpCallOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpCallOperation),
+/// both directions are executable: the un-transposed form replays the derived tangent program, and the transposed
+/// form replays the derived pullback program. This is what lets rematerialized regions support forward mode while
+/// user-authored [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation)
+/// remains reverse-mode-only.
+#[derive(Clone, Debug)]
+pub struct RematerializeCallOperation<T, V, O, F>
+where
+    T: Type,
+    V: Value<T>,
+    F: Value<T>,
+{
+    /// Derived backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
+    backward: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Derived tangent program, mapping `(residuals..., input_tangents...)` to output tangents.
+    tangent: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Captured residual factors consumed by the tangent or backward program.
+    residuals: Vec<F>,
+
+    /// Whether this call has been transposed into its pullback form.
+    transposed: bool,
+
+    /// Backend lowering hint requesting an optimization barrier around the lowered program outputs.
+    prevent_cse: bool,
+}
+
+impl<T: Type, V: Value<T>, F: Value<T>, O> RematerializeCallOperation<T, V, O, F> {
+    /// Creates a rematerialization call. Use `transposed = false` for the tangent form and `transposed = true` for
+    /// the pullback form.
+    pub fn new(
+        backward: Program<T, V, O, Vec<V>, Vec<V>>,
+        tangent: Program<T, V, O, Vec<V>, Vec<V>>,
+        residuals: Vec<F>,
+        transposed: bool,
+        prevent_cse: bool,
+    ) -> Self {
+        Self { backward, tangent, residuals, transposed, prevent_cse }
+    }
+
+    /// Returns the derived backward program.
+    #[inline]
+    pub fn backward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.backward
+    }
+
+    /// Returns the derived tangent program.
+    #[inline]
+    pub fn tangent(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+        &self.tangent
+    }
+
+    /// Returns the captured residual factors.
+    #[inline]
+    pub fn residuals(&self) -> &[F] {
+        self.residuals.as_slice()
+    }
+
+    /// Returns whether this call is in its transposed (pullback) form.
+    #[inline]
+    pub fn transposed(&self) -> bool {
+        self.transposed
+    }
+
+    /// Returns whether backends should wrap this call's lowered program outputs in an optimization barrier.
+    #[inline]
+    pub fn prevent_cse(&self) -> bool {
+        self.prevent_cse
+    }
+
+    /// Maps the residual factor payloads with `map_factor`, preserving the captured programs and direction.
+    pub fn map_captures<MappedFactor: Value<T>, MapFactorFn>(
+        &self,
+        map_factor: &mut MapFactorFn,
+    ) -> Result<RematerializeCallOperation<T, V, O, MappedFactor>, ProgramError>
+    where
+        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
+        O: Clone,
+    {
+        Ok(RematerializeCallOperation {
+            backward: self.backward.clone(),
+            tangent: self.tangent.clone(),
+            residuals: self.residuals.iter().map(map_factor).collect::<Result<Vec<_>, _>>()?,
+            transposed: self.transposed,
+            prevent_cse: self.prevent_cse,
+        })
+    }
+}
+
+impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> RematerializeCallOperation<T, V, O, F> {
+    /// Returns the cotangent types flowing *into* the backward program (one per primal output).
+    fn cotangent_types(&self) -> Vec<T> {
+        self.backward.input_types().split_off(self.residuals.len())
+    }
+
+    /// Returns the tangent types flowing *into* the tangent program (one per primal input).
+    fn tangent_input_types(&self) -> Vec<T> {
+        self.tangent.input_types().split_off(self.residuals.len())
+    }
+}
+
+impl<T: Type, V: Value<T>, F: Value<T>, O> Display for RematerializeCallOperation<T, V, O, F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.transposed {
+            formatter.write_str("rematerialize_backward")
+        } else {
+            formatter.write_str("rematerialize_tangent")
+        }
+    }
+}
+
+impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for RematerializeCallOperation<T, V, O, F> {
+    #[inline]
+    fn name(&self) -> &'static str {
+        if self.transposed { "rematerialize_backward" } else { "rematerialize_tangent" }
+    }
+
+    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        if self.transposed {
+            check_types!("rematerialize backward cotangent", &self.cotangent_types(), input_types);
+            Ok(self.backward.output_types())
+        } else {
+            check_types!("rematerialize tangent", &self.tangent_input_types(), input_types);
+            Ok(self.tangent.output_types())
+        }
+    }
+}
+
+impl<T, Constant, O, F, V> InterpretableOperation<T, V> for RematerializeCallOperation<T, Constant, O, F>
+where
+    T: Type,
+    Constant: Value<T>,
+    V: Value<T, InterpretationContext: Context<Type = T, Constant = Constant, Value = V>>,
+    F: CustomVjpResidual<T, V>,
+    O: InterpretableOperation<T, V> + Operation<T>,
+    Vec<Constant>: Parameterized<Constant, ParameterStructure: Debug + PartialEq>,
+{
+    fn interpret(
+        &self,
+        context: &<V as Value<T>>::InterpretationContext,
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let program = if self.transposed { &self.backward } else { &self.tangent };
+        let mut values =
+            self.residuals.iter().map(|residual| residual.residual_value()).collect::<Result<Vec<_>, _>>()?;
+        values.extend(inputs.iter().cloned());
+        program.interpret_with(
+            values,
+            |_, constant| context.lift(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(context, inputs),
+        )
+    }
+}
+
+/// Transpose rule for [`RematerializeCallOperation`]: stages the flipped-direction form of the call.
+impl<T, V, O, F, W, OLinear> TransposableOperation<T, W, OLinear> for RematerializeCallOperation<T, V, O, F>
+where
+    T: Type,
+    V: Value<T>,
+    F: Value<T>,
+    W: Value<T>,
+    O: Clone + Operation<T>,
+    OLinear: Operation<T> + From<ZeroOperation<T>> + From<RematerializeCallOperation<T, V, O, F>>,
+{
+    fn transpose<'transpose>(
+        &self,
+        context: &mut AbstractTracingContext<'transpose, T, W, OLinear>,
+        _input_types: &[&T],
+        output_cotangents: &[Cotangent<'transpose, T, W, OLinear>],
+    ) -> Result<Vec<Cotangent<'transpose, T, W, OLinear>>, ProgramError> {
+        let cotangent_types = if self.transposed { self.tangent_input_types() } else { self.cotangent_types() };
+        check_count!("output", output_cotangents, cotangent_types.len(), ProgramError);
+        let cotangent_tracers = output_cotangents
+            .iter()
+            .zip(cotangent_types.iter())
+            .map(|(cotangent, r#type)| stage_cotangent(context, cotangent, r#type))
+            .collect::<Vec<_>>();
+        let call = OLinear::from(RematerializeCallOperation {
+            backward: self.backward.clone(),
+            tangent: self.tangent.clone(),
+            residuals: self.residuals.to_vec(),
+            transposed: !self.transposed,
+            prevent_cse: self.prevent_cse,
+        });
+        let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
+        Ok(outputs.into_iter().map(Cotangent::Staged).collect())
+    }
+}
+
+/// Value-level batching for [`RematerializeCallOperation`]: replays the selected tangent or backward program.
+impl<V, O, F> BatchableOperation<V, EagerContext<ArrayType, V, O>> for RematerializeCallOperation<ArrayType, V, O, F>
+where
+    V: Value<ArrayType>,
+    F: CustomVjpResidual<ArrayType, V>,
+    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<ArrayType, V, O>>,
+{
+    fn batch(
+        &self,
+        context: &EagerContext<ArrayType, V, O>,
+        inputs: &[ArrayBatch<V>],
+    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+        let program = if self.transposed { &self.backward } else { &self.tangent };
+        let mut values = self
+            .residuals
+            .iter()
+            .map(|residual| Ok(ArrayBatch::unbatched(residual.residual_value()?)))
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        values.extend(inputs.iter().cloned());
+        program.interpret_with(
+            values,
+            |_, constant: &V| Ok(ArrayBatch::unbatched(constant.clone())),
+            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
+        )
     }
 }
 
@@ -694,8 +1168,8 @@ impl<D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeRematerializationNam
 /// The wrapped body is stored as a plain closure over [`DomainTracer`]s and nothing is derived at construction
 /// time: each [`call`](Self::call) reads the input types off its tracer arguments, traces the body, derives the
 /// forward and backward programs symbolically (specialized to those types and to the configured
-/// [`RematerializationPolicy`]), and stages one [`CustomVjpOperation`]. The derived forward program returns the body
-/// outputs followed by the region inputs and the policy-saved residual values; the derived backward program
+/// [`RematerializationPolicy`]), and stages one [`RematerializeOperation`]. The derived forward program returns the
+/// body outputs followed by the region inputs and the policy-saved residual values; the derived backward program
 /// recomputes the remaining residuals from those saved values and replays the transposed tangent map. Reverse-mode
 /// differentiation through the staged call therefore stores exactly the saved values — nothing interior — and both
 /// derived programs are pruned of unreachable instructions, so saved residuals are genuinely not recomputed.
@@ -742,10 +1216,10 @@ where
 }
 
 /// One [`Rematerialize`] cache entry: the flat input types a derivation was specialized to, the derived
-/// custom-VJP operation, and the structure of the body's output tree.
+/// rematerialization operation, and the structure of the body's output tree.
 type CachedDerivation<'d, D, OT> = (
     Vec<<D as Domain>::Type>,
-    CustomVjpOperation<<D as Domain>::Type, <D as Domain>::Constant, <D as Domain>::Operation>,
+    RematerializeOperation<<D as Domain>::Type, <D as Domain>::Constant, <D as Domain>::Operation>,
     <OT as Parameterized<DomainTracer<'d, D>>>::ParameterStructure,
 );
 
@@ -835,7 +1309,7 @@ where
     <D as Domain>::Operation: Clone
         + MaybeDot
         + MaybeRematerializationName
-        + From<CustomVjpOperation<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>
+        + From<RematerializeOperation<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>
         + From<ZeroOperation<D::Type>>
         + From<OneOperation<D::Type>>
         + DifferentiableOperation<TracingContext<'d, D>>
@@ -1022,9 +1496,8 @@ where
         )?;
         let tangent = tangent.into_simplified()?;
 
-        let operation = CustomVjpOperation::new(primal, forward, backward)?
-            .with_prevent_cse(self.prevent_cse)
-            .with_tangent_program(tangent)?;
+        let operation =
+            RematerializeOperation::new(primal, forward, backward, tangent)?.with_prevent_cse(self.prevent_cse);
         let output_structure = structured_output_types.parameter_structure();
         self.cache.borrow_mut().push((input_types, operation.clone(), output_structure.clone()));
         let outputs = first.context().stage_operation(<D as Domain>::Operation::from(operation), &input_tracers)?;
@@ -1109,8 +1582,8 @@ mod tests {
             let function = rematerialize(&domain, dot_sine_body).with_policy(policy);
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
             assert_eq!(program.instructions().len(), 1);
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             forward_output_counts.push(operation.forward().output_types().len());
             backward_instruction_counts.push(operation.backward().instructions().len());
@@ -1164,8 +1637,8 @@ mod tests {
         for (policy, expected_forward_outputs) in cases {
             let function = rematerialize(&domain, body).with_policy(policy.clone());
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -1212,7 +1685,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prevent_cse_is_carried_on_the_staged_custom_vjp_operation() {
+    fn test_prevent_cse_is_carried_on_the_staged_rematerialize_operation() {
         // `prevent_cse` defaults to enabled (JAX parity) and is carried on the staged operation as a backend
         // lowering hint; user-authored custom VJPs (constructed directly) leave it disabled.
         let domain = TestArrayDomain;
@@ -1221,8 +1694,8 @@ mod tests {
             (rematerialize(&domain, dot_sine_body).with_prevent_cse(false), false),
         ] {
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             assert_eq!(operation.prevent_cse(), expected);
         }
@@ -1232,7 +1705,7 @@ mod tests {
     fn test_nested_rematerialization_matches_the_unrematerialized_gradient() {
         // The analogue of JAX's sqrt-schedule idiom: rematerialized regions nest, with each level storing only its
         // own region inputs. Differentiating the outer call replays the inner call's backward program inside the
-        // outer backward derivation, which interprets the inner (transposed) custom_vjp call over tracers.
+        // outer backward derivation, which interprets the inner (transposed) rematerialize call over tracers.
         let domain = TestArrayDomain;
         let inner = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| Ok((x.clone() * x).sin()));
         let outer = rematerialize(&domain, |x: DomainTracer<'_, TestArrayDomain>| {
@@ -1260,8 +1733,8 @@ mod tests {
         });
         let (_, program) = TracingContext::trace(&domain, |x| outer.call(x), vector_type(2)).unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-            panic!("nested rematerialization should stage a custom_vjp call");
+        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+            panic!("nested rematerialization should stage a rematerialize call");
         };
         // The outer primal program preserves the inner rematerialized call instead of inlining its body.
         assert!(
@@ -1269,7 +1742,7 @@ mod tests {
                 .primal()
                 .instructions()
                 .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayOperation::CustomVjp(_))),
+                .any(|instruction| matches!(instruction.operation(), ArrayOperation::Rematerialize(_))),
             "the outer primal program should contain the inner rematerialized call",
         );
         // `NothingSaveable` everywhere: the outer forward program outputs only the body output plus the region
@@ -1279,7 +1752,7 @@ mod tests {
 
     #[test]
     fn test_jvp_through_nested_rematerialization_uses_the_derived_tangent_programs() {
-        // Forward mode through nested rematerialized calls exercises the un-transposed custom_vjp call replay over
+        // Forward mode through nested rematerialized calls exercises the un-transposed rematerialize call replay over
         // tracers: deriving the outer tangent program interprets the inner call's tangent program inside the outer
         // tangent trace.
         let domain = TestArrayDomain;
@@ -1323,7 +1796,7 @@ mod tests {
         use crate::tracing_v2::batching::BatchContext;
 
         // Batching a rematerialized call re-wraps it around batched programs instead of inlining the primal, so
-        // the memory-saving structure survives `vmap`: the staged program holds exactly one custom_vjp call whose
+        // the memory-saving structure survives `vmap`: the staged program holds exactly one rematerialize call whose
         // batched forward program still stores only the body output and the region input plus the policy-saved
         // residuals — each now carrying the lane axis.
         let domain = TestArrayDomain;
@@ -1345,8 +1818,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(program.instructions().len(), 1, "unexpected batched program shape for policy {policy:?}");
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("batching a rematerialized call should re-wrap the staged custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("batching a rematerialized call should re-wrap the staged rematerialize call");
             };
             let forward_output_types = operation.forward().output_types();
             assert_eq!(
@@ -1418,12 +1891,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(trace_count.get(), 1);
-        let custom_vjp_count = program
+        let rematerialize_count = program
             .instructions()
             .iter()
-            .filter(|instruction| matches!(instruction.operation(), ArrayOperation::CustomVjp(_)))
+            .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Rematerialize(_)))
             .count();
-        assert_eq!(custom_vjp_count, 2, "both calls should stage their own custom_vjp instruction");
+        assert_eq!(rematerialize_count, 2, "both calls should stage their own rematerialize instruction");
         TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
         assert_eq!(trace_count.get(), 1);
 
@@ -1462,8 +1935,8 @@ mod tests {
         for (policy, expected_forward_outputs) in cases {
             let function = rematerialize(&domain, body).with_policy(policy.clone());
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), matrix_type.clone()).unwrap();
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -1497,8 +1970,8 @@ mod tests {
         for (policy, expected_forward_outputs) in cases {
             let function = rematerialize(&domain, body).with_policy(policy.clone());
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -1536,8 +2009,8 @@ mod tests {
         for (policy, expected_forward_outputs) in [(dot_or_named, 4), (cosines_only, 3)] {
             let function = rematerialize(&domain, body).with_policy(policy.clone());
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             assert_eq!(
                 operation.forward().output_types().len(),
@@ -1693,8 +2166,8 @@ mod tests {
         for (policy, expected_memory) in cases {
             let function = rematerialize(&domain, tagged_dot_sine_body).with_policy(policy.clone());
             let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-            let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-                panic!("rematerialization should stage a custom_vjp call");
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
             };
             let forward_output_types = operation.forward().output_types();
             assert_eq!(forward_output_types.len(), 3, "unexpected forward output count for policy {policy:?}");
@@ -1719,7 +2192,7 @@ mod tests {
                 "unexpected backward transfers for policy {policy:?}",
             );
             assert_eq!(
-                operation.tangent_program().is_some_and(contains_memory_transfers),
+                contains_memory_transfers(operation.tangent()),
                 expects_transfers,
                 "unexpected tangent transfers for policy {policy:?}",
             );
@@ -1739,8 +2212,8 @@ mod tests {
         let function = rematerialize(&domain, dot_sine_body)
             .with_policy(OffloadingRematerializationPolicy::OffloadDotsWithNoBatchDims { destination: PINNED_HOST });
         let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a custom_vjp call");
+        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+            panic!("rematerialization should stage a rematerialize call");
         };
         let forward_output_types = operation.forward().output_types();
         assert_eq!(forward_output_types.len(), 3);
@@ -1776,8 +2249,8 @@ mod tests {
         ));
         let function = rematerialize(&domain, body).with_policy(policy);
         let (_, program) = TracingContext::trace(&domain, |x| function.call(x), vector_type(2)).unwrap();
-        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-            panic!("rematerialization should stage a custom_vjp call");
+        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+            panic!("rematerialization should stage a rematerialize call");
         };
         let forward_output_types = operation.forward().output_types();
         assert_eq!(forward_output_types.len(), 4);
@@ -1826,8 +2299,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program.instructions().len(), 1);
-        let ArrayOperation::CustomVjp(operation) = program.instructions()[0].operation() else {
-            panic!("batching a rematerialized call should re-wrap the staged custom_vjp call");
+        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+            panic!("batching a rematerialized call should re-wrap the staged rematerialize call");
         };
         let forward_output_types = operation.forward().output_types();
         assert_eq!(forward_output_types.len(), 3);

@@ -59,7 +59,9 @@ use crate::tracing_v2::operations::reduce::ReduceOperation;
 use crate::tracing_v2::operations::reshape::ReshapeOps;
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, Reduce};
-use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
+use crate::tracing_v2::rematerialization::{
+    MaybeRematerializationName, RematerializationNameOperation, RematerializeCallOperation, RematerializeOperation,
+};
 use crate::tracing_v2::{DifferentiableOperation, ResidualizedOperation, ValueOrCapture};
 use crate::types::{ArrayType, Typed};
 
@@ -125,6 +127,7 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
     Scan(Box<ScanOperation<ArrayType, V, Self>>),
     CustomJvp(Box<CustomJvpOperation<ArrayType, V, Self>>),
     CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
+    Rematerialize(Box<RematerializeOperation<ArrayType, V, Self>>),
 }
 
 // Differentiation (JVP) for the `ArrayOperation` sum type: each variant delegates to its backing operation's own
@@ -198,6 +201,13 @@ where
         + ResidualizedOperation<C>
         + From<
             CustomVjpCallOperation<
+                ArrayType,
+                C::Constant,
+                ArrayOperation<C::Constant>,
+                ValueOrCapture<ArrayType, C::Value>,
+            >,
+        > + From<
+            RematerializeCallOperation<
                 ArrayType,
                 C::Constant,
                 ArrayOperation<C::Constant>,
@@ -293,6 +303,7 @@ where
             Self::Scan(operation) => operation.jvp(context, inputs),
             Self::CustomJvp(operation) => operation.jvp(context, inputs),
             Self::CustomVjp(operation) => operation.jvp(context, inputs),
+            Self::Rematerialize(operation) => operation.jvp(context, inputs),
         }
     }
 }
@@ -358,6 +369,7 @@ pub enum LinearArrayOperation<
         Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>, F, Input>>,
     ),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, Constant, P, F>>),
+    RematerializeCall(Box<RematerializeCallOperation<ArrayType, Constant, P, F>>),
 }
 
 impl<V> MaybeRematerializationName for ArrayOperation<V>
@@ -404,6 +416,9 @@ where
         match operation {
             LinearArrayOperation::CustomVjpCall(call) => {
                 Ok(LinearArrayOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
+            }
+            LinearArrayOperation::RematerializeCall(call) => {
+                Ok(LinearArrayOperation::RematerializeCall(Box::new(call.map_captures(map_factor)?)))
             }
             LinearArrayOperation::Zero(zero) => Ok(LinearArrayOperation::Zero(zero.clone())),
             LinearArrayOperation::One(one) => Ok(LinearArrayOperation::One(one.clone())),
@@ -668,7 +683,8 @@ where
         | ArrayOperation::While(_)
         | ArrayOperation::Scan(_)
         | ArrayOperation::CustomJvp(_)
-        | ArrayOperation::CustomVjp(_) => return Ok(None),
+        | ArrayOperation::CustomVjp(_)
+        | ArrayOperation::Rematerialize(_) => return Ok(None),
         ArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Zero")),
         ArrayOperation::One(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "One")),
         ArrayOperation::Constant(_) => return Err(missing_zero_input_batch_rule("ArrayOperation", "Constant")),
@@ -747,6 +763,7 @@ where
             Self::Scan(scan) => scan.batch(context, inputs),
             Self::CustomJvp(operation) => operation.batch(context, inputs),
             Self::CustomVjp(operation) => operation.batch(context, inputs),
+            Self::Rematerialize(operation) => operation.batch(context, inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
     }
@@ -812,6 +829,7 @@ where
             Self::Scan(scan) => scan.batch(context, inputs),
             Self::CustomJvp(operation) => operation.batch(context, inputs),
             Self::CustomVjp(operation) => operation.batch(context, inputs),
+            Self::Rematerialize(operation) => operation.batch(context, inputs),
             _ => unreachable!("non-control-flow ArrayOperation variants are handled above"),
         }
     }
@@ -970,6 +988,13 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<
             CustomVjpCallOperation<
+                ArrayType,
+                V,
+                Self,
+                ValueOrCapture<ArrayType, Tracer<LinearizationContextOf<C, Self>>>,
+            >,
+        > + From<
+            RematerializeCallOperation<
                 ArrayType,
                 V,
                 Self,
@@ -1147,7 +1172,8 @@ where
         | LinearArrayOperation::WhileCondition(_)
         | LinearArrayOperation::While(_)
         | LinearArrayOperation::Scan(_)
-        | LinearArrayOperation::CustomVjpCall(_) => {
+        | LinearArrayOperation::CustomVjpCall(_)
+        | LinearArrayOperation::RematerializeCall(_) => {
             return Ok(None);
         }
         LinearArrayOperation::Zero(_) => return Err(missing_zero_input_batch_rule("LinearArrayOperation", "Zero")),
@@ -1337,6 +1363,10 @@ where
                 let primal_context = EagerContext::<ArrayType, V, ArrayOperation<V>>::new();
                 call.batch(&primal_context, inputs)
             }
+            Self::RematerializeCall(call) => {
+                let primal_context = EagerContext::<ArrayType, V, ArrayOperation<V>>::new();
+                call.batch(&primal_context, inputs)
+            }
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }
     }
@@ -1518,6 +1548,16 @@ where
                     .collect::<Vec<_>>();
                 values.extend(inputs.iter().cloned());
                 context.interpret_program(call.backward(), values)
+            }
+            Self::RematerializeCall(call) => {
+                let mut values = call
+                    .residuals()
+                    .iter()
+                    .map(|residual| ArrayBatch::unbatched(context.parent_context().constant(residual.clone())))
+                    .collect::<Vec<_>>();
+                values.extend(inputs.iter().cloned());
+                let program = if call.transposed() { call.backward() } else { call.tangent() };
+                context.interpret_program(program, values)
             }
             _ => unreachable!("non-control-flow LinearArrayOperation variants are handled above"),
         }

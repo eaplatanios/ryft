@@ -131,87 +131,11 @@ where
     }
 }
 
-/// Shared implementation of the [`CustomJvpOperation`] JVP rule, generic over the linearization context's value
-/// type so the operation's [`DifferentiableOperation`] implementation can run for any [`DifferentiationContext`]
-/// whose constants match the captured programs.
+/// Differentiates a `custom_jvp` call by running its forward-derivative rule.
 ///
 /// The rule evaluates the JVP program's primal at `(x̂, 0)` (its first half yields the rule's primal outputs) and
 /// seeds its pushforward with `(0, t̂)` so that only the user-defined — and therefore necessarily linear — tangent
 /// map survives in the staged linear program.
-fn custom_jvp_rule<'jvp, C, O>(
-    operation: &CustomJvpOperation<C::Type, <C as Domain>::Constant, O>,
-    context: &mut TangentContext<'jvp, C>,
-    inputs: &[JvpTracer<'jvp, C>],
-) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-where
-    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
-    <C as Domain>::Value: ZeroLike,
-    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: CaptureParameterizedOperation<
-            C::Type,
-            ValueOrCapture<C::Type, <C as Domain>::Value>,
-            WithCapture<ValueOrCapture<C::Type, <C as Domain>::Value>> = C::LinearOperation<
-                C::Tangent,
-                ValueOrCapture<C::Type, C::Value>,
-            >,
-        >,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
-    Vec<<C as Domain>::Constant>: Parameterized<
-            <C as Domain>::Constant,
-            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
-            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
-            To<C::Tangent> = Vec<C::Tangent>,
-            ParameterStructure: Debug + PartialEq,
-        >,
-{
-    let input_count = operation.input_types().len();
-    let output_count = operation.output_types().len();
-    check_count!("input", inputs, input_count, ProgramError);
-    // Evaluate the JVP program's primal at `(x̂, 0)`; its first half yields the rule's primal outputs.
-    let mut jvp_primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    for input in inputs.iter() {
-        jvp_primal_inputs.push(input.primal().zero_like());
-    }
-    // Seed the pushforward with `(0, t̂)`: zero tangents for the primal slots and the incoming tangents for the
-    // tangent slots, so only the user-defined (linear) tangent map survives.
-    let mut tangent_seeds = Vec::with_capacity(2 * inputs.len());
-    for input in inputs.iter() {
-        let mut tangent_outputs =
-            context.stage_nullary_operation(ZeroOperation::new(input.primal().r#type().into_owned()))?;
-        check_count!("output", tangent_outputs, 1, ProgramError);
-        tangent_seeds.push(tangent_outputs.remove(0));
-    }
-    for input in inputs.iter() {
-        tangent_seeds.push(input.tangent().clone());
-    }
-    let (jvp_primal_outputs, pushforward) =
-        context.differentiable().linearize_program(operation.jvp_program(), jvp_primal_inputs)?;
-    // Re-register the pushforward's residual values in the enclosing residual environment instead of baking them
-    // into closed constant factors: under nested symbolic linearization the residuals are tracers, and only
-    // environment references survive the factor rebasing onto the enclosing context's value type. Direct execution
-    // closes the values into constants through `TangentContext::factor`, preserving the previous behavior.
-    let residual_factors =
-        pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
-    let pushforward_program = pushforward.program().map_operations(|operation| {
-        operation.try_map_captures(&mut |factor: &ValueOrCapture<C::Type, <C as Domain>::Value>| match factor {
-            ValueOrCapture::Capture { index, .. } => residual_factors
-                .get(*index)
-                .cloned()
-                .ok_or(ProgramError::UnboundAtomId { id: crate::programs::AtomId::new(*index) }),
-            ValueOrCapture::Value(value) => Ok(ValueOrCapture::Value(value.clone())),
-        })
-    })?;
-    let tangent_outputs = context.stage_program(&pushforward_program, tangent_seeds)?;
-    Ok(jvp_primal_outputs
-        .into_iter()
-        .take(output_count)
-        .zip(tangent_outputs.into_iter().skip(output_count))
-        .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
-        .collect())
-}
-
-/// Differentiates a `custom_jvp` call by running its forward-derivative rule; see [`custom_jvp_rule`].
 impl<O, C> DifferentiableOperation<C> for CustomJvpOperation<C::Type, C::Constant, O>
 where
     C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
@@ -243,7 +167,51 @@ where
     where
         C: 'jvp,
     {
-        custom_jvp_rule(self, context, inputs)
+        let input_count = self.input_types().len();
+        let output_count = self.output_types().len();
+        check_count!("input", inputs, input_count, ProgramError);
+        // Evaluate the JVP program's primal at `(x̂, 0)`; its first half yields the rule's primal outputs.
+        let mut jvp_primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        for input in inputs.iter() {
+            jvp_primal_inputs.push(input.primal().zero_like());
+        }
+        // Seed the pushforward with `(0, t̂)`: zero tangents for the primal slots and the incoming tangents for the
+        // tangent slots, so only the user-defined (linear) tangent map survives.
+        let mut tangent_seeds = Vec::with_capacity(2 * inputs.len());
+        for input in inputs.iter() {
+            let mut tangent_outputs =
+                context.stage_nullary_operation(ZeroOperation::new(input.primal().r#type().into_owned()))?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            tangent_seeds.push(tangent_outputs.remove(0));
+        }
+        for input in inputs.iter() {
+            tangent_seeds.push(input.tangent().clone());
+        }
+        let (jvp_primal_outputs, pushforward) =
+            context.differentiable().linearize_program(self.jvp_program(), jvp_primal_inputs)?;
+        // Re-register the pushforward's residual values in the enclosing residual environment instead of baking them
+        // into closed constant factors: under nested symbolic linearization the residuals are tracers, and only
+        // environment references survive the factor rebasing onto the enclosing context's value type. Direct
+        // execution closes the values into constants through `TangentContext::factor`, preserving the previous
+        // behavior.
+        let residual_factors =
+            pushforward.residuals().iter().map(|residual| context.factor(residual.clone())).collect::<Vec<_>>();
+        let pushforward_program = pushforward.program().map_operations(|operation| {
+            operation.try_map_captures(&mut |factor: &ValueOrCapture<C::Type, <C as Domain>::Value>| match factor {
+                ValueOrCapture::Capture { index, .. } => residual_factors
+                    .get(*index)
+                    .cloned()
+                    .ok_or(ProgramError::UnboundAtomId { id: crate::programs::AtomId::new(*index) }),
+                ValueOrCapture::Value(value) => Ok(ValueOrCapture::Value(value.clone())),
+            })
+        })?;
+        let tangent_outputs = context.stage_program(&pushforward_program, tangent_seeds)?;
+        Ok(jvp_primal_outputs
+            .into_iter()
+            .take(output_count)
+            .zip(tangent_outputs.into_iter().skip(output_count))
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
+            .collect())
     }
 }
 
@@ -272,7 +240,7 @@ where
 /// original operation is staged unchanged and the outputs stay lane-uniform. Otherwise every input is aligned to
 /// carry the lane at axis `0` (lane-uniform inputs are broadcast, matching the convention that every custom-call
 /// input is mapped at axis `0`) and every output carries the lane at axis `0`.
-fn stage_rewrapped_custom_call<C, MakeOperationFn>(
+pub(crate) fn stage_rewrapped_custom_call<C, MakeOperationFn>(
     context: &BatchingContext<C>,
     inputs: &[ArrayBatch<Tracer<C>>],
     make_operation: MakeOperationFn,
@@ -315,7 +283,7 @@ where
 }
 
 /// Batches `program` using the custom-derivative rewrapping convention: every input and output is mapped at axis `0`.
-fn batch_rewrapped_program<V: Value<ArrayType>, O: BatchableProgramOperation<V>>(
+pub(crate) fn batch_rewrapped_program<V: Value<ArrayType>, O: BatchableProgramOperation<V>>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     axis_size: usize,
 ) -> Result<Program<ArrayType, V, O, Vec<V>, Vec<V>>, ProgramError> {
@@ -353,7 +321,7 @@ where
 }
 
 /// Replays `program` over packed batch values, dispatching every instruction through its value-level batching rule.
-fn batch_program_inline<V, O>(
+pub(crate) fn batch_program_inline<V, O>(
     context: &EagerContext<ArrayType, V, O>,
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     inputs: &[ArrayBatch<V>],
@@ -381,11 +349,10 @@ where
 /// backward program — so reverse mode uses exactly the user-supplied gradient. Forward-mode differentiation
 /// (interpreting the staged linear call) is rejected, matching JAX's `custom_vjp` semantics.
 ///
-/// Traced batching (`batch`) re-wraps the call around batched primal/forward/backward (and tangent) programs —
-/// mirroring JAX's `custom_vjp_call_jaxpr` batching rule — so the custom derivative (and any rematerialization
-/// structure) survives a `batch` applied *before* differentiation. Value-level batching (used by dense Jacobian
-/// materialization, where the custom rule has already been consumed by linearization) inlines the primal program
-/// through the standard per-operation batching rules.
+/// Traced batching (`batch`) re-wraps the call around batched primal/forward/backward programs — mirroring JAX's
+/// `custom_vjp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
+/// differentiation. Value-level batching (used by dense Jacobian materialization, where the custom rule has already
+/// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
 pub struct CustomVjpOperation<T, V, O>
 where
@@ -400,16 +367,6 @@ where
 
     /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
     backward: Program<T, V, O, Vec<V>, Vec<V>>,
-
-    /// Optional program computing one output tangent per primal output from `(residuals..., input_tangents...)`.
-    /// When absent — always the case for user-authored custom VJPs, matching JAX — forward-mode differentiation
-    /// through the staged call is rejected. Rematerializeing attaches a derived tangent program so that `jvp` works
-    /// through rematerialized regions.
-    tangent: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
-
-    /// Backend lowering hint requesting an optimization barrier around the derived backward/tangent program outputs;
-    /// see [`Self::with_prevent_cse`].
-    prevent_cse: bool,
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<T, V, O> {
@@ -440,50 +397,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> CustomVjpOperation<T, V, O> {
         let expected_backward_input_types: Vec<T> = residual_types.iter().chain(output_types.iter()).cloned().collect();
         check_types!("custom_vjp backward input", &expected_backward_input_types, &backward.input_types(),);
         check_types!("custom_vjp backward output", &input_types, &backward.output_types());
-        Ok(Self { primal, forward, backward, tangent: None, prevent_cse: false })
-    }
-
-    /// Sets whether backends should wrap the lowered backward/tangent program outputs in an optimization barrier
-    /// (e.g., StableHLO's `optimization_barrier`). Without a barrier, a compiler may common-subexpression-eliminate
-    /// values recomputed by the backward program against the forward pass, silently restoring the memory cost the
-    /// recomputation was meant to avoid. [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize)
-    /// enables this by default — mirroring `jax.checkpoint`'s `prevent_cse=True` — while user-authored custom VJPs
-    /// leave it disabled because their backward programs do not recompute forward values.
-    ///
-    /// The hint applies where the staged call boundary survives to backend lowering (directly lowered pullback and
-    /// tangent programs). When a transform inlines the backward program into an outer trace at staging time, the
-    /// boundary dissolves and no barrier is emitted.
-    pub fn with_prevent_cse(mut self, prevent_cse: bool) -> Self {
-        self.prevent_cse = prevent_cse;
-        self
-    }
-
-    /// Returns whether backends should wrap the lowered backward/tangent program outputs in an optimization
-    /// barrier; see [`Self::with_prevent_cse`].
-    #[inline]
-    pub fn prevent_cse(&self) -> bool {
-        self.prevent_cse
-    }
-
-    /// Attaches a tangent program mapping `(residuals..., input_tangents...)` to one tangent per primal output,
-    /// enabling forward-mode differentiation through the staged call. This is used by
-    /// [`Rematerialize`](crate::tracing_v2::rematerialization::Rematerialize), which derives the tangent program from the body;
-    /// user-authored custom VJPs leave it absent and reject forward mode, matching JAX.
-    pub fn with_tangent_program(mut self, tangent: Program<T, V, O, Vec<V>, Vec<V>>) -> Result<Self, TypeError> {
-        let input_types = self.primal.input_types();
-        let output_types = self.primal.output_types();
-        let residual_types = self.forward.output_types().split_off(output_types.len());
-        let expected_input_types: Vec<T> = residual_types.iter().chain(input_types.iter()).cloned().collect();
-        check_types!("custom_vjp tangent input", &expected_input_types, &tangent.input_types());
-        check_types!("custom_vjp tangent output", &output_types, &tangent.output_types());
-        self.tangent = Some(tangent);
-        Ok(self)
-    }
-
-    /// Returns the optional tangent program enabling forward-mode differentiation through the staged call.
-    #[inline]
-    pub fn tangent_program(&self) -> Option<&Program<T, V, O, Vec<V>, Vec<V>>> {
-        self.tangent.as_ref()
+        Ok(Self { primal, forward, backward })
     }
 
     /// Returns the primal program.
@@ -554,58 +468,12 @@ where
     }
 }
 
-/// Shared implementation of the [`CustomVjpOperation`] JVP rule, generic over the linearization context's value type
-/// so the operation's [`DifferentiableOperation`] implementation can run for any [`DifferentiationContext`] whose
-/// constants match the captured programs.
+/// Differentiates a `custom_vjp` call by running its forward-derivative rule.
 ///
 /// The rule linearizes the forward program at the primal inputs — discarding the resulting pushforward, so the
 /// forward body is never differentiated beyond what its primal evaluation requires — captures the trailing residual
 /// outputs as factors, and stages one opaque [`CustomVjpCallOperation`] mapping the input tangents to the output
 /// tangents. The staged call rejects forward-mode interpretation; its transpose replays the user's backward program.
-fn custom_vjp_rule<'jvp, C, O>(
-    operation: &CustomVjpOperation<C::Type, <C as Domain>::Constant, O>,
-    context: &mut TangentContext<'jvp, C>,
-    inputs: &[JvpTracer<'jvp, C>],
-) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-where
-    C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O> + 'jvp,
-    O: Clone + DifferentiableOperation<C> + LinearizableProgramOperation<C>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: ResidualizedOperation<C>
-        + From<CustomVjpCallOperation<C::Type, <C as Domain>::Constant, O, ValueOrCapture<C::Type, <C as Domain>::Value>>>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
-    Vec<<C as Domain>::Constant>: Parameterized<
-            <C as Domain>::Constant,
-            Family: ParameterizedFamily<C::Tangent> + ParameterizedFamily<<C as Domain>::Value>,
-            To<<C as Domain>::Value> = Vec<<C as Domain>::Value>,
-            To<C::Tangent> = Vec<C::Tangent>,
-            ParameterStructure: Debug + PartialEq,
-        >,
-{
-    let output_count = operation.output_types().len();
-    check_count!("input", inputs, operation.input_types().len(), ProgramError);
-    let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
-    let (mut forward_values, _pushforward) =
-        context.differentiable().linearize_program(&operation.forward, primal_operands)?;
-    let residuals = forward_values.split_off(output_count);
-    let factors = residuals.into_iter().map(|residual| context.factor(residual)).collect::<Vec<_>>();
-    let call = <C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>::from(CustomVjpCallOperation::new(
-        operation.backward.clone(),
-        operation.tangent.clone(),
-        factors,
-        false,
-        operation.prevent_cse,
-    ));
-    let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
-    check_count!("output", tangent_outputs, output_count, ProgramError);
-    Ok(forward_values
-        .into_iter()
-        .zip(tangent_outputs)
-        .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
-        .collect())
-}
-
-/// Differentiates a `custom_vjp` call by running its forward-derivative rule; see [`custom_vjp_rule`].
 impl<O, C> DifferentiableOperation<C> for CustomVjpOperation<C::Type, C::Constant, O>
 where
     C: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
@@ -629,7 +497,24 @@ where
     where
         C: 'jvp,
     {
-        custom_vjp_rule(self, context, inputs)
+        let output_count = self.output_types().len();
+        check_count!("input", inputs, self.input_types().len(), ProgramError);
+        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let tangent_operands = inputs.iter().map(|input| input.tangent().clone()).collect::<Vec<_>>();
+        let (mut forward_values, _pushforward) =
+            context.differentiable().linearize_program(&self.forward, primal_operands)?;
+        let residuals = forward_values.split_off(output_count);
+        let factors = residuals.into_iter().map(|residual| context.factor(residual)).collect::<Vec<_>>();
+        let call = <C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>>::from(
+            CustomVjpCallOperation::new(self.backward.clone(), factors, false),
+        );
+        let tangent_outputs = context.stage_operation(call, tangent_operands.as_slice())?;
+        check_count!("output", tangent_outputs, output_count, ProgramError);
+        Ok(forward_values
+            .into_iter()
+            .zip(tangent_outputs)
+            .map(|(primal, tangent)| JvpTracer::from_value(primal, tangent))
+            .collect())
     }
 }
 
@@ -649,9 +534,8 @@ where
     }
 }
 
-/// Traced batching for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward (and
-/// tangent, when present) programs so the custom derivative — and any rematerialization structure — survives
-/// `batch`; see [`stage_rewrapped_custom_call`].
+/// Traced batching for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
+/// the custom derivative survives `batch`; see [`stage_rewrapped_custom_call`].
 impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for CustomVjpOperation<ArrayType, C::Constant, O>
 where
     C: StagingContext<Type = ArrayType, Operation = O>,
@@ -669,18 +553,11 @@ where
     ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok(O::from(self.clone())),
-            Some(axis_size) => {
-                let mut operation = CustomVjpOperation::new(
-                    batch_rewrapped_program(&self.primal, axis_size)?,
-                    batch_rewrapped_program(&self.forward, axis_size)?,
-                    batch_rewrapped_program(&self.backward, axis_size)?,
-                )?
-                .with_prevent_cse(self.prevent_cse);
-                if let Some(tangent) = &self.tangent {
-                    operation = operation.with_tangent_program(batch_rewrapped_program(tangent, axis_size)?)?;
-                }
-                Ok(O::from(operation))
-            }
+            Some(axis_size) => Ok(O::from(CustomVjpOperation::new(
+                batch_rewrapped_program(&self.primal, axis_size)?,
+                batch_rewrapped_program(&self.forward, axis_size)?,
+                batch_rewrapped_program(&self.backward, axis_size)?,
+            )?)),
         })
     }
 }
@@ -729,46 +606,24 @@ where
     /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
     backward: Program<T, V, O, Vec<V>, Vec<V>>,
 
-    /// Optional tangent program mapping `(residuals..., input_tangents...)` to output tangents; see
-    /// [`CustomVjpOperation::with_tangent_program`].
-    tangent: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
-
     /// Captured residual factors consumed by the backward program.
     residuals: Vec<F>,
 
     /// Whether this call has been transposed into its executable (pullback) form.
     transposed: bool,
-
-    /// Backend lowering hint requesting an optimization barrier around the lowered program outputs; see
-    /// [`CustomVjpOperation::with_prevent_cse`].
-    prevent_cse: bool,
 }
 
 impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<T, V, O, F> {
-    /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true`
-    /// for the executable pullback form. `prevent_cse` carries the owning [`CustomVjpOperation`]'s lowering hint;
-    /// see [`CustomVjpOperation::with_prevent_cse`].
-    pub fn new(
-        backward: Program<T, V, O, Vec<V>, Vec<V>>,
-        tangent: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
-        residuals: Vec<F>,
-        transposed: bool,
-        prevent_cse: bool,
-    ) -> Self {
-        Self { backward, tangent, residuals, transposed, prevent_cse }
+    /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true` for
+    /// the executable pullback form.
+    pub fn new(backward: Program<T, V, O, Vec<V>, Vec<V>>, residuals: Vec<F>, transposed: bool) -> Self {
+        Self { backward, residuals, transposed }
     }
 
     /// Returns the user's backward program.
     #[inline]
     pub fn backward(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
         &self.backward
-    }
-
-    /// Returns the optional tangent program enabling forward-mode interpretation of the un-transposed call; see
-    /// [`CustomVjpOperation::with_tangent_program`].
-    #[inline]
-    pub fn tangent_program(&self) -> Option<&Program<T, V, O, Vec<V>, Vec<V>>> {
-        self.tangent.as_ref()
     }
 
     /// Returns the captured residual factors.
@@ -783,13 +638,6 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<T, V, O, F> {
         self.transposed
     }
 
-    /// Returns whether backends should wrap this call's lowered program outputs in an optimization barrier; see
-    /// [`CustomVjpOperation::with_prevent_cse`].
-    #[inline]
-    pub fn prevent_cse(&self) -> bool {
-        self.prevent_cse
-    }
-
     /// Maps the residual factor payloads with `map_factor`, preserving the backward program and direction.
     pub fn map_captures<MappedFactor: Value<T>, MapFactorFn>(
         &self,
@@ -801,10 +649,8 @@ impl<T: Type, V: Value<T>, F: Value<T>, O> CustomVjpCallOperation<T, V, O, F> {
     {
         Ok(CustomVjpCallOperation {
             backward: self.backward.clone(),
-            tangent: self.tangent.clone(),
             residuals: self.residuals.iter().map(map_factor).collect::<Result<Vec<_>, _>>()?,
             transposed: self.transposed,
-            prevent_cse: self.prevent_cse,
         })
     }
 }
@@ -848,7 +694,7 @@ impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for Custom
 
 /// Interprets a [`CustomVjpCallOperation`] in an active [`Context`].
 ///
-/// Custom-VJP calls are context-mediated because executing the call means replaying a captured tangent or backward
+/// Custom-VJP calls are context-mediated because executing the transposed call means replaying a captured backward
 /// program. Eager contexts replay the program into concrete values, while staging contexts replay it into tracer
 /// instructions by lifting constants and binding each captured instruction through the active context.
 pub trait CustomVjpCall<T: Type, Constant: Value<T>, O: Operation<T>, F: Value<T>, V: Value<T>>:
@@ -858,7 +704,7 @@ pub trait CustomVjpCall<T: Type, Constant: Value<T>, O: Operation<T>, F: Value<T
     ///
     /// # Parameters
     ///
-    ///   - `operation`: Custom-VJP call whose tangent or backward program is replayed.
+    ///   - `operation`: Custom-VJP call whose backward program is replayed.
     ///   - `inputs`: Runtime tangent or cotangent inputs for the selected captured program.
     fn interpret_custom_vjp_call(
         &self,
@@ -882,25 +728,21 @@ where
         operation: &CustomVjpCallOperation<T, Constant, O, F>,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        let program = if operation.transposed {
-            &operation.backward
-        } else if let Some(tangent) = &operation.tangent {
-            tangent
-        } else {
+        if !operation.transposed {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                     value_and_grad, or jacrev) instead"
                     .to_string(),
             }
             .into());
-        };
+        }
         let mut values = operation
             .residuals
             .iter()
             .map(|residual| residual.residual_value())
             .collect::<Result<Vec<_>, _>>()?;
         values.extend(inputs.iter().cloned());
-        program.interpret_with(
+        operation.backward.interpret_with(
             values,
             |_, constant| self.lift(constant.clone()),
             |instruction, inputs| instruction.operation().interpret(self, inputs),
@@ -931,11 +773,9 @@ where
 /// generic over the cotangent value type `W`, which need not match the backward program's value type `V`: the staged
 /// flipped call carries the programs and residuals along unchanged.
 ///
-/// The un-transposed (tangent-map) call transposes into the executable pullback. The pullback transposes back into
-/// the tangent-map call — a linear map's pullback is linear and its transpose is the original map — but executing
-/// that map requires the derived tangent program, so the second transposition is only supported for
-/// rematerialization-derived calls; user-authored custom VJPs (with no tangent program) keep rejecting it, matching
-/// JAX's behavior for second-order reverse mode through `custom_vjp`.
+/// The un-transposed (tangent-map) call transposes into the executable pullback. The pullback does not transpose back:
+/// user-authored custom VJPs have no tangent program, matching JAX's behavior for second-order reverse mode through
+/// `custom_vjp`.
 impl<T, V, O, F, W, OLinear> TransposableOperation<T, W, OLinear> for CustomVjpCallOperation<T, V, O, F>
 where
     T: Type,
@@ -951,7 +791,7 @@ where
         _input_types: &[&T],
         output_cotangents: &[Cotangent<'transpose, T, W, OLinear>],
     ) -> Result<Vec<Cotangent<'transpose, T, W, OLinear>>, ProgramError> {
-        if self.transposed && self.tangent.is_none() {
+        if self.transposed {
             return Err(TypeError {
                 message: "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
                     supported"
@@ -970,10 +810,8 @@ where
             .collect::<Vec<_>>();
         let call = OLinear::from(CustomVjpCallOperation {
             backward: self.backward.clone(),
-            tangent: self.tangent.clone(),
             residuals: self.residuals.to_vec(),
             transposed: !self.transposed,
-            prevent_cse: self.prevent_cse,
         });
         let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
         Ok(outputs.into_iter().map(Cotangent::Staged).collect())
@@ -995,25 +833,21 @@ where
         context: &EagerContext<ArrayType, V, O>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-        let program = if self.transposed {
-            &self.backward
-        } else if let Some(tangent) = &self.tangent {
-            tangent
-        } else {
+        if !self.transposed {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
                     value_and_grad, or jacrev) instead"
                     .to_string(),
             }
             .into());
-        };
+        }
         let mut values = self
             .residuals
             .iter()
             .map(|residual| Ok(ArrayBatch::unbatched(residual.residual_value()?)))
             .collect::<Result<Vec<_>, ProgramError>>()?;
         values.extend(inputs.iter().cloned());
-        program.interpret_with(
+        self.backward.interpret_with(
             values,
             |_, constant: &V| Ok(ArrayBatch::unbatched(constant.clone())),
             |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
@@ -1417,9 +1251,7 @@ mod tests {
         let scalar = test_type(&[]);
         let call = CustomVjpCallOperation::<ArrayType, TestArray, ArrayOperation<TestArray>, TestArray>::new(
             tripled_sin_backward_program(&scalar),
-            None,
             vec![TestArray::scalar(2.0f64.cos())],
-            false,
             false,
         );
         assert!(matches!(
