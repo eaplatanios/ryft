@@ -380,8 +380,8 @@ pub trait ParameterizedFamily<P: Parameter>: Sized {
 /// [`ParameterPath`] specifying where in the nested data structure it belongs. This is useful for things like saving
 /// model checkpoints, etc. These _named_ parameter operation variants are exposed via the [`Self::named_parameters`],
 /// [`Self::named_parameters_mut`], [`Self::into_named_parameters`], [`Self::from_named_parameters`],
-/// [`Self::from_broadcasted_named_parameters`], [`Self::map_named_parameters`], and [`Self::map_named_parameters`]
-/// functions.
+/// [`Self::from_broadcasted_named_parameters`], [`Self::try_map_parameters`], [`Self::map_parameters`],
+/// [`Self::try_map_named_parameters`], and [`Self::map_named_parameters`] functions.
 ///
 /// Note that, the [`Parameterized`] trait also defines a bunch of additional functions that are implemented using the
 /// aforementioned core primitives like [`Self::partition_parameters`], [`Self::filter_parameters`], etc. You should
@@ -970,26 +970,57 @@ pub trait Parameterized<P: Parameter>: Sized {
         )
     }
 
+    /// Maps each nested [`Parameter`] of type `P` in this value using the provided fallible `map_fn` to a [`Parameter`]
+    /// of type `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the
+    /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`]. `E` must
+    /// implement [`From<ParameterError>`] so that reconstruction errors can be surfaced through the same error type
+    /// as mapping failures.
+    #[inline]
+    fn try_map_parameters<T: Parameter, E: From<ParameterError>, MapFn: FnMut(P) -> Result<T, E>>(
+        self,
+        map_fn: MapFn,
+    ) -> Result<Self::To<T>, E>
+    where
+        Self::Family: ParameterizedFamily<T>,
+    {
+        Self::To::<T>::from_parameters(
+            self.parameter_structure(),
+            self.into_parameters().map(map_fn).collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(E::from)
+    }
+
     /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn` to a [`Parameter`] of type
     /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the same
     /// order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`], [`Self::named_parameters`],
     /// [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
-    fn map_parameters<T: Parameter, F: FnMut(P) -> T>(self, map_fn: F) -> Result<Self::To<T>, ParameterError>
+    #[inline]
+    fn map_parameters<T: Parameter, MapFn: FnMut(P) -> T>(
+        self,
+        mut map_fn: MapFn,
+    ) -> Result<Self::To<T>, ParameterError>
     where
         Self::Family: ParameterizedFamily<T>,
     {
-        Self::To::<T>::from_parameters(self.parameter_structure(), self.into_parameters().map(map_fn))
+        self.try_map_parameters(|parameter| Ok(map_fn(parameter)))
     }
 
-    /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn`, which receives the
-    /// [`ParameterPath`] for each [`Parameter`] along with its value, and returns a new [`Parameter`] value of type
-    /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the
-    /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`],
-    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
-    fn map_named_parameters<T: Parameter, F: FnMut(&ParameterPath, P) -> T>(
+    /// Maps each nested [`Parameter`] of type `P` in this value using the provided fallible `map_fn`, which receives
+    /// the [`ParameterPath`] for each [`Parameter`] along with its value, and returns a new [`Parameter`] value of type
+    /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the same
+    /// order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`]. `E` must
+    /// implement [`From<ParameterError>`] so reconstruction errors can be surfaced through the same error type as
+    /// mapping failures.
+    fn try_map_named_parameters<
+        T: Parameter,
+        E: From<ParameterError>,
+        MapFn: FnMut(&ParameterPath, P) -> Result<T, E>,
+    >(
         self,
-        map_fn: F,
-    ) -> Result<Self::To<T>, ParameterError>
+        map_fn: MapFn,
+    ) -> Result<Self::To<T>, E>
     where
         Self::Family: ParameterizedFamily<T>,
     {
@@ -997,10 +1028,26 @@ pub trait Parameterized<P: Parameter>: Sized {
         let structure = self.parameter_structure();
         let mut mapped_parameters = HashMap::with_capacity(structure.parameter_count());
         for (path, parameter) in self.into_named_parameters() {
-            let mapped_parameter = map_fn(&path, parameter);
+            let mapped_parameter = map_fn(&path, parameter)?;
             mapped_parameters.insert(path, mapped_parameter);
         }
-        Self::To::<T>::from_named_parameters(structure, mapped_parameters)
+        Self::To::<T>::from_named_parameters(structure, mapped_parameters).map_err(E::from)
+    }
+
+    /// Maps each nested [`Parameter`] of type `P` in this value using the provided `map_fn`, which receives the
+    /// [`ParameterPath`] for each [`Parameter`] along with its value, and returns a new [`Parameter`] value of type
+    /// `T`, while preserving the [`Parameterized`] structure of this type. Nested parameters are visited in the
+    /// same order as [`Self::parameters`], [`Self::parameters_mut`], [`Self::into_parameters`],
+    /// [`Self::named_parameters`], [`Self::named_parameters_mut`], and [`Self::into_named_parameters`].
+    #[inline]
+    fn map_named_parameters<T: Parameter, MapFn: FnMut(&ParameterPath, P) -> T>(
+        self,
+        mut map_fn: MapFn,
+    ) -> Result<Self::To<T>, ParameterError>
+    where
+        Self::Family: ParameterizedFamily<T>,
+    {
+        self.try_map_named_parameters(|path, parameter| Ok(map_fn(path, parameter)))
     }
 
     /// Filters all nested [`Parameter`]s of type `P` in this value according to the provided `predicate`, producing a
@@ -2296,6 +2343,19 @@ mod tests {
 
     use ryft::*;
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum TestMappingError {
+        Parameter(ParameterError),
+        RejectedParameter(i32),
+        RejectedNamedParameter { path: String, parameter: i32 },
+    }
+
+    impl From<ParameterError> for TestMappingError {
+        fn from(error: ParameterError) -> Self {
+            Self::Parameter(error)
+        }
+    }
+
     #[test]
     fn test_placeholder() {
         let placeholder = Placeholder;
@@ -2538,6 +2598,27 @@ mod tests {
             Err(ParameterError::MissingParameters { .. }),
         ));
 
+        // Test [`Parameterized::try_map_parameters`].
+        assert_eq!(
+            value
+                .clone()
+                .try_map_parameters(|parameter| Ok::<_, TestMappingError>(i64::from(parameter) * 10))
+                .unwrap()
+                .into_parameters()
+                .collect::<Vec<_>>(),
+            vec![10i64, 20i64, 30i64, 40i64, 50i64, 60i64, 70i64, 80i64, 90i64, 100i64],
+        );
+        assert_eq!(
+            value.clone().try_map_parameters::<i64, TestMappingError, _>(|parameter| {
+                if parameter == 5 {
+                    Err(TestMappingError::RejectedParameter(parameter))
+                } else {
+                    Ok(i64::from(parameter))
+                }
+            }),
+            Err(TestMappingError::RejectedParameter(5)),
+        );
+
         // Test [`Parameterized::map_parameters`].
         assert_eq!(
             value.clone().map_parameters(|parameter| i64::from(parameter) * 10),
@@ -2553,6 +2634,32 @@ mod tests {
                 ],
                 metadata: (42, "meta"),
             })
+        );
+
+        // Test [`Parameterized::try_map_named_parameters`].
+        assert_eq!(
+            value
+                .clone()
+                .try_map_named_parameters(|path, parameter| {
+                    Ok::<_, TestMappingError>(i64::from(parameter) + (path.len() as i64))
+                })
+                .unwrap()
+                .into_parameters()
+                .collect::<Vec<_>>(),
+            vec![4i64, 5i64, 5i64, 7i64, 10i64, 10i64, 11i64, 11i64, 13i64, 13i64],
+        );
+        assert_eq!(
+            value.clone().try_map_named_parameters::<i64, TestMappingError, _>(|path, parameter| {
+                if path.to_string() == "$.controller.blend.branch.pair.0" {
+                    Err(TestMappingError::RejectedNamedParameter { path: path.to_string(), parameter })
+                } else {
+                    Ok(i64::from(parameter))
+                }
+            }),
+            Err(TestMappingError::RejectedNamedParameter {
+                path: "$.controller.blend.branch.pair.0".to_string(),
+                parameter: 5,
+            }),
         );
 
         // Test [`Parameterized::map_named_parameters`].
