@@ -64,8 +64,11 @@ pub enum ScalarOperation<V: Value<DataType>> {
 }
 
 impl<
-    D: DifferentiationContext<Type = DataType, Value: ZeroLike + BooleanLike>
-        + Domain<Operation = ScalarOperation<<D as Domain>::Constant>>,
+    D: DifferentiationContext<
+            Type = DataType,
+            Value: ZeroLike + BooleanLike,
+            Operation = ScalarOperation<<D as Domain>::Constant>,
+        >,
 > DifferentiableOperation<D> for ScalarOperation<D::Constant>
 where
     ZeroOperation<DataType>: DifferentiableOperation<D>,
