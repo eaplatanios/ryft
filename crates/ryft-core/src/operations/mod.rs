@@ -202,6 +202,13 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     dispatcher. Payload-specific value or context requirements should live on the payload's own
 ///     [`InterpretableOperation`] implementation; the enum derivation carries them through this generated payload
 ///     bound.
+///   - `#[ryft(bounds(interpretation(Bound1 + Bound2 + ...)))]` adds extra trait bounds to the generated interpretation
+///     implementation value type for both the generated [`InterpretableOperation`] dispatcher and the generated
+///     [`InterpretableProgramOperation`] witness. This is useful when recursive higher-order payloads require
+///     capabilities on the value being interpreted, while the enum's stored constant or capture type should not be
+///     forced to implement those capabilities. For example, an array operation enum that owns condition, while, and
+///     scan payloads can write `#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]` while
+///     keeping its enum parameter declaration at `V: Value<ArrayType>`.
 ///
 /// The operation type `T` is selected as follows:
 ///
@@ -218,21 +225,26 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - For enums with one `Value<T>` parameter, the payload parameter is treated as the nested program's captured
 ///     constant type `C`, and the derived [`InterpretableOperation`] implementation is generic over a runtime value
 ///     `V`. The generated [`InterpretableProgramOperation`] implementation requires `V::InterpretationContext` to be a
-///     [`Context`] that can lift constants from `C` into `V`. Bounds declared on the enum's value parameter, such as
-///     [`BooleanLike`], are also applied to this generated runtime value parameter, so recursive higher-order payloads
-///     inherit the enum's declared value contract without special cases in the macro.
+///     [`Context`] that can lift constants from `C` into `V`. Interpretation-only capabilities should be provided
+///     with `#[ryft(bounds(interpretation(...)))]` instead of being placed on the enum's stored constant type.
 ///   - For enums with two or more `Value<T>` parameters, the first value parameter is treated as both the runtime value
 ///     type and the nested program constant type for direct program interpretation. Later value parameters remain
 ///     payload-specific metadata unless the generated program witness needs to instantiate a direct-linear operation
 ///     family, in which case extra value parameters after the first two are substituted with the first value parameter.
-///   - For recursive operation enums, the generated nested-program witness inherits value capabilities from the enum
-///     declaration and from payload-owned [`InterpretableOperation`] implementations. If a higher-order payload needs
-///     a capability such as [`BooleanLike`] for predicate extraction, declare that capability on the enum value
-///     parameter or on the payload implementation that owns the rule.
+///   - For recursive operation enums, the generated nested-program witness inherits value capabilities from
+///     payload-owned [`InterpretableOperation`] implementations and from `#[ryft(bounds(interpretation(...)))]`. If a
+///     higher-order payload needs a capability such as [`BooleanLike`] for predicate extraction, prefer the attribute
+///     when that capability belongs to interpretation rather than to the enum's stored payload shape.
+///   - Bounds provided through `#[ryft(bounds(interpretation(...)))]` are applied to the same generated interpretation
+///     value type. For example, one-value-parameter enums apply them to the generated runtime value parameter, while
+///     direct linear enums apply them to their first value parameter. When any interpretation bounds are provided, the
+///     macro also adds the standard companion requirements `V::InterpretationContext: Zero<T, V>` and
+///     `Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>` for that generated value type.
 ///
-/// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
-/// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on
-/// the `ryft` crate normally do not need this attribute.
+/// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
+/// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
+/// `ryft` crate normally do not need this attribute. It also supports `#[ryft(bounds(interpretation(...)))]` for the
+/// interpretation value bounds described above.
 ///
 /// ## Example
 ///

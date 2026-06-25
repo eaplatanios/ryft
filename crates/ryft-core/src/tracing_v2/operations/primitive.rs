@@ -31,8 +31,8 @@ use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOpe
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     GatherOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation, LinearGatherOperation,
-    LinearScatterAddOperation, PadOperation, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
-    TransposeOperation, UpdateSliceOperation,
+    LinearScatterAddOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
+    Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::sharding::{ConstrainSharding, Reshard, ReshardOperation, ShardingConstraintOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
@@ -74,7 +74,6 @@ use super::control_flow::{
     batch_while_with_interpreter, defactorize_operation_default,
 };
 use super::dot::DotOps;
-use crate::operations::manipulation::Reshape;
 
 /// Reusable operation enum for ordinary staged programs.
 ///
@@ -85,7 +84,8 @@ use crate::operations::manipulation::Reshape;
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`],
 /// [`Scale`](Self::Scale) a [`ScaleOperation`], and [`Dot`](Self::Dot) a [`DotOperation`].
 #[derive(Clone, Debug, Operation)]
-pub enum ArrayOperation<V: Value<ArrayType> + BooleanLike> {
+#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]
+pub enum ArrayOperation<V: Value<ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
@@ -138,8 +138,10 @@ pub enum ArrayOperation<V: Value<ArrayType> + BooleanLike> {
 // `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
 // `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
-impl<V: Value<ArrayType> + BooleanLike, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
+impl<V, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
 where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     ZeroOperation<ArrayType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
     OneOperation<ArrayType>: DifferentiableOperation<D>,
@@ -307,8 +309,9 @@ where
 /// constant type of captured primal programs such as [`CustomVjpCall`](Self::CustomVjpCall), which are written over
 /// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
+#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]
 pub enum LinearArrayOperation<
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -351,7 +354,11 @@ pub enum LinearArrayOperation<
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
 }
 
-impl<V: Value<ArrayType> + BooleanLike> MaybeRematerializationName for ArrayOperation<V> {
+impl<V> MaybeRematerializationName for ArrayOperation<V>
+where
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
+{
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
         match self {
@@ -363,7 +370,8 @@ impl<V: Value<ArrayType> + BooleanLike> MaybeRematerializationName for ArrayOper
 
 impl<V> MaybeDot for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
@@ -381,7 +389,8 @@ fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
     map_factor: &mut MapFactorFn,
 ) -> Result<LinearArrayOperation<V, C, MappedFactor, P>, ProgramError>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
@@ -518,7 +527,8 @@ where
 // TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, F, P>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -539,7 +549,8 @@ where
 // TODO(eaplatanios): Fold this into our `TransposableOperation` derive macro.
 impl<V, C, R, P> DefactorizableProgramOperation<V, R, P> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     C: Value<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
@@ -580,7 +591,8 @@ fn batch_array_non_control_operation<F, V>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
-    F: Value<ArrayType> + BooleanLike,
+    F: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    F::InterpretationContext: Zero<ArrayType, F>,
     V: Value<ArrayType>
         + SupportsArithmeticOperations<F>
         + SupportsTrigonometricOperations
@@ -649,7 +661,8 @@ where
 impl<C, V> BatchableOperation<Tracer<C>, BatchingContext<C>> for ArrayOperation<V>
 where
     C: StagingContext<Type = ArrayType, Constant = V, Operation = ArrayOperation<V>>,
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
     Tracer<C>: SupportsArithmeticOperations<V>
         + SupportsTrigonometricOperations
@@ -710,6 +723,7 @@ where
         + SupportsComparisonOperations
         + Select<Condition = V>
         + BooleanLike,
+    V::InterpretationContext: Zero<ArrayType, V>,
     EagerContext<ArrayType, V, ArrayOperation<V>>: Zero<ArrayType, V> + Fill<ArrayType, f64, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
@@ -760,7 +774,8 @@ where
 /// batching-context recursion.
 impl<V> BatchableProgramOperation<V> for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + 'static,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape + 'static,
+    V::InterpretationContext: Zero<ArrayType, V>,
     Tracer<ProgramBatchingContext<V, Self>>: SupportsArithmeticOperations<V>
         + SupportsTrigonometricOperations
         + ZeroLike
@@ -803,7 +818,8 @@ where
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
 impl<V, E, BodyOperation> LinearizableProgramOperation<E> for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
     E::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
@@ -872,8 +888,10 @@ fn batch_linear_non_control_operation<F, C, V>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
-    F: Value<ArrayType> + BooleanLike,
-    C: Value<ArrayType> + BooleanLike,
+    F: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    F::InterpretationContext: Zero<ArrayType, F>,
+    C: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    C::InterpretationContext: Zero<ArrayType, C>,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations<F>
         + ZeroLike
@@ -981,6 +999,7 @@ where
         + BitAnd<Output = V>
         + Select<Condition = V>
         + BooleanLike,
+    V::InterpretationContext: Zero<ArrayType, V>,
     EagerContext<ArrayType, V, LinearArrayOperation<V, V, V, ArrayOperation<V>>>: Zero<ArrayType, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
@@ -1140,7 +1159,8 @@ where
         + Scale<ArrayType, Tracer<C>, C::Constant>
         + LeftDot<Tracer<C>, C::Constant, Captured>
         + RightDot<Tracer<C>, C::Constant, Captured>,
-    C::Constant: Value<ArrayType> + BooleanLike + Slice + Reshape,
+    C::Constant: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    <C::Constant as Value<ArrayType>>::InterpretationContext: Zero<ArrayType, C::Constant>,
     C::Operation: From<ZeroOperation<ArrayType>>,
     Tracer<C>: SupportsLinearArithmeticOperations<C::Constant>
         + ZeroLike

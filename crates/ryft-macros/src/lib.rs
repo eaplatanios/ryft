@@ -35,7 +35,8 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
 ///
 /// See the `ryft-core` documentation for the `TransposableOperation` trait for the full derive contract, including
 /// operation-type inference, generated payload bounds, and when the macro can generate the
-/// `TransposableProgramOperation` witness for nested linear programs.
+/// `TransposableProgramOperation` witness for nested linear programs, plus supported `#[ryft(...)]` attributes such as
+/// `#[ryft(bounds(transposition(...)))]`.
 #[proc_macro_derive(TransposableOperation, attributes(ryft))]
 pub fn derive_transposable_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_transposable_operation_impl(input)

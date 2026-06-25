@@ -1,0 +1,5 @@
+error: invalid '#[ryft(bounds(...))]' attribute: 'differentiation'; only 'interpretation(...)' is supported here
+ --> tests/operations/error_unknown_bounds_attribute.rs:8:15
+  |
+8 | #[ryft(bounds(differentiation(Clone)))]
+  |               ^^^^^^^^^^^^^^^

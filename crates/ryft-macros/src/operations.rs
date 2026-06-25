@@ -14,6 +14,7 @@ const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
 const BOUNDS_ATTRIBUTE: Symbol = Symbol::new("bounds");
 const INTERPRETATION_ATTRIBUTE: Symbol = Symbol::new("interpretation");
+const TRANSPOSITION_ATTRIBUTE: Symbol = Symbol::new("transposition");
 const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
@@ -34,8 +35,20 @@ pub(crate) struct CodeGenerator {
     /// Extra bounds to attach to the generated interpretation value type.
     interpretation_value_bounds: Vec<syn::TypeParamBound>,
 
+    /// Extra bounds to attach to the generated transposition value type.
+    transposition_value_bounds: Vec<syn::TypeParamBound>,
+
     /// Whether `#[ryft(bounds(interpretation(...)))]` was already specified.
     interpretation_value_bounds_set: bool,
+
+    /// Whether `#[ryft(bounds(transposition(...)))]` was already specified.
+    transposition_value_bounds_set: bool,
+
+    /// Whether this derive owns interpretation-bound code generation.
+    generate_interpretation_bounds: bool,
+
+    /// Whether this derive owns transposition-bound code generation.
+    generate_transposition_bounds: bool,
 
     /// Errors accumulated while validating and generating the derive output.
     errors: Vec<syn::Error>,
@@ -71,7 +84,11 @@ impl CodeGenerator {
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
             interpretation_value_bounds: Vec::new(),
+            transposition_value_bounds: Vec::new(),
             interpretation_value_bounds_set: false,
+            transposition_value_bounds_set: false,
+            generate_interpretation_bounds: true,
+            generate_transposition_bounds: false,
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -98,7 +115,11 @@ impl CodeGenerator {
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
             interpretation_value_bounds: Vec::new(),
+            transposition_value_bounds: Vec::new(),
             interpretation_value_bounds_set: false,
+            transposition_value_bounds_set: false,
+            generate_interpretation_bounds: false,
+            generate_transposition_bounds: true,
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -165,27 +186,40 @@ impl CodeGenerator {
     fn extract_bounds_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
         meta.parse_nested_meta(|meta| match &meta.path {
             path if path == &INTERPRETATION_ATTRIBUTE => {
-                if self.interpretation_value_bounds_set {
-                    return Err(meta.error("duplicate ryft attribute 'bounds(interpretation(...))'"));
+                if self.generate_interpretation_bounds {
+                    if self.interpretation_value_bounds_set {
+                        return Err(meta.error("duplicate ryft attribute 'bounds(interpretation(...))'"));
+                    }
+                    self.interpretation_value_bounds_set = true;
+                    self.interpretation_value_bounds = parse_bounds(&meta, "interpretation")?;
+                    return Ok(());
                 }
-                self.interpretation_value_bounds_set = true;
 
-                let content;
-                syn::parenthesized!(content in meta.input);
-                let bounds =
-                    syn::punctuated::Punctuated::<syn::TypeParamBound, syn::Token![+]>::parse_separated_nonempty(
-                        &content,
-                    )?;
-                if !content.is_empty() {
-                    return Err(content.error("unexpected tokens after interpretation bounds"));
-                }
-                self.interpretation_value_bounds = bounds.into_iter().collect();
-                Ok(())
+                parse_bounds(&meta, "interpretation").map(|_| ())
             }
-            _ => Err(meta.error(format_args!(
-                "invalid '#[ryft(bounds(...))]' attribute: '{}'; only 'interpretation(...)' is supported here",
-                meta.path.to_token_stream().to_string().replace(' ', ""),
-            ))),
+            path if path == &TRANSPOSITION_ATTRIBUTE => {
+                if self.generate_transposition_bounds {
+                    if self.transposition_value_bounds_set {
+                        return Err(meta.error("duplicate ryft attribute 'bounds(transposition(...))'"));
+                    }
+                    self.transposition_value_bounds_set = true;
+                    self.transposition_value_bounds = parse_bounds(&meta, "transposition")?;
+                    return Ok(());
+                }
+
+                parse_bounds(&meta, "transposition").map(|_| ())
+            }
+            _ => {
+                let supported_attributes = if self.generate_transposition_bounds {
+                    "only 'transposition(...)' is supported here"
+                } else {
+                    "only 'interpretation(...)' is supported here"
+                };
+                Err(meta.error(format_args!(
+                    "invalid '#[ryft(bounds(...))]' attribute: '{}'; {supported_attributes}",
+                    meta.path.to_token_stream().to_string().replace(' ', ""),
+                )))
+            }
         })
     }
 
@@ -554,18 +588,24 @@ impl CodeGenerator {
         let primary_type = &self.operation_type;
 
         let operation_self_type = conversion_self_type.clone();
-        let mut transposition_generics = self.operation_generics(&input.generics, &variants);
-        let Some(transposed_value_type) = transposed_value_type(&transposition_generics, primary_type) else {
+        let value_type_parameters = value_type_parameters(&input.generics, primary_type);
+        let Some(program_constant_type) = value_type_parameters.first().cloned() else {
             self.add_error(
                 &input.generics,
-                format_args!(
-                    "could not infer the transposed value type for '#[derive(TransposableOperation)]'; expected a \
-                    generic type parameter bounded by 'Value<{}>'",
-                    primary_type.to_token_stream().to_string().replace(' ', ""),
-                ),
+                "could not infer the program constant value type for '#[derive(TransposableOperation)]'",
             );
             return TokenStream::new();
         };
+        let has_separate_transposition_value_type = value_type_parameters.len() == 1;
+        let transposed_value_type: syn::Type = if has_separate_transposition_value_type {
+            syn::parse_quote!(__TranspositionValue)
+        } else {
+            syn::parse_quote!(#program_constant_type)
+        };
+        let mut transposition_generics = self.operation_generics(&input.generics, &variants);
+        if has_separate_transposition_value_type {
+            transposition_generics.params.push(syn::parse_quote!(__TranspositionValue));
+        }
 
         let transpose_bounds = variants
             .iter()
@@ -593,16 +633,39 @@ impl CodeGenerator {
             predicate
         });
         let where_clause = transposition_generics.make_where_clause();
+        if has_separate_transposition_value_type {
+            where_clause.predicates.push(syn::parse_quote!(#transposed_value_type: #ryft::Value<#primary_type>));
+            where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
+                &input.generics,
+                &program_constant_type,
+                &transposed_value_type,
+            ));
+        }
         where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
+        add_value_bounds(where_clause, &transposed_value_type, self.transposition_value_bounds.as_slice());
         where_clause.predicates.extend(transpose_bounds.iter().cloned());
 
         let mut program_transposition_generics = self.operation_generics(&input.generics, &variants);
+        if has_separate_transposition_value_type {
+            program_transposition_generics.params.push(syn::parse_quote!(__TranspositionValue));
+        }
         let program_where_clause = program_transposition_generics.make_where_clause();
+        if has_separate_transposition_value_type {
+            program_where_clause
+                .predicates
+                .push(syn::parse_quote!(#transposed_value_type: #ryft::Value<#primary_type>));
+            program_where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
+                &input.generics,
+                &program_constant_type,
+                &transposed_value_type,
+            ));
+        }
         program_where_clause
             .predicates
             .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
+        add_value_bounds(program_where_clause, &transposed_value_type, self.transposition_value_bounds.as_slice());
         program_where_clause.predicates.extend(program_transpose_bounds);
         program_where_clause.predicates.push(syn::parse_quote!(#primary_type: #ryft::DifferentiableType));
         program_where_clause.predicates.push(syn::parse_quote! {
@@ -1001,6 +1064,29 @@ fn generic_parameter_bounds_as_predicates(
     predicates
 }
 
+/// Parses a `#[ryft(bounds(kind(...)))]` bound list.
+fn parse_bounds(meta: &syn::meta::ParseNestedMeta, kind: &str) -> syn::Result<Vec<syn::TypeParamBound>> {
+    let content;
+    syn::parenthesized!(content in meta.input);
+    let bounds =
+        syn::punctuated::Punctuated::<syn::TypeParamBound, syn::Token![+]>::parse_separated_nonempty(&content)?;
+    if !content.is_empty() {
+        return Err(content.error(format!("unexpected tokens after {kind} bounds")));
+    }
+    Ok(bounds.into_iter().collect())
+}
+
+/// Adds caller-provided value bounds.
+fn add_value_bounds(where_clause: &mut syn::WhereClause, value_type: &syn::Type, value_bounds: &[syn::TypeParamBound]) {
+    if value_bounds.is_empty() {
+        return;
+    }
+    where_clause.predicates.push(syn::parse_quote! {
+        #value_type:
+            #(#value_bounds)+*
+    });
+}
+
 /// Adds caller-provided interpretation value bounds and their standard companion bounds.
 fn add_interpretation_value_bounds(
     where_clause: &mut syn::WhereClause,
@@ -1009,10 +1095,7 @@ fn add_interpretation_value_bounds(
     interpretation_value_type: &syn::Type,
     interpretation_value_bounds: &[syn::TypeParamBound],
 ) {
-    where_clause.predicates.push(syn::parse_quote! {
-        #interpretation_value_type:
-            #(#interpretation_value_bounds)+*
-    });
+    add_value_bounds(where_clause, interpretation_value_type, interpretation_value_bounds);
     where_clause.predicates.push(syn::parse_quote! {
         <#interpretation_value_type as #ryft::Value<#operation_type>>::InterpretationContext:
             #ryft::Zero<#operation_type, #interpretation_value_type>
@@ -1058,28 +1141,6 @@ impl VisitMut for TypeIdentSubstituter<'_> {
         }
         syn::visit_mut::visit_type_mut(self, ty);
     }
-}
-
-/// Infers the value type parameter used by generated transposition.
-fn transposed_value_type(generics: &syn::Generics, operation_type: &syn::Type) -> Option<syn::Ident> {
-    generics
-        .type_params()
-        .find(|parameter| {
-            parameter.bounds.iter().any(|bound| {
-                value_bound_argument(bound).is_some_and(|argument| type_tokens_equal(&argument, operation_type))
-            }) || generics.where_clause.iter().any(|where_clause| {
-                where_clause.predicates.iter().any(|predicate| match predicate {
-                    syn::WherePredicate::Type(predicate) if type_is_ident(&predicate.bounded_ty, &parameter.ident) => {
-                        predicate.bounds.iter().any(|bound| {
-                            value_bound_argument(bound)
-                                .is_some_and(|argument| type_tokens_equal(&argument, operation_type))
-                        })
-                    }
-                    _ => false,
-                })
-            })
-        })
-        .map(|parameter| parameter.ident.clone())
 }
 
 /// Returns generic value parameters bounded by `Value<operation_type>`.

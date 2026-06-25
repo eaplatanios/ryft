@@ -42,13 +42,18 @@ use crate::types::{Type, Typed};
 ///
 ///   - `impl TransposableOperation<T, V, Enum> for Enum`, where `T` is selected using the same rules that are used for
 ///     inferring `T` in the `#[derive(Operation)]` macro.
-///   - `V` is inferred as the first generic type parameter bounded by `Value<T>`. This matches the convention that the
-///     first value parameter is the tangent/cotangent value type and later value parameters are constants or captured
-///     factors.
+///   - For enums with one `Value<T>` parameter, that parameter is treated as the operation family's stored constant
+///     type and the generated implementation is generic over a separate transposition value type `V`. For enums with
+///     two or more `Value<T>` parameters, the first value parameter is treated as the tangent/cotangent value type and
+///     later value parameters are constants or captured factors.
 ///   - Concrete payload variants forward directly to their payload implementations and receive a generated
 ///     `Payload: TransposableOperation<T, V, Enum>` `where` predicate. Payload-specific capability requirements should
 ///     live on the payload's own [`TransposableOperation`] implementation; the enum derivation carries them through
 ///     this generated payload bound.
+///   - `#[ryft(bounds(transposition(Bound1 + Bound2 + ...)))]` adds extra trait bounds to the generated transposition
+///     value type `V` for both the generated [`TransposableOperation`] dispatcher and the generated
+///     [`TransposableProgramOperation`] witness. These bounds apply to the generated `V`, not necessarily to the enum's
+///     stored value parameter.
 ///   - `impl TransposableProgramOperation<T, V> for Enum`, using the same value-type inference and all non-recursive
 ///     payload transposition bounds as the dispatcher implementation. The generated implementation is the standard
 ///     operation-family witness for nested linear programs: it calls [`Program::transpose`] on the provided program.
@@ -64,12 +69,13 @@ use crate::types::{Type, Typed};
 /// Recursive higher-order payloads that need to transpose captured linear programs should depend on
 /// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<T, V, Enum>` bound.
 /// When those recursive payload rules need value capabilities, express those requirements on the enum's generic
-/// parameters or on the payload implementations themselves so the generated dispatcher and program-transposition
-/// witness inherit them through normal Rust bounds.
+/// parameters, on the payload implementations themselves, or with `#[ryft(bounds(transposition(...)))]` so the
+/// generated dispatcher and program-transposition witness inherit them through normal Rust bounds.
 ///
 /// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 /// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
-/// attribute.
+/// attribute. It also supports `#[ryft(bounds(transposition(...)))]` for the transposition value bounds described
+/// above.
 ///
 /// ## Example
 ///

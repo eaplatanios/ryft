@@ -75,6 +75,9 @@ trait UpdateSlice {}
 /// Stand-in for `ryft_core::Reshape`.
 trait Reshape {}
 
+/// Stand-in transposition-only bound used to verify parsed bounds are emitted by `TransposableOperation`.
+trait FutureTranspositionBound {}
+
 /// Stand-in for `ryft_core::Zero`.
 trait Zero<T: Type, V: Value<T>> {}
 
@@ -226,6 +229,13 @@ impl Value<ArrayType> for Factor {
     type InterpretationContext = TestContext<ArrayType, Factor>;
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranspositionFactor(i64);
+
+impl Value<ArrayType> for TranspositionFactor {
+    type InterpretationContext = TestContext<ArrayType, TranspositionFactor>;
+}
+
 impl BooleanLike for Factor {}
 
 impl Slice for Factor {}
@@ -237,6 +247,10 @@ impl Reshape for Factor {}
 trait SpecialTransposableValue {}
 
 impl SpecialTransposableValue for Factor {}
+
+impl SpecialTransposableValue for TranspositionFactor {}
+
+impl FutureTranspositionBound for TranspositionFactor {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ZeroOperation<T: Type> {
@@ -607,6 +621,7 @@ where
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
 #[ryft(crate = "crate")]
+#[ryft(bounds(transposition(FutureTranspositionBound)))]
 enum SpecialLinearOperation<V: Value<ArrayType>> {
     Special(SpecialOperation),
     Constant(ConstantOperation<ArrayType, V>),
@@ -733,17 +748,18 @@ impl<V: Value<ArrayType>, W, O> InterpretableOperation<ArrayType, V> for Recursi
     }
 }
 
-impl<V, O> TransposableOperation<ArrayType, V, O> for RecursiveOperation<V, O>
+impl<StoredValue, TranspositionValue, O> TransposableOperation<ArrayType, TranspositionValue, O>
+    for RecursiveOperation<StoredValue, O>
 where
-    V: Value<ArrayType>,
-    O: RecursiveOperationTransposable<V>,
+    TranspositionValue: Value<ArrayType>,
+    O: RecursiveOperationTransposable<TranspositionValue>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, ArrayType, TranspositionValue, O>,
         _input_types: &[&ArrayType],
-        _output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        _output_cotangents: &[Cotangent<'transpose, ArrayType, TranspositionValue, O>],
+    ) -> Result<Vec<Cotangent<'transpose, ArrayType, TranspositionValue, O>>, ProgramError> {
         Ok(vec![transposed("recursive")])
     }
 }
@@ -757,7 +773,10 @@ enum RecursiveLinearOperation<V: Value<ArrayType>> {
     Recursive(RecursiveOperation<V, Self>),
 }
 
-impl<V: Value<ArrayType>> RecursiveOperationTransposable<V> for RecursiveLinearOperation<V> {}
+impl<StoredValue: Value<ArrayType>, TranspositionValue: Value<ArrayType>>
+    RecursiveOperationTransposable<TranspositionValue> for RecursiveLinearOperation<StoredValue>
+{
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProgramRecursiveOperation<V, O> {
@@ -780,17 +799,18 @@ impl<V: Value<DataType>, W, O> InterpretableOperation<DataType, V> for ProgramRe
     }
 }
 
-impl<V, O> TransposableOperation<DataType, V, O> for ProgramRecursiveOperation<V, O>
+impl<StoredValue, TranspositionValue, O> TransposableOperation<DataType, TranspositionValue, O>
+    for ProgramRecursiveOperation<StoredValue, O>
 where
-    V: Value<DataType> + SpecialTransposableValue,
-    O: TransposableProgramOperation<DataType, V>,
+    TranspositionValue: Value<DataType> + SpecialTransposableValue,
+    O: TransposableProgramOperation<DataType, TranspositionValue>,
 {
     fn transpose<'transpose>(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, DataType, V, O>,
+        _context: &mut AbstractTracingContext<'transpose, DataType, TranspositionValue, O>,
         _input_types: &[&DataType],
-        _output_cotangents: &[Cotangent<'transpose, DataType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, DataType, V, O>>, ProgramError> {
+        _output_cotangents: &[Cotangent<'transpose, DataType, TranspositionValue, O>],
+    ) -> Result<Vec<Cotangent<'transpose, DataType, TranspositionValue, O>>, ProgramError> {
         Ok(vec![transposed("program_recursive")])
     }
 }
@@ -1009,12 +1029,12 @@ fn test_transposable_operation_generates_program_transposition_witness() {
 fn test_transposable_operation_generates_concrete_payload_bounds() {
     type Linear = SpecialLinearOperation<Factor>;
 
-    let mut context = AbstractTracingContext::<ArrayType, Factor, Linear> { marker: PhantomData };
+    let mut context = AbstractTracingContext::<ArrayType, TranspositionFactor, Linear> { marker: PhantomData };
     let operation = Linear::from(SpecialOperation);
 
     assert_eq!(
         operation.transpose(&mut context, &[&ArrayType], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("special")],
+        vec![transposed::<ArrayType, TranspositionFactor, Linear>("special")],
     );
 }
 
@@ -1061,5 +1081,8 @@ fn test_errors() {
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
     test_cases.compile_fail("tests/operations/error_bounds_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_missing_transposition_bound.rs");
+    test_cases.compile_fail("tests/operations/error_unknown_bounds_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_unknown_transposition_bounds_attribute.rs");
     test_cases.compile_fail("tests/operations/error_type_attribute.rs");
 }
