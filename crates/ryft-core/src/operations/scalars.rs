@@ -67,7 +67,7 @@ pub enum ScalarOperation<V: Value<DataType>> {
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
-impl<V: Value<DataType> + BooleanLike, D> DifferentiableOperation<D> for ScalarOperation<V>
+impl<V: Value<DataType>, D> DifferentiableOperation<D> for ScalarOperation<V>
 where
     ZeroOperation<DataType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
@@ -88,23 +88,7 @@ where
     RematerializationNameOperation: DifferentiableOperation<D>,
     D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = ScalarOperation<V>>,
     D::Operation: From<ZeroOperation<DataType>> + From<OneOperation<DataType>>,
-    D::Value: RematerializationName,
-    D::Value: Add<Output = D::Value>
-        + Sub<Output = D::Value>
-        + Mul<Output = D::Value>
-        + Div<Output = D::Value>
-        + Neg<Output = D::Value>
-        + Sin
-        + Cos
-        + ZeroLike
-        + OneLike
-        + Compare<Output = D::Value>
-        + BooleanLike
-        + SelectCondition
-        + Parameterized<D::Value>,
-    D::Value: Select<Condition = <D::Value as SelectCondition>::Condition>,
-    <D::Value as Parameterized<D::Value>>::ParameterStructure: std::fmt::Debug + PartialEq,
-    Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
+    D::Value: ZeroLike + BooleanLike,
     ScalarOperation<V>: Clone + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: From<AddOperation>
         + From<ZeroLikeOperation>
@@ -171,7 +155,7 @@ where
 /// obligation back into every consumer.
 impl<F, E> LinearizableProgramOperation<E> for ScalarOperation<F>
 where
-    F: Value<DataType> + BooleanLike,
+    F: Value<DataType>,
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
