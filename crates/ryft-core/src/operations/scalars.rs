@@ -12,7 +12,6 @@ use crate::operations::constants::{
 use crate::operations::control_flow::{SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::Tracer;
@@ -101,14 +100,6 @@ where
             WithCapture<ValueOrCapture<DataType, D::Value>> = LinearOperationOf<D>,
         >,
     LinearOperationOf<D>: MaybeZeroOperation<DataType>,
-    Vec<V>: Parameterized<
-            V,
-            Family: crate::parameters::ParameterizedFamily<D::Tangent>
-                        + crate::parameters::ParameterizedFamily<D::Value>,
-            To<D::Value> = Vec<D::Value>,
-            To<D::Tangent> = Vec<D::Tangent>,
-            ParameterStructure: std::fmt::Debug + PartialEq,
-        >,
 {
     fn jvp<'jvp>(
         &self,
