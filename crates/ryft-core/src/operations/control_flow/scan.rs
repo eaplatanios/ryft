@@ -1,7 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::contexts::Context;
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
@@ -344,7 +343,7 @@ impl<C, V, O, Capture> ScanPayload<ArrayType, C, V, O, Capture> for Captured
 where
     C: Value<ArrayType>,
     V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Context<Type = ArrayType, Constant = C, Value = V> + Zero<ArrayType, V>,
+    V::InterpretationContext: Zero<ArrayType, V>,
     O: InterpretableProgramOperation<ArrayType, V, C>,
     Capture: Value<ArrayType>,
 {
@@ -353,14 +352,14 @@ where
         context: &V::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        let y_slice_types = operation.body.output_types().split_off(operation.carry_count);
+        let output_slice_types = operation.body.output_types().split_off(operation.carry_count);
         interpret_scan_lanes(
+            context,
             operation.carry_count,
             operation.length,
             operation.reverse,
-            y_slice_types.as_slice(),
+            output_slice_types.as_slice(),
             inputs,
-            |stacked_type| context.zero(stacked_type),
             |_, lane_inputs| O::interpret_program(context, &operation.body, lane_inputs),
         )
     }
@@ -370,7 +369,6 @@ impl<C, V, O, Capture> ScanPayload<DataType, C, V, O, Capture> for Captured
 where
     C: Value<DataType>,
     V: Value<DataType>,
-    V::InterpretationContext: Context<Type = DataType, Constant = C, Value = V>,
     O: InterpretableProgramOperation<DataType, V, C>,
     Capture: Value<DataType>,
 {
@@ -380,7 +378,11 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let mut state = inputs.to_vec();
-        for _ in 0..operation.length {
+        let mut lanes = (0..operation.length).collect::<Vec<_>>();
+        if operation.reverse {
+            lanes.reverse();
+        }
+        for _ in lanes {
             state = O::interpret_program(context, &operation.body, state)?;
             check_count!("output", state, operation.carry_count, ProgramError);
         }
@@ -608,7 +610,7 @@ where
 }
 
 /// Writes `value` as slice `lane` of `accumulator` along its leading axis, prepending a unit axis to `value` first.
-fn write_scan_lane<V>(accumulator: V, lane: usize, value: V) -> Result<V, ProgramError>
+pub(super) fn write_scan_lane<V>(accumulator: V, lane: usize, value: V) -> Result<V, ProgramError>
 where
     V: Value<ArrayType> + UpdateSlice + Reshape,
 {
@@ -622,8 +624,8 @@ where
     accumulator.update_slice(&expanded, start_indices.as_slice())
 }
 
-/// Drives one scan loop over `[carry..., stacked_xs...]` inputs, delegating each iteration's body evaluation to
-/// `interpret_lane` and allocating stacked output accumulators through `allocate_zero`.
+/// Drives one array scan loop over `[carry..., stacked_xs...]` inputs, delegating each iteration's body evaluation to
+/// `interpret_lane`.
 ///
 /// This is the single source of truth for scan lane arithmetic: iteration `lane` consumes slice `lane` of every
 /// stacked input and writes slice `lane` of every stacked output, visiting lanes from `length - 1` down to `0` when
@@ -634,33 +636,36 @@ where
 ///
 /// # Parameters
 ///
+///   - `context`: Interpretation context used to allocate output stacks.
 ///   - `carry_count`: Number of loop-carried state leaves at the front of `inputs`.
 ///   - `length`: Static trip count.
 ///   - `reverse`: Whether lanes are visited in reverse order.
-///   - `y_slice_types`: Per-iteration stacked output slice types used to allocate the output accumulators.
+///   - `y_slice_types`: Per-iteration output slice types used to allocate the output stacks.
 ///   - `inputs`: Flat `[carry..., stacked_xs...]` input values.
-///   - `allocate_zero`: Allocates a zero value of the provided stacked output type.
 ///   - `interpret_lane`: Evaluates one iteration, mapping `(lane, [carry..., x_slice...])` to `[carry...,
 ///     y_slice...]`.
-pub fn interpret_scan_lanes<V, AllocateZeroFn, InterpretLaneFn>(
+pub fn interpret_scan_lanes<V, InterpretLaneFn>(
+    context: &V::InterpretationContext,
     carry_count: usize,
     length: usize,
     reverse: bool,
     y_slice_types: &[ArrayType],
     inputs: &[V],
-    mut allocate_zero: AllocateZeroFn,
     mut interpret_lane: InterpretLaneFn,
 ) -> Result<Vec<V>, ProgramError>
 where
     V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
-    AllocateZeroFn: FnMut(&ArrayType) -> Result<V, ProgramError>,
+    V::InterpretationContext: Zero<ArrayType, V>,
     InterpretLaneFn: FnMut(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
 {
     let (carries, stacks) = inputs.split_at(carry_count);
     let mut carries = carries.to_vec();
     let mut accumulators = y_slice_types
         .iter()
-        .map(|slice_type| allocate_zero(&stacked_scan_type(slice_type, length)))
+        .map(|slice_type| {
+            let stack_type = stacked_scan_type(slice_type, length);
+            context.zero(&stack_type)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut lanes: Vec<usize> = (0..length).collect();
     if reverse {

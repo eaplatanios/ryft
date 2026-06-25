@@ -1639,8 +1639,8 @@ where
                     })
                     .collect())
             }
-            LinearArrayOperation::OperandCondition(operation) => {
-                // The operand-form condition mirrors the factor-form lowering above with the predicate taken from
+            LinearArrayOperation::WhileCondition(operation) => {
+                // The while-condition form mirrors the factor-form lowering above with the predicate taken from
                 // operand 0 instead of a materialized factor literal; the remaining operands (including any
                 // forwarded loop-varying residuals appended by defactorization) flow into both branch regions.
                 let true_branch = operation.true_branch();
@@ -4805,7 +4805,6 @@ mod tests {
     use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::DifferentiationContext;
     use ryft_core::tracing_v2::operations::captures::MaterializeCaptureOperation;
-    use ryft_core::tracing_v2::operations::control_flow::LinearOperandConditionOperation;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::types::{Shape, Size};
     #[cfg(feature = "ndarray")]
@@ -5382,7 +5381,7 @@ mod tests {
             )
             .unwrap();
         let fused_while =
-            CoreWhileOperation::<ArrayType, TestArray, DirectLinearOperation>::new(condition, body).unwrap();
+            CoreWhileOperation::<ArrayType, TestArray, DirectLinearOperation, Input>::new(condition, body).unwrap();
 
         // Tangent program: a nullary residual injection feeds the loop-entry primal state and the fused loop runs
         // over `[primal, tangent]`, returning the final tangent half.
@@ -5406,10 +5405,10 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_operand_form_condition_to_if() {
+    fn test_to_mlir_module_for_plain_program_lowers_while_condition_to_if() {
         // Fused while bodies rewrite linear conditions with loop-varying predicates into operand form: the
         // recomputed predicate becomes operand 0 and forwarded loop-varying residuals become trailing operands that
-        // flow into both branch regions. The operand-form condition lowers to `stablehlo.if` over the predicate
+        // flow into both branch regions. The while-condition form lowers to `stablehlo.if` over the predicate
         // operand with the branch programs inlined as regions, mirroring the factor-form lowering minus the
         // materialized predicate literal.
         use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
@@ -5453,7 +5452,7 @@ mod tests {
         let forwarded = builder.add_input(scalar_f64);
         let output = builder
             .add_instruction(
-                LinearOperandConditionOperation::new(Box::new(true_branch), Box::new(false_branch)),
+                ConditionOperation::new(true_branch, false_branch).unwrap(),
                 vec![predicate, tangent, forwarded],
             )
             .unwrap()[0];
@@ -5641,10 +5640,11 @@ mod tests {
         let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
         let tangent_init = builder.add_input(scalar_f64);
         let tangent_xs = builder.add_input(stacked_f64);
-        let scan = ScanOperation::<ArrayType, TestArray, ScanBodyOperation>::new(body, 1, 3)
-            .unwrap()
-            .with_reverse(true)
-            .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
+        let scan =
+            ScanOperation::<ArrayType, TestArray, ScanBodyOperation, TestArray, Input>::new_with_payload(body, 1, 3)
+                .unwrap()
+                .with_reverse(true)
+                .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
         let outputs = builder
             .add_instruction(DirectLinearOperation::Scan(Box::new(scan)), vec![tangent_init, tangent_xs])
             .unwrap()

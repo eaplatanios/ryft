@@ -70,8 +70,8 @@ use super::bounds::{
 };
 use super::captures::MaterializeCaptureOperation;
 use super::control_flow::{
-    DefactorizableProgramOperation, DefactorizedOperation, LinearOperandConditionOperation,
-    batch_condition_with_interpreter, batch_while_with_interpreter, defactorize_operation_default,
+    DefactorizableProgramOperation, DefactorizedOperation, batch_condition_with_interpreter,
+    batch_while_with_interpreter, defactorize_operation_default,
 };
 use super::dot::DotOps;
 use crate::operations::manipulation::Reshape;
@@ -345,7 +345,7 @@ pub enum LinearArrayOperation<
     Residual(MaterializeCaptureOperation<F>),
     Recompute(RecomputeOperation<P>),
     Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
-    OperandCondition(LinearOperandConditionOperation<V, Self>),
+    WhileCondition(ConditionOperation<ArrayType, V, Self, V, Input>),
     While(Box<WhileOperation<ArrayType, V, Self, Input>>),
     Scan(Box<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>),
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
@@ -465,17 +465,17 @@ where
                     })?,
                 )?))
             }
-            // Operand-form condition branches carry only closed constant factors after defactorization, but the
-            // traversal stays total over them like the factor-form variant's.
-            LinearArrayOperation::OperandCondition(operation) => {
-                Ok(LinearArrayOperation::OperandCondition(LinearOperandConditionOperation::new(
-                    Box::new(operation.true_branch().map_operations(|operation| {
+            // While-condition branches carry only closed constant factors after defactorization, but the traversal
+            // stays total over them like the factor-form variant's.
+            LinearArrayOperation::WhileCondition(operation) => {
+                Ok(LinearArrayOperation::WhileCondition(ConditionOperation::new(
+                    operation.true_branch().map_operations(|operation| {
                         map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
-                    })?),
-                    Box::new(operation.false_branch().map_operations(|operation| {
+                    })?,
+                    operation.false_branch().map_operations(|operation| {
                         map_linear_array_operation_factors::<_, _, _, _, _, _>(operation, map_factor)
-                    })?),
-                )))
+                    })?,
+                )?))
             }
             LinearArrayOperation::While(while_operation) => {
                 let condition = while_operation.condition().map_operations(|operation| {
@@ -949,7 +949,7 @@ where
         | LinearArrayOperation::Residual(_)
         | LinearArrayOperation::Recompute(_)
         | LinearArrayOperation::Condition(_)
-        | LinearArrayOperation::OperandCondition(_)
+        | LinearArrayOperation::WhileCondition(_)
         | LinearArrayOperation::While(_)
         | LinearArrayOperation::Scan(_)
         | LinearArrayOperation::CustomVjpCall(_) => {
@@ -1075,9 +1075,9 @@ where
                     },
                 )
             }
-            // The operand-form condition already reads its predicate from input 0, which is exactly the layout the
+            // The while-condition form already reads its predicate from input 0, which is exactly the layout the
             // condition batching helper expects for an ordinary runtime predicate.
-            Self::OperandCondition(operation) => batch_condition_with_interpreter(
+            Self::WhileCondition(operation) => batch_condition_with_interpreter(
                 operation.true_branch(),
                 operation.false_branch(),
                 inputs,
@@ -1223,10 +1223,10 @@ where
                     if operation.predicate().boolean()? { operation.true_branch() } else { operation.false_branch() };
                 context.interpret_program(branch, inputs.to_vec())
             }
-            // The operand-form condition already reads its predicate from input 0, which is exactly the layout the
+            // The while-condition form already reads its predicate from input 0, which is exactly the layout the
             // condition batching helper expects for an ordinary runtime predicate (lane-uniform predicates extract
             // concretely, lane-varying ones run both branches and select per lane).
-            Self::OperandCondition(operation) => batch_condition_with_interpreter::<C::Constant, Tracer<C>, _, _>(
+            Self::WhileCondition(operation) => batch_condition_with_interpreter::<C::Constant, Tracer<C>, _, _>(
                 operation.true_branch(),
                 operation.false_branch(),
                 inputs,

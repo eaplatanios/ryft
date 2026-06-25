@@ -1,6 +1,6 @@
 // TODO(eaplatanios): Review this module.
 
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, quote};
 use syn::visit_mut::VisitMut;
 
@@ -233,13 +233,25 @@ impl CodeGenerator {
                     >
             });
         }
-        if variants.iter().any(|variant| variant.is_recursive_payload) {
-            add_recursive_interpretation_bounds(
-                program_interpretation_where_clause,
-                ryft,
-                primary_type,
-                &interpretation_value_type,
-            );
+        if variants
+            .iter()
+            .any(|variant| variant.is_recursive_payload && variant.requires_program_boolean_like_bound())
+        {
+            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
+                #interpretation_value_type: #ryft::BooleanLike
+            });
+        }
+        if variants
+            .iter()
+            .any(|variant| variant.is_recursive_payload && variant.requires_program_scan_value_bounds())
+        {
+            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
+                #interpretation_value_type: #ryft::Slice + #ryft::UpdateSlice + #ryft::Reshape
+            });
+            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
+                <#interpretation_value_type as #ryft::Value<#primary_type>>::InterpretationContext:
+                    #ryft::Zero<#primary_type, #interpretation_value_type>
+            });
         }
         program_interpretation_where_clause
             .predicates
@@ -733,6 +745,21 @@ impl OperationVariant {
     fn receiver(&self) -> TokenStream {
         if self.is_boxed { quote!(&**operation) } else { quote!(operation) }
     }
+
+    /// Returns whether this payload needs Boolean predicate extraction for recursive program interpretation.
+    fn requires_program_boolean_like_bound(&self) -> bool {
+        self.operation_type_mentions("ConditionOperation") || self.operation_type_mentions("WhileOperation")
+    }
+
+    /// Returns whether this payload needs scan lane capabilities for recursive program interpretation.
+    fn requires_program_scan_value_bounds(&self) -> bool {
+        self.operation_type_mentions("ScanOperation")
+    }
+
+    /// Returns whether this payload type mentions a path segment named `ident`.
+    fn operation_type_mentions(&self, ident: &str) -> bool {
+        type_mentions_ident(&self.operation_type, &syn::Ident::new(ident, Span::call_site()))
+    }
 }
 
 /// Returns the inner type of `Box<T>`.
@@ -946,41 +973,6 @@ fn value_type_parameters(generics: &syn::Generics, operation_type: &syn::Type) -
         .collect()
 }
 
-/// Adds the value capabilities required by built-in recursive higher-order operation payloads.
-fn add_recursive_interpretation_bounds(
-    where_clause: &mut syn::WhereClause,
-    ryft: &syn::Path,
-    operation_type: &syn::Type,
-    value_type: &syn::Type,
-) {
-    // TODO(eaplatanios): This feels quite hacky. Should this be configurable somehow or can we pull these bounds
-    //  automatically in somehow via some other trait or something?
-    if type_path_ends_with(operation_type, "DataType") {
-        where_clause.predicates.push(syn::parse_quote!(#value_type: #ryft::BooleanLike));
-    } else if type_path_ends_with(operation_type, "ArrayType") {
-        where_clause.predicates.push(syn::parse_quote! {
-            #value_type:
-                #ryft::BooleanLike
-                + #ryft::Slice
-                + #ryft::UpdateSlice
-                + #ryft::Reshape
-        });
-        where_clause.predicates.push(syn::parse_quote! {
-            <#value_type as #ryft::Value<#operation_type>>::InterpretationContext:
-                #ryft::Zero<#operation_type, #value_type>
-        });
-    }
-}
-
-/// Returns whether `ty` is a type path ending with `ident`.
-fn type_path_ends_with(ty: &syn::Type, ident: &str) -> bool {
-    matches!(
-        ty,
-        syn::Type::Path(syn::TypePath { qself: None, path })
-            if path.segments.last().is_some_and(|segment| segment.ident == ident)
-    )
-}
-
 /// Returns whether two types have the same token representation.
 fn type_tokens_equal(left: &syn::Type, right: &syn::Type) -> bool {
     left.to_token_stream().to_string().replace(' ', "") == right.to_token_stream().to_string().replace(' ', "")
@@ -1035,8 +1027,8 @@ mod tests {
     use quote::ToTokens;
 
     use super::{
-        bare_generic_parameter, boxed_inner_type, type_path_ends_with, unique_value_bound_arguments,
-        value_bound_arguments, value_type_parameters,
+        bare_generic_parameter, boxed_inner_type, unique_value_bound_arguments, value_bound_arguments,
+        value_type_parameters,
     };
 
     #[test]
@@ -1105,12 +1097,5 @@ mod tests {
         assert_eq!(parameters.len(), 2);
         assert_eq!(parameters[0].to_string(), "V");
         assert_eq!(parameters[1].to_string(), "C");
-    }
-
-    #[test]
-    fn test_type_path_ends_with() {
-        assert!(type_path_ends_with(&syn::parse_quote!(ArrayType), "ArrayType"));
-        assert!(type_path_ends_with(&syn::parse_quote!(ryft_core::ArrayType), "ArrayType"));
-        assert!(!type_path_ends_with(&syn::parse_quote!(DataType), "ArrayType"));
     }
 }

@@ -76,10 +76,16 @@ where
             operation.try_map_captures(&mut |capture: &ValueOrCapture<DataType, V>| capture.instantiate(&[]))
         })?;
         let mut state = inputs.to_vec();
-        for _ in 0..operation.length() {
+        let mut lanes = (0..operation.length()).collect::<Vec<_>>();
+        if operation.reverse() {
+            lanes.reverse();
+        }
+        for _ in lanes {
             state = <<O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<
                 V,
-            > as InterpretableProgramOperation<DataType, V>>::interpret_program(context, &body, state)?;
+            > as InterpretableProgramOperation<DataType, V>>::interpret_program(
+                context, &body, state,
+            )?;
             check_count!("output", state, operation.carry_count(), ProgramError);
         }
         Ok(state)
@@ -107,12 +113,12 @@ where
         let carry_count = operation.carry_count();
         let y_slice_types = body.output_types().split_off(carry_count);
         interpret_scan_lanes(
+            context,
             carry_count,
             operation.length(),
             operation.reverse(),
             y_slice_types.as_slice(),
             inputs,
-            |stacked_type| context.zero(stacked_type),
             |lane, lane_inputs| {
                 let lane_residuals =
                     stack_values.iter().map(|stack| read_scan_lane(stack, lane)).collect::<Result<Vec<_>, _>>()?;

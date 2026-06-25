@@ -196,15 +196,16 @@ impl<V: Value<ArrayType>, F: Value<ArrayType>, O: Operation<ArrayType>> Operatio
     }
 }
 
-impl<C, V, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayType, C, O, C, Input>
+impl<T, C, V, O> InterpretableOperation<T, V> for ConditionOperation<T, C, O, C, Input>
 where
-    C: Value<ArrayType>,
-    V: Value<ArrayType> + BooleanLike,
-    O: InterpretableProgramOperation<ArrayType, V, C>,
+    T: Type + BooleanLike,
+    C: Value<T>,
+    V: Value<T> + BooleanLike,
+    O: InterpretableProgramOperation<T, V, C>,
 {
     fn interpret(
         &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
+        context: &<V as Value<T>>::InterpretationContext,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();

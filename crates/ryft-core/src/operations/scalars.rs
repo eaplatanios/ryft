@@ -12,7 +12,7 @@ use crate::operations::constants::{
     ConstantOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
     ZeroOperation,
 };
-use crate::operations::control_flow::{ScanOperation, Select, SelectCondition, SelectOperation, WhileOperation};
+use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::parameters::Parameterized;
@@ -59,7 +59,6 @@ pub enum ScalarOperation<V: Value<DataType>> {
     Cos(CosOperation),
     Compare(CompareOperation),
     Select(SelectOperation),
-    Scan(Box<ScanOperation<DataType, V, Self>>),
     While(Box<WhileOperation<DataType, V, Self>>),
     StopGradient(StopGradientOperation),
     RematerializationName(RematerializationNameOperation),
@@ -67,7 +66,7 @@ pub enum ScalarOperation<V: Value<DataType>> {
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
-impl<V: Value<DataType>, D, BodyOperation> DifferentiableOperation<D> for ScalarOperation<V>
+impl<V: Value<DataType>, D> DifferentiableOperation<D> for ScalarOperation<V>
 where
     ZeroOperation<DataType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
@@ -86,7 +85,6 @@ where
     SelectOperation: DifferentiableOperation<D>,
     StopGradientOperation: DifferentiableOperation<D>,
     RematerializationNameOperation: DifferentiableOperation<D>,
-    BodyOperation: crate::operations::Operation<DataType>,
     D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = ScalarOperation<V>>,
     D::Operation: From<ZeroOperation<DataType>> + From<OneOperation<DataType>>,
     D::Value: RematerializationName,
@@ -107,11 +105,6 @@ where
     Vec<D::Value>: Parameterized<D::Value, ParameterStructure: std::fmt::Debug + PartialEq>,
     ScalarOperation<V>: Clone + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, D::Value>>
-        + CaptureParameterizedOperation<
-            DataType,
-            ValueOrCapture<DataType, D::Value>,
-            WithCapture<ValueOrCapture<DataType, D::Tangent>> = BodyOperation,
-        > + From<ScanOperation<DataType, D::Tangent, BodyOperation, ValueOrCapture<DataType, D::Value>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
         + ResidualizedOperation<D>
         + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, ValueOrCapture<DataType, D::Value>>>,
@@ -149,7 +142,6 @@ where
             Self::Cos(operation) => operation.jvp(context, inputs),
             Self::Compare(operation) => operation.jvp(context, inputs),
             Self::Select(operation) => operation.jvp(context, inputs),
-            Self::Scan(operation) => operation.jvp(context, inputs),
             Self::While(operation) => operation.jvp(context, inputs),
             Self::StopGradient(operation) => operation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
@@ -166,29 +158,16 @@ where
 /// [`Program::linearize`] instead of the recursive
 /// `Self: DifferentiableOperation<LinearizationContextOf<E, Self>>` bound, which avoids pushing that recursive
 /// obligation back into every consumer.
-impl<F, E, BodyOperation> LinearizableProgramOperation<E> for ScalarOperation<F>
+impl<F, E> LinearizableProgramOperation<E> for ScalarOperation<F>
 where
     F: Value<DataType>,
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
-    BodyOperation: crate::operations::Operation<DataType>,
     LinearOperationOf<LinearizationContextOf<E, Self>>: SupportsLinearScalarOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>
         + ResidualizedOperation<LinearizationContextOf<E, Self>>
         + From<ZeroOperation<DataType>>
-        + CaptureParameterizedOperation<
-            DataType,
-            ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-            WithCapture<ValueOrCapture<DataType, E::Tangent>> = BodyOperation,
-        > + From<
-            ScanOperation<
-                DataType,
-                E::Tangent,
-                BodyOperation,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
-                Input,
-            >,
-        > + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
+        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>>>
         + From<
             CustomVjpCallOperation<
                 DataType,
@@ -200,6 +179,9 @@ where
     LinearOperationOf<LinearizationContextOf<E, Self>>: CaptureParameterizedOperation<
             DataType,
             ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>,
+            WithCapture<ValueOrCapture<DataType, Tracer<LinearizationContextOf<E, Self>>>> = LinearOperationOf<
+                LinearizationContextOf<E, Self>,
+            >,
             WithCapture<ValueOrCapture<DataType, E::Value>> = LinearOperationOf<E>,
         > + MaybeZeroOperation<DataType>,
 {
@@ -222,7 +204,7 @@ where
 /// exemplar-derived [`ZeroLike`](Self::ZeroLike)/[`OneLike`](Self::OneLike) maps, a typed
 /// [`Constant`](Self::Constant), [`Neg`](Self::Neg)/[`Add`](Self::Add)/[`Sub`](Self::Sub), scaling by a captured
 /// factor ([`Scale`](Self::Scale)), the captured-condition [`Select`](Self::Select)
-/// ([`LinearSelectOperation`]), linearized [`Scan`](Self::Scan)/[`While`](Self::While) payloads, and the opaque
+/// ([`LinearSelectOperation`]), linearized [`While`](Self::While) payloads, and the opaque
 /// [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp` linearization (its transpose replays the user's
 /// backward program).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
@@ -237,7 +219,6 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     Sub(SubOperation),
     Scale(ScaleOperation<DataType, F, Input>),
     Select(LinearSelectOperation<F>),
-    Scan(Box<ScanOperation<DataType, V, LinearScalarOperation<V, C, ValueOrCapture<DataType, V>>, F, Input>>),
     While(Box<WhileOperation<DataType, V, Self, Input>>),
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
@@ -267,17 +248,6 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
                 Ok(ScaleOperation::<DataType, MappedFactor, Input>::new(map_factor(operation.factor())?).into())
             }
             Self::Select(operation) => Ok(LinearSelectOperation::new(map_factor(operation.condition())?).into()),
-            Self::Scan(operation) => {
-                let scan = ScanOperation::<DataType, _, _, MappedFactor, Input>::new_with_payload(
-                    operation.body().clone(),
-                    operation.carry_count(),
-                    operation.length(),
-                )?
-                .with_reverse(operation.reverse())
-                .with_unroll(operation.unroll())?
-                .with_captures(operation.captures().iter().map(map_factor).collect::<Result<Vec<_>, _>>()?);
-                Ok(LinearScalarOperation::Scan(Box::new(scan)))
-            }
             Self::While(operation) => {
                 let condition = operation
                     .condition()
@@ -379,134 +349,6 @@ mod tests {
         // Interpreting the staged program exercises the in-band Boolean condition encoding of scalar values.
         assert_eq!(program.interpret((3.0, 2.0)), Ok(6.0));
         assert_eq!(program.interpret((1.0, 2.0)), Ok(2.0));
-    }
-
-    #[test]
-    fn test_scalar_scan() {
-        let operation =
-            ScanOperation::<DataType, f64, ScalarOperation<f64>>::new(scalar_doubling_body(), 1, 3).unwrap();
-
-        assert_eq!(operation.name(), crate::operations::control_flow::SCAN_OPERATION_NAME);
-        assert_eq!(operation.carry_count(), 1);
-        assert_eq!(operation.length(), 3);
-        assert!(!operation.reverse());
-        assert_eq!(operation.input_types(), vec![DataType::F64]);
-        assert_eq!(operation.output_types(), vec![DataType::F64]);
-        assert_eq!(
-            format!("{operation}"),
-            indoc! {"
-                scan [
-                    carry_count=1,
-                    length=3,
-                    reverse=false,
-                    body={
-                        lambda %0:f64 .
-                        let %1:f64 = add %0 %0
-                        in (%1)
-                    },
-                ]
-            "}
-            .trim_end(),
-        );
-        assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[1.0]), Ok(vec![8.0]));
-
-        let domain = ScalarDomain::<f64>::new();
-        let (output_type, program) = trace(
-            &domain,
-            |carry| {
-                let operation =
-                    ScanOperation::<DataType, f64, ScalarOperation<f64>>::new(scalar_doubling_body(), 1, 3).unwrap();
-                let mut outputs = carry.context().stage_operation(operation, &[&carry])?;
-                Ok(outputs.remove(0))
-            },
-            DataType::F64,
-        )
-        .unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = scan [
-                    carry_count=1,
-                    length=3,
-                    reverse=false,
-                    body={
-                        lambda %0:f64 .
-                        let %1:f64 = add %0 %0
-                        in (%1)
-                    },
-                ] %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(program.interpret(1.0), Ok(8.0));
-
-        let (primal, tangent): (f64, f64) = domain
-            .jvp(
-                |carry| {
-                    let operation =
-                        ScanOperation::<DataType, f64, ScalarOperation<f64>>::new(scalar_doubling_body(), 1, 3)
-                            .unwrap();
-                    carry.unary(operation)
-                },
-                1.0,
-                1.0,
-            )
-            .unwrap();
-        assert_eq!(primal, 8.0);
-        assert_eq!(tangent, 8.0);
-
-        let (_, pushforward) = domain
-            .linearize(
-                |carry| {
-                    let operation =
-                        ScanOperation::<DataType, f64, ScalarOperation<f64>>::new(scalar_doubling_body(), 1, 3)
-                            .unwrap();
-                    Ok(carry.unary(operation))
-                },
-                1.0,
-            )
-            .unwrap();
-        let pushforward = pushforward.instantiate_program().unwrap();
-        assert!(matches!(pushforward.instructions()[0].operation(), LinearScalarOperation::Scan(_)));
-        assert_eq!(pushforward.interpret(1.0), Ok(8.0));
-    }
-
-    #[test]
-    fn test_scalar_scan_rejects_scanned_inputs_and_outputs() {
-        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        let carry = builder.add_input(DataType::F64);
-        let scanned_input = builder.add_input(DataType::F64);
-        let next_carry = builder.add_instruction(AddOperation, vec![carry, scanned_input]).unwrap()[0];
-        let body = builder
-            .build::<Vec<f64>, Vec<f64>>(vec![next_carry], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            ScanOperation::<DataType, f64, ScalarOperation<f64>>::new(body, 1, 3).map(|_| ()),
-            Err(TypeError {
-                message: "scalar scan requires every body input to be loop-carried, but carry count 1 is smaller \
-                          than the body input count 2"
-                    .to_string(),
-            }),
-        );
-
-        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
-        let carry = builder.add_input(DataType::F64);
-        let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
-        let body = builder
-            .build::<Vec<f64>, Vec<f64>>(vec![doubled, carry], vec![Placeholder], vec![Placeholder, Placeholder])
-            .unwrap();
-        assert_eq!(
-            ScanOperation::<DataType, f64, ScalarOperation<f64>>::new(body, 1, 3).map(|_| ()),
-            Err(TypeError {
-                message: "scalar scan requires every body output to be loop-carried, but carry count 1 is smaller \
-                          than the body output count 2"
-                    .to_string(),
-            }),
-        );
     }
 
     #[test]

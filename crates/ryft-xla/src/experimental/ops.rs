@@ -44,8 +44,7 @@ use ryft_core::tracing_v2::operations::bounds::{
     SupportsTrigonometricOperations,
 };
 use ryft_core::tracing_v2::operations::control_flow::{
-    DefactorizableProgramOperation, DefactorizedOperation, LinearOperandConditionOperation,
-    defactorize_operation_default,
+    DefactorizableProgramOperation, DefactorizedOperation, defactorize_operation_default,
 };
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
@@ -771,8 +770,8 @@ pub enum LinearXlaOperation<
     /// Backend-owned captured-predicate condition whose branch bodies can contain XLA linear operations.
     Condition(ConditionOperation<ArrayType, V, Self, F, Captured>),
 
-    /// Backend-owned operand-form condition whose branch bodies can contain XLA linear operations.
-    OperandCondition(LinearOperandConditionOperation<V, Self>),
+    /// Backend-owned while-condition whose predicate is supplied by the fused loop state.
+    WhileCondition(ConditionOperation<ArrayType, V, Self, V, Input>),
 
     /// Backend-owned while loop whose nested programs can contain XLA linear operations.
     While(Box<WhileOperation<ArrayType, V, Self, Input>>),
@@ -832,7 +831,7 @@ where
             Self::Recompute(operation) => LinearArrayOperation::from(operation.clone()),
             Self::CustomVjpCall(operation) => LinearArrayOperation::from((**operation).clone()),
             Self::Condition(_)
-            | Self::OperandCondition(_)
+            | Self::WhileCondition(_)
             | Self::While(_)
             | Self::Scan(_)
             | Self::LinearJitCall(_)
@@ -896,22 +895,19 @@ where
                 )
                 .unwrap(),
             ),
-            LinearArrayOperation::OperandCondition(operation) => {
-                Self::OperandCondition(LinearOperandConditionOperation::new(
-                    Box::new(
-                        operation
-                            .true_branch()
-                            .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
-                            .unwrap(),
-                    ),
-                    Box::new(
-                        operation
-                            .false_branch()
-                            .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
-                            .unwrap(),
-                    ),
-                ))
-            }
+            LinearArrayOperation::WhileCondition(operation) => Self::WhileCondition(
+                ConditionOperation::new(
+                    operation
+                        .true_branch()
+                        .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                        .unwrap(),
+                    operation
+                        .false_branch()
+                        .map_operations(|operation| Ok(LinearXlaOperation::from(operation.clone())))
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
             LinearArrayOperation::While(operation) => Self::While(Box::new(
                 WhileOperation::new(
                     operation
@@ -997,19 +993,15 @@ where
                     .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
             )?))
         }
-        LinearXlaOperation::OperandCondition(operation) => {
-            Ok(LinearXlaOperation::OperandCondition(LinearOperandConditionOperation::new(
-                Box::new(
-                    operation
-                        .true_branch()
-                        .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
-                ),
-                Box::new(
-                    operation
-                        .false_branch()
-                        .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
-                ),
-            )))
+        LinearXlaOperation::WhileCondition(operation) => {
+            Ok(LinearXlaOperation::WhileCondition(ConditionOperation::new(
+                operation
+                    .true_branch()
+                    .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
+                operation
+                    .false_branch()
+                    .map_operations(|operation| map_linear_xla_operation_captures(operation, map_factor))?,
+            )?))
         }
         LinearXlaOperation::While(operation) => {
             let condition = operation

@@ -223,12 +223,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     type and the nested program constant type for direct program interpretation. Later value parameters remain
 ///     payload-specific metadata unless the generated program witness needs to instantiate a direct-linear operation
 ///     family, in which case extra value parameters after the first two are substituted with the first value parameter.
-///   - For recursive operation enums over built-in [`DataType`] or [`ArrayType`] payloads, the generated nested-program
-///     witness adds the same runtime capabilities required by Ryft's built-in higher-order interpretation rules.
-///     Scalar recursive programs require [`BooleanLike`]. Array recursive programs require [`BooleanLike`], [`Slice`],
-///     [`UpdateSlice`], [`Reshape`], and a context that can materialize [`ZeroOperation`]s. These bounds keep recursive
-///     condition, while, and scan payloads local to their own operation semantics while avoiding a recursive proof of
-///     the whole enum's [`InterpretableOperation`] implementation.
+///   - For recursive operation enums, the generated nested-program witness requires the runtime value capabilities
+///     needed by the recursive higher-order payloads it contains. Condition and while payloads require
+///     [`BooleanLike`] for predicate extraction.
 ///
 /// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
 /// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on

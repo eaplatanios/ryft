@@ -2,21 +2,17 @@ use crate::batching::BatchingError;
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::differentiation::{Cotangent, TransposableOperation, TransposableProgramOperation};
 use crate::domains::Domain;
-use crate::macros::{check_count, check_types};
+use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
 use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
-use crate::operations::control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, ScanOperation, SelectOperation, WhileOperation,
-};
+use crate::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, LinearDynamicSliceOperation,
     LinearDynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
-use crate::operations::{
-    BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter,
-};
+use crate::operations::{BooleanLike, InterpretableOperation, InterpretableProgramOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
@@ -40,7 +36,7 @@ use crate::tracing_v2::{
 };
 use crate::types::{ArrayType, DataType, Size, Type, TypeError, Typed};
 use std::collections::BTreeMap;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 
 impl<'domain, E> BooleanLike for JvpTracer<'domain, E>
 where
@@ -144,8 +140,8 @@ pub trait DefactorizableProgramOperation<V: Value<ArrayType>, R: Value<ArrayType
     /// operations (for example, a scale by a referenced residual becomes a recomputed elementwise product and a
     /// select over a referenced condition becomes a recomputed operand-form select), with the residual atom spliced
     /// into `inputs`. Every such rewrite is normally wrapped in [`RecomputeOperation`] so fused bodies carry uniform
-    /// provenance. Higher-order payloads rewrite recursively: a condition over a referenced predicate becomes an
-    /// operand-form condition whose branches receive the union of their referenced residuals as forwarded trailing
+    /// provenance. Higher-order payloads rewrite recursively: a condition over a referenced predicate becomes a
+    /// while-condition form whose branches receive the union of their referenced residuals as forwarded trailing
     /// operands, and a linear scan whose residual stacks reference loop-varying residuals moves those stacks into
     /// extra scanned operands with its body rewritten against the new trailing lane inputs. Operations carrying only
     /// closed [`ValueOrCapture::Value`] factors pass through unchanged, and the remaining unsupported shapes (for
@@ -342,7 +338,7 @@ where
             ValueOrCapture<ArrayType, R>,
             WithCapture<ValueOrCapture<ArrayType, R>> = O,
         > + From<RecomputeOperation<P>>
-        + From<LinearOperandConditionOperation<V, O>>
+        + From<ConditionOperation<ArrayType, V, O, V, Input>>
         + From<
             ScanOperation<
                 ArrayType,
@@ -366,11 +362,14 @@ where
             >>::WithCapture<ValueOrCapture<ArrayType, V>>,
         > + From<RecomputeOperation<P>>
         + From<
-            LinearOperandConditionOperation<
+            ConditionOperation<
+                ArrayType,
                 V,
                 <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, R>>>::WithCapture<
                     ValueOrCapture<ArrayType, V>,
                 >,
+                V,
+                Input,
             >,
         > + From<
             ScanOperation<
@@ -599,7 +598,7 @@ where
         condition_inputs.extend(inputs);
         condition_inputs.extend(forwarded_atoms);
         return Ok(DefactorizedOperation::Operation {
-            operation: O::from(LinearOperandConditionOperation::new(Box::new(true_branch), Box::new(false_branch))),
+            operation: O::from(ConditionOperation::new(true_branch, false_branch)?),
             inputs: condition_inputs,
         });
     }
@@ -2495,8 +2494,8 @@ where
     ) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
-        let branch =
-            if self.predicate().residual_value()?.boolean()? { self.true_branch() } else { self.false_branch() };
+        let predicate = self.predicate().residual_value()?;
+        let branch = if predicate.boolean()? { self.true_branch() } else { self.false_branch() };
         O::interpret_program(context, branch, inputs.to_vec())
     }
 }
@@ -2542,125 +2541,13 @@ where
     }
 }
 
-/// Operand-form conditional linear operation: the operand-form counterpart of captured-predicate
-/// [`ConditionOperation`] produced by [`DefactorizableProgramOperation::defactorize_operation`] for fused while
-/// bodies.
+/// Rejects transposition for input-predicate conditions used inside fused linear while bodies.
 ///
-/// It is the counterpart of the `OperandCondition` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation): the Boolean predicate is operand `0` (recomputed
-/// in-loop) instead of a captured factor, and any loop-varying residuals the branch programs referenced are forwarded
-/// as additional trailing operands. The operands are therefore
-/// `[predicate, branch_operands..., forwarded_residuals...]`, and both branch programs consume
-/// `[branch_operands..., forwarded_residuals...]` with identical signatures. Like recomputed primal operations, the
-/// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
-/// transposition, which is only reachable behind the while transpose error.
-#[derive(Clone, Debug)]
-pub struct LinearOperandConditionOperation<V, O>
-where
-    V: Value<ArrayType>,
-    O: Operation<ArrayType>,
-{
-    /// Branch [`Program`] evaluated when the predicate operand is true.
-    true_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
-
-    /// Branch [`Program`] evaluated when the predicate operand is false.
-    false_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
-}
-
-impl<V, O> LinearOperandConditionOperation<V, O>
-where
-    V: Value<ArrayType>,
-    O: Operation<ArrayType>,
-{
-    /// Creates a new [`LinearOperandConditionOperation`] from the two branch programs.
-    #[inline]
-    pub fn new(
-        true_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
-        false_branch: Box<Program<ArrayType, V, O, Vec<V>, Vec<V>>>,
-    ) -> Self {
-        Self { true_branch, false_branch }
-    }
-
-    /// Returns the branch [`Program`] evaluated when the predicate operand is true.
-    #[inline]
-    pub fn true_branch(&self) -> &Program<ArrayType, V, O, Vec<V>, Vec<V>> {
-        self.true_branch.as_ref()
-    }
-
-    /// Returns the branch [`Program`] evaluated when the predicate operand is false.
-    #[inline]
-    pub fn false_branch(&self) -> &Program<ArrayType, V, O, Vec<V>, Vec<V>> {
-        self.false_branch.as_ref()
-    }
-}
-
-impl<V, O> Display for LinearOperandConditionOperation<V, O>
-where
-    V: Value<ArrayType>,
-    O: Operation<ArrayType>,
-    Self: Operation<ArrayType>,
-{
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.render(formatter, 0)
-    }
-}
-
-impl<V, O> Operation<ArrayType> for LinearOperandConditionOperation<V, O>
-where
-    V: Value<ArrayType>,
-    O: Operation<ArrayType>,
-{
-    #[inline]
-    fn name(&self) -> &'static str {
-        CONDITION_OPERATION_NAME
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        let branch_input_types = self.true_branch.input_types();
-        check_types!("condition branch input", &branch_input_types, &self.false_branch.input_types());
-        let output_types = self.true_branch.output_types();
-        check_types!("condition branch output", &output_types, &self.false_branch.output_types());
-        check_count!("input", input_types, 1 + branch_input_types.len(), TypeError);
-        if !input_types[0].is_scalar() || input_types[0] != input_types[0].as_boolean() {
-            return Err(TypeError {
-                message: format!("condition predicate type must be a scalar boolean, but got {}", input_types[0]),
-            });
-        }
-        check_types!("condition operand", &branch_input_types, &input_types[1..]);
-        Ok(output_types)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
-            operation.program("true_branch", self.true_branch.as_ref())?;
-            operation.program("false_branch", self.false_branch.as_ref())
-        })
-    }
-}
-
-impl<V, O> InterpretableOperation<ArrayType, V> for LinearOperandConditionOperation<V, O>
-where
-    V: Value<ArrayType> + BooleanLike,
-    O: InterpretableProgramOperation<ArrayType, V>,
-{
-    fn interpret(
-        &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.infer_output_types(input_types.as_slice())?;
-        let branch = if inputs[0].boolean()? { self.true_branch() } else { self.false_branch() };
-        O::interpret_program(context, branch, inputs[1..].to_vec())
-    }
-}
-
-/// Transpose rule for the operand-form conditional (the `OperandCondition` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Like recomputed primal operations, the
-/// operand-form condition is not a linear map in its predicate and forwarded-residual operands and rejects
-/// transposition; this rule is only reachable behind the while transpose error, which fires first.
+/// Defactorization represents loop-varying condition predicates as ordinary condition operands. Like recomputed
+/// primal operations, this form is not a linear map in its predicate and forwarded residual operands. It is only
+/// expected behind the enclosing while transpose error.
 impl<V, O, OLinear: Operation<ArrayType>> TransposableOperation<ArrayType, V, OLinear>
-    for LinearOperandConditionOperation<V, O>
+    for ConditionOperation<ArrayType, V, O, V, Input>
 where
     V: Value<ArrayType>,
     O: Operation<ArrayType>,
@@ -2672,7 +2559,7 @@ where
         _output_cotangents: &[Cotangent<'transpose, ArrayType, V, OLinear>],
     ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, OLinear>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
-            message: "operand-form condition inside a fused while body does not support transposition".to_string(),
+            message: "while condition inside a fused linear while body does not support transposition".to_string(),
         })
     }
 }
@@ -4391,16 +4278,16 @@ mod tests {
     fn test_while_jvp_defactorizes_loop_varying_condition_predicates() {
         // `while (x < 100) { x = if (x < 10) { x * x } else { 2 * x } }` captures the nested condition's predicate
         // as a loop-varying residual, and the true branch's product rule references the loop-varying residual `x`
-        // itself. Under abstract tracing the staged path must rewrite the linear condition into operand form with
+        // itself. Under abstract tracing the staged path must rewrite the linear condition into while-condition form with
         // the predicate as operand 0 and the branch-referenced residual forwarded as a trailing operand (previously
         // rejected with "operand-form linear condition is not implemented").
         let staged_while = staged_linear_while_under_abstract_tracing(condition_while_operation());
-        let contains_operand_condition = staged_while
+        let contains_while_condition = staged_while
             .body()
             .instructions()
             .iter()
-            .any(|instruction| matches!(instruction.operation(), AbstractLinearOperation::OperandCondition { .. }));
-        assert!(contains_operand_condition, "{}", staged_while.body());
+            .any(|instruction| matches!(instruction.operation(), AbstractLinearOperation::WhileCondition(_)));
+        assert!(contains_while_condition, "{}", staged_while.body());
 
         // Replaying the staged pushforward at `x = 2` runs five iterations whose nested predicates are true, true,
         // false, false, false (`x` visits 2, 4, 16, 32, 64), exercising both branch paths and the
