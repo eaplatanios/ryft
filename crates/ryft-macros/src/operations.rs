@@ -1,6 +1,6 @@
 // TODO(eaplatanios): Review this module.
 
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 use syn::visit_mut::VisitMut;
 
@@ -12,7 +12,9 @@ use crate::helpers::symbols::Symbol;
 
 const RYFT_ATTRIBUTE: Symbol = Symbol::new("ryft");
 const CRATE_ATTRIBUTE: Symbol = Symbol::new("crate");
-const VALID_CONTAINER_ATTRIBUTES: [Symbol; 1] = [CRATE_ATTRIBUTE];
+const BOUNDS_ATTRIBUTE: Symbol = Symbol::new("bounds");
+const INTERPRETATION_ATTRIBUTE: Symbol = Symbol::new("interpretation");
+const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
 const DEFAULT_OPERATION_TYPE: Symbol = Symbol::new("__OperationType");
@@ -28,6 +30,12 @@ pub(crate) struct CodeGenerator {
 
     /// Type descriptor for the generated [`Operation`](ryft_core::Operation) implementation.
     operation_type: syn::Type,
+
+    /// Extra bounds to attach to the generated interpretation value type.
+    interpretation_value_bounds: Vec<syn::TypeParamBound>,
+
+    /// Whether `#[ryft(bounds(interpretation(...)))]` was already specified.
+    interpretation_value_bounds_set: bool,
 
     /// Errors accumulated while validating and generating the derive output.
     errors: Vec<syn::Error>,
@@ -62,6 +70,8 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
+            interpretation_value_bounds: Vec::new(),
+            interpretation_value_bounds_set: false,
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -87,6 +97,8 @@ impl CodeGenerator {
                 qself: None,
                 path: syn::Path::from(syn::Ident::from(DEFAULT_OPERATION_TYPE)),
             }),
+            interpretation_value_bounds: Vec::new(),
+            interpretation_value_bounds_set: false,
             errors: Vec::new(),
         };
         generator.extract_attributes(&input);
@@ -122,6 +134,7 @@ impl CodeGenerator {
         input.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &CRATE_ATTRIBUTE => ryft_crate.set(&meta),
+                path if path == &BOUNDS_ATTRIBUTE => self.extract_bounds_attribute(&meta),
                 _ => Err(meta.error(format_args!(
                     "invalid '#[ryft(...)]' attribute: '{}'; these are the attributes that are supported here: {:?}",
                     meta.path.to_token_stream().to_string().replace(' ', ""),
@@ -146,6 +159,34 @@ impl CodeGenerator {
                 "could not infer a unique operation type because multiple distinct 'Value<T>' bounds are present",
             ),
         }
+    }
+
+    /// Extracts a `#[ryft(bounds(...))]` attribute.
+    fn extract_bounds_attribute(&mut self, meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
+        meta.parse_nested_meta(|meta| match &meta.path {
+            path if path == &INTERPRETATION_ATTRIBUTE => {
+                if self.interpretation_value_bounds_set {
+                    return Err(meta.error("duplicate ryft attribute 'bounds(interpretation(...))'"));
+                }
+                self.interpretation_value_bounds_set = true;
+
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let bounds =
+                    syn::punctuated::Punctuated::<syn::TypeParamBound, syn::Token![+]>::parse_separated_nonempty(
+                        &content,
+                    )?;
+                if !content.is_empty() {
+                    return Err(content.error("unexpected tokens after interpretation bounds"));
+                }
+                self.interpretation_value_bounds = bounds.into_iter().collect();
+                Ok(())
+            }
+            _ => Err(meta.error(format_args!(
+                "invalid '#[ryft(bounds(...))]' attribute: '{}'; only 'interpretation(...)' is supported here",
+                meta.path.to_token_stream().to_string().replace(' ', ""),
+            ))),
+        })
     }
 
     /// Generates all derive output.
@@ -190,7 +231,11 @@ impl CodeGenerator {
             .collect::<Vec<_>>();
         let program_operation_self_type =
             substitute_type_idents(&operation_self_type, program_value_substitutions.as_slice());
-        let mut interpretation_generics = self.operation_generics(&input.generics, &variants);
+        let interpretation_self_type = program_operation_self_type.clone();
+        let mut interpretation_generics = substitute_generics(
+            &self.operation_generics(&input.generics, &variants),
+            program_value_substitutions.as_slice(),
+        );
         if has_separate_interpretation_value_type {
             interpretation_generics.params.push(syn::parse_quote!(__InterpretationValue));
         }
@@ -204,17 +249,51 @@ impl CodeGenerator {
                 &program_constant_type,
                 &interpretation_value_type,
             ));
+            interpretation_where_clause.predicates.push(syn::parse_quote! {
+                <#interpretation_value_type as #ryft::Value<#primary_type>>::InterpretationContext:
+                    #ryft::Context<
+                        Type = #primary_type,
+                        Constant = #program_constant_type,
+                        Value = #interpretation_value_type,
+                    >
+            });
         }
         interpretation_where_clause
             .predicates
-            .push(syn::parse_quote!(#operation_self_type: #ryft::Operation<#primary_type>));
-        interpretation_where_clause.predicates.extend(variants.iter().map(|variant| {
-            let operation_type = &variant.operation_type;
-            let predicate: syn::WherePredicate = syn::parse_quote! {
-                #operation_type: #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
-            };
-            predicate
-        }));
+            .push(syn::parse_quote!(#interpretation_self_type: #ryft::Operation<#primary_type>));
+        interpretation_where_clause.predicates.push(syn::parse_quote! {
+            #interpretation_self_type:
+                #ryft::InterpretableProgramOperation<
+                    #primary_type,
+                    #interpretation_value_type,
+                    #program_constant_type,
+                >
+        });
+        if !self.interpretation_value_bounds.is_empty() {
+            add_interpretation_value_bounds(
+                interpretation_where_clause,
+                ryft,
+                primary_type,
+                &interpretation_value_type,
+                self.interpretation_value_bounds.as_slice(),
+            );
+        }
+        interpretation_where_clause.predicates.extend(
+            variants
+                .iter()
+                .map(|variant| {
+                    let operation_type =
+                        substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+                    (variant, operation_type)
+                })
+                .filter(|(variant, _)| !variant.is_recursive_payload)
+                .map(|(_, operation_type)| {
+                    let predicate: syn::WherePredicate = syn::parse_quote! {
+                        #operation_type: #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
+                    };
+                    predicate
+                }),
+        );
         let (interpretation_impl_generics, _, interpretation_where_clause) = interpretation_generics.split_for_impl();
 
         let mut program_interpretation_generics = substitute_generics(
@@ -243,33 +322,34 @@ impl CodeGenerator {
                     >
             });
         }
-        if variants
-            .iter()
-            .any(|variant| variant.is_recursive_payload && variant.requires_program_scan_value_bounds())
-        {
-            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
-                #interpretation_value_type: #ryft::Slice + #ryft::UpdateSlice + #ryft::Reshape
-            });
-            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
-                <#interpretation_value_type as #ryft::Value<#primary_type>>::InterpretationContext:
-                    #ryft::Zero<#primary_type, #interpretation_value_type>
-            });
-        }
         program_interpretation_where_clause
             .predicates
             .push(syn::parse_quote!(#program_operation_self_type: #ryft::Operation<#primary_type>));
-        program_interpretation_where_clause.predicates.extend(variants.iter().filter_map(|variant| {
-            if variant.is_recursive_payload {
-                None
-            } else {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate = syn::parse_quote! {
-                    #operation_type: #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
-                };
-                Some(predicate)
-            }
-        }));
+        if !self.interpretation_value_bounds.is_empty() {
+            add_interpretation_value_bounds(
+                program_interpretation_where_clause,
+                ryft,
+                primary_type,
+                &interpretation_value_type,
+                self.interpretation_value_bounds.as_slice(),
+            );
+        }
+        program_interpretation_where_clause.predicates.extend(
+            variants
+                .iter()
+                .map(|variant| {
+                    let operation_type =
+                        substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
+                    (variant, operation_type)
+                })
+                .filter(|(variant, _)| !variant.is_recursive_payload)
+                .map(|(_, operation_type)| {
+                    let predicate: syn::WherePredicate = syn::parse_quote! {
+                        #operation_type: #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
+                    };
+                    predicate
+                }),
+        );
         let program_constant_lift = if has_separate_interpretation_value_type {
             quote! {
                 <<#interpretation_value_type as #ryft::Value<
@@ -346,7 +426,8 @@ impl CodeGenerator {
         });
         let interpretation_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
-            let payload_operation_type = &variant.operation_type;
+            let payload_operation_type =
+                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
@@ -396,7 +477,7 @@ impl CodeGenerator {
             #[automatically_derived]
             impl #interpretation_impl_generics
                 #ryft::InterpretableOperation<#primary_type, #interpretation_value_type>
-                for #operation_self_type
+                for #interpretation_self_type
             #interpretation_where_clause
             {
                 fn interpret(
@@ -747,16 +828,6 @@ impl OperationVariant {
     fn receiver(&self) -> TokenStream {
         if self.is_boxed { quote!(&**operation) } else { quote!(operation) }
     }
-
-    /// Returns whether this payload needs scan lane capabilities for recursive program interpretation.
-    fn requires_program_scan_value_bounds(&self) -> bool {
-        self.operation_type_mentions("ScanOperation")
-    }
-
-    /// Returns whether this payload type mentions a path segment named `ident`.
-    fn operation_type_mentions(&self, ident: &str) -> bool {
-        type_mentions_ident(&self.operation_type, &syn::Ident::new(ident, Span::call_site()))
-    }
 }
 
 /// Returns the inner type of `Box<T>`.
@@ -918,7 +989,7 @@ fn generic_parameter_bounds_as_predicates(
         .collect::<Vec<syn::WherePredicate>>();
     if let Some(where_clause) = &generics.where_clause {
         predicates.extend(where_clause.predicates.iter().filter_map(|predicate| match predicate {
-            syn::WherePredicate::Type(predicate) if type_is_ident(&predicate.bounded_ty, source) => {
+            syn::WherePredicate::Type(predicate) if type_mentions_ident(&predicate.bounded_ty, source) => {
                 let mut predicate = syn::WherePredicate::Type(predicate.clone());
                 TypeIdentSubstituter { substitutions: &[(source.clone(), target.clone())] }
                     .visit_where_predicate_mut(&mut predicate);
@@ -928,6 +999,31 @@ fn generic_parameter_bounds_as_predicates(
         }));
     }
     predicates
+}
+
+/// Adds caller-provided interpretation value bounds and their standard companion bounds.
+fn add_interpretation_value_bounds(
+    where_clause: &mut syn::WhereClause,
+    ryft: &syn::Path,
+    operation_type: &syn::Type,
+    interpretation_value_type: &syn::Type,
+    interpretation_value_bounds: &[syn::TypeParamBound],
+) {
+    where_clause.predicates.push(syn::parse_quote! {
+        #interpretation_value_type:
+            #(#interpretation_value_bounds)+*
+    });
+    where_clause.predicates.push(syn::parse_quote! {
+        <#interpretation_value_type as #ryft::Value<#operation_type>>::InterpretationContext:
+            #ryft::Zero<#operation_type, #interpretation_value_type>
+    });
+    where_clause.predicates.push(syn::parse_quote! {
+        ::std::vec::Vec<#interpretation_value_type>: #ryft::Parameterized<
+            #interpretation_value_type,
+            To<#interpretation_value_type> = ::std::vec::Vec<#interpretation_value_type>,
+            ParameterStructure: ::std::fmt::Debug + ::std::cmp::PartialEq,
+        >
+    });
 }
 
 /// Visitor replacing bare type identifiers with concrete types.
@@ -940,13 +1036,25 @@ impl VisitMut for TypeIdentSubstituter<'_> {
     fn visit_type_mut(&mut self, ty: &mut syn::Type) {
         if let syn::Type::Path(type_path) = ty
             && type_path.qself.is_none()
-            && type_path.path.segments.len() == 1
-            && let Some(segment) = type_path.path.segments.first()
-            && matches!(segment.arguments, syn::PathArguments::None)
-            && let Some((_, replacement)) = self.substitutions.iter().find(|(ident, _)| segment.ident == *ident)
         {
-            *ty = replacement.clone();
-            return;
+            if type_path.path.segments.len() == 1
+                && let Some(segment) = type_path.path.segments.first()
+                && matches!(segment.arguments, syn::PathArguments::None)
+                && let Some((_, replacement)) = self.substitutions.iter().find(|(ident, _)| segment.ident == *ident)
+            {
+                *ty = replacement.clone();
+                return;
+            }
+            if let Some(first_segment) = type_path.path.segments.first()
+                && matches!(first_segment.arguments, syn::PathArguments::None)
+                && let Some((_, syn::Type::Path(replacement))) =
+                    self.substitutions.iter().find(|(ident, _)| first_segment.ident == *ident)
+                && replacement.qself.is_none()
+            {
+                let remaining_segments = type_path.path.segments.iter().skip(1).cloned();
+                type_path.path.leading_colon = replacement.path.leading_colon;
+                type_path.path.segments = replacement.path.segments.iter().cloned().chain(remaining_segments).collect();
+            }
         }
         syn::visit_mut::visit_type_mut(self, ty);
     }

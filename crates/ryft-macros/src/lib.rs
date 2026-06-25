@@ -25,7 +25,7 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 ///
 /// See the `ryft-core` documentation for the `Operation` trait for the full derive contract, including operation-type
 /// inference from `Value<T>` bounds, generated conversions, boxed payload handling, and supported `#[ryft(...)]`
-/// attributes.
+/// attributes such as `#[ryft(bounds(interpretation(...)))]`.
 #[proc_macro_derive(Operation, attributes(ryft))]
 pub fn derive_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_operation_impl(input)

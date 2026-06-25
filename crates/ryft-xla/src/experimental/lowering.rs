@@ -16,11 +16,12 @@ use ryft_core::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
 use ryft_core::operations::compare::ComparisonDirection;
-use ryft_core::operations::constants::{ConstantOperation, FillOperation};
+use ryft_core::operations::constants::{ConstantOperation, FillOperation, Zero};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
 use ryft_core::operations::manipulation::{
     BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
-    GatherScatterMode, ReshapeOperation, ScatterOperation, ScatterReductionKind, TransposeOperation,
+    GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, TransposeOperation,
+    UpdateSlice,
 };
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::operations::{BooleanLike, Operation};
@@ -714,7 +715,10 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
     Ok(vec![operation.result(0).expect("stablehlo.custom_call should return one result").as_ref()])
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for XlaOperation<V> {
+impl<V> LowerableXlaOperation<V> for XlaOperation<V>
+where
+    V: MlirLowerableValue + BooleanLike,
+{
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -723,122 +727,283 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for XlaOperat
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
         match self {
-            Self::Zero(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::Zero(_) => {
+                check_count!("input", input_values, 0, ProgramError);
+                lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
             }
-            Self::ZeroLike(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::ZeroLike(_) => lower_like_constant(
+                input_values,
+                output_types,
+                0,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::One(_) => {
+                check_count!("input", input_values, 0, ProgramError);
+                lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
-            Self::One(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::OneLike(_) => lower_like_constant(
+                input_values,
+                output_types,
+                1,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::Constant(operation) => operation.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::Fill(operation) => <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Neg(operation) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Add(operation) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Sub(operation) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Scale(operation) => operation.lower_to_mlir(input_values, output_types, mode, lowerer),
+            Self::Mul(operation) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Div(operation) => <DivOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Sin(operation) => <SinOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::StopGradient(_) => {
+                check_count!("input", input_values, 1, ProgramError);
+                Ok(vec![input_values[0]])
             }
-            Self::OneLike(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::RematerializationName(_) => {
+                check_count!("input", input_values, 1, ProgramError);
+                Ok(vec![input_values[0]])
             }
-            Self::Constant(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Fill(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Neg(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Add(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Sub(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Scale(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Mul(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Div(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Sin(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Cos(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::StopGradient(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::RematerializationName(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::TransferToMemory(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Dot(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Transpose(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Reshape(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
+            Self::TransferToMemory(operation) => lower_transfer_to_memory(
+                operation.destination(),
+                input_values,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::Dot(operation) => <DotOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Transpose(operation) => <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             Self::Reshard(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
             Self::ShardingConstraint(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
             }
-            Self::Broadcast(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
+            Self::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
             Self::Slice(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                let result = lowerer.block.append_operation(stable_hlo::slice(
+                    input_values[0],
+                    operation.start_indices(),
+                    operation.limit_indices(),
+                    operation.strides(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
             }
             Self::UpdateSlice(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                let index_values = lower_static_index_constants(
+                    operation.start_indices(),
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                    input_values[0],
+                    input_values[1],
+                    index_values.as_slice(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
             Self::DynamicSlice(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
+                    input_values[0],
+                    &input_values[1..],
+                    operation.sizes(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
             }
-            Self::DynamicUpdateSlice(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::DynamicUpdateSlice(_) => {
+                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
+                    input_values[0],
+                    input_values[1],
+                    &input_values[2..],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
             }
             Self::Pad(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                let edge_padding_low: Vec<i64> =
+                    operation.edge_padding_low().iter().map(|&padding| padding as i64).collect();
+                let edge_padding_high: Vec<i64> =
+                    operation.edge_padding_high().iter().map(|&padding| padding as i64).collect();
+                let result = lowerer.block.append_operation(stable_hlo::pad(
+                    input_values[0],
+                    input_values[1],
+                    edge_padding_low.as_slice(),
+                    edge_padding_high.as_slice(),
+                    operation.interior_padding(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
             }
             Self::Concatenate(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                reject_dynamic_concatenate_output(output_types)?;
+                let result = lowerer.block.append_operation(stable_hlo::concatenate(
+                    input_values,
+                    operation.axis(),
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
             }
-            Self::Gather(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            Self::Scatter(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
+            Self::Gather(operation) => lower_gather_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
+            Self::Scatter(operation) => lower_scatter_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            ),
             Self::Reduce(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                check_count!("output", output_types, 1, ProgramError);
+                let value = lower_reduce_to_mlir(
+                    operation.kind(),
+                    operation.axes(),
+                    input_values[0],
+                    &output_types[0],
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
             }
             Self::Compare(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+                let value = lower_compare_to_mlir(
+                    operation.direction(),
+                    input_values[0],
+                    input_values[1],
+                    &mut lowerer.block,
+                    lowerer.location,
+                )?;
+                Ok(vec![value])
             }
-            Self::Not(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::Not(_) => {
+                let result = lowerer.block.append_operation(stable_hlo::not(input_values[0], lowerer.location)?)?;
+                Ok(vec![result.result(0).expect("stablehlo.not should return one result").as_ref()])
             }
-            Self::And(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::And(_) => {
+                let result = lowerer.block.append_operation(stable_hlo::and(
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.and should return one result").as_ref()])
             }
-            Self::Or(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::Or(_) => {
+                let result = lowerer.block.append_operation(stable_hlo::or(
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.or should return one result").as_ref()])
             }
-            Self::Xor(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::Xor(_) => {
+                let result = lowerer.block.append_operation(stable_hlo::xor(
+                    input_values[0],
+                    input_values[1],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
             }
-            Self::Collective(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::Collective(_) => {
+                check_count!("input", input_values, 1, ProgramError);
+                Ok(vec![input_values[0]])
             }
-            Self::Select(operation) => {
-                ArrayOperation::<V>::from(operation.clone()).lower_to_mlir(input_values, output_types, mode, lowerer)
+            Self::Select(_) => {
+                let result = lowerer.block.append_operation(stable_hlo::select(
+                    input_values[0],
+                    input_values[1],
+                    input_values[2],
+                    lowerer.location,
+                )?)?;
+                Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
             }
             Self::Condition(condition) => condition.lower_to_mlir(input_values, output_types, mode, lowerer),
             Self::While(while_operation) => while_operation.lower_to_mlir(input_values, output_types, mode, lowerer),
@@ -966,7 +1131,8 @@ fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
 
 impl<V> LowerableXlaOperation<V> for ArrayOperation<V>
 where
-    V: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1304,8 +1470,10 @@ where
 
 impl<V, C, P> LowerableXlaOperation<V> for LinearArrayOperation<V, C, V, P>
 where
-    V: MlirLowerableValue + BooleanLike,
-    C: MlirLowerableValue + BooleanLike,
+    V: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
+    C: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
+    C::InterpretationContext: Zero<ArrayType, C>,
     P: Clone
         + Operation<ArrayType>
         + LowerableXlaOperation<C>
@@ -2912,7 +3080,8 @@ fn operand_form_scan_body<V, C, P>(
     residual_slice_types: &[ArrayType],
 ) -> Result<Program<ArrayType, V, LinearArrayOperation<V, C, V, P>, Vec<V>, Vec<V>>, LoweringError>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V::InterpretationContext: Zero<ArrayType, V>,
     C: Value<ArrayType>,
     P: Clone
         + Operation<ArrayType>

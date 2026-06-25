@@ -55,6 +55,17 @@ trait Value<T: Type>: Clone {
 /// Stand-in for `ryft_core::BooleanLike`.
 trait BooleanLike {}
 
+/// Stand-in for `ryft_core::Parameterized`.
+trait Parameterized<V> {
+    type To<T>;
+    type ParameterStructure;
+}
+
+impl<V> Parameterized<V> for Vec<V> {
+    type To<T> = Vec<T>;
+    type ParameterStructure = ();
+}
+
 /// Stand-in for `ryft_core::Slice`.
 trait Slice {}
 
@@ -609,6 +620,14 @@ enum InferredArrayOperation<V: Value<ArrayType>, C: Value<ArrayType> = V> {
     Scale(ScaleOperation<ArrayType, C>),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+#[ryft(bounds(interpretation(Slice + UpdateSlice + Reshape)))]
+enum InterpretationBoundOperation<C: Value<ArrayType> + BooleanLike> {
+    Zero(ZeroOperation<ArrayType>),
+    Constant(ConstantOperation<ArrayType, C>),
+}
+
 #[test]
 fn test_array_operation_type_inference() {
     type Operation = InferredArrayOperation<Factor>;
@@ -625,6 +644,31 @@ fn test_array_operation_type_inference() {
         <&ScaleOperation<ArrayType, Factor>>::try_from(&scale),
         Ok(&ScaleOperation { factor: Factor(17), marker: PhantomData }),
     );
+}
+
+#[test]
+fn test_operation_generates_interpretation_value_bounds() {
+    type Operation = InterpretationBoundOperation<Factor>;
+
+    let context = TestContext::<ArrayType, Factor> { marker: PhantomData };
+    let operation = Operation::from(ZeroOperation { r#type: ArrayType });
+
+    assert_eq!(operation.interpret(&context, &[Factor(1)]), Ok(vec![Factor(1)]));
+
+    let program = Program::<ArrayType, Factor, Operation, Vec<Factor>, Vec<Factor>> {
+        label: "array",
+        constant: Some(Factor(3)),
+        operation: Some(Operation::from(ConstantOperation { value: Factor(5), marker: PhantomData })),
+        marker: PhantomData,
+    };
+    let outputs = <Operation as InterpretableProgramOperation<ArrayType, Factor, Factor>>::interpret_program(
+        &context,
+        &program,
+        vec![Factor(1)],
+    )
+    .unwrap();
+
+    assert_eq!(outputs, vec![Factor(1), Factor(3)]);
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
