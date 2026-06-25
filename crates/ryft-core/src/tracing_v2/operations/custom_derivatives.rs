@@ -209,10 +209,9 @@ where
 }
 
 /// Differentiates a `custom_jvp` call by running its forward-derivative rule; see [`custom_jvp_rule`].
-impl<V, O, D> DifferentiableOperation<D> for CustomJvpOperation<D::Type, V, O>
+impl<O, D> DifferentiableOperation<D> for CustomJvpOperation<D::Type, D::Constant, O>
 where
-    V: Value<D::Type>,
-    D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
+    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
@@ -222,8 +221,8 @@ where
             WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = LinearOperationOf<D>,
         >,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
-    Vec<V>: Parameterized<
-            V,
+    Vec<D::Constant>: Parameterized<
+            D::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
             To<<D as Domain>::Value> = Vec<<D as Domain>::Value>,
             To<D::Tangent> = Vec<D::Tangent>,
@@ -601,16 +600,15 @@ where
 }
 
 /// Differentiates a `custom_vjp` call by running its forward-derivative rule; see [`custom_vjp_rule`].
-impl<V, O, D> DifferentiableOperation<D> for CustomVjpOperation<D::Type, V, O>
+impl<O, D> DifferentiableOperation<D> for CustomVjpOperation<D::Type, D::Constant, O>
 where
-    V: Value<D::Type>,
-    D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
+    D: DifferentiationContext<Type: PartialEq> + Domain<Operation = O>,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<D::Type, V, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
+        + From<CustomVjpCallOperation<D::Type, D::Constant, O, ValueOrCapture<D::Type, <D as Domain>::Value>>>,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
-    Vec<V>: Parameterized<
-            V,
+    Vec<D::Constant>: Parameterized<
+            D::Constant,
             Family: ParameterizedFamily<D::Tangent> + ParameterizedFamily<<D as Domain>::Value>,
             To<<D as Domain>::Value> = Vec<<D as Domain>::Value>,
             To<D::Tangent> = Vec<D::Tangent>,

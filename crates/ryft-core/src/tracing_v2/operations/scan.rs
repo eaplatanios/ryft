@@ -167,14 +167,13 @@ where
 /// processed. Transposing the linear scan flips `reverse` (and transposes the body program), which pairs cotangent
 /// lane `i` with residual lane `i` in the opposite visit order — making reverse-mode differentiation through `scan`
 /// total, with no array-reversal operation anywhere.
-impl<V, D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<ArrayType, V, O>
+impl<D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<ArrayType, D::Constant, O>
 where
-    V: Value<ArrayType>,
-    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
+    D: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
         + From<BroadcastOperation>
-        + From<ScanOperation<ArrayType, V, O>>
+        + From<ScanOperation<ArrayType, D::Constant, O>>
         + LinearizableProgramOperation<D>,
     BodyOperation: Operation<ArrayType>,
     LinearOperationOf<D>: ResidualizedOperation<D>
@@ -229,7 +228,7 @@ where
         // Bind the residual-extended primal scan: the appended residual outputs become extra scanned outputs, so
         // the primal scan stores every per-iteration residual as a statically shaped stack. The lowering-only
         // unroll factor carries over from the differentiated scan.
-        let extended_scan = ScanOperation::<ArrayType, V, O>::new(primal_program, carry_count, length)?
+        let extended_scan = ScanOperation::<ArrayType, D::Constant, O>::new(primal_program, carry_count, length)?
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -297,11 +296,10 @@ where
     }
 }
 
-impl<V, D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<DataType, V, O>
+impl<D, O, BodyOperation> DifferentiableOperation<D> for ScanOperation<DataType, D::Constant, O>
 where
-    V: Value<DataType>,
-    D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = O>,
-    O: Clone + Operation<DataType> + From<ScanOperation<DataType, V, O>> + LinearizableProgramOperation<D>,
+    D: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
+    O: Clone + Operation<DataType> + From<ScanOperation<DataType, D::Constant, O>> + LinearizableProgramOperation<D>,
     BodyOperation: Operation<DataType>,
     LinearOperationOf<D>: ResidualizedOperation<D>
         + CaptureParameterizedOperation<
@@ -356,7 +354,7 @@ where
             });
         }
 
-        let extended_scan = ScanOperation::<DataType, V, O>::new(primal_program, carry_count, length)?
+        let extended_scan = ScanOperation::<DataType, D::Constant, O>::new(primal_program, carry_count, length)?
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();

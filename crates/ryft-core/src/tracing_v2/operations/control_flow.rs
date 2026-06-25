@@ -1243,14 +1243,13 @@ where
 /// The predicate is the first operand and its tangent is ignored (Boolean predicates have no tangent space).
 /// Reverse mode composes through the total linear-condition transpose rule, which transposes both branch programs
 /// and carries the predicate factor verbatim.
-impl<V, D, O> DifferentiableOperation<D> for ConditionOperation<ArrayType, V, O>
+impl<D, O> DifferentiableOperation<D> for ConditionOperation<ArrayType, D::Constant, O>
 where
-    V: Value<ArrayType>,
-    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
+    D: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     O: Clone
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<ArrayType, V, O>>
+        + From<ConditionOperation<ArrayType, D::Constant, O>>
         + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: CaptureParameterizedOperation<
             ArrayType,
@@ -1359,10 +1358,9 @@ where
     }
 }
 
-impl<V, D, O> DifferentiableOperation<D> for WhileOperation<DataType, V, O>
+impl<D, O> DifferentiableOperation<D> for WhileOperation<DataType, D::Constant, O>
 where
-    V: Value<DataType>,
-    D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = O>,
+    D: DifferentiationContext<Type = DataType> + Domain<Operation = O>,
     D::Value: BooleanLike,
     O: Clone + Operation<DataType> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: CaptureParameterizedOperation<
@@ -1370,8 +1368,8 @@ where
             ValueOrCapture<DataType, D::Value>,
             WithCapture<ValueOrCapture<DataType, D::Value>> = LinearOperationOf<D>,
         >,
-    Vec<V>: Parameterized<
-            V,
+    Vec<D::Constant>: Parameterized<
+            D::Constant,
             Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
             To<D::Value> = Vec<D::Value>,
             To<D::Tangent> = Vec<D::Tangent>,
@@ -1523,14 +1521,13 @@ where
 /// loop therefore requires an iteration bound (the masked-scan pushforward above transposes totally). Concretizing
 /// domains are unaffected: their pushforwards are straight-line and contain no loop to transpose, so eager reverse
 /// mode works even for unbounded loops.
-impl<V, D, O, BodyOperation> DifferentiableOperation<D> for WhileOperation<ArrayType, V, O>
+impl<D, O, BodyOperation> DifferentiableOperation<D> for WhileOperation<ArrayType, D::Constant, O>
 where
-    V: Value<ArrayType>,
-    D: DifferentiationContext<Type = ArrayType, Constant = V> + Domain<Operation = O>,
+    D: DifferentiationContext<Type = ArrayType> + Domain<Operation = O>,
     D::Value: BooleanLike,
     O: Clone
         + Operation<ArrayType>
-        + From<WhileOperation<ArrayType, V, O>>
+        + From<WhileOperation<ArrayType, D::Constant, O>>
         + DifferentiableOperation<D>
         + LinearizableProgramOperation<D>
         + From<ZeroOperation<ArrayType>>
@@ -1551,10 +1548,10 @@ where
         + From<WhileOperation<ArrayType, D::Tangent, LinearOperationOf<D>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, D::Value>>>
         + From<ScanOperation<ArrayType, D::Tangent, BodyOperation, ValueOrCapture<ArrayType, D::Value>, Input>>,
-    Vec<V>: Parameterized<
-            V,
+    Vec<D::Constant>: Parameterized<
+            D::Constant,
             Family: ParameterizedFamily<D::Value> + ParameterizedFamily<D::Tangent>,
-            To<V> = Vec<V>,
+            To<D::Constant> = Vec<D::Constant>,
             To<D::Value> = Vec<D::Value>,
             To<D::Tangent> = Vec<D::Tangent>,
             ParameterStructure: Debug + PartialEq,

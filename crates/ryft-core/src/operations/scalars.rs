@@ -63,17 +63,20 @@ pub enum ScalarOperation<V: Value<DataType>> {
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
-impl<V: Value<DataType>, D> DifferentiableOperation<D> for ScalarOperation<V>
+impl<
+    D: DifferentiationContext<Type = DataType, Value: ZeroLike + BooleanLike>
+        + Domain<Operation = ScalarOperation<<D as Domain>::Constant>>,
+> DifferentiableOperation<D> for ScalarOperation<D::Constant>
 where
     ZeroOperation<DataType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
     OneOperation<DataType>: DifferentiableOperation<D>,
     OneLikeOperation: DifferentiableOperation<D>,
-    ConstantOperation<DataType, V>: DifferentiableOperation<D>,
+    ConstantOperation<DataType, D::Constant>: DifferentiableOperation<D>,
     NegOperation: DifferentiableOperation<D>,
     AddOperation: DifferentiableOperation<D>,
     SubOperation: DifferentiableOperation<D>,
-    ScaleOperation<DataType, V>: DifferentiableOperation<D>,
+    ScaleOperation<DataType, D::Constant>: DifferentiableOperation<D>,
     MulOperation: DifferentiableOperation<D>,
     DivOperation: DifferentiableOperation<D>,
     SinOperation: DifferentiableOperation<D>,
@@ -82,10 +85,7 @@ where
     SelectOperation: DifferentiableOperation<D>,
     StopGradientOperation: DifferentiableOperation<D>,
     RematerializationNameOperation: DifferentiableOperation<D>,
-    D: DifferentiationContext<Type = DataType, Constant = V> + Domain<Operation = ScalarOperation<V>>,
-    D::Operation: From<ZeroOperation<DataType>> + From<OneOperation<DataType>>,
-    D::Value: ZeroLike + BooleanLike,
-    ScalarOperation<V>: Clone + LinearizableProgramOperation<D>,
+    ScalarOperation<D::Constant>: Clone + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: From<AddOperation>
         + From<ZeroLikeOperation>
         + From<NegOperation>
@@ -93,7 +93,14 @@ where
         + From<ScaleOperation<DataType, ValueOrCapture<DataType, D::Value>, Input>>
         + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
         + ResidualizedOperation<D>
-        + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, ValueOrCapture<DataType, D::Value>>>,
+        + From<
+            CustomVjpCallOperation<
+                DataType,
+                D::Constant,
+                ScalarOperation<D::Constant>,
+                ValueOrCapture<DataType, D::Value>,
+            >,
+        >,
     LinearOperationOf<D>: CaptureParameterizedOperation<
             DataType,
             ValueOrCapture<DataType, D::Value>,

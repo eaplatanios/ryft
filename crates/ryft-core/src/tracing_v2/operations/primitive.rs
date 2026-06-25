@@ -12,6 +12,7 @@ use ryft_macros::{Operation, TransposableOperation};
 
 use crate::batching::BatchingError;
 use crate::contexts::{EagerContext, StagingContext};
+use crate::domains::Domain;
 use crate::macros::check_count;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, Scale, ScaleOperation, SubOperation,
@@ -133,26 +134,21 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
 // `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
 impl<
-    V: Value<ArrayType>,
-    C: DifferentiationContext<
-            Type = ArrayType,
-            Value: ZeroLike + BooleanLike,
-            Constant = V,
-            Operation = ArrayOperation<V>,
-        >,
+    C: DifferentiationContext<Type = ArrayType, Value: ZeroLike + BooleanLike>
+        + Domain<Operation = ArrayOperation<<C as Domain>::Constant>>,
     BodyOperation,
-> DifferentiableOperation<C> for ArrayOperation<V>
+> DifferentiableOperation<C> for ArrayOperation<C::Constant>
 where
     ZeroOperation<ArrayType>: DifferentiableOperation<C>,
     ZeroLikeOperation: DifferentiableOperation<C>,
     OneOperation<ArrayType>: DifferentiableOperation<C>,
     OneLikeOperation: DifferentiableOperation<C>,
-    ConstantOperation<ArrayType, V>: DifferentiableOperation<C>,
+    ConstantOperation<ArrayType, C::Constant>: DifferentiableOperation<C>,
     FillOperation<ArrayType, f64>: DifferentiableOperation<C>,
     NegOperation: DifferentiableOperation<C>,
     AddOperation: DifferentiableOperation<C>,
     SubOperation: DifferentiableOperation<C>,
-    ScaleOperation<ArrayType, V>: DifferentiableOperation<C>,
+    ScaleOperation<ArrayType, C::Constant>: DifferentiableOperation<C>,
     MulOperation: DifferentiableOperation<C>,
     DivOperation: DifferentiableOperation<C>,
     SinOperation: DifferentiableOperation<C>,
@@ -200,8 +196,14 @@ where
         + From<ReshardOperation>
         + From<ShardingConstraintOperation>
         + ResidualizedOperation<C>
-        + From<CustomVjpCallOperation<ArrayType, V, ArrayOperation<V>, ValueOrCapture<ArrayType, C::Value>>>
-        + From<TransferToMemoryOperation>
+        + From<
+            CustomVjpCallOperation<
+                ArrayType,
+                C::Constant,
+                ArrayOperation<C::Constant>,
+                ValueOrCapture<ArrayType, C::Value>,
+            >,
+        > + From<TransferToMemoryOperation>
         + From<ConcatenateOperation>
         + From<LinearSelectOperation<ValueOrCapture<ArrayType, C::Value>>>
         + From<LinearDynamicSliceOperation<ValueOrCapture<ArrayType, C::Value>>>
@@ -217,7 +219,7 @@ where
                 Captured,
             >,
         > + From<MaterializeCaptureOperation<ValueOrCapture<ArrayType, C::Value>>>
-        + From<RecomputeOperation<ArrayOperation<V>>>
+        + From<RecomputeOperation<ArrayOperation<C::Constant>>>
         + From<WhileOperation<ArrayType, C::Tangent, LinearOperationOf<C>, Input>>
         + From<ScanOperation<ArrayType, C::Tangent, BodyOperation, ValueOrCapture<ArrayType, C::Value>, Input>>,
     LinearOperationOf<C>: CaptureParameterizedOperation<
@@ -225,9 +227,9 @@ where
             ValueOrCapture<ArrayType, C::Value>,
             WithCapture<ValueOrCapture<ArrayType, C::Value>> = LinearOperationOf<C>,
             WithCapture<ValueOrCapture<ArrayType, C::Tangent>> = BodyOperation,
-        > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<V>>,
+        > + DefactorizableProgramOperation<C::Tangent, C::Value, ArrayOperation<C::Constant>>,
     LinearOperationOf<C>: MaybeZeroOperation<ArrayType>,
-    ArrayOperation<V>: Clone + LinearizableProgramOperation<C>,
+    ArrayOperation<C::Constant>: Clone + LinearizableProgramOperation<C>,
 {
     fn jvp<'jvp>(
         &self,
