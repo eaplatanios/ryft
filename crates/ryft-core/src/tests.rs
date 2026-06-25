@@ -966,7 +966,7 @@ impl Context for TestArrayDomain {
 
 impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
+    type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> =
         LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 }
 

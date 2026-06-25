@@ -2085,6 +2085,16 @@ mod tests {
             }
         }
 
+        impl BooleanLike for CloneCountingValue {
+            fn as_boolean(&self) -> Self {
+                Self::new(if self.value != 0.0 { 1.0 } else { 0.0 }, Rc::clone(&self.clone_count))
+            }
+
+            fn boolean(&self) -> Result<bool, ProgramError> {
+                Ok(self.value != 0.0)
+            }
+        }
+
         let value_clone_count = Rc::new(Cell::new(0));
         let mut builder = ProgramBuilder::<_, _, ScalarOperation<CloneCountingValue>>::new();
         let i0 = builder.add_input(DataType::F64);

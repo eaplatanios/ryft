@@ -74,8 +74,10 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
     }
 }
 
-impl<V: Value<ArrayType>, O: InterpretableOperation<ArrayType, V>> InterpretableOperation<ArrayType, V>
-    for RecomputeOperation<O>
+impl<V, O> InterpretableOperation<ArrayType, V> for RecomputeOperation<O>
+where
+    V: Value<ArrayType>,
+    O: InterpretableOperation<ArrayType, V>,
 {
     #[inline]
     fn interpret(

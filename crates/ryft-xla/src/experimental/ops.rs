@@ -75,7 +75,7 @@ pub type XlaConstant = CapturedConstant<ArrayType>;
 /// such as [`jit_call`](JitCallOperation) and [`shard_map`](ShardMapOperation).
 #[derive(Clone, Debug, Operation)]
 #[ryft(crate = "ryft_core")]
-pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
+pub enum XlaOperation<V: Value<ArrayType> + BooleanLike = XlaConstant> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
@@ -140,13 +140,13 @@ pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
     LinearShardMap(Box<LinearShardMapOperation<V>>),
 }
 
-fn map_core_xla_program<V: Value<ArrayType>>(
+fn map_core_xla_program<V: Value<ArrayType> + BooleanLike>(
     program: &Program<ArrayType, V, ArrayOperation<V>, Vec<V>, Vec<V>>,
 ) -> Program<ArrayType, V, XlaOperation<V>, Vec<V>, Vec<V>> {
     program.map_operations(|operation| Ok(XlaOperation::from(operation.clone()))).unwrap()
 }
 
-impl<V: Value<ArrayType>> From<ArrayOperation<V>> for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> From<ArrayOperation<V>> for XlaOperation<V> {
     fn from(operation: ArrayOperation<V>) -> Self {
         match operation {
             ArrayOperation::Zero(operation) => Self::Zero(operation),
@@ -197,7 +197,7 @@ impl<V: Value<ArrayType>> From<ArrayOperation<V>> for XlaOperation<V> {
     }
 }
 
-impl<V: Value<ArrayType>> From<ConditionOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> From<ConditionOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
     fn from(operation: ConditionOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
         Self::Condition(Box::new(
             ConditionOperation::new(
@@ -209,7 +209,7 @@ impl<V: Value<ArrayType>> From<ConditionOperation<ArrayType, V, ArrayOperation<V
     }
 }
 
-impl<V: Value<ArrayType>> From<WhileOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> From<WhileOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
     fn from(operation: WhileOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
         Self::While(Box::new(
             WhileOperation::new(map_core_xla_program(operation.condition()), map_core_xla_program(operation.body()))
@@ -220,7 +220,7 @@ impl<V: Value<ArrayType>> From<WhileOperation<ArrayType, V, ArrayOperation<V>>> 
     }
 }
 
-impl<V: Value<ArrayType>> From<ScanOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> From<ScanOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
     fn from(operation: ScanOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
         Self::Scan(Box::new(
             ScanOperation::new(map_core_xla_program(operation.body()), operation.carry_count(), operation.length())
@@ -233,7 +233,7 @@ impl<V: Value<ArrayType>> From<ScanOperation<ArrayType, V, ArrayOperation<V>>> f
     }
 }
 
-impl<V: Value<ArrayType>> From<CustomJvpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> From<CustomJvpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
     fn from(operation: CustomJvpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
         Self::CustomJvp(Box::new(
             CustomJvpOperation::new(
@@ -245,7 +245,7 @@ impl<V: Value<ArrayType>> From<CustomJvpOperation<ArrayType, V, ArrayOperation<V
     }
 }
 
-impl<V: Value<ArrayType>> From<CustomVjpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> From<CustomVjpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V> {
     fn from(core_operation: CustomVjpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
         let mut operation = CustomVjpOperation::new(
             map_core_xla_program(core_operation.primal()),
@@ -261,7 +261,7 @@ impl<V: Value<ArrayType>> From<CustomVjpOperation<ArrayType, V, ArrayOperation<V
     }
 }
 
-impl<V: Value<ArrayType>> ryft_core::tracing_v2::operations::MaybeDot for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> ryft_core::tracing_v2::operations::MaybeDot for XlaOperation<V> {
     #[inline]
     fn dot_dimensions(&self) -> Option<&ryft_core::tracing_v2::DotDimensionNumbers> {
         match self {
@@ -271,7 +271,9 @@ impl<V: Value<ArrayType>> ryft_core::tracing_v2::operations::MaybeDot for XlaOpe
     }
 }
 
-impl<V: Value<ArrayType>> ryft_core::tracing_v2::rematerialization::MaybeRematerializationName for XlaOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> ryft_core::tracing_v2::rematerialization::MaybeRematerializationName
+    for XlaOperation<V>
+{
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
         match self {
@@ -730,7 +732,7 @@ pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
 #[derive(Clone, Debug, Operation, ryft_macros::TransposableOperation)]
 #[ryft(crate = "ryft_core")]
 pub enum LinearXlaOperation<
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType> = XlaConstant,
     F: Value<ArrayType> = V,
     P: Clone + Operation<ArrayType> = XlaOperation,
@@ -790,7 +792,7 @@ pub enum LinearXlaOperation<
 
 impl<V, C, F, P, CaptureFactor> LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -842,7 +844,7 @@ where
 
 impl<V, C, F, P, CaptureFactor> From<LinearArrayOperation<V, C, F, P>> for LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -933,7 +935,7 @@ impl<V, C, F, P, CaptureFactor>
     From<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>
     for LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -971,7 +973,7 @@ fn map_linear_xla_operation_captures<V, C, F, MappedFactor, P, MapFactorFn>(
     map_factor: &mut MapFactorFn,
 ) -> Result<LinearXlaOperation<V, C, MappedFactor, P, MappedFactor>, ProgramError>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
@@ -1044,7 +1046,7 @@ where
 
 impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearXlaOperation<V, C, F, P, F>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -1065,7 +1067,7 @@ where
 impl<V, C, R, P> DefactorizableProgramOperation<V, R, P>
     for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
@@ -1362,7 +1364,7 @@ impl JitCallOperation {
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         PrimalValue: Value<ArrayType>,
-        TangentValue: Value<ArrayType>,
+        TangentValue: Value<ArrayType> + BooleanLike,
         E: DifferentiationContext<
                 Tangent = TangentValue,
                 LinearOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>> = LinearXlaOperation<

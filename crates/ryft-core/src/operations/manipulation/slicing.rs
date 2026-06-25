@@ -1028,7 +1028,7 @@ where
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let start_indices =
-            self.start_indices().iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+            self.start_indices().iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
         Ok(vec![inputs[0].dynamic_slice(start_indices.as_slice(), self.sizes())?])
     }
 }
@@ -1135,7 +1135,7 @@ where
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let start_indices =
-            self.start_indices().iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+            self.start_indices().iter().map(|index| index.residual_value()).collect::<Result<Vec<_>, _>>()?;
         Ok(vec![inputs[0].dynamic_update_slice(&inputs[1], start_indices.as_slice())?])
     }
 }

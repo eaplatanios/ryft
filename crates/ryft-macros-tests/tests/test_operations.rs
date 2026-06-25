@@ -429,7 +429,7 @@ fn test_operation_generates_interpretation_forwarding() {
     let context = TestContext::<DataType, Factor> { marker: PhantomData };
     let operation = ScalarOperation::<Factor>::from(AddOperation);
 
-    assert_eq!(operation.interpret(&context, &[Factor(1), Factor(2)]), Ok(vec![Factor(1), Factor(2)]));
+    assert_eq!(operation.interpret(&context, &[Factor(1), Factor(2)]), Ok(vec![Factor(1), Factor(2)]),);
 }
 
 #[test]

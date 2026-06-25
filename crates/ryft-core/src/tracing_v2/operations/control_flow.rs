@@ -841,14 +841,18 @@ fn remap_branch_residual_factors<D>(
 ) -> Result<Program<ArrayType, D::Tangent, LinearOperationOf<D>, Vec<D::Tangent>, Vec<D::Tangent>>, ProgramError>
 where
     D: DifferentiationContext<Type = ArrayType>,
-    LinearOperationOf<D>:
-        CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>> + ResidualizedOperation<D>,
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, D::Value>,
+            WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
+        > + ResidualizedOperation<D>,
 {
     program.map_operations(|operation| {
         operation.try_map_captures(&mut |factor| match factor {
             ValueOrCapture::Capture { index, .. } => factors.get(*index).cloned().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "condition branch pushforward references residual {index} but only {} residuals were captured",
+                    "condition branch pushforward references residual {} but only {} residuals were captured",
+                    index,
                     factors.len(),
                 ))
             }),
@@ -1248,8 +1252,11 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<ConditionOperation<ArrayType, V, O>>
         + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, D::Value>>
-        + ResidualizedOperation<D>
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            ArrayType,
+            ValueOrCapture<ArrayType, D::Value>,
+            WithCapture<ValueOrCapture<ArrayType, D::Value>> = LinearOperationOf<D>,
+        > + ResidualizedOperation<D>
         + From<
             ConditionOperation<
                 ArrayType,
@@ -1428,8 +1435,9 @@ where
                         ValueOrCapture::Capture { index, .. } => {
                             residual_factors.get(*index).cloned().ok_or_else(|| {
                                 ProgramError::MalformedProgram(format!(
-                                    "while body pushforward references residual {index} but only {} residuals \
+                                    "while body pushforward references residual {} but only {} residuals \
                                      were captured",
+                                    index,
                                     residual_factors.len(),
                                 ))
                             })
@@ -1620,8 +1628,9 @@ where
                             ValueOrCapture::Capture { index, .. } => {
                                 residual_factors.get(*index).cloned().ok_or_else(|| {
                                     ProgramError::MalformedProgram(format!(
-                                        "while body pushforward references residual {index} but only {} residuals \
+                                        "while body pushforward references residual {} but only {} residuals \
                                          were captured",
+                                        index,
                                         residual_factors.len(),
                                     ))
                                 })
@@ -2485,7 +2494,7 @@ impl<V, F, O> InterpretableOperation<ArrayType, V> for ConditionOperation<ArrayT
 where
     V: Value<ArrayType> + BooleanLike,
     F: CustomVjpResidual<ArrayType, V>,
-    O: InterpretableProgramOperation<ArrayType, V>,
+    O: InterpretableProgramOperation<ArrayType, V, V>,
 {
     fn interpret(
         &self,
@@ -3339,7 +3348,7 @@ mod tests {
 
     impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
-        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = TestLinearOperation;
+        type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> = TestLinearOperation;
     }
 
     impl ProvidesContext<<TestValue as Value<ArrayType>>::InterpretationContext> for TestDomain {
@@ -4003,7 +4012,7 @@ mod tests {
 
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
-        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
+        type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> =
             LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {

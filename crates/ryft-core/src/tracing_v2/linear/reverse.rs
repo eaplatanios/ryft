@@ -314,6 +314,16 @@ mod tests {
         }
     }
 
+    impl BooleanLike for TestValue {
+        fn as_boolean(&self) -> Self {
+            Self(if self.0 != 0.0 { 1.0 } else { 0.0 })
+        }
+
+        fn boolean(&self) -> Result<bool, ProgramError> {
+            Ok(self.0 != 0.0)
+        }
+    }
+
     impl ZeroLike for TestValue {
         fn zero_like(&self) -> Self {
             Self(0.0)
@@ -600,7 +610,7 @@ mod tests {
 
     impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
-        type LinearOperation<V: Value<TestType>, F: Value<TestType>> = TestLinearOperation;
+        type LinearOperation<V: Value<TestType> + BooleanLike, F: Value<TestType>> = TestLinearOperation;
     }
 
     impl ProvidesContext<<TestValue as Value<TestType>>::InterpretationContext> for TestDomain {

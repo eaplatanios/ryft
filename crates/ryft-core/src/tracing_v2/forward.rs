@@ -18,7 +18,7 @@ mod tests {
     use crate::operations::constants::{MaybeZeroOperation, One, OneLike, OneOperation, Zero, ZeroLike, ZeroOperation};
     use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
     use crate::operations::trigonometric::Sin;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::operations::{BooleanLike, InterpretableOperation, Operation};
     use crate::parameters::{Parameter, ParameterError, Parameterized};
     use crate::payloads::Input;
     use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
@@ -141,6 +141,16 @@ mod tests {
         #[inline]
         fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
             Some(EagerContext::new())
+        }
+    }
+
+    impl BooleanLike for DistinctTangent {
+        fn as_boolean(&self) -> Self {
+            Self(if self.0 != 0.0 { 1.0 } else { 0.0 })
+        }
+
+        fn boolean(&self) -> Result<bool, ProgramError> {
+            Ok(self.0 != 0.0)
         }
     }
 
@@ -499,7 +509,7 @@ mod tests {
 
     impl DifferentiationContext for DistinctPrimalDomain {
         type Tangent = DistinctTangent;
-        type LinearOperation<V: Value<DataType>, F: Value<DataType>> = DistinctLinearOperation<F>;
+        type LinearOperation<V: Value<DataType> + BooleanLike, F: Value<DataType>> = DistinctLinearOperation<F>;
     }
 
     impl ProvidesContext<<DistinctPrimal as Value<DataType>>::InterpretationContext> for DistinctPrimalDomain {

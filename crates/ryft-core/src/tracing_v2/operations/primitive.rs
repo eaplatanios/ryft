@@ -85,7 +85,7 @@ use crate::operations::manipulation::Reshape;
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`],
 /// [`Scale`](Self::Scale) a [`ScaleOperation`], and [`Dot`](Self::Dot) a [`DotOperation`].
 #[derive(Clone, Debug, Operation)]
-pub enum ArrayOperation<V: Value<ArrayType>> {
+pub enum ArrayOperation<V: Value<ArrayType> + BooleanLike> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
@@ -138,7 +138,7 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
 // `Condition`/`While`/`Scan` and `CustomJvp`/`CustomVjp` arms resolve against this impl's assumed
 // `Self: DifferentiableOperation<D>`. The remaining where-clause spells the leaf closure of value and
 // linear-operation capabilities those per-variant rules require.
-impl<V: Value<ArrayType>, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
+impl<V: Value<ArrayType> + BooleanLike, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
 where
     ZeroOperation<ArrayType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
@@ -308,7 +308,7 @@ where
 /// context constants rather than over the linear program's tangent constants.
 #[derive(Clone, Debug, Operation, TransposableOperation)]
 pub enum LinearArrayOperation<
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -351,7 +351,7 @@ pub enum LinearArrayOperation<
     CustomVjpCall(Box<CustomVjpCallOperation<ArrayType, C, P, F>>),
 }
 
-impl<V: Value<ArrayType>> MaybeRematerializationName for ArrayOperation<V> {
+impl<V: Value<ArrayType> + BooleanLike> MaybeRematerializationName for ArrayOperation<V> {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
         match self {
@@ -363,7 +363,7 @@ impl<V: Value<ArrayType>> MaybeRematerializationName for ArrayOperation<V> {
 
 impl<V> MaybeDot for ArrayOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
@@ -381,7 +381,7 @@ fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
     map_factor: &mut MapFactorFn,
 ) -> Result<LinearArrayOperation<V, C, MappedFactor, P>, ProgramError>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
@@ -518,7 +518,7 @@ where
 // TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, F, P>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -539,7 +539,7 @@ where
 // TODO(eaplatanios): Fold this into our `TransposableOperation` derive macro.
 impl<V, C, R, P> DefactorizableProgramOperation<V, R, P> for LinearArrayOperation<V, C, ValueOrCapture<ArrayType, R>, P>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     C: Value<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
@@ -580,7 +580,7 @@ fn batch_array_non_control_operation<F, V>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
-    F: Value<ArrayType>,
+    F: Value<ArrayType> + BooleanLike,
     V: Value<ArrayType>
         + SupportsArithmeticOperations<F>
         + SupportsTrigonometricOperations
@@ -803,7 +803,7 @@ where
 /// to `LinearizationContextOf<E, ..>` and keeps the obligations finite for nested conditions.
 impl<V, E, BodyOperation> LinearizableProgramOperation<E> for ArrayOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<ArrayType> + BooleanLike,
     E: DifferentiationContext<Type = ArrayType, Constant = V>,
     E::Tangent: Transpose + Broadcast + super::reduce::Reduce + Slice + Reshard + ConstrainSharding,
     E::LinearOperation<E::Tangent, V>:
@@ -872,8 +872,8 @@ fn batch_linear_non_control_operation<F, C, V>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<Option<Vec<ArrayBatch<V>>>, ProgramError>
 where
-    F: Value<ArrayType>,
-    C: Value<ArrayType>,
+    F: Value<ArrayType> + BooleanLike,
+    C: Value<ArrayType> + BooleanLike,
     V: Value<ArrayType>
         + SupportsLinearArithmeticOperations<F>
         + ZeroLike

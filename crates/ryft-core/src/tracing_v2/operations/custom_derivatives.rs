@@ -149,6 +149,11 @@ where
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
     LinearOperationOf<D>: ResidualizedOperation<D>,
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            D::Type,
+            ValueOrCapture<D::Type, <D as Domain>::Value>,
+            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = LinearOperationOf<D>,
+        >,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<<D as Domain>::Constant>: Parameterized<
             <D as Domain>::Constant,
@@ -211,7 +216,12 @@ where
     D: DifferentiationContext<Type: PartialEq, Constant = V> + Domain<Operation = O>,
     <D as Domain>::Value: ZeroLike,
     O: Clone + DifferentiableOperation<D> + LinearizableProgramOperation<D>,
-    LinearOperationOf<D>: ResidualizedOperation<D>,
+    LinearOperationOf<D>: ResidualizedOperation<D>
+        + CaptureParameterizedOperation<
+            D::Type,
+            ValueOrCapture<D::Type, <D as Domain>::Value>,
+            WithCapture<ValueOrCapture<D::Type, <D as Domain>::Value>> = LinearOperationOf<D>,
+        >,
     LinearOperationOf<D>: MaybeZeroOperation<D::Type>,
     Vec<V>: Parameterized<
             V,
@@ -674,8 +684,8 @@ where
 
 /// Access to a custom-VJP residual payload as a concrete value during pullback interpretation.
 ///
-/// Implemented by plain values (identity) and by [`ValueOrCapture`] (whose `Constant` form yields its payload and
-/// whose `Reference` form errors, since references are only meaningful before residual instantiation).
+/// Implemented by plain values (identity) and by [`ValueOrCapture`] (whose [`Value`](ValueOrCapture::Value) form yields
+/// its payload and whose [`Capture`](ValueOrCapture::Capture) form must have been instantiated before interpretation).
 #[doc(hidden)]
 pub trait CustomVjpResidual<T: Type, V: Value<T>>: Value<T> {
     /// Returns the concrete residual value.
@@ -692,11 +702,10 @@ impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for V {
 impl<T: Type, V: Value<T>> CustomVjpResidual<T, V> for ValueOrCapture<T, V> {
     fn residual_value(&self) -> Result<V, ProgramError> {
         match self {
-            ValueOrCapture::Value(value) => Ok(value.clone()),
-            ValueOrCapture::Capture { .. } => Err(TypeError {
-                message: "custom_vjp pullback interpretation requires instantiated residuals".to_string(),
-            }
-            .into()),
+            Self::Value(value) => Ok(value.clone()),
+            Self::Capture { .. } => Err(ProgramError::Concretization {
+                message: "custom_vjp residual requires instantiated captures".to_string(),
+            }),
         }
     }
 }
@@ -882,8 +891,11 @@ where
             }
             .into());
         };
-        let mut values =
-            operation.residuals.iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+        let mut values = operation
+            .residuals
+            .iter()
+            .map(|residual| residual.residual_value())
+            .collect::<Result<Vec<_>, _>>()?;
         values.extend(inputs.iter().cloned());
         program.interpret_with(
             values,

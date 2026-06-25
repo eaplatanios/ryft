@@ -634,6 +634,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::BooleanLike;
     use crate::ProvidesContext;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::compare::CompareOperation;
@@ -696,7 +697,7 @@ mod tests {
 
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
-        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
+        type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> =
             LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {

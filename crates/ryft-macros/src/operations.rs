@@ -199,6 +199,11 @@ impl CodeGenerator {
             interpretation_where_clause
                 .predicates
                 .push(syn::parse_quote!(#interpretation_value_type: #ryft::Value<#primary_type>));
+            interpretation_where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
+                &input.generics,
+                &program_constant_type,
+                &interpretation_value_type,
+            ));
         }
         interpretation_where_clause
             .predicates
@@ -224,6 +229,11 @@ impl CodeGenerator {
             program_interpretation_where_clause
                 .predicates
                 .push(syn::parse_quote!(#interpretation_value_type: #ryft::Value<#primary_type>));
+            program_interpretation_where_clause.predicates.extend(generic_parameter_bounds_as_predicates(
+                &input.generics,
+                &program_constant_type,
+                &interpretation_value_type,
+            ));
             program_interpretation_where_clause.predicates.push(syn::parse_quote! {
                 <#interpretation_value_type as #ryft::Value<#primary_type>>::InterpretationContext:
                     #ryft::Context<
@@ -231,14 +241,6 @@ impl CodeGenerator {
                         Constant = #program_constant_type,
                         Value = #interpretation_value_type,
                     >
-            });
-        }
-        if variants
-            .iter()
-            .any(|variant| variant.is_recursive_payload && variant.requires_program_boolean_like_bound())
-        {
-            program_interpretation_where_clause.predicates.push(syn::parse_quote! {
-                #interpretation_value_type: #ryft::BooleanLike
             });
         }
         if variants
@@ -746,11 +748,6 @@ impl OperationVariant {
         if self.is_boxed { quote!(&**operation) } else { quote!(operation) }
     }
 
-    /// Returns whether this payload needs Boolean predicate extraction for recursive program interpretation.
-    fn requires_program_boolean_like_bound(&self) -> bool {
-        self.operation_type_mentions("ConditionOperation") || self.operation_type_mentions("WhileOperation")
-    }
-
     /// Returns whether this payload needs scan lane capabilities for recursive program interpretation.
     fn requires_program_scan_value_bounds(&self) -> bool {
         self.operation_type_mentions("ScanOperation")
@@ -904,6 +901,33 @@ fn substitute_generics(generics: &syn::Generics, substitutions: &[(syn::Ident, s
         .collect();
     TypeIdentSubstituter { substitutions }.visit_generics_mut(&mut generics);
     generics
+}
+
+/// Copies bounds from a generic parameter to a generated type.
+fn generic_parameter_bounds_as_predicates(
+    generics: &syn::Generics,
+    source: &syn::Ident,
+    target: &syn::Type,
+) -> Vec<syn::WherePredicate> {
+    let mut predicates = generics
+        .type_params()
+        .find(|parameter| parameter.ident == *source)
+        .into_iter()
+        .flat_map(|parameter| parameter.bounds.iter())
+        .map(|bound| syn::parse_quote!(#target: #bound))
+        .collect::<Vec<syn::WherePredicate>>();
+    if let Some(where_clause) = &generics.where_clause {
+        predicates.extend(where_clause.predicates.iter().filter_map(|predicate| match predicate {
+            syn::WherePredicate::Type(predicate) if type_is_ident(&predicate.bounded_ty, source) => {
+                let mut predicate = syn::WherePredicate::Type(predicate.clone());
+                TypeIdentSubstituter { substitutions: &[(source.clone(), target.clone())] }
+                    .visit_where_predicate_mut(&mut predicate);
+                Some(predicate)
+            }
+            _ => None,
+        }));
+    }
+    predicates
 }
 
 /// Visitor replacing bare type identifiers with concrete types.

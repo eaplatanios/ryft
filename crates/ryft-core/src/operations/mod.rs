@@ -218,14 +218,17 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - For enums with one `Value<T>` parameter, the payload parameter is treated as the nested program's captured
 ///     constant type `C`, and the derived [`InterpretableOperation`] implementation is generic over a runtime value
 ///     `V`. The generated [`InterpretableProgramOperation`] implementation requires `V::InterpretationContext` to be a
-///     [`Context`] that can lift constants from `C` into `V`.
+///     [`Context`] that can lift constants from `C` into `V`. Bounds declared on the enum's value parameter, such as
+///     [`BooleanLike`], are also applied to this generated runtime value parameter, so recursive higher-order payloads
+///     inherit the enum's declared value contract without special cases in the macro.
 ///   - For enums with two or more `Value<T>` parameters, the first value parameter is treated as both the runtime value
 ///     type and the nested program constant type for direct program interpretation. Later value parameters remain
 ///     payload-specific metadata unless the generated program witness needs to instantiate a direct-linear operation
 ///     family, in which case extra value parameters after the first two are substituted with the first value parameter.
-///   - For recursive operation enums, the generated nested-program witness requires the runtime value capabilities
-///     needed by the recursive higher-order payloads it contains. Condition and while payloads require
-///     [`BooleanLike`] for predicate extraction.
+///   - For recursive operation enums, the generated nested-program witness inherits value capabilities from the enum
+///     declaration and from payload-owned [`InterpretableOperation`] implementations. If a higher-order payload needs
+///     a capability such as [`BooleanLike`] for predicate extraction, declare that capability on the enum value
+///     parameter or on the payload implementation that owns the rule.
 ///
 /// The derivation macro also supports the `#[ryft(crate = "...")]` attribute to override the path used to reference
 /// Ryft traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on
@@ -420,6 +423,15 @@ macro_rules! impl_boolean_like_for_scalar {
 }
 
 impl_boolean_like_for_scalar!(
+    bool => (false, true),
+    i8 => (0, 1),
+    i16 => (0, 1),
+    i32 => (0, 1),
+    i64 => (0, 1),
+    u8 => (0, 1),
+    u16 => (0, 1),
+    u32 => (0, 1),
+    u64 => (0, 1),
     bf16 => (bf16::ZERO, bf16::ONE),
     f16 => (f16::ZERO, f16::ONE),
     f32 => (0.0, 1.0),

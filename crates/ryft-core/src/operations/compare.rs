@@ -244,7 +244,7 @@ mod tests {
             <CompareOperation as InterpretableOperation<DataType, f64>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &[2.0f64, 3.0f64]
+                &[2.0f64, 3.0f64],
             ),
             Ok(vec![1.0])
         );

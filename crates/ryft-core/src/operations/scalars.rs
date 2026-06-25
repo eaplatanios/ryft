@@ -23,6 +23,7 @@ use crate::tracing_v2::differentiation::{
     CaptureParameterizedOperation, JvpTracer, LinearOperationOf, LinearizationContextOf, NestedLinearization,
     TangentContext,
 };
+use crate::tracing_v2::operations::MaybeDot;
 use crate::tracing_v2::operations::bounds::{SupportsLinearScalarOperation, SupportsTrigonometricOperations};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, custom_jvp_rule, custom_vjp_rule,
@@ -30,8 +31,8 @@ use crate::tracing_v2::operations::custom_derivatives::{
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, LinearizableProgramOperation, RematerializationName,
-    ResidualizedOperation, ValueOrCapture,
+    DifferentiableOperation, DifferentiationContext, DotDimensionNumbers, LinearizableProgramOperation,
+    RematerializationName, ResidualizedOperation, ValueOrCapture,
 };
 use crate::types::DataType;
 
@@ -43,7 +44,7 @@ use crate::types::DataType;
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug, Operation)]
-pub enum ScalarOperation<V: Value<DataType>> {
+pub enum ScalarOperation<V: Value<DataType> + BooleanLike> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
@@ -66,7 +67,7 @@ pub enum ScalarOperation<V: Value<DataType>> {
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
 }
 
-impl<V: Value<DataType>, D> DifferentiableOperation<D> for ScalarOperation<V>
+impl<V: Value<DataType> + BooleanLike, D> DifferentiableOperation<D> for ScalarOperation<V>
 where
     ZeroOperation<DataType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
@@ -108,6 +109,11 @@ where
         + From<LinearSelectOperation<ValueOrCapture<DataType, D::Value>>>
         + ResidualizedOperation<D>
         + From<CustomVjpCallOperation<DataType, V, ScalarOperation<V>, ValueOrCapture<DataType, D::Value>>>,
+    LinearOperationOf<D>: CaptureParameterizedOperation<
+            DataType,
+            ValueOrCapture<DataType, D::Value>,
+            WithCapture<ValueOrCapture<DataType, D::Value>> = LinearOperationOf<D>,
+        >,
     LinearOperationOf<D>: MaybeZeroOperation<DataType>,
     Vec<V>: Parameterized<
             V,
@@ -160,7 +166,7 @@ where
 /// obligation back into every consumer.
 impl<F, E> LinearizableProgramOperation<E> for ScalarOperation<F>
 where
-    F: Value<DataType>,
+    F: Value<DataType> + BooleanLike,
     E: DifferentiationContext<Type = DataType, Constant = F>,
     E::LinearOperation<E::Tangent, F>:
         CaptureParameterizedOperation<DataType, F, WithCapture<F> = E::LinearOperation<E::Tangent, F>>,
@@ -208,7 +214,11 @@ where
 /// [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp` linearization (its transpose replays the user's
 /// backward program).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
-pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Value<DataType> = C> {
+pub enum LinearScalarOperation<
+    V: Value<DataType> + BooleanLike,
+    C: Value<DataType> + BooleanLike = V,
+    F: Value<DataType> = C,
+> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
@@ -223,8 +233,8 @@ pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Va
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
 
-impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
-    for LinearScalarOperation<V, C, F>
+impl<V: Value<DataType> + BooleanLike, C: Value<DataType> + BooleanLike, F: Value<DataType>>
+    CaptureParameterizedOperation<DataType, F> for LinearScalarOperation<V, C, F>
 {
     type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, C, MappedFactor>;
 
@@ -266,7 +276,7 @@ impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParamete
     }
 }
 
-impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
+impl<V: Value<DataType> + BooleanLike> MaybeRematerializationName for ScalarOperation<V> {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
         match self {
@@ -276,9 +286,9 @@ impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
     }
 }
 
-impl<V: Value<DataType>> crate::tracing_v2::operations::dot::MaybeDot for ScalarOperation<V> {
+impl<V: Value<DataType> + BooleanLike> MaybeDot for ScalarOperation<V> {
     #[inline]
-    fn dot_dimensions(&self) -> Option<&crate::tracing_v2::operations::dot::DotDimensionNumbers> {
+    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         None
     }
 }

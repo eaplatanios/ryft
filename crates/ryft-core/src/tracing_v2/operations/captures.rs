@@ -16,9 +16,9 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 /// capture environment.
 ///
 /// A [`ValueOrCapture`] represents a primal value that a linearized tangent or cotangent program closes over. The
-/// value can be carried directly in the operation payload via [`Value`](Self::Value), or it can be represented as a
-/// [`Capture`](Self::Capture) into an external capture environment, such as a
-/// [`Pushforward`](crate::tracing_v2::Pushforward)'s residual table or a higher-order program's capture list.
+/// value can be carried directly in the operation payload via [`Value`](Self::Value), or it can be represented as an
+/// index into an external capture environment, such as a [`Pushforward`](crate::tracing_v2::Pushforward)'s residual
+/// table or a higher-order program's capture list.
 #[derive(Clone, Debug, Parameter)]
 pub enum ValueOrCapture<T: Type, V: Value<T>> {
     /// Embedded value that is independent of a capture environment.
@@ -26,7 +26,7 @@ pub enum ValueOrCapture<T: Type, V: Value<T>> {
 
     /// Reference to a value supplied by the owning capture environment.
     Capture {
-        /// Zero-based capture index inside the owning environment.
+        /// Zero-based index into the owning capture table.
         index: usize,
 
         /// Type metadata for the captured value.
@@ -46,7 +46,7 @@ impl<T: Type, V: Value<T>> ValueOrCapture<T, V> {
     }
 
     /// Returns this payload's capture index, if it references one.
-    pub(crate) fn residual_index(&self) -> Option<usize> {
+    pub fn residual_index(&self) -> Option<usize> {
         match self {
             Self::Value(_) => None,
             Self::Capture { index, .. } => Some(*index),
@@ -54,7 +54,7 @@ impl<T: Type, V: Value<T>> ValueOrCapture<T, V> {
     }
 
     /// Remaps this payload through a compacted capture-index table.
-    pub(crate) fn remap_residuals(&self, mapping: &[Option<usize>]) -> Result<Self, ProgramError> {
+    pub fn remap_residuals(&self, mapping: &[Option<usize>]) -> Result<Self, ProgramError> {
         match self {
             Self::Value(value) => Ok(Self::Value(value.clone())),
             Self::Capture { index: old_index, r#type } => {

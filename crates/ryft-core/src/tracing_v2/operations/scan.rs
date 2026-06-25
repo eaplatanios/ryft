@@ -65,7 +65,7 @@ where
     Capture: Value<DataType>,
     O: CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>,
     <O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<V>:
-        InterpretableProgramOperation<DataType, V>,
+        InterpretableProgramOperation<DataType, V, V>,
 {
     fn interpret_scan(
         operation: &ScanOperation<DataType, V, O, Capture, Self>,
@@ -81,9 +81,7 @@ where
             lanes.reverse();
         }
         for _ in lanes {
-            state = <<O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<
-                V,
-            > as InterpretableProgramOperation<DataType, V>>::interpret_program(
+            state = <<O as CaptureParameterizedOperation<DataType, ValueOrCapture<DataType, V>>>::WithCapture<V> as InterpretableProgramOperation<DataType, V, V>>::interpret_program(
                 context, &body, state,
             )?;
             check_count!("output", state, operation.carry_count(), ProgramError);
@@ -99,7 +97,7 @@ where
     F: CustomVjpResidual<ArrayType, V>,
     O: CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>,
     <O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<V>:
-        InterpretableProgramOperation<ArrayType, V>,
+        InterpretableProgramOperation<ArrayType, V, V>,
     Vec<V>: Parameterized<V, To<V> = Vec<V>, ParameterStructure: Debug + PartialEq>,
 {
     fn interpret_scan(
@@ -108,7 +106,7 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let stack_values =
-            operation.captures().iter().map(CustomVjpResidual::residual_value).collect::<Result<Vec<_>, _>>()?;
+            operation.captures().iter().map(|capture| capture.residual_value()).collect::<Result<Vec<_>, _>>()?;
         let body = operation.body();
         let carry_count = operation.carry_count();
         let y_slice_types = body.output_types().split_off(carry_count);
@@ -127,9 +125,7 @@ where
                         capture.instantiate(&lane_residuals)
                     })
                 })?;
-                <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<
-                    V,
-                > as InterpretableProgramOperation<ArrayType, V>>::interpret_program(
+                <<O as CaptureParameterizedOperation<ArrayType, ValueOrCapture<ArrayType, V>>>::WithCapture<V> as InterpretableProgramOperation<ArrayType, V, V>>::interpret_program(
                     context,
                     &lane_body,
                     lane_inputs,
