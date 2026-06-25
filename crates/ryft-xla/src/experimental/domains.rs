@@ -9,8 +9,8 @@ use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
 use ryft_core::contexts::{Context, EagerContext, ProvidesContext};
 use ryft_core::domains::Domain;
+use ryft_core::operations::Operation;
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
-use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::{DeviceMesh, Sharding};
@@ -275,8 +275,7 @@ impl<'c> Context for XlaDomain<'c> {
 
 impl<'c> DifferentiationContext for XlaDomain<'c> {
     type Tangent = ArrayType;
-    type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> =
-        LinearXlaOperation<V, XlaConstant, F>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, XlaConstant, F>;
 }
 
 impl<'c> ProvidesContext<EagerContext<ArrayType, Array<'c>>> for XlaDomain<'c> {

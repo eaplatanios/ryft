@@ -44,7 +44,8 @@ use crate::types::DataType;
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug, Operation)]
-pub enum ScalarOperation<V: Value<DataType> + BooleanLike> {
+#[ryft(bounds(interpretation(BooleanLike)))]
+pub enum ScalarOperation<V: Value<DataType>> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
@@ -214,11 +215,8 @@ where
 /// [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp` linearization (its transpose replays the user's
 /// backward program).
 #[derive(Clone, Debug, Operation, TransposableOperation)]
-pub enum LinearScalarOperation<
-    V: Value<DataType> + BooleanLike,
-    C: Value<DataType> + BooleanLike = V,
-    F: Value<DataType> = C,
-> {
+#[ryft(bounds(interpretation(BooleanLike)))]
+pub enum LinearScalarOperation<V: Value<DataType>, C: Value<DataType> = V, F: Value<DataType> = C> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
@@ -233,8 +231,8 @@ pub enum LinearScalarOperation<
     CustomVjpCall(Box<CustomVjpCallOperation<DataType, C, ScalarOperation<C>, F>>),
 }
 
-impl<V: Value<DataType> + BooleanLike, C: Value<DataType> + BooleanLike, F: Value<DataType>>
-    CaptureParameterizedOperation<DataType, F> for LinearScalarOperation<V, C, F>
+impl<V: Value<DataType>, C: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
+    for LinearScalarOperation<V, C, F>
 {
     type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, C, MappedFactor>;
 
@@ -276,7 +274,7 @@ impl<V: Value<DataType> + BooleanLike, C: Value<DataType> + BooleanLike, F: Valu
     }
 }
 
-impl<V: Value<DataType> + BooleanLike> MaybeRematerializationName for ScalarOperation<V> {
+impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
         match self {
@@ -286,7 +284,7 @@ impl<V: Value<DataType> + BooleanLike> MaybeRematerializationName for ScalarOper
     }
 }
 
-impl<V: Value<DataType> + BooleanLike> MaybeDot for ScalarOperation<V> {
+impl<V: Value<DataType>> MaybeDot for ScalarOperation<V> {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         None

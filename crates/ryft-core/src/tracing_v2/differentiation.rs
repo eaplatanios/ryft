@@ -359,11 +359,12 @@ impl<E: Context> StagingContext for PrimalTracingContext<E> {
 ///
 /// Implementors supply the differentiation hooks: a tangent value type ([`Tangent`](Self::Tangent)), the linear
 /// operation type used by pushforward and pullback programs ([`LinearOperation`](Self::LinearOperation)), and primal
-/// validation ([`validate_primal`](Self::validate_primal)). Tangent values are required to implement
-/// [`BooleanLike`] because built-in linear operation families include predicate-consuming control-flow variants.
-/// Everything else an AD pass needs — the primal
-/// value/constant/operation types, applying an operation (`bind`), and lifting a constant (`lift`) — comes from the
-/// underlying [`Context`]/[`Domain`]. On top of those hooks the trait provides the user-facing transforms
+/// validation ([`validate_primal`](Self::validate_primal)). Predicate-capable operations such as `condition`,
+/// `while`, and `select` impose their own [`BooleanLike`] bounds through their operation-family implementations;
+/// tangent carriers themselves do not need to be Boolean-like just to participate in differentiation. Everything else
+/// an AD pass needs — the primal value/constant/operation types, applying an operation (`bind`), and lifting a
+/// constant (`lift`) — comes from the underlying [`Context`]/[`Domain`]. On top of those hooks the trait provides the
+/// user-facing transforms
 /// [`linearize`](Self::linearize), [`jvp`](Self::jvp), [`vjp`](Self::vjp), and
 /// [`value_and_gradient`](Self::value_and_gradient).
 ///
@@ -374,15 +375,14 @@ pub trait DifferentiationContext:
     Context + ProvidesContext<<Self::Value as Value<Self::Type>>::InterpretationContext>
 {
     /// Tangent value type staged in the active linear program.
-    type Tangent: Value<Self::Type> + BooleanLike;
+    type Tangent: Value<Self::Type>;
 
     /// Linear operation type specialized to the tangent and factor representations used by a transform context.
     ///
-    /// The first generic parameter is the linear program's value type and must implement [`BooleanLike`] for the same
-    /// reason as [`Tangent`](Self::Tangent): operation families may contain condition or while variants whose
-    /// interpretation extracts predicates from linear values. Factor/capture payloads do not need that bound unless a
-    /// concrete operation family chooses to require it.
-    type LinearOperation<V: Value<Self::Type> + BooleanLike, F: Value<Self::Type>>: Clone + Operation<Self::Type>;
+    /// Operation families that include predicate-consuming variants should attach those bounds to the corresponding
+    /// enum declarations or impls, rather than forcing every differentiation context's tangent carrier to support
+    /// Boolean extraction.
+    type LinearOperation<V: Value<Self::Type>, F: Value<Self::Type>>: Clone + Operation<Self::Type>;
 
     /// Returns the interpretation context used for this differentiation context's primal values.
     ///
@@ -1048,7 +1048,7 @@ where
     <D as Domain>::Operation: From<ZeroOperation<<D as Domain>::Type>>,
 {
     type Tangent = Tracer<TracingContext<'domain, D, Capture>>;
-    type LinearOperation<V: Value<<D as Domain>::Type> + BooleanLike, F: Value<<D as Domain>::Type>> =
+    type LinearOperation<V: Value<<D as Domain>::Type>, F: Value<<D as Domain>::Type>> =
         <D as DifferentiationContext>::LinearOperation<V, F>;
 
     #[inline]
@@ -1116,7 +1116,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     /// [`ProgramBuilder`] that owns the nested primal [`Program`] staged by this context.
@@ -1133,7 +1133,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     /// Creates a new [`LinearizationContext`] that owns a fresh [`ProgramBuilder`].
@@ -1148,7 +1148,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     fn clone(&self) -> Self {
@@ -1162,7 +1162,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1176,7 +1176,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     type Type = T;
@@ -1191,7 +1191,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     /// Lifts a constant payload into this context by recording it as a constant primal [`Tracer`].
@@ -1218,7 +1218,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     #[inline]
@@ -1234,7 +1234,7 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     #[inline]
@@ -1249,11 +1249,11 @@ where
     T: Type,
     C: Value<T>,
     O: Operation<T>,
-    TangentValue: Value<T> + BooleanLike,
+    TangentValue: Value<T>,
     CanonicalLinearOperation: CaptureParameterizedOperation<T, C>,
 {
     type Tangent = TangentValue;
-    type LinearOperation<V: Value<T> + BooleanLike, F: Value<T>> =
+    type LinearOperation<V: Value<T>, F: Value<T>> =
         <CanonicalLinearOperation as CaptureParameterizedOperation<T, C>>::WithCapture<F>;
 
     #[inline]
@@ -1946,14 +1946,14 @@ impl<'domain, E: DifferentiationContext> Value<E::Type> for JvpTracer<'domain, E
     }
 }
 
-impl<S: Value<DataType> + BooleanLike> DifferentiationContext for ScalarDomain<S>
+impl<S: Value<DataType>> DifferentiationContext for ScalarDomain<S>
 where
     <S as Value<DataType>>::InterpretationContext: Default,
     ScalarDomain<S>: Context + Domain<Type = DataType, Value = S, Constant = S, Operation = ScalarOperation<S>>,
     ScalarOperation<S>: Clone + InterpretableOperation<DataType, S> + From<ZeroOperation<DataType>>,
 {
     type Tangent = S;
-    type LinearOperation<V: Value<DataType> + BooleanLike, F: Value<DataType>> = LinearScalarOperation<V, S, F>;
+    type LinearOperation<V: Value<DataType>, F: Value<DataType>> = LinearScalarOperation<V, S, F>;
 }
 
 impl<S: Value<DataType>> ProvidesContext<<S as Value<DataType>>::InterpretationContext> for ScalarDomain<S>

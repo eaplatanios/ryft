@@ -292,7 +292,7 @@ where
 
 impl<V> ryft_core::tracing_v2::operations::MaybeDot for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType>,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&ryft_core::tracing_v2::DotDimensionNumbers> {
@@ -305,7 +305,7 @@ where
 
 impl<V> ryft_core::tracing_v2::rematerialization::MaybeRematerializationName for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType>,
 {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
@@ -829,7 +829,7 @@ pub enum LinearXlaOperation<
 
 impl<V, C, F, P, CaptureFactor> LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -881,7 +881,7 @@ where
 
 impl<V, C, F, P, CaptureFactor> From<LinearArrayOperation<V, C, F, P>> for LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -972,7 +972,7 @@ impl<V, C, F, P, CaptureFactor>
     From<ScanOperation<ArrayType, V, LinearArrayOperation<V, C, ValueOrCapture<ArrayType, V>, P>, F, Input>>
     for LinearXlaOperation<V, C, F, P, CaptureFactor>
 where
-    V: Value<ArrayType> + BooleanLike,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -1010,8 +1010,7 @@ fn map_linear_xla_operation_captures<V, C, F, MappedFactor, P, MapFactorFn>(
     map_factor: &mut MapFactorFn,
 ) -> Result<LinearXlaOperation<V, C, MappedFactor, P, MappedFactor>, ProgramError>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
@@ -1084,8 +1083,7 @@ where
 
 impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearXlaOperation<V, C, F, P, F>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,
@@ -1106,8 +1104,7 @@ where
 impl<V, C, R, P> DefactorizableProgramOperation<V, R, P>
     for LinearXlaOperation<V, C, ValueOrCapture<ArrayType, R>, P, ValueOrCapture<ArrayType, R>>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     R: Value<ArrayType>,
     P: Clone
@@ -1404,7 +1401,7 @@ impl JitCallOperation {
     ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
     where
         PrimalValue: Value<ArrayType>,
-        TangentValue: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+        TangentValue: Value<ArrayType> + Slice + UpdateSlice + Reshape,
         TangentValue::InterpretationContext: Zero<ArrayType, TangentValue>,
         E: DifferentiationContext<
                 Tangent = TangentValue,

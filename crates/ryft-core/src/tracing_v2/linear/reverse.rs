@@ -610,7 +610,7 @@ mod tests {
 
     impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
-        type LinearOperation<V: Value<TestType> + BooleanLike, F: Value<TestType>> = TestLinearOperation;
+        type LinearOperation<V: Value<TestType>, F: Value<TestType>> = TestLinearOperation;
     }
 
     impl ProvidesContext<<TestValue as Value<TestType>>::InterpretationContext> for TestDomain {

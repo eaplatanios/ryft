@@ -8,7 +8,7 @@ use ryft_core::differentiation::{Cotangent, TransposableOperation};
 use ryft_core::domains::Domain;
 use ryft_core::macros::check_count;
 use ryft_core::operations::constants::ZeroOperation;
-use ryft_core::operations::{BooleanLike, InterpretableOperation, Operation};
+use ryft_core::operations::{InterpretableOperation, Operation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::programs::{AtomId, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding};
@@ -372,7 +372,7 @@ fn complete_shard_map_jvp<'jvp, E, PrimalValue, TangentValue>(
 ) -> Result<Vec<JvpTracer<'jvp, E>>, ProgramError>
 where
     PrimalValue: Value<ArrayType>,
-    TangentValue: Value<ArrayType> + BooleanLike,
+    TangentValue: Value<ArrayType>,
     E: DifferentiationContext<
             Tangent = TangentValue,
             LinearOperation<TangentValue, ValueOrCapture<ArrayType, PrimalValue>> = LinearXlaOperation<

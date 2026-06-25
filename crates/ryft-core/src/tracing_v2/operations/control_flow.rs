@@ -3348,7 +3348,7 @@ mod tests {
 
     impl DifferentiationContext for TestDomain {
         type Tangent = TestValue;
-        type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> = TestLinearOperation;
+        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = TestLinearOperation;
     }
 
     impl ProvidesContext<<TestValue as Value<ArrayType>>::InterpretationContext> for TestDomain {
@@ -4012,7 +4012,7 @@ mod tests {
 
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
-        type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> =
+        type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
             LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 
         fn supports_primal_concretization(&self) -> bool {

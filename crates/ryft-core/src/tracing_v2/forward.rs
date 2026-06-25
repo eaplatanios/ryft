@@ -509,7 +509,7 @@ mod tests {
 
     impl DifferentiationContext for DistinctPrimalDomain {
         type Tangent = DistinctTangent;
-        type LinearOperation<V: Value<DataType> + BooleanLike, F: Value<DataType>> = DistinctLinearOperation<F>;
+        type LinearOperation<V: Value<DataType>, F: Value<DataType>> = DistinctLinearOperation<F>;
     }
 
     impl ProvidesContext<<DistinctPrimal as Value<DataType>>::InterpretationContext> for DistinctPrimalDomain {

@@ -140,8 +140,7 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
 // linear-operation capabilities those per-variant rules require.
 impl<V, D, BodyOperation> DifferentiableOperation<D> for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
     ZeroOperation<ArrayType>: DifferentiableOperation<D>,
     ZeroLikeOperation: DifferentiableOperation<D>,
     OneOperation<ArrayType>: DifferentiableOperation<D>,
@@ -356,8 +355,7 @@ pub enum LinearArrayOperation<
 
 impl<V> MaybeRematerializationName for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
 {
     #[inline]
     fn rematerialization_name(&self) -> Option<&str> {
@@ -370,8 +368,7 @@ where
 
 impl<V> MaybeDot for ArrayOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
@@ -389,8 +386,7 @@ fn map_linear_array_operation_factors<V, C, F, MappedFactor, P, MapFactorFn>(
     map_factor: &mut MapFactorFn,
 ) -> Result<LinearArrayOperation<V, C, MappedFactor, P>, ProgramError>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     MappedFactor: Value<ArrayType>,
@@ -527,8 +523,7 @@ where
 // TODO(eaplatanios): Can we get rid of this similar to what we did for some of the scan-related functionality?
 impl<V, C, F, P> CaptureParameterizedOperation<ArrayType, F> for LinearArrayOperation<V, C, F, P>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
+    V: Value<ArrayType>,
     C: Value<ArrayType>,
     F: Value<ArrayType>,
     P: Clone + Operation<ArrayType>,

@@ -11,7 +11,7 @@ use crate::contexts::{Context, ProvidesContext, StagingContext};
 use crate::domains::{AbstractDomain, Domain};
 use crate::macros::{check_builders, check_count};
 use crate::operations::manipulation::{Broadcast, Transpose, TransposeOperation};
-use crate::operations::{BooleanLike, InterpretableOperation, Operation};
+use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::ShardingDimension;
@@ -1031,7 +1031,7 @@ where
         StagingContext<Type = ArrayType, Constant = <C as Domain>::Constant, Operation = <C as Domain>::Operation>,
 {
     type Tangent = Tracer<BatchingContext<C>>;
-    type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> = C::LinearOperation<V, F>;
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = C::LinearOperation<V, F>;
 
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
