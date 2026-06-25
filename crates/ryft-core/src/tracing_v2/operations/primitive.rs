@@ -49,7 +49,7 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::collective::CollectiveOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, custom_jvp_rule, custom_vjp_rule,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
 };
 use crate::tracing_v2::operations::dot::{LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
@@ -280,8 +280,8 @@ where
             Self::Condition(operation) => operation.jvp(context, inputs),
             Self::While(operation) => operation.jvp(context, inputs),
             Self::Scan(operation) => operation.jvp(context, inputs),
-            Self::CustomJvp(operation) => custom_jvp_rule(operation.as_ref(), context, inputs),
-            Self::CustomVjp(operation) => custom_vjp_rule(operation.as_ref(), context, inputs),
+            Self::CustomJvp(operation) => operation.jvp(context, inputs),
+            Self::CustomVjp(operation) => operation.jvp(context, inputs),
         }
     }
 }

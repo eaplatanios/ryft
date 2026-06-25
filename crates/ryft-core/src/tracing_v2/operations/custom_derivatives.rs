@@ -132,14 +132,13 @@ where
 }
 
 /// Shared implementation of the [`CustomJvpOperation`] JVP rule, generic over the linearization context's value
-/// type so the operation enum dispatchers ([`ArrayOperation`](crate::tracing_v2::ArrayOperation),
-/// [`ScalarOperation`](crate::operations::scalars::ScalarOperation)) can invoke it for any
-/// [`DifferentiationContext`] whose constants match the captured programs.
+/// type so the operation's [`DifferentiableOperation`] implementation can run for any [`DifferentiationContext`]
+/// whose constants match the captured programs.
 ///
 /// The rule evaluates the JVP program's primal at `(x̂, 0)` (its first half yields the rule's primal outputs) and
 /// seeds its pushforward with `(0, t̂)` so that only the user-defined — and therefore necessarily linear — tangent
 /// map survives in the staged linear program.
-pub(crate) fn custom_jvp_rule<'jvp, D, O>(
+fn custom_jvp_rule<'jvp, D, O>(
     operation: &CustomJvpOperation<D::Type, <D as Domain>::Constant, O>,
     context: &mut TangentContext<'jvp, D>,
     inputs: &[JvpTracer<'jvp, D>],
@@ -551,14 +550,14 @@ where
 }
 
 /// Shared implementation of the [`CustomVjpOperation`] JVP rule, generic over the linearization context's value type
-/// so the operation enum dispatchers can invoke it for any [`DifferentiationContext`] whose constants match the
-/// captured programs.
+/// so the operation's [`DifferentiableOperation`] implementation can run for any [`DifferentiationContext`] whose
+/// constants match the captured programs.
 ///
 /// The rule linearizes the forward program at the primal inputs — discarding the resulting pushforward, so the
 /// forward body is never differentiated beyond what its primal evaluation requires — captures the trailing residual
 /// outputs as factors, and stages one opaque [`CustomVjpCallOperation`] mapping the input tangents to the output
 /// tangents. The staged call rejects forward-mode interpretation; its transpose replays the user's backward program.
-pub(crate) fn custom_vjp_rule<'jvp, D, O>(
+fn custom_vjp_rule<'jvp, D, O>(
     operation: &CustomVjpOperation<D::Type, <D as Domain>::Constant, O>,
     context: &mut TangentContext<'jvp, D>,
     inputs: &[JvpTracer<'jvp, D>],

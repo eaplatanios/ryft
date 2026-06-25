@@ -1,5 +1,3 @@
-use std::ops::{Add, Div, Mul, Neg, Sub};
-
 use ryft_macros::{Operation, TransposableOperation};
 
 use crate::domains::Domain;
@@ -7,14 +5,13 @@ use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{
     AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
 };
-use crate::operations::compare::{Compare, CompareOperation};
+use crate::operations::compare::CompareOperation;
 use crate::operations::constants::{
-    ConstantOperation, MaybeZeroOperation, OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation,
-    ZeroOperation,
+    ConstantOperation, MaybeZeroOperation, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{Select, SelectCondition, SelectOperation, WhileOperation};
+use crate::operations::control_flow::{SelectOperation, WhileOperation};
 use crate::operations::differentiation::StopGradientOperation;
-use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
+use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::parameters::Parameterized;
 use crate::payloads::Input;
 use crate::programs::{Program, ProgramError, Value};
@@ -25,13 +22,13 @@ use crate::tracing_v2::differentiation::{
 };
 use crate::tracing_v2::operations::MaybeDot;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation, custom_jvp_rule, custom_vjp_rule,
+    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
 };
 use crate::tracing_v2::operations::select::LinearSelectOperation;
 use crate::tracing_v2::rematerialization::{MaybeRematerializationName, RematerializationNameOperation};
 use crate::tracing_v2::{
     DifferentiableOperation, DifferentiationContext, DotDimensionNumbers, LinearizableProgramOperation,
-    RematerializationName, ResidualizedOperation, ValueOrCapture,
+    ResidualizedOperation, ValueOrCapture,
 };
 use crate::types::DataType;
 
@@ -140,8 +137,8 @@ where
             Self::While(operation) => operation.jvp(context, inputs),
             Self::StopGradient(operation) => operation.jvp(context, inputs),
             Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::CustomJvp(operation) => custom_jvp_rule(operation.as_ref(), context, inputs),
-            Self::CustomVjp(operation) => custom_vjp_rule(operation.as_ref(), context, inputs),
+            Self::CustomJvp(operation) => operation.jvp(context, inputs),
+            Self::CustomVjp(operation) => operation.jvp(context, inputs),
         }
     }
 }
