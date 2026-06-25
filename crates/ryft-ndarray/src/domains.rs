@@ -55,7 +55,7 @@ impl<T: NdArrayElement> Context for NdArrayDomain<T> {
 
 impl<T: NdArrayElement> DifferentiationContext for NdArrayDomain<T> {
     type Tangent = Array<T>;
-    type LinearOperation<V: Value<ArrayType> + BooleanLike, F: Value<ArrayType>> =
+    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
         LinearNdarrayOperation<V, Array<T>, F>;
 }
 

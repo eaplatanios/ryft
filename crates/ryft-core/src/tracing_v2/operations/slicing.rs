@@ -634,7 +634,6 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::BooleanLike;
     use crate::ProvidesContext;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::compare::CompareOperation;
