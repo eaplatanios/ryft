@@ -6,9 +6,9 @@ use crate::domains::Domain;
 use crate::macros::check_builders;
 use crate::operations::constants::{ConstantOperation, MaybeZeroOperation};
 use crate::operations::{InterpretableOperation, Operation};
-use crate::parameters::Parameterized;
+use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::{Tracer, TracerState};
+use crate::tracing::{Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
@@ -42,6 +42,77 @@ pub trait Context: Domain + Clone {
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
+
+    /// Traces `function` into a [`Program`] and interprets that program on the provided `input`. This creates an
+    /// ordinary symbolic trace over this context's `(Self::Type, Self::Constant, Self::Operation)` universe through a
+    /// fresh [`TracingContext`], simplifies the resulting flat program, and interprets it with the provided concrete
+    /// input values. Use this when a caller needs both the staged program and the corresponding concrete output for
+    /// the same input. The runtime values flow through `self`, which supplies the concrete value type and the
+    /// constant-lifting behavior.
+    fn interpret_and_trace<
+        F: FnOnce(
+            Input::To<Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>>,
+        ) -> Result<Output, ProgramError>,
+        Input: Parameterized<
+                Self::Value,
+                Family: ParameterizedFamily<Self::Constant>
+                            + ParameterizedFamily<Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>>,
+            >,
+        Output: Parameterized<
+                Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>,
+                Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Constant>,
+            >,
+    >(
+        &self,
+        function: F,
+        input: Input,
+    ) -> Result<
+        (
+            Output::To<Self::Value>,
+            Program<Self::Type, Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
+        ),
+        ProgramError,
+    >
+    where
+        Self::Operation: InterpretableOperation<Self::Type, Self::Value>,
+        <Self::Value as Value<Self::Type>>::InterpretationContext: Default,
+    {
+        let input_structure = input.parameter_structure();
+        let input_values = input.into_parameters().collect::<Vec<_>>();
+        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let mut output_structure = None;
+        let (_, flat_program) =
+            Self::trace(
+                |flat_input| {
+                    let input = <Input::To<
+                    Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>,
+                >>::from_parameters(input_structure.clone(), flat_input)?;
+                    let output = function(input)?;
+                    output_structure = Some(output.parameter_structure());
+                    Ok(output.into_parameters().collect::<Vec<_>>())
+                },
+                input_types,
+            )?;
+        let output_structure = output_structure.unwrap();
+        let flat_program = flat_program.into_simplified()?;
+        let interpretation_context = <Self::Value as Value<Self::Type>>::InterpretationContext::default();
+        let output_values = flat_program.interpret_with(
+            input_values,
+            |_, constant| self.lift(constant.clone()),
+            |instruction, inputs| instruction.operation().interpret(&interpretation_context, inputs),
+        )?;
+        let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
+        let program = Program {
+            atoms: flat_program.atoms,
+            input_ids: flat_program.input_ids,
+            output_ids: flat_program.output_ids,
+            instructions: flat_program.instructions,
+            input_structure,
+            output_structure,
+            marker: PhantomData,
+        };
+        Ok((output, program))
+    }
 }
 
 /// Represents instances that can provide a [`Context`] value used by an owning or enclosing object. This trait
@@ -121,12 +192,12 @@ impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOpera
 }
 
 /// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`]. Binding
-/// records [`Operation`] invocations as [`Program`] [`Instruction`]s rather than interpreting them, and this trait
-/// owns the builder-dependent staging API: [`constant`](StagingContext::constant), [`input`](StagingContext::input),
-/// [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
+/// records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than interpreting
+/// them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
+/// [`input`](StagingContext::input), [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
 /// [`stage_operation`](StagingContext::stage_operation), and [`stage_program`](StagingContext::stage_program).
-/// Ordinary backend tracing implements it through [`TracingContext`](crate::TracingContext). Stackable transform
-/// contexts such as batching or linearization implement it by delegating to a parent context.
+/// Ordinary backend tracing implements it through [`TracingContext`]. Stackable transform contexts such as batching
+/// or linearization implement it by delegating to a parent context.
 pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>>;
@@ -265,18 +336,17 @@ pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
+    use crate::domains::Domain;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, Instruction, ProgramBuilder, ProgramError};
-    use crate::scalars::ScalarDomain;
-    use crate::tracing::{TracerState, TracingContext};
+    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::tracing::TracerState;
     use crate::types::{DataType, Typed};
 
     use super::{Context, EagerContext, StagingContext};
@@ -299,12 +369,11 @@ mod tests {
 
     #[test]
     fn test_staging_context_creates_inputs_constants_and_tracers() {
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = ScalarDomain::new_tracing_context();
+        let builder = context.builder().clone();
 
         let input = context.input(DataType::F64);
-        let constant = context.constant(2.5);
+        let constant = context.constant(Scalar::from(2.5));
         let builder_typed = context.tracer(AtomId::new(0), None);
         let cached_typed = context.tracer(AtomId::new(0), Some(DataType::F64));
 
@@ -324,9 +393,8 @@ mod tests {
 
     #[test]
     fn test_staging_context_stages_nullary_and_regular_operations() {
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = ScalarDomain::new_tracing_context();
+        let builder = context.builder().clone();
 
         let mut nullary_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
         assert_eq!(nullary_outputs.len(), 1);
@@ -355,16 +423,15 @@ mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<(f64, f64), f64>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
+            .build::<(Scalar, Scalar), Scalar>(vec![sum.atom_id().unwrap()], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.interpret((2.0, 3.5)), Ok(5.5));
+        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.5))), Ok(Scalar::from(5.5)));
     }
 
     #[test]
     fn test_staging_context_records_errors_and_returns_poisoned_outputs_after_failure() {
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = ScalarDomain::new_tracing_context();
+        let builder = context.builder().clone();
         let input = context.input(DataType::F64);
 
         let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
@@ -380,11 +447,10 @@ mod tests {
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = ScalarDomain::new_tracing_context();
+        let builder = context.builder().clone();
         let input = context.input(DataType::F64);
-        let foreign_context = TracingContext::new(&domain, foreign_builder);
+        let foreign_context = ScalarDomain::new_tracing_context();
         let foreign_input = foreign_context.input(DataType::F64);
 
         assert!(matches!(
@@ -396,16 +462,16 @@ mod tests {
 
     #[test]
     fn test_staging_context_stages_programs_by_lifting_constants_and_replaying_instructions() {
-        let mut source_builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let mut source_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let source_input = source_builder.add_input(DataType::F64);
-        let source_constant = source_builder.add_constant(4.0);
+        let source_constant = source_builder.add_constant(Scalar::from(4.0));
         let source_output =
             source_builder.add_instruction(AddOperation, vec![source_input, source_constant]).unwrap()[0];
-        let source_program = source_builder.build::<f64, f64>(vec![source_output], Placeholder, Placeholder).unwrap();
+        let source_program =
+            source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
 
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = ScalarDomain::new_tracing_context();
+        let builder = context.builder().clone();
         let input = context.input(DataType::F64);
         let mut outputs = context.stage_program(&source_program, vec![input]).unwrap();
 
@@ -426,18 +492,17 @@ mod tests {
         let program = builder
             .borrow()
             .clone()
-            .build::<f64, f64>(vec![output.atom_id().unwrap()], Placeholder, Placeholder)
+            .build::<Scalar, Scalar>(vec![output.atom_id().unwrap()], Placeholder, Placeholder)
             .unwrap();
-        assert_eq!(program.interpret(3.0), Ok(7.0));
+        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
     }
 
     #[test]
     fn test_staging_context_is_zero_recognizes_only_nullary_zero_operations_in_the_same_builder() {
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = ScalarDomain::new_tracing_context();
+        let builder = context.builder().clone();
         let input = context.input(DataType::F64);
-        let constant = context.constant(1.0);
+        let constant = context.constant(Scalar::from(1.0));
         let mut zero_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
         let zero = zero_outputs.remove(0);
         let mut add_outputs = context.stage_operation(AddOperation, &[&input, &zero]).unwrap();
@@ -465,8 +530,7 @@ mod tests {
         );
         assert_eq!(builder.borrow().error(), None);
 
-        let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let foreign_context = TracingContext::new(&domain, foreign_builder);
+        let foreign_context = ScalarDomain::new_tracing_context();
         let foreign_input = foreign_context.input(DataType::F64);
         assert_eq!(context.is_zero(&foreign_input), Err(ProgramError::MismatchedProgramBuilders));
         assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
