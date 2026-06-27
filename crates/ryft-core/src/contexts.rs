@@ -198,7 +198,7 @@ impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOpera
 /// [`stage_operation`](StagingContext::stage_operation), and [`stage_program`](StagingContext::stage_program).
 /// Ordinary backend tracing implements it through [`TracingContext`]. Stackable transform contexts such as batching
 /// or linearization implement it by delegating to a parent context.
-pub trait StagingContext: Context + Domain<Value = Tracer<Self>> {
+pub trait StagingContext: Context<Value = Tracer<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>>;
 
@@ -339,14 +339,13 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
-    use crate::domains::Domain;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, Instruction, ProgramBuilder, ProgramError};
     use crate::scalars::{Scalar, ScalarDomain};
-    use crate::tracing::TracerState;
+    use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
 
     use super::{Context, EagerContext, StagingContext};
@@ -369,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_creates_inputs_constants_and_tracers() {
-        let context = ScalarDomain::new_tracing_context();
+        let context = DomainTracingContext::<ScalarDomain>::new();
         let builder = context.builder().clone();
 
         let input = context.input(DataType::F64);
@@ -393,7 +392,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_stages_nullary_and_regular_operations() {
-        let context = ScalarDomain::new_tracing_context();
+        let context = DomainTracingContext::<ScalarDomain>::new();
         let builder = context.builder().clone();
 
         let mut nullary_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
@@ -430,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_records_errors_and_returns_poisoned_outputs_after_failure() {
-        let context = ScalarDomain::new_tracing_context();
+        let context = DomainTracingContext::<ScalarDomain>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
 
@@ -447,10 +446,10 @@ mod tests {
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
-        let context = ScalarDomain::new_tracing_context();
+        let context = DomainTracingContext::<ScalarDomain>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
-        let foreign_context = ScalarDomain::new_tracing_context();
+        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
         let foreign_input = foreign_context.input(DataType::F64);
 
         assert!(matches!(
@@ -470,7 +469,7 @@ mod tests {
         let source_program =
             source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
 
-        let context = ScalarDomain::new_tracing_context();
+        let context = DomainTracingContext::<ScalarDomain>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
         let mut outputs = context.stage_program(&source_program, vec![input]).unwrap();
@@ -499,7 +498,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_is_zero_recognizes_only_nullary_zero_operations_in_the_same_builder() {
-        let context = ScalarDomain::new_tracing_context();
+        let context = DomainTracingContext::<ScalarDomain>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
         let constant = context.constant(Scalar::from(1.0));
@@ -530,7 +529,7 @@ mod tests {
         );
         assert_eq!(builder.borrow().error(), None);
 
-        let foreign_context = ScalarDomain::new_tracing_context();
+        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
         let foreign_input = foreign_context.input(DataType::F64);
         assert_eq!(context.is_zero(&foreign_input), Err(ProgramError::MismatchedProgramBuilders));
         assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));

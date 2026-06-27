@@ -1283,11 +1283,12 @@ pub trait Parameterized<P: Parameter>: Sized {
     }
 }
 
-/// Iterator adapter that prefixes each yielded [`ParameterPath`] with [`Self::segment`]. This exists as a dedicated
-/// type (instead of using only standard [`Iterator`] combinators) because many [`Parameterized`] associated iterator
-/// types must be named concrete types. A closure-based `map(move |...| ...)` adapter would capture the prefix segment
-/// and produce an unnameable closure type, which is not usable directly in those associated type definitions on stable
-/// Rust. [`PathPrefixedParameterIterator`] preserves static dispatch and avoids heap allocation and dynamic dispatch.
+/// Iterator adapter that prefixes each yielded [`ParameterPath`] with a stored [`ParameterPathSegment`]. This exists as
+/// a dedicated type (instead of using only standard [`Iterator`] combinators) because many [`Parameterized`] associated
+/// iterator types must be named concrete types. A closure-based `map(move |...| ...)` adapter would capture the prefix
+/// segment and produce an unnameable closure type, which is not usable directly in those associated type definitions on
+/// stable Rust. [`PathPrefixedParameterIterator`] preserves static dispatch and avoids heap allocation and dynamic
+/// dispatch.
 pub struct PathPrefixedParameterIterator<P, I: Iterator<Item = (ParameterPath, P)>> {
     /// Underlying [`Iterator`] that yields `(path, value)` pairs before prefixing with [`Self::segment`].
     iterator: I,

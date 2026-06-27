@@ -56,10 +56,10 @@ impl Error {
     }
 }
 
-/// Object-safe error that operations and transforms can surface through the `Custom` variants of [`Error`] and other
-/// error types in `ryft-core` without those enums enumerating every extension error. This keeps the core error types
-/// decoupled from operation and transform extensibility: a new operation or transform carries its own typed error,
-/// boxes it behind this trait to travel through the core APIs, and the concrete type is recovered later with
+/// Object-safe error that operations and transforms can surface through the `Custom` variants of [`Error`](enum@Error)
+/// and other error types in `ryft-core` without those enums enumerating every extension error. This keeps the core
+/// error types decoupled from operation and transform extensibility: a new operation or transform carries its own typed
+/// error, boxes it behind this trait to travel through the core APIs, and the concrete type is recovered later with
 /// [`Error::downcast_custom`] or a similarly named function on another error enum.
 ///
 /// A blanket implementation covers every type that is `'static`, [`Error`](std::error::Error), [`Send`], [`Sync`],

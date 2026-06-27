@@ -36,7 +36,7 @@ use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, DifferentiationContext, LinearArrayOperation, RematerializationName,
+    ArrayOperation, CoordinateValue, DifferentiationContext, RematerializationName,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Compare, ComparisonDirection, Select, SelectCondition};
@@ -83,7 +83,7 @@ impl TestArray {
 
     /// Returns the number of elements represented by `type`. Panics if the type has dynamic dimensions, so this
     /// helper is reserved for types of already-materialized values (which are always fully static); kernels that
-    /// materialize values from payload types use [`Self::materialized_element_count`] instead.
+    /// materialize values from payload types use [`TestArray::materialized_element_count`] instead.
     pub fn element_count(r#type: &ArrayType) -> usize {
         r#type.element_count().unwrap().unwrap()
     }
@@ -966,8 +966,6 @@ impl Context for TestArrayDomain {
 
 impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> =
-        LinearArrayOperation<V, TestArray, F, ArrayOperation<TestArray>>;
 }
 
 impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for TestArrayDomain {
