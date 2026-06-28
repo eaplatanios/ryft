@@ -519,11 +519,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::Context;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
-    use crate::scalars::ScalarDomain;
-    use crate::tracing::TracingContext;
+    use crate::scalars::{Scalar, ScalarDomain};
     use crate::types::DataType;
 
     use super::*;
@@ -531,15 +531,14 @@ mod tests {
     /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let domain = ScalarDomain::<f64>::new();
-        let (_, compiled): (f64, Program<DataType, f64, ScalarOperation<f64>, f64, f64>) =
-            TracingContext::interpret_and_trace(
-                &domain,
+        let domain = ScalarDomain::new();
+        let (_, compiled): (Scalar, Program<DataType, Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) = domain
+            .interpret_and_trace(
                 |x| {
-                    let with_constant = x.clone() + x.context().constant(1.0);
+                    let with_constant = x.clone() + x.context().constant(Scalar::from(1.0));
                     Ok(with_constant.sin())
                 },
-                2.0f64,
+                Scalar::from(2.0),
             )
             .unwrap();
 
@@ -564,11 +563,9 @@ mod tests {
     fn test_benchmark_case_registry_contains_expected_ids() {
         let case_ids = benchmark_case_ids(&[]);
         assert!(case_ids.contains(&"scalar_bilinear_sin_jit"));
-        assert!(case_ids.contains(&"scalar_bilinear_sin_jvp"));
         assert!(case_ids.contains(&"scalar_bilinear_sin_vjp_pullback"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_grad"));
         assert!(case_ids.contains(&"scalar_quartic_plus_sin_value_and_grad"));
-        assert!(case_ids.contains(&"scalar_quartic_plus_sin_linearize_pushforward"));
     }
 
     /// Verifies that exact case filtering emits only the requested case.

@@ -803,7 +803,7 @@ pub struct BatchingContext<C: Context<Type = ArrayType>> {
     axis_table: Rc<RefCell<HashMap<AtomId, usize>>>,
 }
 
-impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
+impl<C: StagingContext<Type = ArrayType, Value = Tracer<C>>> BatchingContext<C> {
     /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied lane size.
     #[inline]
     pub fn new(parent_context: C, axis_size: usize) -> Self {
@@ -892,7 +892,7 @@ impl<C: Context<Type = ArrayType>> Clone for BatchingContext<C> {
 
 impl<C> Domain for BatchingContext<C>
 where
-    C: StagingContext<Type = ArrayType>,
+    C: StagingContext<Type = ArrayType, Value = Tracer<C>>,
     C::Operation: BatchableOperation<Tracer<C>, Self>,
 {
     type Type = ArrayType;
@@ -903,7 +903,7 @@ where
 
 impl<C> Context for BatchingContext<C>
 where
-    C: StagingContext<Type = ArrayType>,
+    C: StagingContext<Type = ArrayType, Value = Tracer<C>>,
     C::Operation: BatchableOperation<Tracer<C>, Self>,
 {
     /// Lifts a constant payload into this batching context by recording it as a constant [`Tracer`].
@@ -927,7 +927,7 @@ where
 
 impl<C> StagingContext for BatchingContext<C>
 where
-    C: StagingContext<Type = ArrayType>,
+    C: StagingContext<Type = ArrayType, Value = Tracer<C>>,
     C::Operation: BatchableOperation<Tracer<C>, Self>,
 {
     #[inline]
@@ -948,7 +948,7 @@ where
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             return Ok(output_types
                 .into_iter()
-                .map(|r#type| Tracer::new(TracerState::Poison, r#type, self.clone()))
+                .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
                 .collect());
         }
 
@@ -1015,10 +1015,14 @@ where
 
 impl<C> DifferentiationContext for BatchingContext<C>
 where
-    C: StagingContext<Type = ArrayType> + DifferentiationContext + Domain<Type = ArrayType, Value = Tracer<C>>,
+    C: StagingContext<Type = ArrayType, Value = Tracer<C>> + DifferentiationContext + Domain<Type = ArrayType>,
     C: DifferentiationContext<Tangent = Tracer<C>>,
-    BatchingContext<C>:
-        StagingContext<Type = ArrayType, Constant = <C as Domain>::Constant, Operation = <C as Domain>::Operation>,
+    BatchingContext<C>: StagingContext<
+            Type = ArrayType,
+            Value = Tracer<BatchingContext<C>>,
+            Constant = <C as Domain>::Constant,
+            Operation = <C as Domain>::Operation,
+        >,
 {
     type Tangent = Tracer<BatchingContext<C>>;
 
@@ -1277,7 +1281,7 @@ impl<D: Domain<Type = ArrayType>> Batch for D {}
 /// This is the already-traced counterpart of [`Batch`]. It wraps the receiver in a [`BatchingContext`] and routes all
 /// primitive binds through the current transform stack, so `batch` composes with tracing, JVP, VJP, and other context
 /// wrappers through the same [`StagingContext::stage_operation`] path.
-pub trait BatchContext: StagingContext<Type = ArrayType> {
+pub trait BatchContext: StagingContext<Type = ArrayType, Value = Tracer<Self>> {
     /// Maps a traced function over per-leaf array axes inside this active context. The `in_axes` and `out_axes`
     /// parameters accept anything convertible to [`BatchAxes`] (explicit per-leaf axes or one uniform leaf
     /// specification), and the `axis` parameter accepts anything convertible to a [`BatchAxis`] (an optional
@@ -1440,7 +1444,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType>> BatchContext for C {}
+impl<C: StagingContext<Type = ArrayType, Value = Tracer<C>>> BatchContext for C {}
 
 // TODO(eaplatanios): Review this function.
 /// Returns the axis permutation that moves dimension `from` to position `to`, shifting the other
