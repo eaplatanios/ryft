@@ -176,82 +176,59 @@ pub struct TracingContext<T: Type, V: Value<T>, O: Operation<T>, C = V> {
     /// supplies the interior mutability that staging needs.
     builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
 
-    // TODO(eaplatanios): Is this the best way to model capturing? Also, why does this require the `Rc<RefCell<...>>` wrapper?
-    /// Optional capture table of closed-over runtime values (`C`), referenced symbolically from the staged program
-    /// via [`CaptureReference`]. This is `None` for ordinary (i.e., non-capturing) tracing, and `Some` only when
-    /// tracing a captured [`Program`] (e.g., when just-in-time-compiling a function that closes over device buffers),
-    /// in which case those values are passed to the compiled program as runtime arguments rather than being baked into
-    /// it. Refer to the documentation of [`CaptureReference`] for more information.
-    captures: Option<Rc<RefCell<Vec<C>>>>,
-}
-
-impl<T: Type, V: Value<T>, O: Operation<T>> TracingContext<T, V, O> {
-    // TODO(eaplatanios): Should we provide a consuming accessor for getting the built `Program` instead of having to go through the builder?
-    /// Creates a new [`TracingContext`] over the `(T, V, O)` type universe with a fresh, empty [`ProgramBuilder`]. Use
-    /// [`builder`](Self::builder) afterward to read or finalize the staged program. To instead stage into a
-    /// [`ProgramBuilder`] that already owns prior instructions, such as the builder backing an input [`Tracer`]'s
-    /// program, use [`from_builder`](Self::from_builder).
-    #[inline]
-    pub fn new() -> Self {
-        Self { builder: Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new())), captures: None }
-    }
-
-    // TODO(eaplatanios): Do we really need this function? Why can this not be kept clean and hide the builder?
-    /// Creates a new [`TracingContext`] over the `(T, V, O)` type universe that adopts the provided existing
-    /// [`ProgramBuilder`]. Unlike [`new`](Self::new), which originates a fresh empty builder, this stages into a
-    /// builder that may already own prior instructions, so operations recorded through the returned context append to
-    /// that same program. This is required when staging operations whose input [`Tracer`]s belong to `builder`,
-    /// because [`StagingContext::stage_operation`] rejects inputs that belong to a different builder.
-    #[inline]
-    pub fn from_builder(builder: Rc<RefCell<ProgramBuilder<T, V, O>>>) -> Self {
-        Self { builder, captures: None }
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-impl<T: Type, V: Value<T>, O: Operation<T>> Default for TracingContext<T, V, O> {
-    #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Capture table of closed-over runtime values, referenced symbolically from the staged [`Program`] via
+    /// [`CaptureReference`]s. It stays empty for ordinary (i.e., non-capturing) tracing and is filled only when tracing
+    /// a captured [`Program`] (e.g., when just-in-time-compiling a function that closes over device buffers), in which
+    /// case those values are passed to the compiled program as runtime arguments rather than being baked into it.
+    /// Capturing is gated at the type level: [`capture`](CapturingContext::capture) is implemented only when the staged
+    /// constant type is [`CaptureReference`], and so an ordinary trace can never push into this table. Refer to the
+    /// documentation of [`CaptureReference`] for more information.
+    ///
+    /// Like the [`builder`](Self::builder), the table is held behind an [`Rc`] and a [`RefCell`] for the same reason:
+    /// one capturing trace shares a single table across its many cloned contexts, so the [`Rc`] keeps every clone
+    /// pushing into the *same* accumulating table (which is what keeps [`CaptureReference`] indices consistent) instead
+    /// of forking it, and the [`RefCell`] supplies the interior mutability [`capture`](CapturingContext::capture) needs
+    /// to push through a shared `&self`.
+    captures: Rc<RefCell<Vec<C>>>,
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
-    /// Creates a new [`TracingContext`] over the `(T, V, O)` type universe with a fresh, empty [`ProgramBuilder`] and
-    /// the provided shared capture table.
+    /// Creates a new [`TracingContext`] over the `(T, V, O)` type universe with a fresh, empty [`ProgramBuilder`] and a
+    /// fresh, empty capture table. Use [`builder`](Self::builder) afterward to read or finalize the staged program, and
+    /// [`captures`](Self::captures) to read any values registered through [`capture`](CapturingContext::capture). To
+    /// instead compose further staging onto a trace that already owns prior instructions, do not create a context at
+    /// all: an input [`Tracer`]'s [`context`](Tracer::context) shares that trace's [`ProgramBuilder`], and so staging
+    /// on it (e.g., via [`stage_operation`](StagingContext::stage_operation)) appends to the same program.
     #[inline]
-    pub fn new_with_captures(captures: Rc<RefCell<Vec<C>>>) -> Self {
-        Self { builder: Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new())), captures: Some(captures) }
+    pub fn new() -> Self {
+        Self {
+            builder: Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new())),
+            captures: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
-    /// Returns the shared [`ProgramBuilder`] this [`TracingContext`] stages into.
+    /// Returns the [`ProgramBuilder`] that this [`TracingContext`] stages into.
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, V, O>>> {
         &self.builder
     }
 
-    /// Replaces this [`TracingContext`]'s active [`ProgramBuilder`] and returns the previous builder. This is intended
-    /// for transforms that need to consume or temporarily swap a builder while preserving the rest of the context
-    /// identity, such as nested [`Program`] transposition.
+    /// Returns the shared capture table that [`capture`](CapturingContext::capture) fills while tracing. That table
+    /// stays empty for ordinary traces, since [`capture`](CapturingContext::capture) is only implemented when the
+    /// staged constant type is [`CaptureReference`].
     #[inline]
-    pub(crate) fn replace_builder(
-        &mut self,
-        builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
-    ) -> Rc<RefCell<ProgramBuilder<T, V, O>>> {
-        std::mem::replace(&mut self.builder, builder)
+    pub fn captures(&self) -> &Rc<RefCell<Vec<C>>> {
+        &self.captures
     }
-}
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
     /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
     /// point. It creates a fresh [`TracingContext`] over the `(T, V, O)` type universe, executes `function` once on
     /// [`Tracer`] inputs standing in for `input_type`, and returns the output types plus the finalized program.
-    /// Operation binds are handled by the context's [`StagingContext::stage_operation`] implementation; the type
-    /// universe only supplies the staged-constant and operation types used by that program. The capture parameter `C`
-    /// is preserved on the staged [`Tracer`] leaves so callers tracing in a context with a non-default capture type
-    /// (such as a backend whose runtime [`Value`](Domain::Value) differs from its staged [`Constant`](Domain::Constant))
-    /// observe that same context type.
+    /// Operation binds are handled by the context's [`StagingContext::stage_operation`] implementation. The type
+    /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
+    /// is preserved on the staged [`Tracer`] leaves so that callers tracing in a context with a non-default capture
+    /// type (such as a backend whose runtime [`Value`](Domain::Value) differs from its staged
+    /// [`Constant`](Domain::Constant)) observe that same context type.
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<T, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
@@ -263,7 +240,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_type.parameter_structure();
         let (output_types, outputs, output_structure) = {
-            let context = Self { builder: builder.clone(), captures: None };
+            let context = Self { builder: builder.clone(), captures: Rc::new(RefCell::new(Vec::new())) };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
             builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
@@ -304,6 +281,13 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> Debug for TracingContext<T, V, O,
     }
 }
 
+impl<T: Type, V: Value<T>, O: Operation<T>, C> Default for TracingContext<T, V, O, C> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Type, V: Value<T>, O: Operation<T>, C> Domain for TracingContext<T, V, O, C> {
     type Type = T;
     type Value = Tracer<Self>;
@@ -331,11 +315,9 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> StagingContext for TracingContext
 }
 
 impl<T: Type, O: Operation<T>, C: Value<T>> CapturingContext<C> for TracingContext<T, CaptureReference<T>, O, C> {
+    #[inline]
     fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
-        let captures = self.captures.as_ref().ok_or_else(|| {
-            self.error(ProgramError::MalformedProgram("the tracing context does not have a capture table".to_string()))
-        })?;
-        let mut captures = captures.borrow_mut();
+        let mut captures = self.captures.borrow_mut();
         let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
         captures.push(value);
         Ok(constant)
@@ -343,20 +325,21 @@ impl<T: Type, O: Operation<T>, C: Value<T>> CapturingContext<C> for TracingConte
 }
 
 /// [`TracingContext`] named by an enclosing [`Domain`] `D`'s associated types. This is `TracingContext` over `D`'s
-/// type, staged-constant, and operation representations, so it is the active tracing context that stages a program
-/// expressed in `D`'s universe. The optional capture parameter `C` defaults to `D`'s staged-constant representation,
-/// matching the default capture type of [`TracingContext::new`]; captured-program traces over a backend whose runtime
-/// [`Value`](Domain::Value) differs from its staged [`Constant`](Domain::Constant) pin `C` to that runtime value type
-/// explicitly. Use this alias at call sites that already hold a [`Domain`] and want to name the matching tracing
-/// context; use [`TracingContext`] directly at sites that already work in terms of a `(T, V, O)` universe.
+/// type, staged constant, and [`Operation`] representations, and so it is the active tracing context that stages a
+/// [`Program`] expressed in `D`'s universe. The optional capture parameter `C` defaults to `D`'s staged constant
+/// representation, matching the default capture type of [`TracingContext::new`]. Closed program traces over a backend
+/// whose runtime [`Value`](Domain::Value) differs from its staged [`Constant`](Domain::Constant) pin `C` to that
+/// runtime value type explicitly. Use this alias at call sites that already hold a [`Domain`] and want to name the
+/// matching tracing context. Use [`TracingContext`] directly at sites that already work in terms of a `(T, V, O)`
+/// universe.
 pub type DomainTracingContext<D, C = <D as Domain>::Constant> =
     TracingContext<<D as Domain>::Type, <D as Domain>::Constant, <D as Domain>::Operation, C>;
 
 /// [`Tracer`] flowing through a [`DomainTracingContext`] for a backend [`Domain`] `D`. This is the value that stands in
-/// for a `D`-typed runtime value while a function is traced into a [`Program`]. Each [`Operation`] bound on these
+/// for a `D`-typed runtime value while a function is being traced into a [`Program`]. Each [`Operation`] bound on these
 /// tracers records a program instruction and yields further [`DomainTracer`]s, and so ordinary backend traces flow
-/// entirely in them. The [`Domain`] is a pure type witness, so the tracer borrows nothing from it. The
-/// backend-less specialization used during symbolic program tracing and transposition is a [`Tracer`] over a plain
+/// entirely in them. The [`Domain`] is a pure type witness, and so the tracer borrows nothing from it. The backend-less
+/// specialization used during symbolic program tracing and transposition is a [`Tracer`] over a plain
 /// [`TracingContext<T, V, O>`](TracingContext).
 pub type DomainTracer<D> = Tracer<DomainTracingContext<D>>;
 
