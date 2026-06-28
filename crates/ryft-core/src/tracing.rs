@@ -31,21 +31,21 @@ pub enum TracerState {
 /// tracers which are represented using [`TracerState::Poison`].
 #[derive(Clone, Parameter)]
 pub struct Tracer<C: Context> {
+    /// [`Context`] associated with this [`Tracer`].
+    context: C,
+
     /// [`TracerState`] of this [`Tracer`].
     state: TracerState,
 
     /// [`Type`] of the value that this [`Tracer`] represents.
     r#type: C::Type,
-
-    /// [`Context`] associated with this [`Tracer`].
-    context: C,
 }
 
 impl<C: Context> Tracer<C> {
     /// Creates a new [`Tracer`].
     #[inline]
-    pub fn new(state: TracerState, r#type: C::Type, context: C) -> Self {
-        Self { state, r#type, context }
+    pub fn new(context: C, state: TracerState, r#type: C::Type) -> Self {
+        Self { context, state, r#type }
     }
 
     /// Returns the [`TracerState`] of this [`Tracer`].
@@ -154,12 +154,12 @@ impl<C: Context> Value<C::Type> for Tracer<C> {
 impl<C: Context> StagingValue<C> for Tracer<C> {
     #[inline]
     fn live(context: C, atom: AtomId, r#type: C::Type) -> Self {
-        Self::new(TracerState::Live(atom), r#type, context)
+        Self::new(context, TracerState::Live(atom), r#type)
     }
 
     #[inline]
     fn poison(context: C, r#type: C::Type) -> Self {
-        Self::new(TracerState::Poison, r#type, context)
+        Self::new(context, TracerState::Poison, r#type)
     }
 
     #[inline]
@@ -428,7 +428,7 @@ mod tests {
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let tracer = tracing_context.tracer(atom, None);
-        let poisoned = Tracer::new(TracerState::Poison, DataType::F64, tracing_context.clone());
+        let poisoned = Tracer::new(tracing_context.clone(), TracerState::Poison, DataType::F64);
         let cloned_tracer = tracer.clone();
         assert!(Rc::ptr_eq(tracer.builder(), &builder));
         assert_eq!(tracer.atom_id(), Ok(atom));

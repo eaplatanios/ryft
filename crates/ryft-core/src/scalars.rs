@@ -1,192 +1,525 @@
 use std::borrow::Cow;
-use std::marker::PhantomData;
+use std::cmp::Ordering;
+use std::fmt::{Display, Formatter, Result as FormatResult};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use half::{bf16, f16};
+use ryft_macros::Parameter;
 
 use crate::contexts::{Context, EagerContext};
 use crate::domains::Domain;
-use crate::operations::InterpretableOperation;
-use crate::operations::scalars::{LinearScalarOperation, ScalarOperation};
+use crate::operations::arithmetic::Scalable;
+use crate::operations::compare::{Compare, ComparisonDirection};
+use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
+use crate::operations::control_flow::{Select, SelectCondition};
+use crate::operations::differentiation::StopGradient;
+use crate::operations::scalars::ScalarOperation;
+use crate::operations::trigonometric::{Cos, Sin};
+use crate::operations::{BooleanLike, InterpretableOperation, Operation};
+use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
-use crate::types::{DataType, Typed};
+use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
+use crate::tracing_v2::rematerialization::RematerializationName;
+use crate::types::{DataType, TypeError, Typed};
 
-macro_rules! impl_typed_for_scalar {
-    ($ty:ty, $data_type:path) => {
-        impl Typed<DataType> for $ty {
-            fn r#type(&self) -> Cow<'_, DataType> {
-                Cow::Owned($data_type)
-            }
-        }
-    };
-}
-
-impl_typed_for_scalar!(bool, DataType::Boolean);
-impl_typed_for_scalar!(i8, DataType::I8);
-impl_typed_for_scalar!(i16, DataType::I16);
-impl_typed_for_scalar!(i32, DataType::I32);
-impl_typed_for_scalar!(i64, DataType::I64);
-impl_typed_for_scalar!(u8, DataType::U8);
-impl_typed_for_scalar!(u16, DataType::U16);
-impl_typed_for_scalar!(u32, DataType::U32);
-impl_typed_for_scalar!(u64, DataType::U64);
-impl_typed_for_scalar!(bf16, DataType::BF16);
-impl_typed_for_scalar!(f16, DataType::F16);
-impl_typed_for_scalar!(f32, DataType::F32);
-impl_typed_for_scalar!(f64, DataType::F64);
-
-// Scalars are valid values for their `DataType`, mirroring their `Typed<DataType>` implementations, and so each
-// scalar type implements `Value<DataType>`. Eager scalar interpretation needs no backend-owned staging context,
-// and so their `InterpretationContext` is a zero-sized `EagerContext`.
-macro_rules! impl_value_for_scalar {
-    ($ty:ty) => {
-        impl Value<DataType> for $ty {
-            type InterpretationContext = EagerContext<DataType, Self>;
-
-            #[inline]
-            fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-                Some(EagerContext::new())
-            }
-        }
-    };
-}
-
-impl_value_for_scalar!(bool);
-impl_value_for_scalar!(i8);
-impl_value_for_scalar!(i16);
-impl_value_for_scalar!(i32);
-impl_value_for_scalar!(i64);
-impl_value_for_scalar!(u8);
-impl_value_for_scalar!(u16);
-impl_value_for_scalar!(u32);
-impl_value_for_scalar!(u64);
-impl_value_for_scalar!(bf16);
-impl_value_for_scalar!(f16);
-impl_value_for_scalar!(f32);
-impl_value_for_scalar!(f64);
-
-/// Stateless [`Domain`] that uses [`DataType`] for scalar metadata and Rust scalar values such as `f32` for runtime
-/// values. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in `ryft-core`. It
+/// Stateless [`Domain`] that uses [`DataType`] to represent [`Type`]s and [`Scalar`] to represent runtime [`Value`]s.
+/// [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in this crate. It
 /// demonstrates the intended role of an eager [`Context`] in the smallest possible form. There are no device handles,
 /// no mesh states, and no backend registries. There are just the built-in [`ScalarOperation`] variants plus
-/// [`DataType`]-driven construction of scalar values.
+/// [`DataType`]-driven construction of scalar values. Note that because [`Scalar`] reports the [`DataType`] of
+/// whichever variant it holds, this single non-generic domain interprets scalar [`Program`](crate::Program)s over
+/// every supported scalar [`DataType`] without monomorphizing over one Rust primitive at a time.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct ScalarDomain<V> {
-    /// [`PhantomData`] marker that ties this zero-sized [`ScalarDomain`] to its scalar value type.
-    marker: PhantomData<fn() -> V>,
-}
+pub struct ScalarDomain;
 
-impl<V> ScalarDomain<V> {
+impl ScalarDomain {
     /// Creates a new [`ScalarDomain`].
     #[inline]
     pub const fn new() -> Self {
-        Self { marker: PhantomData }
+        Self
     }
 }
 
-/// Stateless linear [`Domain`] for scalar tangent and cotangent [`Program`](crate::Program)s. This is the linear
-/// complement of [`ScalarDomain`]. They both use the same scalar type (i.e., [`DataType`]) and the same runtime scalar
-/// values (i.e., `f32`, `f64`, etc.). They differ only in the operation type selected by [`Domain`]:
-///
-/// - [`ScalarDomain`] records ordinary scalar programs using [`ScalarOperation`].
-/// - [`LinearScalarDomain`] records linear tangent and cotangent programs using [`LinearScalarOperation`].
-///
-/// This separate domain is needed because [`Domain::Operation`] is an associated type. Once [`ScalarDomain`] says
-/// "ordinary scalar traces store [`ScalarOperation`] instructions", the same domain type cannot also say "linear scalar
-/// traces store [`LinearScalarOperation`] instructions". Automatic differentiation therefore keeps a tiny companion
-/// domain for linear [`Program`](crate::Program)s.
-///
-/// For example, tracing `f(x) = x * x` with [`ScalarDomain<f64>`] records an ordinary multiplication. Linearizing that
-/// program at `x = 3.0` produces a tangent program equivalent to `δx -> 3.0 * δx + 3.0 * δx`. That tangent program is
-/// stored with [`LinearScalarOperation`] instructions such as `scale` and `add`. [`LinearScalarDomain`] is what tells
-/// the generic tracing machinery to use that linear operation type instead of the standard operation type.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct LinearScalarDomain<V> {
-    /// [`PhantomData`] marker that ties this zero-sized [`LinearScalarDomain`] to its scalar value type.
-    marker: PhantomData<fn() -> V>,
+impl Domain for ScalarDomain {
+    type Type = DataType;
+    type Value = Scalar;
+    type Constant = Scalar;
+    type Operation = ScalarOperation<Scalar>;
 }
 
-impl<V> LinearScalarDomain<V> {
-    /// Creates a new [`LinearScalarDomain`].
+impl Context for ScalarDomain {
     #[inline]
-    pub const fn new() -> Self {
-        Self { marker: PhantomData }
+    fn lift(&self, constant: Scalar) -> Result<Scalar, ProgramError> {
+        Ok(constant)
+    }
+
+    #[inline]
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        // `ScalarDomain` is an eager `Context` whose `bind` interprets the operation directly over `Scalar` values.
+        operation.into().interpret(&EagerContext::new(), inputs)
     }
 }
 
-macro_rules! impl_domain_for_scalar {
-    ($ty:ty) => {
-        impl Domain for ScalarDomain<$ty> {
-            type Type = DataType;
-            type Value = $ty;
-            type Constant = $ty;
-            type Operation = ScalarOperation<$ty>;
-        }
+/// Scalar [`Value`] whose [`Type`] is a [`DataType`] and which is meant to be used primarily for testing the Ryft
+/// infrastructure and machinery with programs that do not involve multidimensional arrays.
+///
+/// # Examples
+///
+/// ```rust
+/// # use ryft_core::scalars::Scalar;
+/// # use ryft_core::types::{DataType, Typed};
+/// let scalar = Scalar::from(1.5f64);
+/// assert_eq!(scalar.r#type().into_owned(), DataType::F64);
+/// assert_eq!(scalar, 1.5f64);
+/// assert_eq!(scalar + Scalar::from(0.5f64), Scalar::from(2.0f64));
+/// ```
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Parameter)]
+pub enum Scalar {
+    Bool(bool),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    BF16(bf16),
+    F16(f16),
+    F32(f32),
+    F64(f64),
+}
 
-        impl Domain for LinearScalarDomain<$ty> {
-            type Type = DataType;
-            type Value = $ty;
-            type Constant = $ty;
-            type Operation = LinearScalarOperation<$ty>;
+impl Display for Scalar {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+        match self {
+            Scalar::Bool(value) => Display::fmt(value, formatter),
+            Scalar::I8(value) => Display::fmt(value, formatter),
+            Scalar::I16(value) => Display::fmt(value, formatter),
+            Scalar::I32(value) => Display::fmt(value, formatter),
+            Scalar::I64(value) => Display::fmt(value, formatter),
+            Scalar::U8(value) => Display::fmt(value, formatter),
+            Scalar::U16(value) => Display::fmt(value, formatter),
+            Scalar::U32(value) => Display::fmt(value, formatter),
+            Scalar::U64(value) => Display::fmt(value, formatter),
+            Scalar::BF16(value) => Display::fmt(value, formatter),
+            Scalar::F16(value) => Display::fmt(value, formatter),
+            Scalar::F32(value) => Display::fmt(value, formatter),
+            Scalar::F64(value) => Display::fmt(value, formatter),
+        }
+    }
+}
+
+impl Typed<DataType> for Scalar {
+    fn r#type(&self) -> Cow<'_, DataType> {
+        Cow::Owned(match self {
+            Scalar::Bool(_) => DataType::Boolean,
+            Scalar::I8(_) => DataType::I8,
+            Scalar::I16(_) => DataType::I16,
+            Scalar::I32(_) => DataType::I32,
+            Scalar::I64(_) => DataType::I64,
+            Scalar::U8(_) => DataType::U8,
+            Scalar::U16(_) => DataType::U16,
+            Scalar::U32(_) => DataType::U32,
+            Scalar::U64(_) => DataType::U64,
+            Scalar::BF16(_) => DataType::BF16,
+            Scalar::F16(_) => DataType::F16,
+            Scalar::F32(_) => DataType::F32,
+            Scalar::F64(_) => DataType::F64,
+        })
+    }
+}
+
+impl Value<DataType> for Scalar {
+    type InterpretationContext = EagerContext<DataType, Self>;
+
+    #[inline]
+    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
+        Some(EagerContext::new())
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+// Conversions from each supported Rust primitive into the corresponding [`Scalar`] variant. These let later stages and
+// numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
+macro_rules! impl_from_primitive_for_scalar {
+    ($ty:ty, $variant:ident) => {
+        impl From<$ty> for Scalar {
+            fn from(value: $ty) -> Self {
+                Scalar::$variant(value)
+            }
         }
     };
 }
 
-impl_domain_for_scalar!(bool);
-impl_domain_for_scalar!(i8);
-impl_domain_for_scalar!(i16);
-impl_domain_for_scalar!(i32);
-impl_domain_for_scalar!(i64);
-impl_domain_for_scalar!(u8);
-impl_domain_for_scalar!(u16);
-impl_domain_for_scalar!(u32);
-impl_domain_for_scalar!(u64);
-impl_domain_for_scalar!(bf16);
-impl_domain_for_scalar!(f16);
-impl_domain_for_scalar!(f32);
-impl_domain_for_scalar!(f64);
+impl_from_primitive_for_scalar!(bool, Bool);
+impl_from_primitive_for_scalar!(i8, I8);
+impl_from_primitive_for_scalar!(i16, I16);
+impl_from_primitive_for_scalar!(i32, I32);
+impl_from_primitive_for_scalar!(i64, I64);
+impl_from_primitive_for_scalar!(u8, U8);
+impl_from_primitive_for_scalar!(u16, U16);
+impl_from_primitive_for_scalar!(u32, U32);
+impl_from_primitive_for_scalar!(u64, U64);
+impl_from_primitive_for_scalar!(bf16, BF16);
+impl_from_primitive_for_scalar!(f16, F16);
+impl_from_primitive_for_scalar!(f32, F32);
+impl_from_primitive_for_scalar!(f64, F64);
 
-// Eager [`Context`] support is provided through the operation's interpretation, so it is available only for the
-// floating-point element types whose [`ScalarOperation`]/[`LinearScalarOperation`] enums are fully interpretable. The
-// integer and boolean scalar domains intentionally remain trace-only [`Domain`]s because their operation enums include
-// variants (such as negation, division, and the trigonometric primitives) that those element types do not support.
-// Because [`Domain::Value`] equals [`Domain::Constant`] here, these are eager [`Context`]s whose bind interprets.
-impl<V: Clone + Value<DataType>> Context for ScalarDomain<V>
-where
-    Self: Domain<Value = V, Constant = V, Operation: InterpretableOperation<DataType, V>>,
-    <V as Value<DataType>>::InterpretationContext: Default,
-{
-    #[inline]
-    fn lift(&self, constant: V) -> Result<V, ProgramError> {
-        Ok(constant)
-    }
+// Equality against each supported Rust primitive, comparing only within the matching variant so that a [`Scalar`] of a
+// different [`DataType`] never compares equal to a primitive (e.g., a `Scalar::F32` is never equal to an `f64`). These
+// let later stages and numeric-literal tests write `scalar == 0.0` directly.
+macro_rules! impl_partial_eq_primitive_for_scalar {
+    ($ty:ty, $variant:ident) => {
+        impl PartialEq<$ty> for Scalar {
+            fn eq(&self, other: &$ty) -> bool {
+                matches!(self, Scalar::$variant(value) if value == other)
+            }
+        }
+    };
+}
 
-    #[inline]
-    fn bind<O: Into<Self::Operation>>(
-        &self,
-        operation: O,
-        inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        operation.into().interpret(&<V as Value<DataType>>::InterpretationContext::default(), inputs)
+impl_partial_eq_primitive_for_scalar!(bool, Bool);
+impl_partial_eq_primitive_for_scalar!(i8, I8);
+impl_partial_eq_primitive_for_scalar!(i16, I16);
+impl_partial_eq_primitive_for_scalar!(i32, I32);
+impl_partial_eq_primitive_for_scalar!(i64, I64);
+impl_partial_eq_primitive_for_scalar!(u8, U8);
+impl_partial_eq_primitive_for_scalar!(u16, U16);
+impl_partial_eq_primitive_for_scalar!(u32, U32);
+impl_partial_eq_primitive_for_scalar!(u64, U64);
+impl_partial_eq_primitive_for_scalar!(bf16, BF16);
+impl_partial_eq_primitive_for_scalar!(f16, F16);
+impl_partial_eq_primitive_for_scalar!(f32, F32);
+impl_partial_eq_primitive_for_scalar!(f64, F64);
+
+// Elementwise arithmetic over equal-[`DataType`] variant pairs. A [`Scalar`] only combines with another [`Scalar`] of
+// the same variant. Any other pairing violates an internal invariant: either the data types differ (which an
+// operation's `infer_output_types` already rules out before interpretation) or the matched variant is Boolean, whose
+// primitive has no arithmetic operators (so the scalar Boolean domain stays trace-only and never reaches this code).
+// Both situations are bugs, so panicking with a clear message is correct here.
+macro_rules! impl_binary_arithmetic_for_scalar {
+    ($trait:ident, $method:ident, $operator:tt) => {
+        impl $trait for Scalar {
+            type Output = Scalar;
+
+            fn $method(self, rhs: Scalar) -> Scalar {
+                match (self, rhs) {
+                    (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
+                    (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
+                    (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left $operator right),
+                    (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left $operator right),
+                    (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left $operator right),
+                    (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left $operator right),
+                    (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left $operator right),
+                    (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left $operator right),
+                    (Scalar::BF16(left), Scalar::BF16(right)) => Scalar::BF16(left $operator right),
+                    (Scalar::F16(left), Scalar::F16(right)) => Scalar::F16(left $operator right),
+                    (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left $operator right),
+                    (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(left $operator right),
+                    (left, right) => unreachable!(
+                        "cannot apply `{}` to scalars of data types {} and {}",
+                        stringify!($method),
+                        left.r#type(),
+                        right.r#type(),
+                    ),
+                }
+            }
+        }
+    };
+}
+
+impl_binary_arithmetic_for_scalar!(Add, add, +);
+impl_binary_arithmetic_for_scalar!(Sub, sub, -);
+impl_binary_arithmetic_for_scalar!(Mul, mul, *);
+impl_binary_arithmetic_for_scalar!(Div, div, /);
+
+impl Neg for Scalar {
+    type Output = Scalar;
+
+    /// Negates this scalar. Only signed integer and floating-point variants are negatable; Boolean and unsigned
+    /// integer variants have no primitive negation and reaching them violates an internal invariant, so this panics
+    /// with a clear message in that case.
+    fn neg(self) -> Scalar {
+        match self {
+            Scalar::I8(value) => Scalar::I8(-value),
+            Scalar::I16(value) => Scalar::I16(-value),
+            Scalar::I32(value) => Scalar::I32(-value),
+            Scalar::I64(value) => Scalar::I64(-value),
+            Scalar::BF16(value) => Scalar::BF16(-value),
+            Scalar::F16(value) => Scalar::F16(-value),
+            Scalar::F32(value) => Scalar::F32(-value),
+            Scalar::F64(value) => Scalar::F64(-value),
+            other => unreachable!("cannot negate a scalar of data type {}", other.r#type()),
+        }
     }
 }
 
-impl<V: Clone + Value<DataType>> Context for LinearScalarDomain<V>
-where
-    Self: Domain<Value = V, Constant = V, Operation: InterpretableOperation<DataType, V>>,
-    <V as Value<DataType>>::InterpretationContext: Default,
-{
+// Context-level construction capabilities for [`Scalar`] values. Because a [`Scalar`] reports the [`DataType`] of
+// whichever variant it holds, a single [`EagerContext<DataType, Scalar, O>`] can synthesize the zero, one, or fill
+// value for every supported [`DataType`] by selecting the matching variant, rather than monomorphizing one context per
+// Rust primitive.
+
+impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
+    /// Returns the zero [`Scalar`] for the requested [`DataType`], selecting the variant that reports that data type.
+    fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
+        Ok(match r#type {
+            DataType::Boolean => Scalar::Bool(false),
+            DataType::I8 => Scalar::I8(0),
+            DataType::I16 => Scalar::I16(0),
+            DataType::I32 => Scalar::I32(0),
+            DataType::I64 => Scalar::I64(0),
+            DataType::U8 => Scalar::U8(0),
+            DataType::U16 => Scalar::U16(0),
+            DataType::U32 => Scalar::U32(0),
+            DataType::U64 => Scalar::U64(0),
+            DataType::BF16 => Scalar::BF16(bf16::ZERO),
+            DataType::F16 => Scalar::F16(f16::ZERO),
+            DataType::F32 => Scalar::F32(0.0),
+            DataType::F64 => Scalar::F64(0.0),
+            other => {
+                return Err(TypeError { message: format!("scalar value does not support data type {other}") }.into());
+            }
+        })
+    }
+}
+
+impl<O: Operation<DataType>> One<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
+    /// Returns the one [`Scalar`] for the requested [`DataType`], selecting the variant that reports that data type.
+    fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
+        Ok(match r#type {
+            DataType::Boolean => Scalar::Bool(true),
+            DataType::I8 => Scalar::I8(1),
+            DataType::I16 => Scalar::I16(1),
+            DataType::I32 => Scalar::I32(1),
+            DataType::I64 => Scalar::I64(1),
+            DataType::U8 => Scalar::U8(1),
+            DataType::U16 => Scalar::U16(1),
+            DataType::U32 => Scalar::U32(1),
+            DataType::U64 => Scalar::U64(1),
+            DataType::BF16 => Scalar::BF16(bf16::ONE),
+            DataType::F16 => Scalar::F16(f16::ONE),
+            DataType::F32 => Scalar::F32(1.0),
+            DataType::F64 => Scalar::F64(1.0),
+            other => {
+                return Err(TypeError { message: format!("scalar value does not support data type {other}") }.into());
+            }
+        })
+    }
+}
+
+impl<O: Operation<DataType>> Fill<DataType, Scalar, Scalar> for EagerContext<DataType, Scalar, O> {
+    /// Returns the fill [`Scalar`] for the requested [`DataType`], which for scalars is just the captured `value`
+    /// itself once its [`DataType`] is confirmed to match the requested one.
+    fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
+        let value_type = value.r#type().into_owned();
+        if *r#type != value_type {
+            return Err(TypeError {
+                message: format!("scalar value expected data type {value_type} but got {}", r#type),
+            }
+            .into());
+        }
+        Ok(value)
+    }
+}
+
+impl ZeroLike for Scalar {
+    /// Returns the zero [`Scalar`] with the same [`DataType`] as `self`.
+    fn zero_like(&self) -> Self {
+        match self {
+            Scalar::Bool(_) => Scalar::Bool(false),
+            Scalar::I8(_) => Scalar::I8(0),
+            Scalar::I16(_) => Scalar::I16(0),
+            Scalar::I32(_) => Scalar::I32(0),
+            Scalar::I64(_) => Scalar::I64(0),
+            Scalar::U8(_) => Scalar::U8(0),
+            Scalar::U16(_) => Scalar::U16(0),
+            Scalar::U32(_) => Scalar::U32(0),
+            Scalar::U64(_) => Scalar::U64(0),
+            Scalar::BF16(_) => Scalar::BF16(bf16::ZERO),
+            Scalar::F16(_) => Scalar::F16(f16::ZERO),
+            Scalar::F32(_) => Scalar::F32(0.0),
+            Scalar::F64(_) => Scalar::F64(0.0),
+        }
+    }
+}
+
+impl OneLike for Scalar {
+    /// Returns the one [`Scalar`] with the same [`DataType`] as `self`.
+    fn one_like(&self) -> Self {
+        match self {
+            Scalar::Bool(_) => Scalar::Bool(true),
+            Scalar::I8(_) => Scalar::I8(1),
+            Scalar::I16(_) => Scalar::I16(1),
+            Scalar::I32(_) => Scalar::I32(1),
+            Scalar::I64(_) => Scalar::I64(1),
+            Scalar::U8(_) => Scalar::U8(1),
+            Scalar::U16(_) => Scalar::U16(1),
+            Scalar::U32(_) => Scalar::U32(1),
+            Scalar::U64(_) => Scalar::U64(1),
+            Scalar::BF16(_) => Scalar::BF16(bf16::ONE),
+            Scalar::F16(_) => Scalar::F16(f16::ONE),
+            Scalar::F32(_) => Scalar::F32(1.0),
+            Scalar::F64(_) => Scalar::F64(1.0),
+        }
+    }
+}
+
+impl Scalable<Scalar> for Scalar {
+    /// Scales `self` by `factor`, reusing the variant-matched [`Mul`] implementation of [`Scalar`]. Mismatched
+    /// variants panic through that multiplication, since equal-[`DataType`] operands are an interpretation invariant.
     #[inline]
-    fn lift(&self, constant: V) -> Result<V, ProgramError> {
-        Ok(constant)
+    fn scale(&self, factor: Scalar) -> Result<Self, ProgramError> {
+        Ok(*self * factor)
+    }
+}
+
+impl Sin for Scalar {
+    /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point variants support sine; reaching any
+    /// other variant violates an interpretation invariant guaranteed upstream by type inference, so it panics.
+    fn sin(&self) -> Self {
+        match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sin())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sin())),
+            Scalar::F32(value) => Scalar::F32(value.sin()),
+            Scalar::F64(value) => Scalar::F64(value.sin()),
+            other => unreachable!("cannot compute the sine of a scalar of data type {}", other.r#type()),
+        }
+    }
+}
+
+impl Cos for Scalar {
+    /// Computes the elementwise cosine of this [`Scalar`]. Only the floating-point variants support cosine; reaching
+    /// any other variant violates an interpretation invariant guaranteed upstream by type inference, so it panics.
+    fn cos(&self) -> Self {
+        match self {
+            Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().cos())),
+            Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().cos())),
+            Scalar::F32(value) => Scalar::F32(value.cos()),
+            Scalar::F64(value) => Scalar::F64(value.cos()),
+            other => unreachable!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
+        }
+    }
+}
+
+impl Dot for Scalar {
+    /// Computes the rank-0 dot product of two [`Scalar`]s, which is just their product. The dimension numbers carry no
+    /// axes for rank-0 operands and are therefore unused.
+    #[inline]
+    fn dot(&self, rhs: &Self, _dimensions: &DotDimensionNumbers) -> Self {
+        *self * *rhs
+    }
+}
+
+impl StopGradient for Scalar {
+    /// Returns this [`Scalar`] unchanged while marking it as a constant for differentiation purposes.
+    #[inline]
+    fn stop_gradient(&self) -> Self {
+        *self
+    }
+}
+
+impl RematerializationName for Scalar {
+    /// Returns this [`Scalar`] unchanged. Rematerialization-name tagging is the identity on concrete values; the tag
+    /// only matters when staging through a [`Tracer`](crate::tracing::Tracer).
+    #[inline]
+    fn rematerialization_name(self, _name: &str) -> Self {
+        self
+    }
+}
+
+impl Compare for Scalar {
+    type Output = Scalar;
+
+    /// Compares two equal-[`DataType`] [`Scalar`]s and returns the Boolean result as an honestly Boolean-typed
+    /// [`Scalar::Bool`], never a numeric variant. Mismatched variants violate an interpretation invariant guaranteed
+    /// upstream by type inference, so it panics.
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
+        let ordering = match (self, rhs) {
+            (Scalar::Bool(left), Scalar::Bool(right)) => left.partial_cmp(right),
+            (Scalar::I8(left), Scalar::I8(right)) => left.partial_cmp(right),
+            (Scalar::I16(left), Scalar::I16(right)) => left.partial_cmp(right),
+            (Scalar::I32(left), Scalar::I32(right)) => left.partial_cmp(right),
+            (Scalar::I64(left), Scalar::I64(right)) => left.partial_cmp(right),
+            (Scalar::U8(left), Scalar::U8(right)) => left.partial_cmp(right),
+            (Scalar::U16(left), Scalar::U16(right)) => left.partial_cmp(right),
+            (Scalar::U32(left), Scalar::U32(right)) => left.partial_cmp(right),
+            (Scalar::U64(left), Scalar::U64(right)) => left.partial_cmp(right),
+            (Scalar::BF16(left), Scalar::BF16(right)) => left.partial_cmp(right),
+            (Scalar::F16(left), Scalar::F16(right)) => left.partial_cmp(right),
+            (Scalar::F32(left), Scalar::F32(right)) => left.partial_cmp(right),
+            (Scalar::F64(left), Scalar::F64(right)) => left.partial_cmp(right),
+            (left, right) => {
+                unreachable!("cannot compare scalars of data types {} and {}", left.r#type(), right.r#type(),)
+            }
+        };
+        let result = match direction {
+            ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
+            ComparisonDirection::NotEqual => ordering != Some(Ordering::Equal),
+            ComparisonDirection::LessThan => ordering == Some(Ordering::Less),
+            ComparisonDirection::LessThanOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+            ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
+            ComparisonDirection::GreaterThanOrEqual => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
+        };
+        Scalar::Bool(result)
+    }
+}
+
+impl Select for Scalar {
+    type Condition = bool;
+
+    /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the per-primitive scalar
+    /// selection semantics. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before reaching
+    /// here, so this only needs the resolved `bool`.
+    #[inline]
+    fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        Ok(if *condition { *on_true } else { *on_false })
+    }
+}
+
+impl SelectCondition for Scalar {
+    type Condition = bool;
+
+    /// Extracts the selection condition carried by this [`Scalar`], decoding its in-band Boolean payload through
+    /// [`BooleanLike::boolean`].
+    #[inline]
+    fn select_condition(&self) -> Result<bool, ProgramError> {
+        self.boolean()
+    }
+}
+
+impl BooleanLike for Scalar {
+    /// Returns the honest Boolean counterpart of this [`Scalar`] as a [`Scalar::Bool`]: a zero payload maps to `false`
+    /// and any non-zero payload maps to `true`. This is the crux of the redesign, as the result is always a genuine
+    /// [`DataType::Boolean`] scalar rather than an in-band numeric encoding.
+    fn as_boolean(&self) -> Self {
+        // `Self::boolean` decodes every [`Scalar`] variant without failing, so the unwrap here can never panic.
+        Scalar::Bool(self.boolean().unwrap())
     }
 
-    #[inline]
-    fn bind<O: Into<Self::Operation>>(
-        &self,
-        operation: O,
-        inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        operation.into().interpret(&<V as Value<DataType>>::InterpretationContext::default(), inputs)
+    /// Extracts the Rust `bool` represented by this [`Scalar`]: zero maps to `false` and any non-zero payload maps to
+    /// `true`.
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        Ok(match self {
+            Scalar::Bool(value) => *value,
+            Scalar::I8(value) => *value != 0,
+            Scalar::I16(value) => *value != 0,
+            Scalar::I32(value) => *value != 0,
+            Scalar::I64(value) => *value != 0,
+            Scalar::U8(value) => *value != 0,
+            Scalar::U16(value) => *value != 0,
+            Scalar::U32(value) => *value != 0,
+            Scalar::U64(value) => *value != 0,
+            Scalar::BF16(value) => *value != bf16::ZERO,
+            Scalar::F16(value) => *value != f16::ZERO,
+            Scalar::F32(value) => *value != 0.0,
+            Scalar::F64(value) => *value != 0.0,
+        })
     }
 }
 
@@ -198,39 +531,12 @@ mod tests {
 
     #[test]
     fn test_scalar_domain() {
-        // Both [`ScalarDomain`] and [`LinearScalarDomain`] are zero-sized tokens.
-        assert_eq!(size_of::<ScalarDomain<bool>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<i8>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<i16>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<i32>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<i64>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<u8>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<u16>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<u32>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<u64>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<bf16>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<f16>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<f32>>(), 0);
-        assert_eq!(size_of::<ScalarDomain<f64>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<bool>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<i8>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<i16>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<i32>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<i64>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<u8>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<u16>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<u32>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<u64>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<bf16>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<f16>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<f32>>(), 0);
-        assert_eq!(size_of::<LinearScalarDomain<f64>>(), 0);
+        // [`ScalarDomain`] is a zero-sized token.
+        assert_eq!(size_of::<ScalarDomain>(), 0);
 
-        // Both are eager `Context`s for floating-point element types and so, binding a nullary zero/one operation
-        // interprets it directly over concrete values, yielding the corresponding scalar identity.
-        assert_eq!(ScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0]));
-        assert_eq!(ScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0]));
-        assert_eq!(LinearScalarDomain::<f64>::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0]));
-        assert_eq!(LinearScalarDomain::<f64>::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0]));
+        // It is an eager `Context`. Binding a nullary zero/one operation interprets it directly over concrete
+        // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
+        assert_eq!(ScalarDomain::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(0.0)]));
+        assert_eq!(ScalarDomain::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(1.0)]));
     }
 }
