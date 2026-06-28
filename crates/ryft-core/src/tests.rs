@@ -90,7 +90,7 @@ impl TestArray {
 
     /// Returns the number of elements represented by `type`, or an error when `type` has dynamic dimensions and
     /// therefore cannot be materialized into a concrete payload.
-    fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
+    pub fn materialized_element_count(r#type: &ArrayType) -> Result<usize, ProgramError> {
         r#type.element_count().map_err(|error| TypeError { message: error.to_string() })?.ok_or_else(|| {
             TypeError { message: format!("cannot materialize a value of dynamically sized type {}", r#type) }.into()
         })
