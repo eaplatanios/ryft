@@ -28,6 +28,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::Placeholder;
@@ -444,38 +445,34 @@ where
     }
 }
 
-/// Copies an already-residual `program` into `builder` over the caller-provided `input_atoms`, returning the builder
-/// atoms holding the spliced program's outputs in output order.
-///
-/// This is a plain relocation, not a re-partial-evaluation: every instruction and every program constant is rebuilt
-/// verbatim into `builder`. It is the reconciliation primitive an unknown-predicate `condition` uses to graft each
-/// branch's residual program into the reconciled branch it emits.
-///
-/// # Parameters
-///
-///   - `builder`: Builder accumulating the program the spliced instructions are appended to.
-///   - `program`: Already-residual program to copy in.
-///   - `input_atoms`: Builder atoms feeding `program`'s inputs, aligned with `program`'s input atoms in input order.
-pub(crate) fn splice_program_into<T, V, O>(
-    builder: &mut ProgramBuilder<T, V, O>,
-    program: &Program<T, V, O, Vec<V>, Vec<V>>,
-    input_atoms: &[AtomId],
-) -> Result<Vec<AtomId>, ProgramError>
-where
-    T: Type,
-    V: Value<T>,
-    O: Clone + InterpretableOperation<T, V>,
-{
-    // The builder is borrowed by both interpretation closures, which never run concurrently; a `RefCell` lets each
-    // take a short-lived mutable borrow without the borrow checker conservatively rejecting the second closure.
-    let builder = RefCell::new(builder);
-    program.interpret_with::<AtomId, ProgramError, _, _>(
-        input_atoms.to_vec(),
-        |_, constant| Ok(builder.borrow_mut().add_constant(constant.clone())),
-        |instruction, operand_atoms| {
-            Ok(builder.borrow_mut().add_instruction(instruction.operation().clone(), operand_atoms.to_vec())?.to_vec())
-        },
-    )
+impl<T: Type, V: Value<T>, O: Clone + InterpretableOperation<T, V>> Program<T, V, O, Vec<V>, Vec<V>> {
+    /// Copies this already-residual program into `builder` over the caller-provided `inputs`, returning the builder
+    /// atoms holding the spliced program's outputs in output order.
+    ///
+    /// This is a plain relocation, not a re-partial-evaluation: every instruction and every program constant is
+    /// rebuilt verbatim into `builder`. It is the reconciliation primitive an unknown-predicate `condition` uses to
+    /// graft each branch's residual program into the reconciled branch it emits.
+    ///
+    /// # Parameters
+    ///
+    ///   - `builder`: Builder accumulating the program the spliced instructions are appended to.
+    ///   - `inputs`: Builder atoms feeding this program's inputs, aligned with its input atoms in input order.
+    pub(crate) fn splice_into(
+        &self,
+        builder: &mut ProgramBuilder<T, V, O>,
+        inputs: &[AtomId],
+    ) -> Result<Vec<AtomId>, ProgramError> {
+        // The builder is borrowed by both interpretation closures, which never run concurrently; a `RefCell` lets each
+        // take a short-lived mutable borrow without the borrow checker conservatively rejecting the second closure.
+        let builder = RefCell::new(builder);
+        self.interpret_with::<AtomId, ProgramError, _, _>(
+            inputs.to_vec(),
+            |_, constant| Ok(builder.borrow_mut().add_constant(constant.clone())),
+            |instruction, inputs| {
+                Ok(builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs.to_vec())?.to_vec())
+            },
+        )
+    }
 }
 
 impl<T, V, O> Program<T, V, O, Vec<V>, Vec<V>>
@@ -503,7 +500,7 @@ where
     /// a residual input of the residual program; literal constants are rebuilt inline as residual-program constants,
     /// so they are never residual inputs.
     ///
-    /// # Relationship to [`partial_eval_split`](Self::partial_eval_split)
+    /// # Relationship to [`partition`](Self::partition)
     ///
     /// This is the **value-carrying** form of partial evaluation: it holds concrete known values, so it *evaluates*
     /// the known subcomputation away (folding it through [`InterpretableOperation::interpret`]) and applies
@@ -512,11 +509,11 @@ where
     /// known now. It is the analogue of JAX's value-carrying partial evaluation (tracing over `PartialVal`s);
     /// [`PartialValue`] mirrors JAX's `PartialVal`.
     ///
-    /// [`partial_eval_split`](Self::partial_eval_split) is the **structural** counterpart: from a known/unknown
-    /// *flag* per input (no values, no context) it *partitions* the program into two sub-programs joined by
-    /// residuals, folding and rewriting nothing — the form linearization needs. The two are not reducible to each
-    /// other: this method requires concrete values and *discards* the known computation (folds it to values),
-    /// whereas the split keeps the known computation as a runnable program.
+    /// [`partition`](Self::partition) is the **structural** counterpart: from a stage id per input (no values, no
+    /// context) it *partitions* the program into per-stage sub-programs joined by residuals, folding and rewriting
+    /// nothing — the form linearization needs, run as a two-stage known/unknown split. The two are not reducible to
+    /// each other: this method requires concrete values and *discards* the known computation (folds it to values),
+    /// whereas a partition keeps each stage's computation as a runnable program.
     ///
     /// # Parameters
     ///
@@ -580,195 +577,223 @@ where
     }
 }
 
-/// Result of splitting a flat program by partial evaluation; see [`Program::partial_eval_split`].
+/// Result of partitioning a flat [`Program`] into `stage_count` totally-ordered stages by a per-input stage
+/// assignment; see [`Program::partition`].
 ///
-/// Unlike [`ResidualProgram`], this is a purely *structural* split: it carries no concrete values and folds nothing.
-/// It partitions the original program into two sub-programs by a per-input known/unknown classification — the
-/// [`known_program`](Self::known_program) over the known inputs and the [`unknown_program`](Self::unknown_program) over
-/// the unknown inputs plus the *residuals* (the known values the unknown side consumes) — so that interpreting the two
-/// in sequence and interleaving their outputs reproduces the original program. It is the structural analogue of JAX's
-/// `partial_eval_jaxpr` primitive.
+/// Unlike [`ResidualProgram`], this is a purely *structural* partition: it carries no concrete values and folds
+/// nothing. Each instruction is placed in the latest stage among its operands, and the forward cross-stage edges are
+/// threaded as *residuals* between the per-stage sub-programs. Running the [`stages`](Self::stages) in stage order,
+/// threading each stage's produced residuals forward to the stages that consume them, and reassembling the outputs via
+/// [`output_stages`](Self::output_stages) reproduces the original program. It is the structural, multi-stage
+/// generalization of JAX's `partial_eval_jaxpr`; its two-stage known/unknown instance is the partial-evaluation split.
 ///
-/// To recombine the original outputs: interpret [`known_program`](Self::known_program) on the known inputs and split
-/// its outputs into the known program-outputs followed by the [`residual_count`](Self::residual_count) residuals;
-/// interpret [`unknown_program`](Self::unknown_program) on the unknown inputs followed by those residuals; then, for
-/// each original output, take it from the unknown program's outputs where [`output_unknowns`](Self::output_unknowns) is
-/// `true` and from the known program's outputs otherwise.
+/// To recombine the original outputs: interpret each [`PartitionStage::program`] in stage order over its own inputs
+/// (the original inputs named by [`PartitionStage::input_indices`]) followed by its consumed residuals (each fetched
+/// through its [`ResidualSource`] from an earlier stage's stored produced residuals); split each stage's outputs into
+/// its leading [`PartitionStage::output_count`] own outputs and its trailing produced residuals; then, for each
+/// original program output, take it from the own outputs of the stage named by [`output_stages`](Self::output_stages).
+///
+/// # Invariants
+///
+///   - `stages[i].program.input_ids().len() == stages[i].input_indices.len() + stages[i].residual_inputs.len()`.
+///   - The producer's produced-residual count is `stages[i].program.output_ids().len() - stages[i].output_count`.
+///   - Every [`ResidualSource`] `{ stage, index }` consumed by stage `i` has `stage < i` and `index` less than the
+///     producer's produced-residual count.
 #[derive(Debug)]
-pub struct PartitionedResidualProgram<T: Type, V: Value<T>, O> {
-    /// Computes the program's known outputs followed by the residuals, from the known inputs.
-    pub known_program: Program<T, V, O, Vec<V>, Vec<V>>,
+pub struct PartitionedProgram<T: Type, V: Value<T>, O> {
+    /// One sub-program per stage, in stage order (the index of a stage is its stage id).
+    pub stages: Vec<PartitionStage<T, V, O>>,
 
-    /// Computes the unknown outputs from the unknown inputs followed by the residuals.
-    pub unknown_program: Program<T, V, O, Vec<V>, Vec<V>>,
-
-    /// For each original program output, `true` if it is produced by [`unknown_program`](Self::unknown_program),
-    /// `false` if by [`known_program`](Self::known_program).
-    pub output_unknowns: Vec<bool>,
-
-    /// Original input indices (in order) that are known — the inputs of [`known_program`](Self::known_program).
-    pub known_input_indices: Vec<usize>,
-
-    /// Original input indices (in order) that are unknown — the leading inputs of
-    /// [`unknown_program`](Self::unknown_program).
-    pub unknown_input_indices: Vec<usize>,
-
-    /// Number of residuals: the trailing outputs of [`known_program`](Self::known_program) and the trailing inputs of
-    /// [`unknown_program`](Self::unknown_program).
-    pub residual_count: usize,
+    /// For each original program output, in original output order, the stage that produces it.
+    pub output_stages: Vec<usize>,
 }
 
-impl<T, V, O> Program<T, V, O, Vec<V>, Vec<V>>
-where
-    T: Type,
-    V: Value<T>,
-    O: Clone + Operation<T>,
-{
-    /// Partially evaluates this flat program structurally, splitting it into a *known* sub-program and an *unknown*
-    /// sub-program by the per-input classification `input_unknowns` (one bool per program input; `true` = unknown).
+/// One stage of a [`PartitionedProgram`]. Its [`program`](Self::program) takes `[stage inputs..., consumed
+/// residuals...]` and produces `[stage outputs..., produced residuals...]`.
+#[derive(Debug)]
+pub struct PartitionStage<T: Type, V: Value<T>, O> {
+    /// Projected sub-program for this stage, over this stage's own inputs followed by its consumed residuals, producing
+    /// this stage's own outputs followed by its produced residuals.
+    pub program: Program<T, V, O, Vec<V>, Vec<V>>,
+
+    /// Original input indices feeding this stage's leading (own) inputs, in order; inputs that no surviving instruction
+    /// consumes are dropped.
+    pub input_indices: Vec<usize>,
+
+    /// Source of each trailing consumed-residual input, in order: which earlier stage produced it and its index among
+    /// that stage's produced residuals.
+    pub residual_inputs: Vec<ResidualSource>,
+
+    /// Count of this stage's leading (own) outputs; the remaining [`program`](Self::program) outputs are the produced
+    /// residuals other stages consume.
+    pub output_count: usize,
+}
+
+/// Where a consumed residual comes from: the producer `stage` and the `index` of the residual among that stage's
+/// produced residuals (the trailing outputs of the producer's program, after its own outputs).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ResidualSource {
+    /// Stage id of the producer — the earlier stage whose produced residuals include this value.
+    pub stage: usize,
+
+    /// Index of this value among the producer stage's produced residuals.
+    pub index: usize,
+}
+
+impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
+    /// Partitions this flat program structurally into `stage_count` totally-ordered stages by the per-input stage
+    /// assignment `input_stages` (one stage id per program input, in input order).
     ///
-    /// This is the structural analogue of JAX's `partial_eval_jaxpr`: it carries no values, uses no interpretation
-    /// context, and folds nothing. It only partitions the program's [`Atom`]s and
-    /// [`Instruction`](crate::programs::Instruction)s into two sides so that running the known side, then the unknown
-    /// side fed the *residuals* (the known values the unknown side consumes), and interleaving their outputs
-    /// reproduces the original program.
+    /// This is the structural, multi-stage generalization of JAX's `partial_eval_jaxpr`: it carries no values, uses no
+    /// interpretation context, and folds nothing. It only partitions the program's [`Atom`]s and
+    /// [`Instruction`](crate::programs::Instruction)s across stages so that running the stages in stage order, fed the
+    /// *residuals* (the cross-stage values each stage consumes from earlier stages), and reassembling their outputs
+    /// reproduces the original program. The two-stage instance (stage 0 = known, stage 1 = unknown) is the
+    /// partial-evaluation split that [`Program::linearize`](crate::Program::linearize) uses.
     ///
-    /// Classification is a single forward pass: a program input is unknown exactly when its `input_unknowns` flag is
-    /// set; a constant is always known; an instruction's outputs are unknown when any of its input atoms is unknown,
-    /// and known otherwise. Control-flow and other nested-program operations are treated as ordinary operations here —
-    /// there are no operation-specific split rules at this stage. The residuals are the known *variable* atoms (program
-    /// inputs or instruction outputs) consumed by at least one unknown instruction, in first-encountered order and
-    /// deduplicated; known constants consumed by the unknown side are rebuilt inline in the unknown program rather than
-    /// threaded as residuals.
+    /// Stage classification is a single forward pass: a program input takes its `input_stages` entry; a constant is
+    /// stage `0` (literals are available from the start and rebuilt inline by [`Self::filtered`], never threaded); an
+    /// instruction's outputs all share the maximum stage over the instruction's operands. Control-flow and other
+    /// nested-program operations are treated as ordinary operations here — there are no operation-specific partition
+    /// rules at this stage. A residual is any *variable* operand of an instruction at stage `j` whose own stage is some
+    /// `i < j`; it is produced once (deduplicated globally on first encounter, so a value consumed by several later
+    /// stages or by a non-adjacent stage is threaded once) and consumed by every stage that reads it (deduplicated per
+    /// consuming stage). Known constants are rebuilt inline by [`Self::filtered`] and are never threaded as residuals.
     ///
-    /// The two sub-programs are projected with [`Self::filtered`], which keeps only the instructions reachable from
-    /// each side's outputs and rebuilds constants inline. Because every residual is, by construction, both an output of
-    /// the known side and an operand of the unknown side, the residual count is consistent across both programs. The
-    /// reported [`known_input_indices`](PartitionedResidualProgram::known_input_indices) and
-    /// [`unknown_input_indices`](PartitionedResidualProgram::unknown_input_indices) reflect exactly the inputs each
-    /// projected program actually takes, so a known or unknown input that no surviving instruction consumes is dropped
-    /// from the corresponding program and from its index list.
+    /// Each stage's sub-program is projected with [`Self::filtered`], which keeps only the instructions reachable from
+    /// that stage's outputs and rebuilds constants inline. Because every residual is, by construction, both an output
+    /// of its producer stage and an operand of each consuming stage, the residual wiring is consistent across stages.
+    /// The reported [`input_indices`](PartitionStage::input_indices) and [`residual_inputs`](PartitionStage::residual_inputs)
+    /// reflect exactly the inputs each projected program actually takes, so an own input or a residual that no surviving
+    /// instruction consumes is dropped from the corresponding program and from its index lists.
+    ///
+    /// An empty stage (no own inputs, outputs, or instructions — for example a trailing stage that nothing reaches)
+    /// yields an empty projected program. `stage_count` is taken explicitly rather than inferred from `input_stages`,
+    /// so a trailing empty stage is still produced (this is what lets a two-stage known/unknown split always produce
+    /// its unknown stage, even when every input is known).
     ///
     /// # Relationship to [`partially_evaluate`](Self::partially_evaluate)
     ///
-    /// This is the **structural** form, and is what [`Program::linearize`](crate::Program::linearize) uses to split a
-    /// jvp-traced program into its primal (known) and tangent (unknown) halves: at linearization time there are no
-    /// concrete values, the residuals are symbolic, and *both* halves must survive as reusable programs. It is the
-    /// analogue of JAX's `partial_eval_jaxpr`.
-    ///
-    /// [`partially_evaluate`](Self::partially_evaluate) is the **value-carrying** counterpart: it folds the known
-    /// half to concrete values (and applies per-operation rewrites) for constant-folding or specialization. The two
-    /// are not reducible to each other — this method neither has values to fold nor produces them, and it preserves
-    /// the known computation as a program rather than evaluating it away.
+    /// This is the **structural** form: at partition time there are no concrete values, the residuals are symbolic, and
+    /// *every* stage survives as a reusable program. [`partially_evaluate`](Self::partially_evaluate) is the
+    /// **value-carrying** counterpart: it folds the known half to concrete values (and applies per-operation rewrites)
+    /// for constant-folding or specialization. The two are not reducible to each other — this method neither has values
+    /// to fold nor produces them, and it preserves each stage's computation as a program rather than evaluating it away.
     ///
     /// # Parameters
     ///
-    ///   - `input_unknowns`: One flag per program input, in input order; `true` marks the input as unknown.
-    pub fn partial_eval_split(
+    ///   - `input_stages`: One stage id per program input, in input order; each must be less than `stage_count`.
+    ///   - `stage_count`: Number of stages to partition into; must be at least `1`.
+    pub fn partition(
         &self,
-        input_unknowns: &[bool],
-    ) -> Result<PartitionedResidualProgram<T, V, O>, ProgramError> {
-        if input_unknowns.len() != self.input_ids.len() {
+        input_stages: &[usize],
+        stage_count: usize,
+    ) -> Result<PartitionedProgram<T, V, O>, ProgramError> {
+        if input_stages.len() != self.input_ids.len() {
             return Err(ProgramError::InvalidInputCount {
                 expected: self.input_ids.len(),
-                actual: input_unknowns.len(),
+                actual: input_stages.len(),
             });
         }
+        if stage_count < 1 {
+            return Err(ProgramError::MalformedProgram("partition requires at least one stage".into()));
+        }
+        if let Some(&stage) = input_stages.iter().find(|&&stage| stage >= stage_count) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "input stage {stage} is out of range for {stage_count} stages",
+            )));
+        }
 
-        // Classify every atom known/unknown by a forward pass. Constants are known; a program input takes its flag; an
-        // instruction's outputs are unknown iff any operand is unknown.
-        let mut atom_unknown = vec![false; self.atoms.len()];
-        for (input_id, &unknown) in self.input_ids.iter().copied().zip(input_unknowns) {
-            atom_unknown[input_id.index()] = unknown;
+        // Classify every atom's stage by a forward pass. A program input takes its assignment; a constant is stage 0;
+        // an instruction's outputs all share the maximum stage over its operands.
+        let mut atom_stage = vec![0usize; self.atoms.len()];
+        for (input_id, &stage) in self.input_ids.iter().copied().zip(input_stages) {
+            atom_stage[input_id.index()] = stage;
         }
         for instruction in self.instructions.iter() {
-            let unknown = instruction.inputs().iter().any(|operand| atom_unknown[operand.index()]);
+            let stage = instruction.inputs().iter().map(|operand| atom_stage[operand.index()]).max().unwrap_or(0);
             for output_id in instruction.outputs().iter().copied() {
-                atom_unknown[output_id.index()] = unknown;
+                atom_stage[output_id.index()] = stage;
             }
         }
 
-        // Residuals: known *variable* atoms consumed by at least one unknown instruction, in first-encountered order,
-        // deduplicated. Known constants are rebuilt inline by `filtered` and never threaded as residuals.
-        let mut residual_atoms: Vec<AtomId> = Vec::new();
-        let mut is_residual = vec![false; self.atoms.len()];
+        // Cross-stage residuals, discovered with two distinct dedup scopes:
+        //   - producer side (`produced` + `source_of`): the identity set of each residual, fixed once on first
+        //     encounter, so a value consumed by several later stages or by a non-adjacent stage is threaded once;
+        //   - consumer side (`consumed`): a per-consuming-stage ordered, deduplicated candidate list.
+        // Known constants are excluded (`is_variable` guard) — `filtered` rebuilds them inline.
+        let mut produced: Vec<Vec<AtomId>> = vec![Vec::new(); stage_count];
+        let mut source_of: HashMap<AtomId, ResidualSource> = HashMap::new();
+        let mut consumed: Vec<Vec<AtomId>> = vec![Vec::new(); stage_count];
+        let mut seen: Vec<Vec<bool>> = vec![vec![false; self.atoms.len()]; stage_count];
         for instruction in self.instructions.iter() {
-            let unknown = instruction.outputs().iter().any(|output_id| atom_unknown[output_id.index()]);
-            if !unknown {
+            let consuming_stage = instruction.outputs().iter().map(|output_id| atom_stage[output_id.index()]).max();
+            let Some(consuming_stage) = consuming_stage else {
                 continue;
-            }
+            };
             for operand in instruction.inputs().iter().copied() {
-                if atom_unknown[operand.index()] || is_residual[operand.index()] {
+                let producing_stage = atom_stage[operand.index()];
+                if producing_stage >= consuming_stage || !self.atoms[operand.index()].is_variable() {
                     continue;
                 }
-                if self.atoms[operand.index()].is_variable() {
-                    is_residual[operand.index()] = true;
-                    residual_atoms.push(operand);
+                // Producer side: assign this residual its identity once, shared by every consumer.
+                source_of.entry(operand).or_insert_with(|| {
+                    produced[producing_stage].push(operand);
+                    ResidualSource { stage: producing_stage, index: produced[producing_stage].len() - 1 }
+                });
+                // Consumer side: record it in this consuming stage's candidate list, deduplicated per stage.
+                if !seen[consuming_stage][operand.index()] {
+                    seen[consuming_stage][operand.index()] = true;
+                    consumed[consuming_stage].push(operand);
                 }
             }
         }
 
-        // Per original output: unknown iff its atom is unknown.
-        let output_unknowns =
-            self.output_ids.iter().map(|output_id| atom_unknown[output_id.index()]).collect::<Vec<_>>();
+        // Per original output: the stage that produces its atom.
+        let output_stages = self.output_ids.iter().map(|output_id| atom_stage[output_id.index()]).collect::<Vec<_>>();
 
-        // Original input indices, partitioned by classification and kept in input order. The boundary atoms passed to
-        // `filtered` are these inputs' atoms, so a surviving `filtered` position indexes straight back into them.
-        let known_input_candidates = (0..self.input_ids.len()).filter(|&index| !input_unknowns[index]);
-        let unknown_input_candidates = (0..self.input_ids.len()).filter(|&index| input_unknowns[index]);
+        let mut stages = Vec::with_capacity(stage_count);
+        for stage in 0..stage_count {
+            // Own inputs/outputs of this stage, in original order. Boundary inputs are the own inputs followed by this
+            // stage's consumed residuals; boundary outputs are the own outputs followed by this stage's produced
+            // residuals. A surviving `filtered` input position less than `own_inputs.len()` is an own input; otherwise
+            // it indexes into `consumed[stage]`.
+            let own_inputs = (0..self.input_ids.len()).filter(|&index| input_stages[index] == stage).collect::<Vec<_>>();
+            let own_outputs = self
+                .output_ids
+                .iter()
+                .copied()
+                .zip(&output_stages)
+                .filter_map(|(output_id, &output_stage)| (output_stage == stage).then_some(output_id))
+                .collect::<Vec<_>>();
+            let output_count = own_outputs.len();
 
-        // Known program: inputs are the known program-input atoms (in order); outputs are the known program-outputs
-        // (in original order) followed by the residuals.
-        let known_input_candidates = known_input_candidates.collect::<Vec<_>>();
-        let known_input_atoms = known_input_candidates.iter().map(|&index| self.input_ids[index]).collect::<Vec<_>>();
-        let mut known_outputs = self
-            .output_ids
-            .iter()
-            .copied()
-            .zip(&output_unknowns)
-            .filter_map(|(output_id, &unknown)| (!unknown).then_some(output_id))
-            .collect::<Vec<_>>();
-        known_outputs.extend(residual_atoms.iter().copied());
-        let (known_program, known_live_inputs) = self.filtered(&known_input_atoms, &known_outputs)?;
+            let mut boundary_inputs = own_inputs.iter().map(|&index| self.input_ids[index]).collect::<Vec<_>>();
+            boundary_inputs.extend(consumed[stage].iter().copied());
+            let mut boundary_outputs = own_outputs;
+            boundary_outputs.extend(produced[stage].iter().copied());
+            let (program, surviving_positions) = self.filtered(&boundary_inputs, &boundary_outputs)?;
 
-        // Unknown program: inputs are the unknown program-input atoms (in order) followed by the residuals; outputs are
-        // the unknown program-outputs (in original order).
-        let unknown_input_candidates = unknown_input_candidates.collect::<Vec<_>>();
-        let mut unknown_boundary_inputs =
-            unknown_input_candidates.iter().map(|&index| self.input_ids[index]).collect::<Vec<_>>();
-        let unknown_input_count = unknown_boundary_inputs.len();
-        unknown_boundary_inputs.extend(residual_atoms.iter().copied());
-        let unknown_outputs = self
-            .output_ids
-            .iter()
-            .copied()
-            .zip(&output_unknowns)
-            .filter_map(|(output_id, &unknown)| unknown.then_some(output_id))
-            .collect::<Vec<_>>();
-        let (unknown_program, unknown_live_inputs) = self.filtered(&unknown_boundary_inputs, &unknown_outputs)?;
+            // Rebuild both input lists from the post-filter survivors, parallel to the filtered program's inputs: an
+            // own-input survivor maps back to its original input index; a residual-tail survivor maps to its producer's
+            // `ResidualSource`. Keeping (rather than dropping) surviving residual-tail positions preserves the invariant
+            // `program.input_ids().len() == input_indices.len() + residual_inputs.len()` even when a dead residual is
+            // pruned. `output_count` is exact because `filtered` never prunes outputs, so the produced-residual suffix
+            // is exactly `produced[stage]`.
+            let mut input_indices = Vec::new();
+            let mut residual_inputs = Vec::new();
+            for position in surviving_positions {
+                if position < own_inputs.len() {
+                    input_indices.push(own_inputs[position]);
+                } else {
+                    residual_inputs.push(source_of[&consumed[stage][position - own_inputs.len()]]);
+                }
+            }
 
-        // `filtered` returns the surviving boundary-input positions, in order. Drop positions in the residual tail (the
-        // residuals are not program inputs) and map the rest back to original input indices, so the reported index
-        // lists match each projected program's actual inputs.
-        let known_input_indices = known_live_inputs
-            .into_iter()
-            .filter(|&position| position < known_input_candidates.len())
-            .map(|position| known_input_candidates[position])
-            .collect::<Vec<_>>();
-        let unknown_input_indices = unknown_live_inputs
-            .into_iter()
-            .filter(|&position| position < unknown_input_count)
-            .map(|position| unknown_input_candidates[position])
-            .collect::<Vec<_>>();
+            stages.push(PartitionStage { program, input_indices, residual_inputs, output_count });
+        }
 
-        Ok(PartitionedResidualProgram {
-            known_program,
-            unknown_program,
-            output_unknowns,
-            known_input_indices,
-            unknown_input_indices,
-            residual_count: residual_atoms.len(),
-        })
+        Ok(PartitionedProgram { stages, output_stages })
     }
 }
 
@@ -1131,7 +1156,7 @@ mod tests {
     /// consumes the known values `a` and `a*a` as residuals. Interpreting the known side, feeding its residual tail to
     /// the unknown side, and interleaving by `output_unknowns` must equal interpreting the original program.
     #[test]
-    fn test_partial_eval_split_recombines_to_the_original() {
+    fn test_partition_two_stages_recombine_to_the_original() {
         let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
@@ -1142,38 +1167,40 @@ mod tests {
             .build::<Vec<f64>, Vec<f64>>(vec![aa, ax, xa], vec![Placeholder; 2], vec![Placeholder; 3])
             .unwrap();
 
-        // `a` known (index 0), `x` unknown (index 1).
-        let split = program.partial_eval_split(&[false, true]).unwrap();
+        // `a` known (stage 0, index 0), `x` unknown (stage 1, index 1).
+        let split = program.partition(&[0, 1], 2).unwrap();
+        let known = &split.stages[0];
+        let unknown = &split.stages[1];
+        let residual_count = unknown.residual_inputs.len();
 
-        // `a*a` depends only on `a` (known); `a*x` and `x + a` depend on `x` (unknown).
-        assert_eq!(split.output_unknowns, vec![false, true, true]);
-        assert_eq!(split.known_input_indices, vec![0]);
-        assert_eq!(split.unknown_input_indices, vec![1]);
+        // `a*a` depends only on `a` (known, stage 0); `a*x` and `x + a` depend on `x` (unknown, stage 1).
+        assert_eq!(split.output_stages, vec![0, 1, 1]);
+        assert_eq!(known.input_indices, vec![0]);
+        assert_eq!(unknown.input_indices, vec![1]);
         // The unknown side needs `a` (for `x + a`) and the folded `a*a`'s operand `a`; specifically it consumes `a`
         // directly, so at least one residual is threaded.
-        assert!(split.residual_count > 0);
+        assert!(residual_count > 0);
         // Known side produces the known outputs then the residuals; unknown side takes its inputs then the residuals.
-        assert_eq!(split.known_program.outputs().count(), 1 + split.residual_count);
-        assert_eq!(split.unknown_program.inputs().count(), split.unknown_input_indices.len() + split.residual_count);
+        assert_eq!(known.program.outputs().count(), 1 + residual_count);
+        assert_eq!(unknown.program.inputs().count(), unknown.input_indices.len() + residual_count);
 
         // Recombination: run the known side on the known inputs, peel off the residuals, run the unknown side on the
-        // unknown inputs followed by those residuals, then interleave by `output_unknowns`.
+        // unknown inputs followed by those residuals, then interleave by `output_stages` (stage 1 ⇔ unknown).
         let recombine = |inputs: &[f64]| -> Vec<f64> {
-            let known_inputs = split.known_input_indices.iter().map(|&index| inputs[index]).collect::<Vec<_>>();
-            let mut known_outputs = split.known_program.interpret(known_inputs).unwrap();
-            let residuals = known_outputs.split_off(known_outputs.len() - split.residual_count);
+            let known_inputs = known.input_indices.iter().map(|&index| inputs[index]).collect::<Vec<_>>();
+            let mut known_outputs = known.program.interpret(known_inputs).unwrap();
+            let residuals = known_outputs.split_off(known_outputs.len() - residual_count);
 
-            let mut unknown_inputs =
-                split.unknown_input_indices.iter().map(|&index| inputs[index]).collect::<Vec<_>>();
+            let mut unknown_inputs = unknown.input_indices.iter().map(|&index| inputs[index]).collect::<Vec<_>>();
             unknown_inputs.extend(residuals);
-            let unknown_outputs = split.unknown_program.interpret(unknown_inputs).unwrap();
+            let unknown_outputs = unknown.program.interpret(unknown_inputs).unwrap();
 
             let mut known_outputs = known_outputs.into_iter();
             let mut unknown_outputs = unknown_outputs.into_iter();
             split
-                .output_unknowns
+                .output_stages
                 .iter()
-                .map(|&unknown| if unknown { unknown_outputs.next().unwrap() } else { known_outputs.next().unwrap() })
+                .map(|&stage| if stage == 1 { unknown_outputs.next().unwrap() } else { known_outputs.next().unwrap() })
                 .collect()
         };
 
@@ -1190,7 +1217,7 @@ mod tests {
     /// no residuals, and the known program has no outputs. With every input known, the mirror image holds: everything
     /// lands on the known side and the unknown program is empty.
     #[test]
-    fn test_partial_eval_split_handles_all_known_and_all_unknown() {
+    fn test_partition_two_stages_handle_all_known_and_all_unknown() {
         let build = || {
             let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
             let a = builder.add_input(DataType::F64);
@@ -1204,34 +1231,36 @@ mod tests {
 
         // All inputs unknown: the unknown side is the whole computation; the known side is empty with no residuals.
         let program = build();
-        let split = program.partial_eval_split(&[true, true]).unwrap();
-        assert_eq!(split.output_unknowns, vec![true, true]);
-        assert_eq!(split.residual_count, 0);
-        assert_eq!(split.known_input_indices, Vec::<usize>::new());
-        assert_eq!(split.unknown_input_indices, vec![0, 1]);
-        assert_eq!(split.known_program.outputs().count(), 0);
-        assert_eq!(split.known_program.instructions().len(), 0);
-        assert_eq!(split.unknown_program.instructions().len(), 2);
-        assert_eq!(split.unknown_program.interpret(vec![3.0, 5.0]).unwrap(), vec![15.0, 18.0]);
+        let split = program.partition(&[1, 1], 2).unwrap();
+        let (known, unknown) = (&split.stages[0], &split.stages[1]);
+        assert_eq!(split.output_stages, vec![1, 1]);
+        assert_eq!(unknown.residual_inputs.len(), 0);
+        assert_eq!(known.input_indices, Vec::<usize>::new());
+        assert_eq!(unknown.input_indices, vec![0, 1]);
+        assert_eq!(known.program.outputs().count(), 0);
+        assert_eq!(known.program.instructions().len(), 0);
+        assert_eq!(unknown.program.instructions().len(), 2);
+        assert_eq!(unknown.program.interpret(vec![3.0, 5.0]).unwrap(), vec![15.0, 18.0]);
 
         // All inputs known: the known side is the whole computation; the unknown side is empty with no residuals.
         let program = build();
-        let split = program.partial_eval_split(&[false, false]).unwrap();
-        assert_eq!(split.output_unknowns, vec![false, false]);
-        assert_eq!(split.residual_count, 0);
-        assert_eq!(split.known_input_indices, vec![0, 1]);
-        assert_eq!(split.unknown_input_indices, Vec::<usize>::new());
-        assert_eq!(split.unknown_program.outputs().count(), 0);
-        assert_eq!(split.unknown_program.instructions().len(), 0);
-        assert_eq!(split.known_program.instructions().len(), 2);
-        assert_eq!(split.known_program.interpret(vec![3.0, 5.0]).unwrap(), vec![15.0, 18.0]);
+        let split = program.partition(&[0, 0], 2).unwrap();
+        let (known, unknown) = (&split.stages[0], &split.stages[1]);
+        assert_eq!(split.output_stages, vec![0, 0]);
+        assert_eq!(unknown.residual_inputs.len(), 0);
+        assert_eq!(known.input_indices, vec![0, 1]);
+        assert_eq!(unknown.input_indices, Vec::<usize>::new());
+        assert_eq!(unknown.program.outputs().count(), 0);
+        assert_eq!(unknown.program.instructions().len(), 0);
+        assert_eq!(known.program.instructions().len(), 2);
+        assert_eq!(known.program.interpret(vec![3.0, 5.0]).unwrap(), vec![15.0, 18.0]);
     }
 
     /// A nested-program / control-flow operation is treated as an ordinary operation by the structural split: there is
     /// no special split rule. With an unknown predicate the whole `condition` lands on the unknown side, and the known
     /// side contributes only the residuals the condition consumes. Recombination still reproduces the original program.
     #[test]
-    fn test_partial_eval_split_treats_control_flow_as_ordinary() {
+    fn test_partition_two_stages_treat_control_flow_as_ordinary() {
         let scalar = || ArrayType::scalar(DataType::F64);
 
         // Branches over `[x, a]`: true branch `x * 2`, false branch `x + a`.
@@ -1269,17 +1298,19 @@ mod tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![conditional, aa], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
 
-        // `predicate` and `x` unknown, `a` known.
-        let split = program.partial_eval_split(&[true, true, false]).unwrap();
+        // `predicate` and `x` unknown (stage 1), `a` known (stage 0).
+        let split = program.partition(&[1, 1, 0], 2).unwrap();
+        let (known, unknown) = (&split.stages[0], &split.stages[1]);
+        let residual_count = unknown.residual_inputs.len();
 
-        // The conditional output is unknown; the `a * a` output is known.
-        assert_eq!(split.output_unknowns, vec![true, false]);
-        assert_eq!(split.known_input_indices, vec![2]);
-        assert_eq!(split.unknown_input_indices, vec![0, 1]);
+        // The conditional output is unknown (stage 1); the `a * a` output is known (stage 0).
+        assert_eq!(split.output_stages, vec![1, 0]);
+        assert_eq!(known.input_indices, vec![2]);
+        assert_eq!(unknown.input_indices, vec![0, 1]);
         // The condition consumes `a` (known), so it is threaded as a residual; the whole condition survives on the
         // unknown side unchanged (no inlining).
-        assert!(split.residual_count > 0);
-        assert!(matches!(split.unknown_program.instructions()[0].operation(), ArrayOperation::Condition(_)));
+        assert!(residual_count > 0);
+        assert!(matches!(unknown.program.instructions()[0].operation(), ArrayOperation::Condition(_)));
 
         let recombine = |predicate: bool, x_value: f64, a_value: f64| -> Vec<Vec<f64>> {
             let inputs = [
@@ -1287,20 +1318,19 @@ mod tests {
                 TestArray::scalar(x_value),
                 TestArray::scalar(a_value),
             ];
-            let known_inputs =
-                split.known_input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
-            let mut known_outputs = split.known_program.interpret(known_inputs).unwrap();
-            let residuals = known_outputs.split_off(known_outputs.len() - split.residual_count);
+            let known_inputs = known.input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+            let mut known_outputs = known.program.interpret(known_inputs).unwrap();
+            let residuals = known_outputs.split_off(known_outputs.len() - residual_count);
             let mut unknown_inputs =
-                split.unknown_input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+                unknown.input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
             unknown_inputs.extend(residuals);
-            let unknown_outputs = split.unknown_program.interpret(unknown_inputs).unwrap();
+            let unknown_outputs = unknown.program.interpret(unknown_inputs).unwrap();
             let mut known_outputs = known_outputs.into_iter();
             let mut unknown_outputs = unknown_outputs.into_iter();
             split
-                .output_unknowns
+                .output_stages
                 .iter()
-                .map(|&unknown| if unknown { unknown_outputs.next().unwrap() } else { known_outputs.next().unwrap() })
+                .map(|&stage| if stage == 1 { unknown_outputs.next().unwrap() } else { known_outputs.next().unwrap() })
                 .map(|array| array.values)
                 .collect()
         };
@@ -1317,5 +1347,113 @@ mod tests {
         assert_eq!(recombine(true, 4.0, 3.0), vec![vec![8.0], vec![9.0]]);
         assert_eq!(recombine(false, 4.0, 3.0), original(false, 4.0, 3.0));
         assert_eq!(recombine(false, 4.0, 3.0), vec![vec![7.0], vec![9.0]]);
+    }
+
+    /// A three-stage [`Program::partition`] must reassemble exactly. Builds `f(s0, s1, s2) = (s0*s0, s1*s0, s2*s0,
+    /// s2 + s0*s0)` over scalar `f64` with inputs assigned to stages `[0, 1, 2]`. The data flow induces the two tricky
+    /// residual shapes the random-access model must handle:
+    ///
+    ///   - `s0*s0` is produced at stage 0 and consumed only at stage 2 (the last output), so it *skips* stage 1 — a
+    ///     non-adjacent residual with no pass-through;
+    ///   - `s0` (a stage-0 input) is consumed by both stage 1 (for `s1*s0`) and stage 2 (for `s2*s0`), so one produced
+    ///     residual feeds *two* later stages.
+    ///
+    /// The round-trip runs the stages in order, stores each stage's produced residuals, feeds each stage its
+    /// `input_indices` plus its `residual_inputs` (resolved through their [`ResidualSource`]s), and reassembles the
+    /// outputs by `output_stages` (own outputs first) — and must equal interpreting the original program.
+    #[test]
+    fn test_partition_three_stages_round_trips_with_skip_and_shared_residuals() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let s0 = builder.add_input(DataType::F64);
+        let s1 = builder.add_input(DataType::F64);
+        let s2 = builder.add_input(DataType::F64);
+        let p = builder.add_instruction(MulOperation, vec![s0, s0]).unwrap()[0]; // stage 0
+        let b = builder.add_instruction(MulOperation, vec![s1, s0]).unwrap()[0]; // stage 1, consumes s0
+        let c = builder.add_instruction(MulOperation, vec![s2, s0]).unwrap()[0]; // stage 2, consumes s0 (skip + shared)
+        let d = builder.add_instruction(AddOperation, vec![s2, p]).unwrap()[0]; // stage 2, consumes p (skip)
+        let program = builder
+            .build::<Vec<f64>, Vec<f64>>(vec![p, b, c, d], vec![Placeholder; 3], vec![Placeholder; 4])
+            .unwrap();
+
+        let partition = program.partition(&[0, 1, 2], 3).unwrap();
+
+        // Each output lands in the stage that produces its atom.
+        assert_eq!(partition.output_stages, vec![0, 1, 2, 2]);
+        assert_eq!(partition.stages.len(), 3);
+        // Stage 0 produces two residuals (`s0` and `p`); stage 1 produces none; stage 2 produces none.
+        let produced_count =
+            |stage: &PartitionStage<_, _, _>| stage.program.output_ids().len() - stage.output_count;
+        assert_eq!(produced_count(&partition.stages[0]), 2);
+        assert_eq!(produced_count(&partition.stages[1]), 0);
+        assert_eq!(produced_count(&partition.stages[2]), 0);
+        // `s0` is shared: it is consumed by both stage 1 and stage 2 (one entry in stage 0's produced residuals).
+        let consumes_stage_zero = |stage: &PartitionStage<_, _, _>| {
+            stage.residual_inputs.iter().any(|source| source.stage == 0)
+        };
+        assert!(consumes_stage_zero(&partition.stages[1]));
+        assert!(consumes_stage_zero(&partition.stages[2]));
+        // The per-stage invariant: program inputs split exactly into own inputs and consumed residuals.
+        for stage in partition.stages.iter() {
+            assert_eq!(stage.program.input_ids().len(), stage.input_indices.len() + stage.residual_inputs.len());
+        }
+
+        // Round-trip: run the stages in order, threading residuals via `ResidualSource`, and reassemble by
+        // `output_stages` (own outputs first within each stage).
+        let recombine = |inputs: &[f64]| -> Vec<f64> {
+            let mut own_outputs: Vec<Vec<f64>> = Vec::with_capacity(partition.stages.len());
+            let mut produced: Vec<Vec<f64>> = Vec::with_capacity(partition.stages.len());
+            for stage in partition.stages.iter() {
+                let mut arguments = stage.input_indices.iter().map(|&index| inputs[index]).collect::<Vec<_>>();
+                for source in stage.residual_inputs.iter() {
+                    arguments.push(produced[source.stage][source.index]);
+                }
+                let mut outputs = stage.program.interpret(arguments).unwrap();
+                let residuals = outputs.split_off(stage.output_count);
+                own_outputs.push(outputs);
+                produced.push(residuals);
+            }
+
+            // Read each original output from the own outputs of its producing stage, in original order.
+            let mut cursor = vec![0usize; partition.stages.len()];
+            partition
+                .output_stages
+                .iter()
+                .map(|&stage| {
+                    let index = cursor[stage];
+                    cursor[stage] += 1;
+                    own_outputs[stage][index]
+                })
+                .collect()
+        };
+
+        let inputs = [3.0f64, 5.0f64, 7.0f64];
+        assert_eq!(recombine(&inputs), program.interpret(inputs.to_vec()).unwrap());
+        assert_eq!(recombine(&inputs), vec![9.0, 15.0, 21.0, 16.0]);
+        // A second point confirms the partition is value-independent.
+        let inputs = [2.0f64, 4.0f64, 6.0f64];
+        assert_eq!(recombine(&inputs), program.interpret(inputs.to_vec()).unwrap());
+        assert_eq!(recombine(&inputs), vec![4.0, 8.0, 12.0, 10.0]);
+    }
+
+    /// [`Program::partition`] validates its arguments: a zero `stage_count`, an out-of-range input stage, and a wrong
+    /// `input_stages` length each fail rather than producing a malformed partition.
+    #[test]
+    fn test_partition_rejects_invalid_arguments() {
+        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let product = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
+        let program =
+            builder.build::<Vec<f64>, Vec<f64>>(vec![product], vec![Placeholder; 2], vec![Placeholder; 1]).unwrap();
+
+        // Zero stages is invalid.
+        assert!(matches!(program.partition(&[0, 0], 0), Err(ProgramError::MalformedProgram(_))));
+        // An input stage at or beyond `stage_count` is out of range.
+        assert!(matches!(program.partition(&[0, 2], 2), Err(ProgramError::MalformedProgram(_))));
+        // The stage assignment must have one entry per input.
+        assert!(matches!(
+            program.partition(&[0], 2),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+        ));
     }
 }
