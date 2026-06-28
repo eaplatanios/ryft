@@ -12,6 +12,7 @@ pub mod errors;
 pub mod macros;
 pub mod operations;
 pub mod parameters;
+pub mod partial;
 pub mod programs;
 pub mod scalars;
 pub mod sharding;
@@ -29,7 +30,7 @@ pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
 pub use contexts::{Context, EagerContext, ProvidesContext, StagingContext};
 pub use differentiation::*;
-pub use domains::{AbstractDomain, Domain};
+pub use domains::Domain;
 pub use errors::{CustomError, Error};
 pub use operations::*;
 pub use parameters::{
@@ -38,11 +39,8 @@ pub use parameters::{
     PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
 };
 pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value};
-pub use scalars::{LinearScalarDomain, ScalarDomain};
+pub use scalars::{ScalarDomain, Scalar};
 pub use sharding::*;
-pub use tracing::{
-    AbstractTracer, AbstractTracingContext, DomainTracer, Tracer, TracerState, TracingContext, infer_output_type,
-    interpret_and_trace, trace,
-};
+pub use tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
 pub use tracing_v2::batch;
 pub use types::*;

@@ -18,7 +18,6 @@ use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 use crate::tracing_v2::rematerialization::RematerializationName;
 use crate::types::{DataType, TypeError, Typed};
 
@@ -92,6 +91,9 @@ pub enum Scalar {
     F16(f16),
     F32(f32),
     F64(f64),
+    // TODO(eaplatanios): Support token values, complex values, and the remaining quantized floating-point types.
+    //  Once more are supported, we will also need to update certain implementations later on in this module that
+    //  return a `TypeError` when they encounter any of those types.
 }
 
 impl Display for Scalar {
@@ -143,10 +145,8 @@ impl Value<DataType> for Scalar {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-// Conversions from each supported Rust primitive into the corresponding [`Scalar`] variant. These let later stages and
-// numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
+// Conversions from each supported Rust primitive into the corresponding [`Scalar`] variant. These let later stages
+// and numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
 macro_rules! impl_from_primitive_for_scalar {
     ($ty:ty, $variant:ident) => {
         impl From<$ty> for Scalar {
@@ -181,6 +181,12 @@ macro_rules! impl_partial_eq_primitive_for_scalar {
                 matches!(self, Scalar::$variant(value) if value == other)
             }
         }
+
+        impl PartialEq<Scalar> for $ty {
+            fn eq(&self, other: &Scalar) -> bool {
+                matches!(other, Scalar::$variant(value) if value == self)
+            }
+        }
     };
 }
 
@@ -197,6 +203,161 @@ impl_partial_eq_primitive_for_scalar!(bf16, BF16);
 impl_partial_eq_primitive_for_scalar!(f16, F16);
 impl_partial_eq_primitive_for_scalar!(f32, F32);
 impl_partial_eq_primitive_for_scalar!(f64, F64);
+
+impl BooleanLike for Scalar {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        // `Self::boolean` decodes every `Scalar` variant without failing, so the `unwrap` here is safe.
+        Scalar::Bool(self.boolean().unwrap())
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        Ok(match self {
+            Scalar::Bool(value) => *value,
+            Scalar::I8(value) => *value != 0,
+            Scalar::I16(value) => *value != 0,
+            Scalar::I32(value) => *value != 0,
+            Scalar::I64(value) => *value != 0,
+            Scalar::U8(value) => *value != 0,
+            Scalar::U16(value) => *value != 0,
+            Scalar::U32(value) => *value != 0,
+            Scalar::U64(value) => *value != 0,
+            Scalar::BF16(value) => *value != bf16::ZERO,
+            Scalar::F16(value) => *value != f16::ZERO,
+            Scalar::F32(value) => *value != 0.0,
+            Scalar::F64(value) => *value != 0.0,
+        })
+    }
+}
+
+impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
+    #[inline]
+    fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
+        Ok(match r#type {
+            DataType::Boolean => Scalar::Bool(false),
+            DataType::I8 => Scalar::I8(0),
+            DataType::I16 => Scalar::I16(0),
+            DataType::I32 => Scalar::I32(0),
+            DataType::I64 => Scalar::I64(0),
+            DataType::U8 => Scalar::U8(0),
+            DataType::U16 => Scalar::U16(0),
+            DataType::U32 => Scalar::U32(0),
+            DataType::U64 => Scalar::U64(0),
+            DataType::BF16 => Scalar::BF16(bf16::ZERO),
+            DataType::F16 => Scalar::F16(f16::ZERO),
+            DataType::F32 => Scalar::F32(0.0),
+            DataType::F64 => Scalar::F64(0.0),
+            other => {
+                return Err(
+                    TypeError { message: format!("data type {other} is not supported in the scalar domain") }.into()
+                );
+            }
+        })
+    }
+}
+
+impl ZeroLike for Scalar {
+    #[inline]
+    fn zero_like(&self) -> Self {
+        match self {
+            Scalar::Bool(_) => Scalar::Bool(false),
+            Scalar::I8(_) => Scalar::I8(0),
+            Scalar::I16(_) => Scalar::I16(0),
+            Scalar::I32(_) => Scalar::I32(0),
+            Scalar::I64(_) => Scalar::I64(0),
+            Scalar::U8(_) => Scalar::U8(0),
+            Scalar::U16(_) => Scalar::U16(0),
+            Scalar::U32(_) => Scalar::U32(0),
+            Scalar::U64(_) => Scalar::U64(0),
+            Scalar::BF16(_) => Scalar::BF16(bf16::ZERO),
+            Scalar::F16(_) => Scalar::F16(f16::ZERO),
+            Scalar::F32(_) => Scalar::F32(0.0),
+            Scalar::F64(_) => Scalar::F64(0.0),
+        }
+    }
+}
+
+impl<O: Operation<DataType>> One<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
+    #[inline]
+    fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
+        Ok(match r#type {
+            DataType::Boolean => Scalar::Bool(true),
+            DataType::I8 => Scalar::I8(1),
+            DataType::I16 => Scalar::I16(1),
+            DataType::I32 => Scalar::I32(1),
+            DataType::I64 => Scalar::I64(1),
+            DataType::U8 => Scalar::U8(1),
+            DataType::U16 => Scalar::U16(1),
+            DataType::U32 => Scalar::U32(1),
+            DataType::U64 => Scalar::U64(1),
+            DataType::BF16 => Scalar::BF16(bf16::ONE),
+            DataType::F16 => Scalar::F16(f16::ONE),
+            DataType::F32 => Scalar::F32(1.0),
+            DataType::F64 => Scalar::F64(1.0),
+            other => {
+                return Err(
+                    TypeError { message: format!("data type {other} is not supported in the scalar domain") }.into()
+                );
+            }
+        })
+    }
+}
+
+impl OneLike for Scalar {
+    #[inline]
+    fn one_like(&self) -> Self {
+        match self {
+            Scalar::Bool(_) => Scalar::Bool(true),
+            Scalar::I8(_) => Scalar::I8(1),
+            Scalar::I16(_) => Scalar::I16(1),
+            Scalar::I32(_) => Scalar::I32(1),
+            Scalar::I64(_) => Scalar::I64(1),
+            Scalar::U8(_) => Scalar::U8(1),
+            Scalar::U16(_) => Scalar::U16(1),
+            Scalar::U32(_) => Scalar::U32(1),
+            Scalar::U64(_) => Scalar::U64(1),
+            Scalar::BF16(_) => Scalar::BF16(bf16::ONE),
+            Scalar::F16(_) => Scalar::F16(f16::ONE),
+            Scalar::F32(_) => Scalar::F32(1.0),
+            Scalar::F64(_) => Scalar::F64(1.0),
+        }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
+impl<O: Operation<DataType>> Fill<DataType, Scalar, Scalar> for EagerContext<DataType, Scalar, O> {
+    #[inline]
+    fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
+        let value_type = value.r#type().into_owned();
+        if *r#type != value_type {
+            return Err(TypeError {
+                message: format!("scalar value expected data type {value_type} but got {}", r#type),
+            }
+            .into());
+        }
+        Ok(value)
+    }
+}
+
+impl Neg for Scalar {
+    type Output = Scalar;
+
+    fn neg(self) -> Scalar {
+        match self {
+            Scalar::I8(value) => Scalar::I8(-value),
+            Scalar::I16(value) => Scalar::I16(-value),
+            Scalar::I32(value) => Scalar::I32(-value),
+            Scalar::I64(value) => Scalar::I64(-value),
+            Scalar::BF16(value) => Scalar::BF16(-value),
+            Scalar::F16(value) => Scalar::F16(-value),
+            Scalar::F32(value) => Scalar::F32(-value),
+            Scalar::F64(value) => Scalar::F64(-value),
+            other => unreachable!("cannot negate a scalar of data type {}", other.r#type()),
+        }
+    }
+}
 
 // Elementwise arithmetic over equal-[`DataType`] variant pairs. A [`Scalar`] only combines with another [`Scalar`] of
 // the same variant. Any other pairing violates an internal invariant: either the data types differ (which an
@@ -239,136 +400,10 @@ impl_binary_arithmetic_for_scalar!(Sub, sub, -);
 impl_binary_arithmetic_for_scalar!(Mul, mul, *);
 impl_binary_arithmetic_for_scalar!(Div, div, /);
 
-impl Neg for Scalar {
-    type Output = Scalar;
-
-    /// Negates this scalar. Only signed integer and floating-point variants are negatable; Boolean and unsigned
-    /// integer variants have no primitive negation and reaching them violates an internal invariant, so this panics
-    /// with a clear message in that case.
-    fn neg(self) -> Scalar {
-        match self {
-            Scalar::I8(value) => Scalar::I8(-value),
-            Scalar::I16(value) => Scalar::I16(-value),
-            Scalar::I32(value) => Scalar::I32(-value),
-            Scalar::I64(value) => Scalar::I64(-value),
-            Scalar::BF16(value) => Scalar::BF16(-value),
-            Scalar::F16(value) => Scalar::F16(-value),
-            Scalar::F32(value) => Scalar::F32(-value),
-            Scalar::F64(value) => Scalar::F64(-value),
-            other => unreachable!("cannot negate a scalar of data type {}", other.r#type()),
-        }
-    }
-}
-
 // Context-level construction capabilities for [`Scalar`] values. Because a [`Scalar`] reports the [`DataType`] of
 // whichever variant it holds, a single [`EagerContext<DataType, Scalar, O>`] can synthesize the zero, one, or fill
 // value for every supported [`DataType`] by selecting the matching variant, rather than monomorphizing one context per
 // Rust primitive.
-
-impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
-    /// Returns the zero [`Scalar`] for the requested [`DataType`], selecting the variant that reports that data type.
-    fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
-        Ok(match r#type {
-            DataType::Boolean => Scalar::Bool(false),
-            DataType::I8 => Scalar::I8(0),
-            DataType::I16 => Scalar::I16(0),
-            DataType::I32 => Scalar::I32(0),
-            DataType::I64 => Scalar::I64(0),
-            DataType::U8 => Scalar::U8(0),
-            DataType::U16 => Scalar::U16(0),
-            DataType::U32 => Scalar::U32(0),
-            DataType::U64 => Scalar::U64(0),
-            DataType::BF16 => Scalar::BF16(bf16::ZERO),
-            DataType::F16 => Scalar::F16(f16::ZERO),
-            DataType::F32 => Scalar::F32(0.0),
-            DataType::F64 => Scalar::F64(0.0),
-            other => {
-                return Err(TypeError { message: format!("scalar value does not support data type {other}") }.into());
-            }
-        })
-    }
-}
-
-impl<O: Operation<DataType>> One<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
-    /// Returns the one [`Scalar`] for the requested [`DataType`], selecting the variant that reports that data type.
-    fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
-        Ok(match r#type {
-            DataType::Boolean => Scalar::Bool(true),
-            DataType::I8 => Scalar::I8(1),
-            DataType::I16 => Scalar::I16(1),
-            DataType::I32 => Scalar::I32(1),
-            DataType::I64 => Scalar::I64(1),
-            DataType::U8 => Scalar::U8(1),
-            DataType::U16 => Scalar::U16(1),
-            DataType::U32 => Scalar::U32(1),
-            DataType::U64 => Scalar::U64(1),
-            DataType::BF16 => Scalar::BF16(bf16::ONE),
-            DataType::F16 => Scalar::F16(f16::ONE),
-            DataType::F32 => Scalar::F32(1.0),
-            DataType::F64 => Scalar::F64(1.0),
-            other => {
-                return Err(TypeError { message: format!("scalar value does not support data type {other}") }.into());
-            }
-        })
-    }
-}
-
-impl<O: Operation<DataType>> Fill<DataType, Scalar, Scalar> for EagerContext<DataType, Scalar, O> {
-    /// Returns the fill [`Scalar`] for the requested [`DataType`], which for scalars is just the captured `value`
-    /// itself once its [`DataType`] is confirmed to match the requested one.
-    fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
-        let value_type = value.r#type().into_owned();
-        if *r#type != value_type {
-            return Err(TypeError {
-                message: format!("scalar value expected data type {value_type} but got {}", r#type),
-            }
-            .into());
-        }
-        Ok(value)
-    }
-}
-
-impl ZeroLike for Scalar {
-    /// Returns the zero [`Scalar`] with the same [`DataType`] as `self`.
-    fn zero_like(&self) -> Self {
-        match self {
-            Scalar::Bool(_) => Scalar::Bool(false),
-            Scalar::I8(_) => Scalar::I8(0),
-            Scalar::I16(_) => Scalar::I16(0),
-            Scalar::I32(_) => Scalar::I32(0),
-            Scalar::I64(_) => Scalar::I64(0),
-            Scalar::U8(_) => Scalar::U8(0),
-            Scalar::U16(_) => Scalar::U16(0),
-            Scalar::U32(_) => Scalar::U32(0),
-            Scalar::U64(_) => Scalar::U64(0),
-            Scalar::BF16(_) => Scalar::BF16(bf16::ZERO),
-            Scalar::F16(_) => Scalar::F16(f16::ZERO),
-            Scalar::F32(_) => Scalar::F32(0.0),
-            Scalar::F64(_) => Scalar::F64(0.0),
-        }
-    }
-}
-
-impl OneLike for Scalar {
-    /// Returns the one [`Scalar`] with the same [`DataType`] as `self`.
-    fn one_like(&self) -> Self {
-        match self {
-            Scalar::Bool(_) => Scalar::Bool(true),
-            Scalar::I8(_) => Scalar::I8(1),
-            Scalar::I16(_) => Scalar::I16(1),
-            Scalar::I32(_) => Scalar::I32(1),
-            Scalar::I64(_) => Scalar::I64(1),
-            Scalar::U8(_) => Scalar::U8(1),
-            Scalar::U16(_) => Scalar::U16(1),
-            Scalar::U32(_) => Scalar::U32(1),
-            Scalar::U64(_) => Scalar::U64(1),
-            Scalar::BF16(_) => Scalar::BF16(bf16::ONE),
-            Scalar::F16(_) => Scalar::F16(f16::ONE),
-            Scalar::F32(_) => Scalar::F32(1.0),
-            Scalar::F64(_) => Scalar::F64(1.0),
-        }
-    }
-}
 
 impl Scalable<Scalar> for Scalar {
     /// Scales `self` by `factor`, reusing the variant-matched [`Mul`] implementation of [`Scalar`]. Mismatched
@@ -404,15 +439,6 @@ impl Cos for Scalar {
             Scalar::F64(value) => Scalar::F64(value.cos()),
             other => unreachable!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
         }
-    }
-}
-
-impl Dot for Scalar {
-    /// Computes the rank-0 dot product of two [`Scalar`]s, which is just their product. The dimension numbers carry no
-    /// axes for rank-0 operands and are therefore unused.
-    #[inline]
-    fn dot(&self, rhs: &Self, _dimensions: &DotDimensionNumbers) -> Self {
-        *self * *rhs
     }
 }
 
@@ -490,36 +516,6 @@ impl SelectCondition for Scalar {
     #[inline]
     fn select_condition(&self) -> Result<bool, ProgramError> {
         self.boolean()
-    }
-}
-
-impl BooleanLike for Scalar {
-    /// Returns the honest Boolean counterpart of this [`Scalar`] as a [`Scalar::Bool`]: a zero payload maps to `false`
-    /// and any non-zero payload maps to `true`. This is the crux of the redesign, as the result is always a genuine
-    /// [`DataType::Boolean`] scalar rather than an in-band numeric encoding.
-    fn as_boolean(&self) -> Self {
-        // `Self::boolean` decodes every [`Scalar`] variant without failing, so the unwrap here can never panic.
-        Scalar::Bool(self.boolean().unwrap())
-    }
-
-    /// Extracts the Rust `bool` represented by this [`Scalar`]: zero maps to `false` and any non-zero payload maps to
-    /// `true`.
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        Ok(match self {
-            Scalar::Bool(value) => *value,
-            Scalar::I8(value) => *value != 0,
-            Scalar::I16(value) => *value != 0,
-            Scalar::I32(value) => *value != 0,
-            Scalar::I64(value) => *value != 0,
-            Scalar::U8(value) => *value != 0,
-            Scalar::U16(value) => *value != 0,
-            Scalar::U32(value) => *value != 0,
-            Scalar::U64(value) => *value != 0,
-            Scalar::BF16(value) => *value != bf16::ZERO,
-            Scalar::F16(value) => *value != f16::ZERO,
-            Scalar::F32(value) => *value != 0.0,
-            Scalar::F64(value) => *value != 0.0,
-        })
     }
 }
 
