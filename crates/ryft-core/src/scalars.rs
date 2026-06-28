@@ -10,7 +10,7 @@ use crate::contexts::{Context, EagerContext};
 use crate::domains::Domain;
 use crate::operations::arithmetic::Scalable;
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
+use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
 use crate::operations::differentiation::StopGradient;
 use crate::operations::scalars::ScalarOperation;
@@ -21,10 +21,10 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::rematerialization::RematerializationName;
 use crate::types::{DataType, TypeError, Typed};
 
-/// Stateless [`Domain`] that uses [`DataType`] to represent [`Type`]s and [`Scalar`] to represent runtime [`Value`]s.
-/// [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in this crate. It
-/// demonstrates the intended role of an eager [`Context`] in the smallest possible form. There are no device handles,
-/// no mesh states, and no backend registries. There are just the built-in [`ScalarOperation`] variants plus
+/// Stateless [`Domain`] that uses [`DataType`] to represent [`Type`](crate::Type)s and [`Scalar`] to represent runtime
+/// [`Value`]s. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in this crate.
+/// It demonstrates the intended role of an eager [`Context`] in the smallest possible form. There are no device
+/// handles, no mesh states, and no backend registries. There are just the built-in [`ScalarOperation`] variants plus
 /// [`DataType`]-driven construction of scalar values. Note that because [`Scalar`] reports the [`DataType`] of
 /// whichever variant it holds, this single non-generic domain interprets scalar [`Program`](crate::Program)s over
 /// every supported scalar [`DataType`] without monomorphizing over one Rust primitive at a time.
@@ -63,8 +63,8 @@ impl Context for ScalarDomain {
     }
 }
 
-/// Scalar [`Value`] whose [`Type`] is a [`DataType`] and which is meant to be used primarily for testing the Ryft
-/// infrastructure and machinery with programs that do not involve multidimensional arrays.
+/// Scalar [`Value`] whose [`Type`](crate::Type) is a [`DataType`] and which is meant to be used primarily for testing
+/// the Ryft infrastructure and machinery with programs that do not involve multidimensional arrays.
 ///
 /// # Examples
 ///
@@ -327,20 +327,6 @@ impl OneLike for Scalar {
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl<O: Operation<DataType>> Fill<DataType, Scalar, Scalar> for EagerContext<DataType, Scalar, O> {
-    #[inline]
-    fn fill(&self, r#type: &DataType, value: Scalar) -> Result<Scalar, ProgramError> {
-        let value_type = value.r#type().into_owned();
-        if *r#type != value_type {
-            return Err(TypeError {
-                message: format!("scalar value expected data type {value_type} but got {}", r#type),
-            }
-            .into());
-        }
-        Ok(value)
-    }
-}
-
 impl Neg for Scalar {
     type Output = Scalar;
 
@@ -354,6 +340,7 @@ impl Neg for Scalar {
             Scalar::F16(value) => Scalar::F16(-value),
             Scalar::F32(value) => Scalar::F32(-value),
             Scalar::F64(value) => Scalar::F64(-value),
+            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
             other => unreachable!("cannot negate a scalar of data type {}", other.r#type()),
         }
     }
@@ -383,6 +370,7 @@ macro_rules! impl_binary_arithmetic_for_scalar {
                     (Scalar::F16(left), Scalar::F16(right)) => Scalar::F16(left $operator right),
                     (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left $operator right),
                     (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(left $operator right),
+                    // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
                     (left, right) => unreachable!(
                         "cannot apply `{}` to scalars of data types {} and {}",
                         stringify!($method),
@@ -401,9 +389,10 @@ impl_binary_arithmetic_for_scalar!(Mul, mul, *);
 impl_binary_arithmetic_for_scalar!(Div, div, /);
 
 // Context-level construction capabilities for [`Scalar`] values. Because a [`Scalar`] reports the [`DataType`] of
-// whichever variant it holds, a single [`EagerContext<DataType, Scalar, O>`] can synthesize the zero, one, or fill
-// value for every supported [`DataType`] by selecting the matching variant, rather than monomorphizing one context per
-// Rust primitive.
+// whichever variant it holds, a single [`EagerContext<DataType, Scalar, O>`] can synthesize the zero or one value for
+// every supported [`DataType`] by selecting the matching variant, rather than monomorphizing one context per Rust
+// primitive. Producing a constant scalar from a value needs no scalar-specific impl: it is the generic identity from
+// the blanket [`Constant`] implementation for [`EagerContext`].
 
 impl Scalable<Scalar> for Scalar {
     /// Scales `self` by `factor`, reusing the variant-matched [`Mul`] implementation of [`Scalar`]. Mismatched
@@ -423,6 +412,7 @@ impl Sin for Scalar {
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sin())),
             Scalar::F32(value) => Scalar::F32(value.sin()),
             Scalar::F64(value) => Scalar::F64(value.sin()),
+            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
             other => unreachable!("cannot compute the sine of a scalar of data type {}", other.r#type()),
         }
     }
@@ -437,6 +427,7 @@ impl Cos for Scalar {
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().cos())),
             Scalar::F32(value) => Scalar::F32(value.cos()),
             Scalar::F64(value) => Scalar::F64(value.cos()),
+            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
             other => unreachable!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
         }
     }
@@ -480,6 +471,7 @@ impl Compare for Scalar {
             (Scalar::F16(left), Scalar::F16(right)) => left.partial_cmp(right),
             (Scalar::F32(left), Scalar::F32(right)) => left.partial_cmp(right),
             (Scalar::F64(left), Scalar::F64(right)) => left.partial_cmp(right),
+            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
             (left, right) => {
                 unreachable!("cannot compare scalars of data types {} and {}", left.r#type(), right.r#type(),)
             }
