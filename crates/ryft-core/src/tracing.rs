@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::{Context, StagingContext, StagingValue};
 use crate::domains::Domain;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
@@ -71,7 +71,7 @@ impl<C: Context> Tracer<C> {
     }
 }
 
-impl<C: StagingContext> Tracer<C> {
+impl<C: StagingContext<Value = Tracer<C>>> Tracer<C> {
     /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>> {
@@ -148,6 +148,31 @@ impl<C: Context> Value<C::Type> for Tracer<C> {
     #[inline]
     fn interpretation_context(&self) -> Option<C> {
         Some(self.context().clone())
+    }
+}
+
+impl<C: Context> StagingValue<C> for Tracer<C> {
+    #[inline]
+    fn live(context: C, atom: AtomId, r#type: C::Type) -> Self {
+        Self::new(TracerState::Live(atom), r#type, context)
+    }
+
+    #[inline]
+    fn poison(context: C, r#type: C::Type) -> Self {
+        Self::new(TracerState::Poison, r#type, context)
+    }
+
+    #[inline]
+    fn atom_id(&self) -> Result<AtomId, ProgramError> {
+        match &self.state {
+            TracerState::Live(atom) => Ok(*atom),
+            TracerState::Poison => Err(ProgramError::PoisonedValue),
+        }
+    }
+
+    #[inline]
+    fn context(&self) -> &C {
+        &self.context
     }
 }
 
@@ -518,18 +543,18 @@ mod tests {
             }
         }
 
-        impl InterpretableOperation<DataType, f64> for NoOutputOperation {
+        impl InterpretableOperation<DataType, Scalar> for NoOutputOperation {
             #[inline]
             fn interpret(
                 &self,
-                _context: &<f64 as Value<DataType>>::InterpretationContext,
-                _inputs: &[f64],
-            ) -> Result<Vec<f64>, ProgramError> {
+                _context: &<Scalar as Value<DataType>>::InterpretationContext,
+                _inputs: &[Scalar],
+            ) -> Result<Vec<Scalar>, ProgramError> {
                 Ok(Vec::new())
             }
         }
 
-        let context = TracingContext::<DataType, f64, NoOutputOperation>::new();
+        let context = TracingContext::<DataType, Scalar, NoOutputOperation>::new();
         let builder = context.builder().clone();
         let input_type = DataType::F64;
         let tracer = context.input(input_type);

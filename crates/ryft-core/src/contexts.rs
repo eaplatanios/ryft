@@ -8,7 +8,7 @@ use crate::operations::constants::{ConstantOperation, MaybeZeroOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::{Tracer, TracerState, TracingContext};
+use crate::tracing::{Tracer, TracingContext};
 use crate::types::{Type, Typed};
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
@@ -191,39 +191,64 @@ impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOpera
     }
 }
 
-/// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`]. Binding
-/// records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than interpreting
-/// them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
+/// [`Value`] that flows through a [`StagingContext`]. This is a handle to a staged [`Atom`](crate::Atom) in that
+/// context's [`ProgramBuilder`], carrying the [`Context`] itself so that value can recover its [`ProgramBuilder`].
+/// This generalizes the staged value representation away from the concrete [`Tracer`]. Ordinary tracing flows
+/// [`Tracer`]s, while transform contexts may use richer value representations that additionally carry transform
+/// metadata (e.g., a batch axis or a partial-evaluation known/unknown classification) on the value rather than in a
+/// side table. The bound is on [`Context`] rather than a [`StagingContext`] so that the `Value: StagingValue<Self>`
+/// constraint on [`StagingContext`] does not form a trait cycle. Staged values get interpreted in their own staging
+/// context, and so [`InterpretationContext`](Value::InterpretationContext) is pinned to `C`. This is what lets generic
+/// staging code recover `C` from the flowing value's [`Value`] projection.
+pub trait StagingValue<C: Context>: Value<C::Type, InterpretationContext = C> {
+    /// Creates a _live_ [`StagingValue`] referring to `atom` in `context`'s [`ProgramBuilder`], typed as `r#type`.
+    fn live(context: C, atom: AtomId, r#type: C::Type) -> Self;
+
+    /// Creates a _poisoned_ [`StagingValue`] (i.e., an error placeholder) of `r#type` in `context`.
+    fn poison(context: C, r#type: C::Type) -> Self;
+
+    /// Returns the staged [`AtomId`] this [`StagingValue`] refers to if it is _live_,
+    /// or [`ProgramError::PoisonedValue`] if it is poisoned.
+    fn atom_id(&self) -> Result<AtomId, ProgramError>;
+
+    /// Returns the [`Context`] that this [`StagingValue`] carries.
+    fn context(&self) -> &C;
+}
+
+/// Staging [`Context`] whose flowing [`Domain::Value`] is a [`StagingValue`] into an active [`ProgramBuilder`]
+/// (typically a [`Tracer`], but transform contexts may use richer value representations carrying transform metadata).
+/// Binding records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than
+/// interpreting them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
 /// [`input`](StagingContext::input), [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
 /// [`stage_operation`](StagingContext::stage_operation), and [`stage_program`](StagingContext::stage_program).
 /// Ordinary backend tracing implements it through [`TracingContext`]. Stackable transform contexts such as batching
 /// or linearization implement it by delegating to a parent context.
-pub trait StagingContext: Context<Value = Tracer<Self>> {
+pub trait StagingContext: Context<Value: StagingValue<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>>;
 
-    /// Creates a constant [`Tracer`] in this context with the provided constant payload.
+    /// Creates a constant [`StagingValue`] in this context with the provided constant payload.
     #[inline]
-    fn constant(&self, value: Self::Constant) -> Tracer<Self> {
+    fn constant(&self, value: Self::Constant) -> Self::Value {
         let r#type = value.r#type().into_owned();
         let atom = self.builder().borrow_mut().add_constant(value);
         self.tracer(atom, Some(r#type))
     }
 
-    /// Creates an input [`Tracer`] in this context with the provided type.
+    /// Creates an input [`StagingValue`] in this context with the provided type.
     #[inline]
-    fn input(&self, r#type: Self::Type) -> Tracer<Self> {
+    fn input(&self, r#type: Self::Type) -> Self::Value {
         let atom = self.builder().borrow_mut().add_input(r#type.clone());
         self.tracer(atom, Some(r#type))
     }
 
-    /// Constructs a [`TracerState::Live`] [`Tracer`] in this context with the provided [`AtomId`]. If the provided
+    /// Constructs a _live_ [`StagingValue`] in this context referring to the provided [`AtomId`]. If the provided
     /// `r#type` is [`None`], the staged [`Atom`](crate::programs::Atom)'s type is read from the owned
     /// [`ProgramBuilder`].
     #[inline]
-    fn tracer(&self, atom: AtomId, r#type: Option<Self::Type>) -> Tracer<Self> {
+    fn tracer(&self, atom: AtomId, r#type: Option<Self::Type>) -> Self::Value {
         let r#type = r#type.unwrap_or_else(|| self.builder().borrow().atoms()[atom.index()].r#type().into_owned());
-        Tracer::new(TracerState::Live(atom), r#type, self.clone())
+        Self::Value::live(self.clone(), atom, r#type)
     }
 
     /// Records the provided [`ProgramError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
@@ -238,17 +263,17 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
         error
     }
 
-    /// Returns `true` if the provided [`Tracer`] is produced by a nullary
-    /// [`ZeroOperation`](crate::operations::constants::ZeroOperation) in this [`StagingContext`].
-    /// Structural zero recognition is intentionally narrow: inputs, constants, non-zero operations, and malformed
-    /// non-nullary zero operations are not treated as **canonical** zeros. Callers that need broader algebraic
-    /// simplification should perform it in [`Operation`]-owned rules rather than weakening this definition.
-    fn is_zero(&self, tracer: &Tracer<Self>) -> Result<bool, ProgramError>
+    /// Returns `true` if the provided [`Tracer`] is produced by a nullary [`ZeroOperation`](crate::ZeroOperation)
+    /// in this [`StagingContext`]. Structural zero recognition is intentionally narrow: inputs, constants, non-zero
+    /// operations, and malformed non-nullary zero operations are not treated as **canonical** zeros. Callers that
+    /// need broader algebraic simplification should perform it in [`Operation`]-owned rules rather than weakening
+    /// this definition.
+    fn is_zero(&self, value: &Self::Value) -> Result<bool, ProgramError>
     where
         Self::Operation: MaybeZeroOperation<Self::Type>,
     {
-        check_builders!(self.builder(), tracer.context().builder()).map_err(|error| self.error(error))?;
-        let atom = tracer.atom_id()?;
+        check_builders!(self.builder(), value.context().builder()).map_err(|error| self.error(error))?;
+        let atom = value.atom_id()?;
         let builder = self.builder().borrow();
         if builder.atoms().get(atom.index()).is_none() {
             return Err(ProgramError::UnboundAtomId { id: atom });
@@ -267,16 +292,16 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
     fn stage_nullary_operation<O: Into<Self::Operation>>(
         &self,
         operation: O,
-    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        self.stage_operation::<O, Tracer<Self>>(operation, &[])
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        self.stage_operation::<O, Self::Value>(operation, &[])
     }
 
     /// Stages an application of the provided [`Operation`] in this context and returns [`Tracer`]s for its outputs.
-    fn stage_operation<O: Into<Self::Operation>, I: std::borrow::Borrow<Tracer<Self>>>(
+    fn stage_operation<O: Into<Self::Operation>, I: std::borrow::Borrow<Self::Value>>(
         &self,
         operation: O,
         inputs: &[I],
-    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+    ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
         check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
             .map_err(|error| self.error(error))?;
@@ -285,7 +310,7 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             Ok(output_types
                 .into_iter()
-                .map(|r#type| Tracer::new(TracerState::Poison, r#type, self.clone()))
+                .map(|r#type| Self::Value::poison(self.clone(), r#type))
                 .collect())
         } else {
             let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
@@ -319,8 +344,8 @@ pub trait StagingContext: Context<Value = Tracer<Self>> {
     fn stage_program<Input: Parameterized<Self::Constant>, Output: Parameterized<Self::Constant>>(
         &self,
         program: &Program<Self::Type, Self::Constant, Self::Operation, Input, Output>,
-        inputs: Vec<Tracer<Self>>,
-    ) -> Result<Vec<Tracer<Self>>, ProgramError>
+        inputs: Vec<Self::Value>,
+    ) -> Result<Vec<Self::Value>, ProgramError>
     where
         Self::Constant: Clone,
         Self::Operation: Clone,
@@ -352,18 +377,18 @@ mod tests {
 
     #[test]
     fn test_eager_context_binds_and_lifts_values() {
-        let context = EagerContext::<DataType, f64, ScalarOperation<f64>>::new();
-        let default_context = EagerContext::<DataType, f64, ScalarOperation<f64>>::default();
+        let context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let default_context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::default();
         let copied_context = context;
         let cloned_context = copied_context.clone();
 
         assert_eq!(format!("{context:?}"), "EagerContext");
         assert_eq!(format!("{default_context:?}"), "EagerContext");
         assert_eq!(format!("{cloned_context:?}"), "EagerContext");
-        assert_eq!(context.lift(2.5), Ok(2.5));
-        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![0.0]));
-        assert_eq!(context.bind(OneOperation::new(DataType::F64), &[]), Ok(vec![1.0]));
-        assert_eq!(context.bind(AddOperation, &[2.0, 3.5]), Ok(vec![5.5]));
+        assert_eq!(context.lift(Scalar::from(2.5)), Ok(Scalar::from(2.5)));
+        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(0.0)]));
+        assert_eq!(context.bind(OneOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(context.bind(AddOperation, &[Scalar::from(2.0), Scalar::from(3.5)]), Ok(vec![Scalar::from(5.5)]));
     }
 
     #[test]
