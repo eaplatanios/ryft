@@ -4,28 +4,73 @@ use crate::types::{ArrayType, DataType, Type};
 /// A [`Type`] whose reverse-mode cotangents carry a (possibly different) dual, or **cotangent**, [`Type`]. Reverse-mode
 /// differentiation seeds an output cotangent, transposes the linear program, and emits structural zero cotangents for
 /// disconnected inputs. Each of those cotangent values must be typed in the *dual* space rather than the primal one.
-/// For types that carry no distribution metadata the dual type is the type itself (i.e., the identity). Types that
-/// carry such metadata map it to its cotangent dual. For example, [`ArrayType`] swaps the unreduced and reduced axes of
-/// its [`Sharding`] (refer to [`Sharding::cotangent`]). The swap is an **involution**, so that
-/// `value.cotangent().cotangent()` recovers `value`.
 pub trait DifferentiableType: Type {
-    /// Returns the [`Type`] that reverse-mode cotangents of values of this type carry.
-    fn cotangent(&self) -> Self;
+    /// Returns the [`Type`] that reverse-mode cotangents of values of this type carry, or `None`
+    /// when this type carries no cotangent space (i.e., analogous to the
+    /// [JAX `float0` type](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.float0.html)).
+    ///
+    /// Differentiable types (e.g., floating-point and complex element types) carry a cotangent space, and so
+    /// [`Self::cotangent`] returns `Some(dual)`. In most cases, the cotangent type is the type itself (i.e.,
+    /// [`Self::cotangent`] is an identity function). However, that is not always the case. For example, [`ArrayType`]
+    /// swaps the unreduced and reduced axes of its [`Sharding`] (refer to [`Sharding::cotangent`] for more
+    /// information). For types that are actually differentiable, the swap is an **involution** so that if
+    /// `value.cotangent()` is `Some(dual)`, then `dual.cotangent()` recovers `value`.
+    ///
+    /// Non-differentiable types (e.g., Boolean, integer, and token element types) carry no cotangent space and for
+    /// those cases, [`Self::cotangent`] returns `None`. A `None` cotangent means that the type contributes no adjoint.
+    /// Reverse mode differentiation will seed no cotangent for outputs corresponding to those types, and it will emit
+    /// no cotangent for inputs corresponding to those types. The non-differentiable fixed point satisfies
+    /// `cotangent().is_none()` reflexively (i.e., there is no dual to involute).
+    fn cotangent(&self) -> Option<Self>;
 }
 
 impl DifferentiableType for DataType {
     #[inline]
-    fn cotangent(&self) -> Self {
-        // Scalar data types carry no distribution metadata, so a cotangent has the same type as its primal value.
-        self.clone()
+    fn cotangent(&self) -> Option<Self> {
+        match self {
+            Self::Token
+            | Self::Boolean
+            | Self::I1
+            | Self::I2
+            | Self::I4
+            | Self::I8
+            | Self::I16
+            | Self::I32
+            | Self::I64
+            | Self::U1
+            | Self::U2
+            | Self::U4
+            | Self::U8
+            | Self::U16
+            | Self::U32
+            | Self::U64 => None,
+            Self::F4E2M1FN
+            | Self::F8E3M4
+            | Self::F8E4M3
+            | Self::F8E4M3FN
+            | Self::F8E4M3FNUZ
+            | Self::F8E4M3B11FNUZ
+            | Self::F8E5M2
+            | Self::F8E5M2FNUZ
+            | Self::F8E8M0FNU
+            | Self::BF16
+            | Self::F16
+            | Self::F32
+            | Self::F64
+            | Self::C64
+            | Self::C128 => Some(self.clone()),
+        }
     }
 }
 
 impl DifferentiableType for ArrayType {
     #[inline]
-    fn cotangent(&self) -> Self {
-        // Swap the unreduced and reduced sharding axes (the cotangent dual); all other type metadata is unchanged.
-        Self { sharding: self.sharding.as_ref().map(Sharding::cotangent), ..self.clone() }
+    fn cotangent(&self) -> Option<Self> {
+        // An array is differentiable exactly when its element data type is. A non-differentiable element type carries
+        // no cotangent space. For differentiable element data types, swap the unreduced and reduced sharding axes and
+        // keep all other type metadata unchanged.
+        self.data_type().cotangent()?;
+        Some(Self { sharding: self.sharding.as_ref().map(Sharding::cotangent), ..self.clone() })
     }
 }
 
@@ -48,22 +93,27 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::types::DataType::F32;
+    use crate::types::DataType::{Boolean, F32, I32};
     use crate::types::{ArrayType, Shape, Size};
 
     use super::*;
 
     #[test]
     fn test_data_type_cotangent() {
-        // A scalar data type carries no distribution metadata, so its cotangent type is itself.
-        assert_eq!(F32.cotangent(), F32);
+        assert_eq!(F32.cotangent(), Some(F32));
+        assert_eq!(Boolean.cotangent(), None);
+        assert_eq!(I32.cotangent(), None);
     }
 
     #[test]
     fn test_array_type_cotangent() {
+        // A non-differentiable element type carries no cotangent space regardless of shape.
+        let boolean = ArrayType::new(Boolean, Shape::new(vec![Size::Static(4)]));
+        assert_eq!(boolean.cotangent(), None);
+
         // Without a sharding, the cotangent type is the type itself.
         let plain = ArrayType::new(F32, Shape::new(vec![Size::Static(4)]));
-        assert_eq!(plain.cotangent(), plain);
+        assert_eq!(plain.cotangent(), Some(plain.clone()));
 
         // With a sharding, the unreduced and reduced axes are swapped.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -85,8 +135,8 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        assert_eq!(unreduced.cotangent(), reduced);
-        assert_eq!(reduced.cotangent(), unreduced);
+        assert_eq!(unreduced.cotangent(), Some(reduced.clone()));
+        assert_eq!(reduced.cotangent(), Some(unreduced));
     }
 
     #[test]
