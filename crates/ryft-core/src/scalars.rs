@@ -14,11 +14,11 @@ use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
 use crate::operations::differentiation::StopGradient;
 use crate::operations::scalars::ScalarOperation;
+use crate::operations::tag::Tag;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, InterpretableOperation, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::rematerialization::RematerializationName;
 use crate::types::{DataType, TypeError, Typed};
 
 /// Stateless [`Domain`] that uses [`DataType`] to represent [`Type`](crate::Type)s and [`Scalar`] to represent runtime
@@ -441,11 +441,11 @@ impl StopGradient for Scalar {
     }
 }
 
-impl RematerializationName for Scalar {
-    /// Returns this [`Scalar`] unchanged. Rematerialization-name tagging is the identity on concrete values; the tag
-    /// only matters when staging through a [`Tracer`](crate::tracing::Tracer).
+impl Tag for Scalar {
+    /// Returns this [`Scalar`] unchanged. Tagging is the identity on concrete values; the tag only matters when staging
+    /// through a [`Tracer`](crate::tracing::Tracer).
     #[inline]
-    fn rematerialization_name(self, _name: &str) -> Self {
+    fn tag(self, _key: &str) -> Self {
         self
     }
 }
