@@ -100,7 +100,7 @@ pub trait MaybeTag {
     fn key(&self) -> Option<&str>;
 }
 
-impl<C: StagingContext<Value = Tracer<C, Meta>, Operation: From<TagOperation>>, Meta: Clone> Tag for Tracer<C, Meta> {
+impl<C: StagingContext<Operation: From<TagOperation>>> Tag for Tracer<C, C::Meta> {
     #[inline]
     fn tag(self, key: &str) -> Self {
         self.unary(TagOperation::new(key))

@@ -1,14 +1,13 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::fmt::{Display, Formatter, Result as FormatResult};
-use std::ops::{Add, Div, Mul, Neg, Sub};
+use std::fmt::Display;
 
 use half::{bf16, f16};
 use ryft_macros::Parameter;
 
 use crate::contexts::{Context, EagerContext};
 use crate::domains::Domain;
-use crate::operations::arithmetic::Scalable;
+use crate::operations::arithmetic::{Add, Div, Mul, Neg, Scalable, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
@@ -97,7 +96,7 @@ pub enum Scalar {
 }
 
 impl Display for Scalar {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> FormatResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Scalar::Bool(value) => Display::fmt(value, formatter),
             Scalar::I8(value) => Display::fmt(value, formatter),
@@ -325,13 +324,10 @@ impl OneLike for Scalar {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Neg for Scalar {
-    type Output = Scalar;
-
-    fn neg(self) -> Scalar {
-        match self {
+    #[inline]
+    fn neg(&self) -> Result<Scalar, ProgramError> {
+        Ok(match *self {
             Scalar::I8(value) => Scalar::I8(-value),
             Scalar::I16(value) => Scalar::I16(-value),
             Scalar::I32(value) => Scalar::I32(-value),
@@ -340,24 +336,31 @@ impl Neg for Scalar {
             Scalar::F16(value) => Scalar::F16(-value),
             Scalar::F32(value) => Scalar::F32(-value),
             Scalar::F64(value) => Scalar::F64(-value),
-            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
-            other => unreachable!("cannot negate a scalar of data type {}", other.r#type()),
-        }
+            other => {
+                return Err(
+                    TypeError { message: format!("cannot negate a scalar of data type {}", other.r#type()) }.into()
+                );
+            }
+        })
     }
 }
 
-// Elementwise arithmetic over equal-[`DataType`] variant pairs. A [`Scalar`] only combines with another [`Scalar`] of
-// the same variant. Any other pairing violates an internal invariant: either the data types differ (which an
-// operation's `infer_output_types` already rules out before interpretation) or the matched variant is Boolean, whose
-// primitive has no arithmetic operators (so the scalar Boolean domain stays trace-only and never reaches this code).
-// Both situations are bugs, so panicking with a clear message is correct here.
+impl std::ops::Neg for Scalar {
+    type Output = Scalar;
+
+    #[inline]
+    fn neg(self) -> Scalar {
+        Neg::neg(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
+// TODO(eaplatanios): Support data type promotion / broadcasting.
 macro_rules! impl_binary_arithmetic_for_scalar {
     ($trait:ident, $method:ident, $operator:tt) => {
         impl $trait for Scalar {
-            type Output = Scalar;
-
-            fn $method(self, rhs: Scalar) -> Scalar {
-                match (self, rhs) {
+            #[inline]
+            fn $method(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
+                Ok(match (*self, *rhs) {
                     (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
                     (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
                     (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left $operator right),
@@ -370,14 +373,27 @@ macro_rules! impl_binary_arithmetic_for_scalar {
                     (Scalar::F16(left), Scalar::F16(right)) => Scalar::F16(left $operator right),
                     (Scalar::F32(left), Scalar::F32(right)) => Scalar::F32(left $operator right),
                     (Scalar::F64(left), Scalar::F64(right)) => Scalar::F64(left $operator right),
-                    // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
-                    (left, right) => unreachable!(
-                        "cannot apply `{}` to scalars of data types {} and {}",
-                        stringify!($method),
-                        left.r#type(),
-                        right.r#type(),
-                    ),
-                }
+                    (left, right) => {
+                        return Err(TypeError {
+                            message: format!(
+                                "cannot apply `{}` to scalars of data types {} and {}",
+                                stringify!($method),
+                                left.r#type(),
+                                right.r#type(),
+                            ),
+                        }
+                        .into());
+                    }
+                })
+            }
+        }
+
+        impl std::ops::$trait for Scalar {
+            type Output = Scalar;
+
+            #[inline]
+            fn $method(self, rhs: Scalar) -> Scalar {
+                $trait::$method(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
             }
         }
     };
@@ -388,48 +404,52 @@ impl_binary_arithmetic_for_scalar!(Sub, sub, -);
 impl_binary_arithmetic_for_scalar!(Mul, mul, *);
 impl_binary_arithmetic_for_scalar!(Div, div, /);
 
-// Context-level construction capabilities for [`Scalar`] values. Because a [`Scalar`] reports the [`DataType`] of
-// whichever variant it holds, a single [`EagerContext<DataType, Scalar, O>`] can synthesize the zero or one value for
-// every supported [`DataType`] by selecting the matching variant, rather than monomorphizing one context per Rust
-// primitive. Producing a constant scalar from a value needs no scalar-specific impl: it is the generic identity from
-// the blanket [`Constant`] implementation for [`EagerContext`].
+// TODO(eaplatanios): Review from here onwards.
 
 impl Scalable<Scalar> for Scalar {
-    /// Scales `self` by `factor`, reusing the variant-matched [`Mul`] implementation of [`Scalar`]. Mismatched
-    /// variants panic through that multiplication, since equal-[`DataType`] operands are an interpretation invariant.
+    /// Scales `self` by `factor`, reusing the fallible variant-matched [`Mul`] implementation of [`Scalar`] so that
+    /// mismatched variants surface a [`TypeError`] rather than panicking.
     #[inline]
     fn scale(&self, factor: Scalar) -> Result<Self, ProgramError> {
-        Ok(*self * factor)
+        Mul::mul(self, &factor)
     }
 }
 
 impl Sin for Scalar {
-    /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point variants support sine; reaching any
-    /// other variant violates an interpretation invariant guaranteed upstream by type inference, so it panics.
-    fn sin(&self) -> Self {
-        match self {
+    /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point variants support sine; any other
+    /// variant returns a [`TypeError`].
+    fn sin(&self) -> Result<Self, ProgramError> {
+        Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sin())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sin())),
             Scalar::F32(value) => Scalar::F32(value.sin()),
             Scalar::F64(value) => Scalar::F64(value.sin()),
-            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
-            other => unreachable!("cannot compute the sine of a scalar of data type {}", other.r#type()),
-        }
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the sine of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
     }
 }
 
 impl Cos for Scalar {
-    /// Computes the elementwise cosine of this [`Scalar`]. Only the floating-point variants support cosine; reaching
-    /// any other variant violates an interpretation invariant guaranteed upstream by type inference, so it panics.
-    fn cos(&self) -> Self {
-        match self {
+    /// Computes the elementwise cosine of this [`Scalar`]. Only the floating-point variants support cosine; any other
+    /// variant returns a [`TypeError`].
+    fn cos(&self) -> Result<Self, ProgramError> {
+        Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().cos())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().cos())),
             Scalar::F32(value) => Scalar::F32(value.cos()),
             Scalar::F64(value) => Scalar::F64(value.cos()),
-            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
-            other => unreachable!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
-        }
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot compute the cosine of a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
     }
 }
 
@@ -454,9 +474,8 @@ impl Compare for Scalar {
     type Output = Scalar;
 
     /// Compares two equal-[`DataType`] [`Scalar`]s and returns the Boolean result as an honestly Boolean-typed
-    /// [`Scalar::Bool`], never a numeric variant. Mismatched variants violate an interpretation invariant guaranteed
-    /// upstream by type inference, so it panics.
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
+    /// [`Scalar::Bool`], never a numeric variant. Mismatched variants return a [`TypeError`].
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
         let ordering = match (self, rhs) {
             (Scalar::Bool(left), Scalar::Bool(right)) => left.partial_cmp(right),
             (Scalar::I8(left), Scalar::I8(right)) => left.partial_cmp(right),
@@ -471,9 +490,11 @@ impl Compare for Scalar {
             (Scalar::F16(left), Scalar::F16(right)) => left.partial_cmp(right),
             (Scalar::F32(left), Scalar::F32(right)) => left.partial_cmp(right),
             (Scalar::F64(left), Scalar::F64(right)) => left.partial_cmp(right),
-            // TODO(eaplatanios): `unreachable!` is wrong here. Should we instead make `Output` a `Result`?
             (left, right) => {
-                unreachable!("cannot compare scalars of data types {} and {}", left.r#type(), right.r#type(),)
+                return Err(TypeError {
+                    message: format!("cannot compare scalars of data types {} and {}", left.r#type(), right.r#type()),
+                }
+                .into());
             }
         };
         let result = match direction {
@@ -484,7 +505,7 @@ impl Compare for Scalar {
             ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
             ComparisonDirection::GreaterThanOrEqual => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
         };
-        Scalar::Bool(result)
+        Ok(Scalar::Bool(result))
     }
 }
 
