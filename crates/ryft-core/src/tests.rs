@@ -20,26 +20,26 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
-use std::ops::{Add, BitAnd, BitOr, BitXor, Div, Mul, Neg, Not, Sub};
+use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, EagerContext, ProvidesContext};
 use crate::domains::Domain;
+use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
+use crate::operations::tag::Tag;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, InterpretableOperation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::TransferToMemory;
-use crate::tracing_v2::{
-    ArrayOperation, CoordinateValue, DifferentiationContext, RematerializationName,
-};
+use crate::tracing_v2::{ArrayOperation, CoordinateValue, DifferentiationContext};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
-use crate::{Compare, ComparisonDirection, Select, SelectCondition};
+use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.
@@ -143,9 +143,9 @@ impl Value<ArrayType> for TestArray {
     }
 }
 
-impl RematerializationName for TestArray {
+impl Tag for TestArray {
     #[inline]
-    fn rematerialization_name(self, _name: &str) -> Self {
+    fn tag(self, _key: &str) -> Self {
         self
     }
 }
@@ -259,7 +259,7 @@ impl CoordinateValue for TestArray {
     }
 }
 
-impl Add for TestArray {
+impl std::ops::Add for TestArray {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -267,7 +267,7 @@ impl Add for TestArray {
     }
 }
 
-impl Sub for TestArray {
+impl std::ops::Sub for TestArray {
     type Output = Self;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -275,7 +275,7 @@ impl Sub for TestArray {
     }
 }
 
-impl Mul for TestArray {
+impl std::ops::Mul for TestArray {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
@@ -283,7 +283,7 @@ impl Mul for TestArray {
     }
 }
 
-impl Mul<f64> for TestArray {
+impl std::ops::Mul<f64> for TestArray {
     type Output = Self;
 
     fn mul(self, rhs: f64) -> Self::Output {
@@ -291,7 +291,7 @@ impl Mul<f64> for TestArray {
     }
 }
 
-impl Div for TestArray {
+impl std::ops::Div for TestArray {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
@@ -299,7 +299,7 @@ impl Div for TestArray {
     }
 }
 
-impl Neg for TestArray {
+impl std::ops::Neg for TestArray {
     type Output = Self;
 
     fn neg(self) -> Self::Output {
@@ -307,21 +307,53 @@ impl Neg for TestArray {
     }
 }
 
+// Fallible Ryft arithmetic capabilities used by operation interpretation. A `TestArray` is always `f64`-backed, so
+// these never fail; they delegate to the ergonomic `std::ops` operators and wrap the result.
+impl Add for TestArray {
+    fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() + rhs.clone())
+    }
+}
+
+impl Sub for TestArray {
+    fn sub(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() - rhs.clone())
+    }
+}
+
+impl Mul for TestArray {
+    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() * rhs.clone())
+    }
+}
+
+impl Div for TestArray {
+    fn div(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() / rhs.clone())
+    }
+}
+
+impl Neg for TestArray {
+    fn neg(&self) -> Result<Self, ProgramError> {
+        Ok(-self.clone())
+    }
+}
+
 impl Sin for TestArray {
-    fn sin(&self) -> Self {
-        Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::sin).collect() }
+    fn sin(&self) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::sin).collect() })
     }
 }
 
 impl Cos for TestArray {
-    fn cos(&self) -> Self {
-        Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::cos).collect() }
+    fn cos(&self) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::cos).collect() })
     }
 }
 
-impl crate::operations::manipulation::Broadcast for TestArray {
+impl Broadcast for TestArray {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let r#type = crate::operations::manipulation::Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
+        let r#type = Broadcast::broadcast(&self.r#type, output_type, output_axes)?;
         let input_shape = self.r#type.static_shape().unwrap();
         let Some(target_shape) = r#type.static_shape() else {
             return Err(TypeError {
@@ -818,7 +850,7 @@ impl SelectCondition for TestArray {
 impl Compare for TestArray {
     type Output = Self;
 
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self {
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
         let output_shape = self.r#type.shape().clone();
         let output_len = Self::element_count(&self.r#type);
         let left = self.broadcast_values(output_len);
@@ -839,7 +871,7 @@ impl Compare for TestArray {
             })
             .collect();
         let output_type = ArrayType::new(DataType::Boolean, output_shape);
-        Self { r#type: output_type, values }
+        Ok(Self { r#type: output_type, values })
     }
 }
 

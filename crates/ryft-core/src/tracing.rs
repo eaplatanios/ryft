@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
-use crate::contexts::{Context, StagingContext, StagingValue};
+use crate::contexts::{Context, StagingContext};
 use crate::domains::Domain;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
@@ -26,11 +26,15 @@ pub enum TracerState {
     Poison,
 }
 
-/// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values and
+/// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values, and
 /// recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return _poisoned_
 /// tracers which are represented using [`TracerState::Poison`].
+///
+/// The `Meta` type parameter carries transform-specific metadata alongside each staged value. Ordinary tracing leaves
+/// it as the default `()`, while transform contexts can specialize it (e.g., to a partial-evaluation known/unknown
+/// classification or a batch axis).
 #[derive(Clone, Parameter)]
-pub struct Tracer<C: Context> {
+pub struct Tracer<C: Context, Meta = ()> {
     /// [`Context`] associated with this [`Tracer`].
     context: C,
 
@@ -39,13 +43,25 @@ pub struct Tracer<C: Context> {
 
     /// [`Type`] of the value that this [`Tracer`] represents.
     r#type: C::Type,
+
+    /// Transform-specific metadata carried alongside this [`Tracer`].
+    meta: Meta,
 }
 
-impl<C: Context> Tracer<C> {
-    /// Creates a new [`Tracer`].
+impl<C: Context, Meta> Tracer<C, Meta> {
+    /// Creates a new [`Tracer`] with a default `Meta`.
     #[inline]
-    pub fn new(context: C, state: TracerState, r#type: C::Type) -> Self {
-        Self { context, state, r#type }
+    pub fn new(context: C, state: TracerState, r#type: C::Type) -> Self
+    where
+        Meta: Default,
+    {
+        Self { context, state, r#type, meta: Meta::default() }
+    }
+
+    /// Creates a new [`Tracer`] carrying the provided `meta`.
+    #[inline]
+    pub fn new_with_meta(context: C, state: TracerState, r#type: C::Type, meta: Meta) -> Self {
+        Self { context, state, r#type, meta }
     }
 
     /// Returns the [`TracerState`] of this [`Tracer`].
@@ -60,6 +76,12 @@ impl<C: Context> Tracer<C> {
         &self.context
     }
 
+    /// Returns the transform-specific metadata carried by this [`Tracer`].
+    #[inline]
+    pub fn meta(&self) -> &Meta {
+        &self.meta
+    }
+
     /// Returns the staged [`AtomId`] for this [`Tracer`] if it is _live_,
     /// and [`ProgramError::PoisonedValue`] otherwise.
     #[inline]
@@ -71,7 +93,7 @@ impl<C: Context> Tracer<C> {
     }
 }
 
-impl<C: StagingContext<Value = Tracer<C>>> Tracer<C> {
+impl<C: StagingContext> Tracer<C, C::Meta> {
     /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>> {
@@ -87,11 +109,21 @@ impl<C: StagingContext<Value = Tracer<C>>> Tracer<C> {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
-                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self {
+                    state: TracerState::Poison,
+                    r#type: self.r#type.clone(),
+                    context: self.context.clone(),
+                    meta: self.meta.clone(),
+                }
             }
             Err(error) => {
                 self.context.error(error);
-                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self {
+                    state: TracerState::Poison,
+                    r#type: self.r#type.clone(),
+                    context: self.context.clone(),
+                    meta: self.meta.clone(),
+                }
             }
         }
     }
@@ -106,27 +138,38 @@ impl<C: StagingContext<Value = Tracer<C>>> Tracer<C> {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
-                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self {
+                    state: TracerState::Poison,
+                    r#type: self.r#type.clone(),
+                    context: self.context.clone(),
+                    meta: self.meta.clone(),
+                }
             }
             Err(error) => {
                 self.context.error(error);
-                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
+                Self {
+                    state: TracerState::Poison,
+                    r#type: self.r#type.clone(),
+                    context: self.context.clone(),
+                    meta: self.meta.clone(),
+                }
             }
         }
     }
 }
 
-impl<C: Context> Debug for Tracer<C> {
+impl<C: Context, Meta: Debug> Debug for Tracer<C, Meta> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")
             .field("state", &self.state)
             .field("type", &self.r#type)
+            .field("meta", &self.meta)
             .finish_non_exhaustive()
     }
 }
 
-impl<C: Context> Display for Tracer<C> {
+impl<C: Context, Meta> Display for Tracer<C, Meta> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
             TracerState::Live(atom_id) => write!(formatter, "{atom_id}"),
@@ -135,44 +178,19 @@ impl<C: Context> Display for Tracer<C> {
     }
 }
 
-impl<C: Context> Typed<C::Type> for Tracer<C> {
+impl<C: Context, Meta> Typed<C::Type> for Tracer<C, Meta> {
     #[inline]
     fn r#type(&self) -> Cow<'_, C::Type> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<C: Context> Value<C::Type> for Tracer<C> {
+impl<C: Context, Meta: Clone + Debug> Value<C::Type> for Tracer<C, Meta> {
     type InterpretationContext = C;
 
     #[inline]
     fn interpretation_context(&self) -> Option<C> {
         Some(self.context().clone())
-    }
-}
-
-impl<C: Context> StagingValue<C> for Tracer<C> {
-    #[inline]
-    fn live(context: C, atom: AtomId, r#type: C::Type) -> Self {
-        Self::new(context, TracerState::Live(atom), r#type)
-    }
-
-    #[inline]
-    fn poison(context: C, r#type: C::Type) -> Self {
-        Self::new(context, TracerState::Poison, r#type)
-    }
-
-    #[inline]
-    fn atom_id(&self) -> Result<AtomId, ProgramError> {
-        match &self.state {
-            TracerState::Live(atom) => Ok(*atom),
-            TracerState::Poison => Err(ProgramError::PoisonedValue),
-        }
-    }
-
-    #[inline]
-    fn context(&self) -> &C {
-        &self.context
     }
 }
 
@@ -333,6 +351,8 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> Context for TracingContext<T, V, 
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>, C> StagingContext for TracingContext<T, V, O, C> {
+    type Meta = ();
+
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
         &self.builder
@@ -346,6 +366,87 @@ impl<T: Type, O: Operation<T>, C: Value<T>> CapturingContext<C> for TracingConte
         let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
         captures.push(value);
         Ok(constant)
+    }
+}
+
+/// Represents a nested [`TracingContext`] that is used to trace a closure into a [`Program`] expressed
+/// in an *enclosing* [`Context`]'s universe rather than in a raw `(T, V, O)` type universe of its own.
+/// Where [`TracingContext`] is keyed by the `(T, V, O)` types it stages and owns its own capture table,
+/// [`NestedTracingContext`] is keyed by the enclosing [`Context`] `C`. It derives its [`Type`](Domain::Type),
+/// [`Constant`](Domain::Constant), and [`Operation`](Domain::Operation) from `C`, owns a fresh [`ProgramBuilder`] for
+/// the nested [`Program`] it stages, and holds a clone of `C`. Runtime capture registration is *not* owned by this
+/// context but is rather delegated to the enclosing context through [`CapturingContext`], and so values captured while
+/// tracing the nested program flow into `C`'s table along the same nesting path as ordinary operation staging. As with
+/// [`TracingContext`], the [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the
+/// *same* nested program.
+pub struct NestedTracingContext<C: Context> {
+    /// [`Context`] that this [`NestedTracingContext`] is nested into.
+    parent: C,
+
+    /// [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
+    builder: Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>>,
+}
+
+impl<C: Context> NestedTracingContext<C> {
+    /// Creates a new [`NestedTracingContext`] that owns a fresh [`ProgramBuilder`] and traces on behalf of `parent`.
+    pub fn new(parent: C) -> Self {
+        Self { parent, builder: Rc::new(RefCell::new(ProgramBuilder::new())) }
+    }
+
+    /// Returns the [`Context`] that this [`NestedTracingContext`] is nested into.
+    #[inline]
+    pub fn parent(&self) -> &C {
+        &self.parent
+    }
+
+    /// Returns the [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
+    #[inline]
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>> {
+        &self.builder
+    }
+}
+
+impl<C: Context> Clone for NestedTracingContext<C> {
+    fn clone(&self) -> Self {
+        Self { parent: self.parent.clone(), builder: self.builder.clone() }
+    }
+}
+
+impl<C: Context> Debug for NestedTracingContext<C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NestedTracingContext").finish_non_exhaustive()
+    }
+}
+
+impl<C: Context> Domain for NestedTracingContext<C> {
+    type Type = C::Type;
+    type Value = Tracer<Self>;
+    type Constant = C::Constant;
+    type Operation = C::Operation;
+}
+
+impl<C: Context> Context for NestedTracingContext<C> {
+    #[inline]
+    fn lift(&self, constant: C::Constant) -> Result<Tracer<Self>, ProgramError> {
+        Ok(self.constant(constant))
+    }
+
+    #[inline]
+    fn bind<P: Into<Self::Operation>>(
+        &self,
+        operation: P,
+        inputs: &[Self::Value],
+    ) -> Result<Vec<Self::Value>, ProgramError> {
+        self.stage_operation(operation.into(), inputs)
+    }
+}
+
+impl<C: Context> StagingContext for NestedTracingContext<C> {
+    type Meta = ();
+
+    #[inline]
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
+        &self.builder
     }
 }
 
@@ -400,14 +501,14 @@ mod tests {
     fn test_interpret_and_trace() {
         let domain = ScalarDomain::new();
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), Scalar::from(2.0)).unwrap();
+            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Scalar::from(2.0)).unwrap();
         assert_eq!(output, 2.0 * 2.0 + 2.0f64.sin());
         assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(3.0 * 3.0 + 3.0f64.sin())));
     }
 
     #[test]
     fn test_infer_output_type() {
-        let output_type = ScalarDomain::infer_output_type(|x| Ok(x.sin()), DataType::F64).unwrap();
+        let output_type = ScalarDomain::infer_output_type(|x| Ok(x.sin()?), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
     }
 
@@ -428,7 +529,7 @@ mod tests {
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let tracer = tracing_context.tracer(atom, None);
-        let poisoned = Tracer::new(tracing_context.clone(), TracerState::Poison, DataType::F64);
+        let poisoned: Tracer<_> = Tracer::new(tracing_context.clone(), TracerState::Poison, DataType::F64);
         let cloned_tracer = tracer.clone();
         assert!(Rc::ptr_eq(tracer.builder(), &builder));
         assert_eq!(tracer.atom_id(), Ok(atom));
@@ -438,9 +539,9 @@ mod tests {
         assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
         assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
         assert_eq!(tracer.to_string(), "%0");
-        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
+        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, meta: (), .. }");
         assert_eq!(poisoned.to_string(), "<poison:f64>");
-        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, .. }");
+        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, meta: (), .. }");
 
         // Test staging value-level identity helpers through the tracer convenience API.
         let zero = tracer.zero_like();
@@ -474,8 +575,11 @@ mod tests {
         let output = tracer.unary(NegOperation);
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         let output_atom = output.atom_id().expect("unary output should remain live");
-        let program =
-            builder.borrow().clone().build::<Scalar, Scalar>(vec![output_atom], Placeholder, Placeholder).unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Scalar, Scalar>(vec![output_atom], Placeholder, Placeholder)
+            .unwrap();
         assert_eq!(program.interpret(Scalar::from(2.0)), Ok(Scalar::from(-2.0)));
         assert_eq!(
             program.to_string(),
@@ -743,8 +847,11 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
         let output_atom = outputs[0].atom_id().expect("staged program output should remain live");
-        let program =
-            builder.borrow().clone().build::<Scalar, Scalar>(vec![output_atom], Placeholder, Placeholder).unwrap();
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<Scalar, Scalar>(vec![output_atom], Placeholder, Placeholder)
+            .unwrap();
         assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
         assert_eq!(
             program.to_string(),
@@ -801,7 +908,7 @@ mod tests {
     fn test_tracing_context_interpret_and_trace() {
         let domain = ScalarDomain::new();
         let (output, program) =
-            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()), Scalar::from(2.0)).unwrap();
+            domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Scalar::from(2.0)).unwrap();
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
         assert_eq!(program.interpret(Scalar::from(0.5)), Ok(Scalar::from(0.5f64 * 0.5f64 + 0.5f64.sin())));
         assert_eq!(program.input_ids().len(), 1);
@@ -819,7 +926,7 @@ mod tests {
 
         // Test using a function with a tuple argument.
         let (_, compiled) = domain
-            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()), (Scalar::from(2.0), Scalar::from(3.0)))
+            .interpret_and_trace(|(x, y)| Ok(x.clone() * y + x.sin()?), (Scalar::from(2.0), Scalar::from(3.0)))
             .unwrap();
         assert_eq!(
             compiled.to_string(),
@@ -837,7 +944,7 @@ mod tests {
         let (output, program) = domain
             .interpret_and_trace(
                 |x| {
-                    let _ = x.sin();
+                    let _ = x.sin()?;
                     Ok(x.clone() * x)
                 },
                 Scalar::from(2.0),
@@ -869,5 +976,49 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_nested_tracing_context() {
+        // A nested trace over an eager `ScalarDomain` parent stages its own independent primal program and,
+        // like the root `TracingContext`, shares that program's builder across cloned contexts.
+        let nested = NestedTracingContext::new(ScalarDomain::new());
+        let builder = nested.builder().clone();
+        let cloned_context = nested.clone();
+        assert!(Rc::ptr_eq(nested.builder(), &builder));
+        assert!(Rc::ptr_eq(cloned_context.builder(), &builder));
+        assert_eq!(format!("{nested:?}"), "NestedTracingContext { .. }");
+
+        // Staging an operation appends to the nested program, which interprets and renders exactly
+        // as a root trace would.
+        let lhs = nested.input(DataType::F64);
+        let rhs = nested.input(DataType::F64);
+        let outputs = nested.stage_operation(AddOperation, &[&lhs, &rhs]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
+        let output_atom = outputs[0].atom_id().expect("output tracer should remain live");
+        let program = builder
+            .borrow()
+            .clone()
+            .build::<(Scalar, Scalar), Scalar>(vec![output_atom], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(5.0)));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Runtime captures are not owned by the nested context. They delegate to the enclosing capturing context,
+        // so a value captured through the nested context lands in the parent's shared capture table.
+        let capturing_parent = TracingContext::<DataType, CaptureReference<DataType>, NegOperation, Scalar>::new();
+        let nested = NestedTracingContext::new(capturing_parent.clone());
+        let reference = nested.capture(Scalar::from(7.0)).expect("capture should delegate to the enclosing context");
+        assert_eq!(reference.r#type().into_owned(), DataType::F64);
+        assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Scalar::from(7.0)]);
     }
 }

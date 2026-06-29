@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
@@ -191,43 +192,26 @@ impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOpera
     }
 }
 
-/// [`Value`] that flows through a [`StagingContext`]. This is a handle to a staged [`Atom`](crate::Atom) in that
-/// context's [`ProgramBuilder`], carrying the [`Context`] itself so that value can recover its [`ProgramBuilder`].
-/// This generalizes the staged value representation away from the concrete [`Tracer`]. Ordinary tracing flows
-/// [`Tracer`]s, while transform contexts may use richer value representations that additionally carry transform
-/// metadata (e.g., a batch axis or a partial-evaluation known/unknown classification) on the value rather than in a
-/// side table. The bound is on [`Context`] rather than a [`StagingContext`] so that the `Value: StagingValue<Self>`
-/// constraint on [`StagingContext`] does not form a trait cycle. Staged values get interpreted in their own staging
-/// context, and so [`InterpretationContext`](Value::InterpretationContext) is pinned to `C`. This is what lets generic
-/// staging code recover `C` from the flowing value's [`Value`] projection.
-pub trait StagingValue<C: Context>: Value<C::Type, InterpretationContext = C> {
-    /// Creates a _live_ [`StagingValue`] referring to `atom` in `context`'s [`ProgramBuilder`], typed as `r#type`.
-    fn live(context: C, atom: AtomId, r#type: C::Type) -> Self;
-
-    /// Creates a _poisoned_ [`StagingValue`] (i.e., an error placeholder) of `r#type` in `context`.
-    fn poison(context: C, r#type: C::Type) -> Self;
-
-    /// Returns the staged [`AtomId`] this [`StagingValue`] refers to if it is _live_,
-    /// or [`ProgramError::PoisonedValue`] if it is poisoned.
-    fn atom_id(&self) -> Result<AtomId, ProgramError>;
-
-    /// Returns the [`Context`] that this [`StagingValue`] carries.
-    fn context(&self) -> &C;
-}
-
-/// Staging [`Context`] whose flowing [`Domain::Value`] is a [`StagingValue`] into an active [`ProgramBuilder`]
-/// (typically a [`Tracer`], but transform contexts may use richer value representations carrying transform metadata).
-/// Binding records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than
-/// interpreting them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
+/// Staging [`Context`] whose flowing [`Domain::Value`] is a [`Tracer`] into an active [`ProgramBuilder`]. Binding
+/// records [`Operation`] invocations as [`Program`] [`Instruction`](crate::Instruction)s rather than interpreting
+/// them, and this trait owns the builder-dependent staging API: [`constant`](StagingContext::constant),
 /// [`input`](StagingContext::input), [`tracer`](StagingContext::tracer), [`error`](StagingContext::error),
 /// [`stage_operation`](StagingContext::stage_operation), and [`stage_program`](StagingContext::stage_program).
 /// Ordinary backend tracing implements it through [`TracingContext`]. Stackable transform contexts such as batching
 /// or linearization implement it by delegating to a parent context.
-pub trait StagingContext: Context<Value: StagingValue<Self>> {
+///
+/// The flowing value is pinned to [`Tracer<Self, Self::Meta>`](Tracer). Every staging context flows a [`Tracer`], and
+/// the associated [`Meta`](StagingContext::Meta) selects the transform-specific metadata carried alongside each staged
+/// value (e.g., a partial evaluation known/unknown classification or a batch axis).
+pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>::Meta>> {
+    // TODO(eaplatanios): Do we really need to attach all three bounds to the `Meta` type?
+    /// Transform-specific metadata carried alongside each staged [`Tracer`] flowing through this context.
+    type Meta: Clone + Debug + Default;
+
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>>;
 
-    /// Creates a constant [`StagingValue`] in this context with the provided constant payload.
+    /// Creates a constant [`Tracer`] in this context with the provided constant payload.
     #[inline]
     fn constant(&self, value: Self::Constant) -> Self::Value {
         let r#type = value.r#type().into_owned();
@@ -235,20 +219,20 @@ pub trait StagingContext: Context<Value: StagingValue<Self>> {
         self.tracer(atom, Some(r#type))
     }
 
-    /// Creates an input [`StagingValue`] in this context with the provided type.
+    /// Creates an input [`Tracer`] in this context with the provided type.
     #[inline]
     fn input(&self, r#type: Self::Type) -> Self::Value {
         let atom = self.builder().borrow_mut().add_input(r#type.clone());
         self.tracer(atom, Some(r#type))
     }
 
-    /// Constructs a _live_ [`StagingValue`] in this context referring to the provided [`AtomId`]. If the provided
+    /// Constructs a _live_ [`Tracer`] in this context referring to the provided [`AtomId`]. If the provided
     /// `r#type` is [`None`], the staged [`Atom`](crate::programs::Atom)'s type is read from the owned
     /// [`ProgramBuilder`].
     #[inline]
     fn tracer(&self, atom: AtomId, r#type: Option<Self::Type>) -> Self::Value {
         let r#type = r#type.unwrap_or_else(|| self.builder().borrow().atoms()[atom.index()].r#type().into_owned());
-        Self::Value::live(self.clone(), atom, r#type)
+        Tracer::live(self.clone(), atom, r#type)
     }
 
     /// Records the provided [`ProgramError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
@@ -310,7 +294,7 @@ pub trait StagingContext: Context<Value: StagingValue<Self>> {
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             Ok(output_types
                 .into_iter()
-                .map(|r#type| Self::Value::poison(self.clone(), r#type))
+                .map(|r#type| Tracer::poison(self.clone(), r#type))
                 .collect())
         } else {
             let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {
