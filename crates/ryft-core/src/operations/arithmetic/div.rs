@@ -1,10 +1,10 @@
 use std::fmt::Display;
-use std::ops::Div;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
@@ -56,7 +56,7 @@ impl ElementwiseOperation for DivOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Div<Output = V>> InterpretableOperation<T, V> for DivOperation
+impl<T: Type, V: Clone + Value<T> + Div> InterpretableOperation<T, V> for DivOperation
 where
     Self: Operation<T>,
 {
@@ -67,11 +67,29 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone() / inputs[1].clone()])
+        Ok(vec![inputs[0].div(&inputs[1])?])
     }
 }
 
-impl<C: StagingContext<Operation: From<DivOperation>>> Div for Tracer<C> {
+impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for DivOperation {}
+
+/// Value-level elementwise division capability. [`Div`] is the fallible Ryft counterpart to [`std::ops::Div`]
+/// that [`DivOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
+/// panicking. Value types additionally provide [`std::ops::Div`] as ergonomic (albeit panicking) sugar layered on top
+/// of this capability.
+pub trait Div: Sized {
+    /// Divides `self` by `rhs`, returning a [`ProgramError`] if something goes wrong.
+    fn div(&self, rhs: &Self) -> Result<Self, ProgramError>;
+}
+
+impl<C: StagingContext<Operation: From<DivOperation>>> Div for Tracer<C, C::Meta> {
+    #[inline]
+    fn div(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.binary(rhs, DivOperation))
+    }
+}
+
+impl<C: StagingContext<Operation: From<DivOperation>>> std::ops::Div for Tracer<C, C::Meta> {
     type Output = Self;
 
     #[inline]
@@ -90,6 +108,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
@@ -109,8 +128,12 @@ mod tests {
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[7.0, 2.0]),
-            Ok(vec![3.5])
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(7.0), Scalar::from(2.0)],
+            ),
+            Ok(vec![Scalar::from(3.5)]),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, TestArray>::interpret(
@@ -189,7 +212,11 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0]),
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(2.0)],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
@@ -218,11 +245,13 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, f64, DivOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, Scalar, DivOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
-        let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
+        let program = builder
+            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

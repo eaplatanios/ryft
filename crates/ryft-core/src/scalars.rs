@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::contexts::{Context, EagerContext};
 use crate::domains::Domain;
-use crate::operations::arithmetic::{Add, Div, Mul, Neg, Scalable, Sub};
+use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
@@ -405,15 +405,6 @@ impl_binary_arithmetic_for_scalar!(Mul, mul, *);
 impl_binary_arithmetic_for_scalar!(Div, div, /);
 
 // TODO(eaplatanios): Review from here onwards.
-
-impl Scalable<Scalar> for Scalar {
-    /// Scales `self` by `factor`, reusing the fallible variant-matched [`Mul`] implementation of [`Scalar`] so that
-    /// mismatched variants surface a [`TypeError`] rather than panicking.
-    #[inline]
-    fn scale(&self, factor: Scalar) -> Result<Self, ProgramError> {
-        Mul::mul(self, &factor)
-    }
-}
 
 impl Sin for Scalar {
     /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point variants support sine; any other

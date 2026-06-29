@@ -1,10 +1,9 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
@@ -65,49 +64,23 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].sin()])
+        Ok(vec![inputs[0].sin()?])
     }
 }
+
+impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for SinOperation {}
 
 /// Value-level elementwise sine capability. [`Sin`] fills the same role for [`SinOperation`] that
 /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 pub trait Sin: Sized {
-    /// Computes the elementwise sine of this value.
-    fn sin(&self) -> Self;
+    /// Computes the elementwise sine of this value, returning a [`ProgramError`] if something goes wrong.
+    fn sin(&self) -> Result<Self, ProgramError>;
 }
 
-impl Sin for f32 {
+impl<C: StagingContext<Operation: From<SinOperation>>> Sin for Tracer<C, C::Meta> {
     #[inline]
-    fn sin(&self) -> Self {
-        (*self).sin()
-    }
-}
-
-impl Sin for f64 {
-    #[inline]
-    fn sin(&self) -> Self {
-        (*self).sin()
-    }
-}
-
-impl Sin for bf16 {
-    #[inline]
-    fn sin(&self) -> Self {
-        Self::from_f32(self.to_f32().sin())
-    }
-}
-
-impl Sin for f16 {
-    #[inline]
-    fn sin(&self) -> Self {
-        Self::from_f32(self.to_f32().sin())
-    }
-}
-
-impl<C: StagingContext<Operation: From<SinOperation>>> Sin for Tracer<C> {
-    #[inline]
-    fn sin(&self) -> Self {
-        self.unary(SinOperation)
+    fn sin(&self) -> Result<Self, ProgramError> {
+        Ok(self.unary(SinOperation))
     }
 }
 
@@ -120,6 +93,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
@@ -128,10 +102,10 @@ mod tests {
 
     #[test]
     fn test_sin() {
-        assert_eq!(Sin::sin(&0.5f32), 0.5f32.sin());
-        assert_eq!(Sin::sin(&0.5f64), 0.5f64.sin());
-        assert_eq!(Sin::sin(&bf16::from_f32(0.5)), bf16::from_f32(0.5f32.sin()));
-        assert_eq!(Sin::sin(&f16::from_f32(0.5)), f16::from_f32(0.5f32.sin()));
+        assert_eq!(Scalar::from(0.5f32).sin().unwrap(), 0.5f32.sin());
+        assert_eq!(Scalar::from(0.5f64).sin().unwrap(), 0.5f64.sin());
+        assert_eq!(Scalar::from(bf16::from_f32(0.5)).sin().unwrap(), bf16::from_f32(0.5f32.sin()));
+        assert_eq!(Scalar::from(f16::from_f32(0.5)).sin().unwrap(), f16::from_f32(0.5f32.sin()));
 
         let operation = SinOperation;
 
@@ -141,8 +115,12 @@ mod tests {
         assert_eq!(format!("{operation}"), SIN_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[0.5]),
-            Ok(vec![0.5f64.sin()]),
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(0.5)],
+            ),
+            Ok(vec![Scalar::from(0.5f64.sin())]),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, TestArray>::interpret(
@@ -187,7 +165,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<DataType, Scalar>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
@@ -196,10 +174,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, f64, SinOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, Scalar, SinOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

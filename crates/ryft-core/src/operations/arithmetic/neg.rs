@@ -1,9 +1,9 @@
 use std::fmt::Display;
-use std::ops::Neg;
 
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
@@ -53,7 +53,7 @@ impl ElementwiseOperation for NegOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Neg<Output = V>> InterpretableOperation<T, V> for NegOperation
+impl<T: Type, V: Clone + Value<T> + Neg> InterpretableOperation<T, V> for NegOperation
 where
     Self: Operation<T>,
 {
@@ -64,11 +64,29 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![-inputs[0].clone()])
+        Ok(vec![inputs[0].neg()?])
     }
 }
 
-impl<C: StagingContext<Operation: From<NegOperation>>> Neg for Tracer<C> {
+impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for NegOperation {}
+
+/// Value-level elementwise negation capability. [`Neg`] is the fallible Ryft counterpart to [`std::ops::Neg`]
+/// that [`NegOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
+/// panicking. Value types additionally provide [`std::ops::Neg`] as ergonomic (albeit panicking) sugar layered on top
+/// of this capability.
+pub trait Neg: Sized {
+    /// Negates `self`, returning a [`ProgramError`] if something goes wrong.
+    fn neg(&self) -> Result<Self, ProgramError>;
+}
+
+impl<C: StagingContext<Operation: From<NegOperation>>> Neg for Tracer<C, C::Meta> {
+    #[inline]
+    fn neg(&self) -> Result<Self, ProgramError> {
+        Ok(self.unary(NegOperation))
+    }
+}
+
+impl<C: StagingContext<Operation: From<NegOperation>>> std::ops::Neg for Tracer<C, C::Meta> {
     type Output = Self;
 
     #[inline]
@@ -85,6 +103,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
@@ -101,8 +120,12 @@ mod tests {
         assert_eq!(format!("{operation}"), NEG_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0]),
-            Ok(vec![-2.0])
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(2.0)],
+            ),
+            Ok(vec![Scalar::from(-2.0)]),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, TestArray>::interpret(
@@ -147,7 +170,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<DataType, Scalar>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
@@ -156,10 +179,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, f64, NegOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, Scalar, NegOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

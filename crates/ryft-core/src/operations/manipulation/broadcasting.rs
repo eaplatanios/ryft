@@ -3,6 +3,7 @@ use std::fmt::Display;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
@@ -83,6 +84,8 @@ impl<V: Value<ArrayType> + Broadcast> InterpretableOperation<ArrayType, V> for B
         Ok(vec![inputs[0].clone().broadcast(self.output_type.clone(), self.output_axes.as_slice())?])
     }
 }
+
+impl<V: Value<ArrayType>, O> PartiallyEvaluatableOperation<ArrayType, V, O> for BroadcastOperation {}
 
 /// Represents the ability to perform general N-dimensional broadcasting. This is the direct analogue of JAX's
 /// [`lax.broadcast_in_dim`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.broadcast_in_dim.html).
@@ -249,7 +252,7 @@ impl Broadcast for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> Broadcast for Tracer<C> {
+impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> Broadcast for Tracer<C, C::Meta> {
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self
             .context()

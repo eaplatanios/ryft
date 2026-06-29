@@ -8,8 +8,8 @@ use lru::LruCache;
 
 use crate::contexts::Context;
 use crate::programs::{ProgramError, Value};
+use crate::tracing::NestedTracingContext;
 use crate::tracing_v2::batching::BatchingContext;
-use crate::tracing_v2::differentiation::PrimalTracingContext;
 use crate::types::ArrayType;
 
 use super::disk_cache::{CacheDigest, DiskCache};
@@ -198,7 +198,7 @@ where
     }
 }
 
-impl<C: CapturingContext<Capture>, Capture: Value<C::Type>> CapturingContext<Capture> for PrimalTracingContext<C> {
+impl<C: CapturingContext<Capture>, Capture: Value<C::Type>> CapturingContext<Capture> for NestedTracingContext<C> {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)

@@ -1501,7 +1501,8 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
-    use crate::operations::arithmetic::{AddOperation, MulOperation, ScaleOperation};
+    use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::scalars::Scalar;
@@ -1587,7 +1588,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![i0]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
         let o0 = builder.add_instruction(AddOperation, vec![v0, i1]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![o0], (Placeholder, Placeholder), Placeholder)
@@ -1596,12 +1597,12 @@ mod tests {
         assert_eq!(program.output_types(), vec![DataType::F64]);
         let input = program.input().unwrap();
         let output = program.output().unwrap();
-        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(7.0)));
+        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(3.0))), Ok(Scalar::from(1.0)));
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64, %1:f64 .
-                let %2:f64 = scale [factor=2] %0
+                let %2:f64 = neg %0
                     %3:f64 = add %2 %1
                 in (%3)
             "}
@@ -1777,7 +1778,7 @@ mod tests {
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
-        let o0 = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![i0]).unwrap()[0];
+        let o0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
@@ -1795,7 +1796,7 @@ mod tests {
         let first_input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
         let second_input = builder.add_input(DataType::F64);
-        let scaled = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![first_input]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation, vec![first_input]).unwrap()[0];
         let output = builder.add_instruction(AddOperation, vec![scaled, second_input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
@@ -1818,9 +1819,9 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
-        let scaled = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![input]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation, vec![input]).unwrap()[0];
         let output = builder.add_instruction(AddOperation, vec![scaled, constant]).unwrap()[0];
-        let dead_output = builder.add_instruction(ScaleOperation::new(Scalar::from(4.0)), vec![input]).unwrap()[0];
+        let dead_output = builder.add_instruction(NegOperation, vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
 
         assert_eq!(
@@ -1843,7 +1844,7 @@ mod tests {
         let dead_input = builder.add_input(DataType::F64);
         let live_constant = builder.add_constant(Scalar::from(3.0f64));
         let dead_constant = builder.add_constant(Scalar::from(5.0f64));
-        let scaled = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![live_input]).unwrap()[0];
+        let scaled = builder.add_instruction(NegOperation, vec![live_input]).unwrap()[0];
         let output = builder.add_instruction(AddOperation, vec![scaled, live_constant]).unwrap()[0];
         let dead_output = builder.add_instruction(AddOperation, vec![dead_input, dead_constant]).unwrap()[0];
         let program = builder
@@ -1954,41 +1955,57 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
-        let scaled = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![input]).unwrap()[0];
-        let output = builder.add_instruction(AddOperation, vec![scaled, constant]).unwrap()[0];
+        let negated = builder.add_instruction(NegOperation, vec![input]).unwrap()[0];
+        let combined = builder.add_instruction(AddOperation, vec![negated, constant]).unwrap()[0];
+        let output = builder
+            .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![combined, constant])
+            .unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+
+        // `map_operations` rebuilds the value graph while rewriting operations: the binary `add` is replaced by a
+        // different operation (`mul`), the `compare` payload field is rewritten in place (its direction is flipped),
+        // and the unary `neg` is forwarded unchanged. The atom table and rendered structure are preserved.
         let mapped = program
             .map_operations(|operation| {
                 Ok::<_, ProgramError>(match operation {
-                    ScalarOperation::Scale(operation) => {
-                        ScalarOperation::Scale(ScaleOperation::new(*operation.factor() + Scalar::from(2.0)))
+                    ScalarOperation::Compare(operation) => {
+                        assert_eq!(operation.direction(), ComparisonDirection::LessThan);
+                        ScalarOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan))
                     }
                     ScalarOperation::Add(_) => ScalarOperation::Mul(MulOperation),
                     operation => operation.clone(),
                 })
             })
             .unwrap();
-        assert_eq!(program.interpret(Scalar::from(2.0f64)), Ok(Scalar::from(7.0f64)));
-        assert_eq!(mapped.interpret(Scalar::from(2.0f64)), Ok(Scalar::from(24.0f64)));
+
+        // Original: `(-input + 3) < 3`, so for `input = 2` this is `1 < 3 = true`.
+        assert_eq!(program.interpret(Scalar::from(2.0f64)), Ok(Scalar::from(true)));
+        // Mapped: `(-input * 3) > 3`, so for `input = 2` this is `-6 > 3 = false`.
+
+        assert_eq!(mapped.interpret(Scalar::from(2.0f64)), Ok(Scalar::from(false)));
+
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f64 .
                 let %1:f64 = const
-                    %2:f64 = scale [factor=2] %0
+                    %2:f64 = neg %0
                     %3:f64 = add %2 %1
-                in (%3)
+                    %4:bool = compare [direction=LessThan] %3 %1
+                in (%4)
             "}
             .trim_end(),
         );
+
         assert_eq!(
             mapped.to_string(),
             indoc! {"
                 lambda %0:f64 .
                 let %1:f64 = const
-                    %2:f64 = scale [factor=4] %0
+                    %2:f64 = neg %0
                     %3:f64 = mul %2 %1
-                in (%3)
+                    %4:bool = compare [direction=GreaterThan] %3 %1
+                in (%4)
             "}
             .trim_end(),
         );
@@ -1999,7 +2016,7 @@ mod tests {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
-        let v0 = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![i0]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
         let o0 = builder.add_instruction(AddOperation, vec![v0, i1]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![o0], (Placeholder, Placeholder), Placeholder)
@@ -2008,12 +2025,12 @@ mod tests {
         let flat_program = program.to_flat_program();
         assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
         assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]), Ok(vec![Scalar::from(7.0)]));
+        assert_eq!(flat_program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]), Ok(vec![Scalar::from(1.0)]));
 
         let flat_program = program.into_flat_program();
         assert_eq!(flat_program.input_structure(), &vec![Placeholder, Placeholder]);
         assert_eq!(flat_program.output_structure(), &vec![Placeholder]);
-        assert_eq!(flat_program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]), Ok(vec![Scalar::from(7.0)]));
+        assert_eq!(flat_program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]), Ok(vec![Scalar::from(1.0)]));
     }
 
     #[test]
@@ -2155,7 +2172,7 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
-        let v0 = builder.add_instruction(ScaleOperation::new(Scalar::from(3.0)), vec![i0]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation, vec![v0, c0]).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
@@ -2166,14 +2183,14 @@ mod tests {
         let (pruned, pruned_live) = program.filtered(&[i0, i1], &[v1]).unwrap();
         assert_eq!(pruned_live, vec![0]);
         assert_eq!(pruned.input_ids().len(), 1);
-        assert_eq!(pruned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(14.0)]));
+        assert_eq!(pruned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-2.0)]));
 
         // Selecting an intermediate atom (i.e., `v0`) as the output drops the downstream `add`
         // and the now-dead constant.
         let (intermediate, intermediate_live) = program.filtered(&[i0], &[v0]).unwrap();
         assert_eq!(intermediate_live, vec![0]);
         assert_eq!(intermediate.instructions().len(), 1);
-        assert_eq!(intermediate.interpret(vec![Scalar::from(5.0)]), Ok(vec![Scalar::from(15.0)]));
+        assert_eq!(intermediate.interpret(vec![Scalar::from(5.0)]), Ok(vec![Scalar::from(-5.0)]));
 
         // Forwarding an input directly as an output yields an instruction-free program over only that input.
         let (forwarded, forwarded_live) = program.filtered(&[i0, i1], &[i0]).unwrap();
@@ -2198,7 +2215,7 @@ mod tests {
             let i0 = builder.add_input(DataType::F64);
             let i1 = builder.add_input(DataType::F64);
             let c0 = builder.add_constant(Scalar::from(2.0f64));
-            let v0 = builder.add_instruction(ScaleOperation::new(Scalar::from(3.0)), vec![i0]).unwrap()[0];
+            let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
             let v1 = builder.add_instruction(AddOperation, vec![v0, c0]).unwrap()[0];
             let program = builder
                 .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
@@ -2215,7 +2232,7 @@ mod tests {
         assert_eq!(owned_live, vec![0]);
         assert_eq!(owned_live, borrowed_live);
         assert_eq!(owned.input_ids().len(), 1);
-        assert_eq!(owned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(14.0)]));
+        assert_eq!(owned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-2.0)]));
         assert_eq!(owned.to_string(), borrowed.to_string());
     }
 
@@ -2225,7 +2242,7 @@ mod tests {
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
-        let v0 = builder.add_instruction(ScaleOperation::new(Scalar::from(2.0)), vec![i0]).unwrap()[0];
+        let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
         let v1 = builder.add_instruction(AddOperation, vec![v0, i1]).unwrap()[0];
         assert_eq!(builder.input_ids, vec![i0, i1]);
         assert!(matches!(
@@ -2257,7 +2274,7 @@ mod tests {
         assert_eq!(program.input_ids, vec![i0, i1]);
         assert_eq!(program.output_ids, vec![v1]);
         assert_eq!(program.instructions.len(), 2);
-        assert_eq!(program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(42.0f64)));
+        assert_eq!(program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(36.0f64)));
     }
 
     #[test]
@@ -2314,7 +2331,7 @@ mod tests {
         let mut input_output_overlap_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let input = input_output_overlap_builder.add_input(DataType::F64);
         input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Scale(ScaleOperation::new(Scalar::from(2.0))),
+            ScalarOperation::Neg(NegOperation),
             vec![input],
             vec![input],
         ));
@@ -2332,12 +2349,12 @@ mod tests {
         let input = duplicate_output_builder.add_input(DataType::F64);
         let output = duplicate_output_builder.add_variable(DataType::F64);
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Scale(ScaleOperation::new(Scalar::from(2.0))),
+            ScalarOperation::Neg(NegOperation),
             vec![input],
             vec![output],
         ));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
-            ScalarOperation::Scale(ScaleOperation::new(Scalar::from(3.0))),
+            ScalarOperation::Neg(NegOperation),
             vec![input],
             vec![output],
         ));

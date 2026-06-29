@@ -1,10 +1,9 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
@@ -65,49 +64,23 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].cos()])
+        Ok(vec![inputs[0].cos()?])
     }
 }
+
+impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for CosOperation {}
 
 /// Value-level elementwise cosine capability. [`Cos`] fills the same role for [`CosOperation`] that
 /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 pub trait Cos: Sized {
-    /// Computes the elementwise cosine of this value.
-    fn cos(&self) -> Self;
+    /// Computes the elementwise cosine of this value, returning a [`ProgramError`] if something goes wrong.
+    fn cos(&self) -> Result<Self, ProgramError>;
 }
 
-impl Cos for f32 {
+impl<C: StagingContext<Operation: From<CosOperation>>> Cos for Tracer<C, C::Meta> {
     #[inline]
-    fn cos(&self) -> Self {
-        (*self).cos()
-    }
-}
-
-impl Cos for f64 {
-    #[inline]
-    fn cos(&self) -> Self {
-        (*self).cos()
-    }
-}
-
-impl Cos for bf16 {
-    #[inline]
-    fn cos(&self) -> Self {
-        Self::from_f32(self.to_f32().cos())
-    }
-}
-
-impl Cos for f16 {
-    #[inline]
-    fn cos(&self) -> Self {
-        Self::from_f32(self.to_f32().cos())
-    }
-}
-
-impl<C: StagingContext<Operation: From<CosOperation>>> Cos for Tracer<C> {
-    #[inline]
-    fn cos(&self) -> Self {
-        self.unary(CosOperation)
+    fn cos(&self) -> Result<Self, ProgramError> {
+        Ok(self.unary(CosOperation))
     }
 }
 
@@ -120,6 +93,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
@@ -128,10 +102,10 @@ mod tests {
 
     #[test]
     fn test_cos() {
-        assert_eq!(Cos::cos(&0.5f32), 0.5f32.cos());
-        assert_eq!(Cos::cos(&0.5f64), 0.5f64.cos());
-        assert_eq!(Cos::cos(&bf16::from_f32(0.5)), bf16::from_f32(0.5f32.cos()));
-        assert_eq!(Cos::cos(&f16::from_f32(0.5)), f16::from_f32(0.5f32.cos()));
+        assert_eq!(Scalar::from(0.5f32).cos().unwrap(), 0.5f32.cos());
+        assert_eq!(Scalar::from(0.5f64).cos().unwrap(), 0.5f64.cos());
+        assert_eq!(Scalar::from(bf16::from_f32(0.5)).cos().unwrap(), bf16::from_f32(0.5f32.cos()));
+        assert_eq!(Scalar::from(f16::from_f32(0.5)).cos().unwrap(), f16::from_f32(0.5f32.cos()));
 
         let operation = CosOperation;
 
@@ -141,8 +115,12 @@ mod tests {
         assert_eq!(format!("{operation}"), COS_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[0.5]),
-            Ok(vec![0.5f64.cos()]),
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(0.5)],
+            ),
+            Ok(vec![Scalar::from(0.5f64.cos())]),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, TestArray>::interpret(
@@ -187,7 +165,7 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<DataType, Scalar>::interpret(&operation, &EagerContext::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
@@ -196,10 +174,10 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, f64, CosOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, Scalar, CosOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-        let program = builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap();
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

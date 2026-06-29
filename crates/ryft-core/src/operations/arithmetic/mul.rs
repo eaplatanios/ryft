@@ -1,11 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
-use std::ops::Mul;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::Tracer;
@@ -179,7 +179,7 @@ fn combine_bilinear_reduction_state(
     Ok((output_unreduced, output_reduced))
 }
 
-impl<T: Type, V: Clone + Value<T> + Mul<Output = V>> InterpretableOperation<T, V> for MulOperation
+impl<T: Type, V: Clone + Value<T> + Mul> InterpretableOperation<T, V> for MulOperation
 where
     Self: Operation<T>,
 {
@@ -190,11 +190,29 @@ where
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].clone() * inputs[1].clone()])
+        Ok(vec![inputs[0].mul(&inputs[1])?])
     }
 }
 
-impl<C: StagingContext<Operation: From<MulOperation>>> Mul for Tracer<C> {
+impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for MulOperation {}
+
+/// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to [`std::ops::Mul`]
+/// that [`MulOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
+/// panicking. Value types additionally provide [`std::ops::Mul`] as ergonomic (albeit panicking) sugar layered on top
+/// of this capability.
+pub trait Mul: Sized {
+    /// Multiplies `self` by `rhs`, returning a [`ProgramError`] if something goes wrong.
+    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError>;
+}
+
+impl<C: StagingContext<Operation: From<MulOperation>>> Mul for Tracer<C, C::Meta> {
+    #[inline]
+    fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.binary(rhs, MulOperation))
+    }
+}
+
+impl<C: StagingContext<Operation: From<MulOperation>>> std::ops::Mul for Tracer<C, C::Meta> {
     type Output = Self;
 
     #[inline]
@@ -213,6 +231,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{Layout, Shape, Size, StridedLayout};
@@ -232,8 +251,12 @@ mod tests {
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0, 3.5]),
-            Ok(vec![7.0])
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(2.0), Scalar::from(3.5)],
+            ),
+            Ok(vec![Scalar::from(7.0)]),
         );
         assert_eq!(
             InterpretableOperation::<ArrayType, TestArray>::interpret(
@@ -312,7 +335,11 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.0]),
+            InterpretableOperation::<DataType, Scalar>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(2.0)],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
@@ -341,11 +368,13 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, f64, MulOperation>::new();
+        let mut builder = ProgramBuilder::<DataType, Scalar, MulOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
-        let program = builder.build::<(f64, f64), f64>(vec![output], (Placeholder, Placeholder), Placeholder).unwrap();
+        let program = builder
+            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

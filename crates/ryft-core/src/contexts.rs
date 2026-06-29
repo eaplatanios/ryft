@@ -9,7 +9,7 @@ use crate::operations::constants::{ConstantOperation, MaybeZeroOperation};
 use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::{Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
@@ -204,8 +204,12 @@ impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOpera
 /// the associated [`Meta`](StagingContext::Meta) selects the transform-specific metadata carried alongside each staged
 /// value (e.g., a partial evaluation known/unknown classification or a batch axis).
 pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>::Meta>> {
-    // TODO(eaplatanios): Do we really need to attach all three bounds to the `Meta` type?
-    /// Transform-specific metadata carried alongside each staged [`Tracer`] flowing through this context.
+    /// Transform-specific metadata carried alongside each staged [`Tracer`] flowing through this context (e.g., a
+    /// partial evaluation known/unknown classification or a batch axis). This type requires [`Clone`] and [`Debug`]
+    /// because the flowing [`Domain::Value`] is pinned to [`Tracer<Self, Self::Meta>`](Tracer), which is a [`Value`]
+    /// (and hence the [`Clone`] and [`Debug`] bounds) only when its metadata is. It also requires [`Default`] because
+    /// the staging functions (i.e., [`input`](Self::input), [`constant`](Self::constant), and [`tracer`](Self::tracer))
+    /// create fresh tracers via [`Tracer::new`], seeding their metadata from [`Default::default`].
     type Meta: Clone + Debug + Default;
 
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
@@ -232,7 +236,7 @@ pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>:
     #[inline]
     fn tracer(&self, atom: AtomId, r#type: Option<Self::Type>) -> Self::Value {
         let r#type = r#type.unwrap_or_else(|| self.builder().borrow().atoms()[atom.index()].r#type().into_owned());
-        Tracer::live(self.clone(), atom, r#type)
+        Tracer::new(self.clone(), TracerState::Live(atom), r#type)
     }
 
     /// Records the provided [`ProgramError`] in the underlying [`ProgramBuilder`] and returns it. If the underlying
@@ -294,7 +298,7 @@ pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>:
             let output_types = operation.infer_output_types(input_types.as_slice())?;
             Ok(output_types
                 .into_iter()
-                .map(|r#type| Tracer::poison(self.clone(), r#type))
+                .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
                 .collect())
         } else {
             let inputs = match inputs.iter().map(|input| input.borrow().atom_id()).collect::<Result<Vec<_>, _>>() {

@@ -98,7 +98,7 @@ impl TestArray {
 
     /// Applies an elementwise binary function using scalar broadcasting.
     fn binary(self, rhs: Self, function: impl Fn(f64, f64) -> f64) -> Self {
-        let output_type = self.r#type.broadcast(&rhs.r#type).unwrap();
+        let output_type = Broadcastable::broadcast(&self.r#type, &rhs.r#type).unwrap();
         let output_len = Self::element_count(&output_type);
         let left = self.broadcast_values(output_len);
         let right = rhs.broadcast_values(output_len);
