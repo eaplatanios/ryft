@@ -469,6 +469,13 @@ pub type DomainTracingContext<D, C = <D as Domain>::Constant> =
 /// [`TracingContext<T, V, O>`](TracingContext).
 pub type DomainTracer<D> = Tracer<DomainTracingContext<D>>;
 
+/// [`Tracer`] flowing through a [`NestedTracingContext`] over an enclosing context `C`. This is the value used while
+/// tracing a nested closure into a [`Program`] expressed in the enclosing context's universe. The closure receives
+/// these tracers in place of `C`-typed runtime values, each [`Operation`] bound on them records an instruction in the
+/// nested [`Program`], and the staged program is then interpreted, differentiated, transposed, etc. back in `C`. Use
+/// this alias at call sites that trace a closure into a nested program over an enclosing context `C`.
+pub type NestedTracer<C> = Tracer<NestedTracingContext<C>>;
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;

@@ -41,6 +41,6 @@ pub use parameters::{
 pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value};
 pub use scalars::{ScalarDomain, Scalar};
 pub use sharding::*;
-pub use tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
+pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
 pub use tracing_v2::batch;
 pub use types::*;
