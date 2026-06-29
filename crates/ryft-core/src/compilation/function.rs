@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::Program;
-use crate::tracing::{DomainTracer, TracingContext};
+use crate::tracing::DomainTracer;
 
 use super::domain::CompilationDomain;
 use super::fingerprint::FunctionFingerprint;
@@ -18,9 +18,9 @@ use super::options::CompilationOptions;
 ///
 /// `In` and `Out` mirror JAX's PyTree pattern: they describe how nested tuples / structs of
 /// runtime values are flattened into the program's positional arguments and outputs. For a
-/// function `|x: DomainTracer<'_, D>| -> DomainTracer<'_, D>`, `In = Out = D::Type`. For
-/// `|(a, b): (DomainTracer<'_, D>, DomainTracer<'_, D>)| ->
-/// (DomainTracer<'_, D>, DomainTracer<'_, D>)`, `In = Out = (D::Type, D::Type)`.
+/// function `|x: DomainTracer<D>| -> DomainTracer<D>`, `In = Out = D::Type`. For
+/// `|(a, b): (DomainTracer<D>, DomainTracer<D>)| ->
+/// (DomainTracer<D>, DomainTracer<D>)`, `In = Out = (D::Type, D::Type)`.
 ///
 /// The handle also retains the **source [`Program`]** that produced the compiled artifact.
 /// This makes the handle inspectable for diagnostics (see [`Self::source_program`]) without
@@ -127,10 +127,9 @@ impl<
 /// Compiles `function` once, caches the resulting program in [`domain.cache()`](
 /// CompilationDomain::cache), and returns a [`CompiledFunction`] handle.
 ///
-/// Mirrors `jax.jit`. The function is traced into a [`Program`](crate::programs::Program) on
-/// every call (the trace cost is small relative to compile), then the domain's [`compile`]
-/// step runs only on cache miss. Repeat invocations at the same call site with the same input
-/// shapes reuse the cached program and skip the lowering / backend-compilation work entirely.
+/// Mirrors `jax.jit`. The function is traced into a [`Program`] on every call (the trace cost is small relative to
+/// compile), then the domain's [`compile`] step runs only on cache miss. Repeat invocations at the same call site with
+/// the same input shapes reuse the cached program and skip the lowering / backend-compilation work entirely.
 ///
 /// If [`CompilationDomain::cache`] returns `None`, every call compiles fresh; the user-visible
 /// behavior is otherwise identical.
@@ -140,21 +139,21 @@ impl<
 pub fn compile_with_options<
     'domain,
     D: 'domain + CompilationDomain,
-    F: FnOnce(Input::To<DomainTracer<'domain, D>>) -> Output::To<DomainTracer<'domain, D>>,
+    F: FnOnce(Input::To<DomainTracer<D>>) -> Output::To<DomainTracer<D>>,
     Input: Parameterized<
             D::Type,
             Family: ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<D::Value>
-                        + ParameterizedFamily<DomainTracer<'domain, D>>,
+                        + ParameterizedFamily<DomainTracer<D>>,
             ParameterStructure: Hash,
         >,
     Output: Parameterized<
             D::Type,
             Family: ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<D::Value>
-                        + ParameterizedFamily<DomainTracer<'domain, D>>,
-            To<DomainTracer<'domain, D>>: Parameterized<
-                DomainTracer<'domain, D>,
+                        + ParameterizedFamily<DomainTracer<D>>,
+            To<DomainTracer<D>>: Parameterized<
+                DomainTracer<D>,
                 To<D::Type> = Output,
                 To<D::Constant> = Output::To<D::Constant>,
             >,
@@ -187,7 +186,7 @@ pub fn compile_with_options<
 
     // 4. Trace the user function. The traced [`Program`] is retained on the resulting handle
     //    so callers can inspect it and so inner-staging / outer-transform paths can walk it.
-    let (output_types_tree, program) = TracingContext::trace(domain, |tracers| Ok(function(tracers)), input_types)?;
+    let (output_types_tree, program) = D::trace(|tracers| Ok(function(tracers)), input_types)?;
     let output_structure = output_types_tree.parameter_structure();
     let output_types_vec: Vec<D::Type> = output_types_tree.parameters().cloned().collect();
 
@@ -214,21 +213,21 @@ pub fn compile_with_options<
 pub fn compile<
     'domain,
     D: 'domain + CompilationDomain<Options: Default>,
-    F: FnOnce(Input::To<DomainTracer<'domain, D>>) -> Output::To<DomainTracer<'domain, D>>,
+    F: FnOnce(Input::To<DomainTracer<D>>) -> Output::To<DomainTracer<D>>,
     Input: Parameterized<
             D::Type,
             Family: ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<D::Value>
-                        + ParameterizedFamily<DomainTracer<'domain, D>>,
+                        + ParameterizedFamily<DomainTracer<D>>,
             ParameterStructure: Hash,
         >,
     Output: Parameterized<
             D::Type,
             Family: ParameterizedFamily<D::Constant>
                         + ParameterizedFamily<D::Value>
-                        + ParameterizedFamily<DomainTracer<'domain, D>>,
-            To<DomainTracer<'domain, D>>: Parameterized<
-                DomainTracer<'domain, D>,
+                        + ParameterizedFamily<DomainTracer<D>>,
+            To<DomainTracer<D>>: Parameterized<
+                DomainTracer<D>,
                 To<D::Type> = Output,
                 To<D::Constant> = Output::To<D::Constant>,
             >,

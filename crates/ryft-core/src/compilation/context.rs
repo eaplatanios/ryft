@@ -21,28 +21,23 @@ use super::domain::CompilationDomain;
 const DEFAULT_CACHE_CAPACITY: usize = 8192;
 
 /// Process-local cache of compiled programs, generic over the
-/// [`CompilationDomain`](super::CompilationDomain) backend.
+/// [`CompilationDomain`] backend.
 ///
 /// Construct one [`CompilationContext`] per backend handle at program start and reuse it across
 /// calls to [`compile_with_options`](super::compile_with_options) and any backend-specific
 /// helpers that look up entries in the cache.
 ///
-/// The cache is keyed by the domain's structurally-typed
-/// [`CompilationDomain::CompilationKey`](super::CompilationDomain::CompilationKey) — `Eq` on
-/// the key guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the
-/// cached program is returned without invoking the producer closure. On miss the producer
-/// runs and the result is inserted.
+/// The cache is keyed by the domain's structurally-typed [`CompilationDomain::CompilationKey`] — `Eq` on the key
+/// guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the cached program is returned
+/// without invoking the producer closure. On miss the producer runs and the result is inserted.
 ///
-/// The in-memory tier uses LRU eviction with a default capacity of [`DEFAULT_CACHE_CAPACITY`].
+/// The in-memory tier uses LRU eviction with a default capacity of `8192` entries.
 /// Use [`CompilationContext::with_capacity`] to override.
 ///
-/// An optional [`DiskCache`] second-tier is configured via
-/// [`CompilationContext::with_disk_cache`]. When present, the disk tier is consulted between
-/// the in-memory tier and the producer closure. The cache uses
-/// [`CompilationDomain::serialize_program`](super::CompilationDomain::serialize_program) and
-/// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program)
-/// to round-trip programs; any error from either method is treated as a cache miss for that
-/// entry.
+/// An optional [`DiskCache`] second-tier is configured via [`CompilationContext::with_disk_cache`]. When present, the
+/// disk tier is consulted between the in-memory tier and the producer closure. The cache uses
+/// [`CompilationDomain::serialize_program`] and [`CompilationDomain::deserialize_program`] to round-trip programs; any
+/// error from either method is treated as a cache miss for that entry.
 pub struct CompilationContext<D: CompilationDomain> {
     /// In-memory LRU keyed by the domain's structural [`CompilationKey`].
     programs: Mutex<LruCache<D::CompilationKey, D::CompiledProgram>>,
@@ -115,10 +110,9 @@ impl<D: CompilationDomain> CompilationContext<D> {
     /// On cache hit, the entry is moved to the most-recently-used position. On miss, the new
     /// entry is inserted; if the cache is at capacity, the least-recently-used entry is evicted.
     ///
-    /// When a disk-cache tier is configured, an in-memory miss falls through to the disk tier
-    /// before invoking `produce`. Disk-tier entries are deserialized via
-    /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program);
-    /// any error from the deserialize step is treated as a miss and the producer runs as usual.
+    /// When a disk-cache tier is configured, an in-memory miss falls through to the disk tier before invoking
+    /// `produce`. Disk-tier entries are deserialized via [`CompilationDomain::deserialize_program`]; any error from the
+    /// deserialize step is treated as a miss and the producer runs as usual.
     pub fn get_or_compile<F: FnOnce() -> Result<D::CompiledProgram, D::Error>>(
         &self,
         domain: &D,
@@ -179,9 +173,14 @@ impl<D: CompilationDomain> Default for CompilationContext<D> {
 /// Active tracing [`Context`] that can register runtime values as captures of the program being built. The returned
 /// value is the context's staged constant payload. For captured-program backends this is usually a lifetime-free
 /// reference into a side table owned by the surrounding compiled function
-/// (see [`CapturedConstant`](super::captures::CapturedConstant)). Stackable transform contexts implement this by
+/// (see [`CaptureReference`](super::captures::CaptureReference)). Stackable transform contexts implement this by
 /// delegating to their parent context so capture registration follows the same nesting path as ordinary operation
 /// staging.
+///
+/// Capturing a closed-over value (rather than staging it as a literal constant) keeps the staged program independent
+/// of that value's concrete data, so the compiled program depends only on its abstract type — which enables executable
+/// reuse across captured values, keeps captured device buffers on-device, and avoids bloating the IR. See
+/// [`CaptureReference`](super::captures::CaptureReference) for the full rationale.
 pub trait CapturingContext<C: Value<Self::Type>>: Context {
     /// Appends `value` to the active capture table and returns the constant payload that refers to it.
     fn capture(&self, value: C) -> Result<Self::Constant, ProgramError>;

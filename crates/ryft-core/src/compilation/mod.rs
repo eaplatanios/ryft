@@ -22,7 +22,7 @@ pub mod fingerprint;
 pub mod function;
 pub mod options;
 
-pub use captures::{CapturedConstant, CapturedProgram};
+pub use captures::{CaptureReference, ClosedProgram};
 pub use context::{CapturingContext, CompilationContext};
 pub use disk_cache::DiskCache;
 pub use domain::CompilationDomain;

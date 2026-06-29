@@ -69,8 +69,7 @@ pub trait CompilationDomain: Domain {
     ) -> Result<Self::CompiledProgram, Self::Error>;
 
     /// Executes a compiled program. Every piece of per-call state is already in the artifact; the caller hands over
-    /// [`Domain::Value`](crate::domains::Domain::Value)s in flat input order and gets runtime values back in
-    /// flat output order.
+    /// [`Domain::Value`]s in flat input order and gets runtime values back in flat output order.
     fn execute(
         &self,
         program: &Self::CompiledProgram,
