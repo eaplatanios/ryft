@@ -1,4 +1,4 @@
-// TODO(eaplatanios): Review this whole module.
+// TODO(eaplatanios): Review this whole module. Also, add tests.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -107,46 +107,36 @@ pub struct ResidualProgram<T: Type, V: Value<T>, O> {
     pub outputs: Vec<ResidualProgramOutput<V>>,
 }
 
-/// Closed operation families that can recursively partially evaluate nested flat [`Program`]s of themselves.
+/// Outcome of partially evaluating a single operation during [`Program::partially_evaluate`]: the decision for what
+/// that operation becomes in the residual program.
 ///
-/// This is the partial-evaluation analogue of
-/// [`InterpretableProgramOperation`](crate::operations::InterpretableProgramOperation): it names the recursive fixed
-/// point that nested-program operations (e.g. `scan`/`while`/`condition` bodies) use to partially evaluate their
-/// bodies, without restating the full [`partially_evaluate`](Program::partially_evaluate) bound at every recursive payload
-/// boundary.
+/// Partial evaluation walks a program with each input classified as either [`Known`](PartialValue::Known) (a concrete
+/// value available now) or [`Unknown`](PartialValue::Unknown) (a value that exists only at residual-program run time),
+/// folds away everything computable now, and emits a residual program over the unknowns. For each operation it
+/// consults that operation's [`PartiallyEvaluatableOperation::partially_evaluate`] rule, which returns one of the
+/// variants below.
 ///
-/// Unlike the linearization and transposition witnesses — whose context/operation type parameters grow with each
-/// recursion level and must therefore name a fixed point to stop the trait solver from diverging — this witness's
-/// parameters `T` and `V` are fixed across recursion. The blanket implementation grounds it in
-/// [`InterpretableOperation`], so proving it for a self-containing operation enum (one whose higher-order variants hold
-/// `Program`s of itself) reduces to that enum's existing [`InterpretableOperation`] proof and introduces no new
-/// recursive obligation.
-pub trait PartiallyEvaluatableProgramOperation<T: Type, V: Value<T>>: Operation<T> + Sized {
-    /// Partially evaluates a nested flat [`Program`] of this operation family; see [`Program::partially_evaluate`].
-    fn partially_evaluate_program(
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
-        context: &V::InterpretationContext,
-        inputs: &[PartialValue<T, V>],
-    ) -> Result<ResidualProgram<T, V, Self>, ProgramError>;
-}
-
-impl<T: Type, V: Value<T>, O: Clone + InterpretableOperation<T, V> + PartiallyEvaluatableOperation<T, V, O>>
-    PartiallyEvaluatableProgramOperation<T, V> for O
-{
-    #[inline]
-    fn partially_evaluate_program(
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
-        context: &V::InterpretationContext,
-        inputs: &[PartialValue<T, V>],
-    ) -> Result<ResidualProgram<T, V, Self>, ProgramError> {
-        program.partially_evaluate(context, inputs)
-    }
-}
-
-/// Outcome by which an operation overrides its own partial evaluation (see [`PartiallyEvaluatableOperation`]).
+/// Most operations return [`Default`](Self::Default) and defer to the standard policy, which the driver applies per
+/// operation from its operands' knowledge: when *all* operands are [`Known`](PartialValue::Known) it **folds** the
+/// operation (interprets it now, so its outputs become known values and it leaves no trace in the residual program),
+/// and otherwise it **residualizes** the operation unchanged (emits it into the residual program, materializing each
+/// known operand as a residual input or an inlined constant). Control-flow operations may override that policy:
+///
+///   - [`Inline`](Self::Inline) splices a nested program in place of the operation, fed the operation's operands at the
+///     listed indices; partial evaluation then recurses into that program, folding and residualizing its instructions
+///     independently. A known-predicate `condition` uses this to inline its taken branch, so the condition vanishes
+///     and only the selected branch's work survives.
+///   - [`Replace`](Self::Replace) emits a transformed operation in place of this one, each operand fed from a
+///     [`ReplaceOperand`] (an original operand reused, or a value the rule folded). An unknown-predicate `condition`,
+///     `while`, or `scan` uses this to residualize a rewritten operation over its partially-evaluated branches.
 ///
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
 pub enum OperationPartialEvaluation<T: Type, V: Value<T>, O> {
+    /// Defer to the default partial-evaluation policy for this operation: when all of its operands are
+    /// [`Known`](PartialValue::Known) the operation is folded by interpretation, and otherwise it is residualized
+    /// unchanged into the residual program. This is what most operations return.
+    Default,
+
     /// Replace the operation by inlining this nested program, fed the operation's operands at the listed operand
     /// indices (in order). Used e.g. by a known-predicate `condition`, which inlines its selected branch.
     Inline {
@@ -186,8 +176,9 @@ pub enum ReplaceOperand<V> {
 ///
 /// # Default Behavior
 ///
-/// The default [`partially_evaluate`](Self::partially_evaluate) returns [`None`], which tells
-/// [`Program::partially_evaluate`] to fall back to its default handling of the operation:
+/// The default [`partially_evaluate`](Self::partially_evaluate) returns
+/// [`OperationPartialEvaluation::Default`], which tells [`Program::partially_evaluate`] to fall back to its default
+/// handling of the operation:
 ///
 ///   - when *all* of the operation's operands are [`Known`](PartialValue::Known), it **folds** the operation by
 ///     interpreting it through [`InterpretableOperation::interpret`], so the operation's outputs become known values
@@ -199,8 +190,8 @@ pub enum ReplaceOperand<V> {
 ///
 /// # Overriding
 ///
-/// Returning [`Some`]\([`OperationPartialEvaluation`]\) overrides this default with the requested rewrite. For
-/// example, a `condition` whose predicate is [`Known`](PartialValue::Known) returns
+/// Returning [`OperationPartialEvaluation::Inline`] or [`OperationPartialEvaluation::Replace`] overrides this default
+/// with the requested rewrite. For example, a `condition` whose predicate is [`Known`](PartialValue::Known) returns
 /// [`OperationPartialEvaluation::Inline`] for its selected branch, so the condition disappears from the residual
 /// program and only the taken branch's work survives.
 ///
@@ -210,9 +201,9 @@ pub enum ReplaceOperand<V> {
 ///     operation belongs to. It is the operation type of every [`Program`] in an
 ///     [`OperationPartialEvaluation`] this rule returns.
 pub trait PartiallyEvaluatableOperation<T: Type, V: Value<T>, O>: Sized {
-    /// Optionally overrides partial evaluation of this operation given its operands' knowledge. Returning [`None`]
-    /// uses the default behavior described in the [trait documentation](Self): fold the operation when all operands
-    /// are [`Known`](PartialValue::Known), otherwise residualize it unchanged.
+    /// Overrides partial evaluation of this operation given its operands' knowledge. Returning
+    /// [`OperationPartialEvaluation::Default`] uses the default behavior described in the [trait documentation](Self):
+    /// fold the operation when all operands are [`Known`](PartialValue::Known), otherwise residualize it unchanged.
     ///
     /// # Parameters
     ///
@@ -222,9 +213,45 @@ pub trait PartiallyEvaluatableOperation<T: Type, V: Value<T>, O>: Sized {
         &self,
         context: &V::InterpretationContext,
         operands: &[PartialValue<T, V>],
-    ) -> Result<Option<OperationPartialEvaluation<T, V, O>>, ProgramError> {
+    ) -> Result<OperationPartialEvaluation<T, V, O>, ProgramError> {
         let _ = (context, operands);
-        Ok(None)
+        Ok(OperationPartialEvaluation::Default)
+    }
+}
+
+/// Closed operation families that can recursively partially evaluate nested flat [`Program`]s of themselves.
+///
+/// This is the partial-evaluation analogue of
+/// [`InterpretableProgramOperation`](crate::operations::InterpretableProgramOperation): it names the recursive fixed
+/// point that nested-program operations (e.g. `scan`/`while`/`condition` bodies) use to partially evaluate their
+/// bodies, without restating the full [`partially_evaluate`](Program::partially_evaluate) bound at every recursive payload
+/// boundary.
+///
+/// Unlike the linearization and transposition witnesses — whose context/operation type parameters grow with each
+/// recursion level and must therefore name a fixed point to stop the trait solver from diverging — this witness's
+/// parameters `T` and `V` are fixed across recursion. The blanket implementation grounds it in
+/// [`InterpretableOperation`], so proving it for a self-containing operation enum (one whose higher-order variants hold
+/// `Program`s of itself) reduces to that enum's existing [`InterpretableOperation`] proof and introduces no new
+/// recursive obligation.
+pub trait PartiallyEvaluatableProgramOperation<T: Type, V: Value<T>>: Operation<T> + Sized {
+    /// Partially evaluates a nested flat [`Program`] of this operation family; see [`Program::partially_evaluate`].
+    fn partially_evaluate_program(
+        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+        context: &V::InterpretationContext,
+        inputs: &[PartialValue<T, V>],
+    ) -> Result<ResidualProgram<T, V, Self>, ProgramError>;
+}
+
+impl<T: Type, V: Value<T>, O: Clone + InterpretableOperation<T, V> + PartiallyEvaluatableOperation<T, V, O>>
+    PartiallyEvaluatableProgramOperation<T, V> for O
+{
+    #[inline]
+    fn partially_evaluate_program(
+        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+        context: &V::InterpretationContext,
+        inputs: &[PartialValue<T, V>],
+    ) -> Result<ResidualProgram<T, V, Self>, ProgramError> {
+        program.partially_evaluate(context, inputs)
     }
 }
 
@@ -315,12 +342,12 @@ where
                 .collect();
 
             let outputs = match instruction.operation().partially_evaluate(self.context, &operand_knowledge)? {
-                Some(OperationPartialEvaluation::Inline { program: inlined, operand_indices }) => {
+                OperationPartialEvaluation::Inline { program: inlined, operand_indices } => {
                     let branch_inputs =
                         operand_indices.iter().map(|&index| operands[index].1.clone()).collect::<Vec<_>>();
                     self.inline(&inlined, branch_inputs)?
                 }
-                Some(OperationPartialEvaluation::Replace { operation, operands: sources }) => {
+                OperationPartialEvaluation::Replace { operation, operands: sources } => {
                     // The rule rewrote the operation; resolve each source to a residual atom and emit the rewrite.
                     let mut operand_atoms = Vec::with_capacity(sources.len());
                     for source in sources {
@@ -340,7 +367,7 @@ where
                     }
                     self.emit(operation, operand_atoms)?
                 }
-                None => {
+                OperationPartialEvaluation::Default => {
                     if operands.iter().all(|(_, value)| matches!(value, Residualized::Known(_))) {
                         // All operands known: fold the instruction through its own interpretation rule.
                         let known = operands
@@ -703,49 +730,8 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
             }
         }
 
-        self.project_by_stage(&atom_stage, stage_count)
-    }
-
-    /// Projects this flat program into `stage_count` totally-ordered stages given a precomputed per-[`Atom`] stage
-    /// classification, threading the forward cross-stage edges as residuals.
-    ///
-    /// This is the projection half of [`partition`](Self::partition): [`partition`](Self::partition) computes the
-    /// stage of every atom by a forward max-propagation pass over `input_stages` and then calls this. Callers that
-    /// already know each atom's stage — notably the linearization trace, whose
-    /// [`LinearizationContext`](crate::tracing_v2::linearization_trace::LinearizationContext) records the known/unknown
-    /// classification online as it stages the fused jvp program — pass it directly, so the classification is computed
-    /// once rather than recovered by a second reachability pass. The two entry points are equivalent because the online
-    /// `Known`/`Unknown` join over two stages is exactly the max-propagation [`partition`](Self::partition) performs.
-    ///
-    /// The residual discovery, [`filtered`](Self::filtered) projection, and input/output reconstruction are identical to
-    /// [`partition`](Self::partition); see its documentation for the full algorithm and the
-    /// [`PartitionedProgram`] invariants.
-    ///
-    /// # Parameters
-    ///
-    ///   - `atom_stage`: One stage id per [`Atom`], in [`AtomId`] order; each must be less than `stage_count`.
-    ///   - `stage_count`: Number of stages to partition into; must be at least `1`.
-    pub(crate) fn project_by_stage(
-        &self,
-        atom_stage: &[usize],
-        stage_count: usize,
-    ) -> Result<PartitionedProgram<T, V, O>, ProgramError> {
-        if atom_stage.len() != self.atoms.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "atom stage classification has {} entries but the program has {} atoms",
-                atom_stage.len(),
-                self.atoms.len(),
-            )));
-        }
-        if stage_count < 1 {
-            return Err(ProgramError::MalformedProgram("partition requires at least one stage".into()));
-        }
-        if let Some(&stage) = atom_stage.iter().find(|&&stage| stage >= stage_count) {
-            return Err(ProgramError::MalformedProgram(format!(
-                "atom stage {stage} is out of range for {stage_count} stages",
-            )));
-        }
-
+        // Project each side with [`filtered`](Self::filtered), threading the forward cross-stage edges as residuals.
+        //
         // Cross-stage residuals, discovered with two distinct dedup scopes:
         //   - producer side (`produced` + `source_of`): the identity set of each residual, fixed once on first
         //     encounter, so a value consumed by several later stages or by a non-adjacent stage is threaded once;
