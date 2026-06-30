@@ -1,5 +1,3 @@
-// TODO(eaplatanios): Review this whole module. Also, add tests.
-
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -9,19 +7,17 @@ use crate::parameters::Placeholder;
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::types::{Type, Typed};
 
-/// Knowledge state of a value during partial evaluation.
-///
-/// A [`PartialValue`] is the abstract value domain the partial evaluator interprets a [`Program`] over: every
-/// [`Atom`] and every intermediate result is either [`Known`](Self::Known) (a concrete value available
-/// now) or [`Unknown`](Self::Unknown) (only its [`Type`] is available until the residual program runs).
-///
-/// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
+/// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial evaluator
+/// interprets a [`Program`] over. Every [`Atom`] and every intermediate result is either [`Known`](Self::Known)
+/// (i.e., a concrete value available now) or [`Unknown`](Self::Unknown) (i.e., only its [`Type`] is available until
+/// the residual program runs). For more information on partial evaluation, refer to the documentation of
+/// [`Program::partially_evaluate`].
 #[derive(Clone, Debug)]
 pub enum PartialValue<T: Type, V: Value<T>> {
-    /// Value that is fully known at partial-evaluation time and can be folded forward.
+    /// [`Value`] that is fully known at partial-evaluation time and can be folded forward.
     Known(V),
 
-    /// Value that is not known until the residual program runs; carries the value's [`Type`].
+    /// [`Value`] that is not known until the residual program runs and only its [`Type`] is known.
     Unknown(T),
 }
 
@@ -49,6 +45,7 @@ impl<T: Type, V: Value<T>> PartialValue<T, V> {
 }
 
 impl<T: Type, V: Value<T>> Typed<T> for PartialValue<T, V> {
+    #[inline]
     fn r#type(&self) -> Cow<'_, T> {
         match self {
             Self::Known(value) => value.r#type(),
@@ -56,6 +53,8 @@ impl<T: Type, V: Value<T>> Typed<T> for PartialValue<T, V> {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Source feeding one input of the residual program.
 ///
@@ -88,12 +87,14 @@ pub enum ResidualProgramOutput<V> {
     Unknown(usize),
 }
 
-/// Result of partially evaluating a flat [`Program`]; see [`Program::partially_evaluate`].
+/// Result of partially evaluating a flat [`Program`].
 ///
 /// To reconstruct the original program's outputs: build the residual program's input vector by mapping each
 /// [`inputs`](Self::inputs) entry to either a runtime unknown-input value or its carried known residual, interpret
 /// [`program`](Self::program), then read each [`outputs`](Self::outputs) entry as either its folded value or the
 /// indexed residual-program output.
+///
+/// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
 #[derive(Debug)]
 pub struct ResidualProgram<T: Type, V: Value<T>, O> {
     /// Residual program over the surviving unknown inputs plus the known residuals, aligned with
@@ -107,8 +108,7 @@ pub struct ResidualProgram<T: Type, V: Value<T>, O> {
     pub outputs: Vec<ResidualProgramOutput<V>>,
 }
 
-/// Outcome of partially evaluating a single operation during [`Program::partially_evaluate`]: the decision for what
-/// that operation becomes in the residual program.
+/// Decision for how an operation is handled during [`Program::partially_evaluate`].
 ///
 /// Partial evaluation walks a program with each input classified as either [`Known`](PartialValue::Known) (a concrete
 /// value available now) or [`Unknown`](PartialValue::Unknown) (a value that exists only at residual-program run time),
@@ -122,8 +122,8 @@ pub struct ResidualProgram<T: Type, V: Value<T>, O> {
 /// and otherwise it **residualizes** the operation unchanged (emits it into the residual program, materializing each
 /// known operand as a residual input or an inlined constant). Control-flow operations may override that policy:
 ///
-///   - [`Inline`](Self::Inline) splices a nested program in place of the operation, fed the operation's operands at the
-///     listed indices; partial evaluation then recurses into that program, folding and residualizing its instructions
+///   - [`Inline`](Self::Inline) splices a nested program in place of the operation, fed by the operation operands at
+///     the listed indices. Partial evaluation then recurses into that program, folding and residualizing its instructions
 ///     independently. A known-predicate `condition` uses this to inline its taken branch, so the condition vanishes
 ///     and only the selected branch's work survives.
 ///   - [`Replace`](Self::Replace) emits a transformed operation in place of this one, each operand fed from a
@@ -131,14 +131,15 @@ pub struct ResidualProgram<T: Type, V: Value<T>, O> {
 ///     `while`, or `scan` uses this to residualize a rewritten operation over its partially-evaluated branches.
 ///
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
+#[derive(Clone, Debug)]
 pub enum OperationPartialEvaluation<T: Type, V: Value<T>, O> {
     /// Defer to the default partial-evaluation policy for this operation: when all of its operands are
     /// [`Known`](PartialValue::Known) the operation is folded by interpretation, and otherwise it is residualized
     /// unchanged into the residual program. This is what most operations return.
     Default,
 
-    /// Replace the operation by inlining this nested program, fed the operation's operands at the listed operand
-    /// indices (in order). Used e.g. by a known-predicate `condition`, which inlines its selected branch.
+    /// Replace the operation by inlining this nested program, fed by the operation operands at the listed operand
+    /// indices in order. A known-predicate `condition` uses this to inline its selected branch.
     Inline {
         /// Nested program to inline in place of the operation.
         program: Program<T, V, O, Vec<V>, Vec<V>>,
@@ -147,9 +148,8 @@ pub enum OperationPartialEvaluation<T: Type, V: Value<T>, O> {
         operand_indices: Vec<usize>,
     },
 
-    /// Residualize a (possibly transformed) operation in place of this one, fed the listed operand sources. Used when
-    /// an operation cannot be folded or inlined but can be rewritten — e.g. an unknown-predicate `condition`
-    /// residualizes a new `condition` over partially-evaluated branches.
+    /// Residualize a transformed operation in place of this one, fed by the listed operand sources.
+    /// An unknown-predicate `condition` uses this to residualize a new `condition` over partially-evaluated branches.
     Replace {
         /// Transformed operation to emit into the residual program.
         operation: O,
@@ -159,7 +159,8 @@ pub enum OperationPartialEvaluation<T: Type, V: Value<T>, O> {
     },
 }
 
-/// Source feeding one operand of a `Replace`d operation; see [`OperationPartialEvaluation::Replace`].
+/// Source feeding one operand of a [`OperationPartialEvaluation::Replace`] operation.
+#[derive(Clone, Debug)]
 pub enum ReplaceOperand<V> {
     /// Feed the original operation's operand at this index (its walk value is reused).
     Operand(usize),
@@ -172,7 +173,7 @@ pub enum ReplaceOperand<V> {
 ///
 /// Implemented per operation payload and forwarded by the owning operation enum's generated implementation, this
 /// trait lets an individual operation decide how partial evaluation treats it. Most operations defer to the default;
-/// control-flow operations may override — for example a known-predicate `condition` inlines its selected branch.
+/// control-flow operations may override. For example, a known-predicate `condition` inlines its selected branch.
 ///
 /// # Default Behavior
 ///
@@ -184,8 +185,8 @@ pub enum ReplaceOperand<V> {
 ///     interpreting it through [`InterpretableOperation::interpret`], so the operation's outputs become known values
 ///     and the operation contributes nothing to the residual program;
 ///   - otherwise it **residualizes** the operation unchanged: it emits the operation into the residual program over
-///     its operands' residual-program atoms — materializing each known operand as a residual input (for a known
-///     variable) or as an inlined residual-program constant (for a literal) — so the operation runs at
+///     its operands' residual-program atoms, materializing each known operand as a residual input for a known
+///     variable or as an inlined residual-program constant for a literal, so the operation runs at
 ///     residual-program execution time.
 ///
 /// # Overriding
@@ -197,7 +198,7 @@ pub enum ReplaceOperand<V> {
 ///
 /// # Type Parameters
 ///
-///   - `O`: Operation family of the residual program and of any inlined nested programs — i.e. the enum this
+///   - `O`: Operation family of the residual program and of any inlined nested programs, namely the enum this
 ///     operation belongs to. It is the operation type of every [`Program`] in an
 ///     [`OperationPartialEvaluation`] this rule returns.
 pub trait PartiallyEvaluatableOperation<T: Type, V: Value<T>, O>: Sized {
@@ -207,7 +208,7 @@ pub trait PartiallyEvaluatableOperation<T: Type, V: Value<T>, O>: Sized {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Interpretation context available to a custom rule, e.g. to fold a known sub-result.
+    ///   - `context`: Interpretation context available to a custom rule, such as for folding a known sub-result.
     ///   - `operands`: Knowledge state for each of this operation's operands, in operand order.
     fn partially_evaluate(
         &self,
@@ -223,12 +224,12 @@ pub trait PartiallyEvaluatableOperation<T: Type, V: Value<T>, O>: Sized {
 ///
 /// This is the partial-evaluation analogue of
 /// [`InterpretableProgramOperation`](crate::operations::InterpretableProgramOperation): it names the recursive fixed
-/// point that nested-program operations (e.g. `scan`/`while`/`condition` bodies) use to partially evaluate their
-/// bodies, without restating the full [`partially_evaluate`](Program::partially_evaluate) bound at every recursive payload
-/// boundary.
+/// point that nested-program operations, such as `scan`/`while`/`condition` bodies, use to partially evaluate their
+/// bodies without restating the full [`partially_evaluate`](Program::partially_evaluate) bound at every recursive
+/// payload boundary.
 ///
-/// Unlike the linearization and transposition witnesses — whose context/operation type parameters grow with each
-/// recursion level and must therefore name a fixed point to stop the trait solver from diverging — this witness's
+/// Unlike the linearization and transposition witnesses, whose context/operation type parameters grow with each
+/// recursion level and must therefore name a fixed point to stop the trait solver from diverging, this witness's
 /// parameters `T` and `V` are fixed across recursion. The blanket implementation grounds it in
 /// [`InterpretableOperation`], so proving it for a self-containing operation enum (one whose higher-order variants hold
 /// `Program`s of itself) reduces to that enum's existing [`InterpretableOperation`] proof and introduces no new
@@ -242,8 +243,11 @@ pub trait PartiallyEvaluatableProgramOperation<T: Type, V: Value<T>>: Operation<
     ) -> Result<ResidualProgram<T, V, Self>, ProgramError>;
 }
 
-impl<T: Type, V: Value<T>, O: Clone + InterpretableOperation<T, V> + PartiallyEvaluatableOperation<T, V, O>>
-    PartiallyEvaluatableProgramOperation<T, V> for O
+impl<T, V, O> PartiallyEvaluatableProgramOperation<T, V> for O
+where
+    T: Type,
+    V: Value<T>,
+    O: Clone + InterpretableOperation<T, V> + PartiallyEvaluatableOperation<T, V, O>,
 {
     #[inline]
     fn partially_evaluate_program(
@@ -255,9 +259,8 @@ impl<T: Type, V: Value<T>, O: Clone + InterpretableOperation<T, V> + PartiallyEv
     }
 }
 
-/// Walk-time classification of an [`Atom`](crate::Atom) during [`Program::partially_evaluate`]: a value known now, or a
-/// value that lives in the residual program at the given residual-program [`AtomId`].
-#[derive(Clone)]
+/// Walk-time classification of an [`Atom`] during [`Program::partially_evaluate`].
+#[derive(Clone, Debug)]
 enum Residualized<V> {
     /// Value known at partial-evaluation time.
     Known(V),
@@ -295,9 +298,10 @@ where
     /// into [`self.builder`](Self::builder). Returns the walk value of each program output, in output order.
     ///
     /// A returned [`OperationPartialEvaluation::Inline`] is handled here by recursively walking the inlined program
-    /// fed the selected operands, so an operation can rewrite itself into transformed work (e.g. a known-predicate
-    /// `condition` inlining its selected branch). Program constants are lifted to [`Residualized::Known`] on first use
-    /// and rebuilt inline in the residual program when a residualized instruction consumes them.
+    /// fed the selected operands, so an operation can rewrite itself into transformed work. For example, a
+    /// known-predicate `condition` can inline its selected branch. Program constants are lifted to
+    /// [`Residualized::Known`] on first use and rebuilt inline in the residual program when a residualized instruction
+    /// consumes them.
     fn inline(
         &mut self,
         program: &Program<T, V, O, Vec<V>, Vec<V>>,
@@ -343,17 +347,30 @@ where
 
             let outputs = match instruction.operation().partially_evaluate(self.context, &operand_knowledge)? {
                 OperationPartialEvaluation::Inline { program: inlined, operand_indices } => {
-                    let branch_inputs =
-                        operand_indices.iter().map(|&index| operands[index].1.clone()).collect::<Vec<_>>();
-                    self.inline(&inlined, branch_inputs)?
+                    let mut inputs = Vec::with_capacity(operand_indices.len());
+                    for operand_index in operand_indices {
+                        let (_, value) = operands.get(operand_index).ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "partial-evaluation rule referenced operand {operand_index} but operation has {} operands",
+                                operands.len(),
+                            ))
+                        })?;
+                        inputs.push(value.clone());
+                    }
+                    self.inline(&inlined, inputs)?
                 }
                 OperationPartialEvaluation::Replace { operation, operands: sources } => {
                     // The rule rewrote the operation; resolve each source to a residual atom and emit the rewrite.
                     let mut operand_atoms = Vec::with_capacity(sources.len());
                     for source in sources {
                         let atom = match source {
-                            ReplaceOperand::Operand(index) => {
-                                let (atom, value) = &operands[index];
+                            ReplaceOperand::Operand(operand_index) => {
+                                let (atom, value) = operands.get(operand_index).ok_or_else(|| {
+                                    ProgramError::MalformedProgram(format!(
+                                        "partial-evaluation rule referenced operand {operand_index} but operation has {} operands",
+                                        operands.len(),
+                                    ))
+                                })?;
                                 self.materialize(program, &mut materialized, *atom, value)?
                             }
                             ReplaceOperand::Known(value) => {
@@ -414,7 +431,11 @@ where
 
     /// Emits an operation into the residual program over the provided residual-program operand atoms and returns its
     /// outputs as [`Residualized::Residual`] walk values, in output order.
-    fn emit(&mut self, operation: O, operand_atoms: Vec<AtomId>) -> Result<Vec<Residualized<V>>, ProgramError> {
+    fn emit<P: Into<O>>(
+        &mut self,
+        operation: P,
+        operand_atoms: Vec<AtomId>,
+    ) -> Result<Vec<Residualized<V>>, ProgramError> {
         let outputs = self.builder.add_instruction(operation, operand_atoms)?;
         Ok(outputs.iter().copied().map(Residualized::Residual).collect())
     }
@@ -451,7 +472,12 @@ where
     }
 }
 
-impl<T: Type, V: Value<T>, O: Clone + InterpretableOperation<T, V>> Program<T, V, O, Vec<V>, Vec<V>> {
+impl<T, V, O> Program<T, V, O, Vec<V>, Vec<V>>
+where
+    T: Type,
+    V: Value<T>,
+    O: Clone + InterpretableOperation<T, V>,
+{
     /// Copies this already-residual program into `builder` over the caller-provided `inputs`, returning the builder
     /// atoms holding the spliced program's outputs in output order.
     ///
@@ -487,13 +513,12 @@ where
     V: Value<T>,
     O: Clone + InterpretableOperation<T, V> + PartiallyEvaluatableOperation<T, V, O>,
 {
-    /// Partially evaluates this flat program against the provided per-input knowledge — the foundation for JAX-style
-    /// residual minimization in Ryft's transforms.
+    /// Partially evaluates this flat program against the provided per-input knowledge.
     ///
     /// Partial evaluation classifies each [`Atom`] as *known* (computable now from the provided values) or *unknown*
     /// (dependent on a runtime input), folds the known subcomputation away, and carves the remaining unknown
     /// subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the known values it
-    /// actually needs. This is the analogue of JAX's `partial_eval_jaxpr`.
+    /// actually needs.
     ///
     /// It is a forward pass that builds the residual program incrementally with a [`ProgramBuilder`], deliberately
     /// built on the existing operation semantics rather than reimplementing graph machinery: every instruction whose
@@ -505,16 +530,16 @@ where
     /// instructions and constants that no longer feed an output.
     ///
     /// Each instruction is first offered to its own [`PartiallyEvaluatableOperation::partially_evaluate`] rule, which
-    /// may override this default — for example a known-predicate `condition` returns
+    /// may override this default. For example, a known-predicate `condition` returns
     /// [`OperationPartialEvaluation::Inline`] to inline its selected branch in place of the operation, so the
     /// condition disappears from the residual program. Building the residual program with a builder (rather than
     /// projecting the original) is what lets these rules emit *transformed* work; flat instructions with no override
     /// are emitted unchanged. The walk is flat per program but recurses through
-    /// [`OperationPartialEvaluation::Inline`] into inlined nested programs (e.g. a selected `condition` branch); an
+    /// [`OperationPartialEvaluation::Inline`] into inlined nested programs, such as a selected `condition` branch; an
     /// instruction carrying a nested program that is *not* inlined is folded only when all of its inputs are known and
     /// is otherwise emitted unchanged.
     ///
-    /// Each known *variable* a residualized instruction consumes — a program input or a folded intermediate — becomes
+    /// Each known *variable* a residualized instruction consumes, whether a program input or a folded intermediate, becomes
     /// a residual input of the residual program; literal constants are rebuilt inline as residual-program constants,
     /// so they are never residual inputs. The resulting [`ResidualProgram`] carries everything a caller needs to
     /// reassemble the original outputs once the runtime (unknown) inputs are available.
@@ -525,12 +550,11 @@ where
     /// the known subcomputation away (folding it through [`InterpretableOperation::interpret`]) and applies
     /// per-operation rewrite rules, yielding a single residual [`Program`] plus the folded output and
     /// residual-input *values*. Reach for it to **specialize or constant-fold** a program against inputs that are
-    /// known now. It is the analogue of JAX's value-carrying partial evaluation (tracing over `PartialVal`s);
-    /// [`PartialValue`] mirrors JAX's `PartialVal`.
+    /// known now.
     ///
     /// [`partition`](Self::partition) is the **structural** counterpart: from a stage id per input (no values, no
     /// context) it *partitions* the program into per-stage sub-programs joined by residuals, folding and rewriting
-    /// nothing — the form linearization needs, run as a two-stage known/unknown split. The two are not reducible to
+    /// nothing, which is the form linearization uses as a two-stage known/unknown split. The two are not reducible to
     /// each other: this method requires concrete values and *discards* the known computation (folds it to values),
     /// whereas a partition keeps each stage's computation as a runnable program.
     ///
@@ -600,8 +624,8 @@ where
 /// nothing. Each instruction is placed in the latest stage among its operands, and the forward cross-stage edges are
 /// threaded as *residuals* between the per-stage sub-programs. Running the [`stages`](Self::stages) in stage order,
 /// threading each stage's produced residuals forward to the stages that consume them, and reassembling the outputs via
-/// [`output_stages`](Self::output_stages) reproduces the original program. It is the structural, multi-stage
-/// generalization of JAX's `partial_eval_jaxpr`; its two-stage known/unknown instance is the partial-evaluation split.
+/// [`output_stages`](Self::output_stages) reproduces the original program. Its two-stage known/unknown instance is the
+/// partial-evaluation split.
 ///
 /// To recombine the original outputs: interpret each [`PartitionStage::program`] in stage order over its own inputs
 /// (the original inputs named by [`PartitionStage::input_indices`]) followed by its consumed residuals (each fetched
@@ -649,19 +673,24 @@ pub struct PartitionStage<T: Type, V: Value<T>, O> {
 /// produced residuals (the trailing outputs of the producer's program, after its own outputs).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ResidualSource {
-    /// Stage id of the producer — the earlier stage whose produced residuals include this value.
+    /// Stage id of the producer, the earlier stage whose produced residuals include this value.
     pub stage: usize,
 
     /// Index of this value among the producer stage's produced residuals.
     pub index: usize,
 }
 
-impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
+impl<T, V, O> Program<T, V, O, Vec<V>, Vec<V>>
+where
+    T: Type,
+    V: Value<T>,
+    O: Clone + Operation<T>,
+{
     /// Partitions this flat program structurally into `stage_count` totally-ordered stages by the per-input stage
     /// assignment `input_stages` (one stage id per program input, in input order).
     ///
-    /// This is the structural, multi-stage generalization of JAX's `partial_eval_jaxpr`: it carries no values, uses no
-    /// interpretation context, and folds nothing. It only partitions the program's [`Atom`]s and
+    /// This structural partition carries no values, uses no interpretation context, and folds nothing. It only
+    /// partitions the program's [`Atom`]s and
     /// [`Instruction`](crate::programs::Instruction)s across stages so that running the stages in stage order, fed the
     /// *residuals* (the cross-stage values each stage consumes from earlier stages), and reassembling their outputs
     /// reproduces the original program. The two-stage instance (stage 0 = known, stage 1 = unknown) is the
@@ -670,7 +699,7 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
     /// Stage classification is a single forward pass: a program input takes its `input_stages` entry; a constant is
     /// stage `0` (literals are available from the start and rebuilt inline by [`Self::filtered`], never threaded); an
     /// instruction's outputs all share the maximum stage over the instruction's operands. Control-flow and other
-    /// nested-program operations are treated as ordinary operations here — there are no operation-specific partition
+    /// nested-program operations are treated as ordinary operations here; there are no operation-specific partition
     /// rules at this stage. A residual is any *variable* operand of an instruction at stage `j` whose own stage is some
     /// `i < j`; it is produced once (deduplicated globally on first encounter, so a value consumed by several later
     /// stages or by a non-adjacent stage is threaded once) and consumed by every stage that reads it (deduplicated per
@@ -683,7 +712,7 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
     /// reflect exactly the inputs each projected program actually takes, so an own input or a residual that no surviving
     /// instruction consumes is dropped from the corresponding program and from its index lists.
     ///
-    /// An empty stage (no own inputs, outputs, or instructions — for example a trailing stage that nothing reaches)
+    /// An empty stage (no own inputs, outputs, or instructions, such as a trailing stage that nothing reaches)
     /// yields an empty projected program. `stage_count` is taken explicitly rather than inferred from `input_stages`,
     /// so a trailing empty stage is still produced (this is what lets a two-stage known/unknown split always produce
     /// its unknown stage, even when every input is known).
@@ -693,7 +722,7 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
     /// This is the **structural** form: at partition time there are no concrete values, the residuals are symbolic, and
     /// *every* stage survives as a reusable program. [`partially_evaluate`](Self::partially_evaluate) is the
     /// **value-carrying** counterpart: it folds the known half to concrete values (and applies per-operation rewrites)
-    /// for constant-folding or specialization. The two are not reducible to each other — this method neither has values
+    /// for constant-folding or specialization. The two are not reducible to each other: this method neither has values
     /// to fold nor produces them, and it preserves each stage's computation as a program rather than evaluating it away.
     ///
     /// # Parameters
@@ -708,7 +737,7 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
         if input_stages.len() != self.input_ids.len() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids.len(), actual: input_stages.len() });
         }
-        if stage_count < 1 {
+        if stage_count == 0 {
             return Err(ProgramError::MalformedProgram("partition requires at least one stage".into()));
         }
         if let Some(&stage) = input_stages.iter().find(|&&stage| stage >= stage_count) {
@@ -736,7 +765,7 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
         //   - producer side (`produced` + `source_of`): the identity set of each residual, fixed once on first
         //     encounter, so a value consumed by several later stages or by a non-adjacent stage is threaded once;
         //   - consumer side (`consumed`): a per-consuming-stage ordered, deduplicated candidate list.
-        // Known constants are excluded (`is_variable` guard) — `filtered` rebuilds them inline.
+        // Known constants are excluded by the `is_variable` guard; `filtered` rebuilds them inline.
         let mut produced: Vec<Vec<AtomId>> = vec![Vec::new(); stage_count];
         let mut source_of: HashMap<AtomId, ResidualSource> = HashMap::new();
         let mut consumed: Vec<Vec<AtomId>> = vec![Vec::new(); stage_count];
@@ -803,7 +832,11 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
                 if position < own_inputs.len() {
                     input_indices.push(own_inputs[position]);
                 } else {
-                    residual_inputs.push(source_of[&consumed[stage][position - own_inputs.len()]]);
+                    let residual = consumed[stage][position - own_inputs.len()];
+                    let source = source_of.get(&residual).copied().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!("missing residual source for atom {residual}"))
+                    })?;
+                    residual_inputs.push(source);
                 }
             }
 
@@ -816,6 +849,8 @@ impl<T: Type, V: Value<T>, O: Clone + Operation<T>> Program<T, V, O, Vec<V>, Vec
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
     use crate::contexts::EagerContext;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::constants::ZeroOperation;
@@ -830,21 +865,43 @@ mod tests {
 
     use super::*;
 
+    type TestArrayProgram = Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>;
+
+    fn scalar_array_type() -> ArrayType {
+        ArrayType::scalar(DataType::F64)
+    }
+
+    fn boolean_array(value: bool) -> TestArray {
+        TestArray::new(ArrayType::scalar(DataType::Boolean), vec![f64::from(value as u8)])
+    }
+
+    fn scalar_branch(operation: ArrayOperation<TestArray>, factor: f64) -> TestArrayProgram {
+        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let input = builder.add_input(scalar_array_type());
+        let factor = builder.add_constant(TestArray::scalar(factor));
+        let output = builder.add_instruction(operation, vec![input, factor]).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
     /// Builds `f(a, x) = (2*a*a, a*a*x, x + a)` over scalar `f64`, where `a*a` is a shared intermediate. With `a`
     /// known and `x` unknown: the first output folds to a constant, the second residualizes against the folded `a*a`
-    /// (a known *intermediate*), and the third residualizes against `a` (a known *input*) — exercising both kinds of
+    /// (a known *intermediate*), and the third residualizes against `a` (a known *input*), exercising both kinds of
     /// residual boundary plus a fully folded output.
     #[test]
     fn test_partially_evaluate_folds_known_subcomputation_and_carves_residual() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let a = builder.add_input(DataType::F64);
-        let x = builder.add_input(DataType::F64);
-        let aa = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
-        let out0 = builder.add_instruction(AddOperation, vec![aa, aa]).unwrap()[0];
-        let out1 = builder.add_instruction(MulOperation, vec![aa, x]).unwrap()[0];
-        let out2 = builder.add_instruction(AddOperation, vec![x, a]).unwrap()[0];
+        let known_input = builder.add_input(DataType::F64);
+        let runtime_input = builder.add_input(DataType::F64);
+        let known_square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
+        let doubled_square = builder.add_instruction(AddOperation, vec![known_square, known_square]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![known_square, runtime_input]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![runtime_input, known_input]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![out0, out1, out2], vec![Placeholder; 2], vec![Placeholder; 3])
+            .build::<Vec<Scalar>, Vec<Scalar>>(
+                vec![doubled_square, product, sum],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
             .unwrap();
 
         let context = EagerContext::<DataType, Scalar>::new();
@@ -897,9 +954,9 @@ mod tests {
     #[test]
     fn test_partially_evaluate_with_all_unknown_inputs_residualizes_everything() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let a = builder.add_input(DataType::F64);
-        let x = builder.add_input(DataType::F64);
-        let product = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
+        let left_input = builder.add_input(DataType::F64);
+        let right_input = builder.add_input(DataType::F64);
+        let product = builder.add_instruction(MulOperation, vec![left_input, right_input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder; 1])
             .unwrap();
@@ -920,9 +977,9 @@ mod tests {
     #[test]
     fn test_partially_evaluate_keeps_program_constants_inline_in_the_residual() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let x = builder.add_input(DataType::F64);
+        let input = builder.add_input(DataType::F64);
         let five = builder.add_constant(Scalar::from(5.0));
-        let sum = builder.add_instruction(AddOperation, vec![x, five]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![input, five]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 1], vec![Placeholder; 1])
             .unwrap();
@@ -939,14 +996,14 @@ mod tests {
     }
 
     /// A nullary `zero` has no inputs, so it folds to a concrete known value during partial evaluation and is dropped
-    /// from the residual program — the symbolic-zero fact falls out of folding with no special handling.
+    /// from the residual program. The symbolic-zero fact falls out of folding with no special handling.
     #[test]
     fn test_partially_evaluate_folds_nullary_zero_to_a_known_value() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let x = builder.add_input(DataType::F64);
+        let input = builder.add_input(DataType::F64);
         let zero = builder.add_instruction(ZeroOperation::new(DataType::F64), vec![]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![zero, x], vec![Placeholder; 1], vec![Placeholder; 2])
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![zero, input], vec![Placeholder; 1], vec![Placeholder; 2])
             .unwrap();
 
         let context = EagerContext::<DataType, Scalar>::new();
@@ -964,15 +1021,15 @@ mod tests {
     }
 
     /// The builder forward pass emits every unknown instruction, then `into_simplified` prunes those that do not feed
-    /// an output — so a dead unknown computation does not survive into the residual program.
+    /// an output, so a dead unknown computation does not survive into the residual program.
     #[test]
     fn test_partially_evaluate_prunes_dead_unknown_instructions() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let x = builder.add_input(DataType::F64);
+        let input = builder.add_input(DataType::F64);
         let one = builder.add_constant(Scalar::from(1.0));
         let two = builder.add_constant(Scalar::from(2.0));
-        let used = builder.add_instruction(AddOperation, vec![x, one]).unwrap()[0];
-        let _dead = builder.add_instruction(MulOperation, vec![x, two]).unwrap()[0];
+        let used = builder.add_instruction(AddOperation, vec![input, one]).unwrap()[0];
+        let _dead = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![used], vec![Placeholder; 1], vec![Placeholder; 1])
             .unwrap();
@@ -988,9 +1045,9 @@ mod tests {
 
     /// Stage 3 de-risking: the partial-evaluation witness must resolve for a *self-containing* operation enum.
     /// `ArrayOperation` holds `Scan`/`While`/`Condition` variants whose bodies are themselves
-    /// `Program<…, ArrayOperation, …>`, so satisfying the bound below is exactly the recursive case feared to overflow
+    /// `Program<..., ArrayOperation, ...>`, so satisfying the bound below is exactly the recursive case feared to overflow
     /// the trait solver. Because the witness's `T`/`V` are fixed and the blanket impl grounds it in
-    /// `InterpretableOperation`, this reduces to the enum's existing interpretation proof — so it compiles, with no
+    /// `InterpretableOperation`, this reduces to the enum's existing interpretation proof, so it compiles with no
     /// recursive obligation and no overflow.
     #[test]
     fn array_operation_satisfies_the_partial_evaluation_witness() {
@@ -1004,44 +1061,29 @@ mod tests {
     /// predicate.
     #[test]
     fn test_partially_evaluate_selects_branch_of_a_known_predicate_condition() {
-        // Builds a single-input scalar `f64` branch program computing `f(x)` as `x <operation> factor`.
-        fn branch(
-            operation: ArrayOperation<TestArray>,
-            factor: f64,
-        ) -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let constant = builder.add_constant(TestArray::scalar(factor));
-            let output = builder.add_instruction(operation, vec![input, constant]).unwrap()[0];
-            builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-        }
-
         // `condition(p, x) = if p { x * 2 } else { x + 100 }`, staged into a flat program over `[predicate, x]`.
-        let build_program =
-            || -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-                let condition = ConditionOperation::new(
-                    branch(ArrayOperation::Mul(MulOperation), 2.0),
-                    branch(ArrayOperation::Add(AddOperation), 100.0),
-                )
-                .unwrap();
-                let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-                let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-                let x = builder.add_input(ArrayType::scalar(DataType::F64));
-                let output = builder
-                    .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, x])
-                    .unwrap()[0];
-                builder
-                    .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                    .unwrap()
-            };
+        let build_program = || -> TestArrayProgram {
+            let condition = ConditionOperation::new(
+                scalar_branch(ArrayOperation::Mul(MulOperation), 2.0),
+                scalar_branch(ArrayOperation::Add(AddOperation), 100.0),
+            )
+            .unwrap();
+            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+            let input = builder.add_input(scalar_array_type());
+            let output = builder
+                .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, input])
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
 
         let context = EagerContext::<ArrayType, TestArray>::new();
-        let boolean = |value: bool| TestArray::new(ArrayType::scalar(DataType::Boolean), vec![value as u8 as f64]);
 
         // Known `true` predicate, unknown `x`: only the `x * 2` branch survives; the condition is gone.
         let program = build_program();
-        let knowledge =
-            vec![PartialValue::Known(boolean(true)), PartialValue::Unknown(ArrayType::scalar(DataType::F64))];
+        let knowledge = vec![PartialValue::Known(boolean_array(true)), PartialValue::Unknown(scalar_array_type())];
         let evaluation = program.partially_evaluate(&context, knowledge.as_slice()).unwrap();
         assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
@@ -1051,8 +1093,7 @@ mod tests {
 
         // Known `false` predicate, unknown `x`: only the `x + 100` branch survives.
         let program = build_program();
-        let knowledge =
-            vec![PartialValue::Known(boolean(false)), PartialValue::Unknown(ArrayType::scalar(DataType::F64))];
+        let knowledge = vec![PartialValue::Known(boolean_array(false)), PartialValue::Unknown(scalar_array_type())];
         let evaluation = program.partially_evaluate(&context, knowledge.as_slice()).unwrap();
         assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
@@ -1060,7 +1101,7 @@ mod tests {
         assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(4.0)]).unwrap()[0].values, vec![104.0],);
     }
 
-    /// With an *unknown* predicate, a `condition` cannot be inlined, so it survives — but it is shrunk: each branch
+    /// With an *unknown* predicate, a `condition` cannot be inlined, so it survives and is shrunk: each branch
     /// is partially evaluated against the operand knowledge and the two residual branches are reconciled into one
     /// rewritten `condition`. The branches are `if p { x * 2 } else { a * a + x * x }` over `[x, a]` with `a` known
     /// and `x` and `p` unknown, so the false branch folds `a * a` to a constant and shrinks from three to two.
@@ -1068,15 +1109,13 @@ mod tests {
     /// predicates reproduces the original program.
     #[test]
     fn test_partially_evaluate_unknown_predicate_condition_shrinks_branches() {
-        let scalar = || ArrayType::scalar(DataType::F64);
-
         // True branch over `[x, a]`: `x * 2` (the `a` operand is unused).
         let true_branch = || {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let x = builder.add_input(scalar());
-            let _a = builder.add_input(scalar());
+            let input = builder.add_input(scalar_array_type());
+            let _known_input = builder.add_input(scalar_array_type());
             let two = builder.add_constant(TestArray::scalar(2.0));
-            let output = builder.add_instruction(MulOperation, vec![x, two]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -1085,40 +1124,38 @@ mod tests {
         // False branch over `[x, a]`: `a * a + x * x`. With `a` known, `a * a` folds away during partial evaluation.
         let false_branch = || {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let x = builder.add_input(scalar());
-            let a = builder.add_input(scalar());
-            let aa = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
-            let xx = builder.add_instruction(MulOperation, vec![x, x]).unwrap()[0];
-            let output = builder.add_instruction(AddOperation, vec![aa, xx]).unwrap()[0];
+            let input = builder.add_input(scalar_array_type());
+            let known_input = builder.add_input(scalar_array_type());
+            let known_square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
+            let input_square = builder.add_instruction(MulOperation, vec![input, input]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation, vec![known_square, input_square]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
 
         // `condition(p, x, a)` staged into a flat program over `[predicate, x, a]`.
-        let build_program =
-            || -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-                let condition = ConditionOperation::new(true_branch(), false_branch()).unwrap();
-                let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-                let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-                let x = builder.add_input(scalar());
-                let a = builder.add_input(scalar());
-                let output = builder
-                    .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, x, a])
-                    .unwrap()[0];
-                builder
-                    .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-                    .unwrap()
-            };
+        let build_program = || -> TestArrayProgram {
+            let condition = ConditionOperation::new(true_branch(), false_branch()).unwrap();
+            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+            let input = builder.add_input(scalar_array_type());
+            let known_input = builder.add_input(scalar_array_type());
+            let output = builder
+                .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, input, known_input])
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
 
         let context = EagerContext::<ArrayType, TestArray>::new();
-        let boolean = |value: bool| TestArray::new(ArrayType::scalar(DataType::Boolean), vec![value as u8 as f64]);
 
         // Predicate and `x` unknown, `a` known: the condition survives but is rewritten over shrunk branches.
         let program = build_program();
         let knowledge = vec![
             PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
-            PartialValue::Unknown(scalar()),
+            PartialValue::Unknown(scalar_array_type()),
             PartialValue::Known(TestArray::scalar(3.0)),
         ];
         let evaluation = program.partially_evaluate(&context, knowledge.as_slice()).unwrap();
@@ -1138,14 +1175,14 @@ mod tests {
         assert!(rewritten.false_branch().instructions().len() <= false_branch().instructions().len());
 
         // Interpreting the residual program for both predicates reproduces the original program over the same inputs.
-        let runtime = |predicate: bool, x: f64| -> Vec<f64> {
+        let runtime = |predicate: bool, input: f64| -> Vec<f64> {
             let arguments = evaluation
                 .inputs
                 .iter()
                 .map(|residual_input| match residual_input {
                     ResidualProgramInput::Known(value) => value.clone(),
-                    ResidualProgramInput::Unknown(0) => boolean(predicate),
-                    ResidualProgramInput::Unknown(_) => TestArray::scalar(x),
+                    ResidualProgramInput::Unknown(0) => boolean_array(predicate),
+                    ResidualProgramInput::Unknown(_) => TestArray::scalar(input),
                 })
                 .collect::<Vec<_>>();
             let residual_outputs = evaluation.program.interpret(arguments).unwrap();
@@ -1158,8 +1195,10 @@ mod tests {
                 })
                 .collect()
         };
-        let original = |predicate: bool, x: f64| {
-            program.interpret(vec![boolean(predicate), TestArray::scalar(x), TestArray::scalar(3.0)]).unwrap()[0]
+        let original = |predicate: bool, input: f64| {
+            program
+                .interpret(vec![boolean_array(predicate), TestArray::scalar(input), TestArray::scalar(3.0)])
+                .unwrap()[0]
                 .values
                 .clone()
         };
@@ -1173,17 +1212,21 @@ mod tests {
     /// The structural split must recombine to the original program. Builds `f(a, x) = (a*a, a*x, x + a)` over scalar
     /// `f64` with `a` known and `x` unknown, so the first output is known, the others unknown, and the unknown side
     /// consumes the known values `a` and `a*a` as residuals. Interpreting the known side, feeding its residual tail to
-    /// the unknown side, and interleaving by `output_unknowns` must equal interpreting the original program.
+    /// the unknown side, and interleaving by `output_stages` must equal interpreting the original program.
     #[test]
     fn test_partition_two_stages_recombine_to_the_original() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let a = builder.add_input(DataType::F64);
-        let x = builder.add_input(DataType::F64);
-        let aa = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
-        let ax = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
-        let xa = builder.add_instruction(AddOperation, vec![x, a]).unwrap()[0];
+        let known_input = builder.add_input(DataType::F64);
+        let runtime_input = builder.add_input(DataType::F64);
+        let known_square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![known_input, runtime_input]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![runtime_input, known_input]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![aa, ax, xa], vec![Placeholder; 2], vec![Placeholder; 3])
+            .build::<Vec<Scalar>, Vec<Scalar>>(
+                vec![known_square, product, sum],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
             .unwrap();
 
         // `a` known (stage 0, index 0), `x` unknown (stage 1, index 1).
@@ -1204,7 +1247,7 @@ mod tests {
         assert_eq!(unknown.program.inputs().count(), unknown.input_indices.len() + residual_count);
 
         // Recombination: run the known side on the known inputs, peel off the residuals, run the unknown side on the
-        // unknown inputs followed by those residuals, then interleave by `output_stages` (stage 1 ⇔ unknown).
+        // unknown inputs followed by those residuals, then interleave by `output_stages` (stage 1 is unknown).
         let recombine = |inputs: &[Scalar]| -> Vec<Scalar> {
             let known_inputs = known.input_indices.iter().map(|&index| inputs[index]).collect::<Vec<_>>();
             let mut known_outputs = known.program.interpret(known_inputs).unwrap();
@@ -1239,10 +1282,10 @@ mod tests {
     fn test_partition_two_stages_handle_all_known_and_all_unknown() {
         let build = || {
             let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-            let a = builder.add_input(DataType::F64);
-            let x = builder.add_input(DataType::F64);
-            let product = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
-            let sum = builder.add_instruction(AddOperation, vec![product, a]).unwrap()[0];
+            let left_input = builder.add_input(DataType::F64);
+            let right_input = builder.add_input(DataType::F64);
+            let product = builder.add_instruction(MulOperation, vec![left_input, right_input]).unwrap()[0];
+            let sum = builder.add_instruction(AddOperation, vec![product, left_input]).unwrap()[0];
             builder
                 .build::<Vec<Scalar>, Vec<Scalar>>(vec![product, sum], vec![Placeholder; 2], vec![Placeholder; 2])
                 .unwrap()
@@ -1280,24 +1323,22 @@ mod tests {
     /// side contributes only the residuals the condition consumes. Recombination still reproduces the original program.
     #[test]
     fn test_partition_two_stages_treat_control_flow_as_ordinary() {
-        let scalar = || ArrayType::scalar(DataType::F64);
-
         // Branches over `[x, a]`: true branch `x * 2`, false branch `x + a`.
         let true_branch = || {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let x = builder.add_input(scalar());
-            let _a = builder.add_input(scalar());
+            let input = builder.add_input(scalar_array_type());
+            let _known_input = builder.add_input(scalar_array_type());
             let two = builder.add_constant(TestArray::scalar(2.0));
-            let output = builder.add_instruction(MulOperation, vec![x, two]).unwrap()[0];
+            let output = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
         let false_branch = || {
             let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let x = builder.add_input(scalar());
-            let a = builder.add_input(scalar());
-            let output = builder.add_instruction(AddOperation, vec![x, a]).unwrap()[0];
+            let input = builder.add_input(scalar_array_type());
+            let known_input = builder.add_input(scalar_array_type());
+            let output = builder.add_instruction(AddOperation, vec![input, known_input]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -1307,14 +1348,18 @@ mod tests {
         let condition = ConditionOperation::new(true_branch(), false_branch()).unwrap();
         let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let x = builder.add_input(scalar());
-        let a = builder.add_input(scalar());
+        let input = builder.add_input(scalar_array_type());
+        let known_input = builder.add_input(scalar_array_type());
         let conditional = builder
-            .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, x, a])
+            .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, input, known_input])
             .unwrap()[0];
-        let aa = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
+        let known_square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![conditional, aa], vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<TestArray>, Vec<TestArray>>(
+                vec![conditional, known_square],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
             .unwrap();
 
         // `predicate` and `x` unknown (stage 1), `a` known (stage 0).
@@ -1331,12 +1376,8 @@ mod tests {
         assert!(residual_count > 0);
         assert!(matches!(unknown.program.instructions()[0].operation(), ArrayOperation::Condition(_)));
 
-        let recombine = |predicate: bool, x_value: f64, a_value: f64| -> Vec<Vec<f64>> {
-            let inputs = [
-                TestArray::new(ArrayType::scalar(DataType::Boolean), vec![predicate as u8 as f64]),
-                TestArray::scalar(x_value),
-                TestArray::scalar(a_value),
-            ];
+        let recombine = |predicate: bool, input_value: f64, known_value: f64| -> Vec<Vec<f64>> {
+            let inputs = [boolean_array(predicate), TestArray::scalar(input_value), TestArray::scalar(known_value)];
             let known_inputs = known.input_indices.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
             let mut known_outputs = known.program.interpret(known_inputs).unwrap();
             let residuals = known_outputs.split_off(known_outputs.len() - residual_count);
@@ -1353,12 +1394,8 @@ mod tests {
                 .map(|array| array.values)
                 .collect()
         };
-        let original = |predicate: bool, x_value: f64, a_value: f64| -> Vec<Vec<f64>> {
-            let inputs = vec![
-                TestArray::new(ArrayType::scalar(DataType::Boolean), vec![predicate as u8 as f64]),
-                TestArray::scalar(x_value),
-                TestArray::scalar(a_value),
-            ];
+        let original = |predicate: bool, input_value: f64, known_value: f64| -> Vec<Vec<f64>> {
+            let inputs = vec![boolean_array(predicate), TestArray::scalar(input_value), TestArray::scalar(known_value)];
             program.interpret(inputs).unwrap().into_iter().map(|array| array.values).collect()
         };
 
@@ -1368,30 +1405,38 @@ mod tests {
         assert_eq!(recombine(false, 4.0, 3.0), vec![vec![7.0], vec![9.0]]);
     }
 
-    /// A three-stage [`Program::partition`] must reassemble exactly. Builds `f(s0, s1, s2) = (s0*s0, s1*s0, s2*s0,
-    /// s2 + s0*s0)` over scalar `f64` with inputs assigned to stages `[0, 1, 2]`. The data flow induces the two tricky
-    /// residual shapes the random-access model must handle:
+    /// A three-stage [`Program::partition`] must reassemble exactly. Builds
+    /// `f(stage0, stage1, stage2) = (stage0*stage0, stage1*stage0, stage2*stage0, stage2 + stage0*stage0)` over scalar
+    /// `f64` with inputs assigned to stages `[0, 1, 2]`. The data flow induces the two tricky residual shapes the
+    /// random-access model must handle:
     ///
-    ///   - `s0*s0` is produced at stage 0 and consumed only at stage 2 (the last output), so it *skips* stage 1 — a
+    ///   - `stage0*stage0` is produced at stage 0 and consumed only at stage 2 (the last output), so it *skips* stage 1, a
     ///     non-adjacent residual with no pass-through;
-    ///   - `s0` (a stage-0 input) is consumed by both stage 1 (for `s1*s0`) and stage 2 (for `s2*s0`), so one produced
-    ///     residual feeds *two* later stages.
+    ///   - `stage0` is consumed by both stage 1 (for `stage1*stage0`) and stage 2 (for `stage2*stage0`), so one
+    ///     produced residual feeds *two* later stages.
     ///
     /// The round-trip runs the stages in order, stores each stage's produced residuals, feeds each stage its
     /// `input_indices` plus its `residual_inputs` (resolved through their [`ResidualSource`]s), and reassembles the
-    /// outputs by `output_stages` (own outputs first) — and must equal interpreting the original program.
+    /// outputs by `output_stages` (own outputs first) and must equal interpreting the original program.
     #[test]
     fn test_partition_three_stages_round_trips_with_skip_and_shared_residuals() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let s0 = builder.add_input(DataType::F64);
-        let s1 = builder.add_input(DataType::F64);
-        let s2 = builder.add_input(DataType::F64);
-        let p = builder.add_instruction(MulOperation, vec![s0, s0]).unwrap()[0]; // stage 0
-        let b = builder.add_instruction(MulOperation, vec![s1, s0]).unwrap()[0]; // stage 1, consumes s0
-        let c = builder.add_instruction(MulOperation, vec![s2, s0]).unwrap()[0]; // stage 2, consumes s0 (skip + shared)
-        let d = builder.add_instruction(AddOperation, vec![s2, p]).unwrap()[0]; // stage 2, consumes p (skip)
+        let stage_zero_input = builder.add_input(DataType::F64);
+        let stage_one_input = builder.add_input(DataType::F64);
+        let stage_two_input = builder.add_input(DataType::F64);
+        let stage_zero_square =
+            builder.add_instruction(MulOperation, vec![stage_zero_input, stage_zero_input]).unwrap()[0];
+        let stage_one_product =
+            builder.add_instruction(MulOperation, vec![stage_one_input, stage_zero_input]).unwrap()[0];
+        let stage_two_product =
+            builder.add_instruction(MulOperation, vec![stage_two_input, stage_zero_input]).unwrap()[0];
+        let skip_sum = builder.add_instruction(AddOperation, vec![stage_two_input, stage_zero_square]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![p, b, c, d], vec![Placeholder; 3], vec![Placeholder; 4])
+            .build::<Vec<Scalar>, Vec<Scalar>>(
+                vec![stage_zero_square, stage_one_product, stage_two_product, skip_sum],
+                vec![Placeholder; 3],
+                vec![Placeholder; 4],
+            )
             .unwrap();
 
         let partition = program.partition(&[0, 1, 2], 3).unwrap();
@@ -1399,12 +1444,13 @@ mod tests {
         // Each output lands in the stage that produces its atom.
         assert_eq!(partition.output_stages, vec![0, 1, 2, 2]);
         assert_eq!(partition.stages.len(), 3);
-        // Stage 0 produces two residuals (`s0` and `p`); stage 1 produces none; stage 2 produces none.
+        // Stage 0 produces two residuals (`stage_zero_input` and `stage_zero_square`); stage 1 produces none; stage 2
+        // produces none.
         let produced_count = |stage: &PartitionStage<_, _, _>| stage.program.output_ids().len() - stage.output_count;
         assert_eq!(produced_count(&partition.stages[0]), 2);
         assert_eq!(produced_count(&partition.stages[1]), 0);
         assert_eq!(produced_count(&partition.stages[2]), 0);
-        // `s0` is shared: it is consumed by both stage 1 and stage 2 (one entry in stage 0's produced residuals).
+        // `stage_zero_input` is shared: it is consumed by both stage 1 and stage 2.
         let consumes_stage_zero =
             |stage: &PartitionStage<_, _, _>| stage.residual_inputs.iter().any(|source| source.stage == 0);
         assert!(consumes_stage_zero(&partition.stages[1]));
@@ -1457,9 +1503,9 @@ mod tests {
     #[test]
     fn test_partition_rejects_invalid_arguments() {
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let a = builder.add_input(DataType::F64);
-        let x = builder.add_input(DataType::F64);
-        let product = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
+        let left_input = builder.add_input(DataType::F64);
+        let right_input = builder.add_input(DataType::F64);
+        let product = builder.add_instruction(MulOperation, vec![left_input, right_input]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder; 1])
             .unwrap();
