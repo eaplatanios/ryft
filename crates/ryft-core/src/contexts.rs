@@ -44,6 +44,14 @@ pub trait Context: Domain + Clone {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
 
+    /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible
+    /// [`ValueResolution`]s and their semantics.
+    #[inline]
+    fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
+        let _ = value;
+        ValueResolution::Opaque
+    }
+
     /// Traces `function` into a [`Program`] and interprets that program on the provided `input`. This creates an
     /// ordinary symbolic trace over this context's `(Self::Type, Self::Constant, Self::Operation)` universe through a
     /// fresh [`TracingContext`], simplifies the resulting flat program, and interprets it with the provided concrete
@@ -75,8 +83,7 @@ pub trait Context: Domain + Clone {
         ProgramError,
     >
     where
-        Self::Operation: InterpretableOperation<Self::Type, Self::Value>,
-        <Self::Value as Value<Self::Type>>::InterpretationContext: Default,
+        Self::Operation: Clone,
     {
         let input_structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
@@ -96,11 +103,10 @@ pub trait Context: Domain + Clone {
             )?;
         let output_structure = output_structure.unwrap();
         let flat_program = flat_program.into_simplified()?;
-        let interpretation_context = <Self::Value as Value<Self::Type>>::InterpretationContext::default();
         let output_values = flat_program.interpret_with(
             input_values,
             |_, constant| self.lift(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(&interpretation_context, inputs),
+            |instruction, inputs| self.bind(instruction.operation().clone(), inputs),
         )?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
         let program = Program {
@@ -114,15 +120,6 @@ pub trait Context: Domain + Clone {
         };
         Ok((output, program))
     }
-}
-
-/// Represents instances that can provide a [`Context`] value used by an owning or enclosing object. This trait
-/// separates the type-level question "what context is needed?" from the value-level question "who can provide that
-/// context?". For example, a [`StagingContext`] can provide itself as the interpretation context for its [`Tracer`]s,
-/// while an **eager** [`Domain`] can provide a zero-sized [`EagerContext`] for concrete values.
-pub trait ProvidesContext<C: Context> {
-    /// Returns the [`Context`] provided by this instance.
-    fn context(&self) -> C;
 }
 
 /// [`Context`] used for a concrete `(type, value, operation)` universe that carries no runtime state and for which,
@@ -178,9 +175,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Domain for EagerContext<T, V, O> {
     type Operation = O;
 }
 
-impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOperation<T, V>> Context
-    for EagerContext<T, V, O>
-{
+impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> Context for EagerContext<T, V, O> {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
         Ok(constant)
@@ -188,7 +183,12 @@ impl<T: Type, V: Value<T, InterpretationContext: Default>, O: InterpretableOpera
 
     #[inline]
     fn bind<P: Into<O>>(&self, operation: P, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        operation.into().interpret(&V::InterpretationContext::default(), inputs)
+        operation.into().interpret(self, inputs)
+    }
+
+    #[inline]
+    fn resolve(&self, value: &V) -> ValueResolution<V> {
+        ValueResolution::Concrete(value.clone())
     }
 }
 
@@ -346,6 +346,44 @@ pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>:
     }
 }
 
+/// Resolution of a flowing [`Domain::Value`] against a [`Context`], as returned by [`Context::resolve`].
+/// It represents what, if anything, the context can prove that the value denotes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueResolution<V> {
+    /// The value denotes this concrete constant payload. This is the strongest outcome. Eager [`Context`]s, whose
+    /// flowing values *are* constants, always resolve to [`ValueResolution::Concrete`]. [`StagingContext`]s resolve
+    /// here only for *literal-backed* [`Tracer`]s, whose staged [`Atom`](crate::Atom) is a constant atom in the
+    /// context's [`ProgramBuilder`].
+    Concrete(V),
+
+    /// The value is a live, staged, value identified by this [`AtomId`] in the resolving context's [`Program`], with no
+    /// concrete payload until the traced program runs. The carried [`AtomId`] is a stable identity for the value within
+    /// that program.
+    Staged(AtomId),
+
+    /// The resolving context can prove nothing about the value. This is the conservative default, and the answer that
+    /// [`StagingContext`]s provide for poisoned [`Tracer`]s and for values belonging to different [`ProgramBuilder`]s.
+    Opaque,
+}
+
+impl<V> ValueResolution<V> {
+    /// Returns `true` if this [`ValueResolution`] is [`Concrete`](Self::Concrete).
+    #[inline]
+    pub fn is_concrete(&self) -> bool {
+        matches!(self, Self::Concrete(_))
+    }
+
+    /// Returns the concrete constant payload of this [`ValueResolution`] if it is a [`Concrete`](Self::Concrete)
+    /// resolution, and [`None`] otherwise.
+    #[inline]
+    pub fn into_concrete(self) -> Option<V> {
+        match self {
+            Self::Concrete(constant) => Some(constant),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -361,7 +399,7 @@ mod tests {
     use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
 
-    use super::{Context, EagerContext, StagingContext};
+    use super::{Context, EagerContext, StagingContext, ValueResolution};
 
     #[test]
     fn test_eager_context_binds_and_lifts_values() {
@@ -546,5 +584,34 @@ mod tests {
         let foreign_input = foreign_context.input(DataType::F64);
         assert_eq!(context.is_zero(&foreign_input), Err(ProgramError::MismatchedProgramBuilders));
         assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
+    }
+
+    #[test]
+    fn test_staging_context_resolve() {
+        let context = DomainTracingContext::<ScalarDomain>::new();
+        let input = context.input(DataType::F64);
+        let constant = context.constant(Scalar::from(2.5));
+        let mut add_outputs = context.stage_operation(AddOperation, &[&input, &constant]).unwrap();
+        let sum = add_outputs.remove(0);
+
+        // Literal-backed tracers resolve to their concrete constant payload, while inputs and operation outputs
+        // resolve to their staged atoms.
+        assert_eq!(context.resolve(&input), ValueResolution::Staged(AtomId::new(0)));
+        assert_eq!(context.resolve(&constant), ValueResolution::Concrete(Scalar::from(2.5)));
+        assert_eq!(context.resolve(&sum), ValueResolution::Staged(AtomId::new(2)));
+
+        // Tracers belonging to a different builder are opaque, in both directions.
+        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
+        let foreign_input = foreign_context.input(DataType::F64);
+        assert_eq!(context.resolve(&foreign_input), ValueResolution::Opaque);
+        assert_eq!(foreign_context.resolve(&input), ValueResolution::Opaque);
+
+        // Poisoned tracers are opaque even in their own context.
+        let poisoning_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        assert_eq!(foreign_context.error(poisoning_error.clone()), poisoning_error);
+        let mut poisoned_outputs = foreign_context.stage_operation(NegOperation, &[&foreign_input]).unwrap();
+        let poisoned = poisoned_outputs.remove(0);
+        assert_eq!(poisoned.state(), &TracerState::Poison);
+        assert_eq!(foreign_context.resolve(&poisoned), ValueResolution::Opaque);
     }
 }

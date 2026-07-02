@@ -8,6 +8,7 @@ pub mod compilation;
 pub mod contexts;
 pub mod differentiation;
 pub mod domains;
+pub mod effects;
 pub mod errors;
 pub mod macros;
 pub mod operations;
@@ -28,9 +29,10 @@ pub mod tests;
 pub use batching::BatchingError;
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
-pub use contexts::{Context, EagerContext, ProvidesContext, StagingContext};
+pub use contexts::{Context, EagerContext, StagingContext, ValueResolution};
 pub use differentiation::*;
 pub use domains::Domain;
+pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error};
 pub use operations::*;
 pub use parameters::{
@@ -39,8 +41,9 @@ pub use parameters::{
     PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
 };
 pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value};
-pub use scalars::{ScalarDomain, Scalar};
+pub use scalars::{Scalar, ScalarDomain};
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
 pub use tracing_v2::batch;
+pub use tracing_v2::linearization::{DifferentiableOperation, DifferentiableProgramOperation, JvpTracer};
 pub use types::*;
