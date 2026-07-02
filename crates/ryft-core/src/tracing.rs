@@ -174,6 +174,7 @@ impl<C: StagingContext> Tracer<C, C::Meta> {
 }
 
 impl<C: Context, Meta: Debug> Debug for Tracer<C, Meta> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")
@@ -327,6 +328,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> Clone for TracingContext<T, V, O,
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>, C> Debug for TracingContext<T, V, O, C> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
@@ -435,6 +437,7 @@ impl<C: Context> Clone for NestedTracingContext<C> {
 }
 
 impl<C: Context> Debug for NestedTracingContext<C> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("NestedTracingContext").finish_non_exhaustive()
     }

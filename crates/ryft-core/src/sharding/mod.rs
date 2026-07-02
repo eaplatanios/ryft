@@ -232,6 +232,7 @@ impl LogicalMesh {
 }
 
 impl Debug for LogicalMesh {
+    #[inline]
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LogicalMesh")

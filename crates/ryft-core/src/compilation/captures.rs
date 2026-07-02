@@ -103,6 +103,7 @@ impl<
 impl<T: Type, V: Value<T>, O, Input: Parameterized<CaptureReference<T>>, Output: Parameterized<CaptureReference<T>>>
     Debug for ClosedProgram<T, V, O, Input, Output>
 {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ClosedProgram")

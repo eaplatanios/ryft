@@ -192,32 +192,28 @@ impl<T: Type, V: Value<T>> Typed<T> for PartialEvaluationValue<T, V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Source feeding one input of the residual program.
-///
+/// Input of a partially evaluated (i.e., a _residual_) [`Program`] (i.e., an input of a [`PartialEvaluation`]).
 /// The residual program's inputs are the original program's surviving unknown inputs followed by the known values
-/// (residuals) that its unknown subcomputation consumes.
+/// (i.e., the residuals) that its unknown subcomputation consumes.
 ///
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
 #[derive(Clone, Debug)]
-pub enum ResidualProgramInput<V> {
-    /// Residual input fed by a value that partial evaluation folded to a concrete known residual.
+pub enum PartialEvaluationInput<V> {
+    /// Residual input fed by a value that partial evaluation folded to a concrete known residual value.
     Known(V),
 
     /// Residual input fed by an unknown input of the original program, identified by that input's index in the
-    /// original program's input list.
+    /// original program's inputs.
     Unknown(usize),
 }
 
-/// Source of one output of the partially evaluated program.
-///
+/// Output of a partially evaluated (i.e., a _residual_) [`Program`] (i.e., an input of a [`PartialEvaluation`]).
 /// Partial evaluation splits the original outputs into those it could fold to a concrete value now and those that
 /// remain computed by the residual program.
 ///
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
 #[derive(Clone, Debug)]
-pub enum ResidualProgramOutput<V> {
+pub enum PartialEvaluationOutput<V> {
     /// Output that was folded to a concrete value during partial evaluation.
     Known(V),
 
@@ -225,36 +221,31 @@ pub enum ResidualProgramOutput<V> {
     Unknown(usize),
 }
 
-/// Result of partially evaluating a flat [`Program`] against a known-side [`Context`] `C`.
+/// Result of partially evaluating a [`Program`] against a known-side [`Context`]. The residual program operates in
+/// the *staged constant* space `C::Constant`, while the feeders that connect it to the known side flow as `C::Value`s.
+/// Under an eager known-side context the two coincide and every [`PartialEvaluationInput::Known`] carries a concrete
+/// folded value, while under a staging known-side context the feeders are [`Tracer`](crate::Tracer)s naming atoms of
+/// the *outer* program that partial evaluation folded the known work into. To reconstruct the original program's
+/// outputs, one must build the residual program's input vector by mapping each input from [`inputs`](Self::inputs)
+/// to either a runtime unknown-input value or its carried known residual, replay [`program`](Self::program) in the
+/// known-side context, and then read each output from [`outputs`](Self::outputs) as either its folded value or the
+/// indexed residual program output.
 ///
-/// The residual program stays in the *staged constant* space `C::Constant`, while the feeders that connect it to the
-/// known side flow as `C::Value`s: under an eager known-side context the two coincide and every
-/// [`ResidualProgramInput::Known`] carries a concrete folded value, while under a staging known-side context the
-/// feeders are [`Tracer`](crate::Tracer)s naming atoms of the *outer* program that partial evaluation folded the
-/// known work into — the known→unknown residual edges.
-///
-/// To reconstruct the original program's outputs: build the residual program's input vector by mapping each
-/// [`inputs`](Self::inputs) entry to either a runtime unknown-input value or its carried known residual, replay
-/// [`program`](Self::program) in the known-side context, then read each [`outputs`](Self::outputs) entry as either
-/// its folded value or the indexed residual-program output.
-///
-/// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate_in`].
+/// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
 pub struct PartialEvaluation<C: Context> {
     /// Residual program over the surviving unknown inputs plus the known residuals, aligned with
-    /// [`inputs`](Self::inputs) and producing the unknown outputs in original order.
+    /// [`inputs`](Self::inputs) and producing the unknown outputs in their original order.
     pub program: Program<C::Type, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
 
-    /// How to feed each residual-program input, in residual-program input order.
-    pub inputs: Vec<ResidualProgramInput<C::Value>>,
+    /// [`PartialEvaluationInput`]s for [`program`](Self::program), in residual program input order.
+    pub inputs: Vec<PartialEvaluationInput<C::Value>>,
 
-    /// Source of each original program output, in original output order.
-    pub outputs: Vec<ResidualProgramOutput<C::Value>>,
+    /// [`PartialEvaluationOutput`]s of [`program`](Self::program), in original output order.
+    pub outputs: Vec<PartialEvaluationOutput<C::Value>>,
 }
 
-impl<C: Context> Debug for PartialEvaluation<C>
-where
-    C::Operation: Debug,
-{
+impl<C: Context<Operation: Debug>> Debug for PartialEvaluation<C> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PartialEvaluation")
@@ -265,39 +256,37 @@ where
     }
 }
 
-impl<C: Context> PartialEvaluation<C> {
-    /// Replays the residual program in `context` and reassembles the original program's outputs, in original output
-    /// order.
-    ///
-    /// This is the single replay path for both known-side flavors: residual-program constants are lifted through
-    /// [`Context::lift`] and instructions are bound through [`Context::bind`], so under an eager context the residual
-    /// program is interpreted immediately, while under a staging context it is staged into the outer program that
-    /// context is building. Each residual input is fed either by its carried known residual (a
-    /// [`Known`](ResidualProgramInput::Known) feeder) or by the next value of `unknown_inputs` (an
-    /// [`Unknown`](ResidualProgramInput::Unknown) feeder); folded outputs are returned directly and the rest read the
-    /// replayed residual program's outputs.
+impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
+    /// Interprets the residual [`Program`] that this [`PartialEvaluation`] represents in the provided `context` and
+    /// at the provided unknown input values, and reassembles the original program's outputs, in original output order.
+    /// This is the single replay path for both known-side flavors: residual program constants are lifted through
+    /// [`Context::lift`] and [`Instruction`](crate::Instruction)s are bound through [`Context::bind`], and so under
+    /// an eager context the residual program is interpreted immediately, while under a [`StagingContext`] it is staged
+    /// into the outer program that context is building. Each residual input is fed either by its carried known residual
+    /// (i.e., a [`Known`](PartialEvaluationInput::Known) feeder) or by the next value of `inputs` (i.e., an
+    /// [`Unknown`](PartialEvaluationInput::Unknown) feeder). Folded outputs are returned directly and the rest
+    /// read the replayed residual program's outputs.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Known-side context to replay the residual program in.
-    ///   - `unknown_inputs`: Values for the original program's surviving unknown inputs, in their original relative
-    ///     order.
-    pub fn replay_in(&self, context: &C, unknown_inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
-    where
-        C::Operation: Clone,
-    {
-        let mut remaining_unknown_inputs = unknown_inputs.iter();
+    ///   - `context`: Known-side context to interpret the residual program in.
+    ///   - `inputs`: Values for the original program's surviving *unknown* inputs only, in their original relative
+    ///     order. The known inputs are fed from the carried residual feeders, and so the size of `inputs` must equal
+    ///     the number of [`Unknown`](PartialEvaluationInput::Unknown) feeders exactly (and not the original program's
+    ///     number of inputs).
+    pub fn interpret(&self, context: &C, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError> {
+        let unknown_count = self.inputs.iter().filter(|i| matches!(i, PartialEvaluationInput::Unknown(_))).count();
+        if inputs.len() != unknown_count {
+            return Err(ProgramError::InvalidInputCount { expected: unknown_count, actual: inputs.len() });
+        }
+        let mut remaining_inputs = inputs.iter();
         let residual_inputs = self
             .inputs
             .iter()
-            .map(|input| match input {
-                ResidualProgramInput::Known(value) => Ok(value.clone()),
-                ResidualProgramInput::Unknown(_) => {
-                    remaining_unknown_inputs.next().cloned().ok_or(ProgramError::InvalidInputCount {
-                        expected: self.inputs.iter().filter(|i| matches!(i, ResidualProgramInput::Unknown(_))).count(),
-                        actual: unknown_inputs.len(),
-                    })
-                }
+            .map(|feeder| match feeder {
+                PartialEvaluationInput::Known(value) => Ok(value.clone()),
+                // The `.unwrap()` in the following line is safe because of the earlier check for `inputs.len()`.
+                PartialEvaluationInput::Unknown(_) => Ok(remaining_inputs.next().cloned().unwrap()),
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let residual_outputs = self.program.interpret_with(
@@ -308,8 +297,8 @@ impl<C: Context> PartialEvaluation<C> {
         self.outputs
             .iter()
             .map(|output| match output {
-                ResidualProgramOutput::Known(value) => Ok(value.clone()),
-                ResidualProgramOutput::Unknown(index) => residual_outputs.get(*index).cloned().ok_or_else(|| {
+                PartialEvaluationOutput::Known(value) => Ok(value.clone()),
+                PartialEvaluationOutput::Unknown(index) => residual_outputs.get(*index).cloned().ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
                         "partial evaluation output references residual output {index} but the residual program \
                          produced {} output(s)",
@@ -320,6 +309,8 @@ impl<C: Context> PartialEvaluation<C> {
             .collect()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Operation that can override the default fold/residualize behavior of [`Program::partially_evaluate_in`].
 ///
@@ -448,7 +439,7 @@ pub struct PartialEvaluationContext<C: Context> {
     known_context: C,
 
     /// How to feed each residual-program input, in residual-program input order.
-    residual_inputs: Vec<ResidualProgramInput<C::Value>>,
+    residual_inputs: Vec<PartialEvaluationInput<C::Value>>,
 
     /// Per-inlined-program materialization scopes. Each scope is indexed by the atoms of the program currently being
     /// walked and stores the corresponding residual-program atom when a known value has already been materialized.
@@ -501,8 +492,8 @@ impl<C: Context> PartialEvaluationContext<C> {
         })
     }
 
-    /// Returns whether every [`Known`](ResidualProgramInput::Known) residual input and
-    /// [`Known`](ResidualProgramOutput::Known) output of `evaluation` resolves to a concrete constant in the
+    /// Returns whether every [`Known`](PartialEvaluationInput::Known) residual input and
+    /// [`Known`](PartialEvaluationOutput::Known) output of `evaluation` resolves to a concrete constant in the
     /// known-side context — i.e., whether a nested-program rebuild that embeds those knowns as inline program
     /// constants (through [`Self::known_constant_payload`]) can succeed.
     ///
@@ -511,13 +502,13 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// live-context probe must check this and fall back to a conservative rewrite when it returns `false`.
     pub fn knowns_are_concrete(&self, evaluation: &PartialEvaluation<C>) -> bool {
         let input_knowns_concrete = evaluation.inputs.iter().all(|input| match input {
-            ResidualProgramInput::Known(value) => self.known_context.resolve(value).is_concrete(),
-            ResidualProgramInput::Unknown(_) => true,
+            PartialEvaluationInput::Known(value) => self.known_context.resolve(value).is_concrete(),
+            PartialEvaluationInput::Unknown(_) => true,
         });
         input_knowns_concrete
             && evaluation.outputs.iter().all(|output| match output {
-                ResidualProgramOutput::Known(value) => self.known_context.resolve(value).is_concrete(),
-                ResidualProgramOutput::Unknown(_) => true,
+                PartialEvaluationOutput::Known(value) => self.known_context.resolve(value).is_concrete(),
+                PartialEvaluationOutput::Unknown(_) => true,
             })
     }
 
@@ -780,7 +771,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.builder.add_constant(payload)
         } else {
             let atom = self.builder.add_input(value.r#type().into_owned());
-            self.residual_inputs.push(ResidualProgramInput::Known(value.clone()));
+            self.residual_inputs.push(PartialEvaluationInput::Known(value.clone()));
             atom
         };
         if let Some(source_atom) = source_atom {
@@ -915,7 +906,7 @@ where
     ///
     /// Each known *variable* a residualized instruction consumes, whether a program input or a folded intermediate,
     /// becomes a residual input of the residual program — under a staging `C` these
-    /// [`Known`](ResidualProgramInput::Known) feeders are the known→unknown residual edges connecting the outer
+    /// [`Known`](PartialEvaluationInput::Known) feeders are the known→unknown residual edges connecting the outer
     /// program to the residual program. Literal constants are rebuilt inline as residual-program constants (their
     /// staged payload is recovered through [`Context::resolve`]), so they are never residual inputs. The resulting
     /// [`PartialEvaluation`] carries everything a caller needs to reassemble the original outputs once the runtime
@@ -965,7 +956,7 @@ where
                 }
                 PartialValue::Unknown(r#type) => {
                     let atom = residual.builder.add_input(r#type.clone());
-                    residual.residual_inputs.push(ResidualProgramInput::Unknown(index));
+                    residual.residual_inputs.push(PartialEvaluationInput::Unknown(index));
                     seed.push(PartialEvaluationValue::variable(r#type.clone(), atom));
                 }
             }
@@ -978,14 +969,14 @@ where
         let mut residual_output_atoms: Vec<AtomId> = Vec::new();
         for value in output_values {
             match value.value {
-                PartialValue::Known(value) => outputs.push(ResidualProgramOutput::Known(value)),
+                PartialValue::Known(value) => outputs.push(PartialEvaluationOutput::Known(value)),
                 PartialValue::Unknown(_) => {
                     let PartialValueMaterialization::Variable { residual_atom } = value.materialization else {
                         return Err(ProgramError::MalformedProgram(
                             "partial evaluation produced an unknown output without a residual atom".to_string(),
                         ));
                     };
-                    outputs.push(ResidualProgramOutput::Unknown(residual_output_atoms.len()));
+                    outputs.push(PartialEvaluationOutput::Unknown(residual_output_atoms.len()));
                     residual_output_atoms.push(residual_atom);
                 }
             }
@@ -1255,13 +1246,13 @@ impl<T: Type, V: Value<T>, O: Operation<T>> OnlineBoundaryPartialEvaluation<T, V
         let mut residual_output_ordinals = Vec::with_capacity(evaluation.outputs.len());
         for (index, output) in evaluation.outputs.iter().enumerate() {
             match output {
-                ResidualProgramOutput::Known(value) => {
+                PartialEvaluationOutput::Known(value) => {
                     known_output_positions.push(Some(known_output_atoms.len()));
                     residual_output_ordinals.push(None);
                     known_output_indices.push(index);
                     known_output_atoms.push(value.atom_id()?);
                 }
-                ResidualProgramOutput::Unknown(ordinal) => {
+                PartialEvaluationOutput::Unknown(ordinal) => {
                     known_output_positions.push(None);
                     residual_output_ordinals.push(Some(*ordinal));
                 }
@@ -1271,10 +1262,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>> OnlineBoundaryPartialEvaluation<T, V
         let mut residual_edge_types = Vec::new();
         for input in evaluation.inputs.iter() {
             match input {
-                ResidualProgramInput::Unknown(index) => {
+                PartialEvaluationInput::Unknown(index) => {
                     residual_input_sources.push(OnlineBoundaryResidualSource::Input(*index));
                 }
-                ResidualProgramInput::Known(value) => {
+                PartialEvaluationInput::Known(value) => {
                     residual_input_sources.push(OnlineBoundaryResidualSource::Edge(residual_edge_types.len()));
                     residual_edge_types.push(value.r#type().into_owned());
                     known_output_atoms.push(value.atom_id()?);
@@ -2064,20 +2055,20 @@ mod tests {
 
         // The fully known output is folded; the other two are produced by the residual program.
         match &evaluation.outputs[0] {
-            ResidualProgramOutput::Known(value) => assert_eq!(*value, 18.0),
+            PartialEvaluationOutput::Known(value) => assert_eq!(*value, 18.0),
             other => panic!("expected a folded known output but got {other:?}"),
         }
-        assert!(matches!(&evaluation.outputs[1], ResidualProgramOutput::Unknown(0)));
-        assert!(matches!(&evaluation.outputs[2], ResidualProgramOutput::Unknown(1)));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[2], PartialEvaluationOutput::Unknown(1)));
 
         // The residual program drops the two folded instructions (`a*a` and `2*a*a`), keeping only the two unknown
         // ones, and takes the unknown input plus the two known residuals (the folded `a*a` and the input `a`).
         assert_eq!(program.instructions().len(), 4);
         assert_eq!(evaluation.program.instructions().len(), 2);
         assert_eq!(evaluation.inputs.len(), 3);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs[1], ResidualProgramInput::Known(value) if *value == 9.0));
-        assert!(matches!(&evaluation.inputs[2], ResidualProgramInput::Known(value) if *value == 3.0));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if *value == 9.0));
+        assert!(matches!(&evaluation.inputs[2], PartialEvaluationInput::Known(value) if *value == 3.0));
 
         // Reassembling the residual program's outputs with the folded outputs reproduces a full eager interpretation.
         let runtime_inputs = [Scalar::from(3.0), Scalar::from(5.0)];
@@ -2085,8 +2076,8 @@ mod tests {
             .inputs
             .iter()
             .map(|residual_input| match residual_input {
-                ResidualProgramInput::Known(value) => *value,
-                ResidualProgramInput::Unknown(original_input_index) => runtime_inputs[*original_input_index],
+                PartialEvaluationInput::Known(value) => *value,
+                PartialEvaluationInput::Unknown(original_input_index) => runtime_inputs[*original_input_index],
             })
             .collect::<Vec<_>>();
         let residual_outputs = evaluation.program.interpret(residual_arguments).unwrap();
@@ -2094,8 +2085,8 @@ mod tests {
             .outputs
             .iter()
             .map(|output| match output {
-                ResidualProgramOutput::Known(value) => *value,
-                ResidualProgramOutput::Unknown(index) => residual_outputs[*index],
+                PartialEvaluationOutput::Known(value) => *value,
+                PartialEvaluationOutput::Unknown(index) => residual_outputs[*index],
             })
             .collect::<Vec<_>>();
 
@@ -2118,9 +2109,9 @@ mod tests {
         let knowledge = vec![PartialValue::Unknown(DataType::F64), PartialValue::Unknown(DataType::F64)];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(evaluation.inputs.iter().all(|input| matches!(input, ResidualProgramInput::Unknown(_))));
+        assert!(evaluation.inputs.iter().all(|input| matches!(input, PartialEvaluationInput::Unknown(_))));
         assert_eq!(evaluation.program.interpret(vec![Scalar::from(3.0), Scalar::from(5.0)]).unwrap(), vec![15.0]);
     }
 
@@ -2141,9 +2132,9 @@ mod tests {
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
 
         // Only the unknown input feeds the residual program; the constant stays inside it.
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.inputs.len(), 1);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(0)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
         assert_eq!(evaluation.program.interpret(vec![Scalar::from(2.0)]).unwrap(), vec![7.0]);
     }
 
@@ -2162,11 +2153,11 @@ mod tests {
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
 
         match &evaluation.outputs[0] {
-            ResidualProgramOutput::Known(value) => assert_eq!(*value, 0.0),
+            PartialEvaluationOutput::Known(value) => assert_eq!(*value, 0.0),
             other => panic!("expected the nullary zero to fold but got {other:?}"),
         }
         // The zero folded away; the residual program carries no instructions and just forwards the unknown input.
-        assert!(matches!(&evaluation.outputs[1], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 0);
         assert_eq!(evaluation.program.interpret(vec![Scalar::from(5.0)]).unwrap(), vec![5.0]);
     }
@@ -2205,10 +2196,10 @@ mod tests {
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Known(value) if *value == 7.0));
-        assert!(matches!(&evaluation.outputs[1], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if *value == 7.0));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.inputs.len(), 1);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(0)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), TestPartialEvaluationOperation::Add(_)));
 
@@ -2217,8 +2208,8 @@ mod tests {
             .outputs
             .iter()
             .map(|output| match output {
-                ResidualProgramOutput::Known(value) => *value,
-                ResidualProgramOutput::Unknown(index) => residual_outputs[*index],
+                PartialEvaluationOutput::Known(value) => *value,
+                PartialEvaluationOutput::Unknown(index) => residual_outputs[*index],
             })
             .collect::<Vec<_>>();
 
@@ -2239,10 +2230,10 @@ mod tests {
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(0)));
-        assert!(matches!(&evaluation.inputs[1], ResidualProgramInput::Known(value) if *value == 7.0));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if *value == 7.0));
         assert_eq!(evaluation.program.instructions().len(), 2);
         assert_eq!(
             evaluation.program.interpret(vec![Scalar::from(4.0), Scalar::from(7.0)]).unwrap(),
@@ -2263,7 +2254,7 @@ mod tests {
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 3);
         assert!(matches!(evaluation.program.instructions()[0].operation(), TestPartialEvaluationOperation::Mul(_)));
         assert!(matches!(evaluation.program.instructions()[1].operation(), TestPartialEvaluationOperation::Add(_)));
@@ -2298,8 +2289,8 @@ mod tests {
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Known(value) if *value == 7.0));
-        assert!(matches!(&evaluation.outputs[1], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if *value == 7.0));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), TestPartialEvaluationOperation::Add(_)));
         assert_eq!(evaluation.program.interpret(vec![Scalar::from(5.0)]).unwrap(), vec![Scalar::from(10.0)]);
@@ -2322,8 +2313,8 @@ mod tests {
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(input_type)]).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Broadcast(_)));
         assert_eq!(
@@ -2402,17 +2393,17 @@ mod tests {
         let program = build_program();
         let knowledge = vec![PartialValue::Known(boolean_array(true)), PartialValue::Unknown(scalar_array_type())];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Mul(_)));
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(1)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
         assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(4.0)]).unwrap()[0].values, vec![8.0]);
 
         // Known `false` predicate, unknown `x`: only the `x + 100` branch survives.
         let program = build_program();
         let knowledge = vec![PartialValue::Known(boolean_array(false)), PartialValue::Unknown(scalar_array_type())];
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Add(_)));
         assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(4.0)]).unwrap()[0].values, vec![104.0],);
@@ -2476,7 +2467,7 @@ mod tests {
         let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
 
         // The output is produced by the residual program, whose only instruction is the rewritten condition.
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 1);
         let ArrayOperation::Condition(rewritten) = evaluation.program.instructions()[0].operation() else {
             panic!("expected the residual program to contain a rewritten condition");
@@ -2495,9 +2486,9 @@ mod tests {
                 .inputs
                 .iter()
                 .map(|residual_input| match residual_input {
-                    ResidualProgramInput::Known(value) => value.clone(),
-                    ResidualProgramInput::Unknown(0) => boolean_array(predicate),
-                    ResidualProgramInput::Unknown(_) => TestArray::scalar(input),
+                    PartialEvaluationInput::Known(value) => value.clone(),
+                    PartialEvaluationInput::Unknown(0) => boolean_array(predicate),
+                    PartialEvaluationInput::Unknown(_) => TestArray::scalar(input),
                 })
                 .collect::<Vec<_>>();
             let residual_outputs = evaluation.program.interpret(arguments).unwrap();
@@ -2505,8 +2496,8 @@ mod tests {
                 .outputs
                 .iter()
                 .map(|output| match output {
-                    ResidualProgramOutput::Known(value) => value.values[0],
-                    ResidualProgramOutput::Unknown(index) => residual_outputs[*index].values[0],
+                    PartialEvaluationOutput::Known(value) => value.values[0],
+                    PartialEvaluationOutput::Unknown(index) => residual_outputs[*index].values[0],
                 })
                 .collect()
         };
@@ -2914,12 +2905,12 @@ mod tests {
         // known feeder is a live tracer naming the staged outer atom.
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(1)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
         match &evaluation.inputs[1] {
-            ResidualProgramInput::Known(value) => assert_eq!(value.atom_id(), Ok(AtomId::new(1))),
+            PartialEvaluationInput::Known(value) => assert_eq!(value.atom_id(), Ok(AtomId::new(1))),
             other => panic!("expected a known residual edge but got {other:?}"),
         }
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
     }
 
     /// A walked-program literal consumed by residual work is rebuilt inline as a residual-program constant carrying
@@ -2941,7 +2932,7 @@ mod tests {
         let evaluation = program.partially_evaluate_in(&outer, &[PartialValue::Unknown(DataType::F64)]).unwrap();
 
         assert_eq!(evaluation.inputs.len(), 1);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(0)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
         // The residual program carries the constant inline with its original payload, so plain interpretation works.
         assert_eq!(evaluation.program.interpret(vec![Scalar::from(2.0)]).unwrap(), vec![7.0]);
         // Nothing folded, so the outer program stages no instructions. The walk does lift the literal into the outer
@@ -2972,13 +2963,13 @@ mod tests {
 
         // All-known: the print folds (firing now) and the whole chain evaluates away.
         let evaluation = program.partially_evaluate(&[PartialValue::Known(TestArray::scalar(3.0))]).unwrap();
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Known(value) if value.values[0] == 6.0));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if value.values[0] == 6.0));
         assert!(evaluation.program.instructions().is_empty());
         assert!(evaluation.inputs.is_empty());
 
         // Unknown input: the print (and everything downstream) residualizes.
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_array_type())]).unwrap();
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 2);
         assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(3.0)]).unwrap()[0].values[0], 6.0);
     }
@@ -3002,7 +2993,7 @@ mod tests {
 
         let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_array_type())]).unwrap();
 
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
         assert_eq!(evaluation.program.instructions().len(), 2);
         assert!(evaluation.program.instructions().iter().any(|instruction| matches!(
             instruction.operation(),
@@ -3051,8 +3042,8 @@ mod tests {
             evaluation.program.instructions()[0].operation(),
             ArrayOperation::Print(operation) if operation.label() == "x",
         ));
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Known(value) if value.atom_id().is_ok()));
-        assert!(matches!(&evaluation.outputs[1], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
     }
 
     /// A folded known intermediate consumed by *several* residual instructions materializes as a single residual
@@ -3079,8 +3070,8 @@ mod tests {
 
         assert_eq!(evaluation.program.instructions().len(), 2);
         assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs[1], ResidualProgramInput::Known(_)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(_)));
     }
 
     /// Two known inputs fed by the *same* outer tracer deduplicate to a single residual input through the value's
@@ -3107,16 +3098,16 @@ mod tests {
 
         // One unknown feeder plus exactly one known feeder for the shared outer tracer.
         assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(2)));
-        assert!(matches!(&evaluation.inputs[1], ResidualProgramInput::Known(value) if value.atom_id().is_ok()));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(2)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if value.atom_id().is_ok()));
         assert_eq!(evaluation.program.instructions().len(), 2);
     }
 
-    /// [`PartialEvaluation::replay_in`] is the single replay path for both known-side flavors: under an eager context
+    /// [`PartialEvaluation::interpret`] is the single replay path for both known-side flavors: under an eager context
     /// it interprets the residual program immediately, and under a staging context it stages the residual work into
     /// the outer program and returns tracers.
     #[test]
-    fn test_partial_evaluation_replay_in_replays_under_eager_and_staging_contexts() {
+    fn test_partial_evaluation_interpret_replays_under_eager_and_staging_contexts() {
         // `f(a, x) = (a * a) * x` with `a` known and `x` unknown.
         let build_program = || {
             let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
@@ -3134,7 +3125,19 @@ mod tests {
         let context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let knowledge = vec![PartialValue::Known(Scalar::from(3.0)), PartialValue::Unknown(DataType::F64)];
         let evaluation = program.partially_evaluate_in(&context, knowledge.as_slice()).unwrap();
-        assert_eq!(evaluation.replay_in(&context, &[Scalar::from(5.0)]).unwrap(), vec![Scalar::from(45.0)]);
+        assert_eq!(evaluation.interpret(&context, &[Scalar::from(5.0)]).unwrap(), vec![Scalar::from(45.0)]);
+
+        // The arity check is strict in both directions: the input count must equal the number of unknown feeders,
+        // so surplus values (e.g., passing the original program's full input vector) are rejected rather than
+        // silently ignored.
+        assert_eq!(
+            evaluation.interpret(&context, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            evaluation.interpret(&context, &[Scalar::from(5.0), Scalar::from(7.0)]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
+        );
 
         // Staging: replaying stages the residual work into the outer program and returns live tracers.
         let program = build_program();
@@ -3144,7 +3147,7 @@ mod tests {
         let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
         let staged_before_replay = outer.builder().borrow().instructions().len();
         let tangent = outer.input(DataType::F64);
-        let outputs = evaluation.replay_in(&outer, &[tangent]).unwrap();
+        let outputs = evaluation.interpret(&outer, &[tangent]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].atom_id().is_ok());
         assert_eq!(outer.builder().borrow().instructions().len(), staged_before_replay + 1);
@@ -3192,8 +3195,8 @@ mod tests {
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Condition(_)));
         // The unknown input's feeder is seeded before the walk, so the predicate's known feeder follows it.
         assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs[1], ResidualProgramInput::Known(_)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(_)));
     }
 
     /// A condition whose branches print inside their known chains keeps those effects *behind the outer
@@ -3341,11 +3344,11 @@ mod tests {
         assert_eq!(residual_condition.true_branch().instructions().len(), 1);
         assert_eq!(residual_condition.false_branch().instructions().len(), 1);
         assert_eq!(evaluation.inputs.len(), 4);
-        assert!(matches!(&evaluation.inputs[0], ResidualProgramInput::Unknown(2)));
-        assert!(matches!(&evaluation.inputs[1], ResidualProgramInput::Known(_)));
-        assert!(matches!(&evaluation.inputs[2], ResidualProgramInput::Known(_)));
-        assert!(matches!(&evaluation.inputs[3], ResidualProgramInput::Known(_)));
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(2)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(_)));
+        assert!(matches!(&evaluation.inputs[2], PartialEvaluationInput::Known(_)));
+        assert!(matches!(&evaluation.inputs[3], PartialEvaluationInput::Known(_)));
         assert_eq!(evaluation.outputs.len(), 1);
-        assert!(matches!(&evaluation.outputs[0], ResidualProgramOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
     }
 }

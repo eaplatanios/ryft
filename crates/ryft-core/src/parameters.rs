@@ -96,6 +96,7 @@ impl Display for Placeholder {
 }
 
 impl Debug for Placeholder {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "<Parameter>")
     }
@@ -238,6 +239,7 @@ impl Display for ParameterPath {
 }
 
 impl Debug for ParameterPath {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "ParameterPath[{self}]")
     }

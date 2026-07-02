@@ -23,6 +23,7 @@ impl<D: CompilationDomain<Options: Clone>> Clone for CompilationOptions<D> {
 }
 
 impl<D: CompilationDomain<Options: Debug>> Debug for CompilationOptions<D> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("CompilationOptions").field("options", &self.options).finish()
     }
