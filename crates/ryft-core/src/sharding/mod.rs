@@ -794,13 +794,14 @@ impl Sharding {
         )
     }
 
-    /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting subsequent dimensions one
-    /// position to the left. This is the sharding-level analogue of [`ArrayType::without_dimension`]. The reduction
-    /// axis sets is unchanged, but the removed entry's placement is reconciled with the manual-axis model. A dimension
-    /// sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the value now varies
-    /// across them rather than being placed along a ranked dimension), while a dimension sharded over a non-manual
-    /// (e.g., a [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently discard an
-    /// explicit placement that only a reduction or collective can remove), and yields a
+    /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting
+    /// subsequent dimensions one position to the left. This is the sharding-level analogue of
+    /// [`ArrayType::without_dimension`](crate::ArrayType::without_dimension). The reduction axis sets are unchanged,
+    /// but the removed entry's placement is reconciled with the manual-axis model. A dimension sharded over
+    /// [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the value now varies across them
+    /// rather than being placed along a ranked dimension), while a dimension sharded over a non-manual (e.g., a
+    /// [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently discard an explicit
+    /// placement that only a reduction or collective can remove), and yields a
     /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
     /// [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
     pub fn without_dimension(&self, index: usize) -> Result<Self, ShardingError> {

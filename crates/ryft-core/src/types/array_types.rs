@@ -6,7 +6,6 @@ use ryft_macros::Parameter;
 
 use crate::Error;
 use crate::broadcasting::Broadcastable;
-use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
@@ -708,14 +707,7 @@ impl Typed<ArrayType> for ArrayType {
 // self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
 // `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<ArrayType>` for metadata-only program
 // storage, lowering, and transformation.
-impl Value<ArrayType> for ArrayType {
-    type InterpretationContext = EagerContext<ArrayType, Self>;
-
-    #[inline]
-    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-        Some(EagerContext::new())
-    }
-}
+impl Value<ArrayType> for ArrayType {}
 
 #[cfg(test)]
 mod tests {
