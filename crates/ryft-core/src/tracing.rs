@@ -7,7 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::{Context, StagingContext, ValueResolution};
 use crate::domains::Domain;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
@@ -90,6 +90,21 @@ impl<C: Context, Meta> Tracer<C, Meta> {
             TracerState::Live(atom) => Ok(*atom),
             TracerState::Poison => Err(ProgramError::PoisonedValue),
         }
+    }
+}
+
+// `Tracer` equality is *staging identity*, not value equality. Two tracers are equal if and only if they carry equal
+// metadata and correspond to the same staged `Atom` of the same `ProgramBuilder` (or are both poisoned in the same
+// builder). Two tracers that would evaluate to equal runtime values but were staged as distinct atoms are considered
+// unequal, which is the conservative answer trace-time analyses need. For example, the loop invariance fixed points of
+// the `scan` and `while` partial evaluation rules degrade to syntactic passthrough detection under a staging known-side
+// context precisely because of these semantics.
+impl<C: StagingContext, Meta: PartialEq> PartialEq for Tracer<C, Meta> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(self.context.builder(), other.context.builder())
+            && self.state == other.state
+            && self.meta == other.meta
     }
 }
 
@@ -185,14 +200,7 @@ impl<C: Context, Meta> Typed<C::Type> for Tracer<C, Meta> {
     }
 }
 
-impl<C: Context, Meta: Clone + Debug> Value<C::Type> for Tracer<C, Meta> {
-    type InterpretationContext = C;
-
-    #[inline]
-    fn interpretation_context(&self) -> Option<C> {
-        Some(self.context().clone())
-    }
-}
+impl<C: Context, Meta: Clone + Debug> Value<C::Type> for Tracer<C, Meta> {}
 
 /// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs the
 /// type, staged-constant, and operation representations `(T, V, O)` of a program with the [`ProgramBuilder`] used for
@@ -348,6 +356,20 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> Context for TracingContext<T, V, 
     fn bind<P: Into<O>>(&self, operation: P, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
         self.stage_operation(operation.into(), inputs)
     }
+
+    #[inline]
+    fn resolve(&self, value: &Tracer<Self>) -> ValueResolution<V> {
+        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
+            return ValueResolution::Opaque;
+        }
+        let Ok(atom_id) = value.atom_id() else {
+            return ValueResolution::Opaque;
+        };
+        match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
+            Some(constant) => ValueResolution::Concrete(constant.clone()),
+            None => ValueResolution::Staged(atom_id),
+        }
+    }
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>, C> StagingContext for TracingContext<T, V, O, C> {
@@ -439,6 +461,20 @@ impl<C: Context> Context for NestedTracingContext<C> {
     ) -> Result<Vec<Self::Value>, ProgramError> {
         self.stage_operation(operation.into(), inputs)
     }
+
+    #[inline]
+    fn resolve(&self, value: &Tracer<Self>) -> ValueResolution<C::Constant> {
+        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
+            return ValueResolution::Opaque;
+        }
+        let Ok(atom_id) = value.atom_id() else {
+            return ValueResolution::Opaque;
+        };
+        match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
+            Some(constant) => ValueResolution::Concrete(constant.clone()),
+            None => ValueResolution::Staged(atom_id),
+        }
+    }
 }
 
 impl<C: Context> StagingContext for NestedTracingContext<C> {
@@ -491,7 +527,7 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, ProgramBuilder, ProgramError, Value};
+    use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::scalars::{Scalar, ScalarDomain};
     use crate::types::{DataType, TypeError, Typed};
 
@@ -654,13 +690,9 @@ mod tests {
             }
         }
 
-        impl InterpretableOperation<DataType, Scalar> for NoOutputOperation {
+        impl<C> InterpretableOperation<DataType, Scalar, C> for NoOutputOperation {
             #[inline]
-            fn interpret(
-                &self,
-                _context: &<Scalar as Value<DataType>>::InterpretationContext,
-                _inputs: &[Scalar],
-            ) -> Result<Vec<Scalar>, ProgramError> {
+            fn interpret(&self, _context: &C, _inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
                 Ok(Vec::new())
             }
         }
