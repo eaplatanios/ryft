@@ -1,9 +1,10 @@
-use crate::operations::arithmetic::ScaleOperation;
+use crate::operations::arithmetic::MulOperation;
 use crate::parameters::Placeholder;
 use crate::programs::ProgramBuilder;
+use crate::scalars::Scalar;
 use crate::tests::{TestArray, TestArrayDomain};
 use crate::tracing_v2::ArrayOperation;
-use crate::types::{ArrayType, DataType};
+use crate::types::{ArrayType, DataType, Typed};
 
 /// Asserts that `actual` is within absolute tolerance `1e-9` of `expected`.
 pub(crate) fn assert_close(actual: f64, expected: f64) {
@@ -11,21 +12,35 @@ pub(crate) fn assert_close(actual: f64, expected: f64) {
     assert!(delta <= 1e-9, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
 }
 
-/// Builds a single-input flat program that scales its scalar input by `factor`.
+/// Asserts that the floating-point payload of `actual` is within absolute tolerance `1e-9` of `expected`. This is the
+/// [`Scalar`] counterpart of [`assert_close`] used by the scalar-domain differentiation tests, whose results are
+/// [`Scalar`] values rather than bare `f64`s. It accepts any floating-point [`Scalar`] variant and panics on a
+/// non-floating-point variant, which would indicate the test produced an unexpected data type.
+pub(crate) fn assert_scalar_close(actual: Scalar, expected: f64) {
+    let value = match actual {
+        Scalar::BF16(value) => value.to_f64(),
+        Scalar::F16(value) => value.to_f64(),
+        Scalar::F32(value) => value as f64,
+        Scalar::F64(value) => value,
+        other => panic!("expected a floating-point scalar but got {}", other.r#type().into_owned()),
+    };
+    assert_close(value, expected);
+}
+
+/// Builds a single-input flat program that scales its scalar input by `factor`, multiplying the input by a captured
+/// constant carrying `factor`.
 pub(crate) fn scalar_scale_branch(
     factor: f64,
 ) -> crate::programs::Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
     let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
     let input = builder.add_input(ArrayType::scalar(DataType::F64));
-    let output = builder.add_instruction(ScaleOperation::new(TestArray::scalar(factor)), vec![input]).unwrap()[0];
+    let factor = builder.add_constant(TestArray::scalar(factor));
+    let output = builder.add_instruction(MulOperation, vec![input, factor]).unwrap()[0];
     builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
@@ -33,15 +48,13 @@ mod tests {
     use crate::operations::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
     use crate::operations::compare::CompareOperation;
-    use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation, ZeroOperation};
+    use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
-    use crate::payloads::Input;
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiableOperation, DifferentiationContext,
-        JvpTracer, LinearArrayOperation, ResidualizedOperation, TangentContext, ValueOrCapture, jacrev,
+        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiationContext, jacrev,
     };
     use crate::types::{Shape, Size, Typed};
 
@@ -57,7 +70,9 @@ mod tests {
         let lhs = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 0).unwrap();
         let rhs = ArrayBatch::unbatched(TestArray::vector(vec![10.0, 100.0, 1000.0]));
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
-        let outputs = DotOperation::new(dimensions).batch(&crate::EagerContext::new(), &[lhs, rhs]).unwrap();
+        let outputs = DotOperation::new(dimensions)
+            .batch(&crate::EagerContext::<ArrayType, TestArray>::new(), &[lhs, rhs])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
         // Lane 0: 1*10 + 2*100 + 3*1000 = 3210; lane 1: 4*10 + 5*100 + 6*1000 = 6540.
@@ -75,7 +90,7 @@ mod tests {
 
         // Primal: reduce(x, [0], Sum) on `TestArray` directly.
         let primal_output = operation
-            .interpret(&crate::EagerContext::new(), std::slice::from_ref(&primal))
+            .interpret(&crate::EagerContext::<ArrayType, TestArray>::new(), std::slice::from_ref(&primal))
             .unwrap()
             .into_iter()
             .next()
@@ -84,8 +99,9 @@ mod tests {
 
         // Tangent: linearizes to itself (Sum is linear), so the tangent of the reduce is the
         // reduce of the tangent.
-        let tangent_outputs =
-            operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&tangent_value)).unwrap();
+        let tangent_outputs = operation
+            .interpret(&crate::EagerContext::<ArrayType, TestArray>::new(), std::slice::from_ref(&tangent_value))
+            .unwrap();
         let tangent_output = tangent_outputs.into_iter().next().unwrap();
         assert_eq!(tangent_output.values(), &[2.0]);
     }
@@ -151,7 +167,7 @@ mod tests {
     fn test_jacfwd_batches_basis_tangents() {
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.sin(), x + y)),
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -173,7 +189,7 @@ mod tests {
     fn test_jacrev_batches_basis_cotangents() {
         let jacobian = jacrev(
             &TestArrayDomain,
-            |(x, y)| Ok((x.clone() * y.clone() + x.sin(), x + y)),
+            |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
         .unwrap();
@@ -192,7 +208,7 @@ mod tests {
     fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.sin(), x + y)),
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -222,7 +238,7 @@ mod tests {
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
         let hessian = TestArrayDomain
-            .hessian(|(x, y)| x.clone() * y + x.sin(), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
+            .hessian(|(x, y)| x.clone() * y + x.sin().unwrap(), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
             .unwrap();
 
         let (row_0, row_1) = hessian.rows();
@@ -240,7 +256,7 @@ mod tests {
         // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
         let jacobian = TestArrayDomain
             .jacfwd(
-                |(x, y)| Ok((x.clone() * y.clone() + x.sin(), y.clone(), x + y)),
+                |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )
             .unwrap();
@@ -305,74 +321,6 @@ mod tests {
         let output_batch = &outputs[0];
         assert_eq!(output_batch.batch_axis(), Some(0));
         assert_eq!(output_batch.value().values, vec![3.0, 12.0, 27.0]);
-    }
-
-    #[test]
-    fn test_linear_condition_batches_through_zero_values() {
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-
-        // Build a LinearArrayOperation::Condition with a captured `true` predicate factor and a linear
-        // scale branch. Pass an all-zero batched input and verify the selected linear branch preserves zeros.
-        let mut builder = ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder
-            .add_instruction(ScaleOperation::<ArrayType, TestArray, Input>::new(TestArray::scalar(5.0)), vec![input])
-            .unwrap()[0];
-        let linear_branch = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let operation: LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> =
-            LinearArrayOperation::Condition(
-                ConditionOperation::new_captured(
-                    TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-                    linear_branch.clone(),
-                    linear_branch,
-                )
-                .unwrap(),
-            );
-
-        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let zero_input = ArrayBatch::new(batched_type, TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
-        let context = EagerContext::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new();
-        let outputs =
-            <LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> as BatchableOperation<
-                TestArray,
-                EagerContext<
-                    ArrayType,
-                    TestArray,
-                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-                >,
-            >>::batch(&operation, &context, &[zero_input])
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].value().values, vec![0.0, 0.0, 0.0, 0.0]);
-    }
-
-    fn linear_scalar_scale_branch(
-        factor: f64,
-    ) -> crate::programs::Program<
-        ArrayType,
-        TestArray,
-        LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        Vec<TestArray>,
-        Vec<TestArray>,
-    > {
-        let mut builder = ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder
-            .add_instruction(ScaleOperation::<ArrayType, TestArray, Input>::new(TestArray::scalar(factor)), vec![input])
-            .unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     #[test]
@@ -549,7 +497,7 @@ mod tests {
         let on_false_batch = ArrayBatch::new(operand_type, TestArray::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
 
         let outputs = SelectOperation
-            .batch(&crate::EagerContext::new(), &[pred_batch, on_true_batch, on_false_batch])
+            .batch(&crate::EagerContext::<ArrayType, TestArray>::new(), &[pred_batch, on_true_batch, on_false_batch])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), Some(0));
@@ -603,85 +551,6 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_condition_captured_predicate_dispatches() {
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-
-        // Linear condition with a captured `true` predicate factor dispatches to the selected branch over the batched
-        // operand. Per-lane output is `[1*2, 2*2, 3*2, 4*2] = [2, 4, 6, 8]`.
-        let operation: LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> =
-            LinearArrayOperation::Condition(
-                ConditionOperation::new_captured(
-                    TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-                    linear_scalar_scale_branch(2.0),
-                    linear_scalar_scale_branch(3.0),
-                )
-                .unwrap(),
-            );
-
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let operand_batch =
-            ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
-
-        let context = EagerContext::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new();
-        let outputs =
-            <LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> as BatchableOperation<
-                TestArray,
-                EagerContext<
-                    ArrayType,
-                    TestArray,
-                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-                >,
-            >>::batch(&operation, &context, &[operand_batch])
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert_eq!(outputs[0].value().values, vec![2.0, 4.0, 6.0, 8.0]);
-    }
-
-    #[test]
-    fn test_linear_condition_with_all_zero_tangents_materializes_correctly() {
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-
-        // Linear condition with a captured predicate factor and an all-zero tangent operand preserves the zero payload.
-        let operation: LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> =
-            LinearArrayOperation::Condition(
-                ConditionOperation::new_captured(
-                    TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-                    linear_scalar_scale_branch(2.0),
-                    linear_scalar_scale_branch(3.0),
-                )
-                .unwrap(),
-            );
-
-        let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
-        let zero_operand_batch =
-            ArrayBatch::new(operand_type, TestArray::vector(vec![0.0, 0.0, 0.0, 0.0]), Some(0)).unwrap();
-
-        let context = EagerContext::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new();
-        let outputs =
-            <LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>> as BatchableOperation<
-                TestArray,
-                EagerContext<
-                    ArrayType,
-                    TestArray,
-                    LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-                >,
-            >>::batch(&operation, &context, &[zero_operand_batch])
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        assert_eq!(outputs[0].value().values, vec![0.0, 0.0, 0.0, 0.0]);
-    }
-
-    #[test]
     fn test_jacrev_through_function_using_zero_like() {
         // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
         // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
@@ -706,7 +575,9 @@ mod tests {
 
     /// Stages `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` inside an
     /// active differentiation trace, feeding its predicate input with a staged constant `true`.
-    fn stage_constant_predicate_condition<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+    fn stage_constant_predicate_condition<C>(
+        x: crate::tracing::Tracer<C, C::Meta>,
+    ) -> crate::tracing::Tracer<C, C::Meta>
     where
         C: crate::contexts::StagingContext<
                 Type = ArrayType,
@@ -765,10 +636,10 @@ mod tests {
     }
 
     #[test]
-    fn test_while_jvp_propagates_tangents_through_staged_fused_loop() {
+    fn test_while_jvp_propagates_tangents_through_staged_linear_loop() {
         // `while (x < 8) { x = x + x }` starting at `x = 1` doubles three times, so the primal output is 8 and the
         // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch in an eager domain:
-        // the rule stages the doubled-state fused linear loop, which direct JVP execution interprets immediately.
+        // the rule stages the doubled-state linear loop, which direct JVP execution interprets immediately.
         let while_operation = doubling_while_operation();
         let (primal, tangent) = TestArrayDomain
             .jvp(
@@ -786,111 +657,10 @@ mod tests {
     }
 
     #[test]
-    fn test_while_linearize_reuses_pushforward_with_fresh_tangents() {
-        // Linearizing eagerly through the doubling loop unrolls its three iterations (at `x = 1`) into a
-        // straight-line pushforward — no `while` remains in the staged tangent program — that is reusable: each
-        // fresh tangent replay is scaled by the captured per-iteration linear maps (`2^3 = 8`).
-        let while_operation = doubling_while_operation();
-        let (primal, pushforward) = TestArrayDomain
-            .linearize(
-                move |x| {
-                    let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
-                    Ok(outputs.remove(0))
-                },
-                TestArray::scalar(1.0),
-            )
-            .unwrap();
-        assert_eq!(primal.values, vec![8.0]);
-        assert!(!pushforward.program().to_string().contains("while"));
-        assert_eq!(
-            pushforward
-                .apply(&crate::contexts::EagerContext::new(), TestArray::scalar(1.0))
-                .map(|tangent| tangent.values),
-            Ok(vec![8.0])
-        );
-        assert_eq!(
-            pushforward
-                .apply(&crate::contexts::EagerContext::new(), TestArray::scalar(2.5))
-                .map(|tangent| tangent.values),
-            Ok(vec![20.0])
-        );
-    }
-
-    #[test]
-    fn test_while_linearize_unrolls_state_dependent_products() {
-        // State `(counter, value)` with body `(counter - 1, value * value)` and condition `counter > 0`: the body
-        // pushforward of `value * value` captures `value` on both sides of the product rule, and eager linearization
-        // unrolls the two iterations, closing each iteration's captured primal value into the inlined linear maps.
-        // For `x_{n+1} = x_n^2` the tangent map is `t_{n+1} = 2 x_n t_n`: starting at `value = 3` with
-        // `counter = 2`, the primal is `3^4 = 81` and the tangent of `(0, 1)` is `(2 * 3) * (2 * 9) = 108` (the
-        // derivative of `x^4` at `x = 3`).
-        use crate::operations::compare::ComparisonDirection;
-        use crate::operations::control_flow::WhileOperation;
-        type TestOp = ArrayOperation<TestArray>;
-
-        let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
-        let condition_counter = condition_builder.add_input(scalar_f64.clone());
-        let _condition_value = condition_builder.add_input(scalar_f64.clone());
-        let condition_zero = condition_builder.add_instruction(ZeroLikeOperation, vec![condition_counter]).unwrap()[0];
-        let predicate = condition_builder
-            .add_instruction(
-                CompareOperation::new(ComparisonDirection::GreaterThan),
-                vec![condition_counter, condition_zero],
-            )
-            .unwrap()[0];
-        let condition = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
-        let body_counter = body_builder.add_input(scalar_f64.clone());
-        let body_value = body_builder.add_input(scalar_f64);
-        let one = body_builder.add_instruction(OneLikeOperation, vec![body_counter]).unwrap()[0];
-        let next_counter = body_builder.add_instruction(SubOperation, vec![body_counter, one]).unwrap()[0];
-        let squared = body_builder.add_instruction(MulOperation, vec![body_value, body_value]).unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![next_counter, squared],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        let while_operation = WhileOperation::<ArrayType, TestArray, TestOp>::new(condition, body).unwrap();
-
-        let ((counter_primal, value_primal), pushforward) = TestArrayDomain
-            .linearize(
-                move |(counter, value)| {
-                    let mut outputs = counter
-                        .context()
-                        .stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&counter, &value])?;
-                    let value_output = outputs.remove(1);
-                    Ok((outputs.remove(0), value_output))
-                },
-                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-            )
-            .unwrap();
-        assert_eq!(counter_primal.values, vec![0.0]);
-        assert_eq!(value_primal.values, vec![81.0]);
-
-        // The unrolled pushforward is straight-line: the per-iteration product rules appear as captured-factor
-        // `scale` maps and no `while` remains in the staged tangent program.
-        assert!(pushforward.program().to_string().contains("scale"));
-        assert!(!pushforward.program().to_string().contains("while"));
-
-        let (counter_tangent, value_tangent) = pushforward
-            .apply(&crate::contexts::EagerContext::new(), (TestArray::scalar(0.0), TestArray::scalar(1.0)))
-            .unwrap();
-        assert_eq!(counter_tangent.values, vec![0.0]);
-        assert_eq!(value_tangent.values, vec![108.0]);
-    }
-
-    #[test]
     fn test_jacfwd_through_while_batches_basis_tangents() {
-        // `jacfwd` linearizes the loop once into a pushforward containing a staged fused linear while, then replays
+        // `jacfwd` linearizes the loop once into a pushforward containing a staged linear while, then replays
         // the batched basis tangents through it: the pushforward is instantiated into a direct linear program and
-        // interpreted over the value-level batching rules, so the fused linear while runs once over the stacked
+        // interpreted over the value-level batching rules, so the linear while runs once over the stacked
         // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
         let while_operation = doubling_while_operation();
         let jacobian = TestArrayDomain
@@ -955,7 +725,7 @@ mod tests {
         // straight-line pushforward into a reusable pullback (no `while` remains). The loop is locally `f(x) = 8 x`,
         // so every output cotangent is scaled by 8.
         let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
-        let (output, pullback) = TestArrayDomain
+        let (output, pullback, residuals) = TestArrayDomain
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -967,8 +737,23 @@ mod tests {
             .unwrap();
         assert_eq!(output.values, vec![8.0]);
         assert!(!pullback.to_string().contains("while"), "{pullback}");
-        assert_eq!(pullback.interpret(TestArray::scalar(1.0)).map(|cotangent| cotangent.values), Ok(vec![8.0]));
-        assert_eq!(pullback.interpret(TestArray::scalar(5.0)).map(|cotangent| cotangent.values), Ok(vec![40.0]));
+        let pullback_inputs = |cotangent: TestArray| {
+            let mut inputs = vec![cotangent];
+            inputs.extend(residuals.iter().cloned());
+            inputs
+        };
+        assert_eq!(
+            pullback
+                .interpret(pullback_inputs(TestArray::scalar(1.0)))
+                .map(|cotangents| cotangents[0].values.clone()),
+            Ok(vec![8.0]),
+        );
+        assert_eq!(
+            pullback
+                .interpret(pullback_inputs(TestArray::scalar(5.0)))
+                .map(|cotangents| cotangents[0].values.clone()),
+            Ok(vec![40.0]),
+        );
     }
 
     #[test]
@@ -976,7 +761,7 @@ mod tests {
         // Eager `vjp` transposes the unrolled straight-line pushforward of an *unbounded* loop into a reusable
         // pullback: the doubling loop at `x = 1` is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
         let while_operation = doubling_while_operation();
-        let (output, pullback) = TestArrayDomain
+        let (output, pullback, residuals) = TestArrayDomain
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -987,8 +772,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.values, vec![8.0]);
-        assert_eq!(pullback.interpret(TestArray::scalar(1.0)).map(|cotangent| cotangent.values), Ok(vec![8.0]));
-        assert_eq!(pullback.interpret(TestArray::scalar(5.0)).map(|cotangent| cotangent.values), Ok(vec![40.0]));
+        let pullback_inputs = |cotangent: TestArray| {
+            let mut inputs = vec![cotangent];
+            inputs.extend(residuals.iter().cloned());
+            inputs
+        };
+        assert_eq!(
+            pullback
+                .interpret(pullback_inputs(TestArray::scalar(1.0)))
+                .map(|cotangents| cotangents[0].values.clone()),
+            Ok(vec![8.0]),
+        );
+        assert_eq!(
+            pullback
+                .interpret(pullback_inputs(TestArray::scalar(5.0)))
+                .map(|cotangents| cotangents[0].values.clone()),
+            Ok(vec![40.0]),
+        );
     }
 
     /// Builds the three-lane cumulative-product [`ScanOperation`] (body `[carry, x] -> [carry * x, carry * x]`)
@@ -1044,7 +844,7 @@ mod tests {
         // scan: the same residual stacks with `reverse` flipped to `true`. Each cotangent seed scales the
         // hand-computed gradients `(24, [12, 8, 6])`.
         let scan = product_scan_operation(false);
-        let (output, pullback) = TestArrayDomain
+        let (output, pullback, residuals) = TestArrayDomain
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -1058,46 +858,17 @@ mod tests {
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
-        let (init_cotangent, xs_cotangent) = pullback.interpret(TestArray::scalar(1.0)).unwrap();
-        assert_eq!(init_cotangent.values, vec![24.0]);
-        assert_eq!(xs_cotangent.values, vec![12.0, 8.0, 6.0]);
-        let (init_cotangent, xs_cotangent) = pullback.interpret(TestArray::scalar(2.0)).unwrap();
-        assert_eq!(init_cotangent.values, vec![48.0]);
-        assert_eq!(xs_cotangent.values, vec![24.0, 16.0, 12.0]);
-    }
-
-    #[test]
-    fn test_scan_linearize_reuses_pushforward_with_fresh_tangents() {
-        // Linearizing through the scan stages one linear scan over stored residual stacks — no unrolling, unlike
-        // `while` in eager domains — and the resulting pushforward replays with fresh tangents:
-        // `df = 24 d_init + 12 d_x0 + 8 d_x1 + 6 d_x2`.
-        let scan = product_scan_operation(false);
-        let (primal, pushforward) = TestArrayDomain
-            .linearize(
-                move |(init, xs)| {
-                    let mut outputs =
-                        init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs])?;
-                    Ok(outputs.remove(0))
-                },
-                (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
-            )
-            .unwrap();
-        assert_eq!(primal.values, vec![24.0]);
-        assert!(pushforward.program().to_string().contains("scan"));
-        let tangent = pushforward
-            .apply(
-                &crate::contexts::EagerContext::new(),
-                (TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0])),
-            )
-            .unwrap();
-        assert_eq!(tangent.values, vec![24.0]);
-        let tangent = pushforward
-            .apply(
-                &crate::contexts::EagerContext::new(),
-                (TestArray::scalar(0.0), TestArray::vector(vec![1.0, 1.0, 1.0])),
-            )
-            .unwrap();
-        assert_eq!(tangent.values, vec![26.0]);
+        let pullback_inputs = |cotangent: TestArray| {
+            let mut inputs = vec![cotangent];
+            inputs.extend(residuals.iter().cloned());
+            inputs
+        };
+        let cotangents = pullback.interpret(pullback_inputs(TestArray::scalar(1.0))).unwrap();
+        assert_eq!(cotangents[0].values, vec![24.0]);
+        assert_eq!(cotangents[1].values, vec![12.0, 8.0, 6.0]);
+        let cotangents = pullback.interpret(pullback_inputs(TestArray::scalar(2.0))).unwrap();
+        assert_eq!(cotangents[0].values, vec![48.0]);
+        assert_eq!(cotangents[1].values, vec![24.0, 16.0, 12.0]);
     }
 
     #[test]
@@ -1128,7 +899,7 @@ mod tests {
         // Reverse mode through the reversed scan flips `reverse` back to `false` in the pullback and produces the
         // same product-rule gradients (multiplication commutes across the visit order).
         let scan = product_scan_operation(true);
-        let (output, pullback) = TestArrayDomain
+        let (output, pullback, residuals) = TestArrayDomain
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -1141,9 +912,11 @@ mod tests {
         assert_eq!(output.values, vec![24.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("reverse=false"), "{rendered_pullback}");
-        let (init_cotangent, xs_cotangent) = pullback.interpret(TestArray::scalar(1.0)).unwrap();
-        assert_eq!(init_cotangent.values, vec![24.0]);
-        assert_eq!(xs_cotangent.values, vec![12.0, 8.0, 6.0]);
+        let mut pullback_inputs = vec![TestArray::scalar(1.0)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(cotangents[0].values, vec![24.0]);
+        assert_eq!(cotangents[1].values, vec![12.0, 8.0, 6.0]);
     }
 
     #[test]
@@ -1154,95 +927,10 @@ mod tests {
         let predicate = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
         assert_eq!(
             operation
-                .interpret(&crate::EagerContext::new(), &[predicate, TestArray::scalar(4.0)])
+                .interpret(&crate::EagerContext::<ArrayType, TestArray>::new(), &[predicate, TestArray::scalar(4.0)])
                 .map(|outputs| outputs[0].values[0]),
             Ok(12.0),
         );
-    }
-
-    #[test]
-    fn test_condition_jvp_linearizes_predicate_chosen_branch() {
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>,
-        >::new()));
-        let residuals = Rc::new(RefCell::new(Vec::new()));
-        let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
-        let mut context =
-            TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
-        let tangent_input = context.input(ArrayType::scalar(DataType::F64));
-        let mut predicate_tangents =
-            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))).unwrap();
-        assert_eq!(predicate_tangents.len(), 1);
-        let predicate = JvpTracer::from_value(
-            TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]),
-            predicate_tangents.remove(0),
-        );
-        let outputs = condition
-            .jvp(&mut context, &[predicate, JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
-            .unwrap();
-
-        assert_eq!(outputs[0].primal().values[0], 8.0);
-        let tangent_output = outputs[0].tangent().atom_id().unwrap();
-        drop(outputs);
-        drop(context);
-        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
-        let tangent_program =
-            builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
-        let residuals = residuals.borrow();
-        let tangent_program = tangent_program
-            .map_operations(|operation| {
-                ResidualizedOperation::<TestArrayDomain>::instantiate_residuals(operation, residuals.as_slice())
-            })
-            .unwrap();
-        assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(20.0));
-    }
-
-    #[test]
-    fn test_condition_jvp_linearizes_false_predicate_branch_and_reuses_pushforward() {
-        // Mirror of `test_condition_jvp_linearizes_predicate_chosen_branch` at a FALSE-predicate primal point: the
-        // bound primal condition evaluates the scale-by-3 branch (3 * 4 = 12), and the captured-predicate linear
-        // condition replays that branch pushforward (tangent * 3) for any fresh tangent, including a second replay
-        // that reuses the pushforward staged at the original primal point.
-        let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, ValueOrCapture<ArrayType, TestArray>, ArrayOperation<TestArray>>,
-        >::new()));
-        let residuals = Rc::new(RefCell::new(Vec::new()));
-        let residual_atoms = Rc::new(RefCell::new(HashMap::new()));
-        let mut context =
-            TangentContext::new_with_residuals(&TestArrayDomain, builder.clone(), residuals.clone(), residual_atoms);
-        let tangent_input = context.input(ArrayType::scalar(DataType::F64));
-        let mut predicate_tangents =
-            context.stage_nullary_operation(ZeroOperation::new(ArrayType::scalar(DataType::Boolean))).unwrap();
-        assert_eq!(predicate_tangents.len(), 1);
-        let predicate = JvpTracer::from_value(
-            TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]),
-            predicate_tangents.remove(0),
-        );
-        let outputs = condition
-            .jvp(&mut context, &[predicate, JvpTracer::from_value(TestArray::scalar(4.0), tangent_input)])
-            .unwrap();
-
-        assert_eq!(outputs[0].primal().values[0], 12.0);
-        let tangent_output = outputs[0].tangent().atom_id().unwrap();
-        drop(outputs);
-        drop(context);
-        let builder = Rc::try_unwrap(builder).unwrap().into_inner();
-        let tangent_program =
-            builder.build::<TestArray, TestArray>(vec![tangent_output], Placeholder, Placeholder).unwrap();
-        let residuals = residuals.borrow();
-        let tangent_program = tangent_program
-            .map_operations(|operation| {
-                ResidualizedOperation::<TestArrayDomain>::instantiate_residuals(operation, residuals.as_slice())
-            })
-            .unwrap();
-        assert_eq!(tangent_program.interpret(TestArray::scalar(10.0)).map(|output| output.values[0]), Ok(30.0));
-        assert_eq!(tangent_program.interpret(TestArray::scalar(-2.0)).map(|output| output.values[0]), Ok(-6.0));
     }
 
     #[test]
@@ -1251,7 +939,7 @@ mod tests {
         // transpose rule: the pullback runs the transposed branch program selected by the captured predicate, so
         // the operand cotangent is 2 * output cotangent at a TRUE-predicate primal point and 3 * output cotangent
         // at a FALSE one. The Boolean predicate has no tangent space, so its cotangent slot is always zero.
-        let (output, pullback) = TestArrayDomain
+        let (output, pullback, residuals) = TestArrayDomain
             .vjp(
                 |(predicate, operand)| {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
@@ -1264,11 +952,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.values, vec![8.0]);
-        let (predicate_cotangent, operand_cotangent) = pullback.interpret(TestArray::scalar(5.0)).unwrap();
-        assert_eq!(operand_cotangent.values, vec![10.0]);
-        assert_eq!(predicate_cotangent.values, vec![0.0]);
+        let mut pullback_inputs = vec![TestArray::scalar(5.0)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(cotangents[1].values, vec![10.0]);
+        assert_eq!(cotangents[0].values, vec![0.0]);
 
-        let (output, pullback) = TestArrayDomain
+        let (output, pullback, residuals) = TestArrayDomain
             .vjp(
                 |(predicate, operand)| {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
@@ -1281,8 +971,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.values, vec![12.0]);
-        let (predicate_cotangent, operand_cotangent) = pullback.interpret(TestArray::scalar(5.0)).unwrap();
-        assert_eq!(operand_cotangent.values, vec![15.0]);
-        assert_eq!(predicate_cotangent.values, vec![0.0]);
+        let mut pullback_inputs = vec![TestArray::scalar(5.0)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret(pullback_inputs).unwrap();
+        assert_eq!(cotangents[1].values, vec![15.0]);
+        assert_eq!(cotangents[0].values, vec![0.0]);
     }
 }

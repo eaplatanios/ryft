@@ -10,8 +10,8 @@ use crate::types::ArrayType;
 /// other. Batching rules get executed by binding operations (i.e., via [`Context::bind`](crate::Context::bind) and
 /// [`StagingContext::stage_operation`](crate::StagingContext::stage_operation)), which can result in [`ProgramError`]s.
 /// So, [`BatchingError`]s travel up a trace, type-erased, inside [`ProgramError::Custom`] payloads. In the other
-/// direction, the public [`Batch::batch`](crate::batch) entry point is typed to [`BatchingError`], and a batching
-/// trace can also fail for reasons that are not batching-related. Those program errors surface through the
+/// direction, the public [`Batch::batch`](crate::Batch::batch) entry point is typed to [`BatchingError`], and a
+/// batching trace can also fail for reasons that are not batching-related. Those program errors surface through the
 /// [`BatchingError::Program`] variant. The paired [`From`] implementations keep this cycle normalized instead of
 /// letting the two types nest: converting to [`ProgramError`] unwraps a [`BatchingError::Program`] back into the
 /// program error that it carries and wraps every other variant in [`ProgramError::Custom`], while converting to
