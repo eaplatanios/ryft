@@ -5,11 +5,11 @@ use std::fmt::Display;
 use half::{bf16, f16};
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, EagerContext};
+use crate::contexts::{Context, EagerContext, ValueResolution};
 use crate::domains::Domain;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
+use crate::operations::constants::{Constant, One, OneLike, Zero, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition};
 use crate::operations::differentiation::StopGradient;
 use crate::operations::scalars::ScalarOperation;
@@ -58,7 +58,12 @@ impl Context for ScalarDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         // `ScalarDomain` is an eager `Context` whose `bind` interprets the operation directly over `Scalar` values.
-        operation.into().interpret(&EagerContext::new(), inputs)
+        operation.into().interpret(&EagerContext::<DataType, Scalar, Self::Operation>::new(), inputs)
+    }
+
+    #[inline]
+    fn resolve(&self, value: &Scalar) -> ValueResolution<Scalar> {
+        ValueResolution::Concrete(*value)
     }
 }
 
@@ -135,14 +140,7 @@ impl Typed<DataType> for Scalar {
     }
 }
 
-impl Value<DataType> for Scalar {
-    type InterpretationContext = EagerContext<DataType, Self>;
-
-    #[inline]
-    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-        Some(EagerContext::new())
-    }
-}
+impl Value<DataType> for Scalar {}
 
 // Conversions from each supported Rust primitive into the corresponding [`Scalar`] variant. These let later stages
 // and numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
@@ -253,6 +251,27 @@ impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, S
                 );
             }
         })
+    }
+}
+
+impl Zero<DataType, Scalar> for ScalarDomain {
+    #[inline]
+    fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
+        EagerContext::<DataType, Scalar>::new().zero(r#type)
+    }
+}
+
+impl One<DataType, Scalar> for ScalarDomain {
+    #[inline]
+    fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
+        EagerContext::<DataType, Scalar>::new().one(r#type)
+    }
+}
+
+impl<Payload> Constant<DataType, Scalar, Scalar, Payload> for ScalarDomain {
+    #[inline]
+    fn constant(&self, value: Scalar) -> Result<Scalar, ProgramError> {
+        Ok(value)
     }
 }
 

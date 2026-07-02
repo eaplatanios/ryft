@@ -23,7 +23,7 @@ use std::fmt::Display;
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, EagerContext, ProvidesContext};
+use crate::contexts::{Context, EagerContext, ValueResolution};
 use crate::domains::Domain;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
@@ -134,14 +134,7 @@ impl Typed<ArrayType> for TestArray {
     }
 }
 
-impl Value<ArrayType> for TestArray {
-    type InterpretationContext = EagerContext<ArrayType, Self>;
-
-    #[inline]
-    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-        Some(EagerContext::new())
-    }
-}
+impl Value<ArrayType> for TestArray {}
 
 impl Tag for TestArray {
     #[inline]
@@ -992,18 +985,44 @@ impl Context for TestArrayDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
-        operation.interpret(&EagerContext::new(), inputs)
+        operation.interpret(&EagerContext::<ArrayType, TestArray, Self::Operation>::new(), inputs)
+    }
+
+    fn resolve(&self, value: &TestArray) -> ValueResolution<TestArray> {
+        ValueResolution::Concrete(value.clone())
+    }
+}
+
+/// Eager-domain context capabilities: [`TestArrayDomain`] interprets operations directly over [`TestArray`]s, so
+/// its nullary-construction and constant-materialization semantics are exactly the zero-state
+/// [`EagerContext`]'s, to which these impls delegate.
+impl Zero<ArrayType, TestArray> for TestArrayDomain {
+    fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
+        EagerContext::<ArrayType, TestArray>::new().zero(r#type)
+    }
+}
+
+impl One<ArrayType, TestArray> for TestArrayDomain {
+    fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
+        EagerContext::<ArrayType, TestArray>::new().one(r#type)
+    }
+}
+
+impl Fill<ArrayType, f64, TestArray> for TestArrayDomain {
+    fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
+        EagerContext::<ArrayType, TestArray>::new().fill(r#type, value)
+    }
+}
+
+impl<Payload> crate::operations::constants::Constant<ArrayType, TestArray, TestArray, Payload> for TestArrayDomain {
+    #[inline]
+    fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
+        Ok(value)
     }
 }
 
 impl DifferentiationContext for TestArrayDomain {
     type Tangent = TestArray;
-}
-
-impl ProvidesContext<<TestArray as Value<ArrayType>>::InterpretationContext> for TestArrayDomain {
-    fn context(&self) -> <TestArray as Value<ArrayType>>::InterpretationContext {
-        EagerContext::new()
-    }
 }
 
 #[cfg(test)]

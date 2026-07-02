@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::Context;
+use crate::contexts::{Context, EagerContext};
+use crate::effects::Effects;
 use crate::errors::CustomError;
 use crate::macros::check_count;
 use crate::operations::{InterpretableOperation, Operation};
@@ -81,27 +82,7 @@ impl ProgramError {
 /// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
 /// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
 /// carried values directly.
-pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized {
-    /// Context required to interpret an [`Operation`] into values of this type. Concrete (i.e., **eager**) values use
-    /// [`EagerContext`](crate::EagerContext) to make the absence of backend-owned runtime state explicit. On the other
-    /// hand, [`Tracer`](crate::Tracer) values use the [`StagingContext`](crate::StagingContext) that owns them so that
-    /// nullary operations (e.g., [`ZeroOperation`](crate::ZeroOperation)) can stage themselves into the surrounding
-    /// trace instead of failing for lack of an operand from which to recover that context. Wrapper value types delegate
-    /// to their payload's context when they carry one.
-    type InterpretationContext: Context<Type = T>;
-
-    /// Recovers the [`InterpretationContext`](Self::InterpretationContext) carried by this value, or `None` when this
-    /// value does not have a payload (e.g., when it represents a symbolic zero value) and therefore carries no context
-    /// to recover. Concrete (i.e., **eager**) values return a zero-sized [`EagerContext`](crate::EagerContext). On the
-    /// other hand, [`Tracer`](crate::Tracer) values return clones of the [`StagingContext`](crate::StagingContext) that
-    /// owns them, and wrapper value types delegate to their payload's context, returning `None` for payload-less
-    /// variants.
-    ///
-    /// This function lets generic helpers that interpret operand-bearing [`Operation`]s recover the context from one of
-    /// their input values instead of requiring callers to thread one in. Because a single operand can sometimes be a
-    /// symbolic zero, callers scan their operands for the first one that yields `Some`.
-    fn interpretation_context(&self) -> Option<Self::InterpretationContext>;
-}
+pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized {}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]
@@ -464,6 +445,18 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         Ok(live_sets)
     }
 
+    /// Returns the [`Effect`](crate::Effect) classes of this [`Program`] which is the [union](Effects::union) of its
+    /// [`Instruction`]s' [`Operation::effects`] sets, or [`Effects::PURE`] for [`Program`]s with no instructions.
+    /// Operations with nested programs report the [`Effects`] returned by this function for their nested programs as
+    /// their own [`Operation::effects`] set so that effects remain visible through higher-order boundaries.
+    #[inline]
+    pub fn effects(&self) -> Effects {
+        self.instructions
+            .iter()
+            .map(|instruction| instruction.operation().effects())
+            .fold(Effects::PURE, Effects::union)
+    }
+
     /// Rebuilds this [`Program`] with each [`Operation`] mapped using the provided `map_fn`. The atom table,
     /// input/output atom identifiers, and parameter structures are preserved exactly. This is useful for transforms
     /// that keep the same value graph but need to change operation payloads. For example, a reusable residualized
@@ -535,7 +528,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
-    /// to the [`Program`]'s output removed.
+    /// to the [`Program`]'s output removed. [`Instruction`]s whose operations are not [`Effects::PURE`] are kept alive
+    /// (together with the instructions producing their inputs) even when no program output consumes their results, in
+    /// their original relative order, so that simplification never eliminates or reorders observable
+    /// [`Effect`](crate::Effect)s.
     pub fn simplified(&self) -> Result<Self, ProgramError>
     where
         O: Clone,
@@ -549,6 +545,24 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
                 return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             atom_id_mapping.insert(input_id, program_builder.add_input(input_type.clone()));
+        }
+
+        // Make sure that effectful instructions and their transitive dependencies are processed in original instruction
+        // order before the outputs, so that instructions with observable effects survive even when dead and ordered
+        // effects keep their relative order.
+        for instruction in self.instructions.iter() {
+            if instruction.operation().effects().is_pure() {
+                continue;
+            }
+            for output_id in instruction.outputs().iter().copied() {
+                add_atom_to_program_builder(
+                    &mut program_builder,
+                    &mut atom_id_mapping,
+                    output_id,
+                    self,
+                    instruction_by_output.as_slice(),
+                )?;
+            }
         }
 
         let output_ids = self
@@ -572,9 +586,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// Consumes this [`Program`] and returns a simplified version with dead constants and [`Instruction`]s that do not
     /// contribute to the [`Program`]'s output removed. Unlike [`Self::simplified`], this method moves live [`Atom`]s,
     /// [`Instruction`]s, and parameter structures into the returned [`Program`] instead of cloning them. This avoids
-    /// copying constants and operations that are discarded during simplification.
+    /// copying constants and operations that are discarded during simplification. The behavior of [`Self::simplified`]
+    /// around [`Effects`] applies here too. [`Instruction`]s whose operations are not [`Effects::PURE`] survive in
+    /// their original relative order even when no program output consumes their outputs.
     pub fn into_simplified(self) -> Result<Self, ProgramError> {
         let instruction_by_output = self.instruction_by_output();
+        let effectful_instruction_outputs = self
+            .instructions
+            .iter()
+            .filter(|instruction| !instruction.operation().effects().is_pure())
+            .flat_map(|instruction| instruction.outputs().iter().copied())
+            .collect::<Vec<_>>();
         let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
 
         let expected_input_count = input_structure.parameter_count();
@@ -604,6 +626,21 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             atom_id_mapping.insert(input_id, new_input);
         }
 
+        // Make sure that effectful instructions and their transitive dependencies are processed in original instruction
+        // order before the outputs, so that instructions with observable effects survive even when dead and ordered
+        // effects keep their relative order.
+        for root in effectful_instruction_outputs {
+            move_atom_to_program(
+                &mut atom_id_mapping,
+                root,
+                atoms.as_mut_slice(),
+                instructions.as_mut_slice(),
+                instruction_by_output.as_slice(),
+                &mut new_atoms,
+                &mut new_instructions,
+            )?;
+        }
+
         let output_ids = output_ids
             .into_iter()
             .map(|output| {
@@ -631,16 +668,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 
     /// Rebuilds this [`Program`] as a flat subprogram over a chosen input/output boundary. The rebuilt program
-    /// keeps only the [`Instruction`]s reachable from `outputs` and lifts embedded constants directly into the result.
-    /// Entries of `inputs` that are not reachable from any requested output are dropped. The returned index vector
-    /// lists, in order, the positions of `inputs` that remain live and become the public inputs of the rebuilt
-    /// program, so that callers can map rebuilt inputs back to the original boundary.
+    /// keeps only the [`Instruction`]s reachable from `outputs` or from the provided `keep_alive` atoms and lifts
+    /// embedded constants directly into the result. Entries of `inputs` that are not reachable from any requested
+    /// output or keep-alive atom are dropped. The returned index vector lists, in order, the positions of `inputs`
+    /// that remain live and become the public inputs of the rebuilt program, so that callers can map rebuilt inputs
+    /// back to the original boundary.
     ///
-    /// Each [`Atom::Variable`] reachable from an output must either appear in `inputs` or be produced by an
-    /// [`Instruction`] of this program; reaching any other source variable (e.g., an original program input that
-    /// was not selected) is reported as a [`ProgramError::MalformedProgram`]. Every entry of `inputs` must be an
-    /// [`Atom::Variable`] and must appear at most once. [`Atom::Constant`]s are rebuilt automatically and need not
-    /// be listed.
+    /// Each [`Atom::Variable`] reachable from an output or keep-alive atom must either appear in `inputs` or be
+    /// produced by an [`Instruction`] of this program. Reaching any other source variable (e.g., an original program
+    /// input that was not selected) is reported as a [`ProgramError::MalformedProgram`]. Every entry of `inputs` must
+    /// be an [`Atom::Variable`] and must appear at most once. [`Atom::Constant`]s are rebuilt automatically and need
+    /// not be listed.
     ///
     /// This is the graph-projection primitive used by transforms that carve a subgraph out of an already-traced program
     /// over a known input boundary, such as separating a primal residual computation from a transposed cotangent
@@ -653,15 +691,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     ///
     ///   - `inputs`: [`AtomId`]s of the atoms eligible to become the rebuilt program's public inputs, in input order.
     ///   - `outputs`: [`AtomId`]s of the atoms to expose as the rebuilt program's outputs, in output order.
+    ///   - `keep_alive`: [`AtomId`]s of atoms that must survive even if they are unreachable from `outputs`.
     pub fn filtered(
         &self,
         inputs: &[AtomId],
         outputs: &[AtomId],
+        keep_alive: &[AtomId],
     ) -> Result<(Program<T, V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError>
     where
         O: Clone,
     {
-        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs)?;
+        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let mut program_builder = ProgramBuilder::new();
         let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
         let mut live_input_indices = Vec::new();
@@ -675,6 +715,19 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             };
             atom_id_mapping.insert(id, program_builder.add_input(input_type.clone()));
             live_input_indices.push(position);
+        }
+
+        // Make sure that the keep-alive-atom-producing instructions and their transitive dependencies are processed in
+        // original instruction order before the outputs, so that instructions with observable effects survive even when
+        // dead and ordered effects keep their relative order.
+        for root in keep_alive.iter().copied() {
+            add_atom_to_program_builder(
+                &mut program_builder,
+                &mut atom_id_mapping,
+                root,
+                self,
+                instruction_by_output.as_slice(),
+            )?;
         }
 
         let output_ids = outputs
@@ -703,14 +756,15 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// Consumes this [`Program`] and returns the same flat subprogram as [`Self::filtered`] over the chosen `inputs`
     /// and `outputs` boundary. Unlike [`Self::filtered`], this moves live [`Atom`]s and [`Instruction`]s into the
     /// returned program instead of cloning them, avoiding copies of the constants and operations that survive the
-    /// projection. The boundary contract, dead-input pruning, and returned live-input index vector are identical
-    /// to [`Self::filtered`].
+    /// projection. The boundary contract, keep-alive semantics, dead-input pruning, and returned live-input index
+    /// vector are identical to [`Self::filtered`].
     pub fn into_filtered(
         self,
         inputs: &[AtomId],
         outputs: &[AtomId],
+        keep_alive: &[AtomId],
     ) -> Result<(Program<T, V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
-        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs)?;
+        let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let Program { atoms, instructions, .. } = self;
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
         let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
@@ -737,6 +791,21 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
             new_input_ids.push(new_input);
             atom_id_mapping.insert(id, new_input);
             live_input_indices.push(position);
+        }
+
+        // Make sure that the keep-alive-atom-producing instructions and their transitive dependencies are processed in
+        // original instruction order before the outputs, so that instructions with observable effects survive even when
+        // dead and ordered effects keep their relative order.
+        for root in keep_alive.iter().copied() {
+            move_atom_to_program(
+                &mut atom_id_mapping,
+                root,
+                atoms.as_mut_slice(),
+                instructions.as_mut_slice(),
+                instruction_by_output.as_slice(),
+                &mut new_atoms,
+                &mut new_instructions,
+            )?;
         }
 
         let output_ids = outputs
@@ -769,15 +838,16 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         ))
     }
 
-    /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability
-    /// from `outputs`, which of them are live (reachable from a requested output). Returns this program's
-    /// instruction-by-output map together with one liveness flag per `inputs` entry. Reaching any variable that is
-    /// neither listed in `inputs` nor produced by an [`Instruction`] is reported as a
-    /// [`ProgramError::MalformedProgram`].
+    /// Validates `inputs` as a deduplicated set of [`Atom::Variable`]s and determines, by reverse reachability from
+    /// `outputs` and the provided `keep_alive` atoms, which of them are live (i.e., reachable from a requested output
+    /// or a keep-alive atom). Returns this program's instruction-by-output map together with one liveness flag per
+    /// `inputs` entry. Reaching any variable that is neither listed in `inputs` nor produced by an [`Instruction`]
+    /// is reported as a [`ProgramError::MalformedProgram`].
     fn compute_live_inputs(
         &self,
         inputs: &[AtomId],
         outputs: &[AtomId],
+        keep_alive: &[AtomId],
     ) -> Result<(Vec<Option<usize>>, Vec<bool>), ProgramError> {
         let mut input_position = vec![None; self.atoms.len()];
         for (position, id) in inputs.iter().copied().enumerate() {
@@ -798,7 +868,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         let mut needed = vec![false; self.atoms.len()];
         let mut input_liveness = vec![false; inputs.len()];
         let mut stack = Vec::new();
-        for output in outputs.iter().copied() {
+        for output in outputs.iter().copied().chain(keep_alive.iter().copied()) {
             if output.index() >= self.atoms.len() {
                 return Err(ProgramError::UnboundAtomId { id: output });
             }
@@ -841,27 +911,21 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     #[inline]
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
-        O: InterpretableOperation<T, V>,
-        <V as Value<T>>::InterpretationContext: Default,
+        O: InterpretableOperation<T, V, EagerContext<T, V, O>>,
         Input::ParameterStructure: Debug + PartialEq,
     {
-        self.interpret_in_context(&<V as Value<T>>::InterpretationContext::default(), input)
+        self.interpret_in_context(&EagerContext::<T, V, O>::new(), input)
     }
 
-    /// Interprets/executes this [`Program`] with the provided input, within the supplied
-    /// [`InterpretationContext`](Value::InterpretationContext). This is the context-taking core
-    /// behind [`Self::interpret`]. [`Self::interpret`] supports eager value types by building an
-    /// [`EagerContext`](crate::EagerContext), while callers that interpret using [`Tracer`](crate::Tracer)s need to
-    /// supply the surrounding [`StagingContext`](crate::StagingContext) using this function so that nullary operations
-    /// can stage themselves into it. Nested program interpretation (e.g., control flow branches, custom derivative
-    /// programs, etc.) routes through here so that a single replay path handles both eager and traced values.
-    pub fn interpret_in_context(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        input: Input,
-    ) -> Result<Output, ProgramError>
+    /// Interprets/executes this [`Program`] with the provided input, within the supplied interpretation context.
+    /// This is the context-taking core behind [`Self::interpret`], which instantiates it at this program's own
+    /// [`EagerContext`]. Callers that interpret using [`Tracer`](crate::Tracer)s must supply the surrounding
+    /// [`StagingContext`](crate::StagingContext) instead, so that nullary operations can stage themselves into it.
+    /// Nested program interpretation (e.g., control flow branches, custom derivative programs, etc.) routes through
+    /// here so that a single replay path handles both eager and traced values.
+    pub fn interpret_in_context<C: Context<Type = T>>(&self, context: &C, input: Input) -> Result<Output, ProgramError>
     where
-        O: InterpretableOperation<T, V>,
+        O: InterpretableOperation<T, V, C>,
         Input::ParameterStructure: Debug + PartialEq,
     {
         // Validate that the caller supplied an input with the expected parameter structure.
@@ -1499,10 +1563,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::debugging::PrintOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::scalars::Scalar;
@@ -1695,7 +1761,7 @@ mod tests {
                     lifted_constants.push((atom_id, *value));
                     Ok(*value)
                 },
-                |instruction, inputs| instruction.operation.interpret(&EagerContext::new(), inputs),
+                |instruction, inputs| instruction.operation.interpret(&EagerContext::<DataType, Scalar>::new(), inputs),
             ),
             Ok(vec![Scalar::from(5.0f64)]),
         );
@@ -1768,7 +1834,7 @@ mod tests {
             program.interpret_with(
                 Vec::<Scalar>::new(),
                 |_, value| Ok(*value),
-                |instruction, inputs| instruction.operation.interpret(&EagerContext::new(), inputs),
+                |instruction, inputs| instruction.operation.interpret(&EagerContext::<DataType, Scalar>::new(), inputs),
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
@@ -2070,6 +2136,29 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // The pure program above reports no effects, and simplification removed its dead `add` as asserted. Effectful
+        // instructions, in contrast, are kept alive by simplification even when they are dead code: nothing consumes
+        // the print's output below, so only its effect keeps it in the simplified program.
+        assert_eq!(program.effects(), Effects::PURE);
+        let build = || {
+            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let input = builder.add_input(DataType::F64);
+            let doubled = builder.add_instruction(AddOperation, vec![input, input]).unwrap()[0];
+            let _printed = builder.add_instruction(PrintOperation::new("x"), vec![input]).unwrap()[0];
+            builder.build::<Scalar, Scalar>(vec![doubled], Placeholder, Placeholder).unwrap()
+        };
+        let effectful = build();
+        assert_eq!(effectful.effects(), Effects::single(Effect::OrderedIo));
+        let expected = indoc! {"
+            lambda %0:f64 .
+            let %1:f64 = print [label=x] %0
+                %2:f64 = add %0 %0
+            in (%2)
+        "}
+        .trim_end();
+        assert_eq!(effectful.simplified().unwrap().to_string(), expected);
+        assert_eq!(build().into_simplified().unwrap().to_string(), expected);
     }
 
     #[test]
@@ -2105,14 +2194,7 @@ mod tests {
             }
         }
 
-        impl Value<DataType> for CloneCountingValue {
-            type InterpretationContext = EagerContext<DataType, Self>;
-
-            #[inline]
-            fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-                Some(EagerContext::new())
-            }
-        }
+        impl Value<DataType> for CloneCountingValue {}
 
         let value_clone_count = Rc::new(Cell::new(0));
         let mut builder = ProgramBuilder::<_, _, ScalarOperation<CloneCountingValue>>::new();
@@ -2180,30 +2262,45 @@ mod tests {
 
         // Dead inputs are pruned and constants are lifted: `i1` is dead for `v1`, so it is dropped,
         // and `c0` is rebuilt into the projected program.
-        let (pruned, pruned_live) = program.filtered(&[i0, i1], &[v1]).unwrap();
+        let (pruned, pruned_live) = program.filtered(&[i0, i1], &[v1], &[]).unwrap();
         assert_eq!(pruned_live, vec![0]);
         assert_eq!(pruned.input_ids().len(), 1);
         assert_eq!(pruned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-2.0)]));
 
         // Selecting an intermediate atom (i.e., `v0`) as the output drops the downstream `add`
         // and the now-dead constant.
-        let (intermediate, intermediate_live) = program.filtered(&[i0], &[v0]).unwrap();
+        let (intermediate, intermediate_live) = program.filtered(&[i0], &[v0], &[]).unwrap();
         assert_eq!(intermediate_live, vec![0]);
         assert_eq!(intermediate.instructions().len(), 1);
         assert_eq!(intermediate.interpret(vec![Scalar::from(5.0)]), Ok(vec![Scalar::from(-5.0)]));
 
         // Forwarding an input directly as an output yields an instruction-free program over only that input.
-        let (forwarded, forwarded_live) = program.filtered(&[i0, i1], &[i0]).unwrap();
+        let (forwarded, forwarded_live) = program.filtered(&[i0, i1], &[i0], &[]).unwrap();
         assert_eq!(forwarded_live, vec![0]);
         assert_eq!(forwarded.instructions().len(), 0);
         assert_eq!(forwarded.interpret(vec![Scalar::from(7.0)]), Ok(vec![Scalar::from(7.0)]));
 
         // Reaching a variable that is neither a selected input nor produced by an instruction is rejected:
         // `v1` depends on `i0`, which is omitted from the selected inputs here.
-        assert!(matches!(program.filtered(&[i1], &[v1]), Err(ProgramError::MalformedProgram(_))));
+        assert!(matches!(program.filtered(&[i1], &[v1], &[]), Err(ProgramError::MalformedProgram(_))));
 
         // Providing the same input atom more than once is rejected.
-        assert!(matches!(program.filtered(&[i0, i0], &[v1]), Err(ProgramError::MalformedProgram(_))));
+        assert!(matches!(program.filtered(&[i0, i0], &[v1], &[]), Err(ProgramError::MalformedProgram(_))));
+
+        // A keep-alive entry naming an otherwise-pruned atom retains its producing instruction chain without
+        // widening the projection's outputs: projecting onto `v0` alone drops the downstream `add` and the constant,
+        // while keeping `v1` alive pulls them back in.
+        let (kept, kept_live) = program.filtered(&[i0], &[v0], &[v1]).unwrap();
+        assert_eq!(kept_live, vec![0]);
+        assert_eq!(kept.instructions().len(), 2);
+        assert_eq!(kept.output_ids().len(), 1);
+        assert_eq!(kept.interpret(vec![Scalar::from(5.0)]), Ok(vec![Scalar::from(-5.0)]));
+
+        // A keep-alive entry naming a dead input pins it as a live public input instead of pruning it.
+        let (pinned, pinned_live) = program.filtered(&[i0, i1], &[v1], &[i1]).unwrap();
+        assert_eq!(pinned_live, vec![0, 1]);
+        assert_eq!(pinned.input_ids().len(), 2);
+        assert_eq!(pinned.interpret(vec![Scalar::from(4.0), Scalar::from(9.0)]), Ok(vec![Scalar::from(-2.0)]));
     }
 
     #[test]
@@ -2224,9 +2321,9 @@ mod tests {
         };
 
         let (borrowed_program, b_i0, b_i1, b_v1) = build();
-        let (borrowed, borrowed_live) = borrowed_program.filtered(&[b_i0, b_i1], &[b_v1]).unwrap();
+        let (borrowed, borrowed_live) = borrowed_program.filtered(&[b_i0, b_i1], &[b_v1], &[]).unwrap();
         let (owned_program, o_i0, o_i1, o_v1) = build();
-        let (owned, owned_live) = owned_program.into_filtered(&[o_i0, o_i1], &[o_v1]).unwrap();
+        let (owned, owned_live) = owned_program.into_filtered(&[o_i0, o_i1], &[o_v1], &[]).unwrap();
 
         // The consuming variant drops the dead input, lifts the constant, and is identical to the borrowing `filter`.
         assert_eq!(owned_live, vec![0]);

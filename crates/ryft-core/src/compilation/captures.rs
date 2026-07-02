@@ -3,7 +3,6 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::contexts::EagerContext;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
@@ -66,14 +65,7 @@ impl<T: Type> Typed<T> for CaptureReference<T> {
     }
 }
 
-impl<T: Type> Value<T> for CaptureReference<T> {
-    type InterpretationContext = EagerContext<T, Self>;
-
-    #[inline]
-    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-        Some(EagerContext::new())
-    }
-}
+impl<T: Type> Value<T> for CaptureReference<T> {}
 
 /// A staged [`Program`] paired with the concrete runtime values referenced by its captured
 /// constants.
@@ -471,11 +463,10 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
     use crate::macros::check_count;
     use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, ProgramError, Value};
+    use crate::programs::{ProgramBuilder, ProgramError};
     use crate::scalars::Scalar;
     use crate::types::{DataType, TypeError};
 
@@ -495,12 +486,8 @@ mod tests {
         }
     }
 
-    impl InterpretableOperation<DataType, Scalar> for TestAddOperation {
-        fn interpret(
-            &self,
-            _context: &<Scalar as Value<DataType>>::InterpretationContext,
-            inputs: &[Scalar],
-        ) -> Result<Vec<Scalar>, ProgramError> {
+    impl<C> InterpretableOperation<DataType, Scalar, C> for TestAddOperation {
+        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
             check_count!("input", inputs, 2, ProgramError);
             Ok(vec![inputs[0] + inputs[1]])
         }
@@ -535,7 +522,9 @@ mod tests {
             .interpret_with_captures(
                 vec![Scalar::from(2.0)],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| instruction.operation().interpret(&EagerContext::new(), inputs),
+                |instruction, inputs| {
+                    instruction.operation().interpret(&crate::EagerContext::<DataType, Scalar>::new(), inputs)
+                },
             )
             .unwrap();
 
@@ -553,7 +542,9 @@ mod tests {
             .interpret_with(
                 vec![Scalar::from(3.0), Scalar::from(2.0)],
                 |_, constant| Ok::<_, ProgramError>(Scalar::from(constant.index() as f64)),
-                |instruction, inputs| instruction.operation().interpret(&EagerContext::new(), inputs),
+                |instruction, inputs| {
+                    instruction.operation().interpret(&crate::EagerContext::<DataType, Scalar>::new(), inputs)
+                },
             )
             .unwrap();
 
@@ -613,7 +604,9 @@ mod tests {
             .interpret_with_captures(
                 vec![Scalar::from(2.0)],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| instruction.operation().interpret(&EagerContext::new(), inputs),
+                |instruction, inputs| {
+                    instruction.operation().interpret(&crate::EagerContext::<DataType, Scalar>::new(), inputs)
+                },
             )
             .unwrap();
         assert_eq!(output, vec![101.0]);
