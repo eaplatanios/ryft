@@ -2317,12 +2317,12 @@ mod tests {
             let program = builder
                 .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
                 .unwrap();
-            (program, i0, i1, v1)
+            (program, i0, i1, v0, v1)
         };
 
-        let (borrowed_program, b_i0, b_i1, b_v1) = build();
+        let (borrowed_program, b_i0, b_i1, _, b_v1) = build();
         let (borrowed, borrowed_live) = borrowed_program.filtered(&[b_i0, b_i1], &[b_v1], &[]).unwrap();
-        let (owned_program, o_i0, o_i1, o_v1) = build();
+        let (owned_program, o_i0, o_i1, _, o_v1) = build();
         let (owned, owned_live) = owned_program.into_filtered(&[o_i0, o_i1], &[o_v1], &[]).unwrap();
 
         // The consuming variant drops the dead input, lifts the constant, and is identical to the borrowing `filter`.
@@ -2331,6 +2331,15 @@ mod tests {
         assert_eq!(owned.input_ids().len(), 1);
         assert_eq!(owned.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-2.0)]));
         assert_eq!(owned.to_string(), borrowed.to_string());
+
+        // Keep-alive entries follow the same contract as the borrowing `filtered`: keeping `v1` alive moves its
+        // otherwise-pruned `add` and constant into the projection onto `v0`, without widening the outputs.
+        let (kept_program, k_i0, _, k_v0, k_v1) = build();
+        let (kept, kept_live) = kept_program.into_filtered(&[k_i0], &[k_v0], &[k_v1]).unwrap();
+        assert_eq!(kept_live, vec![0]);
+        assert_eq!(kept.instructions().len(), 2);
+        assert_eq!(kept.output_ids().len(), 1);
+        assert_eq!(kept.interpret(vec![Scalar::from(4.0)]), Ok(vec![Scalar::from(-4.0)]));
     }
 
     #[test]
