@@ -62,16 +62,16 @@ impl<T: Type, V: Value<T>> Typed<T> for PartialValue<T, V> {
 /// Represents the way in which a [`PartialEvaluationValue`] is represented when _residual_ work depends on it.
 /// A [`PartialValue`] only records whether a value is known now or unknown until a residual [`Program`] runs.
 /// [`PartialValueMaterialization`] records how that value is represented at the residual boundary. The optional
-/// `source_atom` fields are source-program deduplication keys which let [`PartialEvaluationContext`]s reuse the same
-/// residual [`PartialValueMaterialization::Input`] or [`PartialValueMaterialization::Constant`] when the same known
-/// source value is materialized more than once in the current scope. They are `None` for known values synthesized by
-/// partial evaluation rules or otherwise not tied to a stable [`Atom`] in the source program. By contrast, the
-/// `residual_atom` field represents an atom _in_ the residual program and is required because
-/// [`PartialValueMaterialization::Variable`] values have already been emitted there.
+/// `source_atom` fields are source-program deduplication keys which let [`PartialEvaluator`]s reuse the same residual
+/// [`PartialValueMaterialization::Input`] or [`PartialValueMaterialization::Constant`] when the same known source
+/// value is materialized more than once in the current scope. They are `None` for known values synthesized by partial
+/// evaluation rules or otherwise not tied to a stable [`Atom`] in the source program. By contrast, the `residual_atom`
+/// field represents an atom _in_ the residual program and is required because [`PartialValueMaterialization::Variable`]
+/// values have already been emitted there.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PartialValueMaterialization {
     /// Known value with no residual materialization decision yet. If residual work depends on it, the corresponding
-    /// [`PartialEvaluationContext`] will materialize it as a fresh residual input.
+    /// [`PartialEvaluator`] will materialize it as a fresh residual input.
     Undecided,
 
     /// Known value that should be materialized as a residual program input.
@@ -99,7 +99,7 @@ pub enum PartialValueMaterialization {
     },
 }
 
-/// Represents the [`Value`] type used by [`PartialEvaluationContext`]s while partially evaluating [`Program`]s.
+/// Represents the [`Value`] type used by [`PartialEvaluator`]s while partially evaluating [`Program`]s.
 #[derive(Clone, Debug)]
 pub struct PartialEvaluationValue<T: Type, V: Value<T>> {
     /// Underlying [`PartialValue`] that represents the abstract known/unknown classification of the value.
@@ -313,8 +313,8 @@ impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
 
 /// [`Operation`] that supports partial evaluation via [`Program::partially_evaluate`]. This trait lets an individual
 /// operation decide how partial evaluation treats it. It can be implemented with an empty implementation block,
-/// deferring to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior
-/// can be customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
+/// deferring to [`PartialEvaluator::fold_or_residualize`], which is what most operations do, or its behavior can be
+/// customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
 ///
 /// # Type Parameters
 ///
@@ -326,8 +326,8 @@ impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
 ///     under [`StagingContext`]s).
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
-    /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses
-    /// the following semantics:
+    /// overridden, this function will default to calling [`PartialEvaluator::fold_or_residualize`] which uses the
+    /// following semantics:
     ///
     ///   - When *all* of the operation's inputs are [`Known`](PartialValue::Known), it **folds** the operation by
     ///     [`bind`](Context::bind)ing it in the known-side context, interpreting it immediately under an eager context,
@@ -340,7 +340,7 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///
     /// There are situations where overriding this function can result in improved performance and better partitioning
     /// of a computation into known and unknown parts. For example, a `condition` instruction whose predicate is
-    /// [`Known`](PartialValue::Known) and concretizable may ask the context to inline the selected branch and return
+    /// [`Known`](PartialValue::Known) and concretizable may ask the evaluator to inline the selected branch and return
     /// that branch's output trace values, so that the condition disappears from the residual program and only the taken
     /// branch's work survives. Rules that inspect known *payloads* must gate that inspection on a
     /// [`Concrete`](ValueResolution::Concrete) [`Context::resolve`] resolution because a known value under a staging
@@ -349,15 +349,15 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     ///
     /// # Parameters
     ///
-    ///   - `context`: [`PartialEvaluationContext`] that owns residual emission, inlining, and materialization.
+    ///   - `evaluator`: [`PartialEvaluator`] that owns residual emission, inlining, and materialization.
     ///   - `inputs`: [`PartialEvaluationValue`] for each of this operation's inputs, in input order.
     #[inline]
     fn partially_evaluate(
         &self,
-        context: &mut PartialEvaluationContext<C>,
+        evaluator: &mut PartialEvaluator<C>,
         inputs: &[PartialEvaluationValue<C::Type, C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
-        context.fold_or_residualize(self.clone(), inputs)
+        evaluator.fold_or_residualize(self.clone(), inputs)
     }
 }
 
@@ -399,60 +399,83 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> PartiallyEvaluatab
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Driver of one [`Program::partially_evaluate`] walk. A [`PartialEvaluator`] carries out partial evaluation of a flat
+/// [`Program`], accumulating the residual program as it goes and folding known subcomputations through the known-side
+/// [`Context`]. It owns the [`ProgramBuilder`] that accumulates the residual program, the known-side [`Context`] used
+/// to fold known subcomputations (where folding [`bind`](Context::bind)s the operation in that context, which
+/// interprets it immediately under an eager context and stages it into the outer program under a staging context),
+/// and the running list of residual inputs. The recursive inline walk handles a flat program (i.e., the top-level
+/// program, or an inlined nested program) and returns the walk value of each of its outputs.
+pub struct PartialEvaluator<C: Context> {
+    /// Known-side [`Context`] used to fold [`Instruction`](crate::Instruction)s whose inputs are all known.
+    context: C,
 
-/// Shared residual-build state threaded through the recursive partial-evaluation walk of
-/// [`Program::partially_evaluate`].
-///
-/// It owns the [`ProgramBuilder`] that accumulates the residual program, the known-side [`Context`] used to fold
-/// known subcomputations — folding [`bind`](Context::bind)s the operation in that context, which interprets it
-/// immediately under an eager context and stages it into the outer program under a staging context — and the running
-/// list of residual inputs. The recursive inline walk handles a flat program (the top-level program, or an inlined
-/// nested branch) and returns the walk value of each of its outputs.
-pub struct PartialEvaluationContext<C: Context> {
-    /// Builder accumulating the residual program's atoms and instructions.
+    /// [`ProgramBuilder`] accumulating the residual program's [`Atom`]s and [`Instruction`](crate::Instruction)s.
     builder: ProgramBuilder<C::Type, C::Constant, C::Operation>,
 
-    /// Known-side context used to fold instructions whose inputs are all known.
-    known_context: C,
+    /// [`PartialEvaluationInput`]s for the residual program, in residual program input order.
+    inputs: Vec<PartialEvaluationInput<C::Value>>,
 
-    /// How to feed each residual-program input, in residual-program input order.
-    residual_inputs: Vec<PartialEvaluationInput<C::Value>>,
-
-    /// Per-inlined-program materialization scopes. Each scope is indexed by the atoms of the program currently being
-    /// walked and stores the corresponding residual-program atom when a known value has already been materialized.
+    /// Per-program materialization scopes deduplicating each known value's residual [`PartialValueMaterialization`]
+    /// by its *source-program* [`Atom`], keyed structurally so one known variable consumed by several residualized
+    /// [`Instruction`](crate::Instruction)s yields a single residual input (or inline constant) rather than one per
+    /// consumer. When a residualized instruction consumes a known variable, that variable is materialized into the
+    /// residual program (as a residual input or as an inline constant) and its source atom's slot records the
+    /// resulting residual [`Atom`], so that later consumers of the same source atom can reuse it. This is a [`Vec`]
+    /// of scopes rather than a single table because the walk recurses into inlined nested programs (e.g., a known
+    /// predicate `condition` instruction inlining its branch through [`inline_program`](Self::inline_program)), and
+    /// each program has its own [`AtomId`] space starting at zero. A single flat table would conflate atom `k` of an
+    /// inlined nested program with atom `k` of the enclosing program and hand back the wrong residual atom, and so
+    /// [`inline_program`](Self::inline_program) pushes a fresh scope sized to the nested program before walking it,
+    /// and pops it afterward. [`materialized`](Self::materialized) and [`set_materialized`](Self::set_materialized)
+    /// act on the innermost scope.
+    ///
+    /// Note that this is the *primary*, always-active deduplication, and the only one available in two cases the
+    /// walk-global [`staged_feeders`](Self::staged_feeders) cannot cover: under an eager known-side [`Context`], where
+    /// known values resolve to [`Concrete`](ValueResolution::Concrete) instances and so carry no staged identity to key
+    /// on, and for inline constants, whose materialization never consults a staged identity at all.
     materialization_scopes: Vec<Vec<Option<AtomId>>>,
 
-    /// Walk-global materialization table for known values with a *staged* identity (a
-    /// [`Staged`](ValueResolution::Staged) [`Context::resolve`] resolution), mapping the known-side context's staged
-    /// atom to the residual input already created for it. Unlike the
-    /// per-inlined-program `materialization_scopes`, staged atoms are stable across the whole walk, so two known
-    /// feeders naming the same outer atom deduplicate to one residual input even across inlined programs and for
-    /// rule-produced knowns that carry no source atom.
+    /// Walk-global deduplication of residual *input* feeders by the known value's *staged* identity
+    /// (i.e., the outer program [`Atom`] a known value names when it [`resolve`](Context::resolve)s as a
+    /// [`Staged`](ValueResolution::Staged) instance in a staging known-side context), mapping the staged [`Atom`] to
+    /// the residual input already created for it.
+    /// 
+    /// This complements the per-program [`materialization_scopes`](Self::materialization_scopes) along the axis that
+    /// scope-local, source-atom-keyed deduplication cannot reach. Staged atoms are stable identities across the whole
+    /// walk (an outer-trace atom is the same value no matter which inlined program is being walked), and so two known
+    /// feeders naming the same outer atom collapse to one residual input even when they arise in *different* inlined
+    /// programs, and even for rule-produced knowns that carry no source atom to key the per-program table on. It holds
+    /// only under a *staging* known-side context because an eager context resolves knowns as
+    /// [`Concrete`](ValueResolution::Concrete) rather than [`Staged`](ValueResolution::Staged), and so nothing
+    /// is ever recorded in that case, and inline constants are excluded because they carry no staged identity.
     staged_feeders: HashMap<AtomId, AtomId>,
 }
 
-impl<C: Context> PartialEvaluationContext<C> {
-    /// Creates a fresh partial-evaluation context that folds known work through `known_context` and accumulates
+impl<C: Context> PartialEvaluator<C> {
+    /// Creates a fresh [`PartialEvaluator`] that folds known work through `context` and accumulates
     /// residual work in a new residual [`ProgramBuilder`].
-    pub fn new(known_context: C) -> Self {
+    #[inline]
+    pub fn new(context: C) -> Self {
         Self {
+            context,
             builder: ProgramBuilder::new(),
-            known_context,
-            residual_inputs: Vec::new(),
+            inputs: Vec::new(),
             materialization_scopes: Vec::new(),
             staged_feeders: HashMap::new(),
         }
     }
 
-    /// Returns the known-side context used to fold known subcomputations.
+    /// Returns the known-side [`Context`] of this [`PartialEvaluator`] which is used to fold known subcomputations.
     #[inline]
-    pub fn known_context(&self) -> &C {
-        &self.known_context
+    pub fn context(&self) -> &C {
+        &self.context
     }
 
-    /// Recovers the staged-constant payload of the known value `value` through [`Context::resolve`], reporting a
-    /// [`ProgramError`] when the known-side context cannot prove that the value is a concrete constant.
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Recovers the staged-constant payload of the provided known value `value` through [`Context::resolve`], reporting
+    /// a [`ProgramError`] when the known-side [`Context`] cannot prove that the provided value is a concrete constant.
     ///
     /// Higher-order rules use this when they must embed a known value *inside* a nested residual program (e.g., a
     /// folded loop-invariant carry spliced into a rebuilt `scan` body), where only a program constant can represent
@@ -461,7 +484,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// literal-backed values, and the caller must treat the error as "this rewrite is not available" and fall back to
     /// a conservative alternative.
     pub fn known_constant_payload(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
-        self.known_context.resolve(value).into_concrete().ok_or_else(|| {
+        self.context.resolve(value).into_concrete().ok_or_else(|| {
             ProgramError::MalformedProgram(
                 "a known value crossing into a nested residual program is not concretizable in the active \
                  known-side context"
@@ -480,12 +503,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// live-context probe must check this and fall back to a conservative rewrite when it returns `false`.
     pub fn knowns_are_concrete(&self, evaluation: &PartialEvaluation<C>) -> bool {
         let input_knowns_concrete = evaluation.inputs.iter().all(|input| match input {
-            PartialEvaluationInput::Known(value) => self.known_context.resolve(value).is_concrete(),
+            PartialEvaluationInput::Known(value) => self.context.resolve(value).is_concrete(),
             PartialEvaluationInput::Unknown(_) => true,
         });
         input_knowns_concrete
             && evaluation.outputs.iter().all(|output| match output {
-                PartialEvaluationOutput::Known(value) => self.known_context.resolve(value).is_concrete(),
+                PartialEvaluationOutput::Known(value) => self.context.resolve(value).is_concrete(),
                 PartialEvaluationOutput::Unknown(_) => true,
             })
     }
@@ -496,12 +519,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// default fold-or-residualize behavior byte-for-byte.
     pub fn has_symbolic_known(&self, inputs: &[PartialEvaluationValue<C::Type, C::Value>]) -> bool {
         inputs.iter().any(|input| match input.value() {
-            PartialValue::Known(value) => !self.known_context.resolve(value).is_concrete(),
+            PartialValue::Known(value) => !self.context.resolve(value).is_concrete(),
             PartialValue::Unknown(_) => false,
         })
     }
 
-    /// Binds `operation` in this partial-evaluation context.
+    /// Binds `operation` through this partial evaluator.
     #[inline]
     pub fn bind<P: Into<C::Operation>>(
         &mut self,
@@ -550,7 +573,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
             Ok(self
-                .known_context
+                .context
                 .bind(operation, known.as_slice())?
                 .into_iter()
                 .map(PartialEvaluationValue::known)
@@ -580,71 +603,64 @@ impl<C: Context> PartialEvaluationContext<C> {
     where
         C::Operation: Clone + PartiallyEvaluatableOperation<C>,
     {
+        // A fresh materialization scope isolates this program's source-atom deduplication to its own atom space (see
+        // `materialization_scopes`). The walk runs inside a closure so the scope is popped on every exit path,
+        // including error paths, keeping the scope stack balanced.
         self.materialization_scopes.push(vec![None; program.atoms.len()]);
-        let result = self.inline_scoped(program, inputs);
+        let result = (|| -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+            // Walk-time value of each atom in `program`, populated as the forward pass reaches it.
+            let mut values: Vec<Option<PartialEvaluationValue<C::Type, C::Value>>> = vec![None; program.atoms.len()];
+            for (input_id, value) in program.input_ids.iter().copied().zip(inputs) {
+                values[input_id.index()] = Some(value.bind(input_id));
+            }
+
+            for instruction in program.instructions.iter() {
+                // Resolve instruction inputs as walk values, lifting a program constant to `Known` on first use.
+                let mut inputs: Vec<PartialEvaluationValue<C::Type, C::Value>> =
+                    Vec::with_capacity(instruction.inputs().len());
+                for input_id in instruction.inputs().iter().copied() {
+                    let value = match values[input_id.index()].clone() {
+                        Some(value) => value,
+                        None => match &program.atoms[input_id.index()] {
+                            Atom::Constant(constant) => {
+                                let value = PartialEvaluationValue::known_constant(
+                                    self.context.lift(constant.clone())?,
+                                    Some(input_id),
+                                );
+                                values[input_id.index()] = Some(value.clone());
+                                value
+                            }
+                            Atom::Variable(_) => return Err(ProgramError::UnboundAtomId { id: input_id }),
+                        },
+                    };
+                    inputs.push(value);
+                }
+
+                let outputs = instruction.operation().partially_evaluate(self, inputs.as_slice())?;
+                check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
+                    values[output_id.index()] = Some(output.bind(output_id));
+                }
+            }
+
+            program
+                .output_ids
+                .iter()
+                .copied()
+                .map(|output_id| match values[output_id.index()].clone() {
+                    Some(value) => Ok(value),
+                    None => match &program.atoms[output_id.index()] {
+                        Atom::Constant(constant) => Ok(PartialEvaluationValue::known_constant(
+                            self.context.lift(constant.clone())?,
+                            Some(output_id),
+                        )),
+                        Atom::Variable(_) => Err(ProgramError::UnboundAtomId { id: output_id }),
+                    },
+                })
+                .collect()
+        })();
         self.materialization_scopes.pop();
         result
-    }
-
-    /// Implementation of [`Self::inline_program`] for a program whose materialization scope has already been pushed.
-    fn inline_scoped(
-        &mut self,
-        program: &Program<C::Type, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        inputs: Vec<PartialEvaluationValue<C::Type, C::Value>>,
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError>
-    where
-        C::Operation: Clone + PartiallyEvaluatableOperation<C>,
-    {
-        // Walk-time value of each atom in `program`, populated as the forward pass reaches it.
-        let mut values: Vec<Option<PartialEvaluationValue<C::Type, C::Value>>> = vec![None; program.atoms.len()];
-        for (input_id, value) in program.input_ids.iter().copied().zip(inputs) {
-            values[input_id.index()] = Some(value.bind(input_id));
-        }
-
-        for instruction in program.instructions.iter() {
-            // Resolve instruction inputs as walk values, lifting a program constant to `Known` on first use.
-            let mut inputs: Vec<PartialEvaluationValue<C::Type, C::Value>> =
-                Vec::with_capacity(instruction.inputs().len());
-            for input_id in instruction.inputs().iter().copied() {
-                let value = match values[input_id.index()].clone() {
-                    Some(value) => value,
-                    None => match &program.atoms[input_id.index()] {
-                        Atom::Constant(constant) => {
-                            let value = PartialEvaluationValue::known_constant(
-                                self.known_context.lift(constant.clone())?,
-                                Some(input_id),
-                            );
-                            values[input_id.index()] = Some(value.clone());
-                            value
-                        }
-                        Atom::Variable(_) => return Err(ProgramError::UnboundAtomId { id: input_id }),
-                    },
-                };
-                inputs.push(value);
-            }
-
-            let outputs = instruction.operation().partially_evaluate(self, inputs.as_slice())?;
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-            for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
-                values[output_id.index()] = Some(output.bind(output_id));
-            }
-        }
-
-        program
-            .output_ids
-            .iter()
-            .copied()
-            .map(|output_id| match values[output_id.index()].clone() {
-                Some(value) => Ok(value),
-                None => match &program.atoms[output_id.index()] {
-                    Atom::Constant(constant) => Ok(PartialEvaluationValue::known_constant(
-                        self.known_context.lift(constant.clone())?,
-                        Some(output_id),
-                    )),
-                    Atom::Variable(_) => Err(ProgramError::UnboundAtomId { id: output_id }),
-                },
-            })
-            .collect()
     }
 
     /// Emits an operation into the residual program over the provided residual-program input atoms and returns its
@@ -679,46 +695,36 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.emit_residual(operation, input_atoms)
     }
 
-    /// Maps a trace value to a residual-program atom, deduplicating known values with source atoms in the current
-    /// materialization scope.
-    fn materialize(&mut self, value: &PartialEvaluationValue<C::Type, C::Value>) -> Result<AtomId, ProgramError> {
-        match value.materialization() {
-            PartialValueMaterialization::Variable { residual_atom } => Ok(residual_atom),
-            PartialValueMaterialization::Undecided => {
-                self.materialize_known_with_source_atom(value.as_known(), None, false)
-            }
-            PartialValueMaterialization::Input { source_atom } => {
-                self.materialize_known_with_source_atom(value.as_known(), source_atom, false)
-            }
-            PartialValueMaterialization::Constant { source_atom } => {
-                self.materialize_known_with_source_atom(value.as_known(), source_atom, true)
-            }
-        }
-    }
-
-    /// Materializes a known value as either a residual-program constant or input, deduplicated by `source_atom` when
-    /// provided and, for inputs, additionally by the value's staged identity when it
-    /// [`resolve`](Context::resolve)s as [`Staged`](ValueResolution::Staged) in the known-side context.
+    /// Maps a trace value to a residual-program atom.
+    ///
+    /// A residual variable is already a residual atom. Every known value reduces to the same materialization: it
+    /// becomes either a residual-program input or an inline residual-program constant (a
+    /// [`Constant`](PartialValueMaterialization::Constant) materialization), deduplicated by its source atom in the
+    /// current materialization scope when it has one and, for inputs, additionally by the value's staged identity
+    /// when it [`resolve`](Context::resolve)s as [`Staged`](ValueResolution::Staged) in the known-side context.
     ///
     /// Constant materialization recovers the value's staged-constant payload through [`Context::resolve`]: a
-    /// [`Constant`](PartialValueMaterialization::Constant) materialization is only ever attached to values that originated
-    /// as literals — walked-program constants lifted into the known-side context, or rule-produced
+    /// [`Constant`](PartialValueMaterialization::Constant) materialization is only ever attached to values that
+    /// originated as literals — walked-program constants lifted into the known-side context, or rule-produced
     /// [`known_constant`](PartialEvaluationValue::known_constant) values — so the recovery is expected to succeed and
     /// a failure reports a [`ProgramError`]. This is what keeps the residual program in the staged-constant space:
     /// under a staging known-side context the known value is a [`Tracer`](crate::Tracer), which can never itself be a
     /// residual-program constant.
-    fn materialize_known_with_source_atom(
-        &mut self,
-        value: Option<&C::Value>,
-        source_atom: Option<AtomId>,
-        constant: bool,
-    ) -> Result<AtomId, ProgramError> {
+    fn materialize(&mut self, value: &PartialEvaluationValue<C::Type, C::Value>) -> Result<AtomId, ProgramError> {
+        // A residual variable is already a residual atom; every known value differs only in its source-atom
+        // deduplication key and whether it materializes as an inline constant.
+        let (source_atom, constant) = match value.materialization() {
+            PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
+            PartialValueMaterialization::Undecided => (None, false),
+            PartialValueMaterialization::Input { source_atom } => (source_atom, false),
+            PartialValueMaterialization::Constant { source_atom } => (source_atom, true),
+        };
         if let Some(source_atom) = source_atom {
             if let Some(atom) = self.materialized(source_atom)? {
                 return Ok(atom);
             }
         }
-        let value = value.ok_or_else(|| {
+        let value = value.as_known().ok_or_else(|| {
             ProgramError::MalformedProgram(
                 "residual materialization marked an unknown value as a known residual".to_string(),
             )
@@ -726,7 +732,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let staged_atom = if constant {
             None
         } else {
-            match self.known_context.resolve(value) {
+            match self.context.resolve(value) {
                 ValueResolution::Staged(atom) => Some(atom),
                 _ => None,
             }
@@ -740,7 +746,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             }
         }
         let atom = if constant {
-            let payload = self.known_context.resolve(value).into_concrete().ok_or_else(|| {
+            let payload = self.context.resolve(value).into_concrete().ok_or_else(|| {
                 ProgramError::MalformedProgram(
                     "residual materialization required a constant payload for a known value that is not \
                      concretizable in the active known-side context"
@@ -750,7 +756,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             self.builder.add_constant(payload)
         } else {
             let atom = self.builder.add_input(value.r#type().into_owned());
-            self.residual_inputs.push(PartialEvaluationInput::Known(value.clone()));
+            self.inputs.push(PartialEvaluationInput::Known(value.clone()));
             atom
         };
         if let Some(source_atom) = source_atom {
@@ -853,7 +859,7 @@ where
     ///
     /// Each instruction is first offered to its own [`PartiallyEvaluatableOperation::partially_evaluate`] rule, which
     /// may override this default. For example, a `condition` with a concretizable known predicate calls
-    /// [`PartialEvaluationContext::inline_program`] to inline its selected branch in place of the operation, so the
+    /// [`PartialEvaluator::inline_program`] to inline its selected branch in place of the operation, so the
     /// condition disappears from the residual program. Building the residual program with a builder (rather than
     /// projecting the original) is what lets these rules emit *transformed* work; flat instructions with no override
     /// are emitted unchanged. The walk is flat per program but can recurse through operation rules into inlined nested
@@ -913,11 +919,11 @@ where
     ///
     /// # Parameters
     ///
-    ///   - `known_context`: Known-side context used to fold instructions whose inputs are all known.
+    ///   - `context`: Known-side context used to fold instructions whose inputs are all known.
     ///   - `inputs`: Knowledge state for each program input, in input order.
     pub fn partially_evaluate_in_context<C>(
         &self,
-        known_context: &C,
+        context: &C,
         inputs: &[PartialValue<T, C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError>
     where
@@ -928,7 +934,7 @@ where
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids.len(), actual: inputs.len() });
         }
 
-        let mut residual = PartialEvaluationContext::new(known_context.clone());
+        let mut residual = PartialEvaluator::new(context.clone());
 
         // Seed top-level inputs: known inputs hold their value; unknown inputs lead the residual program's inputs.
         let mut seed = Vec::with_capacity(inputs.len());
@@ -939,7 +945,7 @@ where
                 }
                 PartialValue::Unknown(r#type) => {
                     let atom = residual.builder.add_input(r#type.clone());
-                    residual.residual_inputs.push(PartialEvaluationInput::Unknown(index));
+                    residual.inputs.push(PartialEvaluationInput::Unknown(index));
                     seed.push(PartialEvaluationValue::variable(r#type.clone(), atom));
                 }
             }
@@ -966,7 +972,7 @@ where
         }
 
         let output_count = residual_output_atoms.len();
-        let residual_inputs = residual.residual_inputs;
+        let residual_inputs = residual.inputs;
         let residual_program = residual
             .builder
             .build::<Vec<V>, Vec<V>>(
@@ -1826,17 +1832,17 @@ mod tests {
     impl PartiallyEvaluatableOperation<TestKnownContext> for TestPartialEvaluationOperation {
         fn partially_evaluate(
             &self,
-            context: &mut PartialEvaluationContext<TestKnownContext>,
+            evaluator: &mut PartialEvaluator<TestKnownContext>,
             inputs: &[PartialEvaluationValue<DataType, Scalar>],
         ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
             match self {
-                Self::Add(operation) => operation.partially_evaluate(context, inputs),
-                Self::Mul(operation) => operation.partially_evaluate(context, inputs),
-                Self::SplitConstantVariable(operation) => operation.partially_evaluate(context, inputs),
-                Self::MultiInstructionRewrite(operation) => operation.partially_evaluate(context, inputs),
-                Self::Inline(operation) => operation.partially_evaluate(context, inputs),
-                Self::InvalidResidualOutput(operation) => operation.partially_evaluate(context, inputs),
-                Self::TooManyOutputs(operation) => operation.partially_evaluate(context, inputs),
+                Self::Add(operation) => operation.partially_evaluate(evaluator, inputs),
+                Self::Mul(operation) => operation.partially_evaluate(evaluator, inputs),
+                Self::SplitConstantVariable(operation) => operation.partially_evaluate(evaluator, inputs),
+                Self::MultiInstructionRewrite(operation) => operation.partially_evaluate(evaluator, inputs),
+                Self::Inline(operation) => operation.partially_evaluate(evaluator, inputs),
+                Self::InvalidResidualOutput(operation) => operation.partially_evaluate(evaluator, inputs),
+                Self::TooManyOutputs(operation) => operation.partially_evaluate(evaluator, inputs),
             }
         }
     }
@@ -1867,11 +1873,11 @@ mod tests {
     impl PartiallyEvaluatableOperation<TestKnownContext> for SplitConstantVariableOperation {
         fn partially_evaluate(
             &self,
-            context: &mut PartialEvaluationContext<TestKnownContext>,
+            evaluator: &mut PartialEvaluator<TestKnownContext>,
             inputs: &[PartialEvaluationValue<DataType, Scalar>],
         ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
             check_count!("input", inputs, 1, ProgramError);
-            let doubled = context.bind(AddOperation, &[inputs[0].clone(), inputs[0].clone()])?;
+            let doubled = evaluator.bind(AddOperation, &[inputs[0].clone(), inputs[0].clone()])?;
             Ok(vec![PartialEvaluationValue::known(Scalar::from(7.0)), doubled[0].clone()])
         }
     }
@@ -1902,13 +1908,13 @@ mod tests {
     impl PartiallyEvaluatableOperation<TestKnownContext> for MultiInstructionRewriteOperation {
         fn partially_evaluate(
             &self,
-            context: &mut PartialEvaluationContext<TestKnownContext>,
+            evaluator: &mut PartialEvaluator<TestKnownContext>,
             inputs: &[PartialEvaluationValue<DataType, Scalar>],
         ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
             check_count!("input", inputs, 1, ProgramError);
-            let squared = context.bind(MulOperation, &[inputs[0].clone(), inputs[0].clone()])?;
-            let doubled = context.bind(AddOperation, &[inputs[0].clone(), inputs[0].clone()])?;
-            context.bind(AddOperation, &[squared[0].clone(), doubled[0].clone()])
+            let squared = evaluator.bind(MulOperation, &[inputs[0].clone(), inputs[0].clone()])?;
+            let doubled = evaluator.bind(AddOperation, &[inputs[0].clone(), inputs[0].clone()])?;
+            evaluator.bind(AddOperation, &[squared[0].clone(), doubled[0].clone()])
         }
     }
 
@@ -1939,10 +1945,10 @@ mod tests {
     impl PartiallyEvaluatableOperation<TestKnownContext> for InlineProgramOperation {
         fn partially_evaluate(
             &self,
-            context: &mut PartialEvaluationContext<TestKnownContext>,
+            evaluator: &mut PartialEvaluator<TestKnownContext>,
             inputs: &[PartialEvaluationValue<DataType, Scalar>],
         ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            context.inline_program(&self.program, inputs.to_vec())
+            evaluator.inline_program(&self.program, inputs.to_vec())
         }
     }
 
@@ -1972,7 +1978,7 @@ mod tests {
     impl PartiallyEvaluatableOperation<TestKnownContext> for InvalidResidualOutputOperation {
         fn partially_evaluate(
             &self,
-            _context: &mut PartialEvaluationContext<TestKnownContext>,
+            _evaluator: &mut PartialEvaluator<TestKnownContext>,
             _inputs: &[PartialEvaluationValue<DataType, Scalar>],
         ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
             Ok(vec![PartialEvaluationValue::variable(DataType::F64, AtomId::new(999))])
@@ -2005,7 +2011,7 @@ mod tests {
     impl PartiallyEvaluatableOperation<TestKnownContext> for TooManyOutputsOperation {
         fn partially_evaluate(
             &self,
-            _context: &mut PartialEvaluationContext<TestKnownContext>,
+            _evaluator: &mut PartialEvaluator<TestKnownContext>,
             _inputs: &[PartialEvaluationValue<DataType, Scalar>],
         ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
             Ok(vec![PartialEvaluationValue::known(Scalar::from(1.0)), PartialEvaluationValue::known(Scalar::from(2.0))])
@@ -2225,7 +2231,7 @@ mod tests {
     }
 
     /// An executable rule can rewrite one source instruction into several residual instructions by binding through
-    /// the active partial-evaluation context.
+    /// the active partial evaluator.
     #[test]
     fn test_partially_evaluate_rule_emits_multiple_residual_operations() {
         let mut builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
