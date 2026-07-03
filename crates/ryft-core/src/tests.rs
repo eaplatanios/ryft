@@ -2573,7 +2573,7 @@ mod linearization_tests {
     /// program, partially evaluated with the primals seeded as inputs of a *fresh staging context* and the tangents
     /// unknown, reproduces the `linearize` split — the primal work folds (stages) into the outer program, the
     /// residual program is the linear tangent map, and the known feeders are the residual edges. `Program::linearize`
-    /// now *is* this walk (wrapped by `OnlineBoundaryPartialEvaluation::split` plus canonical-arity restoration), so
+    /// now *is* this walk (wrapped by `Program::partition` plus canonical-arity restoration), so
     /// the test pins that the packaged entry point and a hand-driven walk agree value-for-value: interpreting both
     /// splits at concrete primals and tangents yields identical primal outputs and identical tangents.
     #[test]

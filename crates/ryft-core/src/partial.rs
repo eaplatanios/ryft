@@ -372,41 +372,6 @@ pub struct PartitionedProgram<T: Type, V: Value<T>, O: Operation<T>> {
     pub outputs: Vec<PartialEvaluationOutput<usize>>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> PartitionedProgram<T, V, O> {
-    /// Returns the type of each residual edge, in edge order, read off the residual program's input types at the
-    /// [`Known`](PartialEvaluationInput::Known) source positions.
-    #[inline]
-    pub fn residual_edge_types(&self) -> Vec<T> {
-        self.residual_inputs
-            .iter()
-            .zip(self.residual_program.input_types())
-            .filter_map(|(source, input_type)| matches!(source, PartialEvaluationInput::Known(_)).then_some(input_type))
-            .collect()
-    }
-
-    /// Returns the original program's output index of each fully known output, aligned with the known-side
-    /// operation's leading outputs.
-    #[inline]
-    pub fn known_output_indices(&self) -> Vec<usize> {
-        self.outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, source)| matches!(source, PartialEvaluationOutput::Known(_)).then_some(index))
-            .collect()
-    }
-
-    /// Returns the original program's output index of each residual-owned output, aligned with the residual
-    /// program's outputs.
-    #[inline]
-    pub fn residual_output_indices(&self) -> Vec<usize> {
-        self.outputs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, source)| matches!(source, PartialEvaluationOutput::Unknown(_)).then_some(index))
-            .collect()
-    }
-}
-
 /// [`Operation`] that supports partial evaluation via [`Program::partially_evaluate`]. This trait lets an individual
 /// operation decide how partial evaluation treats it. It can be implemented with an empty implementation block,
 /// deferring to [`PartialEvaluator::fold_or_residualize`], which is what most operations do, or its behavior can be
