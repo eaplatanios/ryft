@@ -4,8 +4,9 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 
 use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation};
+use crate::operations::Operation;
 use crate::parameters::Placeholder;
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::TracingContext;
@@ -310,97 +311,76 @@ impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Operation that can override the default fold/residualize behavior of [`Program::partially_evaluate_in`].
-///
-/// Implemented per operation payload and forwarded by the owning operation enum's generated implementation, this
-/// trait lets an individual operation decide how partial evaluation treats it. Most operations defer to the default;
-/// control-flow operations may override. For example, a `condition` with a concretizable known predicate inlines its
-/// selected branch.
-///
-/// # Default Behavior
-///
-/// The default [`partially_evaluate`](Self::partially_evaluate) delegates to
-/// [`PartialEvaluationContext::partially_evaluate_default`]:
-///
-///   - when *all* of the operation's inputs are [`Known`](PartialValue::Known), it **folds** the operation by
-///     [`bind`](Context::bind)ing it in the known-side context — interpreting it immediately under an eager context
-///     and staging it into the outer program under a staging context — so the operation's outputs become known values
-///     and the operation contributes nothing to the residual program;
-///   - otherwise it **residualizes** the operation unchanged: it emits the operation into the residual program over
-///     its inputs' residual-program atoms, materializing each known input as a residual input for a known
-///     variable or as an inlined residual-program constant for a literal, so the operation runs at
-///     residual-program execution time.
-///
-/// # Overriding
-///
-/// A custom rule receives the active [`PartialEvaluationContext`] and its input [`PartialEvaluationValue`]s, and
-/// returns output trace values directly. For example, a `condition` whose predicate is [`Known`](PartialValue::Known)
-/// and concretizable asks the context to inline the selected branch and returns that branch's output trace values, so
-/// the condition disappears from the residual program and only the taken branch's work survives. Rules that inspect
-/// known *payloads* must gate that inspection on a [`Concrete`](crate::ValueResolution::Concrete)
-/// [`Context::resolve`] resolution, because a known value under a staging known-side context is a
-/// [`Tracer`](crate::Tracer) into the outer program rather than a concrete value, and fall back to a conservative
-/// rewrite otherwise.
+/// [`Operation`] that supports partial evaluation via [`Program::partially_evaluate`]. This trait lets an individual
+/// operation decide how partial evaluation treats it. It can be implemented with an empty implementation block,
+/// deferring to [`PartialEvaluationContext::fold_or_residualize`], which is what most operations do, or its behavior
+/// can be customized by overriding the [`PartiallyEvaluatableOperation::partially_evaluate`] function.
 ///
 /// # Type Parameters
 ///
 ///   - `C`: Known-side [`Context`] that partial evaluation folds known work through. Its
-///     [`Operation`](crate::Domain::Operation) is the operation family of the residual program and of any inlined
-///     nested programs, namely the enum this operation belongs to; its [`Constant`](crate::Domain::Constant) is the
-///     staged-constant space those programs store; and its [`Value`](crate::Domain::Value) is the space known values
-///     flow in — concrete values under an eager context and [`Tracer`](crate::Tracer)s into the outer program under a
-///     staging context.
-pub trait PartiallyEvaluatableOperation<C: Context>: Sized {
-    /// Overrides partial evaluation of this operation given its inputs' partial-evaluation trace values. The default
-    /// behavior described in the [trait documentation](Self) folds the operation when all inputs are
-    /// [`Known`](PartialValue::Known), otherwise residualizes it unchanged.
+///     [`Operation`](crate::Domain::Operation) is the operation family of the residual [`Program`] and of any inlined
+///     nested programs (e.g., the enum this operation may belong to). Its [`Constant`](crate::Domain::Constant) is the
+///     staged constant space those programs store. Finally, its [`Value`](crate::Domain::Value) is the space known
+///     values flow in (i.e., concrete values under eager contexts and [`Tracer`](crate::Tracer)s into the outer program
+///     under [`StagingContext`]s).
+pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
+    /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
+    /// overridden, this function will default to calling [`PartialEvaluationContext::fold_or_residualize`] which uses
+    /// the following semantics:
+    ///
+    ///   - When *all* of the operation's inputs are [`Known`](PartialValue::Known), it **folds** the operation by
+    ///     [`bind`](Context::bind)ing it in the known-side context, interpreting it immediately under an eager context,
+    ///     and staging it into the outer program under a [`StagingContext`], so that the operation's outputs become
+    ///     known values and the operation contributes nothing to the residual [`Program`].
+    ///   - Otherwise, it **residualizes** the operation unchanged, meaning that it emits the operation into the
+    ///     residual program over its inputs' residual program [`Atom`]s, materializing each known input as a residual
+    ///     input for a known variable or as an inlined residual program constant for a literal, so that the operation
+    ///     runs at residual program execution time.
+    ///
+    /// There are situations where overriding this function can result in improved performance and better partitioning
+    /// of a computation into known and unknown parts. For example, a `condition` instruction whose predicate is
+    /// [`Known`](PartialValue::Known) and concretizable may ask the context to inline the selected branch and return
+    /// that branch's output trace values, so that the condition disappears from the residual program and only the taken
+    /// branch's work survives. Rules that inspect known *payloads* must gate that inspection on a
+    /// [`Concrete`](ValueResolution::Concrete) [`Context::resolve`] resolution because a known value under a staging
+    /// known-side context is a [`Tracer`](crate::Tracer) into the outer program rather than a concrete value, and
+    /// partial evaluation should fall back to a conservative rewrite otherwise.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Active partial-evaluation context that owns residual emission, inlining, and materialization.
-    ///   - `inputs`: Trace value for each of this operation's inputs, in input order.
+    ///   - `context`: [`PartialEvaluationContext`] that owns residual emission, inlining, and materialization.
+    ///   - `inputs`: [`PartialEvaluationValue`] for each of this operation's inputs, in input order.
+    #[inline]
     fn partially_evaluate(
         &self,
         context: &mut PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Type, C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError>
-    where
-        Self: Clone + Into<C::Operation>,
-    {
-        context.partially_evaluate_default(self.clone(), inputs)
+    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        context.fold_or_residualize(self.clone(), inputs)
     }
 }
 
-/// Closed operation families that can recursively partially evaluate nested flat [`Program`]s of themselves.
+/// Represents closed [`Operation`] families whose nested flat [`Program`]s can be partially evaluated. This is the
+/// partial evaluation analogue of [`InterpretableProgramOperation`](crate::InterpretableProgramOperation). It names the
+/// recursive fixed point needed by higher-order partial evaluation helpers without requiring the full operation enum's
+/// [`PartiallyEvaluatableOperation`] implementation while proving that implementation. Operation families implement it
+/// by replaying nested flat [`Program`]s through their operation-owned partial evaluation rules.
 ///
-/// This is the partial-evaluation analogue of
-/// [`InterpretableProgramOperation`](crate::operations::InterpretableProgramOperation): it names the recursive fixed
-/// point that nested-program operations, such as `scan`/`while`/`condition` bodies, use to partially evaluate their
-/// bodies without restating the full [`partially_evaluate_in`](Program::partially_evaluate_in) bound at every
-/// recursive payload boundary.
-///
-/// Unlike the linearization and transposition witnesses, whose context/operation type parameters grow with each
+/// Unlike the linearization and transposition witnesses, whose context and operation type parameters grow with each
 /// recursion level and must therefore name a fixed point to stop the trait solver from diverging, this witness's
 /// known-side context parameter `C` is fixed across recursion. The blanket implementation grounds it in
-/// [`PartiallyEvaluatableOperation`], which a recursive operation enum's own generated implementation supplies, so
-/// proving it for a self-containing operation enum (one whose higher-order variants hold `Program`s of itself)
+/// [`PartiallyEvaluatableOperation`], which a recursive operation enum's own generated implementation supplies, and so
+/// proving it for a self-containing operation enum (i.e., one whose higher-order variants hold `Program`s of itself)
 /// introduces no new recursive obligation.
-///
-/// Rules must not fold a nested *split*'s probe rounds through a live staging `C` (that would stage abandoned
-/// fixed-point work into the caller's program); recursion through this witness is appropriate for folding decisions
-/// that are final, such as the converged round of the `scan`/`while` invariance fixed points, whose probe rounds fold
-/// nothing precisely because non-concretizable knowns are demoted before probing.
 pub trait PartiallyEvaluatableProgramOperation<C: Context<Operation = Self>>: Operation<C::Type> + Sized {
-    /// Partially evaluates a nested flat [`Program`] of this operation family; see
-    /// [`Program::partially_evaluate_in`].
+    /// Partially evaluates a nested flat [`Program`].
     ///
     /// # Parameters
     ///
     ///   - `context`: Known-side context used to fold known subcomputations.
-    ///   - `program`: Nested program to partially evaluate.
-    ///   - `inputs`: Known/unknown classification for each nested program input, in input order.
+    ///   - `program`: Nested [`Program`] to partially evaluate.
+    ///   - `inputs`: Input [`PartialValue`]s to use for partially evaluating the provided [`Program`].
     fn partially_evaluate_program(
         context: &C,
         program: &Program<C::Type, C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
@@ -408,23 +388,21 @@ pub trait PartiallyEvaluatableProgramOperation<C: Context<Operation = Self>>: Op
     ) -> Result<PartialEvaluation<C>, ProgramError>;
 }
 
-impl<C, O> PartiallyEvaluatableProgramOperation<C> for O
-where
-    C: Context<Operation = O>,
-    O: Clone + Operation<C::Type> + PartiallyEvaluatableOperation<C>,
-{
+impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> PartiallyEvaluatableProgramOperation<C> for C::Operation {
     #[inline]
     fn partially_evaluate_program(
         context: &C,
         program: &Program<C::Type, C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
         inputs: &[PartialValue<C::Type, C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError> {
-        program.partially_evaluate_in(context, inputs)
+        program.partially_evaluate_in_context(context, inputs)
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Shared residual-build state threaded through the recursive partial-evaluation walk of
-/// [`Program::partially_evaluate_in`].
+/// [`Program::partially_evaluate`].
 ///
 /// It owns the [`ProgramBuilder`] that accumulates the residual program, the known-side [`Context`] used to fold
 /// known subcomputations — folding [`bind`](Context::bind)s the operation in that context, which interprets it
@@ -562,7 +540,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// **live** known-side context (rather than a fresh, discarded one) must skip effectful programs, because a
     /// probe's folds would execute or stage the effect once per probe round; refer to the scan and while invariance
     /// fixed points for the canonical gate.
-    pub fn partially_evaluate_default<P: Into<C::Operation>>(
+    #[inline]
+    pub fn fold_or_residualize<P: Into<C::Operation>>(
         &mut self,
         operation: P,
         inputs: &[PartialEvaluationValue<C::Type, C::Value>],
@@ -853,11 +832,56 @@ where
 {
     /// Partially evaluates this flat program against the provided per-input knowledge, folding known work eagerly.
     ///
-    /// This is the eager convenience form of [`partially_evaluate_in`](Self::partially_evaluate_in), instantiated at
-    /// this program's own [`EagerContext<T, V, O>`](crate::EagerContext) — an eager known-side [`Context`] whose
-    /// value and constant spaces coincide — so known values are concrete `V`s and folding interprets each all-known
-    /// instruction immediately. Refer to [`partially_evaluate_in`](Self::partially_evaluate_in) for the full
-    /// semantics.
+    /// This is the main partial-evaluation entry point, instantiated at this program's own
+    /// [`EagerContext<T, V, O>`](crate::EagerContext) so that known values are concrete `V`s and folding interprets
+    /// each all-known instruction immediately.
+    /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context) is the context-taking core it delegates
+    /// to; supply that form a live [`StagingContext`] to fold known work into an enclosing trace instead.
+    ///
+    /// Partial evaluation classifies each [`Atom`] as *known* (computable now from the provided values) or *unknown*
+    /// (dependent on a runtime input), folds the known subcomputation away, and carves the remaining unknown
+    /// subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the known values it
+    /// actually needs.
+    ///
+    /// It is a forward pass that builds the residual program incrementally with a [`ProgramBuilder`], deliberately
+    /// built on the existing operation semantics rather than reimplementing graph machinery: every instruction whose
+    /// inputs are all [`Known`](PartialValue::Known) is folded eagerly by [`bind`](Context::bind)ing it (so no
+    /// operation semantics are duplicated) and contributes nothing to the residual program; any instruction with at
+    /// least one [`Unknown`](PartialValue::Unknown) input is emitted into the residual program over its inputs'
+    /// residual-program atoms; and the residual program is finalized with [`Program::into_simplified`], which prunes
+    /// instructions and constants that no longer feed an output.
+    ///
+    /// Each instruction is first offered to its own [`PartiallyEvaluatableOperation::partially_evaluate`] rule, which
+    /// may override this default. For example, a `condition` with a concretizable known predicate calls
+    /// [`PartialEvaluationContext::inline_program`] to inline its selected branch in place of the operation, so the
+    /// condition disappears from the residual program. Building the residual program with a builder (rather than
+    /// projecting the original) is what lets these rules emit *transformed* work; flat instructions with no override
+    /// are emitted unchanged. The walk is flat per program but can recurse through operation rules into inlined nested
+    /// programs, such as a selected `condition` branch; an instruction carrying a nested program that is *not* inlined
+    /// is folded only when all of its inputs are known and is otherwise emitted unchanged.
+    ///
+    /// Each known *variable* a residualized instruction consumes, whether a program input or a folded intermediate,
+    /// becomes a residual input of the residual program. Literal constants are rebuilt inline as residual-program
+    /// constants (their staged payload is recovered through [`Context::resolve`]), so they are never residual inputs.
+    /// The resulting [`PartialEvaluation`] carries everything a caller needs to reassemble the original outputs once
+    /// the runtime (unknown) inputs are available.
+    ///
+    /// # Relationship to [`partition`](Self::partition)
+    ///
+    /// This is the **value-carrying** form of partial evaluation: it holds known values, so it *evaluates* the known
+    /// subcomputation away (folding it through [`Context::bind`]) and applies per-operation rewrite rules, yielding a
+    /// single residual [`Program`] plus the folded output and residual-input *values*. Reach for it to **specialize
+    /// or constant-fold** a program against inputs that are known now, or (through
+    /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context)) to split a program online against
+    /// values known to a live outer trace.
+    ///
+    /// [`partition`](Self::partition) is the **structural** counterpart: from a stage id per input (no values, no
+    /// context) it *partitions* the program into per-stage sub-programs joined by residuals, folding and rewriting
+    /// nothing, which is the form linearization uses as a two-stage known/unknown split. The two are not reducible to
+    /// each other: this method requires known values and *discards* the known computation (folds it to values or
+    /// stages it into the outer program), whereas a partition keeps each stage's computation as a runnable program.
+    /// This mirrors JAX, where `partial_eval_jaxpr_nounits` is the online trace under a staging parent while
+    /// `partial_eval_jaxpr_custom` is a separate structural equation walk.
     ///
     /// # Parameters
     ///
@@ -871,75 +895,34 @@ where
             + InterpretableOperation<T, V, EagerContext<T, V, O>>
             + PartiallyEvaluatableOperation<EagerContext<T, V, O>>,
     {
-        self.partially_evaluate_in(&EagerContext::new(), inputs)
+        self.partially_evaluate_in_context(&EagerContext::new(), inputs)
     }
 
     /// Partially evaluates this flat program against the provided per-input knowledge, folding known work through the
-    /// known-side [`Context`] `C`.
+    /// known-side [`Context`] `C`. This is the context-taking core behind
+    /// [`partially_evaluate`](Self::partially_evaluate), which instantiates it at this program's own
+    /// [`EagerContext`]; refer to that method for the full semantics.
     ///
-    /// Partial evaluation classifies each [`Atom`] as *known* (computable now from the provided values) or *unknown*
-    /// (dependent on a runtime input), folds the known subcomputation away, and carves the remaining unknown
-    /// subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the known values it
-    /// actually needs. What *folding* means is owned by `C`: under an eager known-side context (see
-    /// [`partially_evaluate`](Self::partially_evaluate)) known values are concrete and folding interprets the
-    /// operation immediately, while under a [`StagingContext`] known values are
+    /// What *folding* means is owned by `C`: under an eager known-side context known values are concrete and folding
+    /// interprets the operation immediately, while under a [`StagingContext`] known values are
     /// [`Tracer`](crate::Tracer)s and folding *stages* the operation into the outer program that context is building
     /// — the parent-trace-polymorphic behavior of JAX's `JaxprTrace`, whose known side folds by binding under
-    /// whatever trace encloses it.
-    ///
-    /// It is a forward pass that builds the residual program incrementally with a [`ProgramBuilder`], deliberately
-    /// built on the existing operation semantics rather than reimplementing graph machinery: every instruction whose
-    /// inputs are all [`Known`](PartialValue::Known) is folded eagerly by [`bind`](Context::bind)ing it in
-    /// `known_context` (so no operation semantics are duplicated) and contributes nothing to the residual program;
-    /// any instruction with at least one [`Unknown`](PartialValue::Unknown) input is emitted into the residual
-    /// program over its inputs' residual-program atoms; and the residual program is finalized with
-    /// [`Program::into_simplified`], which prunes instructions and constants that no longer feed an output.
-    ///
-    /// Each instruction is first offered to its own [`PartiallyEvaluatableOperation::partially_evaluate`] rule, which
-    /// may override this default. For example, a `condition` with a concretizable known predicate calls
-    /// [`PartialEvaluationContext::inline_program`] to inline its selected branch in place of the operation, so the
-    /// condition disappears from the residual program. Building the residual program with a builder (rather than
-    /// projecting the original) is what lets these rules emit *transformed* work; flat instructions with no override
-    /// are emitted unchanged. The walk is flat per program but can recurse through operation rules into inlined nested
-    /// programs, such as a selected `condition` branch; an instruction carrying a nested program that is *not* inlined
-    /// is folded only when all of its inputs are known and is otherwise emitted unchanged.
-    ///
-    /// Each known *variable* a residualized instruction consumes, whether a program input or a folded intermediate,
-    /// becomes a residual input of the residual program — under a staging `C` these
-    /// [`Known`](PartialEvaluationInput::Known) feeders are the known→unknown residual edges connecting the outer
-    /// program to the residual program. Literal constants are rebuilt inline as residual-program constants (their
-    /// staged payload is recovered through [`Context::resolve`]), so they are never residual inputs. The resulting
-    /// [`PartialEvaluation`] carries everything a caller needs to reassemble the original outputs once the runtime
-    /// (unknown) inputs are available.
-    ///
-    /// # Relationship to [`partition`](Self::partition)
-    ///
-    /// This is the **value-carrying** form of partial evaluation: it holds known values, so it *evaluates* the known
-    /// subcomputation away (folding it through [`Context::bind`]) and applies per-operation rewrite rules, yielding a
-    /// single residual [`Program`] plus the folded output and residual-input *values*. Reach for it to **specialize
-    /// or constant-fold** a program against inputs that are known now, or to split a program online against values
-    /// known to a live outer trace.
-    ///
-    /// [`partition`](Self::partition) is the **structural** counterpart: from a stage id per input (no values, no
-    /// context) it *partitions* the program into per-stage sub-programs joined by residuals, folding and rewriting
-    /// nothing, which is the form linearization uses as a two-stage known/unknown split. The two are not reducible to
-    /// each other: this method requires known values and *discards* the known computation (folds it to values or
-    /// stages it into the outer program), whereas a partition keeps each stage's computation as a runnable program.
-    /// This mirrors JAX, where `partial_eval_jaxpr_nounits` is the online trace under a staging parent while
-    /// `partial_eval_jaxpr_custom` is a separate structural equation walk.
+    /// whatever trace encloses it, which is what lets partial evaluation split a program online against values known
+    /// to a live outer trace. Under a staging `C`, the [`Known`](PartialEvaluationInput::Known) residual feeders are
+    /// the known→unknown residual edges connecting the outer program to the residual program.
     ///
     /// # Parameters
     ///
     ///   - `known_context`: Known-side context used to fold instructions whose inputs are all known.
     ///   - `inputs`: Knowledge state for each program input, in input order.
-    pub fn partially_evaluate_in<C>(
+    pub fn partially_evaluate_in_context<C>(
         &self,
         known_context: &C,
         inputs: &[PartialValue<T, C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError>
     where
         C: Context<Type = T, Constant = V, Operation = O>,
-        O: Clone + PartiallyEvaluatableOperation<C>,
+        O: PartiallyEvaluatableOperation<C>,
     {
         if inputs.len() != self.input_ids.len() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids.len(), actual: inputs.len() });
@@ -2878,7 +2861,7 @@ mod tests {
     /// interpreting it, and a folded known value consumed by residual work becomes a known feeder naming the staged
     /// outer atom — the known→unknown residual edge.
     #[test]
-    fn test_partially_evaluate_in_stages_known_work_into_a_live_outer_trace() {
+    fn test_partially_evaluate_stages_known_work_into_a_live_outer_trace() {
         // `f(a, x) = (a * a) * x` with `a` known as an outer tracer and `x` unknown.
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let known_input = builder.add_input(DataType::F64);
@@ -2892,7 +2875,7 @@ mod tests {
         let outer = ScalarTracingContext::new();
         let known = outer.input(DataType::F64);
         let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         // The known `a * a` landed in the outer program as a staged instruction over the outer input.
         {
@@ -2918,7 +2901,7 @@ mod tests {
     /// resolution), never a lifted tracer,
     /// and it never becomes a residual input.
     #[test]
-    fn test_partially_evaluate_in_rebuilds_walked_literals_as_residual_constants_under_staging() {
+    fn test_partially_evaluate_rebuilds_walked_literals_as_residual_constants_under_staging() {
         // `f(x) = x + 5` with `x` unknown: the literal `5` crosses into the residual program.
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
@@ -2929,7 +2912,8 @@ mod tests {
             .unwrap();
 
         let outer = ScalarTracingContext::new();
-        let evaluation = program.partially_evaluate_in(&outer, &[PartialValue::Unknown(DataType::F64)]).unwrap();
+        let evaluation =
+            program.partially_evaluate_in_context(&outer, &[PartialValue::Unknown(DataType::F64)]).unwrap();
 
         assert_eq!(evaluation.inputs.len(), 1);
         assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
@@ -3026,7 +3010,7 @@ mod tests {
         let outer = TracingContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let known = outer.input(scalar_array_type());
         let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         // The known print landed in the outer program; the unknown print stayed residual.
         {
@@ -3050,7 +3034,7 @@ mod tests {
     /// input, deduplicated by its source atom in the walked program — under a staging known-side context exactly as
     /// under an eager one.
     #[test]
-    fn test_partially_evaluate_in_deduplicates_known_feeders_by_source_atom_under_staging() {
+    fn test_partially_evaluate_deduplicates_known_feeders_by_source_atom_under_staging() {
         // `f(a, x) = ((a * a) * x, (a * a) + x)` with `a` known (an outer tracer) and `x` unknown: the folded `a * a`
         // feeds both residual instructions and must become one residual input.
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
@@ -3066,7 +3050,7 @@ mod tests {
         let outer = ScalarTracingContext::new();
         let known = outer.input(DataType::F64);
         let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         assert_eq!(evaluation.program.instructions().len(), 2);
         assert_eq!(evaluation.inputs.len(), 2);
@@ -3078,7 +3062,7 @@ mod tests {
     /// staged identity (its outer atom), even though their source atoms in the walked program differ — the
     /// walk-global counterpart of per-scope source-atom deduplication.
     #[test]
-    fn test_partially_evaluate_in_deduplicates_known_feeders_by_staged_identity() {
+    fn test_partially_evaluate_deduplicates_known_feeders_by_staged_identity() {
         // `f(a, b, x) = (a * x, b + x)` with `a` and `b` both fed by the same outer tracer and `x` unknown.
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let first_known = builder.add_input(DataType::F64);
@@ -3094,7 +3078,7 @@ mod tests {
         let known = outer.input(DataType::F64);
         let knowledge =
             vec![PartialValue::Known(known.clone()), PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         // One unknown feeder plus exactly one known feeder for the shared outer tracer.
         assert_eq!(evaluation.inputs.len(), 2);
@@ -3124,7 +3108,7 @@ mod tests {
         let program = build_program();
         let context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let knowledge = vec![PartialValue::Known(Scalar::from(3.0)), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in(&context, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&context, knowledge.as_slice()).unwrap();
         assert_eq!(evaluation.interpret(&context, &[Scalar::from(5.0)]).unwrap(), vec![Scalar::from(45.0)]);
 
         // The arity check is strict in both directions: the input count must equal the number of unknown feeders,
@@ -3144,7 +3128,7 @@ mod tests {
         let outer = ScalarTracingContext::new();
         let known = outer.input(DataType::F64);
         let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
         let staged_before_replay = outer.builder().borrow().instructions().len();
         let tangent = outer.input(DataType::F64);
         let outputs = evaluation.interpret(&outer, &[tangent]).unwrap();
@@ -3157,7 +3141,7 @@ mod tests {
     /// concretizable (a literal-backed tracer), falling back to the rewritten condition with the predicate as a known
     /// feeder when it is a genuine outer tracer — the concretization gate.
     #[test]
-    fn test_partially_evaluate_in_condition_predicate_concretization_gate_under_staging() {
+    fn test_partially_evaluate_condition_predicate_concretization_gate_under_staging() {
         let build_program = || -> TestArrayProgram {
             let condition = ConditionOperation::new(
                 scalar_branch(ArrayOperation::Mul(MulOperation), 2.0),
@@ -3180,7 +3164,7 @@ mod tests {
         let outer = ArrayTracingContext::new();
         let predicate = outer.constant(boolean_array(true));
         let knowledge = vec![PartialValue::Known(predicate), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Mul(_)));
 
@@ -3190,7 +3174,7 @@ mod tests {
         let outer = ArrayTracingContext::new();
         let predicate = outer.input(ArrayType::scalar(DataType::Boolean));
         let knowledge = vec![PartialValue::Known(predicate), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
         assert_eq!(evaluation.program.instructions().len(), 1);
         assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Condition(_)));
         // The unknown input's feeder is seeded before the walk, so the predicate's known feeder follows it.
@@ -3206,7 +3190,7 @@ mod tests {
     /// can never fire speculatively (only its typed zero-padding for the peer's edge slots is staged). The residual
     /// condition stays pure.
     #[test]
-    fn test_partially_evaluate_in_condition_keeps_effectful_known_work_behind_the_outer_conditional() {
+    fn test_partially_evaluate_condition_keeps_effectful_known_work_behind_the_outer_conditional() {
         use crate::operations::debugging::PrintOperation;
 
         type ArrayTracingContext = TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>;
@@ -3247,7 +3231,7 @@ mod tests {
             PartialValue::Known(known),
             PartialValue::Unknown(scalar_array_type()),
         ];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         // The known condition carries the branch prints (visible through the nested-program effects union) and each
         // print stays inside its own branch program; the residual condition is pure.
@@ -3275,7 +3259,7 @@ mod tests {
     /// *outer* conditional instead of being staged speculatively for both branches — while the unknown work stays
     /// behind a residual condition consuming the per-branch residual edges the known condition outputs.
     #[test]
-    fn test_partially_evaluate_in_condition_composite_split_under_staging() {
+    fn test_partially_evaluate_condition_composite_split_under_staging() {
         type ArrayTracingContext = TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>;
 
         // Branches over `[k, x]`: true computes `(k + k) * x`, false computes `(k * k) + x`, so each branch has one
@@ -3318,7 +3302,7 @@ mod tests {
             PartialValue::Known(known),
             PartialValue::Unknown(scalar_array_type()),
         ];
-        let evaluation = program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         // The known halves landed in the outer program as one known condition over `[predicate, k]`, each branch
         // producing its own residual edge plus a typed zero for the peer's edge slot.
