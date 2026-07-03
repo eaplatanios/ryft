@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -652,13 +651,96 @@ impl<C: Context> PartialEvaluator<C> {
 
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Emits an operation into the residual program over the provided residual-program input atoms and returns its
-    /// outputs as residual trace values, in output order.
-    fn emit_residual<P: Into<C::Operation>>(
+    /// Emits an operation into the residual program, materializing each known input into a residual-program atom
+    /// according to its residual materialization, and returns the operation's outputs as residual trace values, in
+    /// output order.
+    ///
+    /// Materializing a known value deduplicates it two ways so a value consumed by several residualized instructions
+    /// yields one residual input (or inline constant): by its *source-program* atom within the current
+    /// materialization scope, and — for inputs — by its *staged* identity across the whole walk when it
+    /// [`resolve`](Context::resolve)s as [`Staged`](ValueResolution::Staged) in the known-side context. A
+    /// [`Constant`](PartialValueMaterialization::Constant) materialization is only ever attached to values that
+    /// originated as literals (walked-program constants lifted into the known-side context, or rule-produced
+    /// [`known_constant`](PartialEvaluationValue::known_constant) values), so recovering its payload through
+    /// [`Context::resolve`] is expected to succeed; this is what keeps the residual program in the staged-constant
+    /// space, since under a staging known-side context a known value is a [`Tracer`](crate::Tracer) that can never
+    /// itself be a residual-program constant.
+    pub fn emit_operation<P: Into<C::Operation>>(
         &mut self,
         operation: P,
-        input_atoms: Vec<AtomId>,
+        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        // Materialize each known input into a residual-program atom; the deduplication fast-paths return early, and
+        // a genuine error rides `?` out through the `collect` into `emit_operation`.
+        let input_atoms = inputs
+            .iter()
+            .map(|input| -> Result<AtomId, ProgramError> {
+                // A residual variable is already a residual atom; every known value differs only in its source-atom
+                // deduplication key and whether it materializes as an inline constant.
+                let (source_atom, constant) = match input.materialization() {
+                    PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
+                    PartialValueMaterialization::Undecided => (None, false),
+                    PartialValueMaterialization::Input { source_atom } => (source_atom, false),
+                    PartialValueMaterialization::Constant { source_atom } => (source_atom, true),
+                };
+
+                // Reuse the residual atom already created for this source atom in the current scope, if any.
+                if let Some(source_atom) = source_atom {
+                    if let Some(atom) = self.materialized(source_atom)? {
+                        return Ok(atom);
+                    }
+                }
+
+                let known = input.as_known().ok_or_else(|| {
+                    ProgramError::MalformedProgram(
+                        "residual materialization marked an unknown value as a known residual".to_string(),
+                    )
+                })?;
+
+                // Inputs (but not inline constants) additionally deduplicate across the whole walk by the value's
+                // staged identity in the known-side context; reuse the residual input already created for it, if any.
+                let staged_atom = if constant {
+                    None
+                } else {
+                    match self.context.resolve(known) {
+                        ValueResolution::Staged(atom) => Some(atom),
+                        _ => None,
+                    }
+                };
+                if let Some(staged_atom) = staged_atom {
+                    if let Some(&atom) = self.staged_feeders.get(&staged_atom) {
+                        if let Some(source_atom) = source_atom {
+                            self.set_materialized(source_atom, atom)?;
+                        }
+                        return Ok(atom);
+                    }
+                }
+
+                // No dedup hit: create a fresh residual constant (recovering the literal payload) or residual input,
+                // then record it under whichever dedup keys apply.
+                let atom = if constant {
+                    let payload = self.context.resolve(known).into_concrete().ok_or_else(|| {
+                        ProgramError::MalformedProgram(
+                            "residual materialization required a constant payload for a known value that is not \
+                             concretizable in the active known-side context"
+                                .to_string(),
+                        )
+                    })?;
+                    self.builder.add_constant(payload)
+                } else {
+                    let atom = self.builder.add_input(known.r#type().into_owned());
+                    self.inputs.push(PartialEvaluationInput::Known(known.clone()));
+                    atom
+                };
+                if let Some(source_atom) = source_atom {
+                    self.set_materialized(source_atom, atom)?;
+                }
+                if let Some(staged_atom) = staged_atom {
+                    self.staged_feeders.insert(staged_atom, atom);
+                }
+                Ok(atom)
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
         let outputs = self.builder.add_instruction(operation, input_atoms)?.to_vec();
         Ok(outputs
             .iter()
@@ -668,93 +750,6 @@ impl<C: Context> PartialEvaluator<C> {
                 PartialEvaluationValue::variable(r#type, atom)
             })
             .collect())
-    }
-
-    /// Emits an operation into the residual program, materializing known inputs according to their residual
-    /// materializations.
-    pub fn emit_operation<P: Into<C::Operation>>(
-        &mut self,
-        operation: P,
-        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
-        let mut input_atoms = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            input_atoms.push(self.materialize(input)?);
-        }
-        self.emit_residual(operation, input_atoms)
-    }
-
-    /// Maps a trace value to a residual-program atom.
-    ///
-    /// A residual variable is already a residual atom. Every known value reduces to the same materialization: it
-    /// becomes either a residual-program input or an inline residual-program constant (a
-    /// [`Constant`](PartialValueMaterialization::Constant) materialization), deduplicated by its source atom in the
-    /// current materialization scope when it has one and, for inputs, additionally by the value's staged identity
-    /// when it [`resolve`](Context::resolve)s as [`Staged`](ValueResolution::Staged) in the known-side context.
-    ///
-    /// Constant materialization recovers the value's staged-constant payload through [`Context::resolve`]: a
-    /// [`Constant`](PartialValueMaterialization::Constant) materialization is only ever attached to values that
-    /// originated as literals — walked-program constants lifted into the known-side context, or rule-produced
-    /// [`known_constant`](PartialEvaluationValue::known_constant) values — so the recovery is expected to succeed and
-    /// a failure reports a [`ProgramError`]. This is what keeps the residual program in the staged-constant space:
-    /// under a staging known-side context the known value is a [`Tracer`](crate::Tracer), which can never itself be a
-    /// residual-program constant.
-    fn materialize(&mut self, value: &PartialEvaluationValue<C::Type, C::Value>) -> Result<AtomId, ProgramError> {
-        // A residual variable is already a residual atom; every known value differs only in its source-atom
-        // deduplication key and whether it materializes as an inline constant.
-        let (source_atom, constant) = match value.materialization() {
-            PartialValueMaterialization::Variable { residual_atom } => return Ok(residual_atom),
-            PartialValueMaterialization::Undecided => (None, false),
-            PartialValueMaterialization::Input { source_atom } => (source_atom, false),
-            PartialValueMaterialization::Constant { source_atom } => (source_atom, true),
-        };
-        if let Some(source_atom) = source_atom {
-            if let Some(atom) = self.materialized(source_atom)? {
-                return Ok(atom);
-            }
-        }
-        let value = value.as_known().ok_or_else(|| {
-            ProgramError::MalformedProgram(
-                "residual materialization marked an unknown value as a known residual".to_string(),
-            )
-        })?;
-        let staged_atom = if constant {
-            None
-        } else {
-            match self.context.resolve(value) {
-                ValueResolution::Staged(atom) => Some(atom),
-                _ => None,
-            }
-        };
-        if let Some(staged_atom) = staged_atom {
-            if let Some(&atom) = self.staged_feeders.get(&staged_atom) {
-                if let Some(source_atom) = source_atom {
-                    self.set_materialized(source_atom, atom)?;
-                }
-                return Ok(atom);
-            }
-        }
-        let atom = if constant {
-            let payload = self.context.resolve(value).into_concrete().ok_or_else(|| {
-                ProgramError::MalformedProgram(
-                    "residual materialization required a constant payload for a known value that is not \
-                     concretizable in the active known-side context"
-                        .to_string(),
-                )
-            })?;
-            self.builder.add_constant(payload)
-        } else {
-            let atom = self.builder.add_input(value.r#type().into_owned());
-            self.inputs.push(PartialEvaluationInput::Known(value.clone()));
-            atom
-        };
-        if let Some(source_atom) = source_atom {
-            self.set_materialized(source_atom, atom)?;
-        }
-        if let Some(staged_atom) = staged_atom {
-            self.staged_feeders.insert(staged_atom, atom);
-        }
-        Ok(atom)
     }
 
     /// Returns the residual atom already materialized for `source_atom` in the current inlined program, if one exists.
@@ -781,41 +776,6 @@ impl<C: Context> PartialEvaluator<C> {
         })?;
         *slot = Some(atom);
         Ok(())
-    }
-}
-
-impl<T, V, O> Program<T, V, O, Vec<V>, Vec<V>>
-where
-    T: Type,
-    V: Value<T>,
-    O: Clone + Operation<T>,
-{
-    /// Copies this already-residual program into `builder` over the caller-provided `inputs`, returning the builder
-    /// atoms holding the spliced program's outputs in output order.
-    ///
-    /// This is a plain relocation, not a re-partial-evaluation: every instruction and every program constant is
-    /// rebuilt verbatim into `builder`. It is the reconciliation primitive an unknown-predicate `condition` uses to
-    /// graft each branch's residual program into the reconciled branch it emits.
-    ///
-    /// # Parameters
-    ///
-    ///   - `builder`: Builder accumulating the program the spliced instructions are appended to.
-    ///   - `inputs`: Builder atoms feeding this program's inputs, aligned with its input atoms in input order.
-    pub(crate) fn splice_into(
-        &self,
-        builder: &mut ProgramBuilder<T, V, O>,
-        inputs: &[AtomId],
-    ) -> Result<Vec<AtomId>, ProgramError> {
-        // The builder is borrowed by both interpretation closures, which never run concurrently; a `RefCell` lets each
-        // take a short-lived mutable borrow without the borrow checker conservatively rejecting the second closure.
-        let builder = RefCell::new(builder);
-        self.interpret_with::<AtomId, ProgramError, _, _>(
-            inputs.to_vec(),
-            |_, constant| Ok(builder.borrow_mut().add_constant(constant.clone())),
-            |instruction, inputs| {
-                Ok(builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs.to_vec())?.to_vec())
-            },
-        )
     }
 }
 

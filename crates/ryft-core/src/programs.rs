@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
@@ -1141,6 +1142,33 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         self.instructions.push(instruction);
     }
 
+    /// Appends the provided [`Program`]'s [`Instruction`]s and constants to this [`ProgramBuilder`], remapping its
+    /// inputs to the caller-provided `inputs` and returning the builder atoms holding the program's outputs, in output
+    /// order. This is a plain relocation and not a re-interpretation or partial evaluation. Every instruction and every
+    /// constant of the provided program is rebuilt verbatim into this builder. It is, for example, the reconciliation
+    /// primitive an unknown-predicate `condition` uses to graft each branch's residual program into the reconciled
+    /// branch it emits during partial evaluation.
+    #[inline]
+    pub fn add_program<Input: Parameterized<V>, Output: Parameterized<V>>(
+        &mut self,
+        program: &Program<T, V, O, Input, Output>,
+        inputs: &[AtomId],
+    ) -> Result<Vec<AtomId>, ProgramError>
+    where
+        O: Clone,
+    {
+        // The two closures below never run concurrently but both need `&mut` access to this builder. A `RefCell` lets
+        // each take a short-lived mutable borrow without the borrow checker conservatively rejecting the second one.
+        let builder = RefCell::new(self);
+        program.interpret_with::<AtomId, ProgramError, _, _>(
+            inputs.to_vec(),
+            |_, constant| Ok(builder.borrow_mut().add_constant(constant.clone())),
+            |instruction, inputs| {
+                Ok(builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs.to_vec())?.to_vec())
+            },
+        )
+    }
+
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
     #[inline]
     pub fn build<Input: Parameterized<V>, Output: Parameterized<V>>(
@@ -2079,6 +2107,19 @@ mod tests {
         assert_eq!(program.output_ids, vec![v1]);
         assert_eq!(program.instructions.len(), 2);
         assert_eq!(program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(36.0f64)));
+
+        // `add_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to the
+        // provided builder atoms and returning the builder atoms for its outputs. The program's `2.0` constant is dead
+        // (i.e., no instruction consumes it), and so only the two reachable instructions are rebuilt.
+        let mut outer = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a0 = outer.add_input(DataType::F64);
+        let a1 = outer.add_input(DataType::F64);
+        let outputs = outer.add_program(&program, &[a0, a1]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outer.instructions.len(), 2);
+        let outer_program =
+            outer.build::<(Scalar, Scalar), Scalar>(outputs, (Placeholder, Placeholder), Placeholder).unwrap();
+        assert_eq!(outer_program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(36.0f64)));
     }
 
     #[test]
