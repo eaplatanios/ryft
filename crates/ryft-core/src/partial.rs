@@ -921,39 +921,38 @@ pub struct PartitionedProgram<T: Type, V: Value<T>, O> {
     pub output_stages: Vec<usize>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// One stage of a [`PartitionedProgram`]. Its [`program`](Self::program) takes `[stage inputs..., consumed
-/// residuals...]` and produces `[stage outputs..., produced residuals...]`.
+/// One stage of a [`PartitionedProgram`].
 #[derive(Debug)]
 pub struct PartitionStage<T: Type, V: Value<T>, O> {
-    /// Projected sub-program for this stage, over this stage's own inputs followed by its consumed residuals, producing
-    /// this stage's own outputs followed by its produced residuals.
+    /// Projected sub-[`Program`] for this stage, over this stage's own inputs followed by its consumed residuals,
+    /// producing this stage's own outputs followed by its produced residuals. It takes `[stage inputs..., consumed
+    /// residuals...]` and produces `[stage outputs..., produced residuals...]`.
     pub program: Program<T, V, O, Vec<V>, Vec<V>>,
 
-    /// Original input indices feeding this stage's leading (own) inputs, in order; inputs that no surviving instruction
-    /// consumes are dropped.
+    /// Original input indices feeding this stage's leading (i.e., own) inputs, in order. Inputs that no surviving
+    /// [`Instruction`](crate::Instruction) consumes are dropped.
     pub input_indices: Vec<usize>,
 
-    /// Source of each trailing consumed-residual input, in order: which earlier stage produced it and its index among
-    /// that stage's produced residuals.
+    /// [`PartitionResidualSource`] of each trailing consumed-residual input, in order, based on which earlier stage
+    /// produced it and its index among that stage's produced residuals.
     pub residual_inputs: Vec<PartitionResidualSource>,
 
-    /// Count of this stage's leading (own) outputs; the remaining [`program`](Self::program) outputs are the produced
-    /// residuals other stages consume.
+    /// Count of this stage's leading (i.e., own) outputs. The remaining [`program`](Self::program) outputs are the
+    /// produced residuals that other stages consume.
     pub output_count: usize,
 }
 
-/// Where a consumed residual comes from: the producer `stage` and the `index` of the residual among that stage's
-/// produced residuals (the trailing outputs of the producer's program, after its own outputs).
+/// Represents the source of a residual (i.e., where it comes from) in a [`PartitionedProgram`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PartitionResidualSource {
-    /// Stage id of the producer, the earlier stage whose produced residuals include this value.
+    /// Stage ID of the producer (i.e., the earlier stage whose produced residuals include this value).
     pub stage: usize,
 
-    /// Index of this value among the producer stage's produced residuals.
+    /// Index of this value among the producing stage's produced residuals.
     pub index: usize,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Structural two-stage partial-evaluation split of a flat [`Program`].
 ///
