@@ -167,7 +167,7 @@ impl BooleanLike for TestArray {
 
     fn boolean(&self) -> Result<bool, ProgramError> {
         // Accept scalar Boolean predicates (rank-0, one element, encoded as 0.0=false / nonzero=true)
-        // so that lane-varying while can extract a final `any(mask)` result. Higher-rank predicates
+        // so that batch-varying while can extract a final `any(mask)` result. Higher-rank predicates
         // still error because they cannot collapse to a single Boolean.
         if self.r#type.rank() == 0 && self.r#type.data_type() == DataType::Boolean && self.values.len() == 1 {
             return Ok(self.values[0] != 0.0);
@@ -235,17 +235,17 @@ impl CoordinateValue for TestArray {
     }
 
     fn stack(values: Vec<Self>) -> Result<Self, ProgramError> {
-        let lane_count = values.len();
-        assert!(lane_count > 0, "cannot stack zero values");
+        let batch_size = values.len();
+        assert!(batch_size > 0, "cannot stack zero values");
         let first_type = &values[0].r#type;
         for value in values.iter().skip(1) {
             assert_eq!(value.r#type, *first_type, "stacked test arrays must share the same type");
         }
-        let stacked_dimensions = std::iter::once(Size::Static(lane_count))
+        let stacked_dimensions = std::iter::once(Size::Static(batch_size))
             .chain(first_type.shape().dimensions().iter().copied())
             .collect::<Vec<_>>();
         let stacked_type = ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions));
-        let mut stacked_values = Vec::with_capacity(lane_count * values[0].values.len());
+        let mut stacked_values = Vec::with_capacity(batch_size * values[0].values.len());
         for value in values {
             stacked_values.extend(value.values);
         }
@@ -1097,7 +1097,7 @@ mod differentiation_tests {
                     let mut outputs = severed
                         .context()
                         .stage_operation(
-                            CollectiveOperation::new("lanes".to_string(), CollectiveKind::PSum),
+                            CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
                             &[&severed],
                         )
                         .unwrap();
@@ -1863,7 +1863,7 @@ mod linearization_tests {
         // f(x, y) = sin(x) + stop_gradient(y) uses both inputs in the primal (so the primal sub-program keeps both),
         // but `stop_gradient` blocks `y`'s tangent: `dy` reaches no tangent output, so partial-evaluation liveness
         // pruning drops it from the unknown sub-program. The canonical tangent arity must be restored (a fresh
-        // zero-typed `dy` lane reinserted) so the tangent program still presents `[dx, dy, residuals...]`. This
+        // zero-typed `dy` slot reinserted) so the tangent program still presents `[dx, dy, residuals...]`. This
         // exercises the input-restoration branch of `linearize` that straight-line all-differentiable programs do not.
         let domain = ScalarDomain::new();
         let (primal_program, _, _, _) = domain
@@ -1876,19 +1876,19 @@ mod linearization_tests {
         let linearization = primal_program.linearize().unwrap();
 
         // Structural asserts: the function uses both inputs primally (so `sin(x)` threads at least one residual) and
-        // only the second output direction is a tangent. The pruned `dy` lane is restored, so the tangent program
+        // only the second output direction is a tangent. The pruned `dy` slot is restored, so the tangent program
         // presents both tangent inputs (`dx`, the restored `dy`) ahead of its residuals — `2 + residual_count`.
         assert!(linearization.residual_count > 0, "the chosen function must produce a non-empty residual environment");
         assert_eq!(linearization.output_unknowns, vec![false, true], "output classification");
         assert_eq!(
             linearization.tangent_program.input_ids().len(),
             2 + linearization.residual_count,
-            "tangent program input count (restored dy lane)",
+            "tangent program input count (restored dy slot)",
         );
 
         // Behavioral assert (absolute, hand-computed): `d(sin x + stop_gradient(y)) = cos(x) * dx`, with `dy` ignored.
         // Recover the residuals by interpreting the primal sub-program at the primals, then feed `(dx, dy, residuals)`
-        // through the tangent sub-program. The restored `dy` lane must be reinserted for the tangent program to accept
+        // through the tangent sub-program. The restored `dy` slot must be reinserted for the tangent program to accept
         // both tangent inputs even though `stop_gradient` blocks `y`'s tangent and `dy` feeds nothing.
         let context = EagerContext::<DataType, Scalar>::new();
         let primal_outputs = linearization
@@ -2034,6 +2034,126 @@ mod linearization_tests {
             .interpret_in_context(&context, vec![Scalar::from(1.5), Scalar::from(1.0)])
             .unwrap();
         assert_close(&outputs, &[Scalar::from(3.75), Scalar::from(1.0)], "stop_gradient");
+    }
+
+    #[test]
+    fn test_jvp_interleaved_matches_jvp() {
+        // The interleaved forward mode (one walk over the primal program with `JvpTracer` duals under a
+        // `JvpContext`) must agree with the fused-program `jvp` path on values and derivatives, including through
+        // piecewise `select` derivatives, severed `stop_gradient` tangents, and zero input tangents.
+        let domain = ScalarDomain::new();
+
+        // f(x) = x * sin(x): derivative sin(x) + x * cos(x).
+        let (fused_value, fused_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
+            .jvp(
+                |inputs: Vec<_>| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
+                vec![Scalar::from(0.7)],
+                vec![Scalar::from(1.0)],
+            )
+            .unwrap();
+        let (interleaved_value, interleaved_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
+            .jvp_interleaved(
+                |inputs: Vec<_>| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
+                vec![Scalar::from(0.7)],
+                vec![Scalar::from(1.0)],
+            )
+            .unwrap();
+        assert_close(&interleaved_value, &fused_value, "x * sin(x) value");
+        assert_close(&interleaved_tangent, &fused_tangent, "x * sin(x) tangent");
+
+        // f(x) = stop_gradient(x * x) + select(x > 1, x * x, x + x): a piecewise derivative plus a structural-zero
+        // contribution that must stay symbolic through the interleaved walk.
+        for primal in [3.0, 0.5] {
+            let (fused_value, fused_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
+                .jvp(
+                    |inputs: Vec<_>| {
+                        let one = inputs[0].context().constant(Scalar::from(1.0));
+                        let mask = inputs[0].clone().greater_than(&one).unwrap();
+                        let on_true = inputs[0].clone() * inputs[0].clone();
+                        let on_false = inputs[0].clone() + inputs[0].clone();
+                        let selected = Select::select(&mask, &on_true, &on_false).unwrap();
+                        vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + selected]
+                    },
+                    vec![Scalar::from(primal)],
+                    vec![Scalar::from(1.0)],
+                )
+                .unwrap();
+            let (interleaved_value, interleaved_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
+                .jvp_interleaved(
+                    |inputs: Vec<_>| {
+                        let one = inputs[0].context().constant(Scalar::from(1.0));
+                        let mask = inputs[0].clone().greater_than(&one).unwrap();
+                        let on_true = inputs[0].clone() * inputs[0].clone();
+                        let on_false = inputs[0].clone() + inputs[0].clone();
+                        let selected = Select::select(&mask, &on_true, &on_false).unwrap();
+                        vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + selected]
+                    },
+                    vec![Scalar::from(primal)],
+                    vec![Scalar::from(1.0)],
+                )
+                .unwrap();
+            assert_close(&interleaved_value, &fused_value, "piecewise value");
+            assert_close(&interleaved_tangent, &fused_tangent, "piecewise tangent");
+        }
+
+        // A zero input tangent flows through the all-zero fast path of the interleaved context: the derivative is
+        // zero and the value matches the primal evaluation.
+        let (value, tangent): (Vec<Scalar>, Vec<Scalar>) = domain
+            .jvp_interleaved(
+                |inputs: Vec<_>| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
+                vec![Scalar::from(0.7)],
+                vec![Scalar::from(0.0)],
+            )
+            .unwrap();
+        assert_close(&value, &[Scalar::from(0.7 * 0.7_f64.sin())], "zero-tangent value");
+        assert_close(&tangent, &[Scalar::from(0.0)], "zero-tangent tangent");
+    }
+
+    #[test]
+    fn test_program_keeps_structural_zero_tangents_symbolic() {
+        // f(x) = stop_gradient(x * x) + x: the severed tangent is a structural zero that must stay symbolic — the
+        // `add` rule drops the zero term instead of staging `add(zero, dx)`, so the *unsimplified* fused program
+        // contains no `zero` instruction at all and its tangent output is the tangent input directly.
+        let domain = ScalarDomain::new();
+        let (primal_program, _, _, _) = domain
+            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
+                |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + inputs[0].clone()]),
+                vec![Scalar::from(1.5)],
+            )
+            .unwrap();
+        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        use crate::operations::Operation;
+        assert!(
+            !jvp_program.instructions().iter().any(|instruction| instruction.operation().name() == "zero"),
+            "expected no staged zero instructions in the fused jvp program, but got:\n{jvp_program}",
+        );
+    }
+
+    #[test]
+    fn test_program_materializes_structural_zero_tangents_only_at_the_output_boundary() {
+        // f(x) = stop_gradient(x): the sole tangent output is a structural zero, which must be materialized as
+        // exactly one typed `zero` instruction at the output boundary to preserve the
+        // `(primal_outputs ++ tangent_outputs)` program contract.
+        let domain = ScalarDomain::new();
+        let (primal_program, _, _, _) = domain
+            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
+                |inputs| Ok(vec![inputs[0].clone().stop_gradient()]),
+                vec![Scalar::from(1.5)],
+            )
+            .unwrap();
+        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        use crate::operations::Operation;
+        let zero_count = jvp_program
+            .instructions()
+            .iter()
+            .filter(|instruction| instruction.operation().name() == "zero")
+            .count();
+        assert_eq!(zero_count, 1, "expected exactly one boundary zero, but got:\n{jvp_program}");
+
+        // The fused program still evaluates correctly: primal passes through and the tangent output is zero.
+        let context = EagerContext::<DataType, Scalar>::new();
+        let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(1.5), Scalar::from(1.0)]).unwrap();
+        assert_close(&outputs, &[Scalar::from(1.5), Scalar::from(0.0)], "boundary-zero jvp");
     }
 
     #[test]
@@ -2440,6 +2560,65 @@ mod linearization_tests {
             &direct_cotangents,
             &[Scalar::from(3.0 * 0.7f64.cos() * 2.5)],
             "direct-transpose tripled gradient",
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_backward_zero_outputs_are_recovered_as_structural_zeros() {
+        use crate::operations::Operation;
+        use crate::operations::arithmetic::AddOperation;
+        use crate::operations::constants::ZeroOperation;
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+        use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
+
+        // f(x) = custom_vjp(add)(sin(x), cos(x)) with a user backward that returns `[cotangent, zero]`: the second
+        // primal input is declared non-differentiated through a canonical `zero` output. The transpose splice must
+        // recover that zero *structurally*, so the `cos(x)` branch contributes no adjoint work: the pullback contains
+        // no `add` accumulation (only the `sin` branch contributes to `x`) and the gradient is `cos(x) * cotangent`.
+        fn function(inputs: Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError> {
+            use crate::contexts::StagingContext;
+            use crate::operations::trigonometric::{CosOperation, SinOperation};
+
+            let mut primal_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let a = primal_builder.add_input(DataType::F64);
+            let b = primal_builder.add_input(DataType::F64);
+            let y = primal_builder.add_instruction(AddOperation, vec![a, b]).unwrap()[0];
+            let primal = primal_builder.build(vec![y], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
+
+            let mut forward_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let a = forward_builder.add_input(DataType::F64);
+            let b = forward_builder.add_input(DataType::F64);
+            let y = forward_builder.add_instruction(AddOperation, vec![a, b]).unwrap()[0];
+            let forward = forward_builder.build(vec![y], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
+
+            let mut backward_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let cotangent = backward_builder.add_input(DataType::F64);
+            let zero = backward_builder.add_instruction(ZeroOperation::new(DataType::F64), Vec::new()).unwrap()[0];
+            let backward = backward_builder
+                .build(vec![cotangent, zero], vec![Placeholder], vec![Placeholder, Placeholder])
+                .unwrap();
+
+            let operation = CustomVjpOperation::new(primal, forward, backward)?;
+            let a = inputs[0].context().stage_operation(SinOperation, &[&inputs[0]])?.remove(0);
+            let b = inputs[0].context().stage_operation(CosOperation, &[&inputs[0]])?.remove(0);
+            inputs[0].context().stage_operation(ScalarOperation::CustomVjp(Box::new(operation)), &[&a, &b])
+        }
+
+        let domain = ScalarDomain::new();
+        let context = EagerContext::<DataType, Scalar>::new();
+        let (_, pullback, residuals) = vjp_direct(&domain, function, vec![Scalar::from(0.7)]).unwrap();
+        let mut pullback_inputs = vec![Scalar::from(2.5)];
+        pullback_inputs.extend(residuals);
+        let cotangents = pullback.interpret_in_context(&context, pullback_inputs).unwrap();
+        assert_close(&cotangents, &[Scalar::from(0.7f64.cos() * 2.5)], "zero-backward gradient");
+
+        // With the zero recovered structurally, the `cos` branch contributes nothing to `x`, so the pullback never
+        // stages an `add` accumulation (a lost zero would flow as a live cotangent through the `cos` branch's
+        // bilinear rule and accumulate against the `sin` branch's contribution).
+        assert!(
+            !pullback.instructions().iter().any(|instruction| instruction.operation().name() == "add"),
+            "expected no adjoint accumulation in the pullback, but got:\n{pullback}",
         );
     }
 
@@ -2927,7 +3106,7 @@ mod array_linearization_tests {
         use crate::types::DataType;
 
         // Condition: the direct path transposes the primal `condition` operand-form — reading the known predicate and
-        // the joined residuals from the pullback and recursing into each branch through `transpose_partitioned` — so it
+        // the joined residuals from the pullback and recursing into each branch through `transpose_with_respect_to` — so it
         // matches `vjp`'s operand cotangent.
         assert_array_control_flow_reverse_equivalent_to_vjp(
             condition_function,
@@ -2943,7 +3122,7 @@ mod array_linearization_tests {
         );
 
         // Scan: the direct path transposes the primal `scan` operand-form — reading the known residual stacks from the
-        // pullback, recursing into the body through `transpose_partitioned`, and re-staging a flipped-`reverse` scan —
+        // pullback, recursing into the body through `transpose_with_respect_to`, and re-staging a flipped-`reverse` scan —
         // so it matches `vjp` one-to-one (no predicate to prune).
         assert_array_control_flow_reverse_equivalent_to_vjp(
             scan_function,
@@ -3570,8 +3749,8 @@ mod array_linearization_tests {
             vec![TestArray::scalar(1.0), TestArray::new(stacked_f64.clone(), vec![0.0, 0.0, 0.0])],
         );
 
-        // A unit tangent on `xs[1]` exercises the per-lane residual stacking: only lanes at or past iteration 1 depend
-        // on `x1`, so the stacked-output tangent is `[0, 2, 8]`.
+        // A unit tangent on `xs[1]` exercises the per-iteration residual stacking: only iterations at or past
+        // iteration 1 depend on `x1`, so the stacked-output tangent is `[0, 2, 8]`.
         assert_array_forward_equivalent(
             |inputs| scan_function(inputs).unwrap(),
             scan_function,
@@ -3584,9 +3763,9 @@ mod array_linearization_tests {
     fn test_array_reverse_equivalent_to_vjp_for_scan() {
         // f(init, xs) = scan(init, xs) cumulative product. Reverse mode re-keys the tangent scan into a captured-stack
         // linear scan whose body folds the trailing residual-slice scanned inputs into scan-local captures, then the
-        // single outer transpose flips `reverse` and transposes the body — pairing cotangent lane `i` with residual
-        // stack lane `i`. Both operand cotangents are real (no predicate to prune), so the pullback matches
-        // `vjp`'s cotangents one-to-one.
+        // single outer transpose flips `reverse` and transposes the body — pairing cotangent iteration `i` with
+        // residual stack iteration `i`. Both operand cotangents are real (no predicate to prune), so the pullback
+        // matches `vjp`'s cotangents one-to-one.
         assert_array_reverse_equivalent(
             scan_function,
             scan_function,
@@ -3616,18 +3795,14 @@ mod array_linearization_tests {
     /// it compiles, with no recursive obligation and no overflow.
     #[test]
     fn array_operation_satisfies_the_linearization_witness() {
-        use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
+        use crate::operations::constants::ZeroOperation;
         use crate::programs::Value;
         use crate::tracing_v2::differentiation::DifferentiableProgramOperation;
         use crate::types::Type;
 
         fn assert_linearizable<T: Type, V: Value<T>, O>()
         where
-            O: Clone
-                + Operation<T>
-                + MaybeZeroOperation<T>
-                + From<ZeroOperation<T>>
-                + DifferentiableProgramOperation<T, V, O>,
+            O: Clone + Operation<T> + From<ZeroOperation<T>> + DifferentiableProgramOperation<T, V, O>,
         {
         }
         assert_linearizable::<ArrayType, TestArray, ArrayOperation<TestArray>>();
@@ -3635,7 +3810,7 @@ mod array_linearization_tests {
 
     /// Builds the `while (x < threshold) { x = x * x }` loop with the provided semantic iteration bound. Squaring
     /// captures the loop state itself as a per-iteration residual, so the rule stacks the residual into a
-    /// `[bound, ...]` stack and the masked tangent scan is exercised on the lanes beyond the actual trip count.
+    /// `[bound, ...]` stack and the masked tangent scan is exercised on the iterations beyond the actual trip count.
     fn bounded_squaring_while_operation(
         threshold: f64,
         bound: usize,
@@ -3671,7 +3846,7 @@ mod array_linearization_tests {
 
     /// Stages the bounded squaring `while (x < 100) { x = x * x }` loop (iteration bound `5`) over the single closure
     /// input `[x]`, the shared body of the bounded-while equivalence closures. Starting from `x = 2` the loop runs the
-    /// actual trip count `3` (`2 -> 4 -> 16 -> 256`), so lanes `3` and `4` are inactive and the validity mask is
+    /// actual trip count `3` (`2 -> 4 -> 16 -> 256`), so iterations `3` and `4` are inactive and the validity mask is
     /// exercised; the loop computes `x^8` and its derivative is `8 * x^7`.
     fn bounded_while_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
         let while_operation = bounded_squaring_while_operation(100.0, 5);
@@ -3685,8 +3860,8 @@ mod array_linearization_tests {
     fn test_array_forward_equivalent_to_jvp_for_bounded_while() {
         // f(x) = (((x^2)^2)^2) = x^8 via the bounded squaring loop. The rule stages an augmented primal while
         // that stores the per-iteration `x` residual into a `[5, ...]` stack plus a `[5]` validity mask, then a
-        // length-5 masked tangent scan whose lanes beyond the actual trip count (3) pass the carried tangent through
-        // unchanged. At x = 2 the loop value is 256 and the directional derivative is `8 * x^7 = 1024`.
+        // length-5 masked tangent scan whose iterations beyond the actual trip count (3) pass the carried tangent
+        // through unchanged. At x = 2 the loop value is 256 and the directional derivative is `8 * x^7 = 1024`.
         assert_array_forward_equivalent(
             |inputs| bounded_while_function(inputs).unwrap(),
             bounded_while_function,
@@ -3698,8 +3873,9 @@ mod array_linearization_tests {
     #[test]
     fn test_array_reverse_equivalent_to_vjp_for_bounded_while() {
         // Reverse mode through the bounded while re-keys the masked tangent scan into a captured-stack linear scan with
-        // no while-specific transpose code: the per-iteration `select` over the mask-lane capture transposes so the
-        // inactive lanes pass cotangents through unchanged. A unit output cotangent pulls back to `8 * x^7 = 1024`.
+        // no while-specific transpose code: the per-iteration `select` over the mask-iteration capture transposes so
+        // the inactive iterations pass cotangents through unchanged. A unit output cotangent pulls back to
+        // `8 * x^7 = 1024`.
         assert_array_reverse_equivalent(
             bounded_while_function,
             bounded_while_function,
@@ -4008,9 +4184,9 @@ mod array_linearization_tests {
     }
 
     /// Builds the bounded `while (x < threshold) { x = x + x }` doubling loop over a scalar `f64` state with the given
-    /// semantic iteration bound, the per-lane body of the vmapped masked-while test. The predicate is per lane, so
-    /// vmapping this loop stages a masked bounded `while` whose augmented state carries a Boolean validity mask whose
-    /// tangent is structurally zero.
+    /// semantic iteration bound, the per-item body of the vmapped masked-while test. The predicate is per batch
+    /// item, so vmapping this loop stages a masked bounded `while` whose augmented state carries a Boolean validity
+    /// mask whose tangent is structurally zero.
     fn bounded_doubling_while_operation(
         threshold: f64,
         bound: usize,
@@ -4042,10 +4218,10 @@ mod array_linearization_tests {
         WhileOperation::new(condition, body).unwrap().with_iteration_bound(bound).unwrap()
     }
 
-    /// Stages the vmapped per-lane bounded doubling `while` over the single closure input `[x]`, the shared body of the
-    /// masked-while equivalence test. Batching a per-lane predicate stages one masked bounded `while` over the
+    /// Stages the vmapped per-item bounded doubling `while` over the single closure input `[x]`, the shared body of the
+    /// masked-while equivalence test. Batching a per-item predicate stages one masked bounded `while` over the
     /// augmented state `[f64[N] value, bool[N] mask]`, so fuse-linearizing it drives the Gap B path: the Boolean mask
-    /// lane's tangent is structurally zero, so partial evaluation prunes that tangent input and the linearization
+    /// item's tangent is structurally zero, so partial evaluation prunes that tangent input and the linearization
     /// must restore the canonical `[carry_tangents..., residuals...]` arity the bounded-`while` rule assumes.
     fn batched_bounded_while_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
         use crate::tracing_v2::batching::BatchContext;
@@ -4053,10 +4229,10 @@ mod array_linearization_tests {
         let context = inputs[0].context().clone();
         let mapped = BatchContext::batch(
             &context,
-            |lane| {
+            |item| {
                 let while_operation = bounded_doubling_while_operation(8.0, 5);
                 let mut outputs =
-                    lane.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&lane])?;
+                    item.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&item])?;
                 Ok(outputs.remove(0))
             },
             inputs[0].clone(),
@@ -4069,13 +4245,13 @@ mod array_linearization_tests {
 
     #[test]
     fn test_array_masked_bounded_while_restores_pruned_mask_tangent() {
-        // Gap B: a vmapped per-lane bounded `while` stages a masked bounded loop whose augmented state carries a
-        // `bool[3]` validity mask. The mask lane's tangent is structurally zero, so partial evaluation prunes that
+        // Gap B: a vmapped per-item bounded `while` stages a masked bounded loop whose augmented state carries a
+        // `bool[3]` validity mask. The mask item's tangent is structurally zero, so partial evaluation prunes that
         // tangent input from the unknown sub-program; the linearization restores the canonical
         // `[carry_tangents..., residuals...]` arity the bounded-while rule assumes, so the staged augmented while
-        // plus masked tangent scan composes instead of tripping the rule's input-count check. Lanes [1, 5, 9] double 3,
-        // 1, and 0 times under the threshold `x < 8`, so the primal is [8, 10, 9] and the per-lane tangent scale is
-        // `2^iterations = [8, 2, 1]`.
+        // plus masked tangent scan composes instead of tripping the rule's input-count check. Batch items [1, 5, 9]
+        // double 3, 1, and 0 times under the threshold `x < 8`, so the primal is [8, 10, 9] and the per-item tangent
+        // scale is `2^iterations = [8, 2, 1]`.
         let domain = TestArrayDomain;
         let primals = vec![TestArray::vector(vec![1.0, 5.0, 9.0])];
         let tangents = vec![TestArray::vector(vec![1.0, 1.0, 1.0])];
@@ -4090,7 +4266,7 @@ mod array_linearization_tests {
         assert_close(&known_outputs[0].values, &[8.0, 10.0, 9.0], "masked-while primal");
 
         // The unknown (tangent) side now presents the canonical arity, so the masked tangent scan interprets to the
-        // per-lane doubling scales [8, 2, 1].
+        // per-item doubling scales [8, 2, 1].
         let mut tangent_inputs = tangents;
         tangent_inputs.extend(residuals);
         let tangent_outputs = linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
@@ -4098,9 +4274,9 @@ mod array_linearization_tests {
         assert_close(&tangent_outputs[0].values, &[8.0, 2.0, 1.0], "masked-while tangent");
 
         // Reverse mode exercises the same restored arity on the pullback side. The direct-transpose path transposes the
-        // tangent sub-program in the primal operation enum through `transpose_partitioned`, which carries the
+        // tangent sub-program in the primal operation enum through `transpose_with_respect_to`, which carries the
         // structurally zero `bool[3]` mask state as a linear-zero carry without the re-key path's leading-linear
-        // operand heuristic; it yields per-lane gradients equal to the doubling scales.
+        // operand heuristic; it yields per-item gradients equal to the doubling scales.
         let reverse_primals = vec![TestArray::vector(vec![1.0, 5.0, 9.0])];
         let (primal_outputs, pullback, residuals) =
             vjp_direct(&domain, batched_bounded_while_function, reverse_primals).unwrap();
@@ -4182,7 +4358,7 @@ mod batching_tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::BatchingError;
+    use crate::batching::{ArrayBatch, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
     use crate::operations::arithmetic::AddOperation;
@@ -4221,11 +4397,15 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_array_batch_derives_logical_type_from_batch_axis() {
-        let batch = ArrayBatch::mapped(TestArray::vector(vec![1.0, 2.0, 3.0]), 0).unwrap();
+    fn test_array_batch_derives_unbatched_type_from_batch_axis() {
+        let batch = {
+            let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
 
-        assert_eq!(batch.axis_size(), Ok(Some(3)));
-        assert_eq!(batch.logical_type(), Ok(ArrayType::scalar(DataType::F64)));
+        assert_eq!(batch.batch_size(), Ok(Some(3)));
+        assert_eq!(batch.unbatched_type(), Ok(ArrayType::scalar(DataType::F64)));
     }
 
     #[test]
@@ -4272,7 +4452,7 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_named_axis_psum_reduces_over_lanes() {
+    fn test_batch_named_axis_psum_reduces_over_batch() {
         let output: TestArray = TestArrayDomain
             .batch(
                 |x| Ok(x.collective("i", CollectiveKind::PSum)),
@@ -4289,8 +4469,8 @@ mod batching_tests {
 
     #[test]
     fn test_nested_batch_named_axes_route_collectives_to_matching_level() {
-        // The inner `psum` targets the *outer* named axis, so each inner lane must reduce over the
-        // outer lanes: column sums of [[1, 2], [3, 4]].
+        // The inner `psum` targets the *outer* named axis, so each inner batch item must reduce over the
+        // outer batch items: column sums of [[1, 2], [3, 4]].
         let x = TestArray::new(
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
@@ -4323,9 +4503,9 @@ mod batching_tests {
     fn test_value_and_grad_flows_through_batch_staged_broadcast() {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
-        // The scalar input is lane-uniform inside the batch, so the elementwise batching rule
+        // The scalar input is replicated inside the batch, so the elementwise batching rule
         // stages a `Broadcast` on the differentiated value; the gradient must flow back
-        // through the broadcast's transpose rule (a sum-reduction over the lane axis).
+        // through the broadcast's transpose rule (a sum-reduction over the batch axis).
         let (value, gradient) = crate::tracing_v2::value_and_grad(
             &TestArrayDomain,
             |x| {
@@ -4333,7 +4513,7 @@ mod batching_tests {
                 let y = context.constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]));
                 let mapped: NestedTracer<TestArrayDomain> = BatchContext::batch(
                     &context,
-                    |(lane, shift)| Ok(lane * shift),
+                    |(item, shift)| Ok(item * shift),
                     (y, x),
                     (BatchAxis::mapped(0), BatchAxis::uniform()),
                     Some(0),
@@ -4394,7 +4574,7 @@ mod batching_tests {
                 |x| {
                     let context = x.context().clone();
                     let output: crate::tracing_v2::NestedTracer<TestArrayDomain> =
-                        BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None)
+                        BatchContext::batch(&context, |item| Ok(item.clone() * item), x, Some(0), Some(0), None)
                             .unwrap();
                     output
                 },
@@ -4416,7 +4596,7 @@ mod batching_tests {
             |x| {
                 let context = x.context().clone();
                 let mapped: crate::tracing_v2::NestedTracer<TestArrayDomain> =
-                    BatchContext::batch(&context, |lane| Ok(lane.clone() * lane), x, Some(0), Some(0), None).unwrap();
+                    BatchContext::batch(&context, |item| Ok(item.clone() * item), x, Some(0), Some(0), None).unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![2.0, 3.0]),
@@ -4429,15 +4609,23 @@ mod batching_tests {
 
     #[test]
     fn test_batching_rule_auto_aligns_unaligned_batch_axes() {
-        // Both square so the lane sizes agree (4), but they sit on different batch axes.
+        // Both square so the batch sizes agree (4), but they sit on different batch axes.
         // `apply_elementwise_batch` realigns the second operand to match the first batched
         // input's canonical axis (JAX's matchaxis policy), then computes elementwise add.
         //
         // Left is identity-like along axis 0; right is transposed (axis 1). Using row 0 of each
-        // lane: left[lane=k, j] == 1.0; right[lane=k, j] == 1.0 (since right is symmetric here),
+        // batch item: left[item=k, j] == 1.0; right[item=k, j] == 1.0 (since right is symmetric here),
         // so the sum is `2.0` for every element after realignment.
-        let left = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 0).unwrap();
-        let right = ArrayBatch::mapped(TestArray::matrix(4, 4, vec![1.0; 16]), 1).unwrap();
+        let left = {
+            let value = TestArray::matrix(4, 4, vec![1.0; 16]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let right = {
+            let value = TestArray::matrix(4, 4, vec![1.0; 16]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
+        }
+        .unwrap();
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let outputs = ArrayOperation::<TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
@@ -4475,7 +4663,7 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_lift_elementwise_passes_through_lane_uniform_inputs() {
+    fn test_lift_elementwise_passes_through_replicated_inputs() {
         let scalar = ArrayType::scalar(DataType::F64);
         let op = ArrayOperation::<TestArray>::Add(AddOperation);
         let (lifted_op, output_axes) = lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), None], 5).unwrap();
@@ -4486,7 +4674,7 @@ mod batching_tests {
     #[test]
     fn test_nested_batch_squares_every_element() {
         // x has shape [3, 4]; outer batch maps axis 0 (size 3), inner batch maps axis 0 of the
-        // per-outer-lane shape [4]. Each element should be squared.
+        // per-outer-item shape [4]. Each element should be squared.
         let x_data: Vec<f64> = (0..12).map(|i| i as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
 
@@ -4514,8 +4702,8 @@ mod batching_tests {
     fn test_nested_batch_over_dot_lifts_dimension_numbers() {
         use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 
-        // x has shape [3, 4]; outer batch over axis 0 produces per-lane rank-1 vectors. Inside,
-        // we want every per-lane vector dotted with itself, giving a per-lane scalar; batch
+        // x has shape [3, 4]; outer batch over axis 0 produces per-item rank-1 vectors. Inside,
+        // we want every per-item vector dotted with itself, giving a per-item scalar; batch
         // over the leading axis then yields a length-3 vector of dot products.
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data);
@@ -4525,7 +4713,7 @@ mod batching_tests {
             .unwrap();
 
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
-        // Lane 0: [1,2,3,4]·[1,2,3,4] = 30. Lane 1: [5,6,7,8]·[5,6,7,8] = 174. Lane 2: 446.
+        // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.
         for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
             assert_close(*actual, *expected);
         }
@@ -4533,7 +4721,7 @@ mod batching_tests {
 
     #[test]
     fn test_nested_batch_over_transpose_lifts_permutation() {
-        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-lane rank-2 matrices,
+        // x has shape [2, 3, 4]; outer batch over axis 0 yields per-item rank-2 matrices,
         // which we transpose. The combined effect is to permute axes 1 and 2 of the original
         // tensor, leaving the batch axis (originally axis 0) in place.
         let x_data: Vec<f64> = (0..24).map(|value| value as f64).collect();
@@ -4555,9 +4743,9 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_broadcasts_lane_uniform_input_with_in_axes_none() {
-        // x is a [4]-vector mapped on axis 0 (lanes), y is a lane-uniform scalar that should be
-        // added to every lane. The output should be element-wise `x + y` over the 4 lanes.
+    fn test_batch_broadcasts_replicated_input_with_in_axes_none() {
+        // x is a [4]-vector mapped on axis 0 (batch items), y is a replicated scalar that should be
+        // added to every batch item. The output should be element-wise `x + y` over the 4 batch items.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let y = TestArray::scalar(10.0);
         let output: TestArray = TestArrayDomain
@@ -4573,9 +4761,9 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_with_axis_size_validates_mapped_lane_count() {
-        // With explicit axis_size = Some(4), the lane count is pinned. A mapped input of size 4
-        // must agree, and the lane count flows through to subsequent operations.
+    fn test_batch_with_axis_size_validates_mapped_batch_size() {
+        // With explicit axis_size = Some(4), the batch size is pinned. A mapped input of size 4
+        // must agree, and the batch size flows through to subsequent operations.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let output: TestArray = TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(4)).unwrap();
         assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
@@ -4583,9 +4771,9 @@ mod batching_tests {
 
     #[test]
     fn test_batch_with_out_axes_none_rejects_mapped_output() {
-        // Function produces a per-lane output (mapped on axis 0), but `out_axes = None` declares
-        // the output as lane-uniform — matching JAX's semantics. The batch rejects because the
-        // computed output is genuinely per-lane; users wanting to collapse the lane axis must
+        // Function produces a per-item output (mapped on axis 0), but `out_axes = None` declares
+        // the output as replicated — matching JAX's semantics. The batch rejects because the
+        // computed output is genuinely per-item; users wanting to collapse the batch axis must
         // apply an explicit reduction inside the function.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
@@ -4594,8 +4782,8 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_with_out_axes_position_rejects_lane_uniform_output() {
-        // No input is mapped, so the output never picks up the lane axis, but `out_axes = Some(0)`
+    fn test_batch_with_out_axes_position_rejects_replicated_output() {
+        // No input is mapped, so the output never picks up the batch axis, but `out_axes = Some(0)`
         // requests a mapped output; `batch` refuses to materialize the axis with an implicit broadcast.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
@@ -4606,7 +4794,7 @@ mod batching_tests {
     #[test]
     fn test_batch_rejects_dynamic_batch_axis() {
         // A mapped input whose batch dimension is `Size::Dynamic` cannot be batched: batch has no
-        // way to determine the lane count.
+        // way to determine the batch size.
         let dynamic_input = TestArray {
             r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
             values: vec![1.0, 2.0, 3.0],
@@ -4627,7 +4815,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_repositions_output_with_out_axes() {
-        // Outer batch over axis 0 of a [3, 4] matrix: each lane returns its row unchanged.
+        // Outer batch over axis 0 of a [3, 4] matrix: each batch item returns its row unchanged.
         // out_axes=Some(1) requests that the batch axis end up at position 1 of the rank-2
         // output, which forces a transpose to swap the axes.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
@@ -4646,8 +4834,8 @@ mod batching_tests {
     #[test]
     fn test_nested_batch_with_mixed_in_axes_propagates_broadcast() {
         // Outer batch over axis 0 of `x: [3, 4]` exposes a rank-1 row to the closure; inside, a
-        // second inner batch maps that row's lane axis 0 while broadcasting a captured `bias`
-        // scalar to every inner lane. The combined output is x + bias broadcasted.
+        // second inner batch maps that row's batch axis 0 while broadcasting a captured `bias`
+        // scalar to every inner batch item. The combined output is x + bias broadcasted.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
         let bias = TestArray::scalar(0.5);
@@ -4683,8 +4871,8 @@ mod batching_tests {
     fn test_nested_batch_over_reshape_lifts_input_and_output_shapes() {
         use crate::operations::manipulation::Reshape;
 
-        // x has shape [2, 6]; outer batch over axis 0 yields per-lane rank-1 vectors of size 6,
-        // which we reshape to per-lane [2, 3]. The combined effect should be a [2, 2, 3] tensor
+        // x has shape [2, 6]; outer batch over axis 0 yields per-item rank-1 vectors of size 6,
+        // which we reshape to per-item [2, 3]. The combined effect should be a [2, 2, 3] tensor
         // whose leading axis is the original batch dimension.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(2, 6, x_data.clone());
@@ -4702,12 +4890,12 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_stages_lane_uniform_condition_predicates() {
-        // A lane-uniform *abstract* condition predicate under trace-time batching cannot be concretized to pick one
+    fn test_batch_stages_replicated_condition_predicates() {
+        // A replicated *abstract* condition predicate under trace-time batching cannot be concretized to pick one
         // branch (previously this surfaced a `Concretization` error), so the staged batching rule batches both
-        // branch programs at the operand lane axes and stages exactly one `condition` operation over them, with the
+        // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
         // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
-        // values matches the eager operational path lane for lane (scale by 2 when true and by 3 when false).
+        // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
         let parent_context = DomainTracingContext::<TestArrayDomain>::new();
         let builder = parent_context.builder().clone();
         let predicate_type = ArrayType::scalar(DataType::Boolean);
@@ -4750,11 +4938,11 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_normalizes_lane_uniform_condition_branch_output_axes() {
-        // The two branches of a staged batched condition may disagree on their natural output lane axes: here the
-        // true branch scales the batched operand per lane (axis 0) while the false branch returns a lane-uniform
-        // constant (no lane axis). The staged rule normalizes the false branch by appending a broadcast at its
-        // tail, so the staged condition stays well-typed and both predicate values interpret correctly per lane.
+    fn test_batch_normalizes_replicated_condition_branch_output_axes() {
+        // The two branches of a staged batched condition may disagree on their natural output batch axes: here the
+        // true branch scales the batched operand per batch item (axis 0) while the false branch returns a replicated
+        // constant (no batch axis). The staged rule normalizes the false branch by appending a broadcast at its
+        // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
         let mut constant_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         constant_builder.add_input(ArrayType::scalar(DataType::F64));
         let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
@@ -4799,11 +4987,11 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_lifts_lane_varying_condition_via_select() {
-        // A runtime-predicate Condition inside batch with a lane-varying predicate: each lane
+    fn test_batch_lifts_batch_varying_condition_via_select() {
+        // A runtime-predicate Condition inside batch with a batch-varying predicate: each batch item
         // independently chooses between `on_true` (scale by 2.0) and `on_false` (scale by 3.0).
         // The trace-time `BatchingContext` dispatches the rule's `batch`, whose
-        // lane-varying branch evaluates both branches over the operand axes and combines per lane
+        // batch-varying branch evaluates both branches over the operand axes and combines per batch item
         // via `Select`. Multi-op staging emerges automatically through `Tracer`'s value-level traits.
         let predicate = TestArray::new(
             ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(4)])),
@@ -4826,16 +5014,16 @@ mod batching_tests {
                 None,
             )
             .unwrap();
-        // Expected per-lane: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
+        // Expected per-item: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
         assert_eq!(output.values, vec![2.0, 6.0, 6.0, 12.0]);
     }
 
     #[test]
-    fn test_batch_over_zero_operation_yields_lane_uniform_output() {
-        // End-to-end: a batched function that stages `ZeroOperation` produces a lane-uniform zero
-        // value at the per-lane scalar type. Verifies that the trace-time stage hook accepts a
+    fn test_batch_over_zero_operation_yields_replicated_output() {
+        // End-to-end: a batched function that stages `ZeroOperation` produces a replicated zero
+        // value at the per-item scalar type. Verifies that the trace-time stage hook accepts a
         // zero-input operation and that the post-trace replay materializes the same zero for
-        // every lane through the lane-uniform broadcast path.
+        // every batch item through the replicated broadcast path.
         let output: TestArray = TestArrayDomain
             .batch(
                 |x| {
@@ -4884,16 +5072,21 @@ mod batching_tests {
             .unwrap();
 
         // A batched input whose mapped axis is sharded contributes that `ShardingDimension`.
-        let batched = ArrayBatch::mapped(sharded_type.clone(), 0).unwrap();
+        let batched = {
+            let value = sharded_type.clone();
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
         assert_eq!(
             batch_dimension_sharding(std::slice::from_ref(&batched)).unwrap(),
             ShardingDimension::sharded(["x"])
         );
 
-        // A lane-uniform input contributes nothing, so the axis defaults to replicated.
-        let lane_uniform = ArrayBatch::unbatched(sharded_type);
+        // A replicated batch input (no mapped axis) contributes no mapped-axis sharding, so the derived batch
+        // dimension defaults to replicated sharding.
+        let replicated = ArrayBatch::replicated(sharded_type);
         assert_eq!(
-            batch_dimension_sharding(std::slice::from_ref(&lane_uniform)).unwrap(),
+            batch_dimension_sharding(std::slice::from_ref(&replicated)).unwrap(),
             ShardingDimension::replicated()
         );
 
@@ -4901,7 +5094,11 @@ mod batching_tests {
         let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
             .with_sharding(Sharding::replicated(mesh, 2))
             .unwrap();
-        let other = ArrayBatch::mapped(replicated_type, 0).unwrap();
+        let other = {
+            let value = replicated_type;
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
         let error = batch_dimension_sharding(&[batched, other]).unwrap_err();
         assert!(matches!(
             error.downcast_custom::<BatchingError>(),
@@ -4911,8 +5108,8 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_axis_per_value_lane_index() {
-        // The per-value `BatchAxis` metadata: a mapped lane dimension index or lane-uniform.
+    fn test_batch_axis_per_value_batch_index() {
+        // The per-value `BatchAxis` metadata: a mapped batch dimension index or replicated.
         assert_eq!(BatchAxis::default(), BatchAxis::uniform());
         assert!(BatchAxis::uniform().is_uniform());
         assert!(!BatchAxis::mapped(2).is_uniform());
@@ -4977,10 +5174,10 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_broadcasts_mapped_inputs_with_mixed_per_lane_ranks() {
-        // x is mapped with per-lane shape [3]; y is mapped with a per-lane scalar shape. The
-        // elementwise rule broadcasts y's per-lane scalar across the common per-lane shape, so
-        // each lane computes `row + shift` with its own shift.
+    fn test_batch_broadcasts_mapped_inputs_with_mixed_per_item_ranks() {
+        // x is mapped with per-item shape [3]; y is mapped with a per-item scalar shape. The
+        // elementwise rule broadcasts y's per-item scalar across the common per-item shape, so
+        // each batch item computes `row + shift` with its own shift.
         let x = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let y = TestArray::vector(vec![10.0, 20.0]);
         let output: TestArray = TestArrayDomain
@@ -4997,8 +5194,8 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_broadcasts_scalar_lane_uniform_operands_to_full_shape() {
-        // A lane-uniform scalar constant added to a mapped [3, 4] input: the elementwise rule
+    fn test_batch_broadcasts_scalar_replicated_operands_to_full_shape() {
+        // A replicated scalar constant added to a mapped [3, 4] input: the elementwise rule
         // materializes a `BroadcastOperation` to the full common batched shape so the staged
         // add receives shape-congruent operands — required for backends such as XLA whose
         // elementwise lowerings (e.g., `stablehlo.add`) have no implicit broadcasting.

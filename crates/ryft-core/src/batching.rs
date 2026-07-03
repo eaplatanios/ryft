@@ -104,18 +104,6 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
         Ok(Self { r#type, value, batch_axis })
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Wraps a value that already contains a mapped axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `value`: Packed array value.
-    ///   - `batch_axis`: Mapped axis in `value`.
-    #[inline]
-    pub fn mapped(value: V, batch_axis: usize) -> Result<Self, ProgramError> {
-        Self::new(value.r#type().into_owned(), value, Some(batch_axis))
-    }
-
     /// Creates a new [`ArrayBatch`] that replicates the provided value across the batch.
     #[inline]
     pub fn replicated(value: V) -> Self {
