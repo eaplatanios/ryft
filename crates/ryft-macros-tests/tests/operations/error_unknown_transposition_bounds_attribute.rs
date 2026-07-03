@@ -5,7 +5,7 @@ struct ArrayType;
 trait Value<T> {}
 
 #[derive(ryft::TransposableOperation)]
-#[ryft(bounds(differentiation(Clone)))]
+#[ryft(bounds(transposition(Clone)))]
 enum BadOperation<V: Value<ArrayType>> {
     Operation(PhantomData<V>),
 }

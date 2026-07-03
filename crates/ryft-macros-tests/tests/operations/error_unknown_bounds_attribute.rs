@@ -5,7 +5,7 @@ struct DataType;
 trait Value<T> {}
 
 #[derive(ryft::Operation)]
-#[ryft(bounds(differentiation(Clone)))]
+#[ryft(bounds(lowering(Clone)))]
 enum BadOperation<V: Value<DataType>> {
     Operation(PhantomData<V>),
 }

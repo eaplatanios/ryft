@@ -1,5 +1,5 @@
-error: invalid '#[ryft(bounds(...))]' attribute: 'differentiation'; only 'transposition(...)' is supported here
+error: invalid '#[ryft(bounds(...))]' attribute: 'transposition'; only 'interpretation(...)' and 'partial_evaluation(...)' are supported here
  --> tests/operations/error_unknown_transposition_bounds_attribute.rs:8:15
   |
-8 | #[ryft(bounds(differentiation(Clone)))]
-  |               ^^^^^^^^^^^^^^^
+8 | #[ryft(bounds(transposition(Clone)))]
+  |               ^^^^^^^^^^^^^
