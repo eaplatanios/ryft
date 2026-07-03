@@ -901,17 +901,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
 ///
 /// To recombine the original outputs, interpret each [`PartitionStage::program`] in stage order over its own inputs
 /// (i.e., the original inputs named by [`PartitionStage::input_indices`]) followed by its consumed residuals (each
-/// fetched through its [`ResidualSource`] from an earlier stage's stored produced residuals), split each stage's
-/// outputs into its leading [`PartitionStage::output_count`] own outputs and its trailing produced residuals, and then,
-/// for each original program output, take it from the own outputs of the stage named by
+/// fetched through its [`PartitionResidualSource`] from an earlier stage's stored produced residuals), split each
+/// stage's outputs into its leading [`PartitionStage::output_count`] own outputs and its trailing produced residuals,
+/// and then, for each original program output, take it from the own outputs of the stage named by
 /// [`output_stages`](Self::output_stages).
 ///
 /// # Invariants
 ///
 ///   - `stages[i].program.input_ids().len() == stages[i].input_indices.len() + stages[i].residual_inputs.len()`.
 ///   - The producer's produced-residual count is `stages[i].program.output_ids().len() - stages[i].output_count`.
-///   - Every [`ResidualSource`] `{ stage, index }` consumed by stage `i` has `stage < i` and `index` less than the
-///     producer's produced-residual count.
+///   - Every [`PartitionResidualSource`] `{ stage, index }` consumed by stage `i` has `stage < i` and `index` less
+///     than the producer's produced-residual count.
 #[derive(Debug)]
 pub struct PartitionedProgram<T: Type, V: Value<T>, O> {
     /// [`PartitionStage`]s of this [`PartitionedProgram`]. The index of each stage in this vector is its ID.
@@ -937,7 +937,7 @@ pub struct PartitionStage<T: Type, V: Value<T>, O> {
 
     /// Source of each trailing consumed-residual input, in order: which earlier stage produced it and its index among
     /// that stage's produced residuals.
-    pub residual_inputs: Vec<ResidualSource>,
+    pub residual_inputs: Vec<PartitionResidualSource>,
 
     /// Count of this stage's leading (own) outputs; the remaining [`program`](Self::program) outputs are the produced
     /// residuals other stages consume.
@@ -947,7 +947,7 @@ pub struct PartitionStage<T: Type, V: Value<T>, O> {
 /// Where a consumed residual comes from: the producer `stage` and the `index` of the residual among that stage's
 /// produced residuals (the trailing outputs of the producer's program, after its own outputs).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct ResidualSource {
+pub struct PartitionResidualSource {
     /// Stage id of the producer, the earlier stage whose produced residuals include this value.
     pub stage: usize,
 
@@ -1016,7 +1016,7 @@ pub struct StructuralBoundaryStage<O> {
     pub input_indices: Vec<usize>,
 
     /// Source of each trailing residual input consumed by this stage.
-    pub residual_inputs: Vec<ResidualSource>,
+    pub residual_inputs: Vec<PartitionResidualSource>,
 
     /// Number of leading outputs corresponding to original boundary outputs. Any remaining operation outputs are
     /// produced residuals consumed by later stages.
@@ -1422,7 +1422,7 @@ where
         //   - consumer side (`consumed`): a per-consuming-stage ordered, deduplicated candidate list.
         // Known constants are excluded by the `is_variable` guard; `filtered` rebuilds them inline.
         let mut produced: Vec<Vec<AtomId>> = vec![Vec::new(); stage_count];
-        let mut source_of: HashMap<AtomId, ResidualSource> = HashMap::new();
+        let mut source_of: HashMap<AtomId, PartitionResidualSource> = HashMap::new();
         let mut consumed: Vec<Vec<AtomId>> = vec![Vec::new(); stage_count];
         let mut seen: Vec<Vec<bool>> = vec![vec![false; self.atoms.len()]; stage_count];
         for instruction in self.instructions.iter() {
@@ -1438,7 +1438,7 @@ where
                 // Producer side: assign this residual its identity once, shared by every consumer.
                 source_of.entry(input_id).or_insert_with(|| {
                     produced[producing_stage].push(input_id);
-                    ResidualSource { stage: producing_stage, index: produced[producing_stage].len() - 1 }
+                    PartitionResidualSource { stage: producing_stage, index: produced[producing_stage].len() - 1 }
                 });
                 // Consumer side: record it in this consuming stage's candidate list, deduplicated per stage.
                 if !seen[consuming_stage][input_id.index()] {
@@ -1494,7 +1494,7 @@ where
 
             // Rebuild both input lists from the post-filter survivors, parallel to the filtered program's inputs: an
             // own-input survivor maps back to its original input index; a residual-tail survivor maps to its producer's
-            // `ResidualSource`. Keeping (rather than dropping) surviving residual-tail positions preserves the invariant
+            // `PartitionResidualSource`. Keeping (rather than dropping) surviving residual-tail positions preserves the invariant
             // `program.input_ids().len() == input_indices.len() + residual_inputs.len()` even when a dead residual is
             // pruned. `output_count` is exact because `filtered` never prunes outputs, so the produced-residual suffix
             // is exactly `produced[stage]`.
@@ -2516,7 +2516,7 @@ mod tests {
         assert!(matches!(split.known.program.instructions()[0].operation(), SymbolicOperation::Add));
 
         assert_eq!(split.staged.input_indices, vec![1]);
-        assert_eq!(split.staged.residual_inputs, vec![ResidualSource { stage: 0, index: 0 }]);
+        assert_eq!(split.staged.residual_inputs, vec![PartitionResidualSource { stage: 0, index: 0 }]);
         assert_eq!(split.staged.output_count, 2);
         assert_eq!(split.staged.program.instructions().len(), 2);
         assert!(matches!(split.staged.program.instructions()[0].operation(), SymbolicOperation::Mul));
@@ -2664,7 +2664,7 @@ mod tests {
     ///     produced residual feeds *two* later stages.
     ///
     /// The round-trip runs the stages in order, stores each stage's produced residuals, feeds each stage its
-    /// `input_indices` plus its `residual_inputs` (resolved through their [`ResidualSource`]s), and reassembles the
+    /// `input_indices` plus its `residual_inputs` (resolved through their [`PartitionResidualSource`]s), and reassembles the
     /// outputs by `output_stages` (own outputs first) and must equal interpreting the original program.
     #[test]
     fn test_partition_three_stages_round_trips_with_skip_and_shared_residuals() {
@@ -2708,7 +2708,7 @@ mod tests {
             assert_eq!(stage.program.input_ids().len(), stage.input_indices.len() + stage.residual_inputs.len());
         }
 
-        // Round-trip: run the stages in order, threading residuals via `ResidualSource`, and reassemble by
+        // Round-trip: run the stages in order, threading residuals via `PartitionResidualSource`, and reassemble by
         // `output_stages` (own outputs first within each stage).
         let recombine = |inputs: &[Scalar]| -> Vec<Scalar> {
             let mut own_outputs: Vec<Vec<Scalar>> = Vec::with_capacity(partition.stages.len());
