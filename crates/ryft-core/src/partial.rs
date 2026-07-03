@@ -776,116 +776,74 @@ impl<C: Context> PartialEvaluator<C> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<T, V, O> Program<T, V, O, Vec<V>, Vec<V>>
-where
-    T: Type,
-    V: Value<T>,
-    O: Operation<T>,
-{
-    /// Partially evaluates this flat program against the provided per-input knowledge, folding known work eagerly.
+impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
+    /// Partially evaluates this [`Program`] against the provided [`PartialValue`] inputs, folding known work eagerly.
+    /// This is the main partial evaluation entry point, instantiated at this program's own [`EagerContext`] so that
+    /// known values are concrete values and folding interprets each all-known [`Instruction`](crate::Instruction)
+    /// immediately. [`partially_evaluate_in_context`](Self::partially_evaluate_in_context) is the [`Context`]-taking
+    /// core it delegates to and must be used instead with a [`StagingContext`] to fold known work into an enclosing
+    /// trace.
     ///
-    /// This is the main partial-evaluation entry point, instantiated at this program's own
-    /// [`EagerContext<T, V, O>`](crate::EagerContext) so that known values are concrete `V`s and folding interprets
-    /// each all-known instruction immediately.
-    /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context) is the context-taking core it delegates
-    /// to; supply that form a live [`StagingContext`] to fold known work into an enclosing trace instead.
-    ///
-    /// Partial evaluation classifies each [`Atom`] as *known* (computable now from the provided values) or *unknown*
-    /// (dependent on a runtime input), folds the known subcomputation away, and carves the remaining unknown
-    /// subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the known values it
-    /// actually needs.
-    ///
-    /// It is a forward pass that builds the residual program incrementally with a [`ProgramBuilder`], deliberately
-    /// built on the existing operation semantics rather than reimplementing graph machinery: every instruction whose
-    /// inputs are all [`Known`](PartialValue::Known) is folded eagerly by [`bind`](Context::bind)ing it (so no
-    /// operation semantics are duplicated) and contributes nothing to the residual program; any instruction with at
-    /// least one [`Unknown`](PartialValue::Unknown) input is emitted into the residual program over its inputs'
-    /// residual-program atoms; and the residual program is finalized with [`Program::into_simplified`], which prunes
-    /// instructions and constants that no longer feed an output.
-    ///
-    /// Each instruction is first offered to its own [`PartiallyEvaluatableOperation::partially_evaluate`] rule, which
-    /// may override this default. For example, a `condition` with a concretizable known predicate calls
-    /// [`PartialEvaluator::inline_program`] to inline its selected branch in place of the operation, so the
-    /// condition disappears from the residual program. Building the residual program with a builder (rather than
-    /// projecting the original) is what lets these rules emit *transformed* work; flat instructions with no override
-    /// are emitted unchanged. The walk is flat per program but can recurse through operation rules into inlined nested
-    /// programs, such as a selected `condition` branch; an instruction carrying a nested program that is *not* inlined
-    /// is folded only when all of its inputs are known and is otherwise emitted unchanged.
+    /// Partial evaluation classifies each [`Atom`] as *known* (i.e., computable _now_ from the provided values) or
+    /// *unknown* (i.e., dependent on a runtime input), folds the known subcomputation away, and carves the remaining
+    /// unknown subcomputation into a residual [`Program`] that consumes only the unknown inputs plus the known values
+    /// it actually needs. During partial evaluation, each instruction is first offered to its own
+    /// [`PartiallyEvaluatableOperation::partially_evaluate`] implementation, which may override the default behavior.
+    /// For example, a `condition` with a concretizable known predicate calls [`PartialEvaluator::inline_program`]
+    /// to inline its selected branch in place of the operation, so that the condition disappears from the residual
+    /// program. Building the residual program with a [`ProgramBuilder`] (rather than projecting the original) is what
+    /// lets these rules emit *transformed* work; flat instructions with no override are emitted unchanged. The walk is
+    /// flat per program but can recurse through operation rules into inlined nested programs, such as a selected
+    /// `condition` branch; an instruction carrying a nested program that is *not* inlined is folded only when all of
+    /// its inputs are known and is otherwise emitted unchanged.
     ///
     /// Each known *variable* a residualized instruction consumes, whether a program input or a folded intermediate,
     /// becomes a residual input of the residual program. Literal constants are rebuilt inline as residual-program
     /// constants (their staged payload is recovered through [`Context::resolve`]), so they are never residual inputs.
     /// The resulting [`PartialEvaluation`] carries everything a caller needs to reassemble the original outputs once
-    /// the runtime (unknown) inputs are available.
+    /// the runtime (i.e., unknown) inputs are available.
     ///
     /// # Relationship to [`partition`](Self::partition)
     ///
-    /// This is the **value-carrying** form of partial evaluation: it holds known values, so it *evaluates* the known
-    /// subcomputation away (folding it through [`Context::bind`]) and applies per-operation rewrite rules, yielding a
-    /// single residual [`Program`] plus the folded output and residual-input *values*. Reach for it to **specialize
-    /// or constant-fold** a program against inputs that are known now, or (through
-    /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context)) to split a program online against
-    /// values known to a live outer trace.
-    ///
-    /// [`partition`](Self::partition) is the **structural** counterpart: from a stage id per input (no values, no
-    /// context) it *partitions* the program into per-stage sub-programs joined by residuals, folding and rewriting
-    /// nothing, which is the form linearization uses as a two-stage known/unknown split. The two are not reducible to
-    /// each other: this method requires known values and *discards* the known computation (folds it to values or
-    /// stages it into the outer program), whereas a partition keeps each stage's computation as a runnable program.
-    /// This mirrors JAX, where `partial_eval_jaxpr_nounits` is the online trace under a staging parent while
-    /// `partial_eval_jaxpr_custom` is a separate structural equation walk.
-    ///
-    /// # Parameters
-    ///
-    ///   - `inputs`: Knowledge state for each program input, in input order.
+    /// This function is the **value-carrying** form of partial evaluation: it holds known values, and it *evaluates*
+    /// the known subcomputation away (folding it through [`Context::bind`]) and applies per-operation rewrite rules,
+    /// yielding a single residual [`Program`] plus the folded output and residual-input *values*. Use this function
+    /// to **specialize or constant-fold** a program against inputs that are known now, or, through
+    /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context), to split a program online against values
+    /// known to a live outer trace. [`partition`](Self::partition) is the **structural** counterpart to this function:
+    /// given a stage ID per input (with no values and no context), it *partitions* the program into per-stage
+    /// sub-programs joined by residuals, folding and rewriting nothing, which is the form linearization uses as a
+    /// two-stage known/unknown split. The two are not reducible to each other: this function requires known values and
+    /// *discards* the known computation (i.e., it folds it to values or stages it into the outer program), whereas a
+    /// partition keeps each stage's computation as a runnable program.
     #[inline]
     pub fn partially_evaluate(
         &self,
         inputs: &[PartialValue<T, V>],
     ) -> Result<PartialEvaluation<EagerContext<T, V, O>>, ProgramError>
     where
-        O: Clone
-            + InterpretableOperation<T, V, EagerContext<T, V, O>>
-            + PartiallyEvaluatableOperation<EagerContext<T, V, O>>,
+        O: InterpretableOperation<T, V, EagerContext<T, V, O>> + PartiallyEvaluatableOperation<EagerContext<T, V, O>>,
     {
         self.partially_evaluate_in_context(&EagerContext::new(), inputs)
     }
 
-    /// Partially evaluates this flat program against the provided per-input knowledge, folding known work through the
-    /// known-side [`Context`] `C`. This is the context-taking core behind
-    /// [`partially_evaluate`](Self::partially_evaluate), which instantiates it at this program's own
-    /// [`EagerContext`]; refer to that method for the full semantics.
-    ///
-    /// What *folding* means is owned by `C`: under an eager known-side context known values are concrete and folding
-    /// interprets the operation immediately, while under a [`StagingContext`] known values are
-    /// [`Tracer`](crate::Tracer)s and folding *stages* the operation into the outer program that context is building
-    /// — the parent-trace-polymorphic behavior of JAX's `JaxprTrace`, whose known side folds by binding under
-    /// whatever trace encloses it, which is what lets partial evaluation split a program online against values known
-    /// to a live outer trace. Under a staging `C`, the [`Known`](PartialEvaluationInput::Known) residual feeders are
-    /// the known→unknown residual edges connecting the outer program to the residual program.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Known-side context used to fold instructions whose inputs are all known.
-    ///   - `inputs`: Knowledge state for each program input, in input order.
-    pub fn partially_evaluate_in_context<C>(
+    /// Partially evaluates this [`Program`] against the provided [`PartialValue`] inputs, folding known work through
+    /// the provided known-side [`Context`]. This is the context-taking core behind
+    /// [`partially_evaluate`](Self::partially_evaluate).
+    pub fn partially_evaluate_in_context<C: Context<Type = T, Constant = V, Operation = O>>(
         &self,
         context: &C,
         inputs: &[PartialValue<T, C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError>
     where
-        C: Context<Type = T, Constant = V, Operation = O>,
         O: PartiallyEvaluatableOperation<C>,
     {
         if inputs.len() != self.input_ids.len() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_ids.len(), actual: inputs.len() });
         }
 
+        // Seed top-level inputs. Known inputs hold their value and unknown inputs lead the residual program's inputs.
         let mut residual = PartialEvaluator::new(context.clone());
-
-        // Seed top-level inputs: known inputs hold their value; unknown inputs lead the residual program's inputs.
         let mut seed = Vec::with_capacity(inputs.len());
         for (index, (input_id, knowledge)) in self.input_ids.iter().copied().zip(inputs.iter()).enumerate() {
             match knowledge {
@@ -900,9 +858,8 @@ where
             }
         }
 
+        // Assemble outputs. Folded values return directly and residual values index the residual program's outputs.
         let output_values = residual.inline_program(self, seed)?;
-
-        // Assemble outputs: folded values return directly; residual values index the residual program's outputs.
         let mut outputs = Vec::with_capacity(output_values.len());
         let mut residual_output_atoms: Vec<AtomId> = Vec::new();
         for value in output_values {
@@ -934,6 +891,8 @@ where
         Ok(PartialEvaluation { program: residual_program, inputs: residual_inputs, outputs })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Result of partitioning a flat [`Program`] into `stage_count` totally-ordered stages by a per-input stage
 /// assignment; see [`Program::partition`].
