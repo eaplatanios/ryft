@@ -892,23 +892,19 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Result of partitioning a flat [`Program`] into `stage_count` totally-ordered stages by a per-input stage
-/// assignment; see [`Program::partition`].
-///
-/// Unlike [`PartialEvaluation`], this is a purely *structural* partition: it carries no concrete values and folds
+/// Result of partitioning a [`Program`] into a sequence of totally-ordered stages by calling [`Program::partition`].
+/// Unlike [`PartialEvaluation`], this is a purely *structural* partition that carries no concrete values and folds
 /// nothing. Each instruction is placed in the latest stage among its inputs, and the forward cross-stage edges are
 /// threaded as *residuals* between the per-stage sub-programs. Running the [`stages`](Self::stages) in stage order,
 /// threading each stage's produced residuals forward to the stages that consume them, and reassembling the outputs via
-/// [`output_stages`](Self::output_stages) reproduces the original program. Its two-stage known/unknown instance is the
-/// partial-evaluation split.
+/// [`output_stages`](Self::output_stages) reproduces the original program.
 ///
-/// To recombine the original outputs: interpret each [`PartitionStage::program`] in stage order over its own inputs
-/// (the original inputs named by [`PartitionStage::input_indices`]) followed by its consumed residuals (each fetched
-/// through its [`ResidualSource`] from an earlier stage's stored produced residuals); split each stage's outputs into
-/// its leading [`PartitionStage::output_count`] own outputs and its trailing produced residuals; then, for each
-/// original program output, take it from the own outputs of the stage named by [`output_stages`](Self::output_stages).
+/// To recombine the original outputs, interpret each [`PartitionStage::program`] in stage order over its own inputs
+/// (i.e., the original inputs named by [`PartitionStage::input_indices`]) followed by its consumed residuals (each
+/// fetched through its [`ResidualSource`] from an earlier stage's stored produced residuals), split each stage's
+/// outputs into its leading [`PartitionStage::output_count`] own outputs and its trailing produced residuals, and then,
+/// for each original program output, take it from the own outputs of the stage named by
+/// [`output_stages`](Self::output_stages).
 ///
 /// # Invariants
 ///
@@ -918,12 +914,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
 ///     producer's produced-residual count.
 #[derive(Debug)]
 pub struct PartitionedProgram<T: Type, V: Value<T>, O> {
-    /// One sub-program per stage, in stage order (the index of a stage is its stage id).
+    /// [`PartitionStage`]s of this [`PartitionedProgram`]. The index of each stage in this vector is its ID.
     pub stages: Vec<PartitionStage<T, V, O>>,
 
-    /// For each original program output, in original output order, the stage that produces it.
+    /// Vector that contains, for each original program output, in original output order, the stage that produces it.
     pub output_stages: Vec<usize>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// One stage of a [`PartitionedProgram`]. Its [`program`](Self::program) takes `[stage inputs..., consumed
 /// residuals...]` and produces `[stage outputs..., produced residuals...]`.
