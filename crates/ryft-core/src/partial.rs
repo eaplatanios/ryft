@@ -472,18 +472,16 @@ impl<C: Context> PartialEvaluator<C> {
         &self.context
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Recovers the staged-constant payload of the provided known value `value` through [`Context::resolve`], reporting
     /// a [`ProgramError`] when the known-side [`Context`] cannot prove that the provided value is a concrete constant.
-    ///
     /// Higher-order rules use this when they must embed a known value *inside* a nested residual program (e.g., a
     /// folded loop-invariant carry spliced into a rebuilt `scan` body), where only a program constant can represent
-    /// it: nested programs cannot reference atoms of the enclosing residual program or of the outer known-side
-    /// program. Under an eager known-side context this always succeeds; under a staging context it succeeds only for
-    /// literal-backed values, and the caller must treat the error as "this rewrite is not available" and fall back to
-    /// a conservative alternative.
-    pub fn known_constant_payload(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
+    /// it (nested programs cannot reference atoms of the enclosing residual program or of the outer known-side
+    /// program). Under an eager known-side context this always succeeds. Under a [`StagingContext`] it succeeds only
+    /// for literal-backed values, and the caller must treat the error as "this rewrite is not available" and fall back
+    /// to a conservative alternative.
+    #[inline]
+    pub fn known_constant(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
         self.context.resolve(value).into_concrete().ok_or_else(|| {
             ProgramError::MalformedProgram(
                 "a known value crossing into a nested residual program is not concretizable in the active \
@@ -493,10 +491,12 @@ impl<C: Context> PartialEvaluator<C> {
         })
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Returns whether every [`Known`](PartialEvaluationInput::Known) residual input and
     /// [`Known`](PartialEvaluationOutput::Known) output of `evaluation` resolves to a concrete constant in the
     /// known-side context — i.e., whether a nested-program rebuild that embeds those knowns as inline program
-    /// constants (through [`Self::known_constant_payload`]) can succeed.
+    /// constants (through [`Self::known_constant`]) can succeed.
     ///
     /// Under a staging known-side context, a probe's folds can produce known values that are genuine tracers into
     /// the live trace (e.g., a constant-only chain staged by the fold); rules that rebuild nested programs from a
