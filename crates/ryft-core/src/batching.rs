@@ -76,13 +76,13 @@ impl From<BatchingError> for ProgramError {
 
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
 /// representation for Ryft's batching/vectorization transform. It pairs a physical array value with a batch axis that
-/// marks which of its dimensions indexes the current batch lanes. A value is either *batched* (i.e., its physical type
-/// carries the lane dimension) or *lane-uniform*, meaning that it is shared unchanged across every batch lane.
+/// marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its physical type carries
+/// the batch dimension) or *batch-uniform*, meaning that it is shared unchanged across every batch item.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct ArrayBatch<V> {
-    /// Physical array type of `value`. When the value is batched this type includes the mapped lane dimension at
-    /// `batch_axis`. The logical per-lane [`ArrayType`] is recovered by removing that dimension and can be obtained
-    /// using [`Self::logical_type`].
+    /// Physical array type of `value`. When the value is batched this type includes the mapped batch dimension at
+    /// `batch_axis`. The unbatched (i.e., per-item) [`ArrayType`] is recovered by removing that dimension and can be
+    /// obtained using [`Self::unbatched_type`].
     r#type: ArrayType,
 
     /// Refer to the documentation of [`value`](Self::value) for more information.
@@ -103,13 +103,31 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
         Ok(Self { r#type, value, batch_axis })
     }
 
-    /// Returns the axis in [`r#type`](Self::type) and [`value`](Self::value) that indexes the current batch lanes,
-    /// or `None` when `value` is *lane-uniform* (i.e., it carries no physical dimension for the current lanes and is
-    /// interpreted as the same value for every lane). For example, a traced constant in `batch(|x| x + 1)` has a `None`
-    /// batch axis, while `x` carries the mapped input axis. Runtime control flow predicates may also require `None`,
-    /// because a single predicate may select one branch for all lanes while a lane-varying predicate would need a
+    // TODO(eaplatanios): Review this function.
+    /// Wraps a value that already contains a mapped axis.
+    ///
+    /// # Parameters
+    ///
+    ///   - `value`: Packed array value.
+    ///   - `batch_axis`: Mapped axis in `value`.
+    pub fn mapped(value: V, batch_axis: usize) -> Result<Self, ProgramError> {
+        Self::new(value.r#type().into_owned(), value, Some(batch_axis))
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Creates a new [`ArrayBatch`] that wraps the provided value in a batch-uniform fashion
+    /// (i.e., that replicates across the batch).
+    pub fn unbatched(value: V) -> Self {
+        Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
+    }
+
+    /// Returns the axis in [`r#type`](Self::type) and [`value`](Self::value) that indexes the batch items, or `None`
+    /// when `value` is *batch-uniform* (i.e., it carries no physical dimension for the batch and is interpreted as the
+    /// same value for every batch item). For example, a traced constant in `batch(|x| x + 1)` has a `None` batch axis,
+    /// while `x` carries the mapped input axis. Runtime control flow predicates may also require `None`, because a
+    /// single predicate may select one branch for the whole batch while a batch-varying predicate would need a
     /// dedicated batching rule. Note that `None` is not limited to rank-0 (i.e., scalar) values. Any shaped constant
-    /// or operand is lane-uniform when none of its physical dimensions indexes the current lanes.
+    /// or operand is batch-uniform when none of its physical dimensions indexes the batch.
     #[inline]
     pub fn batch_axis(&self) -> Option<usize> {
         self.batch_axis
@@ -127,40 +145,28 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
         self.value
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-    
-    /// Returns the static mapped axis size, if this value is batched.
-    pub fn axis_size(&self) -> Result<Option<usize>, ProgramError> {
+    /// Returns the batch size of this [`ArrayBatch`] (i.e., the number of items that are batched together),
+    /// or `None` if it batch-uniform (i.e., replicated as-is across the whole batch).
+    #[inline]
+    pub fn batch_size(&self) -> Result<Option<usize>, ProgramError> {
         let Some(axis) = self.batch_axis else {
             return Ok(None);
         };
-        let Some(size) = self.r#type.dimension(axis as isize).value() else {
-            return Err(BatchingError::DynamicBatchAxis { r#type: self.r#type.clone(), axis }.into());
-        };
+        let size = self
+            .r#type
+            .dimension(axis as isize)
+            .value()
+            .ok_or_else(|| BatchingError::DynamicBatchAxis { r#type: self.r#type.clone(), axis })?;
         Ok(Some(size))
     }
 
-    /// Returns the scalar-body type obtained by removing the mapped axis.
-    pub fn logical_type(&self) -> Result<ArrayType, ProgramError> {
+    /// Returns the [`ArrayType`] of each item in the batch (i.e., with the batch axis removed, if any).
+    #[inline]
+    pub fn unbatched_type(&self) -> Result<ArrayType, ProgramError> {
         let Some(axis) = self.batch_axis else {
             return Ok(self.r#type.clone());
         };
         Ok(self.r#type.without_dimension(axis)?.0)
-    }
-
-    /// Wraps a value that already contains a mapped axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `value`: Packed array value.
-    ///   - `batch_axis`: Mapped axis in `value`.
-    pub fn mapped(value: V, batch_axis: usize) -> Result<Self, ProgramError> {
-        Self::new(value.r#type().into_owned(), value, Some(batch_axis))
-    }
-
-    /// Wraps a value that is uniform across the current batch lanes.
-    pub fn unbatched(value: V) -> Self {
-        Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
     }
 }
 
@@ -169,7 +175,7 @@ impl<V: Display> Display for ArrayBatch<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.batch_axis {
             Some(axis) => write!(formatter, "batch[{}, axis={axis}]({})", self.r#type, self.value),
-            None => write!(formatter, "batch[{}, lane-uniform]({})", self.r#type, self.value),
+            None => write!(formatter, "batch[{}, batch-uniform]({})", self.r#type, self.value),
         }
     }
 }
