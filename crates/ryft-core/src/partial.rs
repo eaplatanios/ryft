@@ -440,7 +440,7 @@ pub struct PartialEvaluator<C: Context> {
     /// (i.e., the outer program [`Atom`] a known value names when it [`resolve`](Context::resolve)s as a
     /// [`Staged`](ValueResolution::Staged) instance in a staging known-side context), mapping the staged [`Atom`] to
     /// the residual input already created for it.
-    /// 
+    ///
     /// This complements the per-program [`materialization_scopes`](Self::materialization_scopes) along the axis that
     /// scope-local, source-atom-keyed deduplication cannot reach. Staged atoms are stable identities across the whole
     /// walk (an outer-trace atom is the same value no matter which inlined program is being walked), and so two known
@@ -491,27 +491,25 @@ impl<C: Context> PartialEvaluator<C> {
         })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns whether every [`Known`](PartialEvaluationInput::Known) residual input and
-    /// [`Known`](PartialEvaluationOutput::Known) output of `evaluation` resolves to a concrete constant in the
-    /// known-side context — i.e., whether a nested-program rebuild that embeds those knowns as inline program
-    /// constants (through [`Self::known_constant`]) can succeed.
-    ///
-    /// Under a staging known-side context, a probe's folds can produce known values that are genuine tracers into
-    /// the live trace (e.g., a constant-only chain staged by the fold); rules that rebuild nested programs from a
-    /// live-context probe must check this and fall back to a conservative rewrite when it returns `false`.
+    /// Returns `true` if every [`Known`](PartialEvaluationInput::Known) residual input and
+    /// [`Known`](PartialEvaluationOutput::Known) output of the provided [`PartialEvaluation`] resolves to a concrete
+    /// constant in the known-side [`Context`] of this [`PartialEvaluator`] (i.e., if a nested program rebuild that
+    /// embeds those knowns as inline program constants through [`Self::known_constant`] can succeed). Under a staging
+    /// known-side context, a probe's folds can produce known values that are genuine tracers into the live trace (e.g.,
+    /// a constant-only chain staged by the fold). Rules that rebuild nested programs from a live context probe must
+    /// check this and fall back to a conservative rewrite when it returns `false`.
+    #[inline]
     pub fn knowns_are_concrete(&self, evaluation: &PartialEvaluation<C>) -> bool {
-        let input_knowns_concrete = evaluation.inputs.iter().all(|input| match input {
+        evaluation.inputs.iter().all(|input| match input {
             PartialEvaluationInput::Known(value) => self.context.resolve(value).is_concrete(),
             PartialEvaluationInput::Unknown(_) => true,
-        });
-        input_knowns_concrete
-            && evaluation.outputs.iter().all(|output| match output {
-                PartialEvaluationOutput::Known(value) => self.context.resolve(value).is_concrete(),
-                PartialEvaluationOutput::Unknown(_) => true,
-            })
+        }) && evaluation.outputs.iter().all(|output| match output {
+            PartialEvaluationOutput::Known(value) => self.context.resolve(value).is_concrete(),
+            PartialEvaluationOutput::Unknown(_) => true,
+        })
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns `true` when any of `inputs` is known but does not [`resolve`](Context::resolve) to a
     /// [`Concrete`](crate::ValueResolution::Concrete) constant in the known-side context — a genuine tracer into a
