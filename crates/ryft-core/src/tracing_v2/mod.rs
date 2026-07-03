@@ -49,9 +49,7 @@ pub use linear::{
 pub use operations::collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
 pub use operations::control_flow::transpose_primal_condition;
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;
-pub use operations::dot::{
-    Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, RightDot, RightDotOperation,
-};
+pub use operations::dot::{Dot, DotDimensionNumbers, DotOperation, DotOps};
 pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::transpose_primal_scan;
 pub use operations::{ArrayOperation, RecomputeOperation};
