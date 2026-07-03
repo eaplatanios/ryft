@@ -4,9 +4,10 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::domains::Domain;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_builders;
+use crate::operations::Operation;
 use crate::operations::constants::{ConstantOperation, MaybeZeroOperation};
-use crate::operations::{InterpretableOperation, Operation};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracerState, TracingContext};

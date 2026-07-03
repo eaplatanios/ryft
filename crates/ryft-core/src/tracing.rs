@@ -524,11 +524,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
-    use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::scalars::{Scalar, ScalarDomain};

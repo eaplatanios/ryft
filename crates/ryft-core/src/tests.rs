@@ -25,6 +25,8 @@ use std::ops::{BitAnd, BitOr, BitXor, Not};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, EagerContext, ValueResolution};
 use crate::domains::Domain;
+use crate::interpretation::InterpretableOperation;
+use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::manipulation::{
@@ -33,7 +35,6 @@ use crate::operations::manipulation::{
 };
 use crate::operations::tag::Tag;
 use crate::operations::trigonometric::{Cos, Sin};
-use crate::operations::{BooleanLike, InterpretableOperation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::TransferToMemory;
@@ -2578,7 +2579,7 @@ mod linearization_tests {
     #[test]
     fn test_staging_partial_evaluation_reproduces_the_linearize_split() {
         use crate::contexts::StagingContext;
-        use crate::partial::{ResidualProgramInput, ResidualProgramOutput};
+        use crate::partial::{PartialEvaluationInput, PartialEvaluationOutput};
         use crate::tracing::TracingContext;
 
         let domain = ScalarDomain::new();
@@ -2614,7 +2615,7 @@ mod linearization_tests {
         for _ in 0..primal_count {
             knowledge.push(PartialValue::Unknown(DataType::F64));
         }
-        let evaluation = jvp_program.partially_evaluate_in(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = jvp_program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
         // The outer program plays `Linearization::primal_program`'s role: its outputs are the folded primal outputs
         // followed by the known feeders (the residual edges), in feeder order.
@@ -2622,13 +2623,13 @@ mod linearization_tests {
         let mut outer_output_atoms = Vec::new();
         for output in primal_outputs {
             match output {
-                ResidualProgramOutput::Known(value) => outer_output_atoms.push(value.atom_id().unwrap()),
-                ResidualProgramOutput::Unknown(_) => panic!("a primal output did not fold under the staging trace"),
+                PartialEvaluationOutput::Known(value) => outer_output_atoms.push(value.atom_id().unwrap()),
+                PartialEvaluationOutput::Unknown(_) => panic!("a primal output did not fold under the staging trace"),
             }
         }
         let mut residual_edge_count = 0;
         for input in evaluation.inputs.iter() {
-            if let ResidualProgramInput::Known(value) = input {
+            if let PartialEvaluationInput::Known(value) = input {
                 outer_output_atoms.push(value.atom_id().unwrap());
                 residual_edge_count += 1;
             }
@@ -2658,16 +2659,16 @@ mod linearization_tests {
             .inputs
             .iter()
             .map(|input| match input {
-                ResidualProgramInput::Unknown(_) => remaining_tangents.next().unwrap(),
-                ResidualProgramInput::Known(_) => remaining_residuals.next().unwrap(),
+                PartialEvaluationInput::Unknown(_) => remaining_tangents.next().unwrap(),
+                PartialEvaluationInput::Known(_) => remaining_residuals.next().unwrap(),
             })
             .collect::<Vec<_>>();
         let staged_tangent_values = evaluation.program.interpret(residual_inputs).unwrap();
         let reassembled_tangents = tangent_outputs
             .iter()
             .map(|output| match output {
-                ResidualProgramOutput::Known(_) => panic!("a tangent output unexpectedly folded"),
-                ResidualProgramOutput::Unknown(index) => staged_tangent_values[*index],
+                PartialEvaluationOutput::Known(_) => panic!("a tangent output unexpectedly folded"),
+                PartialEvaluationOutput::Unknown(index) => staged_tangent_values[*index],
             })
             .collect::<Vec<_>>();
         assert_close(&reassembled_tangents, &reference_tangents, "staging-trace tangent outputs");
@@ -3349,7 +3350,7 @@ mod array_linearization_tests {
         assert_eq!(jvp_program.output_ids().len(), 2);
 
         // The crux: the program is expressed entirely in the primal `ArrayOperation` enum, so it carries no
-        // captured-factor linear operation (no `LeftDot` / `RightDot` carrying a captured residual factor). The tangent
+        // captured-factor linear operation (no captured-factor linear dot operation carrying a residual factor). The tangent
         // dots are ordinary binary `Dot`s referencing primal and tangent SSA values directly. The type system proves
         // the absence of symbolic captures: the program's operation family is `ArrayOperation<TestArray>`, the ordinary
         // primal operation family, rather than a capture-keyed linear operation family. This binding documents that

@@ -7,6 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::contexts::{Context, EagerContext, ValueResolution};
 use crate::domains::Domain;
+use crate::interpretation::InterpretableOperation;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Constant, One, OneLike, Zero, ZeroLike};
@@ -15,7 +16,7 @@ use crate::operations::differentiation::StopGradient;
 use crate::operations::scalars::ScalarOperation;
 use crate::operations::tag::Tag;
 use crate::operations::trigonometric::{Cos, Sin};
-use crate::operations::{BooleanLike, InterpretableOperation, Operation};
+use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::types::{DataType, TypeError, Typed};

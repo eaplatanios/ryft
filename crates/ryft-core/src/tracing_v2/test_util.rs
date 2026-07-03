@@ -45,7 +45,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::InterpretableOperation;
+    use crate::interpretation::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
@@ -377,12 +377,12 @@ mod tests {
     }
 
     #[test]
-    fn test_jacrev_over_dot_uses_left_right_dot_batching() {
+    fn test_jacrev_over_dot_batches_adjoint_dots() {
         use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 
-        // jacrev internally batches cotangents of the form LeftDot/RightDot through
-        // BatchableOperation::batch — exercise that path explicitly via a dot-based scalar
-        // function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
+        // jacrev internally batches the pullback's adjoint `dot` operations (their known operands riding as
+        // lane-uniform pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
+        // dot-based scalar function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
         let jacobian = jacrev(
             &TestArrayDomain,
             |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),

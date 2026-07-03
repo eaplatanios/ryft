@@ -464,8 +464,9 @@ impl<
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::interpretation::InterpretableOperation;
     use crate::macros::check_count;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::scalars::Scalar;

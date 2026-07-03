@@ -8,11 +8,10 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, EagerContext};
 use crate::effects::Effects;
 use crate::errors::CustomError;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation};
+use crate::operations::Operation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::types::{Type, TypeError, Typed};
 
@@ -903,193 +902,6 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
 
         Ok((instruction_by_output, input_liveness))
     }
-
-    /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
-    /// [`Program`]s. It checks that the provided input value matches the program's expected input structure and type,
-    /// evaluates the [`Instruction`]s in order, and finally builds a structured output value from the computed output
-    /// values.
-    #[inline]
-    pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
-    where
-        O: InterpretableOperation<T, V, EagerContext<T, V, O>>,
-        Input::ParameterStructure: Debug + PartialEq,
-    {
-        self.interpret_in_context(&EagerContext::<T, V, O>::new(), input)
-    }
-
-    /// Interprets/executes this [`Program`] with the provided input, within the supplied interpretation context.
-    /// This is the context-taking core behind [`Self::interpret`], which instantiates it at this program's own
-    /// [`EagerContext`]. Callers that interpret using [`Tracer`](crate::Tracer)s must supply the surrounding
-    /// [`StagingContext`](crate::StagingContext) instead, so that nullary operations can stage themselves into it.
-    /// Nested program interpretation (e.g., control flow branches, custom derivative programs, etc.) routes through
-    /// here so that a single replay path handles both eager and traced values.
-    pub fn interpret_in_context<C: Context<Type = T>>(&self, context: &C, input: Input) -> Result<Output, ProgramError>
-    where
-        O: InterpretableOperation<T, V, C>,
-        Input::ParameterStructure: Debug + PartialEq,
-    {
-        // Validate that the caller supplied an input with the expected parameter structure.
-        let input_structure = input.parameter_structure();
-        if input_structure != self.input_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{:?}", self.input_structure),
-                right_structure: format!("{input_structure:?}"),
-            }
-            .into());
-        }
-
-        // Flatten the structured input and validate each input value's type.
-        let inputs = input.into_parameters().collect::<Vec<_>>();
-        for (input, input_id) in inputs.iter().zip(self.input_ids.iter()) {
-            let Some(declared) = self.atoms.get(input_id.index()) else {
-                return Err(ProgramError::UnboundAtomId { id: *input_id });
-            };
-            let declared = declared.r#type();
-            let actual = input.r#type();
-            if !declared.is_refined_by(actual.as_ref()) {
-                return Err(TypeError {
-                    message: format!(
-                        "encountered input type {actual} which is incompatible with the program's \
-                        declared type {declared}",
-                    ),
-                }
-                .into());
-            }
-        }
-
-        // Replay using ordinary interpretation and reshape the flat outputs back into the expected
-        // structured `Output` form expected by this program.
-        let outputs = self.interpret_with(
-            inputs,
-            |_, constant| Ok(constant.clone()),
-            |instruction, inputs| instruction.operation.interpret(context, inputs),
-        )?;
-
-        Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
-    }
-
-    /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value and error semantics.
-    /// Transforms and backends specialize this interpretation by choosing a runtime value type `V`, an error type `E`,
-    /// a constant-lifting closure `lift_fn`, and an instruction-interpretation closure `interpret_fn`. Inputs and
-    /// outputs are flat [`Vec`]s aligned with the program's [`Self::input_ids`] and [`Self::output_ids`]. Structured
-    /// input/output handling stays at the call site so that callers can use any parameter family of their choice.
-    ///
-    /// The `E` type parameter mirrors `V`: a [`Program`] is not tied to a single interpretation, and each
-    /// interpretation has its own natural error type. Eager execution interprets instructions into concrete values and
-    /// fails with [`ProgramError`], while a backend that lowers each instruction into a compiler IR interprets them
-    /// into IR value handles and fails with that backend's own error (e.g., the XLA backend lowers a program into MLIR
-    /// values, failing with an MLIR or sharding lowering error). The `E: From<ProgramError>` bound lets one signature
-    /// serve both: callers choose the error their closures fail with, and this function's own structural errors (e.g.,
-    /// [`ProgramError::UnboundAtomId`] or an input/output count mismatch) fold into that type. A backend error could
-    /// instead be boxed into [`ProgramError::Custom`] and recovered by downcasting, but because this function is
-    /// already generic over `V`, carrying the matching `E` keeps each interpreter's error statically typed rather than
-    /// erasing it to a runtime downcast.
-    ///
-    /// # Parameters
-    ///
-    ///   - `inputs`: Flat input values aligned with [`Self::input_ids`].
-    ///   - `lift_fn`: Closure that lifts an [`Atom::Constant`]'s carried `V` into the runtime leaf type `Value`. This
-    ///     closure receives the constant's [`AtomId`] for callers that surface diagnostics or maintain parallel atom
-    ///     tables and is invoked at most once per live constant atom, in atom-index order.
-    ///   - `interpret_fn`: Closure that interprets one [`Instruction`]'s [`Operation`] to its already-lifted inputs and
-    ///     returns the instruction's outputs. The full [`Instruction`] is provided so that the closure can inspect the
-    ///     operation's expected output [`Atom`] IDs when needed (e.g., to look up output [`Type`]s).
-    pub fn interpret_with<
-        Value: Clone,
-        Error: From<ProgramError>,
-        LiftFn: FnMut(AtomId, &V) -> Result<Value, Error>,
-        InterpretFn: FnMut(&Instruction<O>, &[Value]) -> Result<Vec<Value>, Error>,
-    >(
-        &self,
-        inputs: Vec<Value>,
-        mut lift_fn: LiftFn,
-        mut interpret_fn: InterpretFn,
-    ) -> Result<Vec<Value>, Error> {
-        check_count!("input", inputs, self.input_ids.len(), ProgramError);
-
-        // Count every future consumer of each atom, including final program outputs. These counts let us move each
-        // value out on its last use and clone it only when a later consumer still needs it.
-        let mut remaining_uses = vec![0usize; self.atoms.len()];
-        for instruction in self.instructions.iter() {
-            for input_id in instruction.inputs.iter().copied() {
-                let Some(remaining_uses) = remaining_uses.get_mut(input_id.index) else {
-                    return Err(ProgramError::UnboundAtomId { id: input_id }.into());
-                };
-                *remaining_uses += 1;
-            }
-        }
-        for output_id in self.output_ids.iter().copied() {
-            let Some(remaining_uses) = remaining_uses.get_mut(output_id.index) else {
-                return Err(ProgramError::UnboundAtomId { id: output_id }.into());
-            };
-            *remaining_uses += 1;
-        }
-
-        // Store concrete input values in a sparse value table indexed by [`AtomId`].
-        let mut values = vec![None; self.atoms.len()];
-        for (input_id, input) in self.input_ids.iter().copied().zip(inputs) {
-            let Some(slot) = values.get_mut(input_id.index) else {
-                return Err(ProgramError::UnboundAtomId { id: input_id }.into());
-            };
-            *slot = Some(input);
-        }
-
-        // Materialize literal constants that are live. Dead constants can remain unset because no instruction or
-        // program output will read them.
-        for (atom_index, atom) in self.atoms.iter().enumerate() {
-            if remaining_uses[atom_index] == 0 {
-                continue;
-            }
-            if let Atom::Constant(value) = atom {
-                values[atom_index] = Some(lift_fn(AtomId { index: atom_index }, value)?);
-            }
-        }
-
-        // Replay instructions in program order, reusing one scratch input buffer to avoid per-instruction allocation.
-        let max_input_count = self.instructions.iter().map(|instruction| instruction.inputs.len()).max().unwrap_or(0);
-        let mut instruction_inputs = Vec::with_capacity(max_input_count);
-        for instruction in self.instructions.iter() {
-            instruction_inputs.clear();
-            for input_id in instruction.inputs.iter().copied() {
-                // Consume the appropriate input value for the current instruction. If this is the last consumer,
-                // move the value out of the table. Otherwise, clone it so later consumers can still read it.
-                let remaining_uses = remaining_uses.get_mut(input_id.index).unwrap();
-                debug_assert!(*remaining_uses > 0);
-                *remaining_uses -= 1;
-                let value = values.get_mut(input_id.index).unwrap();
-                let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
-                instruction_inputs.push(value);
-            }
-
-            // Apply the operation using the supplied dispatcher and ensure it produces the expected number of outputs.
-            let outputs = interpret_fn(instruction, instruction_inputs.as_slice())?;
-            check_count!("output", outputs, instruction.outputs.len(), ProgramError);
-
-            for (output_id, output) in instruction.outputs.iter().copied().zip(outputs) {
-                let Some(value) = values.get_mut(output_id.index) else {
-                    return Err(ProgramError::UnboundAtomId { id: output_id }.into());
-                };
-
-                // Keep only outputs with a future consumer. Dead instruction results do not need to occupy the table.
-                if remaining_uses[output_id.index] != 0 {
-                    *value = Some(output);
-                }
-            }
-        }
-
-        // Gather the program outputs using the same last-use transfer logic that we used for the instruction inputs.
-        let mut outputs = Vec::with_capacity(self.output_ids.len());
-        for output_id in self.output_ids.iter().copied() {
-            let remaining_uses = remaining_uses.get_mut(output_id.index).unwrap();
-            debug_assert!(*remaining_uses > 0);
-            *remaining_uses -= 1;
-            let value = values.get_mut(output_id.index).unwrap();
-            let value = if *remaining_uses == 0 { value.take().unwrap() } else { value.as_ref().unwrap().clone() };
-            outputs.push(value);
-        }
-
-        Ok(outputs)
-    }
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
@@ -1562,7 +1374,6 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
     use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
@@ -1570,10 +1381,9 @@ mod tests {
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::debugging::PrintOperation;
     use crate::operations::scalars::ScalarOperation;
-    use crate::parameters::{ParameterError, Parameterized, Placeholder};
+    use crate::parameters::Placeholder;
     use crate::scalars::Scalar;
-    use crate::tests::TestArray;
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+    use crate::types::{DataType, TypeError};
 
     use super::*;
 
@@ -1711,7 +1521,6 @@ mod tests {
             .unwrap();
         let input = program.input().unwrap();
         let output = program.output().unwrap();
-        assert_eq!(program.interpret(Scalar::from(2.0f32)), Ok((Scalar::from(4.0f32), Scalar::from(4.0f32))));
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -1742,117 +1551,6 @@ mod tests {
         assert!(matches!(
             builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder),
             Err(ProgramError::MalformedProgram(message)) if message == "variable atom has no owning instruction",
-        ));
-    }
-
-    #[test]
-    fn test_program_interpret_lifts_live_constants_once() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let c0 = builder.add_constant(Scalar::from(7.0f64));
-        let c1 = builder.add_constant(Scalar::from(3.0f64));
-        let o0 = builder.add_instruction(AddOperation, vec![i0, c1]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
-        let mut lifted_constants = Vec::new();
-        assert_eq!(
-            program.interpret_with(
-                vec![Scalar::from(2.0f64)],
-                |atom_id, value| {
-                    lifted_constants.push((atom_id, *value));
-                    Ok(*value)
-                },
-                |instruction, inputs| instruction.operation.interpret(&EagerContext::<DataType, Scalar>::new(), inputs),
-            ),
-            Ok(vec![Scalar::from(5.0f64)]),
-        );
-        assert_eq!(lifted_constants, vec![(c1, Scalar::from(3.0f64))]);
-        assert_eq!(c0, AtomId { index: 1 });
-    }
-
-    #[test]
-    fn test_program_interpret_with_mismatched_parameter_structures() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let program = builder.build::<Vec<Scalar>, Scalar>(vec![i0], vec![Placeholder], Placeholder).unwrap();
-        assert!(matches!(
-            program.interpret(vec![Scalar::from(1.0f64), Scalar::from(2.0f64)]),
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure,
-                right_structure,
-            })) if left_structure == format!("{:?}", vec![Placeholder])
-                && right_structure == format!("{:?}", vec![1.0f64, 2.0f64].parameter_structure())
-        ));
-    }
-
-    #[test]
-    fn test_program_interpret_input_type_checking() {
-        // A statically typed program input rejects values whose concrete types do not match it exactly.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
-        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
-        assert!(matches!(
-            program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])),
-            Err(ProgramError::Type(TypeError { message })) if message
-                == "encountered input type f64[3] which is incompatible with the program's declared type f64[2]",
-        ));
-
-        // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
-        // replays at several concrete sizes. Rank mismatches are still rejected.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])));
-        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap().values, vec![2.0, 4.0, 6.0]);
-        assert!(matches!(
-            program.interpret(TestArray::scalar(1.0)),
-            Err(ProgramError::Type(TypeError { message })) if message
-                == "encountered input type f64[] which is incompatible with the program's declared type f64[*]",
-        ));
-
-        // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
-        let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(3))])));
-        let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
-        let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.interpret(TestArray::vector(vec![1.0, 2.0])).unwrap().values, vec![2.0, 4.0]);
-        assert!(matches!(
-            program.interpret(TestArray::vector(vec![1.0, 2.0, 3.0])),
-            Err(ProgramError::Type(TypeError { message })) if message
-                == "encountered input type f64[3] which is incompatible with the program's declared type f64[<3]",
-        ));
-    }
-
-    #[test]
-    fn test_program_interpret_with_wrong_number_of_operation_inputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let program = builder.build::<Scalar, Scalar>(vec![i0], Placeholder, Placeholder).unwrap();
-        assert!(matches!(
-            program.interpret_with(
-                Vec::<Scalar>::new(),
-                |_, value| Ok(*value),
-                |instruction, inputs| instruction.operation.interpret(&EagerContext::<DataType, Scalar>::new(), inputs),
-            ),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
-    }
-
-    #[test]
-    fn test_program_interpret_with_wrong_number_of_operation_outputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let i0 = builder.add_input(DataType::F64);
-        let o0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
-        assert!(matches!(
-            program.interpret_with(
-                vec![Scalar::from(2.0f64)],
-                |_, value| Ok(*value),
-                |_, _| Ok::<Vec<Scalar>, ProgramError>(Vec::new()),
-            ),
-            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
         ));
     }
 

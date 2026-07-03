@@ -10,6 +10,7 @@ pub mod differentiation;
 pub mod domains;
 pub mod effects;
 pub mod errors;
+pub mod interpretation;
 pub mod macros;
 pub mod operations;
 pub mod parameters;
@@ -34,6 +35,7 @@ pub use differentiation::*;
 pub use domains::Domain;
 pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error};
+pub use interpretation::{InterpretableOperation, InterpretableProgramOperation};
 pub use operations::*;
 pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
