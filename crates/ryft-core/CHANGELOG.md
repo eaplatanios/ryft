@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - Added `Parameterized::broadcast_to_parameter_structure`.
-- Added `ryft_core::broadcasting`, `ryft_core::sharding`, `ryft_core::tracing`, `ryft_core::types`,
-  and `ryft_core::utilities`.
+- Added `ryft_core::broadcasting`, `ryft_core::partial`, `ryft_core::sharding`, `ryft_core::tracing`,
+  `ryft_core::types`, and `ryft_core::utilities`.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `LayoutError`, `BroadcastingError`,
   `ShardingError`, and `TracingError`.
 

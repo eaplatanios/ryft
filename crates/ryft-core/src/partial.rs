@@ -173,16 +173,6 @@ impl<T: Type, V: Value<T>> PartialEvaluationValue<T, V> {
     pub fn as_known(&self) -> Option<&V> {
         self.value.as_known()
     }
-
-    /// If this value is [`Known`](PartialValue::Known), this function marks it as being bound to the [`Atom`] that
-    /// corresponds to the provided [`AtomId`], making that atom its residual input materialization deduplication key.
-    #[inline]
-    fn bind(self, atom: AtomId) -> Self {
-        match self.value {
-            PartialValue::Known(value) => Self::known_input(value, Some(atom)),
-            PartialValue::Unknown(_) => self,
-        }
-    }
 }
 
 impl<T: Type, V: Value<T>> Typed<T> for PartialEvaluationValue<T, V> {
@@ -197,7 +187,7 @@ impl<T: Type, V: Value<T>> Typed<T> for PartialEvaluationValue<T, V> {
 /// (i.e., the residuals) that its unknown subcomputation consumes.
 ///
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PartialEvaluationInput<V> {
     /// Residual input fed by a value that partial evaluation folded to a concrete known residual value.
     Known(V),
@@ -226,7 +216,7 @@ impl<V> PartialEvaluationInput<V> {
 /// remain computed by the residual program.
 ///
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PartialEvaluationOutput<V> {
     /// Output that was folded to a concrete value during partial evaluation.
     Known(V),
@@ -734,10 +724,14 @@ impl<C: Context> PartialEvaluator<C> {
         // the scope stack balanced.
         self.materialization_scopes.push(vec![None; program.atoms.len()]);
         let result = (|| -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
-            // Walk-time value of each atom in `program`, populated as the forward pass reaches it.
+            // Walk-time value of each atom in `program`, populated as the forward pass reaches it. Bind each
+            // known input to its program atom, making that atom its materialization deduplication key.
             let mut values = vec![None; program.atoms.len()];
-            for (input_id, value) in program.input_ids.iter().copied().zip(inputs) {
-                values[input_id.index()] = Some(value.bind(input_id));
+            for (input_id, input) in program.input_ids.iter().copied().zip(inputs) {
+                values[input_id.index()] = Some(match input.value {
+                    PartialValue::Known(known) => PartialEvaluationValue::known_input(known, Some(input_id)),
+                    PartialValue::Unknown(_) => input,
+                });
             }
 
             for instruction in program.instructions.iter() {
@@ -761,10 +755,14 @@ impl<C: Context> PartialEvaluator<C> {
                     inputs.push(value);
                 }
 
+                // Bind each known output to its program atom, making that atom its materialization deduplication key.
                 let outputs = instruction.operation().partially_evaluate(self, inputs.as_slice())?;
                 check_count!("output", outputs, instruction.outputs().len(), ProgramError);
                 for (output_id, output) in instruction.outputs().iter().copied().zip(outputs) {
-                    values[output_id.index()] = Some(output.bind(output_id));
+                    values[output_id.index()] = Some(match output.value {
+                        PartialValue::Known(known) => PartialEvaluationValue::known_input(known, Some(output_id)),
+                        PartialValue::Unknown(_) => output,
+                    });
                 }
             }
 
@@ -1136,1326 +1134,554 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::arithmetic::{AddOperation, MulOperation};
-    use crate::operations::constants::ZeroOperation;
-    use crate::operations::control_flow::ConditionOperation;
-    use crate::operations::manipulation::BroadcastOperation;
+    use crate::contexts::{Context, StagingContext};
+    use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
+    use crate::operations::constants::ConstantOperation;
+    use crate::operations::debugging::PrintOperation;
     use crate::operations::scalars::ScalarOperation;
+    use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder};
-    use crate::scalars::Scalar;
-    use crate::tests::TestArray;
-    use crate::tracing::TracingContext;
-    use crate::tracing_v2::ArrayOperation;
-    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
+    use crate::programs::{AtomId, ProgramBuilder, ProgramError};
+    use crate::scalars::{Scalar, ScalarEagerContext, ScalarTracingContext};
+    use crate::types::DataType;
 
     use super::*;
 
-    type TestArrayProgram = Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>;
-
-    /// Eager known-side context the test operations' partial-evaluation rules are pinned to.
-    type TestKnownContext = EagerContext<DataType, Scalar, TestPartialEvaluationOperation>;
-
-    fn scalar_array_type() -> ArrayType {
-        ArrayType::scalar(DataType::F64)
-    }
-
-    fn boolean_array(value: bool) -> TestArray {
-        TestArray::new(ArrayType::scalar(DataType::Boolean), vec![f64::from(value as u8)])
-    }
-
-    fn scalar_branch(operation: ArrayOperation<TestArray>, factor: f64) -> TestArrayProgram {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let input = builder.add_input(scalar_array_type());
-        let factor = builder.add_constant(TestArray::scalar(factor));
-        let output = builder.add_instruction(operation, vec![input, factor]).unwrap()[0];
-        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-    }
-
-    #[derive(Clone, Debug)]
-    enum SymbolicOperation {
-        Add,
-        Mul,
-    }
-
-    impl Operation<DataType> for SymbolicOperation {
-        fn name(&self) -> &'static str {
-            match self {
-                Self::Add => "symbolic_add",
-                Self::Mul => "symbolic_mul",
-            }
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            check_count!("input", input_types, 2, TypeError);
-            if input_types[0] != input_types[1] {
-                return Err(TypeError {
-                    message: format!(
-                        "{} input types do not match: {} vs {}",
-                        self.name(),
-                        input_types[0],
-                        input_types[1],
-                    ),
-                });
-            }
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    enum TestPartialEvaluationOperation {
-        Add(AddOperation),
-        Mul(MulOperation),
-        SplitConstantVariable(SplitConstantVariableOperation),
-        MultiInstructionRewrite(MultiInstructionRewriteOperation),
-        Inline(InlineProgramOperation),
-        InvalidResidualOutput(InvalidResidualOutputOperation),
-        TooManyOutputs(TooManyOutputsOperation),
-    }
-
-    impl From<AddOperation> for TestPartialEvaluationOperation {
-        fn from(operation: AddOperation) -> Self {
-            Self::Add(operation)
-        }
-    }
-
-    impl From<MulOperation> for TestPartialEvaluationOperation {
-        fn from(operation: MulOperation) -> Self {
-            Self::Mul(operation)
-        }
-    }
-
-    impl From<SplitConstantVariableOperation> for TestPartialEvaluationOperation {
-        fn from(operation: SplitConstantVariableOperation) -> Self {
-            Self::SplitConstantVariable(operation)
-        }
-    }
-
-    impl From<MultiInstructionRewriteOperation> for TestPartialEvaluationOperation {
-        fn from(operation: MultiInstructionRewriteOperation) -> Self {
-            Self::MultiInstructionRewrite(operation)
-        }
-    }
-
-    impl From<InlineProgramOperation> for TestPartialEvaluationOperation {
-        fn from(operation: InlineProgramOperation) -> Self {
-            Self::Inline(operation)
-        }
-    }
-
-    impl From<InvalidResidualOutputOperation> for TestPartialEvaluationOperation {
-        fn from(operation: InvalidResidualOutputOperation) -> Self {
-            Self::InvalidResidualOutput(operation)
-        }
-    }
-
-    impl From<TooManyOutputsOperation> for TestPartialEvaluationOperation {
-        fn from(operation: TooManyOutputsOperation) -> Self {
-            Self::TooManyOutputs(operation)
-        }
-    }
-
-    impl Operation<DataType> for TestPartialEvaluationOperation {
-        fn name(&self) -> &'static str {
-            match self {
-                Self::Add(operation) => <AddOperation as Operation<DataType>>::name(operation),
-                Self::Mul(operation) => <MulOperation as Operation<DataType>>::name(operation),
-                Self::SplitConstantVariable(operation) => operation.name(),
-                Self::MultiInstructionRewrite(operation) => operation.name(),
-                Self::Inline(operation) => operation.name(),
-                Self::InvalidResidualOutput(operation) => operation.name(),
-                Self::TooManyOutputs(operation) => operation.name(),
-            }
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            match self {
-                Self::Add(operation) => operation.infer_output_types(input_types),
-                Self::Mul(operation) => operation.infer_output_types(input_types),
-                Self::SplitConstantVariable(operation) => operation.infer_output_types(input_types),
-                Self::MultiInstructionRewrite(operation) => operation.infer_output_types(input_types),
-                Self::Inline(operation) => operation.infer_output_types(input_types),
-                Self::InvalidResidualOutput(operation) => operation.infer_output_types(input_types),
-                Self::TooManyOutputs(operation) => operation.infer_output_types(input_types),
-            }
-        }
-    }
-
-    impl<C> InterpretableOperation<DataType, Scalar, C> for TestPartialEvaluationOperation {
-        fn interpret(&self, context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            match self {
-                Self::Add(operation) => operation.interpret(context, inputs),
-                Self::Mul(operation) => operation.interpret(context, inputs),
-                Self::SplitConstantVariable(operation) => operation.interpret(context, inputs),
-                Self::MultiInstructionRewrite(operation) => operation.interpret(context, inputs),
-                Self::Inline(operation) => operation.interpret(context, inputs),
-                Self::InvalidResidualOutput(operation) => operation.interpret(context, inputs),
-                Self::TooManyOutputs(operation) => operation.interpret(context, inputs),
-            }
-        }
-    }
-
-    impl PartiallyEvaluatableOperation<TestKnownContext> for TestPartialEvaluationOperation {
-        fn partially_evaluate(
-            &self,
-            evaluator: &mut PartialEvaluator<TestKnownContext>,
-            inputs: &[PartialEvaluationValue<DataType, Scalar>],
-        ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            match self {
-                Self::Add(operation) => operation.partially_evaluate(evaluator, inputs),
-                Self::Mul(operation) => operation.partially_evaluate(evaluator, inputs),
-                Self::SplitConstantVariable(operation) => operation.partially_evaluate(evaluator, inputs),
-                Self::MultiInstructionRewrite(operation) => operation.partially_evaluate(evaluator, inputs),
-                Self::Inline(operation) => operation.partially_evaluate(evaluator, inputs),
-                Self::InvalidResidualOutput(operation) => operation.partially_evaluate(evaluator, inputs),
-                Self::TooManyOutputs(operation) => operation.partially_evaluate(evaluator, inputs),
-            }
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct SplitConstantVariableOperation;
-
-    impl Operation<DataType> for SplitConstantVariableOperation {
-        fn name(&self) -> &'static str {
-            "split_constant_variable"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError { message: format!("expected 1 input but got {}", input_types.len()) });
-            }
-            Ok(vec![input_types[0].clone(), input_types[0].clone()])
-        }
-    }
-
-    impl<C> InterpretableOperation<DataType, Scalar, C> for SplitConstantVariableOperation {
-        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            Ok(vec![Scalar::from(7.0), inputs[0] + inputs[0]])
-        }
-    }
-
-    impl PartiallyEvaluatableOperation<TestKnownContext> for SplitConstantVariableOperation {
-        fn partially_evaluate(
-            &self,
-            evaluator: &mut PartialEvaluator<TestKnownContext>,
-            inputs: &[PartialEvaluationValue<DataType, Scalar>],
-        ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            let doubled = AddOperation.partially_evaluate(evaluator, &[inputs[0].clone(), inputs[0].clone()])?;
-            Ok(vec![PartialEvaluationValue::known(Scalar::from(7.0)), doubled[0].clone()])
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct MultiInstructionRewriteOperation;
-
-    impl Operation<DataType> for MultiInstructionRewriteOperation {
-        fn name(&self) -> &'static str {
-            "multi_instruction_rewrite"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError { message: format!("expected 1 input but got {}", input_types.len()) });
-            }
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    impl<C> InterpretableOperation<DataType, Scalar, C> for MultiInstructionRewriteOperation {
-        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            Ok(vec![inputs[0] * inputs[0] + inputs[0] + inputs[0]])
-        }
-    }
-
-    impl PartiallyEvaluatableOperation<TestKnownContext> for MultiInstructionRewriteOperation {
-        fn partially_evaluate(
-            &self,
-            evaluator: &mut PartialEvaluator<TestKnownContext>,
-            inputs: &[PartialEvaluationValue<DataType, Scalar>],
-        ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            let squared = MulOperation.partially_evaluate(evaluator, &[inputs[0].clone(), inputs[0].clone()])?;
-            let doubled = AddOperation.partially_evaluate(evaluator, &[inputs[0].clone(), inputs[0].clone()])?;
-            AddOperation.partially_evaluate(evaluator, &[squared[0].clone(), doubled[0].clone()])
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct InlineProgramOperation {
-        program: Program<DataType, Scalar, TestPartialEvaluationOperation, Vec<Scalar>, Vec<Scalar>>,
-    }
-
-    impl Operation<DataType> for InlineProgramOperation {
-        fn name(&self) -> &'static str {
-            "inline_program"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if self.program.input_types() != input_types {
-                return Err(TypeError { message: "inline program input type signature mismatch".to_string() });
-            }
-            Ok(self.program.output_types())
-        }
-    }
-
-    impl<C> InterpretableOperation<DataType, Scalar, C> for InlineProgramOperation {
-        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            self.program.interpret(inputs.to_vec())
-        }
-    }
-
-    impl PartiallyEvaluatableOperation<TestKnownContext> for InlineProgramOperation {
-        fn partially_evaluate(
-            &self,
-            evaluator: &mut PartialEvaluator<TestKnownContext>,
-            inputs: &[PartialEvaluationValue<DataType, Scalar>],
-        ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            evaluator.inline_program(&self.program, inputs.to_vec())
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct InvalidResidualOutputOperation;
-
-    impl Operation<DataType> for InvalidResidualOutputOperation {
-        fn name(&self) -> &'static str {
-            "invalid_residual_output"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError { message: format!("expected 1 input but got {}", input_types.len()) });
-            }
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    impl<C> InterpretableOperation<DataType, Scalar, C> for InvalidResidualOutputOperation {
-        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            Ok(vec![inputs[0]])
-        }
-    }
-
-    impl PartiallyEvaluatableOperation<TestKnownContext> for InvalidResidualOutputOperation {
-        fn partially_evaluate(
-            &self,
-            _evaluator: &mut PartialEvaluator<TestKnownContext>,
-            _inputs: &[PartialEvaluationValue<DataType, Scalar>],
-        ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            Ok(vec![PartialEvaluationValue::variable(DataType::F64, AtomId::new(999))])
-        }
-    }
-
-    #[derive(Clone, Debug)]
-    struct TooManyOutputsOperation;
-
-    impl Operation<DataType> for TooManyOutputsOperation {
-        fn name(&self) -> &'static str {
-            "too_many_outputs"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            if input_types.len() != 1 {
-                return Err(TypeError { message: format!("expected 1 input but got {}", input_types.len()) });
-            }
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    impl<C> InterpretableOperation<DataType, Scalar, C> for TooManyOutputsOperation {
-        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            check_count!("input", inputs, 1, ProgramError);
-            Ok(vec![inputs[0]])
-        }
-    }
-
-    impl PartiallyEvaluatableOperation<TestKnownContext> for TooManyOutputsOperation {
-        fn partially_evaluate(
-            &self,
-            _evaluator: &mut PartialEvaluator<TestKnownContext>,
-            _inputs: &[PartialEvaluationValue<DataType, Scalar>],
-        ) -> Result<Vec<PartialEvaluationValue<DataType, Scalar>>, ProgramError> {
-            Ok(vec![PartialEvaluationValue::known(Scalar::from(1.0)), PartialEvaluationValue::known(Scalar::from(2.0))])
-        }
-    }
-
-    /// Builds `f(a, x) = (2*a*a, a*a*x, x + a)` over scalar `f64`, where `a*a` is a shared intermediate. With `a`
-    /// known and `x` unknown: the first output folds to a constant, the second residualizes against the folded `a*a`
-    /// (a known *intermediate*), and the third residualizes against `a` (a known *input*), exercising both kinds of
-    /// residual boundary plus a fully folded output.
     #[test]
-    fn test_partially_evaluate_folds_known_subcomputation_and_carves_residual() {
+    fn test_partial_evaluation() {
+        // Build a residual program `g(x, r) = x * r + 3`, with `x` standing for the original program's surviving
+        // unknown input and `r` for a known residual feeder carrying the folded value `2`, and pair it with an
+        // original output report whose first output folded to `5`.
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let known_input = builder.add_input(DataType::F64);
-        let runtime_input = builder.add_input(DataType::F64);
-        let known_square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
-        let doubled_square = builder.add_instruction(AddOperation, vec![known_square, known_square]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![known_square, runtime_input]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, vec![runtime_input, known_input]).unwrap()[0];
+        let x = builder.add_input(DataType::F64);
+        let r = builder.add_input(DataType::F64);
+        let c = builder.add_constant(Scalar::from(3.0));
+        let product = builder.add_instruction(MulOperation, vec![x, r]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![product, c]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let evaluation = PartialEvaluation::<ScalarEagerContext> {
+            program: program.clone(),
+            inputs: vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Scalar::from(2.0))],
+            outputs: vec![PartialEvaluationOutput::Known(Scalar::from(5.0)), PartialEvaluationOutput::Unknown(0)],
+        };
+
+        // Interpretation takes exactly one value per `Unknown` feeder, feeds `Known` feeders from their carried values,
+        // returns folded outputs directly, and reads the rest from the replayed residual program:
+        // `(5, 4 * 2 + 3) = (5, 11)`.
+        let context = ScalarEagerContext::new();
+        assert_eq!(
+            evaluation.interpret(&context, &[Scalar::from(4.0)]),
+            Ok(vec![Scalar::from(5.0), Scalar::from(11.0)]),
+        );
+        assert!(matches!(
+            evaluation.interpret(&context, &[]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        ));
+        assert!(matches!(
+            evaluation.interpret(&context, &[Scalar::from(4.0), Scalar::from(5.0)]),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
+        ));
+
+        // An output that references a residual output the residual program does not produce is reported as a
+        // malformed program.
+        let evaluation = PartialEvaluation::<ScalarEagerContext> {
+            program: program.clone(),
+            inputs: evaluation.inputs,
+            outputs: vec![PartialEvaluationOutput::Unknown(1)],
+        };
+        assert!(matches!(
+            evaluation.interpret(&context, &[Scalar::from(4.0)]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "partial evaluation output references residual output 1 but the residual program \
+                    produced 1 output(s)",
+        ));
+
+        // Under a staging known-side context, the same replay stages the residual program into the outer trace
+        // instead of executing it. Its constant is lifted as a staged constant, its instructions are staged as outer
+        // instructions, folded outputs return their tracers directly, and residual outputs are tracers naming the
+        // staged atoms.
+        let outer = ScalarTracingContext::new();
+        let folded = outer.input(DataType::F64);
+        let unknown = outer.input(DataType::F64);
+        let feeder = outer.constant(Scalar::from(2.0));
+        let evaluation = PartialEvaluation::<ScalarTracingContext> {
+            program,
+            inputs: vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(feeder)],
+            outputs: vec![PartialEvaluationOutput::Known(folded.clone()), PartialEvaluationOutput::Unknown(0)],
+        };
+        let outputs = evaluation.interpret(&outer, &[unknown]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].atom_id(), folded.atom_id());
+        let staged = outputs[1].atom_id().unwrap();
+        let outer_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![staged], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            outer_program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = const
+                    %3:f64 = const
+                    %4:f64 = mul %1 %2
+                    %5:f64 = add %4 %3
+                in (%5)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluator() {
+        let mut evaluator = PartialEvaluator::new(ScalarEagerContext::new());
+        assert_eq!(
+            evaluator.context().bind(AddOperation, &[Scalar::from(1.0), Scalar::from(2.0)]),
+            Ok(vec![Scalar::from(3.0)]),
+        );
+
+        // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs are
+        // known values with no residual materialization decision yet.
+        let inputs =
+            [PartialEvaluationValue::known(Scalar::from(2.0)), PartialEvaluationValue::known(Scalar::from(3.0))];
+        let folded = evaluator.fold_or_residualize(MulOperation, &inputs).unwrap();
+        assert_eq!(folded.len(), 1);
+        assert!(folded[0].is_known());
+        assert!(!folded[0].is_unknown());
+        assert_eq!(folded[0].as_known(), Some(&Scalar::from(6.0)));
+        assert_eq!(folded[0].materialization(), PartialValueMaterialization::Undecided);
+        assert_eq!(folded[0].r#type().into_owned(), DataType::F64);
+        assert!(matches!(folded[0].value(), PartialValue::Known(value) if *value == Scalar::from(6.0)));
+
+        // `residualize` emits the operation into the residual program, materializing each known input as a fresh
+        // residual input (i.e., atoms 0 and 1) and returning the instruction output as a residual variable
+        // (i.e., atom 2).
+        let residual = evaluator.residualize(AddOperation, &inputs).unwrap();
+        assert_eq!(residual.len(), 1);
+        assert!(residual[0].is_unknown());
+        assert_eq!(residual[0].as_known(), None);
+        assert_eq!(residual[0].r#type().into_owned(), DataType::F64);
+        assert_eq!(
+            residual[0].materialization(),
+            PartialValueMaterialization::Variable { residual_atom: AtomId::new(2) },
+        );
+
+        // `fold_or_residualize` residualizes as soon as any input is unknown. `neg` lands in the residual program
+        // over the residual variable, producing the next residual atom.
+        let mixed = evaluator.fold_or_residualize(NegOperation, &[residual[0].clone()]).unwrap();
+        assert_eq!(mixed[0].materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
+
+        // Materializing a known value keyed by a source atom requires an active materialization scope,
+        // which only `inline_program` pushes.
+        assert!(matches!(
+            evaluator.residualize(
+                NegOperation,
+                &[PartialEvaluationValue::known_input(Scalar::from(1.0), Some(AtomId::new(0)))],
+            ),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "partial evaluation materialization has no active scope",
+        ));
+
+        // `inline_program` walks a program over seed values. All-known seeds fold every instruction, lifting the
+        // program constant into the known-side context on first use, and so the walk returns folded values.
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let c = builder.add_constant(Scalar::from(1.0));
+        let product = builder.add_instruction(MulOperation, vec![a, x]).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation, vec![product, c]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let outputs = evaluator
+            .inline_program(
+                &program,
+                vec![
+                    PartialEvaluationValue::known(Scalar::from(2.0)),
+                    PartialEvaluationValue::known(Scalar::from(3.0)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&Scalar::from(7.0)));
+
+        // Mixed seeds fold the known work and residualize the rest, and so the walk returns residual variables.
+        let outputs = evaluator
+            .inline_program(&program, vec![PartialEvaluationValue::known(Scalar::from(2.0)), residual[0].clone()])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+        assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
+
+        // `inline_partitioned_program` inlines a `Program::partition` result as two boundary operations. The known
+        // side folds through the known-side context, its trailing residual-edge output feeds the residual boundary
+        // operation, and the original outputs are reassembled from the two operations' outputs. The partitioned sides
+        // of `f(a, x) = sin(a) * x` are a single `sin` and a single `mul`, and so those operations themselves serve as
+        // arity-matching boundary operations.
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![sine, x]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap();
+        let outputs = evaluator
+            .inline_partitioned_program(
+                partition,
+                &[PartialEvaluationValue::known(Scalar::from(2.0)), residual[0].clone()],
+                |_known_program| ScalarOperation::Sin(SinOperation),
+                |_residual_program| ScalarOperation::Mul(MulOperation),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+        assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
+
+        // An all-known partitioned program folds entirely through the known-side boundary operation, and so the
+        // reassembled outputs are known values even though the (empty) residual operation is still emitted.
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a = builder.add_input(DataType::F64);
+        let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
+        let program =
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
+        let partition = program.partition(&[true]).unwrap();
+        let outputs = evaluator
+            .inline_partitioned_program(
+                partition,
+                &[PartialEvaluationValue::known(Scalar::from(2.0))],
+                |_known_program| ScalarOperation::Sin(SinOperation),
+                |_residual_program| ScalarOperation::Constant(ConstantOperation::new(Scalar::from(0.0))),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&Scalar::from(2.0f64.sin())));
+
+        // `known_constant` recovers a known value's staged-constant payload. An eager known value is always concrete,
+        // while under a staging known-side context only literal-backed tracers concretize.
+        assert_eq!(evaluator.known_constant(&Scalar::from(5.0)), Ok(Scalar::from(5.0)));
+        let staging = ScalarTracingContext::new();
+        let staging_evaluator = PartialEvaluator::new(staging.clone());
+        let symbolic = staging.input(DataType::F64);
+        let literal = staging.constant(Scalar::from(4.0));
+        assert_eq!(staging_evaluator.known_constant(&literal), Ok(Scalar::from(4.0)));
+        assert!(matches!(
+            staging_evaluator.known_constant(&symbolic),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "a known value crossing into a nested residual program is not concretizable in the \
+                    active known-side context",
+        ));
+
+        // `all_knowns_are_concrete` checks every known feeder and folded output of a partial evaluation, which is only
+        // non-trivial under a staging known-side context where knowns can be live tracers.
+        let empty = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new()
+            .build::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert!(evaluator.all_knowns_are_concrete(&PartialEvaluation::<ScalarEagerContext> {
+            program: empty.clone(),
+            inputs: vec![PartialEvaluationInput::Known(Scalar::from(1.0)), PartialEvaluationInput::Unknown(0)],
+            outputs: vec![PartialEvaluationOutput::Known(Scalar::from(2.0))],
+        }));
+        assert!(!staging_evaluator.all_knowns_are_concrete(&PartialEvaluation::<ScalarTracingContext> {
+            program: empty.clone(),
+            inputs: vec![PartialEvaluationInput::Known(symbolic.clone())],
+            outputs: Vec::new(),
+        }));
+        assert!(staging_evaluator.all_knowns_are_concrete(&PartialEvaluation::<ScalarTracingContext> {
+            program: empty,
+            inputs: vec![PartialEvaluationInput::Known(literal.clone())],
+            outputs: Vec::new(),
+        }));
+
+        // `any_known_is_symbolic` is the signal online boundary rules split on. Only a known value that does not
+        // resolve to a concrete constant counts, and so eager knowns and unknowns never do.
+        assert!(!evaluator.any_known_is_symbolic(&[PartialEvaluationValue::known(Scalar::from(1.0))]));
+        assert!(!staging_evaluator.any_known_is_symbolic(&[PartialEvaluationValue::known(literal)]));
+        assert!(staging_evaluator.any_known_is_symbolic(&[PartialEvaluationValue::known(symbolic)]));
+        assert!(
+            !staging_evaluator
+                .any_known_is_symbolic(&[PartialEvaluationValue::variable(DataType::F64, AtomId::new(0))]),
+        );
+    }
+
+    #[test]
+    fn test_program_partially_evaluate() {
+        // `f(a, x) = (a * a, a * a * x + 1, a * a + x)` with `a` known and `x` unknown: the `a * a` subcomputation
+        // folds to a known output, its two residual consumers share one residual feeder, and the literal is rebuilt
+        // inline as a residual constant instead of becoming a feeder.
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let c = builder.add_constant(Scalar::from(1.0));
+        let squared = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, vec![squared, x]).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation, vec![scaled, c]).unwrap()[0];
+        let offset = builder.add_instruction(AddOperation, vec![squared, x]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(
-                vec![doubled_square, product, sum],
+                vec![squared, shifted, offset],
                 vec![Placeholder; 2],
                 vec![Placeholder; 3],
             )
             .unwrap();
-
-        let knowledge = vec![PartialValue::Known(Scalar::from(3.0)), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-
-        // The fully known output is folded; the other two are produced by the residual program.
-        match &evaluation.outputs[0] {
-            PartialEvaluationOutput::Known(value) => assert_eq!(*value, 18.0),
-            other => panic!("expected a folded known output but got {other:?}"),
-        }
-        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
-        assert!(matches!(&evaluation.outputs[2], PartialEvaluationOutput::Unknown(1)));
-
-        // The residual program drops the two folded instructions (`a*a` and `2*a*a`), keeping only the two unknown
-        // ones, and takes the unknown input plus the two known residuals (the folded `a*a` and the input `a`).
-        assert_eq!(program.instructions().len(), 4);
-        assert_eq!(evaluation.program.instructions().len(), 2);
-        assert_eq!(evaluation.inputs.len(), 3);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if *value == 9.0));
-        assert!(matches!(&evaluation.inputs[2], PartialEvaluationInput::Known(value) if *value == 3.0));
-
-        // Reassembling the residual program's outputs with the folded outputs reproduces a full eager interpretation.
-        let runtime_inputs = [Scalar::from(3.0), Scalar::from(5.0)];
-        let residual_arguments = evaluation
-            .inputs
-            .iter()
-            .map(|residual_input| match residual_input {
-                PartialEvaluationInput::Known(value) => *value,
-                PartialEvaluationInput::Unknown(original_input_index) => runtime_inputs[*original_input_index],
-            })
-            .collect::<Vec<_>>();
-        let residual_outputs = evaluation.program.interpret(residual_arguments).unwrap();
-        let reassembled = evaluation
-            .outputs
-            .iter()
-            .map(|output| match output {
-                PartialEvaluationOutput::Known(value) => *value,
-                PartialEvaluationOutput::Unknown(index) => residual_outputs[*index],
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(reassembled, program.interpret(runtime_inputs.to_vec()).unwrap());
-        assert_eq!(reassembled, vec![18.0, 45.0, 8.0]);
-    }
-
-    /// With every input unknown, nothing folds: the residual program equals the original computation and there are no
-    /// known residuals.
-    #[test]
-    fn test_partially_evaluate_with_all_unknown_inputs_residualizes_everything() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let left_input = builder.add_input(DataType::F64);
-        let right_input = builder.add_input(DataType::F64);
-        let product = builder.add_instruction(MulOperation, vec![left_input, right_input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder; 1])
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(Scalar::from(3.0)), PartialValue::Unknown(DataType::F64)])
             .unwrap();
-
-        let knowledge = vec![PartialValue::Unknown(DataType::F64), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(evaluation.inputs.iter().all(|input| matches!(input, PartialEvaluationInput::Unknown(_))));
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(3.0), Scalar::from(5.0)]).unwrap(), vec![15.0]);
-    }
-
-    /// A program constant consumed by an unknown instruction must not be carried as a residual input: `filtered`
-    /// rebuilds constants inline and rejects constant atoms as filter inputs. The residual program keeps the constant
-    /// inside it and takes only the unknown input.
-    #[test]
-    fn test_partially_evaluate_keeps_program_constants_inline_in_the_residual() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let five = builder.add_constant(Scalar::from(5.0));
-        let sum = builder.add_instruction(AddOperation, vec![input, five]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 1], vec![Placeholder; 1])
-            .unwrap();
-
-        let knowledge = vec![PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-
-        // Only the unknown input feeds the residual program; the constant stays inside it.
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.inputs.len(), 1);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(2.0)]).unwrap(), vec![7.0]);
-    }
-
-    /// A nullary `zero` has no inputs, so it folds to a concrete known value during partial evaluation and is dropped
-    /// from the residual program. The symbolic-zero fact falls out of folding with no special handling.
-    #[test]
-    fn test_partially_evaluate_folds_nullary_zero_to_a_known_value() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let zero = builder.add_instruction(ZeroOperation::new(DataType::F64), vec![]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![zero, input], vec![Placeholder; 1], vec![Placeholder; 2])
-            .unwrap();
-
-        let knowledge = vec![PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-
-        match &evaluation.outputs[0] {
-            PartialEvaluationOutput::Known(value) => assert_eq!(*value, 0.0),
-            other => panic!("expected the nullary zero to fold but got {other:?}"),
-        }
-        // The zero folded away; the residual program carries no instructions and just forwards the unknown input.
-        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 0);
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(5.0)]).unwrap(), vec![5.0]);
-    }
-
-    /// The builder forward pass emits every unknown instruction, then `into_simplified` prunes those that do not feed
-    /// an output, so a dead unknown computation does not survive into the residual program.
-    #[test]
-    fn test_partially_evaluate_prunes_dead_unknown_instructions() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let one = builder.add_constant(Scalar::from(1.0));
-        let two = builder.add_constant(Scalar::from(2.0));
-        let used = builder.add_instruction(AddOperation, vec![input, one]).unwrap()[0];
-        let _dead = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![used], vec![Placeholder; 1], vec![Placeholder; 1])
-            .unwrap();
-
-        let knowledge = vec![PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-
-        // Only the live `x + 1` survives; the dead `x * 2` (and its constant) are pruned.
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(4.0)]).unwrap(), vec![5.0]);
-    }
-
-    /// An executable rule can return a folded known output and a residual output from the same source instruction.
-    #[test]
-    fn test_partially_evaluate_rule_returns_mixed_known_and_residual_outputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let outputs = builder.add_instruction(SplitConstantVariableOperation, vec![input]).unwrap().to_vec();
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(outputs, vec![Placeholder; 1], vec![Placeholder; 2])
-            .unwrap();
-
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if *value == 7.0));
-        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.inputs.len(), 1);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), TestPartialEvaluationOperation::Add(_)));
-
-        let residual_outputs = evaluation.program.interpret(vec![Scalar::from(4.0)]).unwrap();
-        let reassembled = evaluation
-            .outputs
-            .iter()
-            .map(|output| match output {
-                PartialEvaluationOutput::Known(value) => *value,
-                PartialEvaluationOutput::Unknown(index) => residual_outputs[*index],
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(reassembled, program.interpret(vec![Scalar::from(4.0)]).unwrap());
-        assert_eq!(reassembled, vec![Scalar::from(7.0), Scalar::from(8.0)]);
-    }
-
-    /// A rule-produced known value materializes as a residual input when a later residual instruction consumes it.
-    #[test]
-    fn test_partially_evaluate_materializes_rule_produced_known_values_as_residual_inputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let split_outputs = builder.add_instruction(SplitConstantVariableOperation, vec![input]).unwrap().to_vec();
-        let output = builder.add_instruction(AddOperation, split_outputs).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
-            .unwrap();
-
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
-        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if *value == 7.0));
-        assert_eq!(evaluation.program.instructions().len(), 2);
         assert_eq!(
-            evaluation.program.interpret(vec![Scalar::from(4.0), Scalar::from(7.0)]).unwrap(),
-            vec![Scalar::from(15.0)],
+            evaluation.inputs,
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Scalar::from(9.0)),]
         );
-    }
-
-    /// An executable rule can rewrite one source instruction into several residual instructions by binding through
-    /// the active partial evaluator.
-    #[test]
-    fn test_partially_evaluate_rule_emits_multiple_residual_operations() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(MultiInstructionRewriteOperation, vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
-            .unwrap();
-
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 3);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), TestPartialEvaluationOperation::Mul(_)));
-        assert!(matches!(evaluation.program.instructions()[1].operation(), TestPartialEvaluationOperation::Add(_)));
-        assert!(matches!(evaluation.program.instructions()[2].operation(), TestPartialEvaluationOperation::Add(_)));
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(3.0)]).unwrap(), vec![Scalar::from(15.0)]);
         assert_eq!(
-            evaluation.program.interpret(vec![Scalar::from(3.0)]).unwrap(),
-            program.interpret(vec![Scalar::from(3.0)]).unwrap(),
+            evaluation.outputs,
+            vec![
+                PartialEvaluationOutput::Known(Scalar::from(9.0)),
+                PartialEvaluationOutput::Unknown(0),
+                PartialEvaluationOutput::Unknown(1),
+            ]
         );
-    }
-
-    /// A rule can inline a nested program and return the inlined program's mixed known/residual output trace values.
-    #[test]
-    fn test_partially_evaluate_rule_inlines_nested_program_with_mixed_outputs() {
-        let mut nested_builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
-        let nested_input = nested_builder.add_input(DataType::F64);
-        let nested_outputs =
-            nested_builder.add_instruction(SplitConstantVariableOperation, vec![nested_input]).unwrap().to_vec();
-        let nested_program = nested_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(nested_outputs, vec![Placeholder; 1], vec![Placeholder; 2])
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let outputs = builder
-            .add_instruction(InlineProgramOperation { program: nested_program }, vec![input])
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(outputs, vec![Placeholder; 1], vec![Placeholder; 2])
-            .unwrap();
-
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(DataType::F64)]).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if *value == 7.0));
-        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), TestPartialEvaluationOperation::Add(_)));
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(5.0)]).unwrap(), vec![Scalar::from(10.0)]);
-    }
-
-    /// Broadcast intentionally uses the default primitive partial-evaluation policy. JAX has an explicit
-    /// `broadcast_in_dim` partial-evaluation registration, but that rule delegates to the default primitive path; Ryft
-    /// should therefore residualize an unknown broadcast unchanged instead of adding a redundant custom rule.
-    #[test]
-    fn test_partially_evaluate_broadcast_uses_default_primitive_policy() {
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let input = builder.add_input(input_type.clone());
-        let output = builder.add_instruction(BroadcastOperation::new(output_type, vec![1]), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(input_type)]).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Broadcast(_)));
         assert_eq!(
-            evaluation.program.interpret(vec![TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap()[0].values,
-            vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %1 %0
+                    %3:f64 = const
+                    %4:f64 = add %2 %3
+                    %5:f64 = add %1 %0
+                in (%4, %5)
+            "}
+            .trim_end(),
         );
-    }
 
-    /// Malformed executable rules are surfaced as [`ProgramError`]s by the central context walk.
-    #[test]
-    fn test_partially_evaluate_reports_malformed_rule_outputs() {
-        let build = |operation: TestPartialEvaluationOperation| {
-            let mut builder = ProgramBuilder::<DataType, Scalar, TestPartialEvaluationOperation>::new();
-            let input = builder.add_input(DataType::F64);
-            let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
-            builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder; 1], vec![Placeholder; 1])
-                .unwrap()
-        };
+        // Replaying the partial evaluation at a concrete unknown input matches interpreting the original program.
+        assert_eq!(
+            evaluation.interpret(&ScalarEagerContext::new(), &[Scalar::from(4.0)]),
+            Ok(vec![Scalar::from(9.0), Scalar::from(37.0), Scalar::from(13.0)]),
+        );
+        assert_eq!(
+            program.interpret(vec![Scalar::from(3.0), Scalar::from(4.0)]),
+            Ok(vec![Scalar::from(9.0), Scalar::from(37.0), Scalar::from(13.0)]),
+        );
 
-        let too_many_outputs = build(TestPartialEvaluationOperation::from(TooManyOutputsOperation))
-            .partially_evaluate(&[PartialValue::Unknown(DataType::F64)])
-            .unwrap_err();
-        assert!(matches!(too_many_outputs, ProgramError::InvalidOutputCount { expected: 1, actual: 2 },));
-
-        let invalid_residual_output = build(TestPartialEvaluationOperation::from(InvalidResidualOutputOperation))
-            .partially_evaluate(&[PartialValue::Unknown(DataType::F64)])
-            .unwrap_err();
-        assert!(matches!(invalid_residual_output, ProgramError::UnboundAtomId { id } if id == AtomId::new(999)));
-    }
-
-    /// Stage 3 de-risking: the partial-evaluation witness must resolve for a *self-containing* operation enum.
-    /// `ArrayOperation` holds `Scan`/`While`/`Condition` variants whose bodies are themselves
-    /// `Program<..., ArrayOperation, ...>`, so satisfying the bound below is exactly the recursive case feared to overflow
-    /// the trait solver. Because the witness's known-side context `C` is fixed across recursion and the blanket impl
-    /// grounds it in the enum's own generated `PartiallyEvaluatableOperation` implementation, this compiles with no
-    /// recursive obligation and no overflow — both at an eager known-side context and at a staging one.
-    #[test]
-    fn array_operation_satisfies_the_partial_evaluation_witness() {
-        fn assert_partially_evaluatable<C: Context<Operation = O>, O: PartiallyEvaluatableProgramOperation<C>>() {}
-        assert_partially_evaluatable::<
-            EagerContext<ArrayType, TestArray, ArrayOperation<TestArray>>,
-            ArrayOperation<TestArray>,
-        >();
-        assert_partially_evaluatable::<
-            crate::tracing::TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>,
-            ArrayOperation<TestArray>,
-        >();
-    }
-
-    /// With a *known* predicate, a `condition` partially evaluates by inlining its selected branch: the condition
-    /// disappears from the residual program, which then contains only the taken branch's work over the unknown
-    /// input. Exercises both branches by partially evaluating the same program with a `true` and a `false`
-    /// predicate.
-    #[test]
-    fn test_partially_evaluate_selects_branch_of_a_known_predicate_condition() {
-        // `condition(p, x) = if p { x * 2 } else { x + 100 }`, staged into a flat program over `[predicate, x]`.
-        let build_program = || -> TestArrayProgram {
-            let condition = ConditionOperation::new(
-                scalar_branch(ArrayOperation::Mul(MulOperation), 2.0),
-                scalar_branch(ArrayOperation::Add(AddOperation), 100.0),
-            )
+        // All-known inputs fold the whole program away: every output is known and the residual program is empty.
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(Scalar::from(3.0)), PartialValue::Known(Scalar::from(4.0))])
             .unwrap();
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-            let input = builder.add_input(scalar_array_type());
-            let output = builder
-                .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, input])
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-
-        // Known `true` predicate, unknown `x`: only the `x * 2` branch survives; the condition is gone.
-        let program = build_program();
-        let knowledge = vec![PartialValue::Known(boolean_array(true)), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Mul(_)));
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
-        assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(4.0)]).unwrap()[0].values, vec![8.0]);
-
-        // Known `false` predicate, unknown `x`: only the `x + 100` branch survives.
-        let program = build_program();
-        let knowledge = vec![PartialValue::Known(boolean_array(false)), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Add(_)));
-        assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(4.0)]).unwrap()[0].values, vec![104.0],);
-    }
-
-    /// With an *unknown* predicate, a `condition` cannot be inlined, so it survives and is shrunk: each branch
-    /// is partially evaluated against the input knowledge and the two residual branches are reconciled into one
-    /// rewritten `condition`. The branches are `if p { x * 2 } else { a * a + x * x }` over `[x, a]` with `a` known
-    /// and `x` and `p` unknown, so the false branch folds `a * a` to a constant and shrinks from three to two.
-    /// The rewritten condition is the only instruction in the residual program, and interpreting it for both
-    /// predicates reproduces the original program.
-    #[test]
-    fn test_partially_evaluate_unknown_predicate_condition_shrinks_branches() {
-        // True branch over `[x, a]`: `x * 2` (the `a` input is unused).
-        let true_branch = || {
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let input = builder.add_input(scalar_array_type());
-            let _known_input = builder.add_input(scalar_array_type());
-            let two = builder.add_constant(TestArray::scalar(2.0));
-            let output = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
-            builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-
-        // False branch over `[x, a]`: `a * a + x * x`. With `a` known, `a * a` folds away during partial evaluation.
-        let false_branch = || {
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let input = builder.add_input(scalar_array_type());
-            let known_input = builder.add_input(scalar_array_type());
-            let known_square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
-            let input_square = builder.add_instruction(MulOperation, vec![input, input]).unwrap()[0];
-            let output = builder.add_instruction(AddOperation, vec![known_square, input_square]).unwrap()[0];
-            builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-
-        // `condition(p, x, a)` staged into a flat program over `[predicate, x, a]`.
-        let build_program = || -> TestArrayProgram {
-            let condition = ConditionOperation::new(true_branch(), false_branch()).unwrap();
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-            let input = builder.add_input(scalar_array_type());
-            let known_input = builder.add_input(scalar_array_type());
-            let output = builder
-                .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, input, known_input])
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestArray>, Vec<TestArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-                .unwrap()
-        };
-
-        // Predicate and `x` unknown, `a` known: the condition survives but is rewritten over shrunk branches.
-        let program = build_program();
-        let knowledge = vec![
-            PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
-            PartialValue::Unknown(scalar_array_type()),
-            PartialValue::Known(TestArray::scalar(3.0)),
-        ];
-        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
-
-        // The output is produced by the residual program, whose only instruction is the rewritten condition.
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        let ArrayOperation::Condition(rewritten) = evaluation.program.instructions()[0].operation() else {
-            panic!("expected the residual program to contain a rewritten condition");
-        };
-
-        // The false branch folded `a * a` away: it shrinks from three instructions to two, while the true branch is
-        // unchanged at one. Neither reconciled branch is larger than its original.
-        assert_eq!(rewritten.true_branch().instructions().len(), 1);
-        assert_eq!(rewritten.false_branch().instructions().len(), 2);
-        assert!(rewritten.true_branch().instructions().len() <= true_branch().instructions().len());
-        assert!(rewritten.false_branch().instructions().len() <= false_branch().instructions().len());
-
-        // Interpreting the residual program for both predicates reproduces the original program over the same inputs.
-        let runtime = |predicate: bool, input: f64| -> Vec<f64> {
-            let arguments = evaluation
-                .inputs
-                .iter()
-                .map(|residual_input| match residual_input {
-                    PartialEvaluationInput::Known(value) => value.clone(),
-                    PartialEvaluationInput::Unknown(0) => boolean_array(predicate),
-                    PartialEvaluationInput::Unknown(_) => TestArray::scalar(input),
-                })
-                .collect::<Vec<_>>();
-            let residual_outputs = evaluation.program.interpret(arguments).unwrap();
-            evaluation
-                .outputs
-                .iter()
-                .map(|output| match output {
-                    PartialEvaluationOutput::Known(value) => value.values[0],
-                    PartialEvaluationOutput::Unknown(index) => residual_outputs[*index].values[0],
-                })
-                .collect()
-        };
-        let original = |predicate: bool, input: f64| {
-            program
-                .interpret(vec![boolean_array(predicate), TestArray::scalar(input), TestArray::scalar(3.0)])
-                .unwrap()[0]
-                .values
-                .clone()
-        };
-
-        assert_eq!(runtime(true, 4.0), original(true, 4.0));
-        assert_eq!(runtime(true, 4.0), vec![8.0]);
-        assert_eq!(runtime(false, 4.0), original(false, 4.0));
-        assert_eq!(runtime(false, 4.0), vec![25.0]);
-    }
-
-    /// Type alias for the staging known-side context the staging tests run under.
-    type ScalarTracingContext = TracingContext<DataType, Scalar, ScalarOperation<Scalar>>;
-
-    /// With `C` a live staging context, folding a known instruction *stages* it into the outer program instead of
-    /// interpreting it, and a folded known value consumed by residual work becomes a known feeder naming the staged
-    /// outer atom — the known→unknown residual edge.
-    #[test]
-    fn test_partially_evaluate_stages_known_work_into_a_live_outer_trace() {
-        // `f(a, x) = (a * a) * x` with `a` known as an outer tracer and `x` unknown.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let known_input = builder.add_input(DataType::F64);
-        let runtime_input = builder.add_input(DataType::F64);
-        let square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![square, runtime_input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder; 1])
-            .unwrap();
-
-        let outer = ScalarTracingContext::new();
-        let known = outer.input(DataType::F64);
-        let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-
-        // The known `a * a` landed in the outer program as a staged instruction over the outer input.
-        {
-            let outer_builder = outer.builder().borrow();
-            assert_eq!(outer_builder.instructions().len(), 1);
-            assert_eq!(outer_builder.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(0)]);
-        }
-
-        // The residual program computes only the unknown product, over the unknown input plus the known edge, and the
-        // known feeder is a live tracer naming the staged outer atom.
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
-        match &evaluation.inputs[1] {
-            PartialEvaluationInput::Known(value) => assert_eq!(value.atom_id(), Ok(AtomId::new(1))),
-            other => panic!("expected a known residual edge but got {other:?}"),
-        }
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-    }
-
-    /// A walked-program literal consumed by residual work is rebuilt inline as a residual-program constant carrying
-    /// the original constant payload (recovered through the staging context's [`Concrete`](ValueResolution::Concrete)
-    /// resolution), never a lifted tracer,
-    /// and it never becomes a residual input.
-    #[test]
-    fn test_partially_evaluate_rebuilds_walked_literals_as_residual_constants_under_staging() {
-        // `f(x) = x + 5` with `x` unknown: the literal `5` crosses into the residual program.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let five = builder.add_constant(Scalar::from(5.0));
-        let sum = builder.add_instruction(AddOperation, vec![input, five]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 1], vec![Placeholder; 1])
-            .unwrap();
-
-        let outer = ScalarTracingContext::new();
-        let evaluation =
-            program.partially_evaluate_in_context(&outer, &[PartialValue::Unknown(DataType::F64)]).unwrap();
-
-        assert_eq!(evaluation.inputs.len(), 1);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
-        // The residual program carries the constant inline with its original payload, so plain interpretation works.
-        assert_eq!(evaluation.program.interpret(vec![Scalar::from(2.0)]).unwrap(), vec![7.0]);
-        // Nothing folded, so the outer program stages no instructions. The walk does lift the literal into the outer
-        // context on first reference, leaving one *dead* constant atom behind — the documented cost of eager lifting.
-        // Deferring the lift to the first known fold would require a "known but unlifted" trace-value state, which
-        // the pure known/unknown `PartialValue` contract deliberately rules out, and the standard `into_simplified`
-        // passes prune the dead atom whenever the outer program is built.
-        assert!(outer.builder().borrow().instructions().is_empty());
-        assert_eq!(outer.builder().borrow().atoms().len(), 1);
-    }
-
-    /// An effectful operation is placed by its input known-ness like any other operation: all-known folds (under an
-    /// eager known-side context this executes the effect at partial-evaluation time, which is the known side's
-    /// execution time), and mixed-input residualizes with the known inputs materialized as feeders.
-    #[test]
-    fn test_partially_evaluate_places_effectful_operations_by_input_known_ness() {
-        use crate::operations::debugging::PrintOperation;
-
-        // `f(x) = print(x) * 2`.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let input = builder.add_input(scalar_array_type());
-        let two = builder.add_constant(TestArray::scalar(2.0));
-        let printed = builder.add_instruction(PrintOperation::new("x"), vec![input]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![printed, two]).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // All-known: the print folds (firing now) and the whole chain evaluates away.
-        let evaluation = program.partially_evaluate(&[PartialValue::Known(TestArray::scalar(3.0))]).unwrap();
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if value.values[0] == 6.0));
+        assert_eq!(evaluation.inputs, Vec::new());
+        assert_eq!(
+            evaluation.outputs,
+            vec![
+                PartialEvaluationOutput::Known(Scalar::from(9.0)),
+                PartialEvaluationOutput::Known(Scalar::from(37.0)),
+                PartialEvaluationOutput::Known(Scalar::from(13.0)),
+            ]
+        );
         assert!(evaluation.program.instructions().is_empty());
-        assert!(evaluation.inputs.is_empty());
 
-        // Unknown input: the print (and everything downstream) residualizes.
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_array_type())]).unwrap();
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 2);
-        assert_eq!(evaluation.program.interpret(vec![TestArray::scalar(3.0)]).unwrap()[0].values[0], 6.0);
-    }
-
-    /// A *dead* effectful operation over an unknown input — nothing consumes its output — still survives into the
-    /// residual program (via the residual builder's effect keep-alive), alongside the residualized pure work.
-    #[test]
-    fn test_partially_evaluate_keeps_dead_effectful_operations_in_the_residual_program() {
-        use crate::operations::debugging::PrintOperation;
-
-        // `f(x) = x * 2`, plus a dead `print(x)`, with `x` unknown: both residualize, and only the effect keeps the
-        // print alive through the residual program's simplification.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let input = builder.add_input(scalar_array_type());
-        let two = builder.add_constant(TestArray::scalar(2.0));
-        let product = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
-        let _printed = builder.add_instruction(PrintOperation::new("x"), vec![input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder], vec![Placeholder])
+        // All-unknown inputs residualize the whole program unchanged, with the literal rebuilt inline at its first
+        // residual use rather than up front.
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Unknown(DataType::F64), PartialValue::Unknown(DataType::F64)])
             .unwrap();
+        assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1)]);
+        assert_eq!(
+            evaluation.outputs,
+            vec![
+                PartialEvaluationOutput::Unknown(0),
+                PartialEvaluationOutput::Unknown(1),
+                PartialEvaluationOutput::Unknown(2),
+            ]
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %0 %0
+                    %3:f64 = mul %2 %1
+                    %4:f64 = const
+                    %5:f64 = add %3 %4
+                    %6:f64 = add %2 %1
+                in (%2, %5, %6)
+            "}
+            .trim_end(),
+        );
 
-        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_array_type())]).unwrap();
-
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(evaluation.program.instructions().len(), 2);
-        assert!(evaluation.program.instructions().iter().any(|instruction| matches!(
-            instruction.operation(),
-            ArrayOperation::Print(operation) if operation.label() == "x",
-        )));
-    }
-
-    /// Under a *staging* known-side context, an all-known effectful operation folds by staging into the live outer
-    /// trace — the known side of the split, which executes first and in bind order — while a mixed-input effectful
-    /// operation residualizes. Two ordered prints split across the boundary therefore execute known-first, the
-    /// documented reordering the split performs on all work.
-    #[test]
-    fn test_partially_evaluate_stages_all_known_effectful_operations_into_a_live_outer_trace() {
-        use crate::operations::debugging::PrintOperation;
-
-        // `f(a, x) = (print(a), print(x))` with `a` known (an outer tracer) and `x` unknown.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let known_input = builder.add_input(scalar_array_type());
-        let runtime_input = builder.add_input(scalar_array_type());
-        let known_print = builder.add_instruction(PrintOperation::new("a"), vec![known_input]).unwrap()[0];
-        let runtime_print = builder.add_instruction(PrintOperation::new("x"), vec![runtime_input]).unwrap()[0];
+        // Effectful operations place by input known-ness. An all-known `print` folds (firing its effect at partial
+        // evaluation time), while a mixed-input `print` residualizes and is kept in the residual program even when
+        // no output consumes it.
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let printed = builder.add_instruction(PrintOperation::new("known"), vec![a]).unwrap()[0];
+        builder.add_instruction(PrintOperation::new("dead"), vec![x]).unwrap();
+        let product = builder.add_instruction(MulOperation, vec![printed, x]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![known_print, runtime_print],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(Scalar::from(2.0)), PartialValue::Unknown(DataType::F64)])
+            .unwrap();
+        assert_eq!(
+            evaluation.inputs,
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Scalar::from(2.0)),]
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = print [label=dead] %0
+                    %3:f64 = mul %1 %0
+                in (%3)
+            "}
+            .trim_end(),
+        );
 
-        let outer = TracingContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let known = outer.input(scalar_array_type());
-        let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-
-        // The known print landed in the outer program; the unknown print stayed residual.
-        {
-            let outer_builder = outer.builder().borrow();
-            assert_eq!(outer_builder.instructions().len(), 1);
-            assert!(matches!(
-                outer_builder.instructions()[0].operation(),
-                ArrayOperation::Print(operation) if operation.label() == "a",
-            ));
-        }
-        assert_eq!(evaluation.program.instructions().len(), 1);
+        // The number of provided inputs must match the number of program inputs.
         assert!(matches!(
-            evaluation.program.instructions()[0].operation(),
-            ArrayOperation::Print(operation) if operation.label() == "x",
+            program.partially_evaluate(&[PartialValue::Known(Scalar::from(1.0))]),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         ));
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
-        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(0)));
     }
 
-    /// A folded known intermediate consumed by *several* residual instructions materializes as a single residual
-    /// input, deduplicated by its source atom in the walked program — under a staging known-side context exactly as
-    /// under an eager one.
     #[test]
-    fn test_partially_evaluate_deduplicates_known_feeders_by_source_atom_under_staging() {
-        // `f(a, x) = ((a * a) * x, (a * a) + x)` with `a` known (an outer tracer) and `x` unknown: the folded `a * a`
-        // feeds both residual instructions and must become one residual input.
+    fn test_program_partially_evaluate_in_context() {
+        // `f(a, x) = (a * a) * x + 1` with `a` known as a live tracer of an enclosing trace and `x` unknown: the known
+        // `a * a` folds by staging into the outer program, the residual program consumes its staged result through a
+        // known feeder naming the outer atom, and the literal is rebuilt inline as a residual constant.
         let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let known_input = builder.add_input(DataType::F64);
-        let runtime_input = builder.add_input(DataType::F64);
-        let square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
-        let product = builder.add_instruction(MulOperation, vec![square, runtime_input]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, vec![square, runtime_input]).unwrap()[0];
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let c = builder.add_constant(Scalar::from(1.0));
+        let squared = builder.add_instruction(MulOperation, vec![a, a]).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation, vec![squared, x]).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation, vec![scaled, c]).unwrap()[0];
         let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![product, sum], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
         let outer = ScalarTracingContext::new();
         let known = outer.input(DataType::F64);
-        let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
+        let evaluation = program
+            .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(DataType::F64)])
+            .unwrap();
 
-        assert_eq!(evaluation.program.instructions().len(), 2);
+        // The known feeder is a tracer naming the staged `a * a` atom of the outer program.
         assert_eq!(evaluation.inputs.len(), 2);
         assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(_)));
-    }
-
-    /// Two known inputs fed by the *same* outer tracer deduplicate to a single residual input through the value's
-    /// staged identity (its outer atom), even though their source atoms in the walked program differ — the
-    /// walk-global counterpart of per-scope source-atom deduplication.
-    #[test]
-    fn test_partially_evaluate_deduplicates_known_feeders_by_staged_identity() {
-        // `f(a, b, x) = (a * x, b + x)` with `a` and `b` both fed by the same outer tracer and `x` unknown.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let first_known = builder.add_input(DataType::F64);
-        let second_known = builder.add_input(DataType::F64);
-        let runtime_input = builder.add_input(DataType::F64);
-        let product = builder.add_instruction(MulOperation, vec![first_known, runtime_input]).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation, vec![second_known, runtime_input]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![product, sum], vec![Placeholder; 3], vec![Placeholder; 2])
-            .unwrap();
-
-        let outer = ScalarTracingContext::new();
-        let known = outer.input(DataType::F64);
-        let knowledge =
-            vec![PartialValue::Known(known.clone()), PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-
-        // One unknown feeder plus exactly one known feeder for the shared outer tracer.
-        assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(2)));
-        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if value.atom_id().is_ok()));
-        assert_eq!(evaluation.program.instructions().len(), 2);
-    }
-
-    /// [`PartialEvaluation::interpret`] is the single replay path for both known-side flavors: under an eager context
-    /// it interprets the residual program immediately, and under a staging context it stages the residual work into
-    /// the outer program and returns tracers.
-    #[test]
-    fn test_partial_evaluation_interpret_replays_under_eager_and_staging_contexts() {
-        // `f(a, x) = (a * a) * x` with `a` known and `x` unknown.
-        let build_program = || {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-            let known_input = builder.add_input(DataType::F64);
-            let runtime_input = builder.add_input(DataType::F64);
-            let square = builder.add_instruction(MulOperation, vec![known_input, known_input]).unwrap()[0];
-            let product = builder.add_instruction(MulOperation, vec![square, runtime_input]).unwrap()[0];
-            builder
-                .build::<Vec<Scalar>, Vec<Scalar>>(vec![product], vec![Placeholder; 2], vec![Placeholder; 1])
-                .unwrap()
-        };
-
-        // Eager: the folded outputs and residual replay reproduce full interpretation.
-        let program = build_program();
-        let context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let knowledge = vec![PartialValue::Known(Scalar::from(3.0)), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in_context(&context, knowledge.as_slice()).unwrap();
-        assert_eq!(evaluation.interpret(&context, &[Scalar::from(5.0)]).unwrap(), vec![Scalar::from(45.0)]);
-
-        // The arity check is strict in both directions: the input count must equal the number of unknown feeders,
-        // so surplus values (e.g., passing the original program's full input vector) are rejected rather than
-        // silently ignored.
-        assert_eq!(
-            evaluation.interpret(&context, &[]),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-        assert_eq!(
-            evaluation.interpret(&context, &[Scalar::from(5.0), Scalar::from(7.0)]),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
-        );
-
-        // Staging: replaying stages the residual work into the outer program and returns live tracers.
-        let program = build_program();
-        let outer = ScalarTracingContext::new();
-        let known = outer.input(DataType::F64);
-        let knowledge = vec![PartialValue::Known(known), PartialValue::Unknown(DataType::F64)];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-        let staged_before_replay = outer.builder().borrow().instructions().len();
-        let tangent = outer.input(DataType::F64);
-        let outputs = evaluation.interpret(&outer, &[tangent]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].atom_id().is_ok());
-        assert_eq!(outer.builder().borrow().instructions().len(), staged_before_replay + 1);
-    }
-
-    /// A rule that inspects known payloads (the known-predicate `condition`) inlines only when the known predicate is
-    /// concretizable (a literal-backed tracer), falling back to the rewritten condition with the predicate as a known
-    /// feeder when it is a genuine outer tracer — the concretization gate.
-    #[test]
-    fn test_partially_evaluate_condition_predicate_concretization_gate_under_staging() {
-        let build_program = || -> TestArrayProgram {
-            let condition = ConditionOperation::new(
-                scalar_branch(ArrayOperation::Mul(MulOperation), 2.0),
-                scalar_branch(ArrayOperation::Add(AddOperation), 100.0),
-            )
-            .unwrap();
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-            let input = builder.add_input(scalar_array_type());
-            let output = builder
-                .add_instruction(ArrayOperation::Condition(Box::new(condition)), vec![predicate, input])
-                .unwrap()[0];
-            builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder; 1]).unwrap()
-        };
-
-        type ArrayTracingContext = TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>;
-
-        // A literal-backed known predicate concretizes, so the taken branch is inlined and the condition disappears.
-        let program = build_program();
-        let outer = ArrayTracingContext::new();
-        let predicate = outer.constant(boolean_array(true));
-        let knowledge = vec![PartialValue::Known(predicate), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Mul(_)));
-
-        // A genuine outer-tracer predicate is known but not concretizable: with no known branch work to hoist, the
-        // rule keeps the condition whole, with the predicate materialized as a known feeder.
-        let program = build_program();
-        let outer = ArrayTracingContext::new();
-        let predicate = outer.input(ArrayType::scalar(DataType::Boolean));
-        let knowledge = vec![PartialValue::Known(predicate), PartialValue::Unknown(scalar_array_type())];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        assert!(matches!(evaluation.program.instructions()[0].operation(), ArrayOperation::Condition(_)));
-        // The unknown input's feeder is seeded before the walk, so the predicate's known feeder follows it.
-        assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(_)));
-    }
-
-    /// A condition whose branches print inside their known chains keeps those effects *behind the outer
-    /// conditional*: the per-branch fresh-context splits fold the all-known prints into the branch-local known
-    /// programs, the composite split binds one known condition into the live outer trace, and the effect stays
-    /// inside its own branch program — the known condition executes branch-selected, so an untaken branch's print
-    /// can never fire speculatively (only its typed zero-padding for the peer's edge slots is staged). The residual
-    /// condition stays pure.
-    #[test]
-    fn test_partially_evaluate_condition_keeps_effectful_known_work_behind_the_outer_conditional() {
-        use crate::operations::debugging::PrintOperation;
-
-        type ArrayTracingContext = TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>;
-
-        // Branches over `[k, x]` whose known chains (`k + k` and `k * k`) print `k` first.
-        let branch = |operation: ArrayOperation<TestArray>, combine: ArrayOperation<TestArray>| {
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let k = builder.add_input(scalar_array_type());
-            let x = builder.add_input(scalar_array_type());
-            let printed = builder.add_instruction(PrintOperation::new("k"), vec![k]).unwrap()[0];
-            let known = builder.add_instruction(operation, vec![printed, k]).unwrap()[0];
-            let output = builder.add_instruction(combine, vec![known, x]).unwrap()[0];
-            builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder; 1]).unwrap()
-        };
-        let condition = ConditionOperation::new(
-            branch(ArrayOperation::Add(AddOperation), ArrayOperation::Mul(MulOperation)),
-            branch(ArrayOperation::Mul(MulOperation), ArrayOperation::Add(AddOperation)),
-        )
-        .unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let known_input = builder.add_input(scalar_array_type());
-        let runtime_input = builder.add_input(scalar_array_type());
-        let outputs = builder
-            .add_instruction(
-                ArrayOperation::Condition(Box::new(condition)),
-                vec![predicate, known_input, runtime_input],
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 1]).unwrap();
-
-        let outer = ArrayTracingContext::new();
-        let predicate = outer.input(ArrayType::scalar(DataType::Boolean));
-        let known = outer.input(scalar_array_type());
-        let knowledge = vec![
-            PartialValue::Known(predicate),
-            PartialValue::Known(known),
-            PartialValue::Unknown(scalar_array_type()),
-        ];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-
-        // The known condition carries the branch prints (visible through the nested-program effects union) and each
-        // print stays inside its own branch program; the residual condition is pure.
-        {
-            let outer_builder = outer.builder().borrow();
-            assert_eq!(outer_builder.instructions().len(), 1);
-            let ArrayOperation::Condition(known_condition) = outer_builder.instructions()[0].operation() else {
-                panic!("expected the outer program to contain the known condition");
-            };
-            assert!(known_condition.true_branch().effects().is_ordered());
-            assert!(known_condition.false_branch().effects().is_ordered());
-        }
-        assert!(evaluation.program.effects().is_pure());
-        let residual_conditions = evaluation
-            .program
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Condition(_)))
-            .count();
-        assert_eq!(residual_conditions, 1);
-    }
-
-    /// With a known-but-symbolic predicate *and* known branch work to hoist, the condition splits into a composite:
-    /// each branch's known work rides a known condition bound into the live outer trace — so it runs behind the
-    /// *outer* conditional instead of being staged speculatively for both branches — while the unknown work stays
-    /// behind a residual condition consuming the per-branch residual edges the known condition outputs.
-    #[test]
-    fn test_partially_evaluate_condition_composite_split_under_staging() {
-        type ArrayTracingContext = TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>;
-
-        // Branches over `[k, x]`: true computes `(k + k) * x`, false computes `(k * k) + x`, so each branch has one
-        // known-only instruction (its residual edge) and one unknown instruction.
-        let true_branch = {
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let k = builder.add_input(scalar_array_type());
-            let x = builder.add_input(scalar_array_type());
-            let doubled = builder.add_instruction(AddOperation, vec![k, k]).unwrap()[0];
-            let output = builder.add_instruction(MulOperation, vec![doubled, x]).unwrap()[0];
-            builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder; 1]).unwrap()
-        };
-        let false_branch = {
-            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-            let k = builder.add_input(scalar_array_type());
-            let x = builder.add_input(scalar_array_type());
-            let squared = builder.add_instruction(MulOperation, vec![k, k]).unwrap()[0];
-            let output = builder.add_instruction(AddOperation, vec![squared, x]).unwrap()[0];
-            builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder; 1]).unwrap()
-        };
-        let condition = ConditionOperation::new(true_branch, false_branch).unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let known_input = builder.add_input(scalar_array_type());
-        let runtime_input = builder.add_input(scalar_array_type());
-        let outputs = builder
-            .add_instruction(
-                ArrayOperation::Condition(Box::new(condition)),
-                vec![predicate, known_input, runtime_input],
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder.build(outputs, vec![Placeholder; 3], vec![Placeholder; 1]).unwrap();
-
-        let outer = ArrayTracingContext::new();
-        let predicate = outer.input(ArrayType::scalar(DataType::Boolean));
-        let known = outer.input(scalar_array_type());
-        let knowledge = vec![
-            PartialValue::Known(predicate),
-            PartialValue::Known(known),
-            PartialValue::Unknown(scalar_array_type()),
-        ];
-        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
-
-        // The known halves landed in the outer program as one known condition over `[predicate, k]`, each branch
-        // producing its own residual edge plus a typed zero for the peer's edge slot.
-        {
-            let outer_builder = outer.builder().borrow();
-            assert_eq!(outer_builder.instructions().len(), 1);
-            let ArrayOperation::Condition(known_condition) = outer_builder.instructions()[0].operation() else {
-                panic!("expected the outer program to contain the known condition");
-            };
-            assert_eq!(known_condition.true_branch().input_types().len(), 1);
-            assert_eq!(known_condition.true_branch().output_types().len(), 2);
-            assert_eq!(known_condition.true_branch().instructions().len(), 2);
-            assert_eq!(known_condition.false_branch().output_types().len(), 2);
-            assert_eq!(known_condition.false_branch().instructions().len(), 2);
-        }
-
-        // The unknown halves stayed behind one residual condition over `[predicate, x, true edge, false edge]`.
-        assert_eq!(evaluation.program.instructions().len(), 1);
-        let ArrayOperation::Condition(residual_condition) = evaluation.program.instructions()[0].operation() else {
-            panic!("expected the residual program to contain the residual condition");
-        };
-        assert_eq!(residual_condition.true_branch().input_types().len(), 3);
-        assert_eq!(residual_condition.true_branch().instructions().len(), 1);
-        assert_eq!(residual_condition.false_branch().instructions().len(), 1);
-        assert_eq!(evaluation.inputs.len(), 4);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(2)));
-        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(_)));
-        assert!(matches!(&evaluation.inputs[2], PartialEvaluationInput::Known(_)));
-        assert!(matches!(&evaluation.inputs[3], PartialEvaluationInput::Known(_)));
+        assert!(matches!(
+            &evaluation.inputs[1],
+            PartialEvaluationInput::Known(feeder) if feeder.atom_id() == Ok(AtomId::new(1)),
+        ));
         assert_eq!(evaluation.outputs.len(), 1);
         assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %1 %0
+                    %3:f64 = const
+                    %4:f64 = add %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // The outer trace accumulated the folded known work plus the lifted literal, which stays dead in the outer
+        // trace because the residual program rebuilds it inline.
+        let outer_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![AtomId::new(1)], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            outer_program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = const
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_partition() {
+        // `f(a, x) = (a + a, sin(a) * x)` partitioned with `a` known and `x` unknown: `a + a` is a fully known output,
+        // `sin(a)` is a residual edge trailing it among the known program's outputs, and the residual program computes
+        // the mixed output over the surviving unknown input plus the edge.
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let a = builder.add_input(DataType::F64);
+        let x = builder.add_input(DataType::F64);
+        let doubled = builder.add_instruction(AddOperation, vec![a, a]).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![sine, x]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled, product], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let partition = program.partition(&[true, false]).unwrap();
+        assert_eq!(partition.known_input_indices, vec![0]);
+        assert_eq!(
+            partition.residual_inputs,
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(0),]
+        );
+        assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(
+            partition.known_program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = add %0 %0
+                    %2:f64 = sin %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            partition.residual_program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:f64 = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // The two sides recombine to the original program: interpret the known program at `a`, feed its trailing
+        // residual-edge output to the residual program together with `x`, and interleave per the outputs report.
+        let known_outputs = partition.known_program.interpret(vec![Scalar::from(2.0)]).unwrap();
+        let residual_outputs = partition.residual_program.interpret(vec![Scalar::from(3.0), known_outputs[1]]).unwrap();
+        assert_eq!(known_outputs[0], Scalar::from(4.0));
+        assert_eq!(residual_outputs, vec![Scalar::from(3.0 * 2.0f64.sin())]);
+
+        // All-unknown known-ness produces an empty known program and residualizes everything.
+        let partition = program.partition(&[false, false]).unwrap();
+        assert_eq!(partition.known_input_indices, Vec::<usize>::new());
+        assert!(partition.known_program.instructions().is_empty());
+        assert!(partition.known_program.output_ids().is_empty());
+        assert_eq!(
+            partition.residual_inputs,
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1),]
+        );
+        assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
+
+        // All-known known-ness folds everything into the known program and leaves an empty residual program.
+        let partition = program.partition(&[true, true]).unwrap();
+        assert_eq!(partition.known_input_indices, vec![0, 1]);
+        assert_eq!(partition.residual_inputs, Vec::new());
+        assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Known(1)]);
+        assert!(partition.residual_program.instructions().is_empty());
+
+        // The provided known-ness must cover every program input.
+        assert!(matches!(program.partition(&[true]), Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 })));
     }
 }

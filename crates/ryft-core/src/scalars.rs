@@ -19,6 +19,7 @@ use crate::operations::trigonometric::{Cos, Sin};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
+use crate::tracing::TracingContext;
 use crate::types::{DataType, TypeError, Typed};
 
 /// Stateless [`Domain`] that uses [`DataType`] to represent [`Type`](crate::Type)s and [`Scalar`] to represent runtime
@@ -67,6 +68,14 @@ impl Context for ScalarDomain {
         ValueResolution::Concrete(*value)
     }
 }
+
+/// [`EagerContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] values with the
+/// [`ScalarOperation`] family.
+pub type ScalarEagerContext = EagerContext<DataType, Scalar, ScalarOperation<Scalar>>;
+
+/// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the
+/// [`ScalarOperation`] family.
+pub type ScalarTracingContext = TracingContext<DataType, Scalar, ScalarOperation<Scalar>>;
 
 /// Scalar [`Value`] whose [`Type`](crate::Type) is a [`DataType`] and which is meant to be used primarily for testing
 /// the Ryft infrastructure and machinery with programs that do not involve multidimensional arrays.

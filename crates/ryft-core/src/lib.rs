@@ -42,6 +42,11 @@ pub use parameters::{
     ParameterParameterizedFamily, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
     PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
 };
+pub use partial::{
+    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialEvaluator,
+    PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
+    PartitionedProgram,
+};
 pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value};
 pub use scalars::{Scalar, ScalarDomain};
 pub use sharding::*;
