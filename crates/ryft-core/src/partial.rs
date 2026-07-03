@@ -207,6 +207,20 @@ pub enum PartialEvaluationInput<V> {
     Unknown(usize),
 }
 
+impl<V> PartialEvaluationInput<V> {
+    /// Returns `true` if this [`PartialEvaluationInput`] is [`Self::Known`].
+    #[inline]
+    pub const fn is_known(&self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+
+    /// Returns `true` if this [`PartialEvaluationInput`] is [`Self::Unknown`].
+    #[inline]
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
+}
+
 /// Output of a partially evaluated (i.e., a _residual_) [`Program`] (i.e., an input of a [`PartialEvaluation`]).
 /// Partial evaluation splits the original outputs into those it could fold to a concrete value now and those that
 /// remain computed by the residual program.
@@ -219,6 +233,20 @@ pub enum PartialEvaluationOutput<V> {
 
     /// Output produced by the residual program, identified by its index into the residual program's outputs.
     Unknown(usize),
+}
+
+impl<V> PartialEvaluationOutput<V> {
+    /// Returns `true` if this [`PartialEvaluationOutput`] is [`Self::Known`].
+    #[inline]
+    pub const fn is_known(&self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+
+    /// Returns `true` if this [`PartialEvaluationOutput`] is [`Self::Unknown`].
+    #[inline]
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
+    }
 }
 
 /// Result of partially evaluating a [`Program`] against a known-side [`Context`]. The residual program operates in
@@ -728,6 +756,95 @@ impl<C: Context> PartialEvaluator<C> {
         result
     }
 
+    /// Inlines a [`PartitionedProgram`] into this walk as two boundary operations, consuming the partitioned program
+    /// and returning the reassembled original boundary outputs, in original output order. This is the shared emission
+    /// protocol of online boundary partial-evaluation rules (i.e., the boundary-wise counterpart of the
+    /// instruction-wise [`inline_program`](Self::inline_program)). The partitioned program's known [`Program`] is
+    /// wrapped through `build_known_operation` and [folded-or-residualized](Self::fold_or_residualize) over the
+    /// original known boundary inputs. The residual program is wrapped through `build_residual_operation` and
+    /// [residualized](Self::residualize) over the surviving unknown boundary inputs plus the known-side operation's
+    /// residual outputs. Each original output is picked from the known-side or residual-side operation's outputs per
+    /// the partitioned program's [`outputs`](PartitionedProgram::outputs). Consuming the partitioned program in a
+    /// single step keeps it whole until it is gone, so no partially-moved partition state can ever be observed.
+    ///
+    /// # Parameters
+    ///
+    ///   - `partition`: [`PartitionedProgram`] to inline, produced by [`Program::partition`].
+    ///   - `inputs`: Input [`PartialEvaluationValue`]s in the order of the original program's input, pre-partitioning.
+    ///   - `build_known_operation`: Wraps the provided known [`Program`] in the known-side boundary operation.
+    ///   - `build_residual_operation`: Wraps the provided residual [`Program`] in the residual boundary operation.
+    pub fn inline_partitioned_program<
+        V: Value<C::Type>,
+        O: Operation<C::Type>,
+        P: Into<C::Operation>,
+        BuildKnownProgramOperation: FnOnce(Program<C::Type, V, O, Vec<V>, Vec<V>>) -> P,
+        BuildResidualProgramOperation: FnOnce(Program<C::Type, V, O, Vec<V>, Vec<V>>) -> P,
+    >(
+        &mut self,
+        program: PartitionedProgram<C::Type, V, O>,
+        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
+        build_known_operation: BuildKnownProgramOperation,
+        build_residual_operation: BuildResidualProgramOperation,
+    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        // Bind the known-side operation into the known-side context over the original known inputs.
+        let known_inputs = program
+            .known_input_indices
+            .iter()
+            .map(|&index| {
+                inputs
+                    .get(index)
+                    .cloned()
+                    .ok_or(ProgramError::InvalidInputCount { expected: index + 1, actual: inputs.len() })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let known_program_operation = build_known_operation(program.known_program);
+        let known_outputs = self.fold_or_residualize(known_program_operation, known_inputs.as_slice())?;
+
+        // Emit the residual operation over the surviving unknown boundary inputs plus the residual edges, which trail
+        // the fully known outputs among the known-side operation's outputs. The emission is unconditional: a residual
+        // program without outputs can still carry effectful residual instructions whose effects must be preserved, and
+        // an entirely empty residual program only yields a dead pure operation that the walk's final simplification
+        // removes.
+        let known_output_count = program.outputs.iter().filter(|output| output.is_known()).count();
+        let residual_inputs = program
+            .residual_inputs
+            .iter()
+            .map(|source| match source {
+                PartialEvaluationInput::Unknown(index) => inputs
+                    .get(*index)
+                    .cloned()
+                    .ok_or(ProgramError::InvalidInputCount { expected: *index + 1, actual: inputs.len() }),
+                PartialEvaluationInput::Known(index) => {
+                    known_outputs.get(known_output_count + index).cloned().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "known program partition produced no output for residual known input index {index}",
+                        ))
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let residual_program_operation = build_residual_operation(program.residual_program);
+        let residual_outputs = self.residualize(residual_program_operation, residual_inputs.as_slice())?;
+
+        // Reassemble the original outputs from the two operations' outputs.
+        program
+            .outputs
+            .iter()
+            .map(|source| match source {
+                PartialEvaluationOutput::Known(index) => known_outputs.get(*index).cloned().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "known program partition produced no output for known output {index}",
+                    ))
+                }),
+                PartialEvaluationOutput::Unknown(index) => residual_outputs.get(*index).cloned().ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "residual program partition produced no output for residual output {index}",
+                    ))
+                }),
+            })
+            .collect()
+    }
+
     /// Recovers the staged-constant payload of the provided known value `value` through [`Context::resolve`], reporting
     /// a [`ProgramError`] when the known-side [`Context`] cannot prove that the provided value is a concrete constant.
     /// Higher-order rules use this when they must embed a known value *inside* a nested residual program (e.g., a
@@ -892,7 +1009,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
     }
 
     // TODO(eaplatanios): Review from here onwards.
-    
+
     /// Partitions this [`Program`] based on the provided per-input known-ness into a known-side program and a
     /// residual program joined by residual edges, packaged as a [`PartitionedProgram`]. This function invokes
     /// [`partially_evaluate_in_context`](Self::partially_evaluate_in_context) with a **fresh** [`TracingContext`]
@@ -912,18 +1029,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
         check_count!("input", input_known, input_types.len(), ProgramError);
 
         let context = TracingContext::<T, V, O>::new();
-        let mut known_input_indices = Vec::new();
         let inputs = input_types
             .iter()
             .zip(input_known.iter())
-            .enumerate()
-            .map(|(index, (input_type, &known))| {
-                if known {
-                    known_input_indices.push(index);
-                    PartialValue::Known(context.input(input_type.clone()))
-                } else {
-                    PartialValue::Unknown(input_type.clone())
-                }
+            .map(|(input_type, &known)| match known {
+                true => PartialValue::Known(context.input(input_type.clone())),
+                false => PartialValue::Unknown(input_type.clone()),
             })
             .collect::<Vec<_>>();
         let evaluation = self.partially_evaluate_in_context(&context, inputs.as_slice())?;
@@ -942,45 +1053,47 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
             }
         }
 
-        let mut residual_inputs = Vec::with_capacity(evaluation.inputs.len());
-        let mut residual_edge_count = 0;
         for input in evaluation.inputs.iter() {
-            match input {
-                PartialEvaluationInput::Unknown(index) => {
-                    residual_inputs.push(PartialEvaluationInput::Unknown(*index));
-                }
-                PartialEvaluationInput::Known(value) => {
-                    residual_inputs.push(PartialEvaluationInput::Known(residual_edge_count));
-                    residual_edge_count += 1;
-                    known_output_atoms.push(value.atom_id()?);
-                }
+            if let PartialEvaluationInput::Known(value) = input {
+                known_output_atoms.push(value.atom_id()?);
             }
         }
 
-        let known_program = if known_output_atoms.is_empty() {
-            None
-        } else {
-            let known_output_count = known_output_atoms.len();
-            Some(
-                context
-                    .builder()
-                    .borrow()
-                    .clone()
-                    .build::<Vec<V>, Vec<V>>(
-                        known_output_atoms,
-                        vec![Placeholder; known_input_indices.len()],
-                        vec![Placeholder; known_output_count],
-                    )?
-                    .into_simplified()?,
-            )
-        };
-        Ok(PartitionedProgram {
-            known_program,
-            residual_program: evaluation.program,
-            known_input_indices,
-            residual_inputs,
-            outputs,
-        })
+        let known_input_indices = input_known
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &known)| known.then_some(index))
+            .collect::<Vec<_>>();
+        let residual_inputs = evaluation
+            .inputs
+            .iter()
+            .scan(0, |known_count, input| {
+                Some(match input {
+                    PartialEvaluationInput::Unknown(index) => PartialEvaluationInput::Unknown(*index),
+                    PartialEvaluationInput::Known(_) => {
+                        let index = *known_count;
+                        *known_count += 1;
+                        PartialEvaluationInput::Known(index)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        
+        let known_input_count = known_input_indices.len();
+        let known_output_count = known_output_atoms.len();
+        let known_program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<V>, Vec<V>>(
+                known_output_atoms,
+                vec![Placeholder; known_input_count],
+                vec![Placeholder; known_output_count],
+            )?
+            .into_simplified()?;
+        let residual_program = evaluation.program;
+
+        Ok(PartitionedProgram { known_program, residual_program, known_input_indices, residual_inputs, outputs })
     }
 }
 
@@ -995,22 +1108,23 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
 /// consumes; a rule wraps it in its boundary operation and binds it into the enclosing known-side context over the
 /// original inputs named by [`known_input_indices`](Self::known_input_indices). The
 /// [`residual_program`](Self::residual_program) is wrapped in the residual boundary operation and emitted over the
-/// inputs assembled by [`residual_boundary_inputs`](Self::residual_boundary_inputs) — the surviving unknown boundary
-/// inputs plus the known-side operation's residual-edge outputs — and [`assemble_outputs`](Self::assemble_outputs)
-/// maps the two operations' outputs back to the original boundary output order. The
+/// surviving unknown boundary inputs plus the known-side operation's residual-edge outputs, and the two operations'
+/// outputs are mapped back to the original boundary output order. The
 /// [`residual_inputs`](Self::residual_inputs) and [`outputs`](Self::outputs) reports reuse
 /// [`PartialEvaluationInput`] and [`PartialEvaluationOutput`] with each value erased to a position, mirroring the
-/// callee's [`PartialEvaluation`] one-to-one. All fields are public: a boundary rule keeps the partition whole —
-/// taking the programs through [`Option::take`] on [`known_program`](Self::known_program) and through
-/// [`take_residual_program`](Self::take_residual_program) — so every method up to and including
-/// [`assemble_outputs`](Self::assemble_outputs) stays callable, while a consumer that wants full ownership of the
-/// parts (such as linearization) destructures the partition instead.
+/// callee's [`PartialEvaluation`] one-to-one. A boundary rule checks [`is_trivial`](Self::is_trivial), gathers any
+/// boundary metadata through the accessors and public fields, and then consumes the partition **atomically** through
+/// [`PartialEvaluator::inline_partitioned_program`], which performs the whole bind-and-reassemble protocol in one
+/// step, so the partition is always either whole or gone; a consumer that wants the raw programs (such as
+/// linearization) destructures the public fields instead.
 pub struct PartitionedProgram<T: Type, V: Value<T>, O: Operation<T>> {
-    /// Known-side callee program, or [`None`] when the partition has an empty known side: partial evaluation found
-    /// no fully known callee output and no known→unknown residual edge — the known side computes nothing that
-    /// anyone consumes (for example, when every known boundary input is dead in the callee) — so there is no
-    /// known-side work to wrap in a boundary operation.
-    pub known_program: Option<Program<T, V, O, Vec<V>, Vec<V>>>,
+    /// Known-side program: the known work reified through the fresh trace, taking the original inputs named by
+    /// [`known_input_indices`](Self::known_input_indices) and producing the fully known outputs followed by the
+    /// residual edges. When partial evaluation finds no fully known output and no known→unknown residual edge, this
+    /// program has no outputs and — since simplification keeps only effectful dead work — usually no instructions,
+    /// in which case [`is_trivial`](Self::is_trivial) reports that there is no known-side work worth wrapping in a
+    /// boundary operation.
+    pub known_program: Program<T, V, O, Vec<V>, Vec<V>>,
 
     /// Residual-side callee program: the callee's partial-evaluation residual program, whose inputs are described
     /// by [`residual_inputs`](Self::residual_inputs).
@@ -1035,18 +1149,19 @@ pub struct PartitionedProgram<T: Type, V: Value<T>, O: Operation<T>> {
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>> PartitionedProgram<T, V, O> {
-    /// Returns `true` when the partition's known side performs no computation: its known program (when present)
-    /// contains no instructions, so every residual edge merely forwards a known boundary input. Boundary rules
-    /// should fall back to the default fold-or-residualize behavior in that case — a forwarding-only known
-    /// boundary operation adds a call layer without hoisting any work, while the default materializes the same
-    /// known inputs directly as residual feeders.
+    /// Returns `true` when the partition's known side performs no computation: the known program contains no
+    /// instructions, so every residual edge merely forwards a known boundary input. Boundary rules should fall back
+    /// to the default fold-or-residualize behavior in that case — a forwarding-only known boundary operation adds a
+    /// call layer without hoisting any work, while the default materializes the same known inputs directly as
+    /// residual feeders.
     #[inline]
     pub fn is_trivial(&self) -> bool {
-        self.known_program.as_ref().is_none_or(|program| program.instructions().is_empty())
+        self.known_program.instructions().is_empty()
     }
 
     /// Returns the type of each residual edge, in edge order, read off the residual program's input types at the
     /// [`Known`](PartialEvaluationInput::Known) source positions.
+    #[inline]
     pub fn residual_edge_types(&self) -> Vec<T> {
         self.residual_inputs
             .iter()
@@ -1055,19 +1170,9 @@ impl<T: Type, V: Value<T>, O: Operation<T>> PartitionedProgram<T, V, O> {
             .collect()
     }
 
-    /// Takes the residual program out of this partition, leaving an empty program in its place (the
-    /// [`std::mem::take`] idiom), so the partition stays whole and its methods — most importantly
-    /// [`assemble_outputs`](Self::assemble_outputs) — remain callable after the residual boundary operation has been
-    /// built. Queries that read the residual program, most notably
-    /// [`residual_edge_types`](Self::residual_edge_types), must run before this.
-    pub fn take_residual_program(&mut self) -> Program<T, V, O, Vec<V>, Vec<V>> {
-        // An empty program is trivially well-formed, so this construction can never fail.
-        let empty = ProgramBuilder::new().build::<Vec<V>, Vec<V>>(Vec::new(), Vec::new(), Vec::new()).unwrap();
-        std::mem::replace(&mut self.residual_program, empty)
-    }
-
     /// Returns the original callee-output index of each fully known output, aligned with the known-side operation's
     /// leading outputs.
+    #[inline]
     pub fn known_output_indices(&self) -> Vec<usize> {
         self.outputs
             .iter()
@@ -1078,89 +1183,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>> PartitionedProgram<T, V, O> {
 
     /// Returns the original callee-output index of each residual-owned output, aligned with the residual program's
     /// outputs.
+    #[inline]
     pub fn residual_output_indices(&self) -> Vec<usize> {
         self.outputs
             .iter()
             .enumerate()
             .filter_map(|(index, source)| matches!(source, PartialEvaluationOutput::Unknown(_)).then_some(index))
-            .collect()
-    }
-
-    /// Returns `true` when the residual side produces at least one output, so a residual boundary operation must be
-    /// emitted.
-    #[inline]
-    pub fn has_residual_outputs(&self) -> bool {
-        self.outputs.iter().any(|source| matches!(source, PartialEvaluationOutput::Unknown(_)))
-    }
-
-    /// Returns the position of the residual edge with ordinal `edge` among the known-side operation's outputs,
-    /// which list the fully known outputs first and the residual edges after them.
-    fn edge_output_position(&self, edge: usize) -> usize {
-        let known_output_count =
-            self.outputs.iter().filter(|source| matches!(source, PartialEvaluationOutput::Known(_))).count();
-        known_output_count + edge
-    }
-
-    /// Assembles the residual boundary operation's inputs: the original boundary input for each
-    /// [`Unknown`](PartialEvaluationInput::Unknown) source and the known-side operation's matching residual-edge
-    /// output for each [`Known`](PartialEvaluationInput::Known) source.
-    ///
-    /// # Parameters
-    ///
-    ///   - `inputs`: Original boundary inputs, in boundary input order.
-    ///   - `known_outputs`: Outputs of the known-side boundary operation bound in the enclosing known-side context.
-    pub fn residual_boundary_inputs<Known: Value<T>>(
-        &self,
-        inputs: &[PartialEvaluationValue<T, Known>],
-        known_outputs: &[PartialEvaluationValue<T, Known>],
-    ) -> Result<Vec<PartialEvaluationValue<T, Known>>, ProgramError> {
-        self.residual_inputs
-            .iter()
-            .map(|source| match source {
-                PartialEvaluationInput::Unknown(index) => inputs
-                    .get(*index)
-                    .cloned()
-                    .ok_or(ProgramError::InvalidInputCount { expected: *index + 1, actual: inputs.len() }),
-                PartialEvaluationInput::Known(edge) => {
-                    known_outputs.get(self.edge_output_position(*edge)).cloned().ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!(
-                            "online boundary split known side produced no output for residual edge {edge}",
-                        ))
-                    })
-                }
-            })
-            .collect()
-    }
-
-    /// Reassembles the original boundary outputs, in original output order, from the known-side and residual-side
-    /// boundary operations' outputs: each [`Known`](PartialEvaluationOutput::Known) report picks the output at its
-    /// position among `known_outputs` and each [`Unknown`](PartialEvaluationOutput::Unknown) report picks the
-    /// output at its ordinal among `residual_outputs`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `known_outputs`: Outputs of the known-side boundary operation bound in the enclosing known-side context.
-    ///   - `residual_outputs`: Outputs of the residual boundary operation emitted into the enclosing residual
-    ///     program.
-    pub fn assemble_outputs<Known: Value<T>>(
-        &self,
-        known_outputs: &[PartialEvaluationValue<T, Known>],
-        residual_outputs: &[PartialEvaluationValue<T, Known>],
-    ) -> Result<Vec<PartialEvaluationValue<T, Known>>, ProgramError> {
-        self.outputs
-            .iter()
-            .map(|source| match source {
-                PartialEvaluationOutput::Known(index) => known_outputs.get(*index).cloned().ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "known program partition produced no output for known output {index}",
-                    ))
-                }),
-                PartialEvaluationOutput::Unknown(index) => residual_outputs.get(*index).cloned().ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "residual program partition produced no output for residual output {index}",
-                    ))
-                }),
-            })
             .collect()
     }
 }
