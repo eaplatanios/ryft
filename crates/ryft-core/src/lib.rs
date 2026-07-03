@@ -27,7 +27,7 @@ pub mod utilities;
 pub mod tests;
 
 // TODO(eaplatanios): Make all of the following more specific.
-pub use batching::BatchingError;
+pub use batching::{ArrayBatch, BatchingError};
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
 pub use contexts::{Context, EagerContext, StagingContext, ValueResolution};
@@ -47,7 +47,9 @@ pub use partial::{
     PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
     PartitionedProgram,
 };
-pub use programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value};
+pub use programs::{
+    Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value,
+};
 pub use scalars::{Scalar, ScalarDomain};
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};

@@ -1,12 +1,11 @@
-use std::borrow::Cow;
 use std::cell::RefCell;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
 use crate::ElementwiseOperation;
-use crate::batching::BatchingError;
+use crate::batching::{ArrayBatch, BatchingError};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, StagingContext, ValueResolution};
 use crate::domains::Domain;
@@ -22,124 +21,6 @@ use crate::tracing_v2::differentiation::{DifferentiationContext, replay_via_bind
 use crate::types::{ArrayType, Size, Typed};
 
 // TODO(eaplatanios): Review this module.
-
-/// Packed array value carrying lane metadata for one batching transform.
-///
-/// [`ArrayBatch`] is the production batching representation for `tracing_v2`: its [`ArrayType`] is the
-/// physical type of `value`, so it includes the mapped lane dimension when [`ArrayBatch::batch_axis`]
-/// is `Some`. The logical per-lane type is derived by removing that dimension.
-///
-/// A `None` batch axis is an explicit lane-uniform state. It means the value does not contain a
-/// physical dimension for the current batch lanes and should be interpreted as the same value for
-/// every lane. For example, a traced constant in `batch(|x| x + 1)` is represented with
-/// `batch_axis == None`, while `x` carries the mapped input axis. Runtime control-flow predicates
-/// also require `None` today because a single predicate can select one branch for all lanes, while
-/// a lane-varying predicate would need a dedicated batching rule. `None` is not limited to
-/// rank-0 values: any shaped constant or operand can be lane-uniform when none of its physical
-/// dimensions indexes the current lanes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ArrayBatch<V: Typed<ArrayType>> {
-    /// Physical array type of `value`.
-    r#type: ArrayType,
-
-    /// Packed array value.
-    value: V,
-
-    /// Axis in `r#type` and `value` that represents the mapped batch dimension, or `None` when
-    /// `value` is uniform across the current batch lanes.
-    batch_axis: Option<usize>,
-}
-
-impl<V: Typed<ArrayType>> ArrayBatch<V> {
-    /// Creates a packed array batch from explicit physical metadata.
-    ///
-    /// # Parameters
-    ///
-    ///   - `r#type`: Physical type of `value`. This type includes `batch_axis` when present.
-    ///   - `value`: Physical array value.
-    ///   - `batch_axis`: Mapped axis in `r#type` and `value`, or `None` when `value` is shared
-    ///     uniformly across lanes.
-    pub fn new(r#type: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, ProgramError> {
-        if let Some(axis) = batch_axis
-            && axis >= r#type.rank()
-        {
-            return Err(BatchingError::BatchAxisOutOfBounds { r#type, axis }.into());
-        }
-        Ok(Self { r#type, value, batch_axis })
-    }
-
-    /// Returns the mapped axis, if the physical value carries one.
-    #[inline]
-    pub fn batch_axis(&self) -> Option<usize> {
-        self.batch_axis
-    }
-
-    /// Returns the physical value.
-    #[inline]
-    pub fn value(&self) -> &V {
-        &self.value
-    }
-
-    /// Consumes `self` and returns the physical value.
-    #[inline]
-    pub fn into_value(self) -> V {
-        self.value
-    }
-
-    /// Returns the static mapped axis size, if this value is batched.
-    pub fn axis_size(&self) -> Result<Option<usize>, ProgramError> {
-        let Some(axis) = self.batch_axis else {
-            return Ok(None);
-        };
-        let Some(size) = self.r#type.dimension(axis as isize).value() else {
-            return Err(BatchingError::DynamicBatchAxis { r#type: self.r#type.clone(), axis }.into());
-        };
-        Ok(Some(size))
-    }
-
-    /// Returns the scalar-body type obtained by removing the mapped axis.
-    pub fn logical_type(&self) -> Result<ArrayType, ProgramError> {
-        let Some(axis) = self.batch_axis else {
-            return Ok(self.r#type.clone());
-        };
-        Ok(self.r#type.without_dimension(axis)?.0)
-    }
-
-    /// Wraps a value that already contains a mapped axis.
-    ///
-    /// # Parameters
-    ///
-    ///   - `value`: Packed array value.
-    ///   - `batch_axis`: Mapped axis in `value`.
-    pub fn mapped(value: V, batch_axis: usize) -> Result<Self, ProgramError> {
-        Self::new(value.r#type().into_owned(), value, Some(batch_axis))
-    }
-
-    /// Wraps a value that is uniform across the current batch lanes.
-    pub fn unbatched(value: V) -> Self {
-        Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
-    }
-}
-
-impl<V: Typed<ArrayType> + Parameter> Parameter for ArrayBatch<V> {}
-
-impl<V: Typed<ArrayType>> Typed<ArrayType> for ArrayBatch<V> {
-    #[inline]
-    fn r#type(&self) -> Cow<'_, ArrayType> {
-        Cow::Borrowed(&self.r#type)
-    }
-}
-
-impl<V: Display + Typed<ArrayType>> Display for ArrayBatch<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.batch_axis {
-            Some(axis) => write!(formatter, "batch[{}, axis={axis}]({})", self.r#type, self.value),
-            None => write!(formatter, "batch[{}, lane-uniform]({})", self.r#type, self.value),
-        }
-    }
-}
-
-impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
 
 /// Batching rule for one staged operation.
 ///
