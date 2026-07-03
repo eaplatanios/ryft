@@ -7,7 +7,7 @@ use crate::domains::Domain;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_builders;
 use crate::operations::Operation;
-use crate::operations::constants::{ConstantOperation, MaybeZeroOperation};
+use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracerState, TracingContext};
@@ -252,29 +252,6 @@ pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>:
         error
     }
 
-    /// Returns `true` if the provided [`Tracer`] is produced by a nullary [`ZeroOperation`](crate::ZeroOperation)
-    /// in this [`StagingContext`]. Structural zero recognition is intentionally narrow: inputs, constants, non-zero
-    /// operations, and malformed non-nullary zero operations are not treated as **canonical** zeros. Callers that
-    /// need broader algebraic simplification should perform it in [`Operation`]-owned rules rather than weakening
-    /// this definition.
-    fn is_zero(&self, value: &Self::Value) -> Result<bool, ProgramError>
-    where
-        Self::Operation: MaybeZeroOperation<Self::Type>,
-    {
-        check_builders!(self.builder(), value.context().builder()).map_err(|error| self.error(error))?;
-        let atom = value.atom_id()?;
-        let builder = self.builder().borrow();
-        if builder.atoms().get(atom.index()).is_none() {
-            return Err(ProgramError::UnboundAtomId { id: atom });
-        }
-        for instruction in builder.instructions() {
-            if instruction.outputs().contains(&atom) {
-                return Ok(instruction.inputs().is_empty() && instruction.operation().is_zero_operation());
-            }
-        }
-        Ok(false)
-    }
-
     /// Stages an application of the provided **nullary** [`Operation`] (i.e., an operation with no inputs) in this
     /// [`StagingContext`] and returns [`Tracer`]s for its outputs.
     #[inline]
@@ -395,7 +372,7 @@ mod tests {
     use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Atom, AtomId, Instruction, ProgramBuilder, ProgramError};
+    use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
     use crate::scalars::{Scalar, ScalarDomain};
     use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
@@ -546,45 +523,6 @@ mod tests {
             .build::<Scalar, Scalar>(vec![output.atom_id().unwrap()], Placeholder, Placeholder)
             .unwrap();
         assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
-    }
-
-    #[test]
-    fn test_staging_context_is_zero_recognizes_only_nullary_zero_operations_in_the_same_builder() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
-        let builder = context.builder().clone();
-        let input = context.input(DataType::F64);
-        let constant = context.constant(Scalar::from(1.0));
-        let mut zero_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
-        let zero = zero_outputs.remove(0);
-        let mut add_outputs = context.stage_operation(AddOperation, &[&input, &zero]).unwrap();
-        let add_output = add_outputs.remove(0);
-        let malformed_zero_output = {
-            let mut builder = builder.borrow_mut();
-            let output = builder.add_variable(DataType::F64);
-            builder.add_instruction_unchecked(Instruction::new(
-                ScalarOperation::from(ZeroOperation::new(DataType::F64)),
-                vec![input.atom_id().unwrap()],
-                vec![output],
-            ));
-            output
-        };
-        let malformed_zero = context.tracer(malformed_zero_output, None);
-
-        assert!(!context.is_zero(&input).unwrap());
-        assert!(!context.is_zero(&constant).unwrap());
-        assert!(context.is_zero(&zero).unwrap());
-        assert!(!context.is_zero(&add_output).unwrap());
-        assert!(!context.is_zero(&malformed_zero).unwrap());
-        assert_eq!(
-            context.is_zero(&context.tracer(AtomId::new(999), Some(DataType::F64))),
-            Err(ProgramError::UnboundAtomId { id: AtomId::new(999) }),
-        );
-        assert_eq!(builder.borrow().error(), None);
-
-        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
-        let foreign_input = foreign_context.input(DataType::F64);
-        assert_eq!(context.is_zero(&foreign_input), Err(ProgramError::MismatchedProgramBuilders));
-        assert_eq!(builder.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
     }
 
     #[test]

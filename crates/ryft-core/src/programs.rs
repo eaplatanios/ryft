@@ -22,6 +22,9 @@ pub enum ProgramError {
     #[error("values used in the same operation must share the same program builder")]
     MismatchedProgramBuilders,
 
+    #[error("{message}")]
+    InvalidArgument { message: String },
+
     #[error("invalid number of inputs; expected {expected} but got {actual}")]
     InvalidInputCount { expected: usize, actual: usize },
 
@@ -83,6 +86,71 @@ impl ProgramError {
 /// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
 /// carried values directly.
 pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized {}
+
+/// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`]. [`MaybeZero`] is the
+/// symbolic-zero representation shared by transforms like forward-mode and reverse-mode differentiation where it is the
+/// tangent type carried by [`JvpTracer`](crate::JvpTracer)s and the cotangent type that transposition rules consume and
+/// produce. A [`MaybeZero::Zero`] means that no value exists and nothing has been staged or computed for it. In the
+/// context of differentiation, it means that the corresponding derivative is zero *by construction* (e.g., a
+/// disconnected input, a severed tangent, an unused output, etc.), and is not a runtime value that happens to contain
+/// zeros. Differentiation rules branch on the variant to skip work entirely. A rule that sees a zero tangent or
+/// cotangent emits no operations for it, and "zero-ness" propagates transitively through rules without ever inspecting
+/// a program or materializing a buffer. A zero is _materialized_ into a real value only at the boundaries where one is
+/// structurally required (e.g., a nested sub-program operand, a program output, or an eagerly returned tangent),
+/// which is also where its carried [`Type`] is consumed.
+#[derive(Clone, Debug)]
+pub enum MaybeZero<T: Type, V: Typed<T>> {
+    /// Structural zero of the carried [`Type`] (i.e., no value exists and nothing has been staged or computed for it).
+    Zero(T),
+
+    /// Value that is not known to be structurally equal to zero.
+    Value(V),
+}
+
+impl<T: Type, V: Typed<T>> MaybeZero<T, V> {
+    /// Returns `true` if this is a [`MaybeZero::Zero`].
+    #[inline]
+    pub const fn is_zero(&self) -> bool {
+        matches!(self, Self::Zero(_))
+    }
+
+    /// Returns the value stored in this [`MaybeZero`], if it is a [`MaybeZero::Value`], and [`None`] otherwise.
+    #[inline]
+    pub const fn as_value(&self) -> Option<&V> {
+        match self {
+            Self::Zero(_) => None,
+            Self::Value(value) => Some(value),
+        }
+    }
+
+    /// Maps the value stored in this [`MaybeZero`] using the provided function, leaving a [`MaybeZero::Zero`] and
+    /// its carried [`Type`] unchanged. If this is [`MaybeZero::Zero`], then [`MaybeZero::Zero`] will be returned
+    /// irrespective of what `function` is provided.
+    #[inline]
+    pub fn map<W: Typed<T>, F: FnOnce(V) -> W>(self, function: F) -> MaybeZero<T, W> {
+        match self {
+            Self::Zero(r#type) => MaybeZero::Zero(r#type),
+            Self::Value(value) => MaybeZero::Value(function(value)),
+        }
+    }
+}
+
+impl<T: Type, V: Typed<T>> Typed<T> for MaybeZero<T, V> {
+    #[inline]
+    fn r#type(&self) -> Cow<'_, T> {
+        match self {
+            Self::Zero(r#type) => Cow::Borrowed(r#type),
+            Self::Value(value) => value.r#type(),
+        }
+    }
+}
+
+impl<T: Type, V: Typed<T>> From<V> for MaybeZero<T, V> {
+    #[inline]
+    fn from(value: V) -> Self {
+        Self::Value(value)
+    }
+}
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]

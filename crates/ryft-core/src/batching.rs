@@ -77,7 +77,7 @@ impl From<BatchingError> for ProgramError {
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
 /// representation for Ryft's batching/vectorization transform. It pairs a physical array value with a batch axis that
 /// marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its physical type carries
-/// the batch dimension) or *batch-uniform*, meaning that it is shared unchanged across every batch item.
+/// the batch dimension) or *replicated*, meaning that it is shared unchanged across every batch item.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct ArrayBatch<V> {
     /// Physical array type of `value`. When the value is batched this type includes the mapped batch dimension at
@@ -94,6 +94,7 @@ pub struct ArrayBatch<V> {
 
 impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`].
+    #[inline]
     pub fn new(r#type: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, ProgramError> {
         if let Some(axis) = batch_axis
             && axis >= r#type.rank()
@@ -110,24 +111,24 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     ///
     ///   - `value`: Packed array value.
     ///   - `batch_axis`: Mapped axis in `value`.
+    #[inline]
     pub fn mapped(value: V, batch_axis: usize) -> Result<Self, ProgramError> {
         Self::new(value.r#type().into_owned(), value, Some(batch_axis))
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Creates a new [`ArrayBatch`] that wraps the provided value in a batch-uniform fashion
-    /// (i.e., that replicates across the batch).
-    pub fn unbatched(value: V) -> Self {
+    /// Creates a new [`ArrayBatch`] that replicates the provided value across the batch.
+    #[inline]
+    pub fn replicated(value: V) -> Self {
         Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
     }
 
     /// Returns the axis in [`r#type`](Self::type) and [`value`](Self::value) that indexes the batch items, or `None`
-    /// when `value` is *batch-uniform* (i.e., it carries no physical dimension for the batch and is interpreted as the
+    /// when `value` is *replicated* (i.e., it carries no physical dimension for the batch and is interpreted as the
     /// same value for every batch item). For example, a traced constant in `batch(|x| x + 1)` has a `None` batch axis,
     /// while `x` carries the mapped input axis. Runtime control flow predicates may also require `None`, because a
     /// single predicate may select one branch for the whole batch while a batch-varying predicate would need a
     /// dedicated batching rule. Note that `None` is not limited to rank-0 (i.e., scalar) values. Any shaped constant
-    /// or operand is batch-uniform when none of its physical dimensions indexes the batch.
+    /// or operand is replicated when none of its physical dimensions indexes the batch.
     #[inline]
     pub fn batch_axis(&self) -> Option<usize> {
         self.batch_axis
@@ -146,7 +147,7 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     }
 
     /// Returns the batch size of this [`ArrayBatch`] (i.e., the number of items that are batched together),
-    /// or `None` if it batch-uniform (i.e., replicated as-is across the whole batch).
+    /// or `None` if it is replicated (i.e., shared as-is across the whole batch).
     #[inline]
     pub fn batch_size(&self) -> Result<Option<usize>, ProgramError> {
         let Some(axis) = self.batch_axis else {
@@ -175,7 +176,7 @@ impl<V: Display> Display for ArrayBatch<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.batch_axis {
             Some(axis) => write!(formatter, "batch[{}, axis={axis}]({})", self.r#type, self.value),
-            None => write!(formatter, "batch[{}, batch-uniform]({})", self.r#type, self.value),
+            None => write!(formatter, "batch[{}, replicated]({})", self.r#type, self.value),
         }
     }
 }

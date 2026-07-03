@@ -54,5 +54,7 @@ pub use scalars::{Scalar, ScalarDomain};
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
 pub use tracing_v2::batching::Batch;
-pub use tracing_v2::differentiation::{DifferentiableOperation, DifferentiableProgramOperation, JvpTracer};
+pub use tracing_v2::differentiation::{
+    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, materialize,
+};
 pub use types::*;
