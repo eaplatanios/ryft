@@ -4369,11 +4369,11 @@ mod batching_tests {
     use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
-    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::OneLike;
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::Transpose;
-    use crate::operations::trigonometric::{Sin, SinOperation};
+    use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;
@@ -4642,41 +4642,33 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_lift_elementwise_binary_op() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray>::Add(AddOperation);
-        let (lifted_op, output_axes) =
-            lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(0)], 5).unwrap();
-        assert!(matches!(lifted_op, ArrayOperation::Add(_)));
-        assert_eq!(output_axes, vec![Some(0)]);
+    fn test_apply_elementwise_batch_unary_op() {
+        // A unary elementwise op over a single batched operand preserves elementwise semantics and reports the
+        // operand's batch axis on its single output.
+        let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let batched = ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap();
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let outputs =
+            apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Neg(NegOperation), &[batched]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].value().values(), &[-1.0, -2.0, -3.0]);
     }
 
     #[test]
-    fn test_lift_elementwise_unary_op() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray>::Sin(SinOperation);
-        let (lifted_op, output_axes) = lift_elementwise(&op, &[scalar], &[Some(0)], 7).unwrap();
-        assert!(matches!(lifted_op, ArrayOperation::Sin(_)));
-        assert_eq!(output_axes, vec![Some(0)]);
-    }
-
-    #[test]
-    fn test_lift_elementwise_rejects_misaligned_input_axes() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray>::Add(AddOperation);
-        let err = lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), Some(1)], 5).unwrap_err();
-        // `lift_elementwise` is an operation-level batching helper, so its `BatchingError` rides up as a
-        // `ProgramError::Custom` payload; recover the concrete error with `downcast_custom`.
-        assert!(matches!(err.downcast_custom::<BatchingError>(), Some(BatchingError::MisalignedBatchAxes { .. }),));
-    }
-
-    #[test]
-    fn test_lift_elementwise_passes_through_replicated_inputs() {
-        let scalar = ArrayType::scalar(DataType::F64);
-        let op = ArrayOperation::<TestArray>::Add(AddOperation);
-        let (lifted_op, output_axes) = lift_elementwise(&op, &[scalar.clone(), scalar], &[Some(0), None], 5).unwrap();
-        assert!(matches!(lifted_op, ArrayOperation::Add(_)));
-        assert_eq!(output_axes, vec![Some(0)]);
+    fn test_apply_elementwise_batch_broadcasts_replicated_input() {
+        // A batched operand (axis 0, size 3) added to a replicated scalar broadcasts the replicated operand to the
+        // batched physical shape, so the single output carries the common batch axis and adds the scalar per item.
+        let batched_value = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let batched = ArrayBatch::new(batched_value.r#type().into_owned(), batched_value, Some(0)).unwrap();
+        let replicated = ArrayBatch::replicated(TestArray::scalar(10.0));
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let outputs =
+            apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Add(AddOperation), &[batched, replicated])
+                .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].value().values(), &[11.0, 12.0, 13.0]);
     }
 
     #[test]

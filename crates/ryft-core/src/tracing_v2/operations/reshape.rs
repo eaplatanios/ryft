@@ -1,12 +1,16 @@
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::Operation;
 use crate::operations::manipulation::{Reshape, ReshapeOperation};
-use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::{ArrayType, Shape, Size};
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::batching::{apply_elementwise_batch, apply_with_axes};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::types::{ArrayType, Shape, Size, Typed};
+use crate::{ArrayBatch, BatchableOperation, BatchingError, Broadcast, Transpose};
 
 /// Convenience trait for values that support reshape.
 pub trait ReshapeOps: Reshape + Sized {}
@@ -21,11 +25,11 @@ pub trait ReshapeValue: Value<ArrayType> + ReshapeOps {}
 
 impl<T: Value<ArrayType> + ReshapeOps> ReshapeValue for T {}
 
-/// Lifts a reshape's per-lane `input_shape` / `output_shape` pair through one batching level by
+/// Lifts a reshape's per-item `input_shape` / `output_shape` pair through one batching level by
 /// inserting a new dimension of size `axis_size` at the supplied input position and finding the
 /// matching output position.
 ///
-/// The lifted reshape preserves per-lane semantics in row-major order, which requires that the
+/// The lifted reshape preserves per-item semantics in row-major order, which requires that the
 /// element count to the left of the batch dimension is the same on both sides:
 /// `product(input_shape[..k_in]) == product(output_shape[..k_out])`. When such a `k_out` exists,
 /// the helper inserts `axis_size` at position `k_in` in the input shape and at position `k_out`
@@ -40,10 +44,10 @@ impl<T: Value<ArrayType> + ReshapeOps> ReshapeValue for T {}
 ///
 /// # Parameters
 ///
-///   - `input_shape`: Per-lane shape of the reshape's input.
-///   - `output_shape`: Per-lane shape produced by [`ReshapeOperation::output_shape`].
+///   - `input_shape`: Per-item shape of the reshape's input.
+///   - `output_shape`: Per-item shape produced by [`ReshapeOperation::output_shape`].
 ///   - `k_in`: Position of the batched axis in the parent-physical input.
-///   - `axis_size`: Size of the batched lane this level introduces.
+///   - `axis_size`: Size of the batched item this level introduces.
 pub fn lift_reshape_shapes(
     input_shape: &Shape,
     output_shape: &Shape,
@@ -93,65 +97,58 @@ impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ReshapeO
 where
     O: Operation<ArrayType> + From<ReshapeOperation>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
-        check_count!("output", output_cotangents, 1, ProgramError);
-        match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => {
-                Ok(vec![Cotangent::Staged(cotangent.reshape(input_types[0].shape().clone())?)])
+        _context: &mut TracingContext<ArrayType, V, O>,
+        inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
+        outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
+    ) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Value(cotangent) => {
+                Ok(vec![MaybeZero::Value(cotangent.reshape(inputs[0].r#type().shape().clone())?)])
             }
-            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
         }
     }
 }
 
-impl<C> DifferentiableOperation<C> for ReshapeOperation
+/// Forward-mode rule for [`ReshapeOperation`]: `reshape` is structural-linear, so the tangent is the same reshape
+/// applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this rule is
+/// consulted, so the operand tangent reaching here is always live.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReshapeOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: ReshapeValue,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ReshapeOperation>,
+    C::Operation: Clone + From<ReshapeOperation>,
+    C::Value: Reshape,
 {
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().reshape(self.output_shape().clone())?;
-        let tangent = inputs[0].tangent().clone().reshape(self.output_shape().clone())?;
+        let primal = inputs[0].primal().reshape(self.output_shape().clone())?;
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(self.output_shape().clone())?),
+        };
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
-    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for ReshapeOperation
+impl<V: Value<ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for ReshapeOperation
 where
-    ReshapeOperation: InterpretableOperation<ArrayType, V>,
+    ReshapeOperation: InterpretableOperation<ArrayType, V, C>,
 {
-    fn batch(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
-        let Some(k_in) = input_axes[0] else {
-            // Lane-uniform: reshape is the same elementwise op (no axis arithmetic needed).
-            return crate::tracing_v2::batching::apply_elementwise_batch(context, self, inputs);
+        let Some(k_in) = inputs[0].batch_axis() else {
+            // Replicated: reshape is the same elementwise op (no axis arithmetic needed).
+            return apply_elementwise_batch(context, self, inputs);
         };
-        let input_shape = inputs[0].logical_type()?.shape().clone();
+        let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
+        let input_shape = inputs[0].unbatched_type()?.shape().clone();
         let Some((_, lifted_output_shape, k_out)) =
             lift_reshape_shapes(&input_shape, self.output_shape(), k_in, axis_size)
         else {
-            return Err(crate::batching::BatchingError::UnsupportedOperation {
+            return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "missing batching rule for ReshapeOperation with batch axis {k_in} crossing reshape group \
                     boundaries in {input_shape} -> {}",
@@ -161,6 +158,6 @@ where
             .into());
         };
         let lifted_op = ReshapeOperation::new(lifted_output_shape);
-        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[Some(k_out)])
+        apply_with_axes(context, &lifted_op, inputs, &[Some(k_out)])
     }
 }

@@ -5,14 +5,13 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::ElementwiseOperation;
-use crate::batching::{ArrayBatch, BatchingError};
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingError, ProgramBatchingOutputAxesPolicy};
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, StagingContext, ValueResolution};
-use crate::domains::Domain;
+use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
-use crate::operations::manipulation::{Broadcast, Transpose, TransposeOperation};
+use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::ShardingDimension;
@@ -22,52 +21,14 @@ use crate::types::{ArrayType, Size, Typed};
 
 // TODO(eaplatanios): Review this module.
 
-/// Batching rule for one staged operation.
-///
-/// `BatchableOperation::batch` takes batched physical inputs paired with mapped-axis metadata and returns batched
-/// physical outputs with their lane axes — the same shape as JAX's per-primitive batching rules (`fn(batched_args,
-/// batch_dims, **params) -> (result_value, result_dim)`). Most primitive rules are context-free and use the default
-/// `C = ()`. Active `batch` supplies [`BatchingContext`] for rules that must replay captured nested programs or
-/// stage backend extension operations through the enclosing transform.
-///
-/// # Contract
-///
-///   - **Axis alignment.** If two or more inputs carry a mapped axis (`batch_axis.is_some()`),
-///     elementwise operations require them to agree on the axis position. When they disagree,
-///     return [`BatchingError::MisalignedBatchAxes`] with an error message that names
-///     the misaligned axes and suggests the user repositions one of them with `Transpose` (the
-///     N-D axis permutation primitive) before invoking the operation. Operations with explicit
-///     axis arguments (`Dot`, `Transpose`, `Reshape`, …) rewrite those arguments to thread the
-///     mapped axis through correctly.
-///   - **Output axes.** For elementwise operations, output `ArrayBatch::batch_axis` matches the
-///     common input axis. For axis-arg operations, the output axis follows from the lifted
-///     axis arguments (see the per-op helpers in `tracing_v2::operations` — `lift_dot_dimensions`,
-///     `lift_permutation`, `lift_reshape_shapes`).
-///   - **Zero propagation.** Linear batching rules preserve zero tangent payloads through their operation-specific
-///     semantics; canonical staged zeros are
-///     handled before batching reaches concrete value-level interpretation.
-///   - **Missing rule.** Variants without a defined batching rule (for example, a while-loop
-///     whose loop predicate varies across lanes) return [`BatchingError::UnsupportedOperation`]
-///     with a human-readable message that points at a likely fix.
-///
-/// The internal elementwise lifting helper computes the lifted op plus per-output axes for any pure elementwise op;
-/// the matching value-level applicator composes the rule's axis arithmetic with [`InterpretableOperation::interpret`].
-pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
-    /// Applies this operation to packed batched inputs, returning batched outputs with the
-    /// resulting lane axes, using `context` for rules that need active transform state.
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
-}
-
 /// Blanket [`BatchableOperation`] impl for any [`ElementwiseOperation`].
 ///
-/// Mirrors the existing
-/// [`impl<O: ElementwiseOperation> Operation<ArrayType> for O`](crate::operations::Operation):
-/// every elementwise primitive automatically gets the standard elementwise batching rule, so per-op
-/// `BatchableOperation` impls do not have to be written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`,
-/// `Neg`, `Sin`, `Cos`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and the
-/// [`ArrayOperation`](crate::tracing_v2::ArrayOperation) operation enum (whose impls live with the enum in
-/// [`operations::primitive`](crate::tracing_v2::operations::primitive)) keep their explicit impls; coherence is
-/// preserved because none of those types implement [`ElementwiseOperation`].
+/// Every [`ElementwiseOperation`] automatically gets the standard elementwise batching rule, so per-op
+/// [`BatchableOperation`] impls do not have to be written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`,
+/// `Neg`, `Sin`, `Cos`, `Select`, `ZeroLike`, `OneLike`, …). Ops with non-trivial axis arithmetic (`Dot`,
+/// `Transpose`, `Reshape`, …) and the [`ArrayOperation`](crate::tracing_v2::ArrayOperation) operation enum (whose
+/// impls live with the enum in [`operations::primitive`](crate::tracing_v2::operations::primitive)) keep their
+/// explicit impls; coherence is preserved because none of those types implement [`ElementwiseOperation`].
 impl<
     O: Clone + InterpretableOperation<ArrayType, V, C> + ElementwiseOperation,
     V: Value<ArrayType> + Broadcast + Transpose,
@@ -75,36 +36,9 @@ impl<
 > BatchableOperation<V, C> for O
 {
     #[inline]
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         apply_elementwise_batch(context, self, inputs)
     }
-}
-
-/// Walks `inputs` to compute the per-lane input types, the per-input axis metadata, and the
-/// common lane size — the three quantities every per-op batching rule consumes before
-/// dispatching to its axis-arithmetic helper. Returns `MismatchedBatchSizes` when two mapped
-/// inputs disagree on their lane size and `DynamicBatchAxis` when any mapped input's axis is
-/// non-static. When no inputs are mapped, the returned `axis_size` is `0` (no rule that needs a
-/// lane size is ever invoked in that situation).
-pub fn batch_input_metadata<V: Typed<ArrayType>>(
-    inputs: &[ArrayBatch<V>],
-) -> Result<(Vec<ArrayType>, Vec<Option<usize>>, usize), ProgramError> {
-    let input_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis()).collect();
-    let per_lane_input_types: Vec<ArrayType> =
-        inputs.iter().map(|input| input.logical_type()).collect::<Result<Vec<_>, _>>()?;
-    let mut axis_size: Option<usize> = None;
-    for input in inputs {
-        if let Some(size) = input.axis_size()? {
-            match axis_size {
-                Some(existing) if existing != size => {
-                    return Err(BatchingError::MismatchedBatchSizes { expected: existing, actual: size }.into());
-                }
-                Some(_) => {}
-                None => axis_size = Some(size),
-            }
-        }
-    }
-    Ok((per_lane_input_types, input_axes, axis_size.unwrap_or(0)))
 }
 
 /// Returns the [`ShardingDimension`] to insert at a newly introduced output batch axis, derived from the batched
@@ -113,10 +47,10 @@ pub fn batch_input_metadata<V: Typed<ArrayType>>(
 /// This mirrors JAX deriving the batched dimension's sharding from the inputs' mapped-dimension specs
 /// (`_mapped_axis_spec` feeding `get_sharding_for_vmap`): each genuinely batched input contributes the
 /// [`ShardingDimension`] of its mapped axis, batched inputs that disagree are a
-/// [`BatchingError::MisalignedBatchAxes`], and lane-uniform inputs (or inputs without a
+/// [`BatchingError::MisalignedBatchAxes`], and replicated inputs (or inputs without a
 /// [`Sharding`](crate::sharding::Sharding)) contribute nothing. When no batched input pins the axis the result is
 /// [`ShardingDimension::Replicated`], so the new batch dimension is replicated. Deriving from the original
-/// (pre-alignment) inputs avoids spuriously disagreeing with a lane-uniform operand that batching later broadcasts to
+/// (pre-alignment) inputs avoids spuriously disagreeing with a replicated operand that batching later broadcasts to
 /// gain a singleton batch axis.
 pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
     inputs: &[ArrayBatch<V>],
@@ -161,9 +95,9 @@ pub fn apply_with_axes<V: Value<ArrayType>, C, O: InterpretableOperation<ArrayTy
     lifted_op: &O,
     inputs: &[ArrayBatch<V>],
     output_axes: &[Option<usize>],
-) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
     if inputs.is_empty() {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     }
     let input_values: Vec<V> = inputs.iter().map(|input| input.value().clone()).collect();
     let output_values = lifted_op.interpret(context, input_values.as_slice())?;
@@ -171,85 +105,90 @@ pub fn apply_with_axes<V: Value<ArrayType>, C, O: InterpretableOperation<ArrayTy
     output_values
         .into_iter()
         .zip(output_axes.iter().copied())
-        .map(|(value, axis)| {
-            let output_type = value.r#type().into_owned();
-            ArrayBatch::new(output_type, value, axis)
-        })
+        .map(|(value, axis)| ArrayBatch::new(value.r#type().into_owned(), value, axis))
         .collect()
 }
 
 /// Generic value-level batching helper for pure elementwise operations. Matches JAX's
-/// `defbroadcasting` behavior: lane-uniform inputs are broadcast to the common batched physical
+/// `defbroadcasting` behavior: replicated inputs are broadcast to the common batched physical
 /// shape before applying the operation, so each value-level primitive only ever sees inputs that
 /// agree on shape at the boundary. This is the canonical implementation of
 /// [`BatchableOperation::batch`] for elementwise primitives.
 ///
-/// Inputs whose mapped lane axis is at a different physical position from the first batched
+/// Inputs whose mapped batch axis is at a different physical position from the first batched
 /// input are realigned with an inserted [`TransposeOperation`] before broadcasting, matching
 /// JAX's `matchaxis` policy. The canonical axis position is the first batched input's axis.
 pub(crate) fn apply_elementwise_batch<
     V: Value<ArrayType> + Broadcast + Transpose,
     C,
-    O: Clone + InterpretableOperation<ArrayType, V, C>,
+    O: InterpretableOperation<ArrayType, V, C>,
 >(
     context: &C,
     operation: &O,
     inputs: &[ArrayBatch<V>],
-) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
-    let (per_lane_types, original_input_axes, axis_size) = batch_input_metadata(inputs)?;
-    let common_axis = original_input_axes.iter().copied().flatten().next();
+) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    let unbatched_types: Vec<ArrayType> =
+        inputs.iter().map(|input| input.unbatched_type()).collect::<Result<Vec<_>, _>>()?;
+    let original_batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis()).collect();
+    // The elementwise rule broadcasts replicated operands uniformly, so an all-replicated input set (batch size
+    // `None`) never reaches the axis arithmetic in the broadcasting branch below; `0` is an inert placeholder.
+    let axis_size = ArrayBatch::common_batch_size(inputs)?.unwrap_or(0);
+    let common_axis = original_batch_axes.iter().copied().flatten().next();
     let aligned_inputs: Vec<ArrayBatch<V>> = match common_axis {
         None => inputs.to_vec(),
         Some(target) => inputs.iter().map(|input| align_batch_axis(input, target)).collect::<Result<_, _>>()?,
     };
-    // Realignment only moves each mapped axis to `common_axis`; the per-lane types are unchanged.
-    let input_axes: Vec<Option<usize>> = original_input_axes.iter().map(|axis| axis.and(common_axis)).collect();
-    let (lifted_op, output_axes) = lift_elementwise(operation, &per_lane_types, &input_axes, axis_size)?;
+    // Realignment only moves each mapped axis to `common_axis`; the unbatched types are unchanged.
+    let batch_axes: Vec<Option<usize>> = original_batch_axes.iter().map(|axis| axis.and(common_axis)).collect();
     let broadcasted_inputs = match common_axis {
         None => aligned_inputs,
         Some(batch_axis) => {
-            // Mirroring JAX's `defbroadcasting` policy, every operand whose per-lane shape is narrower than the
-            // common per-lane shape of all operands (trailing-aligned) is broadcast to that common shape with the lane
-            // axis at `batch_axis`. When the operands' per-lane shapes are not broadcast-compatible, the operands are
-            // left at their lane-axis-inserted physical shapes so the operation surfaces its own shape error against
-            // the original shapes. Realignment preserves the per-lane types, so the metadata ones are reused here.
-            let common_per_lane = Broadcastable::broadcasted(per_lane_types.as_slice()).ok();
-            let broadcasted_physical_type = |per_lane_type: &ArrayType| -> Result<ArrayType, ProgramError> {
-                let common = common_per_lane.as_ref().unwrap_or(per_lane_type);
-                elementwise_broadcast_target(per_lane_type, common, batch_axis, axis_size)
+            // Mirroring JAX's `defbroadcasting` policy, every operand whose unbatched shape is narrower than the
+            // common unbatched shape of all operands (trailing-aligned) is broadcast to that common shape with the
+            // batch axis at `batch_axis`. When the operands' unbatched shapes are not broadcast-compatible, the
+            // operands are left at their batch-axis-inserted physical shapes so the operation surfaces its own shape
+            // error against the original shapes. Realignment preserves the unbatched types, so they are reused here.
+            let common_unbatched = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
+            // The common per-item shape only contributes its shape — each operand keeps its own data type (e.g., a
+            // Boolean select condition broadcast against numeric branches stays Boolean) — and the mapped batch axis
+            // is inserted at `batch_axis`.
+            let broadcasted_physical_type = |unbatched_type: &ArrayType| -> Result<ArrayType, ProgramError> {
+                let mut target = common_unbatched.as_ref().unwrap_or(unbatched_type).clone();
+                target.data_type = unbatched_type.data_type();
+                Ok(target.with_inserted_dimension(batch_axis, Size::Static(axis_size))?)
             };
-            // Maps the operand's per-lane dimension `index` (trailing-aligned within the common per-lane shape) to its
-            // position in the broadcast target, accounting for the lane axis insertion.
-            let target_position = |per_lane_rank: usize, target_rank: usize, index: usize| {
-                let position = (target_rank - per_lane_rank) + index;
+            // Maps the operand's unbatched dimension `index` (trailing-aligned within the common unbatched shape) to
+            // its position in the broadcast target, accounting for the batch axis insertion.
+            let target_position = |unbatched_rank: usize, target_rank: usize, index: usize| {
+                let position = (target_rank - unbatched_rank) + index;
                 if position < batch_axis { position } else { position + 1 }
             };
             aligned_inputs
                 .iter()
-                .zip(input_axes.iter())
-                .zip(per_lane_types.iter())
-                .map(|((input, axis), per_lane_type)| {
-                    let physical_type = broadcasted_physical_type(per_lane_type)?;
+                .zip(batch_axes.iter())
+                .zip(unbatched_types.iter())
+                .map(|((input, axis), unbatched_type)| {
+                    let physical_type = broadcasted_physical_type(unbatched_type)?;
                     if physical_type == *input.r#type() {
                         return Ok(input.clone());
                     }
                     let target_rank = physical_type.rank() - 1;
                     let output_axes: Vec<usize> = match axis {
-                        // Mapped operand with a narrower per-lane shape: keep the lane axis fixed and trailing-align
+                        // Mapped operand with a narrower unbatched shape: keep the batch axis fixed and trailing-align
                         // the remaining dimensions.
                         Some(_) => (0..input.r#type().rank())
                             .map(|dimension| match dimension.cmp(&batch_axis) {
                                 std::cmp::Ordering::Equal => batch_axis,
                                 std::cmp::Ordering::Less => {
-                                    target_position(per_lane_type.rank(), target_rank, dimension)
+                                    target_position(unbatched_type.rank(), target_rank, dimension)
                                 }
                                 std::cmp::Ordering::Greater => {
-                                    target_position(per_lane_type.rank(), target_rank, dimension - 1)
+                                    target_position(unbatched_type.rank(), target_rank, dimension - 1)
                                 }
                             })
                             .collect(),
-                        None => (0..per_lane_type.rank())
-                            .map(|dimension| target_position(per_lane_type.rank(), target_rank, dimension))
+                        None => (0..unbatched_type.rank())
+                            .map(|dimension| target_position(unbatched_type.rank(), target_rank, dimension))
                             .collect(),
                     };
                     let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
@@ -258,10 +197,18 @@ pub(crate) fn apply_elementwise_batch<
                 .collect::<Result<Vec<_>, _>>()?
         }
     };
-    apply_with_axes(context, &lifted_op, &broadcasted_inputs, &output_axes)
+    // Elementwise semantics are preserved by adding the batch dimension, so the lifted operation is the original one
+    // applied to the batch-carrying physical operands. Its output count is inferred from those physical types, and
+    // every output takes the common batch axis. For broadcast-incompatible per-item shapes this inference surfaces the
+    // operation's own shape error, matching the shapes `apply_with_axes` would then interpret.
+    let physical_input_types: Vec<ArrayType> =
+        broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect();
+    let output_count = operation.infer_output_types(physical_input_types.as_slice())?.len();
+    let output_axes = vec![common_axis; output_count];
+    apply_with_axes(context, operation, &broadcasted_inputs, &output_axes)
 }
 
-/// Realigns a batched input by moving its mapped lane axis to `target_axis`.
+/// Realigns a batched input by moving its mapped batch axis to `target_axis`.
 ///
 /// Identity case (already at `target_axis`, or unbatched) returns the input unchanged. Otherwise
 /// stages a [`TransposeOperation`] via the receiver's [`Transpose`] impl and returns a new
@@ -270,11 +217,11 @@ pub(crate) fn apply_elementwise_batch<
 /// # Parameters
 ///
 ///   - `input`: Batched input to realign.
-///   - `target_axis`: Desired position of the mapped lane axis in the output.
+///   - `target_axis`: Desired position of the mapped batch axis in the output.
 pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
     input: &ArrayBatch<V>,
     target_axis: usize,
-) -> Result<ArrayBatch<V>, ProgramError> {
+) -> Result<ArrayBatch<V>, BatchingError> {
     let Some(current_axis) = input.batch_axis() else {
         return Ok(input.clone());
     };
@@ -288,219 +235,85 @@ pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
     ArrayBatch::new(permuted_type, permuted_value, Some(target_axis))
 }
 
-/// Broadcasts a lane-uniform `operand` to gain a singleton batch axis at `target_axis`.
+/// Broadcasts a replicated `operand` to gain a singleton batch axis at `target_axis`.
 ///
 /// This is the canonical building block for mixed batched/unbatched primitive rules (e.g.,
 /// [`DotOperation::batch`](crate::tracing_v2::operations::dot::DotOperation)) and for lifting
-/// lane-uniform residuals during linearization: it inserts a new axis at `target_axis` in the
+/// replicated residuals during linearization: it inserts a new axis at `target_axis` in the
 /// operand's type, broadcasts the value to that shape, and returns the result as a batched
-/// [`ArrayBatch`]. Elementwise rules instead broadcast lane-uniform operands to the full common
+/// [`ArrayBatch`]. Elementwise rules instead broadcast replicated operands to the full common
 /// batched shape inside [`apply_elementwise_batch`].
 ///
 /// Returns an error when called on an already-batched input — callers are expected to dispatch
-/// the lane-uniform case explicitly.
+/// the replicated case explicitly.
 ///
 /// # Parameters
 ///
-///   - `operand`: Lane-uniform input to lift.
+///   - `operand`: Replicated input to lift.
 ///   - `target_axis`: Position of the inserted batch axis in the output.
 ///   - `axis_size`: Size of the inserted batch axis.
 pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
     operand: &ArrayBatch<V>,
     target_axis: usize,
     axis_size: usize,
-) -> Result<ArrayBatch<V>, ProgramError> {
+) -> Result<ArrayBatch<V>, BatchingError> {
     if operand.batch_axis().is_some() {
         return Err(BatchingError::MisalignedBatchAxes {
-            message: "broadcast_to_batched expects a lane-uniform operand but received a batched value".to_string(),
+            message: "broadcast_to_batched expects a replicated operand but received a batched value".to_string(),
         }
         .into());
     }
-    let per_lane_type = operand.logical_type()?;
-    let physical_type = per_lane_type.with_inserted_dimension(target_axis, Size::Static(axis_size))?;
-    let output_axes: Vec<usize> = (0..per_lane_type.rank()).map(|i| if i < target_axis { i } else { i + 1 }).collect();
+    let per_item_type = operand.unbatched_type()?;
+    let physical_type = per_item_type.with_inserted_dimension(target_axis, Size::Static(axis_size))?;
+    let output_axes: Vec<usize> = (0..per_item_type.rank()).map(|i| if i < target_axis { i } else { i + 1 }).collect();
     let broadcasted = operand.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
     ArrayBatch::new(physical_type, broadcasted, Some(target_axis))
 }
 
-/// Returns the broadcast target for one elementwise operand under the JAX `defbroadcasting` policy: the common
-/// per-lane shape with the mapped lane axis inserted at `batch_axis`. The common per-lane target only contributes
-/// its shape — each operand keeps its own data type (e.g., a Boolean select condition broadcast against numeric
-/// branches stays Boolean).
-fn elementwise_broadcast_target(
-    per_lane_type: &ArrayType,
-    common_per_lane: &ArrayType,
-    batch_axis: usize,
-    axis_size: usize,
-) -> Result<ArrayType, ProgramError> {
-    let mut target = common_per_lane.clone();
-    target.data_type = per_lane_type.data_type();
-    Ok(target.with_inserted_dimension(batch_axis, Size::Static(axis_size))?)
-}
-
-/// Generic lifting rule for pure elementwise operations.
-///
-/// All inputs that carry the mapped axis must place it at the same position; lane-uniform inputs
-/// (with `input_axes[i] == None`) are accepted and pass through unchanged. The lifted operation
-/// is `operation.clone()` since elementwise semantics are preserved by adding the leading batch
-/// dimension. Output types are inferred from the parent-physical input types, and every output
-/// is given the common batch axis.
-pub(crate) fn lift_elementwise<O: Clone + Operation<ArrayType>>(
-    operation: &O,
-    input_types: &[ArrayType],
-    input_axes: &[Option<usize>],
-    axis_size: usize,
-) -> Result<(O, Vec<Option<usize>>), ProgramError> {
-    check_count!("input", input_axes, input_types.len(), ProgramError);
-
-    let mut common_axis: Option<usize> = None;
-    for axis in input_axes.iter().copied().flatten() {
-        match common_axis {
-            Some(existing) if existing != axis => {
-                return Err(BatchingError::MisalignedBatchAxes {
-                    message: format!(
-                        "elementwise lift for '{}' cannot align batch axis {axis} with existing batch axis {existing}: \
-                        the operands' batched lane dimensions are at different positions. Stage a Transpose to move \
-                        one operand's batch axis to the other's position, or use `in_axes` to align them at the \
-                        outer batch boundary",
-                        operation.name(),
-                    ),
-                }
-                .into());
-            }
-            Some(_) => {}
-            None => common_axis = Some(axis),
-        }
-    }
-
-    // For ops whose `infer_output_types` requires all inputs to share a shape (e.g.,
-    // `SelectOperation`), infer against the common per-lane shape with the lane axis inserted.
-    // Ops with built-in broadcasting semantics (e.g., `AddOperation`) accept the broadcasted
-    // shapes equally. When the per-lane shapes are not broadcast-compatible, fall back to the
-    // lane-axis-inserted physical types so the operation surfaces its own shape error.
-    let broadcasted_input_types: Vec<ArrayType> = match (common_axis, Broadcastable::broadcasted(input_types)) {
-        (Some(axis), Ok(common)) => input_types
-            .iter()
-            .map(|per_lane_type| elementwise_broadcast_target(per_lane_type, &common, axis, axis_size))
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => input_types
-            .iter()
-            .zip(input_axes.iter())
-            .map(|(per_lane_type, axis)| -> Result<ArrayType, ProgramError> {
-                match axis {
-                    Some(k) => Ok(per_lane_type.with_inserted_dimension(*k, Size::Static(axis_size))?),
-                    None => Ok(per_lane_type.clone()),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    let output_count = operation.infer_output_types(broadcasted_input_types.as_slice())?.len();
-    Ok((operation.clone(), vec![common_axis; output_count]))
-}
-
-/// Staging context used by [`batch_program`] to capture a batched program replay: an ordinary trace over the
-/// program's `(ArrayType, V, O)` type universe.
-///
-/// The capture parameter is pinned to `V` explicitly (rather than left at its default) so that bounds written against
-/// this alias match their obligations syntactically.
-pub type ProgramBatchingContext<V, O> = TracingContext<ArrayType, V, O, V>;
-
-/// Policy for choosing a batched program's output axes.
-///
-/// Program batching always replays the program over physical values whose mapped lane axes are specified by the
-/// caller. This policy controls how the replayed output tracers are packaged into the resulting program:
-///
-///   - [`Natural`](Self::Natural) keeps the mapped axes produced by the per-operation batching rules. Lane-uniform
-///     outputs remain lane-uniform and are reported as `None`.
-///   - [`AlignAllTo`](Self::AlignAllTo) normalizes every output to the requested mapped axis, moving already-batched
-///     outputs with [`Transpose`] and broadcasting lane-uniform outputs across the lane.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ProgramBatchingOutputAxes {
-    /// Keep the output axes naturally produced by the batched replay.
-    Natural,
-
-    /// Align every output to the specified mapped axis.
-    AlignAllTo(usize),
-}
-
-/// Operation types whose captured flat programs can be batched into standalone lane-carrying programs.
-///
-/// This is the program-level counterpart of [`BatchableOperation`], implemented by closed operation enums (via
-/// [`batch_program`]) so that higher-order operations can batch the programs they capture. The re-wrapping
-/// `batch` rules of [`CustomJvpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomJvpOperation)
-/// and [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation) bound their
-/// captured-program operation type by this trait. Routing program-level batching through a dedicated, lifetime-free
-/// trait keeps the trait solver's recursion finite: the closed enum impl discharges the derived batching-context
-/// obligations once, against the single [`ProgramBatchingContext`] type, instead of every batching rule re-deriving
-/// them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
-pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
-    /// Batches `program` into a standalone program over lane-carrying physical types; refer to
-    /// [`batch_program`] for the input/output axis conventions.
-    fn batch_program(
-        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
-        axis_size: usize,
-        input_batch_axes: &[Option<usize>],
-        output_batch_axes: ProgramBatchingOutputAxes,
-    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>;
-}
-
-impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
-    /// Batches this flat [`Program`] into a standalone program over lane-carrying physical types.
-    ///
-    /// Refer to [`batch_program`] for the precise replay semantics. This method requires
-    /// [`BatchableProgramOperation`] rather than a direct [`BatchableOperation`] bound on the operation type because
-    /// the latter is self-referential through derived batching contexts and would overflow the trait solver at the
-    /// recursive call sites of higher-order batching rules.
-    pub fn batched(
-        &self,
-        axis_size: usize,
-        input_batch_axes: &[Option<usize>],
-        output_batch_axes: ProgramBatchingOutputAxes,
-    ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
-        O::batch_program(self, axis_size, input_batch_axes, output_batch_axes)
-    }
-}
-
-/// Batches a captured program into a standalone program over lane-carrying physical types.
+/// Batches a captured program into a standalone program over batch-carrying physical types.
 ///
 /// This is the batching analog of symbolic program linearization: staged higher-order
-/// batching rules use it to batch captured programs *without* concretizing any lane values, so that batched
+/// batching rules use it to batch captured programs *without* concretizing any batch-item values, so that batched
 /// control-flow and custom-derivative structure can be staged back into the enclosing trace. Unlike linearization,
 /// batching does not split value spaces — the batched replay stays in one tracer space — so the packaging is one
-/// fresh replay: the program is replayed through a [`BatchingContext`] over a fresh [`ProgramBatchingContext`] trace,
+/// fresh replay: the program is replayed through a [`BatchingContext`] over a fresh [`TracingContext`] trace (with
+/// the capture parameter pinned to `V`, so bounds written against it match their obligations syntactically),
 /// lifting every instruction through its [`BatchableOperation`] rule, and the resulting staged program is extracted
 /// together with the requested output-axis policy.
 ///
-/// Inputs whose `input_batch_axes[i]` is `Some(k)` consume the original logical input type with a mapped lane axis of
-/// size `axis_size` inserted at position `k`, while inputs with `None` enter lane-uniform at their original logical
-/// types. [`ProgramBatchingOutputAxes::Natural`] keeps the mapped axes produced by the batching rules. This is what
+/// Inputs whose `input_batch_axes[i]` is `Some(k)` consume the original logical input type with a mapped batch axis of
+/// size `axis_size` inserted at position `k`, while inputs with `None` enter replicated at their original logical
+/// types. [`ProgramBatchingOutputAxesPolicy::Natural`] keeps the mapped axes produced by the batching rules. This is what
 /// staged control-flow batching needs, because branch/body outputs are normalized to the surrounding operation's
-/// signature afterward. [`ProgramBatchingOutputAxes::AlignAllTo`] imposes a canonical output axis, which is what
+/// signature afterward. [`ProgramBatchingOutputAxesPolicy::AlignAllTo`] imposes a canonical output axis, which is what
 /// custom-derivative re-wrapping needs so independently batched primal/JVP/forward/backward programs have mutually
 /// consistent signatures.
 ///
 /// # Parameters
 ///
-///   - `program`: Captured flat program over per-lane (logical) input and output types.
-///   - `axis_size`: Size of the mapped lane axis.
-///   - `input_batch_axes`: Mapped lane-axis position per program input, or `None` for a lane-uniform input.
-///   - `output_batch_axes`: Policy for packaging the batched program outputs.
+///   - `program`: Captured flat program over per-item (logical) input and output types.
+///   - `axis_size`: Size of the mapped batch axis.
+///   - `input_batch_axes`: Mapped batch-axis position per program input, or `None` for a replicated input.
+///   - `output_axes_policy`: Policy for packaging the batched program outputs.
 pub fn batch_program<V, O>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     axis_size: usize,
     input_batch_axes: &[Option<usize>],
-    output_batch_axes: ProgramBatchingOutputAxes,
-) -> Result<(Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>
+    output_axes_policy: ProgramBatchingOutputAxesPolicy,
+) -> Result<(Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<Option<usize>>), BatchingError>
 where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
-    O: BatchableOperation<Tracer<ProgramBatchingContext<V, O>>, BatchingContext<ProgramBatchingContext<V, O>>>,
-    Tracer<ProgramBatchingContext<V, O>>: Broadcast + Transpose,
+    O: BatchableOperation<
+            Tracer<TracingContext<ArrayType, V, O, V>>,
+            BatchingContext<TracingContext<ArrayType, V, O, V>>,
+        >,
+    O: From<TransposeOperation> + From<BroadcastOperation>,
 {
     let logical_input_types = program.input_types();
     let input_count = logical_input_types.len();
     check_count!("input", input_batch_axes, input_count, ProgramError);
-    let parent_context: ProgramBatchingContext<V, O> = TracingContext::new();
+    let parent_context: TracingContext<ArrayType, V, O, V> = TracingContext::new();
     let builder = parent_context.builder().clone();
     // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
     // builder below is a real ownership check.
@@ -519,13 +332,13 @@ where
         let mut output_atom_ids = Vec::with_capacity(output_values.len());
         let mut output_axes = Vec::with_capacity(output_values.len());
         for output_value in output_values {
-            match output_batch_axes {
-                ProgramBatchingOutputAxes::Natural => {
+            match output_axes_policy {
+                ProgramBatchingOutputAxesPolicy::Natural => {
                     let atom = output_value.atom_id()?;
                     output_axes.push(output_value.meta().0.axis());
                     output_atom_ids.push(atom);
                 }
-                ProgramBatchingOutputAxes::AlignAllTo(target_axis) => {
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(target_axis) => {
                     let atom = output_value.atom_id()?;
                     let axis = output_value.meta().0.axis();
                     let logical_type = output_value.r#type().into_owned();
@@ -558,10 +371,10 @@ where
     Ok((batched_program, output_axes))
 }
 
-/// Trace context that introduces exactly one batched lane at a chosen axis.
+/// Trace context that introduces exactly one batch dimension at a chosen axis.
 ///
 /// [`BatchingContext`] is the active context for one level of `batch`: it runs the user's function
-/// against logical per-lane [`ArrayType`]s while leaving the runtime value type of the staged
+/// against logical per-item [`ArrayType`]s while leaving the runtime value type of the staged
 /// program equal to the parent context's value type. Operations staged through this context are
 /// lifted through their [`BatchableOperation`] rules at bind time. The lifted operation
 /// is then staged into the parent context, so nested transforms compose by wrapping contexts
@@ -577,7 +390,7 @@ pub struct BatchingContext<C: Context<Type = ArrayType>> {
     /// Parent trace context wrapped by this batching level.
     parent_context: C,
 
-    /// Size of the batched lane this level introduces.
+    /// Size of the batch axis this level introduces.
     axis_size: usize,
 
     /// Optional human-readable name for this batched axis. Collectives such as `psum`, `pmean`, and
@@ -586,7 +399,7 @@ pub struct BatchingContext<C: Context<Type = ArrayType>> {
 }
 
 impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
-    /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied lane size.
+    /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied batch size.
     #[inline]
     pub fn new(parent_context: C, axis_size: usize) -> Self {
         Self::with_axis_name(parent_context, axis_size, None)
@@ -606,20 +419,20 @@ where
     C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
 {
     /// Creates a live [`BatchingTracer`] referring to `atom` in the parent builder, carrying the given logical
-    /// (per-lane) type and mapped lane axis at this batching level.
+    /// (per-item) type and mapped batch axis at this batching level.
     ///
     /// This is the axis-carrying counterpart of [`StagingContext::tracer`]: callers that have already staged an atom
-    /// at its physical type and know where its mapped lane axis sits use this to attach that axis to the flowing
+    /// at its physical type and know where its mapped batch axis sits use this to attach that axis to the flowing
     /// value as the head of its [`Meta`](StagingContext::Meta) stack. The tail (the parent context's per-level axes)
-    /// is left lane-uniform here, which is correct for a fresh program input that has no enclosing batched value;
+    /// is left replicated here, which is correct for a fresh program input that has no enclosing batched value;
     /// an enclosing nested-`batch` level instead prepends its axis onto the *incoming* value's existing stack
     /// directly (see [`BatchContext::batch`]).
     ///
     /// # Parameters
     ///
     ///   - `atom`: Staged atom in the parent builder.
-    ///   - `logical_type`: Per-lane (unbatched) type the value reports inside the batched body.
-    ///   - `batch_axis`: Mapped lane axis carried by the value ([`BatchAxis::uniform`] when lane-uniform).
+    ///   - `logical_type`: Per-item (unbatched) type the value reports inside the batched body.
+    ///   - `batch_axis`: Mapped batch axis carried by the value ([`BatchAxis::uniform`] when replicated).
     #[inline]
     pub fn batched_value(
         &self,
@@ -646,13 +459,13 @@ impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
         &self,
         program: &Program<ArrayType, C::Constant, O, Vec<C::Constant>, Vec<C::Constant>>,
         inputs: Vec<ArrayBatch<C::Value>>,
-    ) -> Result<Vec<ArrayBatch<C::Value>>, ProgramError>
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
     where
         O: BatchableOperation<Tracer<C, C::Meta>, Self>,
     {
         program.interpret_with(
             inputs,
-            |_, constant| Ok(ArrayBatch::unbatched(self.parent_context.constant(constant.clone()))),
+            |_, constant| Ok(ArrayBatch::replicated(self.parent_context.constant(constant.clone()))),
             |instruction, instruction_inputs| instruction.operation().batch(self, instruction_inputs),
         )
     }
@@ -670,13 +483,13 @@ impl<C: Context<Type = ArrayType>> BatchingContext<C> {
 
     /// Returns this batch level's named axis, if the enclosing `batch` call named one. Batching rules for
     /// collective-like operations match their own axis name against this to decide whether to consume the mapped
-    /// lane axis at this level or forward the operation to [`BatchingContext::parent_context`].
+    /// batch axis at this level or forward the operation to [`BatchingContext::parent_context`].
     #[inline]
     pub fn axis_name(&self) -> Option<&str> {
         self.axis_name.as_deref()
     }
 
-    /// Returns this batch level's lane count.
+    /// Returns this batch level's batch size.
     #[inline]
     pub fn axis_size(&self) -> usize {
         self.axis_size
@@ -709,7 +522,7 @@ where
     C: StagingContext<Type = ArrayType>,
     C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
 {
-    /// Lifts a constant payload into this batching context by recording it as a lane-uniform [`BatchingTracer`].
+    /// Lifts a constant payload into this batching context by recording it as a replicated [`BatchingTracer`].
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {
         Ok(self.constant(constant))
@@ -771,10 +584,10 @@ where
                 .collect());
         }
 
-        // Zero-input operations (e.g., `ZeroOperation`, `OneOperation`) are lane-uniform by
-        // construction: every batch lane receives the same constant value, and there is no input
+        // Zero-input operations (e.g., `ZeroOperation`, `OneOperation`) are replicated by
+        // construction: every batch item receives the same constant value, and there is no input
         // batch axis to lift through. Stage them directly into the parent's builder with an empty
-        // input list and surface the resulting parent atoms as lane-uniform values (a default
+        // input list and surface the resulting parent atoms as replicated values (a default
         // [`BatchAxis::uniform`] meta, via the default `tracer` path).
         if inputs.is_empty() {
             let parent_outputs = self.parent_context.stage_nullary_operation(operation)?;
@@ -795,7 +608,7 @@ where
         // own per-level axes — so when the parent is itself a `BatchingContext` (nested `batch`), that parent's
         // `stage_operation` reads *its* axis straight off the value in hand, with no side table. The rule's body
         // (`operation.batch(...)`) then dispatches through the parent value's primitive impls, staging directly into
-        // the parent context; multi-op staging (e.g., lane-varying `Condition` lowering to two branches + a per-lane
+        // the parent context; multi-op staging (e.g., batch-varying `Condition` lowering to two branches + a per-item
         // `Select`) emerges automatically.
         let mut parent_input_batches: Vec<ArrayBatch<C::Value>> = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -868,22 +681,22 @@ where
 
 /// Value flowing through a [`BatchingContext<C>`]: the unified [`Tracer`] specialized to carry a [`BatchAxis`] as its
 /// metadata. The batch axis rides on the value itself, so the per-operation [`BatchableOperation`] rules route the
-/// mapped lane through [`StagingContext::stage_operation`] from the value in hand. Its capability impls (arithmetic,
-/// `Broadcast`, `Dot`, `Reduce`, `Select`, …) are the shared `Tracer<C, C::Meta>` impls, so batching needs no bespoke
-/// value-level operation impls of its own.
+/// mapped batch axis through [`StagingContext::stage_operation`] from the value in hand. Its capability impls
+/// (arithmetic, `Broadcast`, `Dot`, `Reduce`, `Select`, …) are the shared `Tracer<C, C::Meta>` impls, so batching needs
+/// no bespoke value-level operation impls of its own.
 ///
-/// The carried [`ArrayType`] is the *logical* (per-lane, unbatched) type, matching what the staged value reports to
+/// The carried [`ArrayType`] is the *logical* (per-item, unbatched) type, matching what the staged value reports to
 /// the batched function body; the physical type with the mapped axis inserted is reconstructed from the value's
 /// [`BatchAxis`] when it is handed to a batching rule.
 ///
 /// The [`Meta`](StagingContext::Meta) is a recursive per-level cons-stack `(BatchAxis, C::Meta)` mirroring the context
-/// nesting: the head [`BatchAxis`] is *this* batching level's mapped lane axis, and the tail `C::Meta` is the parent
+/// nesting: the head [`BatchAxis`] is *this* batching level's mapped batch axis, and the tail `C::Meta` is the parent
 /// context's metadata (itself another `(BatchAxis, …)` stack for a nested `vmap`). This is what lets every level of a
-/// nested `batch` recover its own lane axis for a value without any side table — `batch` over `batch` simply prepends
+/// nested `batch` recover its own batch axis for a value without any side table — `batch` over `batch` simply prepends
 /// one more axis onto the incoming value's stack.
 pub type BatchingTracer<C> = Tracer<BatchingContext<C>, (BatchAxis, <C as StagingContext>::Meta)>;
 
-/// Lane-carrying batching value selected by an ordinary backend [`Domain`]. This is the [`BatchingTracer`] flowing
+/// Batch-carrying batching value selected by an ordinary backend [`Domain`]. This is the [`BatchingTracer`] flowing
 /// through the [`BatchingContext`] that wraps a fresh trace over `D`'s constant and operation families.
 ///
 /// The parent trace is a plain [`TracingContext`] whose [`StagingContext::Meta`] is `()`, so the per-level cons-stack
@@ -896,36 +709,37 @@ pub type DomainBatchingValue<D> = Tracer<
     (BatchAxis, ()),
 >;
 
-/// Per-value lane dimension index carried as the [`Tracer`] metadata of a [`BatchingTracer`]. `Some(k)` means the
-/// value's mapped batch lane sits at physical axis `k`; [`BatchAxis::uniform`] (the [`Default`]) means the value is
-/// lane-uniform — it carries no physical dimension for the current batch lanes and is the same value for every lane.
+/// Per-value batch dimension index carried as the [`Tracer`] metadata of a [`BatchingTracer`]. `Some(k)` means the
+/// value's mapped batch axis sits at physical axis `k`; [`BatchAxis::uniform`] (the [`Default`]) means the value is
+/// replicated — it carries no physical dimension for the batch and is the same value for every batch item.
 ///
 /// This is the per-value counterpart of the per-`batch()`-call [`BatchAxisSpecification`]; it rides on the staged
 /// value itself — as the [`Tracer`] metadata of a batching value — so the per-operation
-/// batching rules route the mapped lane straight from the value in hand.
+/// batching rules route the mapped batch axis straight from the value in hand.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Parameter)]
 pub struct BatchAxis(Option<usize>);
 
 impl BatchAxis {
-    /// Creates a mapped lane axis at physical position `axis`.
+    /// Creates a mapped batch axis at physical position `axis`.
     #[inline]
     pub fn mapped(axis: usize) -> Self {
         Self(Some(axis))
     }
 
-    /// Creates a lane-uniform axis (the value is shared across every batch lane). Equivalent to [`BatchAxis::default`].
+    /// Creates a replicated axis (the value is shared across every batch item). Equivalent to
+    /// [`BatchAxis::default`].
     #[inline]
     pub fn uniform() -> Self {
         Self(None)
     }
 
-    /// Returns the mapped lane axis position, or `None` when this value is lane-uniform.
+    /// Returns the mapped batch axis position, or `None` when this value is replicated.
     #[inline]
     pub fn axis(&self) -> Option<usize> {
         self.0
     }
 
-    /// Returns `true` when this value is lane-uniform (carries no mapped lane axis).
+    /// Returns `true` when this value is replicated (carries no mapped batch axis).
     #[inline]
     pub fn is_uniform(&self) -> bool {
         self.0.is_none()
@@ -945,10 +759,10 @@ impl From<usize> for BatchAxis {
 }
 
 /// Specification of the mapped axis introduced by one [`Batch::batch`] / [`BatchContext::batch`] call: an optional
-/// explicit lane size and an optional axis name.
+/// explicit batch size and an optional axis name.
 ///
-/// The lane size is normally inferred from the mapped inputs; provide an explicit size to either pin it or to drive
-/// a fully-broadcast `batch` whose lane count would otherwise be unobservable. The axis name makes the mapped axis
+/// The batch size is normally inferred from the mapped inputs; provide an explicit size to either pin it or to drive
+/// a fully-broadcast `batch` whose batch size would otherwise be unobservable. The axis name makes the mapped axis
 /// addressable by name from collectives (`psum`, `pmean`, `pmax`) inside the batched function body, mirroring JAX's
 /// `vmap(..., axis_name=...)`.
 ///
@@ -962,7 +776,7 @@ impl From<usize> for BatchAxis {
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BatchAxisSpecification {
-    /// Explicit lane size, or `None` to infer it from the mapped inputs.
+    /// Explicit batch size, or `None` to infer it from the mapped inputs.
     size: Option<usize>,
 
     /// Name that collectives can use to address this axis, or `None` for an anonymous axis.
@@ -970,17 +784,17 @@ pub struct BatchAxisSpecification {
 }
 
 impl BatchAxisSpecification {
-    /// Creates an axis specification with an explicit lane size.
+    /// Creates an axis specification with an explicit batch size.
     pub fn sized(size: usize) -> Self {
         Self { size: Some(size), name: None }
     }
 
-    /// Creates a named axis specification whose lane size is inferred from the mapped inputs.
+    /// Creates a named axis specification whose batch size is inferred from the mapped inputs.
     pub fn named(name: impl Into<String>) -> Self {
         Self { size: None, name: Some(name.into()) }
     }
 
-    /// Creates a named axis specification with an explicit lane size.
+    /// Creates a named axis specification with an explicit batch size.
     pub fn sized_and_named(size: usize, name: impl Into<String>) -> Self {
         Self { size: Some(size), name: Some(name.into()) }
     }
@@ -1023,7 +837,7 @@ impl<A> From<A> for BatchAxesSpecification<A> {
     }
 }
 
-/// Single-leaf ergonomic conversion: a bare `Option<usize>` maps the one leaf at that axis (or lane-uniform).
+/// Single-leaf ergonomic conversion: a bare `Option<usize>` maps the one leaf at that axis (or replicated).
 impl From<Option<usize>> for BatchAxesSpecification<BatchAxis> {
     fn from(axis: Option<usize>) -> Self {
         Self::PerLeaf(BatchAxis::from(axis))
@@ -1048,15 +862,15 @@ pub trait Batch: Domain<Type = ArrayType> {
     /// mapped axis at the position requested by `out_axes`.
     ///
     /// Each `in_axes` leaf is either `Some(k)` (the input is mapped on axis `k` of its physical type)
-    /// or `None` (the input is lane-uniform / broadcast across the batched lanes). When at least one
-    /// input is mapped, the lane size is inferred from those inputs; the `axis` parameter accepts
-    /// anything convertible to a [`BatchAxis`] and can supply an explicit lane size to either pin the
-    /// inferred size or drive a fully-broadcast `batch` whose lane count would otherwise be
+    /// or `None` (the input is replicated / broadcast across the batch). When at least one
+    /// input is mapped, the batch size is inferred from those inputs; the `axis` parameter accepts
+    /// anything convertible to a [`BatchAxis`] and can supply an explicit batch size to either pin the
+    /// inferred size or drive a fully-broadcast `batch` whose batch size would otherwise be
     /// unobservable, as well as an axis name that collectives (`psum`, `pmean`, `pmax`) inside the
     /// batched function can address. The per-leaf `out_axes` selects where the mapped axis lands
     /// in each output: `Some(k)` requests position `k` (an explicit transpose is staged when the
-    /// natural output axis differs), and `None` declares the corresponding output to be lane-uniform
-    /// (e.g., a value produced from broadcast inputs without staging any per-lane work).
+    /// natural output axis differs), and `None` declares the corresponding output to be replicated
+    /// (e.g., a value produced from broadcast inputs without staging any per-item work).
     ///
     /// This is the concrete-value entry point. Already-traced values use [`BatchContext::batch`] on
     /// their active context.
@@ -1178,7 +992,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
     /// Maps a traced function over per-leaf array axes inside this active context. The `in_axes` and `out_axes`
     /// parameters accept anything convertible to [`BatchAxesSpecification`] (explicit per-leaf [`BatchAxis`] axes or
     /// one uniform leaf specification), and the `axis` parameter accepts anything convertible to a
-    /// [`BatchAxisSpecification`] (an optional explicit lane size and an optional axis name).
+    /// [`BatchAxisSpecification`] (an optional explicit batch size and an optional axis name).
     fn batch<F, I, O>(
         &self,
         function: F,
@@ -1250,7 +1064,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
             let parent_physical_type = tracer.r#type().into_owned();
             match axis.axis() {
                 Some(batch_axis) => {
-                    let (per_lane_type, dimension) = parent_physical_type.without_dimension(batch_axis)?;
+                    let (per_item_type, dimension) = parent_physical_type.without_dimension(batch_axis)?;
                     let Some(size) = dimension.value() else {
                         return Err(
                             BatchingError::DynamicBatchAxis { r#type: parent_physical_type, axis: batch_axis }.into()
@@ -1265,7 +1079,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                         Some(_) => {}
                         None => resolved_axis_size = Some(size),
                     }
-                    inputs_with_axes.push((tracer, BatchAxis::mapped(batch_axis), per_lane_type));
+                    inputs_with_axes.push((tracer, BatchAxis::mapped(batch_axis), per_item_type));
                 }
                 None => {
                     inputs_with_axes.push((tracer, BatchAxis::uniform(), parent_physical_type));
@@ -1296,7 +1110,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
         parent_builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
 
         let output_structure = batched_output.parameter_structure();
-        // Each output's mapped lane axis at this level is the head of its `Meta` stack (`value.meta().0`), and the
+        // Each output's mapped batch axis at this level is the head of its `Meta` stack (`value.meta().0`), and the
         // tail (`value.meta().1`) is the parent context's per-level axes for that staged atom. Carrying that tail into
         // the re-wrapped parent value is what threads an enclosing `batch`'s axis through this one for nested `vmap`:
         // the outer driver then reads its own axis straight off this value's stack head with no side table.
