@@ -4366,7 +4366,7 @@ mod batching_tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
@@ -4523,7 +4523,7 @@ mod batching_tests {
                     &context,
                     |(item, shift)| Ok(item * shift),
                     (y, x),
-                    (BatchAxis::mapped(0), BatchAxis::uniform()),
+                    (BatchAxis::mapped(0), BatchAxis::replicated()),
                     Some(0),
                     None,
                 )
@@ -4637,7 +4637,7 @@ mod batching_tests {
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let outputs = ArrayOperation::<TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::mapped(0));
         assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
     }
 
@@ -4651,7 +4651,7 @@ mod batching_tests {
         let outputs =
             apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Neg(NegOperation), &[batched]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::mapped(0));
         assert_eq!(outputs[0].value().values(), &[-1.0, -2.0, -3.0]);
     }
 
@@ -4667,7 +4667,7 @@ mod batching_tests {
             apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Add(AddOperation), &[batched, replicated])
                 .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::mapped(0));
         assert_eq!(outputs[0].value().values(), &[11.0, 12.0, 13.0]);
     }
 
@@ -4752,7 +4752,7 @@ mod batching_tests {
             .batch(
                 |(left, right)| Ok(left + right),
                 (x, y),
-                (BatchAxis::mapped(0), BatchAxis::uniform()),
+                (BatchAxis::mapped(0), BatchAxis::replicated()),
                 Some(0),
                 None,
             )
@@ -4848,13 +4848,13 @@ mod batching_tests {
                         &context,
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
-                        (BatchAxis::mapped(0), BatchAxis::uniform()),
+                        (BatchAxis::mapped(0), BatchAxis::replicated()),
                         Some(0),
                         None,
                     )
                 },
                 (x, bias),
-                (BatchAxis::mapped(0), BatchAxis::uniform()),
+                (BatchAxis::mapped(0), BatchAxis::replicated()),
                 Some(0),
                 None,
             )
@@ -4913,7 +4913,7 @@ mod batching_tests {
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
-            (BatchAxis::uniform(), BatchAxis::mapped(0)),
+            (BatchAxis::replicated(), BatchAxis::mapped(0)),
             Some(0),
             None,
         )
@@ -4966,7 +4966,7 @@ mod batching_tests {
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
-            (BatchAxis::uniform(), BatchAxis::mapped(0)),
+            (BatchAxis::replicated(), BatchAxis::mapped(0)),
             Some(0),
             None,
         )
@@ -5110,12 +5110,12 @@ mod batching_tests {
     #[test]
     fn test_batch_axis_per_value_batch_index() {
         // The per-value `BatchAxis` metadata: a mapped batch dimension index or replicated.
-        assert_eq!(BatchAxis::default(), BatchAxis::uniform());
-        assert!(BatchAxis::uniform().is_uniform());
-        assert!(!BatchAxis::mapped(2).is_uniform());
-        assert_eq!(BatchAxis::uniform().axis(), None);
+        assert_eq!(BatchAxis::default(), BatchAxis::replicated());
+        assert!(BatchAxis::replicated().is_replicated());
+        assert!(!BatchAxis::mapped(2).is_replicated());
+        assert_eq!(BatchAxis::replicated().axis(), None);
         assert_eq!(BatchAxis::mapped(2).axis(), Some(2));
-        assert_eq!(BatchAxis::from(None), BatchAxis::uniform());
+        assert_eq!(BatchAxis::from(None), BatchAxis::replicated());
         assert_eq!(BatchAxis::from(Some(3)), BatchAxis::mapped(3));
         assert_eq!(BatchAxis::from(3), BatchAxis::mapped(3));
         assert_ne!(BatchAxis::mapped(0), BatchAxis::mapped(1));
@@ -5158,8 +5158,8 @@ mod batching_tests {
 
         // Plain per-leaf values convert to `BatchAxesSpecification::PerLeaf`.
         assert_eq!(
-            BatchAxesSpecification::from((BatchAxis::mapped(0), BatchAxis::uniform())),
-            BatchAxesSpecification::PerLeaf((BatchAxis::mapped(0), BatchAxis::uniform())),
+            BatchAxesSpecification::from((BatchAxis::mapped(0), BatchAxis::replicated())),
+            BatchAxesSpecification::PerLeaf((BatchAxis::mapped(0), BatchAxis::replicated())),
         );
         // A single bare `Option<usize>` / `usize` leaf converts ergonomically.
         assert_eq!(

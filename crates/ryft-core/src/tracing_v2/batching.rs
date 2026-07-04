@@ -2,17 +2,15 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use ryft_macros::Parameter;
-
 use crate::ElementwiseOperation;
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingError, ProgramBatchingOutputAxesPolicy};
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError, ProgramBatchingOutputAxesPolicy};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
@@ -57,7 +55,7 @@ pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
 ) -> Result<ShardingDimension, ProgramError> {
     let mut result: Option<ShardingDimension> = None;
     for input in inputs {
-        let Some(axis) = input.batch_axis() else {
+        let Some(axis) = input.batch_axis().axis() else {
             continue;
         };
         let physical_type = input.r#type();
@@ -129,7 +127,7 @@ pub(crate) fn apply_elementwise_batch<
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
     let unbatched_types: Vec<ArrayType> =
         inputs.iter().map(|input| input.unbatched_type()).collect::<Result<Vec<_>, _>>()?;
-    let original_batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis()).collect();
+    let original_batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
     // The elementwise rule broadcasts replicated operands uniformly, so an all-replicated input set (batch size
     // `None`) never reaches the axis arithmetic in the broadcasting branch below; `0` is an inert placeholder.
     let axis_size = ArrayBatch::common_batch_size(inputs)?.unwrap_or(0);
@@ -222,7 +220,7 @@ pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
     input: &ArrayBatch<V>,
     target_axis: usize,
 ) -> Result<ArrayBatch<V>, BatchingError> {
-    let Some(current_axis) = input.batch_axis() else {
+    let Some(current_axis) = input.batch_axis().axis() else {
         return Ok(input.clone());
     };
     if current_axis == target_axis {
@@ -257,7 +255,7 @@ pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
     target_axis: usize,
     axis_size: usize,
 ) -> Result<ArrayBatch<V>, BatchingError> {
-    if operand.batch_axis().is_some() {
+    if !operand.batch_axis().is_replicated() {
         return Err(BatchingError::MisalignedBatchAxes {
             message: "broadcast_to_batched expects a replicated operand but received a batched value".to_string(),
         }
@@ -270,6 +268,7 @@ pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
     ArrayBatch::new(physical_type, broadcasted, Some(target_axis))
 }
 
+// TODO(eaplatanios): Should this be moved to `Program::batched`?
 /// Batches a captured program into a standalone program over batch-carrying physical types.
 ///
 /// This is the batching analog of symbolic program linearization: staged higher-order
@@ -432,7 +431,7 @@ where
     ///
     ///   - `atom`: Staged atom in the parent builder.
     ///   - `logical_type`: Per-item (unbatched) type the value reports inside the batched body.
-    ///   - `batch_axis`: Mapped batch axis carried by the value ([`BatchAxis::uniform`] when replicated).
+    ///   - `batch_axis`: Mapped batch axis carried by the value ([`BatchAxis::replicated`] when replicated).
     #[inline]
     pub fn batched_value(
         &self,
@@ -588,7 +587,7 @@ where
         // construction: every batch item receives the same constant value, and there is no input
         // batch axis to lift through. Stage them directly into the parent's builder with an empty
         // input list and surface the resulting parent atoms as replicated values (a default
-        // [`BatchAxis::uniform`] meta, via the default `tracer` path).
+        // [`BatchAxis::replicated`] meta, via the default `tracer` path).
         if inputs.is_empty() {
             let parent_outputs = self.parent_context.stage_nullary_operation(operation)?;
             return Ok(parent_outputs
@@ -635,7 +634,7 @@ where
 
         let mut output_values = Vec::with_capacity(output_batches.len());
         for output_batch in output_batches {
-            let axis = output_batch.batch_axis();
+            let axis = output_batch.batch_axis().axis();
             let parent_value = output_batch.into_value();
             let parent_physical_type = parent_value.r#type().into_owned();
             let atom = parent_value.atom_id()?;
@@ -709,55 +708,6 @@ pub type DomainBatchingValue<D> = Tracer<
     (BatchAxis, ()),
 >;
 
-/// Per-value batch dimension index carried as the [`Tracer`] metadata of a [`BatchingTracer`]. `Some(k)` means the
-/// value's mapped batch axis sits at physical axis `k`; [`BatchAxis::uniform`] (the [`Default`]) means the value is
-/// replicated — it carries no physical dimension for the batch and is the same value for every batch item.
-///
-/// This is the per-value counterpart of the per-`batch()`-call [`BatchAxisSpecification`]; it rides on the staged
-/// value itself — as the [`Tracer`] metadata of a batching value — so the per-operation
-/// batching rules route the mapped batch axis straight from the value in hand.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Parameter)]
-pub struct BatchAxis(Option<usize>);
-
-impl BatchAxis {
-    /// Creates a mapped batch axis at physical position `axis`.
-    #[inline]
-    pub fn mapped(axis: usize) -> Self {
-        Self(Some(axis))
-    }
-
-    /// Creates a replicated axis (the value is shared across every batch item). Equivalent to
-    /// [`BatchAxis::default`].
-    #[inline]
-    pub fn uniform() -> Self {
-        Self(None)
-    }
-
-    /// Returns the mapped batch axis position, or `None` when this value is replicated.
-    #[inline]
-    pub fn axis(&self) -> Option<usize> {
-        self.0
-    }
-
-    /// Returns `true` when this value is replicated (carries no mapped batch axis).
-    #[inline]
-    pub fn is_uniform(&self) -> bool {
-        self.0.is_none()
-    }
-}
-
-impl From<Option<usize>> for BatchAxis {
-    fn from(axis: Option<usize>) -> Self {
-        Self(axis)
-    }
-}
-
-impl From<usize> for BatchAxis {
-    fn from(axis: usize) -> Self {
-        Self(Some(axis))
-    }
-}
-
 /// Specification of the mapped axis introduced by one [`Batch::batch`] / [`BatchContext::batch`] call: an optional
 /// explicit batch size and an optional axis name.
 ///
@@ -820,7 +770,7 @@ impl From<usize> for BatchAxisSpecification {
 /// counterpart of JAX's `in_axes=0` shorthand. Both entry points accept anything convertible into
 /// [`BatchAxesSpecification`]. Plain per-leaf values convert automatically, and a single leaf additionally converts
 /// from the bare `Option<usize>` / `usize` forms, so call sites can pass `Some(0)` for a single leaf,
-/// `(BatchAxis::mapped(0), BatchAxis::uniform())` for a pair, or `BatchAxesSpecification::Uniform(0.into())` to map
+/// `(BatchAxis::mapped(0), BatchAxis::replicated())` for a pair, or `BatchAxesSpecification::Uniform(0.into())` to map
 /// axis 0 of every leaf without spelling out the structure.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BatchAxesSpecification<A> {
@@ -1082,7 +1032,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                     inputs_with_axes.push((tracer, BatchAxis::mapped(batch_axis), per_item_type));
                 }
                 None => {
-                    inputs_with_axes.push((tracer, BatchAxis::uniform(), parent_physical_type));
+                    inputs_with_axes.push((tracer, BatchAxis::replicated(), parent_physical_type));
                 }
             }
         }

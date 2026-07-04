@@ -78,10 +78,65 @@ impl From<BatchingError> for ProgramError {
     }
 }
 
+/// A batched value's mapped batch axis. [`BatchAxis::mapped`]`(k)` means that the value's batch dimension sits at
+/// physical axis `k`. [`BatchAxis::replicated`] (the [`Default`]) means that the value is *replicated* (i.e., it
+/// carries no physical dimension for the batch and is interpreted as the same value for every batch item). For example,
+/// a traced constant in `batch(|x| x + 1)` is replicated, while `x` carries the mapped input axis. Runtime control flow
+/// predicates may also be replicated, because a single predicate may select one branch for the whole batch while a
+/// batch-varying predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e.,
+/// scalar) values. Any shaped constant or operand is replicated when none of its physical dimensions indexes the batch.
+///
+/// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the
+/// [`Tracer`](crate::Tracer) metadata. Carrying it on the value itself lets the per-operation batching rules route the
+/// mapped batch axis straight from the value in hand.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Parameter)]
+pub struct BatchAxis(Option<usize>);
+
+impl BatchAxis {
+    /// Creates a mapped [`BatchAxis`] at physical position `axis`.
+    #[inline]
+    pub fn mapped(axis: usize) -> Self {
+        Self(Some(axis))
+    }
+
+    /// Creates a replicated [`BatchAxis`] (i.e., the batched value is shared unchanged across every batch item).
+    /// This is equivalent to [`BatchAxis::default`].
+    #[inline]
+    pub fn replicated() -> Self {
+        Self(None)
+    }
+
+    /// Returns the mapped batch axis position, or `None` if this [`BatchAxis`] is replicated.
+    #[inline]
+    pub fn axis(&self) -> Option<usize> {
+        self.0
+    }
+
+    /// Returns `true` if this [`BatchAxis`] is replicated (i.e., if it carries no mapped batch axis).
+    #[inline]
+    pub fn is_replicated(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl From<Option<usize>> for BatchAxis {
+    #[inline]
+    fn from(axis: Option<usize>) -> Self {
+        Self(axis)
+    }
+}
+
+impl From<usize> for BatchAxis {
+    #[inline]
+    fn from(axis: usize) -> Self {
+        Self(Some(axis))
+    }
+}
+
 /// Value with [`ArrayType`] type that represents a _packed_ batch of arrays. [`ArrayBatch`] is the batching
-/// representation for Ryft's batching/vectorization transform. It pairs a physical array value with a batch axis that
-/// marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its physical type carries
-/// the batch dimension) or *replicated*, meaning that it is shared unchanged across every batch item.
+/// representation for Ryft's batching/vectorization transform. It pairs a physical array value with a [`BatchAxis`]
+/// that marks which of its dimensions indexes the batch items. A value is either *batched* (i.e., its physical type
+/// carries the batch dimension) or *replicated*, meaning that it is shared unchanged across every batch item.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct ArrayBatch<V> {
     /// Physical array type of `value`. When the value is batched this type includes the mapped batch dimension at
@@ -93,14 +148,15 @@ pub struct ArrayBatch<V> {
     value: V,
 
     /// Refer to the documentation of [`batch_axis`](Self::batch_axis) for more information.
-    batch_axis: Option<usize>,
+    batch_axis: BatchAxis,
 }
 
 impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`].
     #[inline]
-    pub fn new(r#type: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, BatchingError> {
-        if let Some(axis) = batch_axis
+    pub fn new<A: Into<BatchAxis>>(r#type: ArrayType, value: V, batch_axis: A) -> Result<Self, BatchingError> {
+        let batch_axis = batch_axis.into();
+        if let Some(axis) = batch_axis.axis()
             && axis >= r#type.rank()
         {
             return Err(BatchingError::BatchAxisOutOfBounds { r#type, axis }.into());
@@ -111,18 +167,12 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`] that replicates the provided value across the batch.
     #[inline]
     pub fn replicated(value: V) -> Self {
-        Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
+        Self { r#type: value.r#type().into_owned(), value, batch_axis: BatchAxis::replicated() }
     }
 
-    /// Returns the axis in [`value`](Self::value) that indexes the batch items, or `None` when `value` is *replicated*
-    /// (i.e., it carries no physical dimension for the batch and is interpreted as the same value for every batch
-    /// item). For example, a traced constant in `batch(|x| x + 1)` has a `None` batch axis, while `x` carries the
-    /// mapped input axis. Runtime control flow predicates may also require `None`, because a single predicate may
-    /// select one branch for the whole batch while a batch-varying predicate would need a dedicated batching rule.
-    /// Note that `None` is not limited to rank-0 (i.e., scalar) values. Any shaped constant or operand is replicated
-    /// when none of its physical dimensions indexes the batch.
+    /// Returns the [`BatchAxis`] marking which dimension of [`value`](Self::value) indexes the batch items.
     #[inline]
-    pub fn batch_axis(&self) -> Option<usize> {
+    pub fn batch_axis(&self) -> BatchAxis {
         self.batch_axis
     }
 
@@ -142,7 +192,7 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// or `None` if it is replicated (i.e., shared as-is across the whole batch).
     #[inline]
     pub fn batch_size(&self) -> Result<Option<usize>, BatchingError> {
-        let Some(axis) = self.batch_axis else {
+        let Some(axis) = self.batch_axis.axis() else {
             return Ok(None);
         };
         let size = self
@@ -156,7 +206,7 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Returns the [`ArrayType`] of each item in the batch (i.e., with the batch axis removed, if any).
     #[inline]
     pub fn unbatched_type(&self) -> Result<ArrayType, BatchingError> {
-        let Some(axis) = self.batch_axis else {
+        let Some(axis) = self.batch_axis.axis() else {
             return Ok(self.r#type.clone());
         };
         Ok(self.r#type.without_dimension(axis)?.0)
@@ -179,7 +229,7 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
 impl<V: Display> Display for ArrayBatch<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.batch_axis {
+        match self.batch_axis.axis() {
             Some(axis) => write!(formatter, "batch[{}, axis={axis}]({})", self.r#type, self.value),
             None => write!(formatter, "batch[{}, replicated]({})", self.r#type, self.value),
         }
@@ -294,7 +344,7 @@ mod tests {
         // `new` builds a batched value when the mapped axis is in bounds, and the accessors report the packed value,
         // its physical type, the batch size read off the mapped axis, and the per-item type with that axis removed.
         let batched = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(0)).unwrap();
-        assert_eq!(batched.batch_axis(), Some(0));
+        assert_eq!(batched.batch_axis(), BatchAxis::mapped(0));
         assert_eq!(batched.value(), &matrix);
         assert_eq!(*batched.r#type(), matrix_type);
         assert_eq!(batched.batch_size(), Ok(Some(2)));
@@ -321,7 +371,7 @@ mod tests {
         let vector = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let vector_type = vector.r#type().into_owned();
         let replicated = ArrayBatch::replicated(vector.clone());
-        assert_eq!(replicated.batch_axis(), None);
+        assert_eq!(replicated.batch_axis(), BatchAxis::replicated());
         assert_eq!(*replicated.r#type(), vector_type);
         assert_eq!(replicated.batch_size(), Ok(None));
         assert_eq!(replicated.unbatched_type(), Ok(vector_type));
