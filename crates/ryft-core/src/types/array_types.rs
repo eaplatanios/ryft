@@ -454,10 +454,26 @@ impl ArrayType {
         Self { data_type, shape, layout: None, sharding: None, memory: Memory::Device }
     }
 
+    /// Returns a copy of this [`ArrayType`] with its [`DataType`] replaced by the provided one, keeping its [`Shape`],
+    /// [`Layout`], [`Sharding`], and [`Memory`] unchanged.
+    #[inline]
+    pub fn with_data_type<D: Into<DataType>>(mut self, data_type: D) -> Self {
+        self.data_type = data_type.into();
+        self
+    }
+
+    /// Returns a copy of this [`ArrayType`] with its [`Shape`] replaced by the provided one, keeping its [`DataType`],
+    /// [`Layout`], [`Sharding`], and [`Memory`] unchanged.
+    #[inline]
+    pub fn with_shape<S: Into<Shape>>(mut self, shape: S) -> Self {
+        self.shape = shape.into();
+        self
+    }
+
     /// Returns this [`ArrayType`] with the provided physical memory/storage [`Layout`] replacing its current layout
     /// (or without any [`Layout`] information when [`None`] is provided).
     #[inline]
-    pub fn with_layout(mut self, layout: impl Into<Option<Layout>>) -> Self {
+    pub fn with_layout<L: Into<Option<Layout>>>(mut self, layout: L) -> Self {
         self.layout = layout.into();
         self
     }
@@ -466,7 +482,7 @@ impl ArrayType {
     /// (or without any [`Sharding`] information when [`None`] is provided), after validating that any provided
     /// [`Sharding`] has the same rank as [`Self::shape`].
     #[inline]
-    pub fn with_sharding(mut self, sharding: impl Into<Option<Sharding>>) -> Result<Self, ShardingError> {
+    pub fn with_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Result<Self, ShardingError> {
         let sharding = sharding.into();
         if let Some(sharding) = &sharding {
             let sharding_rank = sharding.rank();
@@ -483,8 +499,8 @@ impl ArrayType {
     /// information is metadata about where the array lives, and it does not affect the array's [`DataType`], [`Shape`],
     /// [`Layout`], or [`Sharding`] (for sharded arrays, every shard resides in its own device's memory of this kind).
     #[inline]
-    pub fn with_memory(mut self, memory: Memory) -> Self {
-        self.memory = memory;
+    pub fn with_memory<M: Into<Memory>>(mut self, memory: M) -> Self {
+        self.memory = memory.into();
         self
     }
 

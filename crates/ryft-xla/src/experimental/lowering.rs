@@ -1,6 +1,24 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use ryft_core::macros::check_count;
+use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use ryft_core::operations::compare::ComparisonDirection;
+use ryft_core::operations::constants::{ConstantOperation, FillOperation};
+use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
+use ryft_core::operations::manipulation::{
+    BroadcastOperation, GatherOperation, GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation,
+    ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
+};
+use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
+use ryft_core::operations::{BooleanLike, Operation};
+use ryft_core::parameters::Parameterized;
+use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
+use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
+use ryft_core::tracing_v2::ArrayOperation;
+use ryft_core::tracing_v2::operations::DotOperation;
+use ryft_core::tracing_v2::operations::reduce::ReductionKind;
+use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
 use ryft_mlir::dialects::stable_hlo::{Accuracy, CustomCallApiVersion, Precision};
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -8,37 +26,8 @@ use ryft_mlir::{
     Location, LocationRef, Operation as MlirOperation, Region, Size as MlirSize, SymbolVisibility, TensorTypeRef, Type,
     TypeAndAttributes, TypeRef, Value as MlirValue, ValueAndAttributes, ValueRef,
 };
-#[cfg(feature = "ndarray")]
-use ryft_ndarray::Array as NdArrayValue;
 
-use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::{
-    AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
-};
-use ryft_core::operations::compare::ComparisonDirection;
-use ryft_core::operations::constants::{ConstantOperation, FillOperation, Zero};
-use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, SelectOperation, WhileOperation};
-use ryft_core::operations::manipulation::{
-    BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, GatherOperation,
-    GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation, ScatterReductionKind, Slice, TransposeOperation,
-    UpdateSlice,
-};
-use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
-use ryft_core::operations::{BooleanLike, Operation};
-use ryft_core::parameters::{Parameterized, Placeholder};
-use ryft_core::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
-use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
-use ryft_core::tracing_v2::operations::reduce::ReductionKind;
-use ryft_core::tracing_v2::operations::{DotOperation, LeftDotOperation, RightDotOperation};
-use ryft_core::tracing_v2::{
-    ArrayOperation, CaptureParameterizedOperation, DefactorizableProgramOperation, DefactorizedOperation,
-    LinearArrayOperation, ValueOrCapture,
-};
-use ryft_core::types::{ArrayType, DataType, Memory, Size, Typed};
-
-use crate::experimental::operations::{
-    FactorizedTransposeOutputSource, FactorizedTransposeResidualSource, LinearShardMapEvalMode,
-};
+use crate::experimental::debugging::{PRINT_CUSTOM_CALL_TARGET, PRINT_LABEL_ATTRIBUTE};
 #[cfg(test)]
 use crate::experimental::ops::XlaProgramBuilder;
 use crate::experimental::ops::{FlatXlaProgram, XlaConstant, XlaOperation, XlaProgram};
@@ -98,10 +87,6 @@ pub(crate) enum LoweringError {
     #[error("unsupported data type '{data_type}' during XLA lowering")]
     UnsupportedDataType { data_type: DataType },
 
-    /// Error returned when lowering needs a staged value that was never assigned.
-    #[error("missing lowered value for staged atom %{atom_id}")]
-    MissingAtomValue { atom_id: AtomId },
-
     /// Error returned when MLIR rejects the constructed dense-elements attribute.
     #[error("invalid dense elements attribute for data type '{data_type}' during XLA lowering")]
     InvalidDenseElementsAttribute { data_type: DataType },
@@ -145,6 +130,12 @@ pub(crate) struct PlainMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
     nested_functions: Option<Rc<JitCallFunctionMap>>,
+
+    /// Current StableHLO effect token of the lowering scope this lowerer emits into, or `None` when the scope has
+    /// not lowered an effectful instruction yet. Lowerers are constructed per instruction by the instruction replay
+    /// loops, which copy the scope-level token in through [`Self::with_token`] and read the updated token back out
+    /// after the instruction lowers, so the token chain threads through effectful instructions in program order.
+    token: Option<ValueRef<'b, 'c, 't>>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
@@ -154,12 +145,18 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Self {
-        Self { block, context, location, nested_functions: None }
+        Self { block, context, location, nested_functions: None, token: None }
     }
 
     /// Attaches the shared deduplicated `jit_call` functions consulted while lowering.
     pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap>>) -> Self {
         self.nested_functions = nested_functions;
+        self
+    }
+
+    /// Attaches the current effect token of the enclosing lowering scope.
+    pub(crate) fn with_token(mut self, token: Option<ValueRef<'b, 'c, 't>>) -> Self {
+        self.token = token;
         self
     }
 
@@ -195,6 +192,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             self.nested_functions.as_ref(),
+            &mut self.token,
         )
     }
 
@@ -214,6 +212,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             self.nested_functions.as_ref(),
+            &mut self.token,
         )
     }
 
@@ -238,6 +237,7 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             self.nested_functions.as_ref(),
+            &mut self.token,
         )
     }
 }
@@ -245,9 +245,9 @@ impl<'b, 'c: 'b, 't: 'c> PlainMlirLowerer<'b, 'c, 't> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Implementing this trait makes an operation eligible for MLIR lowering via
-/// [`to_mlir_module_for_plain_program`] and related entry points. The core [`ArrayOperation`] and
-/// [`LinearArrayOperation`] enums provide the default blanket implementations, and backends can add
-/// their own closed operation enums by implementing this trait for those enums.
+/// [`to_mlir_module_for_plain_program`] and related entry points. The core [`ArrayOperation`] enum provides the default
+/// blanket implementation, and backends can add their own closed operation enums by implementing this trait for those
+/// enums.
 pub(crate) trait LowerableXlaOperation<V: MlirLowerableValue + BooleanLike>: Operation<ArrayType> {
     /// Lowers this operation to one or more StableHLO operations.
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
@@ -417,38 +417,6 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for DotOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike, Payload> LowerableXlaOperation<V> for ScaleOperation<ArrayType, V, Payload> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let factor = self.factor();
-        let factor_value = lowerer.lower_literal_value(factor)?;
-        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let factor_type = factor.r#type();
-        let factor_broadcast = if *factor_type != output_types[0] {
-            let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
-                factor_value,
-                output_tensor_type,
-                &[],
-                lowerer.location,
-            )?)?;
-            broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
-        } else {
-            factor_value
-        };
-        let result = lowerer.block.append_operation(stable_hlo::multiply(
-            input_values[0],
-            factor_broadcast,
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
-    }
-}
-
 impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FillOperation<ArrayType, f64> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -488,68 +456,6 @@ impl<V: MlirLowerableValue + BooleanLike, Payload> LowerableXlaOperation<V>
         // A typed literal constant lowers to a StableHLO constant materialized from the captured value's elements.
         let constant_value = lowerer.lower_literal_value(self.value())?;
         Ok(vec![constant_value])
-    }
-}
-
-impl<V: MlirLowerableValue + BooleanLike, Payload> LowerableXlaOperation<V> for LeftDotOperation<V, Payload> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let factor = self.factor();
-        let factor_value = lowerer.lower_literal_value(factor)?;
-        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimension_numbers = self.dimensions();
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(
-            dimension_numbers.lhs_batching_dimensions(),
-            dimension_numbers.rhs_batching_dimensions(),
-            dimension_numbers.lhs_contracting_dimensions(),
-            dimension_numbers.rhs_contracting_dimensions(),
-        )?;
-        let result = lowerer.block.append_operation(stable_hlo::dot_general(
-            factor_value,
-            input_values[0],
-            dimensions,
-            Some((Precision::Default, Precision::Default)),
-            None,
-            output_tensor_type,
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
-    }
-}
-
-impl<V: MlirLowerableValue + BooleanLike, Payload> LowerableXlaOperation<V> for RightDotOperation<V, Payload> {
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        _mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        let factor = self.factor();
-        let factor_value = lowerer.lower_literal_value(factor)?;
-        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-        let dimension_numbers = self.dimensions();
-        let dimensions = lowerer.context.stable_hlo_dot_dimensions(
-            dimension_numbers.lhs_batching_dimensions(),
-            dimension_numbers.rhs_batching_dimensions(),
-            dimension_numbers.lhs_contracting_dimensions(),
-            dimension_numbers.rhs_contracting_dimensions(),
-        )?;
-        let result = lowerer.block.append_operation(stable_hlo::dot_general(
-            input_values[0],
-            factor_value,
-            dimensions,
-            Some((Precision::Default, Precision::Default)),
-            None,
-            output_tensor_type,
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
     }
 }
 
@@ -780,7 +686,6 @@ where
                 mode,
                 lowerer,
             ),
-            Self::Scale(operation) => operation.lower_to_mlir(input_values, output_types, mode, lowerer),
             Self::Mul(operation) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -813,8 +718,23 @@ where
                 check_count!("input", input_values, 1, ProgramError);
                 Ok(vec![input_values[0]])
             }
-            Self::RematerializationName(_) => {
+            Self::Tag(_) => {
                 check_count!("input", input_values, 1, ProgramError);
+                Ok(vec![input_values[0]])
+            }
+            // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback
+            // custom call that consumes and produces a StableHLO token, so the effect ordering rides the scope's
+            // token chain instead of the value dataflow.
+            Self::Print(operation) => {
+                check_count!("input", input_values, 1, ProgramError);
+                lower_print_to_custom_call(
+                    operation.label(),
+                    input_values[0],
+                    &mut lowerer.token,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
                 Ok(vec![input_values[0]])
             }
             Self::TransferToMemory(operation) => lower_transfer_to_memory(
@@ -1016,6 +936,7 @@ where
                 lowerer.location,
                 false,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
             Self::CustomVjp(operation) => lower_nested_program_inline(
                 operation.primal(),
@@ -1025,7 +946,15 @@ where
                 lowerer.location,
                 false,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
+            // The opaque custom-VJP tangent carrier is a forward-mode tangent map that reverse mode transposes away
+            // before lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp`
+            // slipped through, which is reverse-mode-only.
+            Self::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
+                message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
+            }
+            .into()),
             Self::Rematerialize(operation) => lower_nested_program_inline(
                 operation.primal(),
                 input_values,
@@ -1034,6 +963,7 @@ where
                 lowerer.location,
                 false,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
             Self::JitCall(jit_call_op) => lower_jit_call(
                 jit_call_op.program_rc(),
@@ -1042,6 +972,7 @@ where
                 lowerer.context,
                 lowerer.location,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
             Self::ShardMap(shard_map_op) => {
                 let simplified_body = shard_map_op
@@ -1059,14 +990,6 @@ where
                     lowerer.location,
                 )
             }
-            Self::LinearShardMap(shard_map_op) => lower_linear_shard_map_eval_mode(
-                shard_map_op.linear_state().eval_mode(),
-                &[],
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
         }
     }
 }
@@ -1138,10 +1061,72 @@ fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
 }
 
+/// Returns the current StableHLO effect token of one lowering scope, creating it lazily with a zero-operand
+/// `stablehlo.after_all` at the current insertion point when the scope has not needed a token yet.
+///
+/// One token chain orders all effectful instructions lowered into one scope (a function body or a control-flow
+/// region), in program order. The chain is dropped at the end of the scope, so this v1 design orders effects within
+/// one dispatch; carrying tokens across separately dispatched executions is out of scope.
+fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
+    if let Some(token) = token {
+        return Ok(*token);
+    }
+    let created = block.append_operation(stable_hlo::after_all::<ValueRef, _>(&[], location)?)?;
+    let created = created.result(0).expect("stablehlo.after_all should return one result").as_ref();
+    *token = Some(created);
+    Ok(created)
+}
+
+/// Lowers one `print` operation to the [`PRINT_CUSTOM_CALL_TARGET`] host-callback custom call and advances the
+/// scope's effect token chain past it.
+///
+/// The emitted operation follows the calling convention decoded by the FFI handler registered by
+/// [`ensure_print_handler_registered`](crate::experimental::debugging::ensure_print_handler_registered):
+///
+/// ```mlir
+/// %token_out = stablehlo.custom_call @"ryft.print"(%value, %token_in)
+///   {api_version = 4 : i32, backend_config = {label = "<label>"}, has_side_effect = true}
+///   : (tensor<...>, !stablehlo.token) -> !stablehlo.token
+/// ```
+///
+/// The custom call's only result is the continuation token; the `print` operation's dataflow output is the
+/// forwarded input value, which the caller returns directly.
+fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
+    label: &str,
+    value: ValueRef<'b, 'c, 't>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), LoweringError> {
+    let input_token = current_or_new_token(token, block, location)?;
+    let token_type = context.stable_hlo_token_type()?;
+    let backend_config = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier(PRINT_LABEL_ATTRIBUTE), context.string_attribute(label))
+    ]);
+    let operation = block.append_operation(stable_hlo::custom_call(
+        &[value, input_token],
+        PRINT_CUSTOM_CALL_TARGET,
+        true,
+        Some(backend_config.as_ref()),
+        CustomCallApiVersion::TypedFfi,
+        &[],
+        None,
+        &[],
+        &[token_type],
+        location,
+    )?)?;
+    *token = Some(operation.result(0).expect("the print custom call should return one token result").as_ref());
+    Ok(())
+}
+
 impl<V> LowerableXlaOperation<V> for ArrayOperation<V>
 where
     V: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
 {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1228,12 +1213,27 @@ where
                 }
                 Ok(vec![input_values[0]])
             }
-            // `rematerialization_name` only affects rematerialization policies; by lowering time it is the identity, so
+            // `tag` only affects rematerialization policies; by lowering time it is the identity, so
             // forward the operand without emitting any MLIR operation.
-            ArrayOperation::RematerializationName(_) => {
+            ArrayOperation::Tag(_) => {
                 if input_values.len() != 1 {
                     return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
                 }
+                Ok(vec![input_values[0]])
+            }
+            // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback
+            // custom call that consumes and produces a StableHLO token, so the effect ordering rides the scope's
+            // token chain instead of the value dataflow.
+            ArrayOperation::Print(operation) => {
+                check_count!("input", input_values, 1, ProgramError);
+                lower_print_to_custom_call(
+                    operation.label(),
+                    input_values[0],
+                    &mut lowerer.token,
+                    &mut lowerer.block,
+                    lowerer.context,
+                    lowerer.location,
+                )?;
                 Ok(vec![input_values[0]])
             }
             ArrayOperation::TransferToMemory(operation) => lower_transfer_to_memory(
@@ -1253,6 +1253,7 @@ where
                 lowerer.location,
                 false,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
             ArrayOperation::CustomVjp(operation) => lower_nested_program_inline(
                 operation.primal(),
@@ -1262,7 +1263,15 @@ where
                 lowerer.location,
                 false,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
+            // The opaque custom-VJP tangent carrier is a forward-mode tangent map that reverse mode transposes away
+            // before lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp`
+            // slipped through, which is reverse-mode-only.
+            ArrayOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
+                message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
+            }
+            .into()),
             ArrayOperation::Rematerialize(operation) => lower_nested_program_inline(
                 operation.primal(),
                 input_values,
@@ -1271,6 +1280,7 @@ where
                 lowerer.location,
                 false,
                 lowerer.nested_functions.as_ref(),
+                &mut lowerer.token,
             ),
             ArrayOperation::ZeroLike(_) => lower_like_constant(
                 input_values,
@@ -1302,7 +1312,6 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Scale(operation) => operation.lower_to_mlir(input_values, output_types, mode, lowerer),
             ArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -1375,10 +1384,10 @@ where
                 Ok(vec![result.result(0).expect("stablehlo.xor should return one result").as_ref()])
             }
             ArrayOperation::Collective(_) => {
-                // Collectives are per-lane identity at the operation type level (the named axis
+                // Collectives are per-item identity at the operation type level (the named axis
                 // only exists physically inside a matching `BatchingContext`). When the named-axis
                 // `batch` consumes the collective, the batching rule produces either a `Reduce`
-                // op or an unchanged lane-uniform passthrough — so reaching this lowering site
+                // op or an unchanged replicated passthrough — so reaching this lowering site
                 // means the staged Collective is acting as identity, which is the right
                 // semantics outside the matching batching level. Future work will rewrite
                 // collectives inside `BatchingContext` so they always lower to `Reduce`.
@@ -1486,425 +1495,6 @@ where
     }
 }
 
-impl<V, Constant, P> LowerableXlaOperation<V> for LinearArrayOperation<V, Constant, V, P>
-where
-    V: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    Constant: MlirLowerableValue + BooleanLike + Slice + UpdateSlice + Reshape,
-    Constant::InterpretationContext: Zero<ArrayType, Constant>,
-    P: Clone
-        + Operation<ArrayType>
-        + LowerableXlaOperation<Constant>
-        + From<MulOperation>
-        + From<DotOperation>
-        + From<SelectOperation>
-        + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<ConcatenateOperation>,
-{
-    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
-        &self,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        output_types: &[ArrayType],
-        mode: PlainMlirLoweringMode,
-        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        match self {
-            LinearArrayOperation::CustomVjpCall(call) => {
-                if !call.transposed() {
-                    return Err(ProgramError::from(ryft_core::TypeError {
-                        message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                            value_and_grad, or jacrev) instead"
-                            .to_string(),
-                    })
-                    .into());
-                }
-                let mut values = Vec::with_capacity(call.residuals().len() + input_values.len());
-                for residual in call.residuals() {
-                    values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
-                }
-                values.extend_from_slice(input_values);
-                lower_nested_program_inline(
-                    call.backward(),
-                    values.as_slice(),
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                    false,
-                    lowerer.nested_functions.as_ref(),
-                )
-            }
-            LinearArrayOperation::RematerializeCall(call) => {
-                let program = if call.transposed() { call.backward() } else { call.tangent() };
-                let mut values = Vec::with_capacity(call.residuals().len() + input_values.len());
-                for residual in call.residuals() {
-                    values.push(lower_literal_value(residual, &mut lowerer.block, lowerer.context, lowerer.location)?);
-                }
-                values.extend_from_slice(input_values);
-                // `prevent_cse` calls wrap the inlined program outputs in `stablehlo.optimization_barrier` so XLA
-                // cannot common-subexpression-eliminate rematerialized values against the forward pass.
-                lower_nested_program_inline(
-                    program,
-                    values.as_slice(),
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                    call.prevent_cse(),
-                    lowerer.nested_functions.as_ref(),
-                )
-            }
-            LinearArrayOperation::Zero(_) => {
-                if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
-                }
-                lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
-            }
-            LinearArrayOperation::One(_) => {
-                if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
-                }
-                lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
-            }
-            LinearArrayOperation::Constant(constant) => {
-                constant.lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            LinearArrayOperation::Fill(fill) => {
-                <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
-                    fill,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            LinearArrayOperation::ZeroLike(_) => lower_like_constant(
-                input_values,
-                output_types,
-                0,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            LinearArrayOperation::OneLike(_) => lower_like_constant(
-                input_values,
-                output_types,
-                1,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            LinearArrayOperation::Add(_) => <AddOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &AddOperation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearArrayOperation::Sub(_) => <SubOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &SubOperation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearArrayOperation::Neg(_) => <NegOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &NegOperation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearArrayOperation::Transpose(operation) => {
-                <TransposeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &TransposeOperation::new(operation.permutation().to_vec()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            LinearArrayOperation::Scale(operation) => {
-                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            LinearArrayOperation::Mul(_) => <MulOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &MulOperation,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearArrayOperation::TransferToMemory(operation) => lower_transfer_to_memory(
-                operation.destination(),
-                input_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            ),
-            LinearArrayOperation::LeftDot(operation) => {
-                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            LinearArrayOperation::RightDot(operation) => {
-                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            LinearArrayOperation::Reshape(operation) => <ReshapeOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                &ReshapeOperation::new(operation.output_shape().clone()),
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
-            LinearArrayOperation::Reshard(operation) => {
-                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-            }
-            LinearArrayOperation::ShardingConstraint(operation) => {
-                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-            }
-            LinearArrayOperation::Broadcast(operation) => {
-                <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    &BroadcastOperation::new(operation.output_type().clone(), operation.output_axes().to_vec()),
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            LinearArrayOperation::Reduce(operation) => {
-                check_count!("output", output_types, 1, ProgramError);
-                let value = lower_reduce_to_mlir(
-                    operation.kind(),
-                    operation.axes(),
-                    input_values[0],
-                    &output_types[0],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                Ok(vec![value])
-            }
-            LinearArrayOperation::Slice(operation) => {
-                let result = lowerer.block.append_operation(stable_hlo::slice(
-                    input_values[0],
-                    operation.start_indices(),
-                    operation.limit_indices(),
-                    operation.strides(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()])
-            }
-            LinearArrayOperation::Pad(operation) => {
-                let edge_padding_low: Vec<i64> =
-                    operation.edge_padding_low().iter().map(|&padding| padding as i64).collect();
-                let edge_padding_high: Vec<i64> =
-                    operation.edge_padding_high().iter().map(|&padding| padding as i64).collect();
-                let result = lowerer.block.append_operation(stable_hlo::pad(
-                    input_values[0],
-                    input_values[1],
-                    edge_padding_low.as_slice(),
-                    edge_padding_high.as_slice(),
-                    operation.interior_padding(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.pad should return one result").as_ref()])
-            }
-            LinearArrayOperation::Concatenate(operation) => {
-                reject_dynamic_concatenate_output(output_types)?;
-                let result = lowerer.block.append_operation(stable_hlo::concatenate(
-                    input_values,
-                    operation.axis(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.concatenate should return one result").as_ref()])
-            }
-            LinearArrayOperation::UpdateSlice(operation) => {
-                let index_values = lower_static_index_constants(
-                    operation.start_indices(),
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )?;
-                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-                    input_values[0],
-                    input_values[1],
-                    index_values.as_slice(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-            }
-            LinearArrayOperation::DynamicSlice(operation) => {
-                check_count!("input", input_values, 1, ProgramError);
-                let index_values = operation
-                    .start_indices()
-                    .iter()
-                    .map(|index| lowerer.lower_literal_value(index))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
-                    input_values[0],
-                    index_values.as_slice(),
-                    operation.sizes(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref()])
-            }
-            LinearArrayOperation::DynamicUpdateSlice(operation) => {
-                check_count!("input", input_values, 2, ProgramError);
-                let index_values = operation
-                    .start_indices()
-                    .iter()
-                    .map(|index| lowerer.lower_literal_value(index))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-                    input_values[0],
-                    input_values[1],
-                    index_values.as_slice(),
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-            }
-            LinearArrayOperation::Gather(operation) => {
-                // The captured index operand is materialized as a literal, then the tangent operand and the indices
-                // flow into the same gather lowering as the primal operation.
-                check_count!("input", input_values, 1, ProgramError);
-                let index_value = lowerer.lower_literal_value(operation.indices())?;
-                lower_gather_to_mlir(
-                    operation.operation(),
-                    &[input_values[0], index_value],
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            LinearArrayOperation::ScatterAdd(operation) => {
-                // The captured index operand is materialized as a literal, then the operand and update tangents flow
-                // into the same scatter lowering as the primal operation (the combiner is always `Add`).
-                check_count!("input", input_values, 2, ProgramError);
-                let index_value = lowerer.lower_literal_value(operation.indices())?;
-                lower_scatter_to_mlir(
-                    operation.operation(),
-                    &[input_values[0], index_value, input_values[1]],
-                    output_types,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
-            }
-            LinearArrayOperation::Select(operation) => {
-                check_count!("input", input_values, 2, ProgramError);
-                let condition_value = lowerer.lower_literal_value(operation.condition())?;
-                let result = lowerer.block.append_operation(stable_hlo::select(
-                    condition_value,
-                    input_values[0],
-                    input_values[1],
-                    lowerer.location,
-                )?)?;
-                Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
-            }
-            LinearArrayOperation::Residual(operation) => {
-                if !input_values.is_empty() {
-                    return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
-                }
-                Ok(vec![lowerer.lower_literal_value(operation.capture())?])
-            }
-            LinearArrayOperation::Recompute(operation) => {
-                operation.operation().lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            LinearArrayOperation::Condition(operation) => {
-                let true_branch = operation.true_branch();
-                let false_branch = operation.false_branch();
-                check_count!("input", input_values, true_branch.input_types().len(), ProgramError);
-                let predicate_value = lowerer.lower_literal_value(operation.predicate())?;
-                let true_branch_region = lower_control_flow_region(
-                    true_branch,
-                    input_values,
-                    lowerer.context,
-                    lowerer.location,
-                    lowerer.nested_functions.as_ref(),
-                )?;
-                let false_branch_region = lower_control_flow_region(
-                    false_branch,
-                    input_values,
-                    lowerer.context,
-                    lowerer.location,
-                    lowerer.nested_functions.as_ref(),
-                )?;
-                let operation = lowerer.block.append_operation(stable_hlo::r#if(
-                    predicate_value,
-                    true_branch_region.into(),
-                    false_branch_region.into(),
-                    lowerer.location,
-                )?)?;
-                Ok((0..output_types.len())
-                    .map(|index| {
-                        operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
-                    })
-                    .collect())
-            }
-            LinearArrayOperation::WhileCondition(operation) => {
-                // The while-condition form mirrors the factor-form lowering above with the predicate taken from
-                // operand 0 instead of a materialized factor literal; the remaining operands (including any
-                // forwarded loop-varying residuals appended by defactorization) flow into both branch regions.
-                let true_branch = operation.true_branch();
-                let false_branch = operation.false_branch();
-                check_count!("input", input_values, 1 + true_branch.input_types().len(), ProgramError);
-                let branch_inputs = &input_values[1..];
-                let true_branch_region = lower_control_flow_region(
-                    true_branch,
-                    branch_inputs,
-                    lowerer.context,
-                    lowerer.location,
-                    lowerer.nested_functions.as_ref(),
-                )?;
-                let false_branch_region = lower_control_flow_region(
-                    false_branch,
-                    branch_inputs,
-                    lowerer.context,
-                    lowerer.location,
-                    lowerer.nested_functions.as_ref(),
-                )?;
-                let operation = lowerer.block.append_operation(stable_hlo::r#if(
-                    input_values[0],
-                    true_branch_region.into(),
-                    false_branch_region.into(),
-                    lowerer.location,
-                )?)?;
-                Ok((0..output_types.len())
-                    .map(|index| {
-                        operation.result(index).expect("stablehlo.if should return one result per output").as_ref()
-                    })
-                    .collect())
-            }
-            LinearArrayOperation::While(operation) => {
-                operation.lower_to_mlir(input_values, output_types, mode, lowerer)
-            }
-            LinearArrayOperation::Scan(operation) => {
-                // Materialize the residual stacks after the operand stacks and rewrite the body into operand form
-                // so each lane's residual slices enter as extra scanned inputs, mirroring how fused while bodies
-                // defactorize loop-varying residual references.
-                let residual_stacks = operation.captures();
-                let mut full_inputs = input_values.to_vec();
-                let mut residual_slice_types = Vec::with_capacity(residual_stacks.len());
-                for stack in residual_stacks {
-                    full_inputs.push(lowerer.lower_literal_value(stack)?);
-                    residual_slice_types.push(stack.r#type().without_dimension(0).map_err(ProgramError::from)?.0);
-                }
-                let operand_form_body = operand_form_scan_body(operation.body(), residual_slice_types.as_slice())?;
-                lower_scan_to_while(
-                    &operand_form_body,
-                    operation.carry_count(),
-                    operation.length(),
-                    operation.reverse(),
-                    operation.unroll(),
-                    full_inputs.as_slice(),
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                    lowerer.nested_functions.as_ref(),
-                )
-            }
-        }
-    }
-}
-
 /// Lowering helper passed to op-owned traced XLA MLIR lowering hooks.
 pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Owning block receiving the lowered operations.
@@ -1919,6 +1509,11 @@ pub(crate) struct ShardMapMlirLowerer<'b, 'c: 'b, 't: 'c> {
     /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
     nested_functions: Option<Rc<JitCallFunctionMap>>,
+
+    /// Current StableHLO effect token of the lowering scope this lowerer emits into, or `None` when the scope has
+    /// not lowered an effectful instruction yet. Refer to the documentation of the equivalent
+    /// [`PlainMlirLowerer`] field for the copy-in/copy-out threading protocol.
+    token: Option<ValueRef<'b, 'c, 't>>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
@@ -1928,12 +1523,18 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
         context: &'c MlirContext<'t>,
         location: LocationRef<'c, 't>,
     ) -> Self {
-        Self { block, context, location, nested_functions: None }
+        Self { block, context, location, nested_functions: None, token: None }
     }
 
     /// Attaches the shared deduplicated `jit_call` functions consulted while lowering.
     pub(crate) fn with_nested_functions(mut self, nested_functions: Option<Rc<JitCallFunctionMap>>) -> Self {
         self.nested_functions = nested_functions;
+        self
+    }
+
+    /// Attaches the current effect token of the enclosing lowering scope.
+    pub(crate) fn with_token(mut self, token: Option<ValueRef<'b, 'c, 't>>) -> Self {
+        self.token = token;
         self
     }
 
@@ -1961,6 +1562,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             self.nested_functions.as_ref(),
+            &mut self.token,
         )
     }
 
@@ -1980,6 +1582,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             self.nested_functions.as_ref(),
+            &mut self.token,
         )
     }
 
@@ -2004,6 +1607,7 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             self.context,
             self.location,
             self.nested_functions.as_ref(),
+            &mut self.token,
         )
     }
 
@@ -2027,23 +1631,6 @@ impl<'b, 'c: 'b, 't: 'c> ShardMapMlirLowerer<'b, 'c, 't> {
             program,
             local_input_types,
             global_output_types,
-            self.context,
-            self.location,
-        )
-    }
-
-    /// Lowers one linear shard-map evaluation mode inside this lowering context.
-    pub(crate) fn lower_linear_shard_map_eval_mode(
-        &mut self,
-        eval_mode: &LinearShardMapEvalMode,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-        input_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_linear_shard_map_eval_mode(
-            eval_mode,
-            captured_values,
-            input_values,
-            &mut self.block,
             self.context,
             self.location,
         )
@@ -2364,42 +1951,6 @@ impl MlirLowerableValue for ArrayType {
     }
 }
 
-#[cfg(feature = "ndarray")]
-impl MlirLowerableValue for NdArrayValue<f64> {
-    fn to_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-        let standard_layout = self.as_ndarray().as_standard_layout();
-        let elements = standard_layout.iter().copied().collect::<Vec<_>>();
-        let attribute = context
-            .dense_f64_elements_attribute(tensor_type, elements.as_slice())
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
-        attribute
-            .cast::<DenseElementsAttributeRef>()
-            .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })
-    }
-
-    fn to_scalar_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-        let Some(element) = self.as_ndarray().iter().next().filter(|_| self.as_ndarray().len() == 1) else {
-            return Ok(None);
-        };
-        let attribute = context
-            .dense_f64_elements_attribute(tensor_type, std::slice::from_ref(element))
-            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?;
-        Ok(Some(
-            attribute
-                .cast::<DenseElementsAttributeRef>()
-                .ok_or(LoweringError::InvalidDenseElementsAttribute { data_type: DataType::F64 })?,
-        ))
-    }
-}
-
 /// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
 #[cfg(test)]
 pub(crate) fn to_mlir_module_for_plain_program<
@@ -2492,9 +2043,6 @@ where
                 });
                 mesh = collect_nested_sharding_mesh(body.program(), mesh)?;
             }
-            XlaOperation::LinearShardMap(shard_map_op) => {
-                mesh = collect_nested_linear_shard_map_mesh(shard_map_op.linear_state().eval_mode(), mesh)?;
-            }
             XlaOperation::Condition(condition_op) => {
                 mesh = collect_nested_sharding_mesh(condition_op.true_branch(), mesh)?;
                 mesh = collect_nested_sharding_mesh(condition_op.false_branch(), mesh)?;
@@ -2522,36 +2070,6 @@ where
         }
     }
     Ok(mesh)
-}
-
-/// Collects nested logical meshes referenced by one linear shard-map evaluation mode.
-fn collect_nested_linear_shard_map_mesh(
-    eval_mode: &LinearShardMapEvalMode,
-    existing: Option<LogicalMesh>,
-) -> Result<Option<LogicalMesh>, LoweringError> {
-    match eval_mode {
-        LinearShardMapEvalMode::Body(body) => {
-            let mesh = Some(match existing {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, body.shard_map().mesh())?,
-                None => body.shard_map().mesh().clone(),
-            });
-            collect_nested_sharding_mesh(body.program(), mesh)
-        }
-        LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
-            let residual_body = factorized.residual_body();
-            let mesh = Some(match existing {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, residual_body.shard_map().mesh())?,
-                None => residual_body.shard_map().mesh().clone(),
-            });
-            let mesh = collect_nested_sharding_mesh(residual_body.program(), mesh)?;
-            let apply_body = factorized.apply_body();
-            let mesh = Some(match mesh {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, apply_body.shard_map().mesh())?,
-                None => apply_body.shard_map().mesh().clone(),
-            });
-            collect_nested_sharding_mesh(apply_body.program(), mesh)
-        }
-    }
 }
 
 fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, LoweringError> {
@@ -2592,12 +2110,21 @@ fn static_dimensions(array_type: &ArrayType) -> Result<Vec<usize>, LoweringError
         .collect()
 }
 
+/// Lowers one nested control-flow branch program into a fresh single-block region.
+///
+/// `entry_token` is the enclosing scope's effect token, referenced inside the region through StableHLO's implicit
+/// region capture (the same mechanism that already feeds `input_values` into `stablehlo.if` branches). When
+/// `return_final_token` is set, the region's `stablehlo.return` yields the branch's final effect token as one extra
+/// trailing output — the entry token unchanged for a pure branch — so the enclosing operation can expose it as an
+/// extra result.
 fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, V, O>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    entry_token: Option<ValueRef<'b, 'c, 't>>,
+    return_final_token: bool,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
@@ -2607,7 +2134,8 @@ where
     let block = context.block_with_no_arguments();
     {
         let mut block_ref = block.as_ref();
-        let outputs = lower_nested_program_inline(
+        let mut region_token = entry_token;
+        let mut outputs = lower_nested_program_inline(
             program,
             input_values,
             &mut block_ref,
@@ -2615,7 +2143,11 @@ where
             location,
             false,
             nested_functions,
+            &mut region_token,
         )?;
+        if return_final_token {
+            outputs.push(region_token.expect("token-returning control-flow regions receive an entry token"));
+        }
         block_ref.append_operation(stable_hlo::r#return(outputs.as_slice(), location)?)?;
     }
     region.append_block(block)?;
@@ -2629,6 +2161,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c, V, O>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
@@ -2641,17 +2174,47 @@ where
         });
     }
     let branch_inputs = &input_values[1..];
-    let true_branch_region =
-        lower_control_flow_region(condition_op.true_branch(), branch_inputs, context, location, nested_functions)?;
-    let false_branch_region =
-        lower_control_flow_region(condition_op.false_branch(), branch_inputs, context, location, nested_functions)?;
+    // When either branch is effectful, the enclosing scope's token is captured implicitly by both branch regions
+    // (StableHLO `if` regions capture enclosing values, which is also how `branch_inputs` flow in) and each branch
+    // returns its own final token as one extra trailing result; that extra `stablehlo.if` result then becomes the
+    // scope's current token. Pure conditions emit no token machinery at all.
+    let threads_token =
+        !condition_op.true_branch().effects().is_pure() || !condition_op.false_branch().effects().is_pure();
+    let entry_token = if threads_token { Some(current_or_new_token(token, block, location)?) } else { None };
+    let true_branch_region = lower_control_flow_region(
+        condition_op.true_branch(),
+        branch_inputs,
+        context,
+        location,
+        nested_functions,
+        entry_token,
+        threads_token,
+    )?;
+    let false_branch_region = lower_control_flow_region(
+        condition_op.false_branch(),
+        branch_inputs,
+        context,
+        location,
+        nested_functions,
+        entry_token,
+        threads_token,
+    )?;
     let operation = block.append_operation(stable_hlo::r#if(
         input_values[0],
         true_branch_region.into(),
         false_branch_region.into(),
         location,
     )?)?;
-    Ok((0..condition_op.output_types().len())
+    let output_count = condition_op.output_types().len();
+    if threads_token {
+        *token = Some(
+            operation
+                .result(output_count)
+                .expect("a token-threaded stablehlo.if should return one trailing token result")
+                .as_ref(),
+        );
+    }
+    Ok((0..output_count)
         .map(|index| operation.result(index).expect("stablehlo.if should return one result per output").as_ref())
         .collect())
 }
@@ -2663,6 +2226,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c, V, O, Payload>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
@@ -2680,21 +2244,35 @@ where
     // remain exactly the original state elements. Unbounded loops emit no counter machinery at all.
     let iteration_bound = while_op.iteration_bound();
     let counter_offset = if iteration_bound.is_some() { 1 } else { 0 };
+    // When the nested programs are effectful, the enclosing scope's effect token is carried through the loop as one
+    // extra trailing state element (appended after the states, unlike the prepended counter, so the existing state
+    // index math is untouched): both regions receive it as one extra block argument, the condition region only reads
+    // it (its own final token cannot leave the region and is discarded), the body region threads it through the
+    // body's effectful instructions, and the extra `stablehlo.while` result becomes the scope's current token. Pure
+    // loops emit no token machinery at all.
+    let threads_token = !while_op.condition().effects().is_pure() || !while_op.body().effects().is_pure();
+    let token_index = counter_offset + state_types.len();
     let mut full_state_types = Vec::with_capacity(counter_offset + state_types.len());
     if iteration_bound.is_some() {
         full_state_types.push(ArrayType::scalar(DataType::I64));
     }
     full_state_types.extend(state_types.iter().cloned());
-    let lowered_state_types = full_state_types
+    let mut lowered_state_types = full_state_types
         .iter()
         .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
+    if threads_token {
+        lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
+    }
     let block_arguments = lowered_state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
-    let mut state_values = Vec::with_capacity(full_state_types.len());
+    let mut state_values = Vec::with_capacity(lowered_state_types.len());
     if iteration_bound.is_some() {
         state_values.push(lower_static_index_constants(&[0], block, context, location)?[0]);
     }
     state_values.extend_from_slice(input_values);
+    if threads_token {
+        state_values.push(current_or_new_token(token, block, location)?);
+    }
 
     let mut condition_region = context.region();
     let condition_block = context.block(block_arguments.as_slice());
@@ -2705,6 +2283,16 @@ where
                 condition_block_ref.argument(index).expect("while condition should have state arguments").as_ref()
             })
             .collect::<Vec<_>>();
+        let mut condition_token = if threads_token {
+            Some(
+                condition_block_ref
+                    .argument(token_index)
+                    .expect("token-threaded while state should include the token")
+                    .as_ref(),
+            )
+        } else {
+            None
+        };
         let condition_outputs = lower_nested_program_inline(
             while_op.condition(),
             condition_inputs.as_slice(),
@@ -2713,6 +2301,7 @@ where
             location,
             false,
             nested_functions,
+            &mut condition_token,
         )?;
         if condition_outputs.len() != 1 {
             return Err(LoweringError::UnsupportedOp {
@@ -2752,6 +2341,16 @@ where
         let body_inputs = (counter_offset..counter_offset + state_types.len())
             .map(|index| body_block_ref.argument(index).expect("while body should have state arguments").as_ref())
             .collect::<Vec<_>>();
+        let mut body_token = if threads_token {
+            Some(
+                body_block_ref
+                    .argument(token_index)
+                    .expect("token-threaded while state should include the token")
+                    .as_ref(),
+            )
+        } else {
+            None
+        };
         let body_outputs = lower_nested_program_inline(
             while_op.body(),
             body_inputs.as_slice(),
@@ -2760,13 +2359,14 @@ where
             location,
             false,
             nested_functions,
+            &mut body_token,
         )?;
         if body_outputs.len() != state_types.len() {
             return Err(LoweringError::UnsupportedOp {
                 op: format!("while body lowered to {} outputs", body_outputs.len()),
             });
         }
-        let mut next_state = Vec::with_capacity(full_state_types.len());
+        let mut next_state = Vec::with_capacity(lowered_state_types.len());
         if iteration_bound.is_some() {
             let counter = body_block_ref.argument(0).expect("bounded while state should include the counter").as_ref();
             let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
@@ -2774,6 +2374,9 @@ where
             next_state.push(next_counter.result(0).expect("stablehlo.add should return one result").as_ref());
         }
         next_state.extend(body_outputs);
+        if threads_token {
+            next_state.push(body_token.expect("token-threaded while bodies receive an entry token"));
+        }
         body_block_ref.append_operation(stable_hlo::r#return(next_state.as_slice(), location)?)?;
     }
     body_region.append_block(body_block)?;
@@ -2784,6 +2387,14 @@ where
         body_region.into(),
         location,
     )?)?;
+    if threads_token {
+        *token = Some(
+            operation
+                .result(token_index)
+                .expect("a token-threaded stablehlo.while should return one trailing token result")
+                .as_ref(),
+        );
+    }
     Ok((0..state_types.len())
         .map(|index| {
             operation
@@ -2800,13 +2411,13 @@ where
 /// The `i64` counter starts at zero and the loop runs while `counter < length`. Each loop trip runs `unroll`
 /// consecutive logical iterations (body copies) and advances the counter by `unroll`, so the loop performs
 /// `length / unroll` trips (the unroll factor must be at least `1` and evenly divide `length`, which
-/// [`ScanOperation::with_unroll`] guarantees by construction). Logical iteration `i` computes its lane index (`i`,
+/// [`ScanOperation::with_unroll`] guarantees by construction). Logical iteration `i` computes its iteration index (`i`,
 /// or `length - 1 - i` when `reverse` is set), reads one slice of every stacked input with
-/// `stablehlo.dynamic_slice` (dropping the unit lane axis with `stablehlo.reshape`), inlines the lowered body
-/// program over `[carries..., lane_slices...]`, and writes each per-iteration output into its preallocated stacked
+/// `stablehlo.dynamic_slice` (dropping the unit iteration axis with `stablehlo.reshape`), inlines the lowered body
+/// program over `[carries..., iteration_slices...]`, and writes each per-iteration output into its preallocated stacked
 /// zero accumulator with `stablehlo.dynamic_update_slice`. This is the same strategy JAX uses to lower `lax.scan`,
 /// which is not an XLA primitive. When `unroll == length` no `stablehlo.while` is emitted at all: the body copies
-/// inline as straight-line operations at static lane indices. The provided `input_values` must align with the body
+/// inline as straight-line operations at static iteration indices. The provided `input_values` must align with the body
 /// program's input signature: the first `carry_count` values are the carries and every remaining body input
 /// receives one stacked operand.
 fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
@@ -2820,11 +2431,17 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c, V, O>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
     O: LowerableXlaOperation<V>,
 {
+    // When the scan body is effectful, the enclosing scope's effect token is carried through the loop as one extra
+    // trailing state element that each body copy threads through its effectful instructions (mirroring the while
+    // lowering); the fully unrolled form needs no extra state because its body copies inline directly into the
+    // enclosing scope and thread the scope token itself. Pure scans emit no token machinery at all.
+    let threads_token = !body_program.effects().is_pure();
     let body_input_types = body_program.input_types();
     let body_output_types = body_program.output_types();
     if input_values.len() != body_input_types.len() {
@@ -2850,8 +2467,8 @@ where
     };
 
     // A fully unrolled scan (`unroll == length`) needs no loop at all: the body copies inline as straight-line
-    // operations at static lane indices, reading and writing the same stacked inputs and zero accumulators the loop
-    // form would thread through its state.
+    // operations at static iteration indices, reading and writing the same stacked inputs and zero accumulators the
+    // loop form would thread through its state.
     if unroll == length && length > 0 {
         let mut carries = input_values[..carry_count].to_vec();
         let x_stacks = input_values[carry_count..].to_vec();
@@ -2862,12 +2479,12 @@ where
             y_accumulators.push(accumulators[0]);
         }
         let zero_index = lower_static_index_constants(&[0], block, context, location)?[0];
-        let mut lanes: Vec<usize> = (0..length).collect();
+        let mut iterations: Vec<usize> = (0..length).collect();
         if reverse {
-            lanes.reverse();
+            iterations.reverse();
         }
-        for lane in lanes {
-            let index_value = lower_static_index_constants(&[lane], block, context, location)?[0];
+        for iteration in iterations {
+            let index_value = lower_static_index_constants(&[iteration], block, context, location)?[0];
             (carries, y_accumulators) = lower_scan_iteration(
                 body_program,
                 x_slice_types,
@@ -2881,6 +2498,7 @@ where
                 context,
                 location,
                 nested_functions,
+                token,
             )?;
         }
         carries.extend(y_accumulators);
@@ -2904,10 +2522,17 @@ where
         state_values.push(accumulators[0]);
         state_types.push(stacked_type);
     }
-    let lowered_state_types = state_types
+    // The effect token rides at the very end of the loop state, so all counter/carry/stack/accumulator index math
+    // stays untouched.
+    let token_index = state_types.len();
+    let mut lowered_state_types = state_types
         .iter()
         .map(|array_type| lower_tensor_type(array_type, context, location).map(|tensor_type| tensor_type.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
+    if threads_token {
+        lowered_state_types.push(context.stable_hlo_token_type()?.as_ref());
+        state_values.push(current_or_new_token(token, block, location)?);
+    }
     let block_arguments = lowered_state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
 
     let mut condition_region = context.region();
@@ -2936,7 +2561,7 @@ where
             .collect::<Vec<_>>();
         let counter = arguments[0];
         let zero_index = lower_static_index_constants(&[0], &mut body_block_ref, context, location)?[0];
-        // When the visit order is reversed, logical iteration `i` reads lane `length - 1 - i` (a zero-length
+        // When the visit order is reversed, logical iteration `i` reads iteration `length - 1 - i` (a zero-length
         // reversed scan never runs its body, so the saturated limit constant is inert).
         let reverse_limit = if reverse {
             Some(lower_static_index_constants(&[length.saturating_sub(1)], &mut body_block_ref, context, location)?[0])
@@ -2950,6 +2575,16 @@ where
         let mut carries = arguments[1..1 + carry_count].to_vec();
         let x_stacks = arguments[1 + carry_count..1 + carry_count + x_slice_types.len()].to_vec();
         let mut y_accumulators = arguments[1 + carry_count + x_slice_types.len()..].to_vec();
+        let mut body_token = if threads_token {
+            Some(
+                body_block_ref
+                    .argument(token_index)
+                    .expect("token-threaded scan state should include the token")
+                    .as_ref(),
+            )
+        } else {
+            None
+        };
         for copy in 0..unroll {
             let iteration = if copy == 0 {
                 counter
@@ -2979,17 +2614,21 @@ where
                 context,
                 location,
                 nested_functions,
+                &mut body_token,
             )?;
         }
 
         // Assemble the next state: advance the counter by the unroll factor, thread the new carries, pass the input
-        // stacks through unchanged, and thread the updated stacked accumulators.
+        // stacks through unchanged, and thread the updated stacked accumulators (and the effect token, if any).
         let step = lower_static_index_constants(&[unroll], &mut body_block_ref, context, location)?[0];
         let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, step, location)?)?;
         let mut next_state = vec![next_counter.result(0).expect("stablehlo.add should return one result").as_ref()];
         next_state.extend(carries);
         next_state.extend(x_stacks);
         next_state.extend(y_accumulators);
+        if threads_token {
+            next_state.push(body_token.expect("token-threaded scan bodies receive an entry token"));
+        }
         body_block_ref.append_operation(stable_hlo::r#return(next_state.as_slice(), location)?)?;
     }
     body_region.append_block(body_block)?;
@@ -3000,6 +2639,14 @@ where
         body_region.into(),
         location,
     )?)?;
+    if threads_token {
+        *token = Some(
+            operation
+                .result(token_index)
+                .expect("a token-threaded stablehlo.while should return one trailing token result")
+                .as_ref(),
+        );
+    }
     let result = |index: usize| {
         operation.result(index).expect("stablehlo.while should return one result per state leaf").as_ref()
     };
@@ -3009,8 +2656,8 @@ where
     Ok(outputs)
 }
 
-/// Emits one scan iteration at lane index `index_value` into `block`: reads slice `index_value` of every stacked
-/// input (dropping the unit lane axis), inlines the body program over `[carries..., x_slices...]`, writes each
+/// Emits one scan iteration at iteration index `index_value` into `block`: reads slice `index_value` of every stacked
+/// input (dropping the unit iteration axis), inlines the body program over `[carries..., x_slices...]`, writes each
 /// per-iteration output into its stacked accumulator at `index_value`, and returns the new carries and accumulators.
 /// This is the per-iteration building block shared by the looped and fully unrolled scan lowerings in
 /// [`lower_scan_to_while`].
@@ -3027,42 +2674,44 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c, V, O>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
     O: LowerableXlaOperation<V>,
 {
-    // Read one slice of every stacked input and drop the unit lane axis.
+    // Read one slice of every stacked input and drop the unit iteration axis.
     let carry_count = carries.len();
-    let mut lane_inputs = carries;
+    let mut iteration_inputs = carries;
     for (stack_offset, x_slice_type) in x_slice_types.iter().enumerate() {
         let slice_dimensions = static_dimensions(x_slice_type)?;
         let mut sizes = vec![1];
         sizes.extend(slice_dimensions.iter().copied());
         let mut start_values = vec![index_value];
         start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
-        let lane = block.append_operation(stable_hlo::dynamic_slice(
+        let iteration = block.append_operation(stable_hlo::dynamic_slice(
             x_stacks[stack_offset],
             start_values.as_slice(),
             sizes.as_slice(),
             location,
         )?)?;
         let squeezed = block.append_operation(stable_hlo::reshape(
-            lane.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref(),
+            iteration.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref(),
             slice_dimensions.as_slice(),
             location,
         )?)?;
-        lane_inputs.push(squeezed.result(0).expect("stablehlo.reshape should return one result").as_ref());
+        iteration_inputs.push(squeezed.result(0).expect("stablehlo.reshape should return one result").as_ref());
     }
 
     let body_outputs = lower_nested_program_inline(
         body_program,
-        lane_inputs.as_slice(),
+        iteration_inputs.as_slice(),
         block,
         context,
         location,
         false,
         nested_functions,
+        token,
     )?;
     if body_outputs.len() != carry_count + y_slice_types.len() {
         return Err(LoweringError::UnsupportedOp {
@@ -3094,104 +2743,6 @@ where
             .push(updated.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref());
     }
     Ok((new_carries, new_accumulators))
-}
-
-/// Rewrites a linear scan body's scan-local residual references into operand form for lowering.
-///
-/// The returned program consumes `[tangent_carry..., tangent_x_slice..., residual_slice...]`: each residual stack
-/// contributes one extra input carrying its current lane slice, and every body operation whose factors reference a
-/// residual is rewritten into operand form against those inputs through
-/// [`DefactorizableProgramOperation::defactorize_operation`] (a scale by a referenced residual becomes a recomputed
-/// elementwise product, exactly like fused while bodies). Closed constant factors are unwrapped into direct payloads,
-/// so the result lowers through the ordinary direct linear operation path.
-fn operand_form_scan_body<V, Constant, P>(
-    body: &Program<ArrayType, V, LinearArrayOperation<V, Constant, ValueOrCapture<ArrayType, V>, P>, Vec<V>, Vec<V>>,
-    residual_slice_types: &[ArrayType],
-) -> Result<Program<ArrayType, V, LinearArrayOperation<V, Constant, V, P>, Vec<V>, Vec<V>>, LoweringError>
-where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    Constant: Value<ArrayType>,
-    P: Clone
-        + Operation<ArrayType>
-        + From<MulOperation>
-        + From<DotOperation>
-        + From<SelectOperation>
-        + From<DynamicSliceOperation>
-        + From<DynamicUpdateSliceOperation>
-        + From<ConcatenateOperation>,
-{
-    let mut builder = ProgramBuilder::<ArrayType, V, LinearArrayOperation<V, Constant, V, P>>::new();
-    let mut atom_map: Vec<Option<AtomId>> = vec![None; body.atoms().len()];
-    let body_input_types = body.input_types();
-    for (body_atom, input_type) in body.input_ids().iter().zip(body_input_types.iter()) {
-        atom_map[body_atom.index()] = Some(builder.add_input(input_type.clone()));
-    }
-    let residual_atoms = residual_slice_types
-        .iter()
-        .map(|slice_type| builder.add_input(slice_type.clone()))
-        .collect::<Vec<_>>();
-    for (atom_index, atom) in body.atoms().iter().enumerate() {
-        if let Atom::Constant(constant) = atom {
-            atom_map[atom_index] = Some(builder.add_constant(constant.clone()));
-        }
-    }
-    let map_atom = |atom_map: &[Option<AtomId>], atom: AtomId| {
-        atom_map.get(atom.index()).copied().flatten().ok_or(ProgramError::UnboundAtomId { id: atom })
-    };
-    for instruction in body.instructions() {
-        let inputs = instruction
-            .inputs()
-            .iter()
-            .map(|input| map_atom(atom_map.as_slice(), *input))
-            .collect::<Result<Vec<_>, _>>()?;
-        match instruction
-            .operation()
-            .defactorize_operation(residual_atoms.as_slice(), inputs)
-            .map_err(ProgramError::from)?
-        {
-            DefactorizedOperation::Operation { operation, inputs } => {
-                let operation = operation
-                    .try_map_captures(&mut |factor| match factor {
-                        ValueOrCapture::Value(value) => Ok(value.clone()),
-                        ValueOrCapture::Capture { index, .. } => Err(ProgramError::MalformedProgram(format!(
-                            "scan body defactorization left residual reference {} in operand form",
-                            index,
-                        ))),
-                    })
-                    .map_err(ProgramError::from)?;
-                let outputs = builder.add_instruction(operation, inputs).map_err(ProgramError::from)?.to_vec();
-                if outputs.len() != instruction.outputs().len() {
-                    return Err(ProgramError::InvalidOutputCount {
-                        expected: instruction.outputs().len(),
-                        actual: outputs.len(),
-                    }
-                    .into());
-                }
-                for (body_atom, builder_atom) in instruction.outputs().iter().zip(outputs.into_iter()) {
-                    atom_map[body_atom.index()] = Some(builder_atom);
-                }
-            }
-            DefactorizedOperation::Forward { atom } => {
-                if instruction.outputs().len() != 1 {
-                    return Err(
-                        ProgramError::InvalidOutputCount { expected: 1, actual: instruction.outputs().len() }.into()
-                    );
-                }
-                atom_map[instruction.outputs()[0].index()] = Some(atom);
-            }
-        }
-    }
-    let outputs = body
-        .output_ids()
-        .iter()
-        .map(|output| map_atom(atom_map.as_slice(), *output))
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    let input_count = body_input_types.len() + residual_slice_types.len();
-    let output_count = outputs.len();
-    Ok(builder
-        .build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])
-        .map_err(ProgramError::from)?)
 }
 
 /// Identity of a flat callee program staged behind a `jit_call`, used to deduplicate repeated nested programs into
@@ -3239,10 +2790,10 @@ where
                 | XlaOperation::Scan(_)
                 | XlaOperation::CustomJvp(_)
                 | XlaOperation::CustomVjp(_)
+                | XlaOperation::CustomVjpTangent(_)
                 | XlaOperation::Rematerialize(_)
                 | XlaOperation::JitCall(_)
                 | XlaOperation::ShardMap(_)
-                | XlaOperation::LinearShardMap(_)
         )
     })
 }
@@ -3320,6 +2871,7 @@ fn count_jit_calls<Input, Output>(
             XlaOperation::Scan(scan) => count_jit_calls(scan.body(), counts, order, memo),
             XlaOperation::CustomJvp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
             XlaOperation::CustomVjp(custom) => count_jit_calls(custom.primal(), counts, order, memo),
+            XlaOperation::CustomVjpTangent(carrier) => count_jit_calls(carrier.backward(), counts, order, memo),
             XlaOperation::Rematerialize(operation) => count_jit_calls(operation.primal(), counts, order, memo),
             XlaOperation::JitCall(call) => {
                 let program = call.program_rc();
@@ -3353,7 +2905,9 @@ where
     let mut map = JitCallFunctionMap::default();
     for key in order {
         let (count, program) = counts.remove(&key).expect("every ordered key was counted");
-        if count < 2 {
+        // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
+        // caller's effect token in program order; a shared token-free function could not preserve that ordering.
+        if count < 2 || !program.effects().is_pure() {
             continue;
         }
         let symbol = format!("jit_call_{}", map.order.len());
@@ -3399,6 +2953,9 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
         let input_values = (0..function.input_types.len())
             .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
             .collect::<Vec<_>>();
+        // Deduplicated callees are pure by construction ([`collect_jit_call_functions`] skips effectful programs),
+        // so the shared function body never needs an effect token.
+        let mut token = None;
         let outputs = lower_nested_program_inline(
             function.program.as_ref(),
             input_values.as_slice(),
@@ -3407,6 +2964,7 @@ fn emit_jit_call_function<'b, 'c: 'b, 't: 'c>(
             location,
             false,
             Some(nested_functions),
+            &mut token,
         )?;
         function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
     }
@@ -3444,7 +3002,11 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+    // Only pure callees are ever deduplicated ([`collect_jit_call_functions`] skips effectful programs), so the
+    // shared-function path below never interacts with the caller's effect token; effectful callees always take the
+    // inline path, which threads the caller's token through the callee body in program order.
     if let Some(map) = nested_functions {
         if let Some(function) = map.get(program) {
             // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
@@ -3478,12 +3040,26 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c>(
             }
         }
     }
-    lower_nested_program_inline(program.as_ref(), input_values, block, context, location, false, nested_functions)
+    lower_nested_program_inline(
+        program.as_ref(),
+        input_values,
+        block,
+        context,
+        location,
+        false,
+        nested_functions,
+        token,
+    )
 }
 
 /// Inlines a nested sub-program into the given block by mapping the provided input
 /// MLIR values to the body's input atoms, lowering constants and instructions in topological
 /// order, and returning lowered values corresponding to the program's output atoms.
+///
+/// `token` is the effect token of the lowering scope the program inlines into: it flows into each instruction's
+/// lowerer and the updated token is read back out after the instruction lowers, so effectful instructions chain in
+/// program order and the caller observes the program's final token.
+#[allow(clippy::too_many_arguments)]
 fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -3492,6 +3068,7 @@ fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O, V>(
     location: LocationRef<'c, 't>,
     add_optimization_barrier: bool,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     V: MlirLowerableValue + BooleanLike,
@@ -3510,14 +3087,17 @@ where
                 .iter()
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let mut lowerer =
-                PlainMlirLowerer::new(*block, context, location).with_nested_functions(nested_functions.cloned());
-            instruction.operation().lower_to_mlir(
+            let mut lowerer = PlainMlirLowerer::new(*block, context, location)
+                .with_nested_functions(nested_functions.cloned())
+                .with_token(*token);
+            let outputs = instruction.operation().lower_to_mlir(
                 inputs,
                 output_types.as_slice(),
                 PlainMlirLoweringMode::Unpacked,
                 &mut lowerer,
-            )
+            )?;
+            *token = lowerer.token;
+            Ok(outputs)
         },
     )?;
     if outputs.is_empty() || !add_optimization_barrier {
@@ -3593,6 +3173,9 @@ where
     let input_values = (0..program.input_ids().len())
         .map(|index| block.argument(index).expect("body block arguments should exist").as_ref())
         .collect::<Vec<_>>();
+    // Function-body-scoped effect token chain, created lazily by the first effectful instruction and dropped at the
+    // end of the function body.
+    let mut token = None;
     replay_program_into_block(
         program,
         input_values,
@@ -3606,13 +3189,15 @@ where
                 .iter()
                 .map(|output| program.atoms()[output.index()].r#type().into_owned())
                 .collect::<Vec<_>>();
-            let mut lowerer = PlainMlirLowerer::new(*block, context, location);
-            instruction.operation().lower_to_mlir(
+            let mut lowerer = PlainMlirLowerer::new(*block, context, location).with_token(token);
+            let outputs = instruction.operation().lower_to_mlir(
                 inputs,
                 output_types.as_slice(),
                 PlainMlirLoweringMode::Unpacked,
                 &mut lowerer,
-            )
+            )?;
+            token = lowerer.token;
+            Ok(outputs)
         },
     )
 }
@@ -3647,6 +3232,10 @@ where
         })
         .collect::<Vec<_>>();
     let atom_values = std::cell::RefCell::new(atom_values);
+    // Function-body-scoped effect token chain, created lazily by the first effectful instruction and dropped at the
+    // end of the function body: this v1 design orders effects within one dispatch, and carrying tokens across
+    // separately dispatched executions is out of scope.
+    let mut token = None;
     replay_program_into_block(
         program,
         input_values,
@@ -3669,6 +3258,7 @@ where
                 context,
                 location,
                 nested_functions,
+                &mut token,
             )?;
             for (output_atom, lowered_output) in
                 instruction.outputs().iter().copied().zip(lowered_outputs.iter().copied())
@@ -3734,126 +3324,6 @@ where
         .results()
         .map(|result| result.map(|result| result.as_ref()).map_err(LoweringError::from))
         .collect()
-}
-
-/// Lowers one linear shard-map evaluation mode and returns its resulting values.
-fn lower_linear_shard_map_eval_mode<'b, 'c: 'b, 't: 'c>(
-    eval_mode: &LinearShardMapEvalMode,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-    match eval_mode {
-        LinearShardMapEvalMode::Body(body) => {
-            let simplified_body = body
-                .simplified()
-                .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-            let combined_inputs =
-                captured_values.iter().copied().chain(input_values.iter().copied()).collect::<Vec<_>>();
-            lower_manual_computation(
-                block,
-                combined_inputs.as_slice(),
-                simplified_body.shard_map(),
-                simplified_body.program(),
-                simplified_body.local_input_types(),
-                simplified_body.global_output_types(),
-                context,
-                location,
-            )
-        }
-        LinearShardMapEvalMode::FactorizedTranspose(factorized) => {
-            let residual_body = factorized
-                .residual_body()
-                .simplified()
-                .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-            let residual_inputs = factorized
-                .residual_input_indices()
-                .iter()
-                .copied()
-                .map(|input_index| {
-                    captured_values.get(input_index).copied().ok_or_else(|| {
-                        ProgramError::InvalidInputCount { expected: input_index + 1, actual: captured_values.len() }
-                            .into()
-                    })
-                })
-                .collect::<Result<Vec<_>, LoweringError>>()?;
-            let residual_results = if residual_body.global_output_types().is_empty() {
-                Vec::new()
-            } else {
-                lower_manual_computation(
-                    block,
-                    residual_inputs.as_slice(),
-                    residual_body.shard_map(),
-                    residual_body.program(),
-                    residual_body.local_input_types(),
-                    residual_body.global_output_types(),
-                    context,
-                    location,
-                )?
-            };
-            let apply_body = factorized
-                .apply_body()
-                .simplified()
-                .map_err(|error| LoweringError::SimplificationFailure { message: error.to_string() })?;
-            let mut apply_inputs = factorized
-                .apply_input_indices()
-                .iter()
-                .copied()
-                .map(|input_index| {
-                    input_values.get(input_index).copied().ok_or_else(|| {
-                        ProgramError::InvalidInputCount { expected: input_index + 1, actual: input_values.len() }.into()
-                    })
-                })
-                .collect::<Result<Vec<_>, LoweringError>>()?;
-            let mut residual_values = Vec::with_capacity(factorized.residual_sources().len());
-            for residual_source in factorized.residual_sources().iter().copied() {
-                match residual_source {
-                    FactorizedTransposeResidualSource::CapturedInput { index } => {
-                        residual_values.push(captured_values.get(index).copied().ok_or_else(|| {
-                            ProgramError::InvalidInputCount { expected: index + 1, actual: captured_values.len() }
-                        })?);
-                    }
-                    FactorizedTransposeResidualSource::ResidualOutput { index } => {
-                        residual_values.push(residual_results.get(index).copied().ok_or_else(|| {
-                            ProgramError::InvalidOutputCount { expected: index + 1, actual: residual_results.len() }
-                        })?);
-                    }
-                }
-            }
-            apply_inputs.extend(residual_values.iter().copied());
-            let apply_results = if apply_body.global_output_types().is_empty() {
-                Vec::new()
-            } else {
-                lower_manual_computation(
-                    block,
-                    apply_inputs.as_slice(),
-                    apply_body.shard_map(),
-                    apply_body.program(),
-                    apply_body.local_input_types(),
-                    apply_body.global_output_types(),
-                    context,
-                    location,
-                )?
-            };
-            factorized
-                .output_sources()
-                .iter()
-                .cloned()
-                .map(|output_source| match output_source {
-                    FactorizedTransposeOutputSource::Constant { value } => {
-                        lower_captured_constant(&value, captured_values)
-                    }
-                    FactorizedTransposeOutputSource::ApplyOutput { index } => {
-                        apply_results.get(index).copied().ok_or_else(|| {
-                            ProgramError::InvalidOutputCount { expected: index + 1, actual: apply_results.len() }.into()
-                        })
-                    }
-                })
-                .collect()
-        }
-    }
 }
 
 /// Lowers one concrete traced value to a StableHLO constant operation and returns its result value.
@@ -4007,12 +3477,27 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             }
             Ok(vec![input_values[0]])
         }
-        // `rematerialization_name` only affects rematerialization policies; by lowering time it is the identity, so
+        // `tag` only affects rematerialization policies; by lowering time it is the identity, so
         // forward the operand without emitting any MLIR operation.
-        XlaOperation::RematerializationName(_) => {
+        XlaOperation::Tag(_) => {
             if input_values.len() != 1 {
                 return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
             }
+            Ok(vec![input_values[0]])
+        }
+        // `print` is the identity on its dataflow output; its observable effect lowers to a host-callback custom
+        // call that consumes and produces a StableHLO token, so the effect ordering rides the scope's token chain
+        // instead of the value dataflow.
+        XlaOperation::Print(operation) => {
+            check_count!("input", input_values, 1, ProgramError);
+            lower_print_to_custom_call(
+                operation.label(),
+                input_values[0],
+                &mut lowerer.token,
+                &mut lowerer.block,
+                lowerer.context,
+                lowerer.location,
+            )?;
             Ok(vec![input_values[0]])
         }
         XlaOperation::TransferToMemory(operation) => lower_transfer_to_memory(
@@ -4031,6 +3516,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.location,
             false,
             lowerer.nested_functions.as_ref(),
+            &mut lowerer.token,
         ),
         XlaOperation::CustomVjp(operation) => lower_nested_program_inline(
             operation.primal(),
@@ -4040,7 +3526,15 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.location,
             false,
             lowerer.nested_functions.as_ref(),
+            &mut lowerer.token,
         ),
+        // The opaque custom-VJP tangent carrier is a forward-mode tangent map that reverse mode transposes away before
+        // lowering, so it never reaches the backend; reaching here means a forward-mode use of `custom_vjp` slipped
+        // through, which is reverse-mode-only.
+        XlaOperation::CustomVjpTangent(operation) => Err(ProgramError::UnsupportedOperation {
+            message: format!("operation `{}` cannot be lowered to StableHLO", operation.name()),
+        }
+        .into()),
         XlaOperation::Rematerialize(operation) => lower_nested_program_inline(
             operation.primal(),
             input_values,
@@ -4049,6 +3543,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.location,
             false,
             lowerer.nested_functions.as_ref(),
+            &mut lowerer.token,
         ),
         XlaOperation::ZeroLike(_) => {
             lower_like_constant(input_values, output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
@@ -4084,36 +3579,6 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 lowerer.location,
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
-        }
-        XlaOperation::Scale(operation) => {
-            let factor = operation.factor();
-            let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let factor_value = lower_constant(
-                AtomId::new(0),
-                factor,
-                captured_values,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?;
-            let factor_type = factor.r#type();
-            let factor_broadcast = if *factor_type != output_types[0] {
-                let broadcast = lowerer.block.append_operation(stable_hlo::broadcast(
-                    factor_value,
-                    output_tensor_type,
-                    &[],
-                    lowerer.location,
-                )?)?;
-                broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()
-            } else {
-                factor_value
-            };
-            let result = lowerer.block.append_operation(stable_hlo::multiply(
-                input_values[0],
-                factor_broadcast,
-                lowerer.location,
-            )?)?;
-            Ok(vec![result.result(0).expect("stablehlo.multiply should return one result").as_ref()])
         }
         XlaOperation::Fill(fill) => {
             check_count!("input", input_values, 0, ProgramError);
@@ -4311,6 +3776,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             lowerer.context,
             lowerer.location,
             lowerer.nested_functions.as_ref(),
+            &mut lowerer.token,
         ),
         XlaOperation::ShardMap(shard_map_op) => {
             let simplified_body = shard_map_op
@@ -4325,24 +3791,21 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 simplified_body.global_output_types(),
             )
         }
-        XlaOperation::LinearShardMap(shard_map_op) => lowerer.lower_linear_shard_map_eval_mode(
-            shard_map_op.linear_state().eval_mode(),
-            captured_values,
-            input_values,
-        ),
     }
 }
 
 /// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
+#[allow(clippy::too_many_arguments)]
 fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
     instruction: &Instruction<XlaOperation>,
-    atom_values: &[Option<ValueRef<'b, 'c, 't>>],
+    _atom_values: &[Option<ValueRef<'b, 'c, 't>>],
     input_values: &[ValueRef<'b, 'c, 't>],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
+    token: &mut Option<ValueRef<'b, 'c, 't>>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError>
 where
     ProgramInput: Parameterized<XlaConstant>,
@@ -4353,24 +3816,19 @@ where
         .iter()
         .map(|output| program.atoms()[output.index()].r#type().into_owned())
         .collect::<Vec<_>>();
-    let captured_values = match &instruction.operation() {
-        XlaOperation::LinearShardMap(shard_map_op) => shard_map_op
-            .linear_state()
-            .captured_global_primals()
-            .iter()
-            .map(|atom_id| atom_values[atom_id.index()].ok_or(LoweringError::MissingAtomValue { atom_id: *atom_id }))
-            .collect::<Result<Vec<_>, _>>()?,
-        _ => Vec::new(),
-    };
-    let mut lowerer =
-        ShardMapMlirLowerer::new(*block, context, location).with_nested_functions(nested_functions.cloned());
-    dispatch_lower_shard_map_mlir(
+    let captured_values: Vec<ValueRef<'b, 'c, 't>> = Vec::new();
+    let mut lowerer = ShardMapMlirLowerer::new(*block, context, location)
+        .with_nested_functions(nested_functions.cloned())
+        .with_token(*token);
+    let outputs = dispatch_lower_shard_map_mlir(
         &instruction.operation(),
         captured_values.as_slice(),
         input_values,
         output_types.as_slice(),
         &mut lowerer,
-    )
+    )?;
+    *token = lowerer.token;
+    Ok(outputs)
 }
 
 /// Normalizes a user-provided MLIR symbol name.
@@ -4397,7 +3855,7 @@ impl ToMlir for ComparisonDirection {
     }
 }
 
-/// Lowers an [`ArrayOperation::Compare`] / [`LinearArrayOperation::Compare`]-style dispatch to
+/// Lowers an [`ArrayOperation::Compare`]-style dispatch to
 /// `stablehlo.compare`. The resulting value has the broadcasted shape of the inputs and Boolean
 /// element type. The comparison semantic is routed based on the LHS value's element type
 /// (Float / Signed / Unsigned).
@@ -4760,11 +4218,8 @@ fn lower_element_type<'c, 't>(
 
 /// Builds the dense-elements attribute for one traced splat constant.
 /// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type
-/// matches `output_type`, then broadcasts that scalar to the full output shape. Used by both
-/// [`ArrayOperation::ScaleByConstant`](
-/// ryft_core::ArrayOperation::ScaleByConstant) and
-/// [`LinearArrayOperation::ScaleByConstant`](ryft_core::LinearArrayOperation::ScaleByConstant)
-/// lowerings.
+/// matches `output_type`, then broadcasts that scalar to the full output shape. Used by the
+/// constant-fill and `fill` lowerings.
 fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     factor: f64,
     output_type: &ArrayType,
@@ -5004,24 +4459,19 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use ryft_core::operations::compare::CompareOperation;
-    use ryft_core::operations::constants::{OneLike, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation};
+    use ryft_core::contexts::{Context, Domain};
+    use ryft_core::operations::constants::{OneLike, OneOperation, ZeroLike};
     use ryft_core::operations::manipulation::{
         ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, PadOperation, SliceOperation,
         Transpose, UpdateSliceOperation,
     };
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::parameters::Placeholder;
-    use ryft_core::payloads::Input;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tests::{TestArray, TestArrayDomain};
-    use ryft_core::tracing::TracingContext;
     use ryft_core::tracing_v2::DifferentiationContext;
-    use ryft_core::tracing_v2::operations::captures::MaterializeCaptureOperation;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::types::{Shape, Size};
-    #[cfg(feature = "ndarray")]
-    use ryft_ndarray::{Array as NdArrayValue, NdArrayDomain};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
     use super::*;
@@ -5246,14 +4696,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "ndarray")]
-    fn bilinear_matmul<M>(inputs: (M, M)) -> M
-    where
-        M: ryft_core::tracing_v2::DotOps,
-    {
-        inputs.0.dot(&inputs.1, &DotDimensionNumbers::matmul())
-    }
-
     #[test]
     fn test_to_mlir_module_renders_a_full_add_module() {
         let global_input_type = test_vector_type(8);
@@ -5291,7 +4733,7 @@ mod tests {
         let traced: TracedShardMap<ArrayType, ArrayType> = traced_shard_map(
             |x| {
                 let product = x.transpose(vec![1, 0]).unwrap().dot(&x, &DotDimensionNumbers::matmul());
-                let waveform = (-product).cos().sin();
+                let waveform = (-product).cos().unwrap().sin().unwrap();
                 (waveform.clone() * waveform.one_like()) + waveform.zero_like()
             },
             global_input_type,
@@ -5523,167 +4965,6 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_fused_linear_while_with_residual_injections() {
-        // Under tracing domains, the while JVP rule stages one doubled-state linear `while` whose body interleaves
-        // recomputed primal operations with defactorized tangent products, fed by nullary residual injections
-        // carrying the loop-entry primal state (eager domains unroll the loop instead, so no staged loop reaches
-        // lowering there). This test builds that fused-loop shape directly over the instantiated linear operation
-        // enum and verifies that it lowers end to end: the residual injection becomes a constant, the fused loop
-        // becomes `stablehlo.while`, and the recomputed product rule becomes `stablehlo.multiply` inside the loop
-        // body.
-        use ryft_core::operations::control_flow::WhileOperation as CoreWhileOperation;
-        use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
-        type CoreTestOperation = CoreArrayOperation<TestArray>;
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
-
-        let scalar_f64 = ArrayType::scalar(DataType::F64);
-        // Extended condition over the doubled state `[primal, tangent]`: recomputes `primal > 0` from the primal
-        // half and ignores the tangent half.
-        let mut condition_builder =
-            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let condition_primal = condition_builder.add_input(scalar_f64.clone());
-        let _condition_tangent = condition_builder.add_input(scalar_f64.clone());
-        let condition_zero = condition_builder
-            .add_instruction(
-                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::ZeroLike(
-                    ZeroLikeOperation,
-                ))),
-                vec![condition_primal],
-            )
-            .unwrap()[0];
-        let predicate = condition_builder
-            .add_instruction(
-                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Compare(
-                    CompareOperation::new(ComparisonDirection::GreaterThan),
-                ))),
-                vec![condition_primal, condition_zero],
-            )
-            .unwrap()[0];
-        let condition = condition_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        // Fused body over the doubled state: the recomputed primal half counts down while the tangent half carries
-        // the defactorized product rule `tangent' = primal * tangent` against the recomputed primal state.
-        let mut body_builder =
-            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let body_primal = body_builder.add_input(scalar_f64.clone());
-        let body_tangent = body_builder.add_input(scalar_f64.clone());
-        let one = body_builder
-            .add_instruction(
-                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::OneLike(OneLikeOperation))),
-                vec![body_primal],
-            )
-            .unwrap()[0];
-        let next_primal = body_builder
-            .add_instruction(
-                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Sub(SubOperation))),
-                vec![body_primal, one],
-            )
-            .unwrap()[0];
-        let next_tangent = body_builder
-            .add_instruction(
-                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Mul(MulOperation))),
-                vec![body_primal, body_tangent],
-            )
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![next_primal, next_tangent],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        let fused_while =
-            CoreWhileOperation::<ArrayType, TestArray, DirectLinearOperation, Input>::new(condition, body).unwrap();
-
-        // Tangent program: a nullary residual injection feeds the loop-entry primal state and the fused loop runs
-        // over `[primal, tangent]`, returning the final tangent half.
-        let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let tangent_input = builder.add_input(scalar_f64.clone());
-        let primal_entry =
-            builder.add_instruction(MaterializeCaptureOperation::new(TestArray::scalar(2.0)), vec![]).unwrap()[0];
-        let while_outputs = builder
-            .add_instruction(DirectLinearOperation::While(Box::new(fused_while)), vec![primal_entry, tangent_input])
-            .unwrap()
-            .to_vec();
-        let tangent_program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![while_outputs[1]], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&tangent_program, "main").unwrap();
-
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.compare"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.constant"), "{stablehlo}");
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_while_condition_to_if() {
-        // Fused while bodies rewrite linear conditions with loop-varying predicates into operand form: the
-        // recomputed predicate becomes operand 0 and forwarded loop-varying residuals become trailing operands that
-        // flow into both branch regions. The while-condition form lowers to `stablehlo.if` over the predicate
-        // operand with the branch programs inlined as regions, mirroring the factor-form lowering minus the
-        // materialized predicate literal.
-        use ryft_core::tracing_v2::{ArrayOperation as CoreArrayOperation, RecomputeOperation};
-        type CoreTestOperation = CoreArrayOperation<TestArray>;
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
-
-        let scalar_boolean = ArrayType::scalar(DataType::Boolean);
-        let scalar_f64 = ArrayType::scalar(DataType::F64);
-        // True branch: the defactorized product rule `tangent * forwarded_residual`; false branch: `2 * tangent`
-        // (the forwarded trailing input is unused there but keeps the branch signatures identical).
-        let mut true_builder =
-            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let true_tangent = true_builder.add_input(scalar_f64.clone());
-        let true_forwarded = true_builder.add_input(scalar_f64.clone());
-        let product = true_builder
-            .add_instruction(
-                DirectLinearOperation::Recompute(RecomputeOperation::new(CoreTestOperation::Mul(MulOperation))),
-                vec![true_forwarded, true_tangent],
-            )
-            .unwrap()[0];
-        let true_branch = true_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![product], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        let mut false_builder =
-            ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let false_tangent = false_builder.add_input(scalar_f64.clone());
-        let _false_forwarded = false_builder.add_input(scalar_f64.clone());
-        let doubled = false_builder
-            .add_instruction(
-                ScaleOperation::<ArrayType, TestArray, Input>::new(TestArray::scalar(2.0)),
-                vec![false_tangent],
-            )
-            .unwrap()[0];
-        let false_branch = false_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![doubled], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let predicate = builder.add_input(scalar_boolean);
-        let tangent = builder.add_input(scalar_f64.clone());
-        let forwarded = builder.add_input(scalar_f64);
-        let output = builder
-            .add_instruction(
-                ConditionOperation::new(true_branch, false_branch).unwrap(),
-                vec![predicate, tangent, forwarded],
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![output],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert!(stablehlo.contains("stablehlo.if"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
-    }
-
-    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_scan_to_while() {
         // A primal scan lowers to a `stablehlo.while` over `[counter, carries..., xs..., ys...]`: each iteration
         // reads one slice of the stacked inputs with `stablehlo.dynamic_slice`, inlines the body, and writes the
@@ -5731,7 +5012,7 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_fully_unrolled_scan_without_while() {
         // A scan whose unroll factor equals its length lowers to straight-line operations: no `stablehlo.while` is
-        // emitted at all and the body inlines once per lane (three `stablehlo.multiply` copies for `length = 3`).
+        // emitted at all and the body inlines once per iteration (three `stablehlo.multiply` copies for `length = 3`).
         use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
@@ -5773,8 +5054,8 @@ mod tests {
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_partially_unrolled_scan() {
         // A scan with `unroll = 2` over `length = 4` keeps the `stablehlo.while` skeleton but runs two body copies
-        // per loop trip: the body region contains two `stablehlo.multiply` copies (and one lane read/write pair per
-        // copy) while the counter advances by the unroll factor.
+        // per loop trip: the body region contains two `stablehlo.multiply` copies (and one iteration read/write pair
+        // per copy) while the counter advances by the unroll factor.
         use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
@@ -5813,75 +5094,422 @@ mod tests {
         assert_eq!(stablehlo.matches("stablehlo.dynamic_update_slice").count(), 2, "{stablehlo}");
     }
 
+    // ---------------------------------------------------------------------------
+    // Print lowering / effect-token threading tests
+    // ---------------------------------------------------------------------------
+
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_linear_scan_with_residual_stacks() {
-        // The linear scan staged by the scan JVP rule carries scan-local residual references in its body and the
-        // stacked residuals as factor payloads. Lowering materializes each stack as a constant, rewrites the body
-        // into operand form (the referenced scale becomes a recomputed `stablehlo.multiply` against the lane
-        // slice), and reuses the `stablehlo.while` scan skeleton with the stacks as extra scanned inputs.
-        use ryft_core::tracing_v2::ArrayOperation as CoreArrayOperation;
-        type DirectLinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
-        type ScanBodyOperation = LinearArrayOperation<
-            TestArray,
-            TestArray,
-            ValueOrCapture<ArrayType, TestArray>,
-            CoreArrayOperation<TestArray>,
-        >;
+    fn test_to_mlir_module_for_program_lowers_two_prints_through_one_token_chain() {
+        use ryft_core::operations::debugging::PrintOperation;
 
-        let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut body_builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, ScanBodyOperation>::new();
-        let tangent_carry = body_builder.add_input(scalar_f64.clone());
-        let tangent_x = body_builder.add_input(scalar_f64.clone());
-        let scaled = body_builder
-            .add_instruction(
-                ScaleOperation::<ArrayType, ValueOrCapture<ArrayType, TestArray>, Input>::new(
-                    ValueOrCapture::Capture { index: 0, r#type: scalar_f64.clone() },
-                ),
-                vec![tangent_carry],
-            )
-            .unwrap()[0];
-        let summed = body_builder.add_instruction(AddOperation, vec![scaled, tangent_x]).unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                vec![summed, summed],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-
-        let mut builder = ryft_core::programs::ProgramBuilder::<ArrayType, TestArray, DirectLinearOperation>::new();
-        let tangent_init = builder.add_input(scalar_f64);
-        let tangent_xs = builder.add_input(stacked_f64);
-        let scan =
-            ScanOperation::<ArrayType, TestArray, ScanBodyOperation, TestArray, Input>::new_with_payload(body, 1, 3)
-                .unwrap()
-                .with_reverse(true)
-                .with_captures(vec![TestArray::vector(vec![2.0, 3.0, 4.0])]);
-        let outputs = builder
-            .add_instruction(DirectLinearOperation::Scan(Box::new(scan)), vec![tangent_init, tangent_xs])
-            .unwrap()
-            .to_vec();
+        // Two prints in one flat program: the token chain is created lazily by one zero-operand
+        // `stablehlo.after_all` at the first print, the second print consumes the first print's token result, and
+        // each print's dataflow output is its forwarded operand (the final add reads `%arg0` and `%0`, not custom
+        // call results).
+        let array_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(array_type.clone());
+        let doubled = builder.add_instruction(AddOperation, vec![input, input]).unwrap()[0];
+        let first = builder.add_instruction(PrintOperation::new("first"), vec![input]).unwrap()[0];
+        let second = builder.add_instruction(PrintOperation::new("second"), vec![doubled]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![first, second]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(
-                outputs,
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![array_type.clone()];
+        let output_types = vec![array_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf64>) -> tensor<2xf64> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<2xf64>
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "first"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%0, %2) {api_version = 4 : i32, backend_config = {label = "second"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    %4 = stablehlo.add %arg0, %0 : tensor<2xf64>
+                    return %4 : tensor<2xf64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_scan_body_print_with_token_loop_state() {
+        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+        use ryft_core::operations::debugging::PrintOperation;
+
+        // A print inside a scan body makes the lowered `stablehlo.while` carry the effect token as one extra
+        // trailing state element: the entry token is created before the loop, both regions receive it as an extra
+        // block argument, the body threads it through the print custom call, and the loop's trailing result
+        // continues the chain (unused here because the program ends right after the scan).
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut body_builder = XlaProgramBuilder::new();
+        let carry = body_builder.add_input(scalar_f64.clone());
+        let x = body_builder.add_input(scalar_f64.clone());
+        let printed = body_builder.add_instruction(PrintOperation::new("iteration"), vec![x]).unwrap()[0];
+        let sum = body_builder.add_instruction(AddOperation, vec![carry, printed]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let scan = CoreScanOperation::<ArrayType, _, _>::new(body, 1, 3).unwrap();
+
+        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let init = builder.add_input(scalar_f64.clone());
+        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let output =
+            builder.add_instruction(XlaOperation::Scan(Box::new(scan)), vec![init, stacked_inputs]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
                 vec![Placeholder, Placeholder],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder],
             )
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        let input_types = vec![scalar_f64.clone(), stacked_type];
+        let output_types = vec![scalar_f64];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
 
-        assert!(stablehlo.contains("stablehlo.while"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.dynamic_update_slice"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.multiply"), "{stablehlo}");
-        // The residual stack materializes as a dense constant in the enclosing block.
-        assert!(
-            stablehlo.contains("stablehlo.constant dense<[2.000000e+00, 3.000000e+00, 4.000000e+00]>"),
-            "{stablehlo}"
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>, %arg1: tensor<3xf64>) -> tensor<f64> {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1:4 = stablehlo.while(%iterArg = %c, %iterArg_0 = %arg0, %iterArg_1 = %arg1, %iterArg_2 = %0) : tensor<i64>, tensor<f64>, tensor<3xf64>, !stablehlo.token
+                    cond {
+                      %c_3 = stablehlo.constant dense<3> : tensor<i64>
+                      %2 = stablehlo.compare LT, %iterArg, %c_3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                      stablehlo.return %2 : tensor<i1>
+                    } do {
+                      %c_3 = stablehlo.constant dense<0> : tensor<i64>
+                      %2 = stablehlo.dynamic_slice %iterArg_1, %iterArg, sizes = [1] : (tensor<3xf64>, tensor<i64>) -> tensor<1xf64>
+                      %3 = stablehlo.reshape %2 : (tensor<1xf64>) -> tensor<f64>
+                      %4 = stablehlo.custom_call @ryft.print(%3, %iterArg_2) {api_version = 4 : i32, backend_config = {label = "iteration"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %5 = stablehlo.add %iterArg_0, %3 : tensor<f64>
+                      %c_4 = stablehlo.constant dense<1> : tensor<i64>
+                      %6 = stablehlo.add %iterArg, %c_4 : tensor<i64>
+                      stablehlo.return %6, %5, %iterArg_1, %4 : tensor<i64>, tensor<f64>, tensor<3xf64>, !stablehlo.token
+                    }
+                    return %1#1 : tensor<f64>
+                  }
+                }
+            "#},
         );
-        // The reversed visit order lowers the lane index as `length - 1 - counter`.
-        assert!(stablehlo.contains("stablehlo.subtract"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_condition_branch_print_with_token_result() {
+        use ryft_core::operations::debugging::PrintOperation;
+
+        // A print inside one condition branch makes the lowered `stablehlo.if` return the branch's final effect
+        // token as one extra trailing result: both branches capture the entry token implicitly, the effectful branch
+        // returns its print custom call's token, and the pure branch returns the entry token unchanged.
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let input_type = ArrayType::scalar(DataType::F64);
+        let mut true_builder = XlaProgramBuilder::new();
+        let true_input = true_builder.add_input(input_type.clone());
+        let printed = true_builder.add_instruction(PrintOperation::new("taken"), vec![true_input]).unwrap()[0];
+        let negated = true_builder.add_instruction(NegOperation, vec![printed]).unwrap()[0];
+        let true_branch = true_builder.build(vec![negated], vec![Placeholder], vec![Placeholder]).unwrap();
+        let condition = ConditionOperation::new(true_branch, xla_identity_branch(input_type.clone())).unwrap();
+
+        let mut builder = XlaProgramBuilder::new();
+        let predicate = builder.add_input(predicate_type.clone());
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(XlaOperation::Condition(Box::new(condition)), vec![predicate, input])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let input_types = vec![predicate_type, input_type.clone()];
+        let output_types = vec![input_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1:2 = "stablehlo.if"(%arg0) ({
+                      %2 = stablehlo.custom_call @ryft.print(%arg1, %0) {api_version = 4 : i32, backend_config = {label = "taken"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                      %3 = stablehlo.negate %arg1 : tensor<f64>
+                      stablehlo.return %3, %2 : tensor<f64>, !stablehlo.token
+                    }, {
+                      stablehlo.return %arg1, %0 : tensor<f64>, !stablehlo.token
+                    }) : (tensor<i1>) -> (tensor<f64>, !stablehlo.token)
+                    return %1#0 : tensor<f64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_repeated_effectful_jit_call_callees_inline_and_chain_prints() {
+        use ryft_core::operations::debugging::PrintOperation;
+
+        // A repeated `jit_call` callee that prints is excluded from function deduplication and inlines at every
+        // call site, so both inlined prints chain onto the caller's single token chain in program order (a shared
+        // token-free `func.func` could not preserve that ordering).
+        let array_type = test_vector_type(4);
+        let mut callee_builder = XlaProgramBuilder::new();
+        let callee_input = callee_builder.add_input(array_type.clone());
+        let printed = callee_builder.add_instruction(PrintOperation::new("callee"), vec![callee_input]).unwrap()[0];
+        let callee_output = callee_builder.add_instruction(AddOperation, vec![printed, printed]).unwrap()[0];
+        let callee =
+            std::rc::Rc::new(callee_builder.build(vec![callee_output], vec![Placeholder], vec![Placeholder]).unwrap());
+        let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "callee"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    %3 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "callee"}, has_side_effect = true} : (tensor<4xf32>, !stablehlo.token) -> !stablehlo.token
+                    %4 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    %5 = stablehlo.add %2, %4 : tensor<4xf32>
+                    return %5 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_jit_two_prints_execute_in_order_on_cpu() {
+        use ryft_core::operations::debugging::Print;
+        use ryft_core::sharding::{Device, DeviceMesh};
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::experimental::domains::XlaDomain;
+        use crate::tests::{values_from_bytes, values_to_bytes};
+        use crate::{Array, CompiledXlaFunction, FromPjrt, compile};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![device],
+        )
+        .unwrap();
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
+            |x| {
+                let x = x.print("x");
+                (x.clone() + x).print("doubled")
+            },
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        let values = [1.5f64, 2.5];
+        let source =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
+                .unwrap();
+        let (output, lines) = with_captured_prints(|| compiled.interpret(source).unwrap());
+
+        // Both prints fire in program order, and the printed values are the forwarded operands.
+        assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string(), "doubled: [3.0, 5.0]".to_string()]);
+
+        // The compiled function still computes its dataflow output (each print is the identity on its operand).
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let output_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_scan_body_print_with_token_loop_state_executes_on_cpu() {
+        use std::sync::Arc;
+
+        use ryft_core::operations::control_flow::ScanOperation as CoreScanOperation;
+        use ryft_core::operations::debugging::PrintOperation;
+        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+        use ryft_pjrt::{
+            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+            load_cpu_plugin,
+        };
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::tests::{values_from_bytes, values_to_bytes};
+
+        // Executes the token-in-loop-state lowering on the real CPU plugin: the effect token is a
+        // `stablehlo.while` carry and each iteration's print custom call consumes and produces it, so this pins that
+        // XLA accepts and runs token-carrying loops (not just the flat token chain).
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let mut body_builder = XlaProgramBuilder::new();
+        let carry = body_builder.add_input(scalar_f64.clone());
+        let x = body_builder.add_input(scalar_f64.clone());
+        let printed = body_builder.add_instruction(PrintOperation::new("iteration"), vec![x]).unwrap()[0];
+        let sum = body_builder.add_instruction(AddOperation, vec![carry, printed]).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let scan = CoreScanOperation::<ArrayType, _, _>::new(body, 1, 3).unwrap();
+
+        let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let mut builder = XlaProgramBuilder::new();
+        let init = builder.add_input(scalar_f64.clone());
+        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let output =
+            builder.add_instruction(XlaOperation::Scan(Box::new(scan)), vec![init, stacked_inputs]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let input_types = vec![scalar_f64.clone(), stacked_type];
+        let output_types = vec![scalar_f64];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let options = CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: std::collections::HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        };
+        let executable = client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &options).unwrap();
+        let device = executable.addressable_devices().unwrap()[0].clone();
+        let init_bytes = values_to_bytes::<f64>(&[1.0]);
+        let stacked_bytes = values_to_bytes::<f64>(&[1.0, 2.0, 3.0]);
+
+        let ((), lines) = with_captured_prints(|| {
+            let inputs = ExecutionDeviceInputs {
+                inputs: &[
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(init_bytes.as_slice(), BufferType::F64, &[], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                    ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(stacked_bytes.as_slice(), BufferType::F64, &[3], None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    },
+                ],
+                ..Default::default()
+            };
+            let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap().remove(0);
+            assert!(outputs.done.r#await().is_ok());
+            assert_eq!(outputs.outputs.len(), 1);
+            let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
+            assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![7.0]);
+        });
+
+        // One print per scan iteration, in iteration order.
+        assert_eq!(
+            lines,
+            vec!["iteration: 1.0".to_string(), "iteration: 2.0".to_string(), "iteration: 3.0".to_string()],
+        );
+    }
+
+    #[test]
+    fn test_grad_of_jitted_print_function_prints_once_on_cpu() {
+        use ryft_core::operations::debugging::Print;
+        use ryft_core::sharding::{Device, DeviceMesh};
+        use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+
+        use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
+        use crate::experimental::domains::XlaDomain;
+        use crate::tests::{values_from_bytes, values_to_bytes};
+        use crate::{Array, CompiledXlaFunction, FromPjrt, compile};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        ensure_print_handler_registered(&client).unwrap();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![device],
+        )
+        .unwrap();
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F64, Shape::new(Vec::new()))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|x| (x.clone() * x).print("y"), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.value_and_gradient().unwrap();
+
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&[3.0]).as_slice())
+                .unwrap();
+        let (output, lines) = with_captured_prints(|| gradient.interpret(input).unwrap());
+
+        // The print fires exactly once, during the forward pass of the differentiated program; transposition is the
+        // identity on the cotangent and re-prints nothing.
+        assert_eq!(lines, vec!["y: 9.0".to_string()]);
+
+        // The gradient of `x * x` at `x = 3` is `6`.
+        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
+        let output_bytes = output
+            .device_shard(device_id)
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![6.0]);
     }
 
     // ---------------------------------------------------------------------------
@@ -5892,14 +5520,14 @@ mod tests {
     where
         T: Clone + ryft_core::operations::trigonometric::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
-        inputs.0.clone() * inputs.1 + inputs.0.sin()
+        inputs.0.clone() * inputs.1 + inputs.0.sin().unwrap()
     }
 
     fn scalar_quartic_plus_sin<T>(x: T) -> T
     where
         T: Clone + ryft_core::operations::trigonometric::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
-        x.clone() * x.clone() * x.clone() * x.clone() + x.sin()
+        x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
     }
 
     static TEST_ARRAY_DOMAIN: TestArrayDomain = TestArrayDomain;
@@ -5915,12 +5543,12 @@ mod tests {
                 (TestArray, TestArray),
                 TestArray,
             >,
-        ) = TracingContext::interpret_and_trace(
-            &TEST_ARRAY_DOMAIN,
-            |inputs| Ok(scalar_bilinear_sin(inputs)),
-            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-        )
-        .unwrap();
+        ) = TEST_ARRAY_DOMAIN
+            .interpret_and_trace(
+                |inputs| Ok(scalar_bilinear_sin(inputs)),
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         assert_eq!(
@@ -5949,16 +5577,16 @@ mod tests {
                 TestArray,
                 TestArray,
             >,
-        ) = TracingContext::interpret_and_trace(
-            &TEST_ARRAY_DOMAIN,
-            |x| {
-                let context = x.context().clone();
-                Ok(DifferentiationContext::value_and_gradient(&context, scalar_quartic_plus_sin, x)
-                    .expect("scalar value_and_gradient should succeed"))
-            },
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
+        ) = TEST_ARRAY_DOMAIN
+            .interpret_and_trace(
+                |x| {
+                    let context = x.context().clone();
+                    Ok(DifferentiationContext::value_and_gradient(&context, scalar_quartic_plus_sin, x)
+                        .expect("scalar value_and_gradient should succeed"))
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft grad(x^4 + sin(x)) StableHLO ===\n{stablehlo}");
@@ -6092,16 +5720,18 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-            TestArray,
-            TestArray,
+            ArrayOperation<TestArray>,
+            Vec<TestArray>,
+            Vec<TestArray>,
         >;
 
         // The static slice pullback writes the cotangent into a zero array at the static offsets via the
         // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
         // The structural-zero destination is emitted as a `ZeroOperation` instruction in the pullback, which lowers
-        // through the canonical zero path to a scalar constant broadcast to the array shape.
-        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+        // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
+        // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
+        // pullback captures no residuals, so the pullback consumes only the single output cotangent.
+        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) = TestArrayDomain
             .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -6122,7 +5752,7 @@ mod tests {
 
         // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
-        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) = TestArrayDomain
             .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -6144,11 +5774,11 @@ mod tests {
         type TestPadPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-            TestArray,
-            (TestArray, TestArray),
+            ArrayOperation<TestArray>,
+            Vec<TestArray>,
+            Vec<TestArray>,
         >;
-        let (_, pullback): (TestArray, TestPadPullbackProgram) = TestArrayDomain
+        let (_, pullback, _): (TestArray, TestPadPullbackProgram, Vec<TestArray>) = TestArrayDomain
             .vjp(
                 |(x, padding_value)| {
                     use ryft_core::operations::manipulation::Pad;
@@ -6177,7 +5807,7 @@ mod tests {
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
         // integer constants through `lower_literal_value`.
-        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) = TestArrayDomain
             .vjp(
                 |x| {
                     let start = x.context().constant(TestArray::new(ArrayType::scalar(DataType::I32), vec![1.0]));
@@ -6192,9 +5822,9 @@ mod tests {
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2xf64>) -> tensor<4xf64> {
+                    %c = stablehlo.constant dense<1> : tensor<i32>
                     %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
                     %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<4xf64>
-                    %c = stablehlo.constant dense<1> : tensor<i32>
                     %1 = stablehlo.dynamic_update_slice %0, %arg0, %c : (tensor<4xf64>, tensor<2xf64>, tensor<i32>) -> tensor<4xf64>
                     return %1 : tensor<4xf64>
                   }
@@ -6205,16 +5835,22 @@ mod tests {
 
     #[test]
     fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
-        // Standalone pullback â€” specialized to primal point (x=2.0, y=3.0), like JAX's standalone vjp_fn.
-        let (_, pullback): (
+        // Standalone pullback over the primal operation family, produced by the partition-aware reverse path.
+        // The reverse program of `f(x, y) = x * y + sin(x)` consumes `[output_cotangent ++ residuals]`, where the
+        // residuals are the linearization-point factors `cos(x)`, `x`, and `y`, and lowers the residual-weighted
+        // backward pass as `stablehlo.multiply`s of the cotangent against those residual inputs rather than baking the
+        // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
+        // explicit arguments.
+        let (_, pullback, _): (
             TestArray,
             ryft_core::programs::Program<
                 ArrayType,
                 TestArray,
-                ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-                TestArray,
-                (TestArray, TestArray),
+                ArrayOperation<TestArray>,
+                Vec<TestArray>,
+                Vec<TestArray>,
             >,
+            Vec<TestArray>,
         ) = TestArrayDomain
             .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
             .unwrap();
@@ -6222,51 +5858,82 @@ mod tests {
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
 
-        // Pullback takes one cotangent, returns two cotangent outputs (for x and y).
-        assert!(stablehlo.contains("-> (tensor<f64>, tensor<f64>)"), "pullback should return two outputs");
-        // Scale ops with baked-in primal values (cos(2.0), y=3.0, x=2.0) lower to multiply-by-constant.
-        assert!(stablehlo.matches("stablehlo.constant").count() >= 2, "should have baked-in primal constants");
+        // The pullback takes the output cotangent plus three residual inputs and returns two cotangent outputs (for x
+        // and y).
+        assert!(
+            stablehlo.contains(
+                "func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>, %arg3: tensor<f64>) -> \
+                 (tensor<f64>, tensor<f64>)",
+            ),
+            "pullback should take a cotangent plus residual inputs and return two outputs, but got:\n{stablehlo}",
+        );
+        // The residual-weighted reverse multiplies the cotangent by the residual inputs rather than baking the primal
+        // point in as constants, so the lowering is multiplies-and-adds with no `stablehlo.constant`.
+        assert!(stablehlo.contains("stablehlo.multiply"), "residual-weighted reverse should multiply: \n{stablehlo}");
+        assert!(
+            !stablehlo.contains("stablehlo.constant"),
+            "residuals are runtime inputs, not baked-in constants, but got:\n{stablehlo}",
+        );
     }
 
     #[test]
-    fn test_rematerialized_vjp_pullback_lowers_with_an_optimization_barrier() {
+    fn test_rematerialized_vjp_pullback_lowers_without_a_rematerialization_boundary() {
         use ryft_core::tracing_v2::rematerialize;
 
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-            TestArray,
-            TestArray,
+            ArrayOperation<TestArray>,
+            Vec<TestArray>,
+            Vec<TestArray>,
         >;
 
-        // The rematerialized pullback inlines the derived backward program behind a
-        // `stablehlo.optimization_barrier`, so XLA cannot common-subexpression-eliminate the recomputed values
-        // against the forward pass — the analogue of `jax.checkpoint`'s default `prevent_cse=True`.
-        let function = rematerialize(&TEST_ARRAY_DOMAIN, |x: ryft_core::tracing::DomainTracer<'_, TestArrayDomain>| {
-            Ok((x.clone() * x).sin())
-        });
-        let (_, pullback): (TestArray, TestPullbackProgram) =
-            TestArrayDomain.vjp(|x| function.call(x), TestArray::scalar(2.0)).unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
-        assert!(
-            stablehlo.contains("stablehlo.optimization_barrier"),
-            "the rematerialized pullback should lower with an optimization barrier, but got:\n{stablehlo}",
-        );
+        // The value-level `vjp` runs on the partition-aware reverse path, which splices the rematerialized
+        // region's recompute-and-pushforward into the program as ordinary straight-line primal operations and
+        // transposes them like any other computation. The rematerialization boundary is purely a forward-pass memory
+        // tradeoff with no effect on the differentiated result, so the resulting pullback carries no
+        // `stablehlo.optimization_barrier`: it is the same residual-weighted backward pass as the un-rematerialized
+        // body. The `prevent_cse` optimization-barrier hint applies to the forward/JVP lowering of a retained
+        // `RematerializeOperation`, not to this reverse pullback, so toggling it leaves the pullback unchanged. For
+        // `f(x) = sin(x · x)` the pullback consumes `[output_cotangent ++ residuals]` (residuals `cos(x²)` and `x`)
+        // and lowers to the symmetric `d(x · x) = 2x · dx` transpose — two `stablehlo.multiply` branches summed —
+        // scaled by `cos(x²)`.
+        let expected = indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>) -> tensor<f64> {
+                %0 = stablehlo.multiply %arg2, %arg0 : tensor<f64>
+                %1 = stablehlo.multiply %arg1, %0 : tensor<f64>
+                %2 = stablehlo.multiply %arg1, %0 : tensor<f64>
+                %3 = stablehlo.add %1, %2 : tensor<f64>
+                return %3 : tensor<f64>
+              }
+            }
+        "#};
 
-        // Disabling `prevent_cse` drops the barrier and nothing else.
-        let function = rematerialize(&TEST_ARRAY_DOMAIN, |x: ryft_core::tracing::DomainTracer<'_, TestArrayDomain>| {
-            Ok((x.clone() * x).sin())
-        })
-        .with_prevent_cse(false);
-        let (_, pullback): (TestArray, TestPullbackProgram) =
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: ryft_core::tracing::DomainTracer<TestArrayDomain>| {
+                Ok((x.clone() * x).sin()?)
+            });
+        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
             TestArrayDomain.vjp(|x| function.call(x), TestArray::scalar(2.0)).unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert!(
             !stablehlo.contains("stablehlo.optimization_barrier"),
-            "a prevent_cse(false) rematerialized pullback should lower without an optimization barrier, but got:\n\
-             {stablehlo}",
+            "the reverse path strips the rematerialization boundary, so the pullback should lower without an \
+             optimization barrier, but got:\n{stablehlo}",
         );
+        assert_eq!(stablehlo, expected);
+
+        // Disabling `prevent_cse` changes nothing about the reverse pullback: the hint only affects forward lowering.
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: ryft_core::tracing::DomainTracer<TestArrayDomain>| {
+                Ok((x.clone() * x).sin()?)
+            })
+            .with_prevent_cse(false);
+        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
+            TestArrayDomain.vjp(|x| function.call(x), TestArray::scalar(2.0)).unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
+        assert_eq!(stablehlo, expected, "the reverse pullback is independent of the prevent_cse hint");
     }
 
     #[test]
@@ -6278,9 +5945,8 @@ mod tests {
         // identity-looking transfer back to device memory, which `HostOffloader` needs to see. The program mirrors
         // the JAX example in `python/scripts/dump_transfer_to_memory_mlir_from_jax.py`, and the asserted custom
         // calls are byte-identical to the ones JAX emits for it.
-        let (_, program) = TracingContext::trace(
-            &TEST_ARRAY_DOMAIN,
-            |x: ryft_core::tracing::DomainTracer<'_, TestArrayDomain>| {
+        let (_, program) = TestArrayDomain::trace(
+            |x: ryft_core::tracing::DomainTracer<TestArrayDomain>| {
                 let y = x.clone() * x;
                 let on_host = y.transfer_to_memory(Memory::Host { pinned: true });
                 let back = on_host.transfer_to_memory(Memory::Device);
@@ -6317,14 +5983,14 @@ mod tests {
         type TestPullbackProgram = ryft_core::programs::Program<
             ArrayType,
             TestArray,
-            ryft_core::tracing_v2::LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-            TestArray,
-            TestArray,
+            ArrayOperation<TestArray>,
+            Vec<TestArray>,
+            Vec<TestArray>,
         >;
 
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
-        let (_, pullback): (TestArray, TestPullbackProgram) = TestArrayDomain
+        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) = TestArrayDomain
             .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), TestArray::scalar(2.0))
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
@@ -6345,16 +6011,16 @@ mod tests {
                 (TestArray, TestArray),
                 (TestArray, TestArray),
             >,
-        ) = TracingContext::interpret_and_trace(
-            &TEST_ARRAY_DOMAIN,
-            |inputs| {
-                let context = inputs.0.context().clone();
-                Ok(DifferentiationContext::value_and_gradient(&context, scalar_bilinear_sin, inputs)
-                    .expect("scalar value_and_gradient should succeed"))
-            },
-            (TestArray::scalar(2.0), TestArray::scalar(3.0)),
-        )
-        .unwrap();
+        ) = TEST_ARRAY_DOMAIN
+            .interpret_and_trace(
+                |inputs| {
+                    let context = inputs.0.context().clone();
+                    Ok(DifferentiationContext::value_and_gradient(&context, scalar_bilinear_sin, inputs)
+                        .expect("scalar value_and_gradient should succeed"))
+                },
+                (TestArray::scalar(2.0), TestArray::scalar(3.0)),
+            )
+            .unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&compiled, "main").unwrap();
         println!("=== ryft jit(grad(bilinear_sin)) StableHLO ===\n{stablehlo}");
@@ -6365,42 +6031,5 @@ mod tests {
         assert!(stablehlo.contains("%arg0") && stablehlo.contains("%arg1"), "should reference both inputs");
         // No sine (sin derivative = cosine, not sine).
         assert!(!stablehlo.contains("stablehlo.sine"), "gradient should not contain sine");
-    }
-
-    #[cfg(feature = "ndarray")]
-    #[test]
-    fn test_to_mlir_module_for_plain_program_renders_transposed_matrix_pullback_factors() {
-        let left = NdArrayValue::from_shape_vec([2, 2], vec![1.0f64, 2.0, 3.0, 4.0]).unwrap();
-        let right = NdArrayValue::from_shape_vec([2, 2], vec![5.0f64, 6.0, 7.0, 8.0]).unwrap();
-        let (_, pullback): (
-            NdArrayValue<f64>,
-            ryft_core::programs::Program<
-                ArrayType,
-                NdArrayValue<f64>,
-                ryft_core::tracing_v2::LinearArrayOperation<
-                    NdArrayValue<f64>,
-                    NdArrayValue<f64>,
-                    NdArrayValue<f64>,
-                    ArrayOperation<NdArrayValue<f64>>,
-                >,
-                NdArrayValue<f64>,
-                (NdArrayValue<f64>, NdArrayValue<f64>),
-            >,
-        ) = NdArrayDomain::<f64>::new().vjp(|inputs| Ok(bilinear_matmul(inputs)), (left, right)).unwrap();
-
-        assert_eq!(
-            to_mlir_module_for_plain_program(&pullback, "main").unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2x2xf64>) -> (tensor<2x2xf64>, tensor<2x2xf64>) {
-                    %cst = stablehlo.constant dense<[[5.000000e+00, 7.000000e+00], [6.000000e+00, 8.000000e+00]]> : tensor<2x2xf64>
-                    %0 = stablehlo.dot_general %arg0, %cst, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf64>, tensor<2x2xf64>) -> tensor<2x2xf64>
-                    %cst_0 = stablehlo.constant dense<[[1.000000e+00, 3.000000e+00], [2.000000e+00, 4.000000e+00]]> : tensor<2x2xf64>
-                    %1 = stablehlo.dot_general %cst_0, %arg0, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf64>, tensor<2x2xf64>) -> tensor<2x2xf64>
-                    return %0, %1 : tensor<2x2xf64>, tensor<2x2xf64>
-                  }
-                }
-            "#}
-        );
     }
 }
