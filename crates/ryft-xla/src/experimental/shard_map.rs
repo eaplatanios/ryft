@@ -10,15 +10,16 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
-use ryft_core::contexts::StagingContext;
+use ryft_core::contexts::{Domain, StagingContext};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::{Tracer, TracingContext};
+use ryft_core::tracing::Tracer;
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
+use crate::experimental::operations::ShardMapOperation;
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
 use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
 
@@ -212,7 +213,7 @@ impl From<ShardMapError> for ShardMapTraceError {
 }
 
 /// Default static tracer alias used by public XLA tracing helpers.
-pub(crate) type ShardMapTracer = XlaTracer<'static, 'static>;
+pub(crate) type ShardMapTracer = XlaTracer<'static>;
 
 /// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API.
 fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
@@ -283,6 +284,91 @@ fn remap_atom_id(atom_id_mapping: &[Option<AtomId>], atom_id: AtomId) -> Result<
         .copied()
         .flatten()
         .ok_or(ProgramError::UnboundAtomId { id: atom_id })
+}
+
+/// Rewrites a traced XLA program to drop dead outputs of [`shard_map`](XlaOperation::ShardMap) instructions.
+///
+/// [`Program::simplified`](ryft_core::Program::simplified) is conservative for multi-output instructions: it keeps an
+/// entire instruction whenever any of its outputs is live. The forward-mode `shard_map` rule
+/// (`ShardMapOperation::jvp`) emits a primal `shard_map` producing `[primal_outputs..., residuals...]`, so when a
+/// primal output is dead — as the discarded primal output of a `value_and_gradient` is — that conservative rule keeps
+/// the dead output and its body computation. This pass walks the program and, for each `shard_map` instruction with at
+/// least one dead output (per whole-program liveness), rebuilds it with its body projected to the live outputs through
+/// [`FlatTracedShardMap::with_live_outputs`], allocating only the live output atoms. Dead `shard_map` outputs have no
+/// uses by definition, so dropping them rewires nothing downstream. Every other instruction is copied verbatim; a
+/// subsequent [`simplified`](ryft_core::Program::simplified) prunes any instructions left dead by the projection.
+pub(crate) fn prune_dead_shard_map_outputs<ProgramInput, ProgramOutput>(
+    program: &XlaProgram<ProgramInput, ProgramOutput>,
+) -> Result<XlaProgram<ProgramInput, ProgramOutput>, ShardMapTraceError>
+where
+    ProgramInput: Parameterized<XlaConstant>,
+    ProgramOutput: Parameterized<XlaConstant>,
+{
+    let live_atoms = program.live_sets();
+    let live_atoms = live_atoms.atoms();
+    let mut builder = XlaProgramBuilder::new();
+    let mut atom_id_mapping = vec![None; program.atoms().len()];
+
+    for input_id in program.input_ids().iter().copied() {
+        let Atom::Variable(input_type) = &program.atoms()[input_id.index()] else {
+            return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()).into());
+        };
+        atom_id_mapping[input_id.index()] = Some(builder.add_input(input_type.clone()));
+    }
+    for (atom_index, atom) in program.atoms().iter().enumerate() {
+        if atom_id_mapping[atom_index].is_some() {
+            continue;
+        }
+        if let Atom::Constant(value) = atom {
+            atom_id_mapping[atom_index] = Some(builder.add_constant(value.clone()));
+        }
+    }
+
+    for instruction in program.instructions() {
+        let inputs = instruction
+            .inputs()
+            .iter()
+            .copied()
+            .map(|input| remap_atom_id(atom_id_mapping.as_slice(), input))
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let live_outputs = instruction
+            .outputs()
+            .iter()
+            .map(|output| live_atoms.get(output.index()).copied().unwrap_or(false))
+            .collect::<Vec<_>>();
+        // Project a `shard_map` body only when some outputs are live and some are dead. A fully dead `shard_map` is left
+        // intact for the subsequent `simplified` to drop wholesale, and a fully live one is copied verbatim.
+        let has_dead_output = live_outputs.iter().any(|&live| !live);
+        let has_live_output = live_outputs.iter().any(|&live| live);
+        let operation = match instruction.operation() {
+            XlaOperation::ShardMap(shard_map_op) if has_dead_output && has_live_output => {
+                let projected = shard_map_op.body().with_live_outputs(live_outputs.as_slice())?;
+                XlaOperation::ShardMap(Box::new(ShardMapOperation::new(projected)))
+            }
+            operation => operation.clone(),
+        };
+        let new_outputs = builder.add_instruction(operation, inputs)?.to_vec();
+        let mut next_new_output = new_outputs.into_iter();
+        for (output, live) in instruction.outputs().iter().copied().zip(live_outputs) {
+            if live {
+                atom_id_mapping[output.index()] = Some(next_new_output.next().ok_or_else(|| {
+                    ProgramError::MalformedProgram("projected shard_map produced too few live outputs".to_string())
+                })?);
+            }
+        }
+    }
+
+    let output_ids = program
+        .output_ids()
+        .iter()
+        .copied()
+        .map(|output| remap_atom_id(atom_id_mapping.as_slice(), output))
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    Ok(builder.build::<ProgramInput, ProgramOutput>(
+        output_ids,
+        program.input_structure().clone(),
+        program.output_structure().clone(),
+    )?)
 }
 
 pub(crate) type ShardMapLocalTraceInput<Input> = <Input as Parameterized<ArrayType>>::To<ShardMapTracer>;
@@ -380,14 +466,14 @@ fn stage_sharding_control_per_leaf<C, Input>(
 ) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input: Parameterized<Tracer<C, C::Meta>, To<Tracer<C, C::Meta>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     fn stage_leaf<C>(
-        input: Tracer<C>,
+        input: Tracer<C, C::Meta>,
         sharding: Sharding,
         make_operation: &impl Fn(Sharding) -> XlaOperation,
-    ) -> Result<Tracer<C>, ShardMapTraceError>
+    ) -> Result<Tracer<C, C::Meta>, ShardMapTraceError>
     where
         C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     {
@@ -420,14 +506,14 @@ where
 /// [`Explicit`](ryft_core::sharding::MeshAxisType::Explicit) and [`Manual`](ryft_core::sharding::MeshAxisType::Manual)
 /// axes.
 ///
-/// This stages a [`ReshardOperation`](ryft_core::operations::ReshardOperation) per leaf, the analogue of JAX's
+/// This stages a [`ReshardOperation`] per leaf, the analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html): it behaves like the identity at the
 /// value level while *replacing* each leaf's tracked [`Sharding`] with the requested one, and it differentiates as a
 /// resharding (its transpose reshards the cotangent to the input's cotangent dual). To merely steer the compiler's
 /// propagation over auto axes without tracking the result, use [`sharding_constraint`] instead.
 ///
 /// Cross-mesh reshards are not representable inside a single staged program; for that case use the eager
-/// [`Array::to`](crate::Array::to) outside the trace.
+/// [`Array::to_placement`](crate::Array::to_placement) outside the trace.
 ///
 /// # Parameters
 ///
@@ -437,7 +523,7 @@ where
 pub fn reshard<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input: Parameterized<Tracer<C, C::Meta>, To<Tracer<C, C::Meta>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
@@ -448,7 +534,7 @@ where
 /// Records sharding-propagation hints on one traced XLA value tree over the mesh's
 /// [`Auto`](ryft_core::sharding::MeshAxisType::Auto) axes.
 ///
-/// This stages a [`ShardingConstraintOperation`](ryft_core::operations::ShardingConstraintOperation) per leaf,
+/// This stages a [`ShardingConstraintOperation`] per leaf,
 /// mirroring [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
 /// it is the identity at both the value and type levels (each leaf's tracked sharding is unchanged) and only steers
 /// the backend compiler's sharding propagation over auto mesh axes at lowering time, recording a concrete Shardy
@@ -463,7 +549,7 @@ where
 pub fn sharding_constraint<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
+    Input: Parameterized<Tracer<C, C::Meta>, To<Tracer<C, C::Meta>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
@@ -958,7 +1044,8 @@ where
         arg_shardings: Option<&[Sharding]>,
         result_shardings: Option<&[Sharding]>,
     ) -> Result<String, ShardMapTraceError> {
-        let simplified_program = self.program.simplified()?;
+        let pruned_program = prune_dead_shard_map_outputs(&self.program)?;
+        let simplified_program = pruned_program.simplified()?;
         super::lowering::to_mlir_module_for_program(
             &simplified_program,
             &[],
@@ -1087,6 +1174,110 @@ impl FlatTracedShardMap {
             local_output_types,
             program,
         )
+    }
+
+    /// Returns a copy of this erased shard-map body whose global output types are replaced by `global_output_types`,
+    /// keeping the manual SPMD metadata, local types, and program unchanged.
+    ///
+    /// Forward-mode differentiation uses this to align a tangent body's global output boundary with the staged
+    /// primal `shard_map`'s adapted output types (see `adapt_traced_shard_map_output_type`), so that the two
+    /// `shard_map`s present matching output signatures. Only the global output array types carried at the boundary
+    /// change; the per-instance output shardings rendered into the `sdy.manual_computation` attributes are unaffected.
+    ///
+    /// # Parameters
+    ///
+    ///   - `global_output_types`: New global output types, one per existing body output.
+    pub(crate) fn with_global_output_types(
+        &self,
+        global_output_types: Vec<ArrayType>,
+    ) -> Result<Self, ShardMapTraceError> {
+        if global_output_types.len() != self.global_output_types.len() {
+            return Err(ShardMapTraceError::OutputTypeCountMismatch {
+                expected: self.global_output_types.len(),
+                actual: global_output_types.len(),
+            });
+        }
+        Ok(Self::from_parts(
+            self.shard_map.clone(),
+            self.global_input_types.clone(),
+            self.local_input_types.clone(),
+            global_output_types,
+            self.local_output_types.clone(),
+            self.program.clone(),
+        ))
+    }
+
+    /// Returns a copy of this erased shard-map body restricted to the outputs selected by `live_outputs`, dropping the
+    /// dead body outputs and their boundary metadata.
+    ///
+    /// `live_outputs` carries one flag per current global output. The retained outputs keep their global types, local
+    /// types, and per-instance output shardings; the body program is rebuilt over the same input boundary with only the
+    /// live output atoms exposed and then simplified, so the computation feeding the dropped outputs is pruned. The
+    /// global and local input boundaries are unchanged so the operand signature seen by callers stays fixed.
+    ///
+    /// This backs dead-output elimination for forward-mode `shard_map`s, whose primal body carries the actual
+    /// primal outputs alongside the residual edges; when a primal output is dead in a gradient-only program, this
+    /// projects it away (see `prune_dead_shard_map_outputs`).
+    ///
+    /// # Parameters
+    ///
+    ///   - `live_outputs`: One flag per current global output; `true` keeps the output.
+    pub(crate) fn with_live_outputs(&self, live_outputs: &[bool]) -> Result<Self, ShardMapTraceError> {
+        if live_outputs.len() != self.global_output_types.len() {
+            return Err(ShardMapTraceError::OutputTypeCountMismatch {
+                expected: self.global_output_types.len(),
+                actual: live_outputs.len(),
+            });
+        }
+        let live_output_ids = self
+            .program
+            .output_ids()
+            .iter()
+            .copied()
+            .zip(live_outputs.iter().copied())
+            .filter_map(|(output_id, live)| live.then_some(output_id))
+            .collect::<Vec<_>>();
+        let live_output_count = live_output_ids.len();
+        let program = rebuild_xla_program_with_builder::<Vec<XlaConstant>, Vec<XlaConstant>>(
+            self.program.atoms().to_vec(),
+            self.program.input_ids().to_vec(),
+            live_output_ids,
+            self.program.instructions().to_vec(),
+            vec![Placeholder; self.program.input_ids().len()],
+            vec![Placeholder; live_output_count],
+        )?
+        .simplified()?;
+        let retain = |types: &[ArrayType]| {
+            types
+                .iter()
+                .cloned()
+                .zip(live_outputs.iter().copied())
+                .filter_map(|(t, live)| live.then_some(t))
+                .collect()
+        };
+        let live_out_shardings = self
+            .shard_map
+            .out_shardings()
+            .iter()
+            .cloned()
+            .zip(live_outputs.iter().copied())
+            .filter_map(|(sharding, live)| live.then_some(sharding))
+            .collect::<Vec<_>>();
+        let shard_map = ShardMap::from_shardings(
+            self.shard_map.mesh().clone(),
+            self.shard_map.in_shardings().to_vec(),
+            live_out_shardings,
+            self.shard_map.manual_axes().to_vec(),
+            self.shard_map.check_vma(),
+        );
+        Ok(Self::from_parts(
+            shard_map,
+            self.global_input_types.clone(),
+            self.local_input_types.clone(),
+            retain(&self.global_output_types),
+            retain(&self.local_output_types),
+            program,
+        ))
     }
 
     /// Returns a copy of this erased shard-map body with dead staged work removed.
@@ -1259,14 +1450,12 @@ where
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
     let (output_types, program): (Output, XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>) = {
-        let domain = XlaDomain::token();
         let cloned_input_types = Input::from_parameters(
             input_types.parameter_structure(),
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) =
-                TracingContext::trace(domain, |input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) = XlaDomain::<'static>::trace(|input| Ok(function(input)), cloned_input_types)?;
             (output_types, program.simplified()?)
         }
     };
@@ -2878,7 +3067,7 @@ mod tests {
             {
                 let sharding = sharding.clone();
                 move |x: ShardMapTracer| {
-                    reshard(x.sin(), sharding.clone()).expect("reshard should stage on traced XLA values")
+                    reshard(x.sin().unwrap(), sharding.clone()).expect("reshard should stage on traced XLA values")
                 }
             },
             global_input_type.clone(),
@@ -2936,7 +3125,7 @@ mod tests {
                                 let sharding = sharding.clone();
                                 move |y| {
                                     shard_map::<_, _, ArrayType, _>(
-                                        |local_x: ShardMapTracer| local_x.sin(),
+                                        |local_x: ShardMapTracer| local_x.sin().unwrap(),
                                         y,
                                         mesh.clone(),
                                         sharding.clone(),

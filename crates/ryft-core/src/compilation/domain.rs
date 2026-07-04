@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::domains::Domain;
+use crate::contexts::Domain;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError};
 

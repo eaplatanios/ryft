@@ -23,8 +23,7 @@ use std::fmt::Display;
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, EagerContext, ValueResolution};
-use crate::domains::Domain;
+use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
@@ -4032,7 +4031,7 @@ mod array_linearization_tests {
     /// once through a `TracingContext::trace` and the staged operation is extracted from the resulting
     /// single-instruction program.
     fn rematerialize_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
-        use crate::domains::Domain;
+        use crate::contexts::Domain;
         use crate::tracing::DomainTracer;
         use crate::tracing_v2::operations::ArrayOperation;
         use crate::tracing_v2::rematerialize;

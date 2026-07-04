@@ -7,8 +7,7 @@ use ryft_macros::Parameter;
 
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
-use crate::contexts::{Context, StagingContext, ValueResolution};
-use crate::domains::Domain;
+use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};

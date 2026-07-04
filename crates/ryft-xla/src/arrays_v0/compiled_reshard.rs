@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
+use ryft_core::contexts::Domain;
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::tracing::TracingContext;
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
@@ -153,7 +153,7 @@ fn try_same_mesh<'o>(
             // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting XLA program is what
             // `CompilationDomain::compile` lowers and feeds to PJRT.
             let (_output_types_tree, program): (ArrayType, _) =
-                TracingContext::trace(engine, |x: XlaTracer<'_, 'o>| Ok(x), bare_input_type.clone())
+                XlaDomain::<'o>::trace(|x: XlaTracer<'o>| Ok(x), bare_input_type.clone())
                     .map_err(XlaDomainError::from)?;
             CompilationDomain::compile(engine, &program, &xla_options)
         })

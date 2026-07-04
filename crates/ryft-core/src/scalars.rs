@@ -5,8 +5,7 @@ use std::fmt::Display;
 use half::{bf16, f16};
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, EagerContext, ValueResolution};
-use crate::domains::Domain;
+use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};

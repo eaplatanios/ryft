@@ -7,7 +7,6 @@ pub mod broadcasting;
 pub mod compilation;
 pub mod contexts;
 pub mod differentiation;
-pub mod domains;
 pub mod effects;
 pub mod errors;
 pub mod interpretation;
@@ -32,9 +31,8 @@ pub use batching::{
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
-pub use contexts::{Context, EagerContext, StagingContext, ValueResolution};
+pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 pub use differentiation::*;
-pub use domains::Domain;
 pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error};
 pub use interpretation::{InterpretableOperation, InterpretableProgramOperation};

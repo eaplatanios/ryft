@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -7,18 +6,17 @@ use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 
 use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
-use ryft_core::contexts::{Context, EagerContext, ProvidesContext};
-use ryft_core::domains::Domain;
+use ryft_core::contexts::{Context, Domain};
 use ryft_core::operations::Operation;
 use ryft_core::operations::constants::{ONE_OPERATION_NAME, ZERO_OPERATION_NAME};
 use ryft_core::parameters::Parameterized;
-use ryft_core::programs::{ProgramError, Value};
+use ryft_core::programs::ProgramError;
 use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::DomainTracer;
 use ryft_core::tracing_v2::{DifferentiationContext, DifferentiationError};
 use ryft_core::types::{ArrayType, DataType, TypeError, Typed};
 
-use super::ops::{LinearXlaOperation, XlaConstant, XlaOperation, XlaProgram};
+use super::ops::{XlaConstant, XlaOperation, XlaProgram};
 use super::shard_map::ShardMapTraceError;
 use crate::arrays_v0::ArrayError;
 use crate::{Array, Error, ToPjrt};
@@ -99,7 +97,7 @@ pub struct XlaDomain<'c> {
 }
 
 /// Tracer shape used while staging XLA programs directly from types.
-pub(crate) type XlaTracer<'domain, 'context> = DomainTracer<'domain, XlaDomain<'context>>;
+pub(crate) type XlaTracer<'context> = DomainTracer<XlaDomain<'context>>;
 
 impl<'c> Clone for XlaDomain<'c> {
     fn clone(&self) -> Self {
@@ -275,57 +273,6 @@ impl<'c> Context for XlaDomain<'c> {
 
 impl<'c> DifferentiationContext for XlaDomain<'c> {
     type Tangent = ArrayType;
-    type LinearOperation<V: Value<ArrayType>, F: Value<ArrayType>> = LinearXlaOperation<V, XlaConstant, F>;
-}
-
-impl<'c> ProvidesContext<EagerContext<ArrayType, Array<'c>>> for XlaDomain<'c> {
-    fn context(&self) -> EagerContext<ArrayType, Array<'c>> {
-        EagerContext::new()
-    }
-}
-
-impl<'c> ProvidesContext<EagerContext<ArrayType, ArrayType>> for XlaDomain<'c> {
-    fn context(&self) -> EagerContext<ArrayType, ArrayType> {
-        EagerContext::new()
-    }
-}
-
-/// Stateless linear [`Domain`] for XLA tangent and cotangent programs over abstract
-/// [`ArrayType`] leaves.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct LinearXlaDomain;
-
-impl LinearXlaDomain {
-    /// Returns a fresh zero-sized linear-XLA-domain instance.
-    #[inline]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Domain for LinearXlaDomain {
-    type Type = ArrayType;
-    type Value = ArrayType;
-    type Constant = ArrayType;
-    type Operation = LinearXlaOperation<ArrayType>;
-}
-
-impl Context for LinearXlaDomain {
-    fn lift(&self, constant: ArrayType) -> Result<ArrayType, ProgramError> {
-        Ok(constant)
-    }
-
-    /// Mirrors [`XlaDomain`]'s eager [`bind`](Context::bind): only the nullary identity operations are supported,
-    /// and they resolve to the normalized identity metadata (this linear domain's "values" are [`ArrayType`]s).
-    fn bind<P: Into<Self::Operation>>(
-        &self,
-        operation: P,
-        inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        let (identity, array_type) = eager_identity_operation(&operation, inputs.len())?;
-        Ok(vec![xla_identity_metadata(identity, &array_type)?])
-    }
 }
 
 /// Validates that `operation` is a nullary additive/multiplicative identity ([`ZERO_OPERATION_NAME`] /
@@ -379,31 +326,6 @@ fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -
         .into()),
         _ => Ok(()),
     }
-}
-
-/// Returns the metadata value for an XLA uniform identity value of `array_type`.
-fn xla_identity_metadata(identity: &'static str, array_type: &ArrayType) -> Result<ArrayType, ProgramError> {
-    validate_identity_synthesis(identity, array_type)?;
-    Ok(normalize_uniform_xla_array_type(array_type.clone()))
-}
-
-/// Clears sharding state that cannot vary for an XLA uniform identity value.
-fn normalize_uniform_xla_array_type(array_type: ArrayType) -> ArrayType {
-    let Some(sharding) = array_type.sharding().cloned() else {
-        return array_type;
-    };
-    let sharding = Sharding::with_manual_axes(
-        sharding.mesh().clone(),
-        sharding.dimensions().to_vec(),
-        sharding.unreduced_axes().clone(),
-        sharding.reduced_axes().clone(),
-        BTreeSet::<String>::new(),
-    )
-    .expect("normalized uniform XLA array type should preserve valid sharding metadata");
-    ArrayType::new(array_type.data_type(), array_type.shape().clone())
-        .with_layout(array_type.layout().cloned())
-        .with_sharding(sharding)
-        .expect("normalized uniform XLA array type should preserve rank-compatible sharding")
 }
 
 impl<'c> XlaDomain<'c> {
@@ -1156,30 +1078,6 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_domain_one_metadata_normalizes_varying_manual_axes() {
-        use ryft_core::operations::constants::OneOperation;
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let sharding = Sharding::with_manual_axes(
-            mesh,
-            vec![ShardingDimension::replicated()],
-            Vec::<String>::new(),
-            Vec::<String>::new(),
-            ["x".to_string()],
-        )
-        .unwrap();
-        let array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)])).with_sharding(sharding).unwrap();
-
-        let one_type = LinearXlaDomain::new().bind(OneOperation::new(array_type.clone()), &[]).unwrap().pop().unwrap();
-
-        assert_eq!(one_type.shape(), array_type.shape());
-        assert_eq!(
-            one_type.sharding().expect("one metadata should preserve sharding metadata").varying_manual_axes(),
-            &BTreeSet::<String>::new(),
-        );
-    }
-
-    #[test]
     fn test_domain_accessors_return_constructor_arguments() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -1206,7 +1104,7 @@ mod tests {
             .unwrap();
         let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
         let compiled: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
-            compile_with_options(&engine, |x| x.sin(), input_type.clone(), options).unwrap();
+            compile_with_options(&engine, |x| x.sin().unwrap(), input_type.clone(), options).unwrap();
 
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -1240,7 +1138,7 @@ mod tests {
             let _: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
                 compile_with_options(
                     &engine,
-                    |x| x.sin(),
+                    |x| x.sin().unwrap(),
                     input_type.clone(),
                     CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
                 )
