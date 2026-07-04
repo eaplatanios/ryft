@@ -1,11 +1,10 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
 use crate::broadcasting::Broadcastable;
-use crate::compilation::CapturedConstant;
+use crate::compilation::CaptureReference;
 use crate::contexts::Context;
+use crate::effects::Effects;
 use crate::macros::check_count;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
@@ -26,6 +25,9 @@ pub mod constants;
 /// Higher-order control-flow operations and capability traits.
 pub mod control_flow;
 
+/// Debugging operations with observable effects (e.g., printing values from inside programs).
+pub mod debugging;
+
 /// Differentiation-control operations and capability traits.
 pub mod differentiation;
 
@@ -44,19 +46,29 @@ pub mod scalars;
 /// Sharding-related operations (e.g., resharding and propagation hints) and capability traits.
 pub mod sharding;
 
+/// Value tagging — attaching a string key to a value in a program (consumed by, e.g., rematerialization policies).
+pub mod tag;
+
 /// Elementwise trigonometric operations and capability traits.
 pub mod trigonometric;
 
 // TODO(eaplatanios): We should be importing specific symbols here.
-pub use arithmetic::*;
+// The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
+// they do not shadow their `std::ops` counterparts; reach them through `crate::operations::arithmetic` instead.
+pub use arithmetic::{
+    ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
+    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation,
+};
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;
+pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::*;
 pub use logical::*;
 pub use manipulation::*;
 pub use scalars::*;
 pub use sharding::*;
+pub use tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::*;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
@@ -172,15 +184,15 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - An [`Operation<T>`](Operation) implementation whose [`name`](Operation::name),
 ///     [`infer_output_types`](Operation::infer_output_types), and [`render`](Operation::render) methods forward to the
 ///     active variant payload.
-///   - An [`InterpretableOperation<T, V>`](InterpretableOperation) implementation that forwards
-///     [`interpret`](InterpretableOperation::interpret) to the active variant payload. Operation-specific eager or
-///     staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
-///   - An [`InterpretableProgramOperation<T, V, C>`](InterpretableProgramOperation) implementation that interprets
-///     nested flat [`Program`]s in the enum's closed operation family. This is the interpretation fixed-point witness
-///     used by higher-order payloads such as condition, while, scan, and custom derivative calls. The generated
-///     implementation performs a flat program walk and dispatches each instruction to the concrete variant payload
-///     directly. That finite dispatch avoids asking Rust to prove the enum's full recursive [`InterpretableOperation`]
-///     implementation while defining the program witness.
+///   - An [`InterpretableOperation<T, V>`](crate::InterpretableOperation) implementation that forwards
+///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
+///     or staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
+///   - An [`InterpretableProgramOperation<T, V, C>`](crate::InterpretableProgramOperation) implementation that
+///     interprets nested flat [`Program`]s in the enum's closed operation family. This is the interpretation
+///     fixed-point witness used by higher-order payloads such as condition, while, scan, and custom derivative calls.
+///     The generated implementation performs a flat program walk and dispatches each instruction to the concrete
+///     variant payload directly. That finite dispatch avoids asking Rust to prove the enum's full recursive
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementation while defining the program witness.
 ///   - A [`Display`] implementation that renders through [`Operation::render`] with zero indentation, so that the enum
 ///     display matches the canonical program rendering format.
 ///   - `From<Payload> for Enum` conversions for concrete payload variants.
@@ -200,15 +212,16 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     generic payload by adding an `Extension: Operation<T>` bound.
 ///   - Each payload receives a generated `Payload: InterpretableOperation<T, V>` bound for the interpretation
 ///     dispatcher. Payload-specific value or context requirements should live on the payload's own
-///     [`InterpretableOperation`] implementation; the enum derivation carries them through this generated payload
-///     bound.
+///     [`InterpretableOperation`](crate::InterpretableOperation) implementation; the enum derivation carries them
+///     through this generated payload bound.
 ///   - `#[ryft(bounds(interpretation(Bound1 + Bound2 + ...)))]` adds extra trait bounds to the generated interpretation
-///     implementation value type for both the generated [`InterpretableOperation`] dispatcher and the generated
-///     [`InterpretableProgramOperation`] witness. This is useful when recursive higher-order payloads require
-///     capabilities on the value being interpreted, while the enum's stored constant or capture type should not be
-///     forced to implement those capabilities. For example, an array operation enum that owns condition, while, and
-///     scan payloads can write `#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]` while
-///     keeping its enum parameter declaration at `V: Value<ArrayType>`.
+///     implementation value type for both the generated [`InterpretableOperation`](crate::InterpretableOperation)
+///     dispatcher and the generated [`InterpretableProgramOperation`](crate::InterpretableProgramOperation) witness.
+///     This is useful when recursive higher-order payloads require capabilities on the value being interpreted, while
+///     the enum's stored constant or capture type should not be forced to implement those capabilities.
+///     For example, an array operation enum that owns condition, while, and scan payloads can write
+///     `#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]` while keeping its enum parameter
+///     declaration at `V: Value<ArrayType>`.
 ///
 /// The operation type `T` is selected as follows:
 ///
@@ -223,23 +236,25 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// The value types used for interpretation are inferred from the enum's `Value<T>` generic parameters:
 ///
 ///   - For enums with one `Value<T>` parameter, the payload parameter is treated as the nested program's captured
-///     constant type `C`, and the derived [`InterpretableOperation`] implementation is generic over a runtime value
-///     `V`. The generated [`InterpretableProgramOperation`] implementation requires `V::InterpretationContext` to be a
-///     [`Context`] that can lift constants from `C` into `V`. Interpretation-only capabilities should be provided
-///     with `#[ryft(bounds(interpretation(...)))]` instead of being placed on the enum's stored constant type.
+///     constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation) implementation is
+///     generic over a runtime value `V`. The generated
+///     [`InterpretableProgramOperation`](crate::InterpretableProgramOperation) implementation requires
+///     `V::InterpretationContext` to be a [`Context`] that can lift constants from `C` into `V`. Interpretation-only
+///     capabilities should be provided with `#[ryft(bounds(interpretation(...)))]` instead of being placed on the
+///     enum's stored constant type.
 ///   - For enums with two or more `Value<T>` parameters, the first value parameter is treated as both the runtime value
 ///     type and the nested program constant type for direct program interpretation. Later value parameters remain
 ///     payload-specific metadata unless the generated program witness needs to instantiate a direct-linear operation
 ///     family, in which case extra value parameters after the first two are substituted with the first value parameter.
 ///   - For recursive operation enums, the generated nested-program witness inherits value capabilities from
-///     payload-owned [`InterpretableOperation`] implementations and from `#[ryft(bounds(interpretation(...)))]`. If a
-///     higher-order payload needs a capability such as [`BooleanLike`] for predicate extraction, prefer the attribute
-///     when that capability belongs to interpretation rather than to the enum's stored payload shape.
+///     payload-owned [`InterpretableOperation`](crate::InterpretableOperation) implementations and from
+///     `#[ryft(bounds(interpretation(...)))]`. If a higher-order payload needs a capability such as [`BooleanLike`] for
+///     predicate extraction, prefer the attribute when that capability belongs to interpretation rather than to the
+///     enum's stored payload shape.
 ///   - Bounds provided through `#[ryft(bounds(interpretation(...)))]` are applied to the same generated interpretation
 ///     value type. For example, one-value-parameter enums apply them to the generated runtime value parameter, while
 ///     direct linear enums apply them to their first value parameter. When any interpretation bounds are provided, the
-///     macro also adds the standard companion requirement `V::InterpretationContext: Zero<T, V>` for the generated
-///     implementation value type.
+///     macro also adds the standard companion requirement `C: Zero<T, V>` for the generated implementation value type.
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
@@ -251,6 +266,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// ```rust
 /// # use ryft_core as ryft;
 /// # use ryft_core::{ConstantOperation, DataType, Operation, Value, ZeroOperation};
+/// # use ryft_core::scalars::Scalar;
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
@@ -259,7 +275,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     Constant(ConstantOperation<DataType, V>),
 /// }
 ///
-/// let operation = BackendOperation::<f32>::from(ZeroOperation::new(DataType::F32));
+/// let operation = BackendOperation::<Scalar>::from(ZeroOperation::new(DataType::F32));
 /// assert_eq!(operation.name(), "zero");
 /// ```
 pub trait Operation<T: Type> {
@@ -268,6 +284,13 @@ pub trait Operation<T: Type> {
 
     /// Infers the output [`Type`]s of this [`Operation`] from the provided input [`Type`]s without executing it.
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError>;
+
+    /// Returns the observable [`Effect`](crate::Effect) classes of this [`Operation`]. Refer to the documentation of
+    /// [`Effects`] and [`Effect`](crate::Effect) for the semantics.
+    #[inline]
+    fn effects(&self) -> Effects {
+        Effects::PURE
+    }
 
     /// Renders this [`Operation`] as part of an [`Instruction`](crate::Instruction). The default implementation simply
     /// renders [`Operation::name`]. Operations carrying semantic metadata or nested [`Program`]s should override this
@@ -291,46 +314,14 @@ impl<T: Type, O: Operation<T> + ?Sized> Operation<T> for Box<O> {
     }
 
     #[inline]
+    fn effects(&self) -> Effects {
+        self.as_ref().effects()
+    }
+
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         self.as_ref().render(formatter, indentation)
     }
-}
-
-/// [`Operation`]s that can be interpreted (i.e., executed) given concrete input values. Interpretation consumes input
-/// values and returns outputs in `V`'s [`InterpretationContext`](Value::InterpretationContext). Eager implementations
-/// execute value semantics directly. [`Tracer`] implementations are the staged replay path and may stage operations
-/// into the active [`StagingContext`](crate::StagingContext) while preserving operation-owned lowering rules.
-pub trait InterpretableOperation<T: Type, V: Value<T>>: Operation<T> {
-    /// Interprets this [`Operation`] given the provided input values and returns the resulting output values. The
-    /// provided `context` is the [`InterpretationContext`](Value::InterpretationContext) required to produce values
-    /// of type `V`. For concrete (i.e., **eager**) values it is set to [`EagerContext`](crate::EagerContext) which
-    /// does nothing. For [`Tracer`] values it is set to the surrounding [`StagingContext`](crate::StagingContext),
-    /// which enables nullary operations (e.g., [`ZeroOperation`]) to stage themselves into that context rather than
-    /// failing for lack of an operand from which to recover the context.
-    fn interpret(&self, context: &V::InterpretationContext, inputs: &[V]) -> Result<Vec<V>, ProgramError>;
-}
-
-/// Represents closed [`Operation`] families that can recursively interpret nested flat [`Program`]s. This trait names
-/// the recursive fixed point needed by higher-order interpretation helpers without requiring the full operation enum's
-/// [`InterpretableOperation`] implementation while proving that implementation. Operation families implement it by
-/// replaying nested flat [`Program`]s through their operation-owned interpretation rules.
-///
-/// The `C` parameter is the nested program's constant value type. It defaults to `V`, which covers direct linear
-/// programs whose constants are already runtime values. Captured higher-order programs and custom derivative bodies
-/// can set `C` to their captured constant type and let the implementation decide how to lift those constants into `V`.
-pub trait InterpretableProgramOperation<T: Type, V: Value<T>, C: Value<T> = V>: Operation<T> + Sized {
-    /// Interprets a nested flat [`Program`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Interpretation context to use.
-    ///   - `program`: Nested [`Program`] to interpret.
-    ///   - `input`: Input values to use for interpreting the provided [`Program`].
-    fn interpret_program(
-        context: &V::InterpretationContext,
-        program: &Program<T, C, Self, Vec<C>, Vec<C>>,
-        input: Vec<V>,
-    ) -> Result<Vec<V>, ProgramError>;
 }
 
 /// Represents [`Operation`]s that operate elementwise on arrays and that support _broadcasting_ semantics.
@@ -392,15 +383,15 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
 ///
 /// - **Predicate-Producing Operations (e.g., [`CompareOperation`]):** Call [`as_boolean`](Self::as_boolean)
 ///   on *type metadata* to infer their output types from their broadcasted input types. For type metadata (e.g.,
-///   [`DataType`](crate::DataType) and [`ArrayType`]), the Boolean counterpart keeps the same structural metadata
-///   (e.g., shape, layout, and sharding) but uses a Boolean element data type.
+///   [`DataType`] and [`ArrayType`]), the Boolean counterpart keeps the same structural metadata (e.g., shape, layout,
+///   and sharding) but uses a Boolean element data type.
 /// - **Predicate-Consuming Operations (e.g., [`ConditionOperation`] and [`WhileOperation`]):** Call
 ///   [`boolean`](Self::boolean) on *values* to extract the concrete scalar Rust Boolean that drives branching
 ///   or selection.
 ///
 /// For values, [`as_boolean`](Self::as_boolean) reinterprets the carried payload as a Boolean value: zero maps to
 /// `false` and any non-zero payload maps to `true`. Values that carry no concrete payload (e.g., staged tracers and
-/// [`CapturedConstant`]s) cannot reinterpret anything and return themselves unchanged. Similarly,
+/// [`CaptureReference`]s) cannot reinterpret anything and return themselves unchanged. Similarly,
 /// [`boolean`](Self::boolean) errors for type metadata and for staged values because they carry no
 /// concrete payload to decode.
 pub trait BooleanLike {
@@ -415,40 +406,6 @@ pub trait BooleanLike {
     /// carry no concrete payload.
     fn boolean(&self) -> Result<bool, ProgramError>;
 }
-
-macro_rules! impl_boolean_like_for_scalar {
-    ($($type:ty => ($zero:expr, $one:expr)),* $(,)?) => {
-        $(
-            impl BooleanLike for $type {
-                #[inline]
-                fn as_boolean(&self) -> Self {
-                    if *self != $zero { $one } else { $zero }
-                }
-
-                #[inline]
-                fn boolean(&self) -> Result<bool, ProgramError> {
-                    Ok(*self != $zero)
-                }
-            }
-        )*
-    };
-}
-
-impl_boolean_like_for_scalar!(
-    bool => (false, true),
-    i8 => (0, 1),
-    i16 => (0, 1),
-    i32 => (0, 1),
-    i64 => (0, 1),
-    u8 => (0, 1),
-    u16 => (0, 1),
-    u32 => (0, 1),
-    u64 => (0, 1),
-    bf16 => (bf16::ZERO, bf16::ONE),
-    f16 => (f16::ZERO, f16::ONE),
-    f32 => (0.0, 1.0),
-    f64 => (0.0, 1.0),
-);
 
 impl BooleanLike for DataType {
     #[inline]
@@ -481,7 +438,7 @@ impl BooleanLike for ArrayType {
     }
 }
 
-impl<C: Context> BooleanLike for Tracer<C> {
+impl<C: Context, Meta: Clone> BooleanLike for Tracer<C, Meta> {
     #[inline]
     fn as_boolean(&self) -> Self {
         // Returns this `Tracer` unchanged. Tracers carry no concrete payload to reinterpret, and a staged Boolean
@@ -496,10 +453,10 @@ impl<C: Context> BooleanLike for Tracer<C> {
     }
 }
 
-impl BooleanLike for CapturedConstant<ArrayType> {
+impl BooleanLike for CaptureReference<ArrayType> {
     #[inline]
     fn as_boolean(&self) -> Self {
-        // Returns this [`CapturedConstant`] unchanged. A captured constant is a reference into a side table,
+        // Returns this [`CaptureReference`] unchanged. A captured constant is a reference into a side table,
         // not the concrete value itself, so there is no payload to reinterpret here.
         self.clone()
     }
@@ -521,9 +478,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::interpretation::InterpretableOperation;
     use crate::macros::check_count;
     use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
+    use crate::programs::{Program, ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -544,14 +503,10 @@ mod tests {
         }
     }
 
-    impl InterpretableOperation<DataType, f64> for IdentityOperation {
-        fn interpret(
-            &self,
-            _context: &<f64 as Value<DataType>>::InterpretationContext,
-            inputs: &[f64],
-        ) -> Result<Vec<f64>, ProgramError> {
+    impl<C> InterpretableOperation<DataType, Scalar, C> for IdentityOperation {
+        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
             check_count!("input", inputs, 1, ProgramError);
-            Ok(vec![inputs[0]])
+            Ok(inputs.to_vec())
         }
     }
 
@@ -602,7 +557,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct NestedProgramOperation {
-        program: Program<DataType, f64, IdentityOperation, f64, f64>,
+        program: Program<DataType, Scalar, IdentityOperation, Scalar, Scalar>,
     }
 
     impl Operation<DataType> for NestedProgramOperation {
@@ -639,11 +594,11 @@ mod tests {
         RenderedOperation { operation, indentation: 0 }.to_string()
     }
 
-    fn identity_program() -> Program<DataType, f64, IdentityOperation, f64, f64> {
-        let mut builder = ProgramBuilder::<DataType, f64, IdentityOperation>::new();
+    fn identity_program() -> Program<DataType, Scalar, IdentityOperation, Scalar, Scalar> {
+        let mut builder = ProgramBuilder::<DataType, Scalar, IdentityOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(IdentityOperation, vec![input]).unwrap()[0];
-        builder.build::<f64, f64>(vec![output], Placeholder, Placeholder).unwrap()
+        builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap()
     }
 
     #[test]
@@ -660,9 +615,12 @@ mod tests {
             operation.infer_output_types(&[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() })
         );
-        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[3.0f64]), Ok(vec![3.0f64]));
         assert_eq!(
-            operation.interpret(&crate::EagerContext::new(), &[]),
+            operation.interpret(&crate::EagerContext::<DataType, Scalar>::new(), &[Scalar::from(3.0)]),
+            Ok(vec![Scalar::from(3.0)])
+        );
+        assert_eq!(
+            operation.interpret(&crate::EagerContext::<DataType, Scalar>::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
     }
