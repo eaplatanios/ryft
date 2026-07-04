@@ -78,10 +78,10 @@ impl From<BatchingError> for ProgramError {
     }
 }
 
-/// A batched value's mapped batch axis. [`BatchAxis::mapped`]`(k)` means that the value's batch dimension sits at
-/// physical axis `k`. [`BatchAxis::replicated`] (the [`Default`]) means that the value is *replicated* (i.e., it
-/// carries no physical dimension for the batch and is interpreted as the same value for every batch item). For example,
-/// a traced constant in `batch(|x| x + 1)` is replicated, while `x` carries the mapped input axis. Runtime control flow
+/// A batched value's mapped batch axis. [`BatchAxis::new`]`(k)` means that the value's batch dimension sits at physical
+/// axis `k`. [`BatchAxis::replicated`] (the [`Default`]) means that the value is *replicated* (i.e., it carries no
+/// physical dimension for the batch and is interpreted as the same value for every batch item). For example, a traced
+/// constant in `batch(|x| x + 1)` is replicated, while `x` carries the mapped input axis. Runtime control flow
 /// predicates may also be replicated, because a single predicate may select one branch for the whole batch while a
 /// batch-varying predicate would need a dedicated batching rule. Note that replication is not limited to rank-0 (i.e.,
 /// scalar) values. Any shaped constant or operand is replicated when none of its physical dimensions indexes the batch.
@@ -95,7 +95,7 @@ pub struct BatchAxis(Option<usize>);
 impl BatchAxis {
     /// Creates a mapped [`BatchAxis`] at physical position `axis`.
     #[inline]
-    pub fn mapped(axis: usize) -> Self {
+    pub fn new(axis: usize) -> Self {
         Self(Some(axis))
     }
 
@@ -130,6 +130,76 @@ impl From<usize> for BatchAxis {
     #[inline]
     fn from(axis: usize) -> Self {
         Self(Some(axis))
+    }
+}
+
+/// Specification of a batch axis introduced by the batching transform that contains an optional explicit batch size
+/// and an optional axis name that can be referenced by operations that support named axes. The batch size is normally
+/// inferred from the inputs that are being batched. An explicit size can be provided to either pin it or to drive a
+/// broadcasted batching transform whose batch size would otherwise be unobservable. The axis name makes the batch axis
+/// addressable by name from collective operations inside the batched function body. [`BatchAxisSpecification`] converts
+/// from the plain size forms, so call sites that do not need a name can pass `None`, `Some(size)`, or `size` directly.
+/// For example:
+///
+/// ```ignore
+/// domain.batch(f, input, in_axes, out_axes, None)?;                                     // Inferred size, anonymous.
+/// domain.batch(f, input, in_axes, out_axes, 8)?;                                        // Explicit size, anonymous.
+/// domain.batch(f, input, in_axes, out_axes, BatchAxisSpecification::named("devices"))?; // Inferred size, named.
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchAxisSpecification {
+    /// Explicit batch size, or `None` to infer it from the inputs that are being batched.
+    size: Option<usize>,
+
+    /// Name that operations (e.g., collectives) can use to refer to it, or `None` for an anonymous axis.
+    name: Option<String>,
+}
+
+impl BatchAxisSpecification {
+    /// Creates a named [`BatchAxisSpecification`] with an explicit batch size.
+    #[inline]
+    pub fn new<N: Into<String>>(size: usize, name: N) -> Self {
+        Self { size: Some(size), name: Some(name.into()) }
+    }
+    
+    /// Creates a [`BatchAxisSpecification`] with an explicit batch size.
+    #[inline]
+    pub fn sized(size: usize) -> Self {
+        Self { size: Some(size), name: None }
+    }
+
+    /// Creates a named [`BatchAxisSpecification`] whose batch size is inferred from the inputs that are being batched.
+    #[inline]
+    pub fn named<N: Into<String>>(name: N) -> Self {
+        Self { size: None, name: Some(name.into()) }
+    }
+
+    /// Returns the explicit batch size of this [`BatchAxisSpecification`], or `None` when it is to be inferred
+    /// from the inputs that are being batched.
+    #[inline]
+    pub fn size(&self) -> Option<usize> {
+        self.size
+    }
+
+    /// Returns the name of this [`BatchAxisSpecification`] that operations (e.g., collectives) can use to refer
+    /// to it, or `None` for an anonymous axis.
+    #[inline]
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
+impl From<Option<usize>> for BatchAxisSpecification {
+    #[inline]
+    fn from(size: Option<usize>) -> Self {
+        Self { size, name: None }
+    }
+}
+
+impl From<usize> for BatchAxisSpecification {
+    #[inline]
+    fn from(size: usize) -> Self {
+        Self::sized(size)
     }
 }
 
@@ -344,7 +414,7 @@ mod tests {
         // `new` builds a batched value when the mapped axis is in bounds, and the accessors report the packed value,
         // its physical type, the batch size read off the mapped axis, and the per-item type with that axis removed.
         let batched = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(0)).unwrap();
-        assert_eq!(batched.batch_axis(), BatchAxis::mapped(0));
+        assert_eq!(batched.batch_axis(), BatchAxis::new(0));
         assert_eq!(batched.value(), &matrix);
         assert_eq!(*batched.r#type(), matrix_type);
         assert_eq!(batched.batch_size(), Ok(Some(2)));

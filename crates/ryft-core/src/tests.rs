@@ -4232,6 +4232,7 @@ mod array_linearization_tests {
     /// item's tangent is structurally zero, so partial evaluation prunes that tangent input and the linearization
     /// must restore the canonical `[carry_tangents..., residuals...]` arity the bounded-`while` rule assumes.
     fn batched_bounded_while_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
+        use crate::batching::BatchAxis;
         use crate::tracing_v2::batching::BatchContext;
 
         let context = inputs[0].context().clone();
@@ -4244,8 +4245,8 @@ mod array_linearization_tests {
                 Ok(outputs.remove(0))
             },
             inputs[0].clone(),
-            Some(0),
-            Some(0),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
             None,
         )?;
         Ok(vec![mapped])
@@ -4366,7 +4367,7 @@ mod batching_tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingError};
+    use crate::batching::{ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
@@ -4422,8 +4423,8 @@ mod batching_tests {
             .batch(
                 |x| Ok(x.clone() * x.clone() + x.sin()?),
                 TestArray::vector(vec![0.0, 1.0, 2.0]),
-                Some(0),
-                Some(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -4437,7 +4438,13 @@ mod batching_tests {
     #[test]
     fn test_batch_broadcasts_scalar_constants_inside_packed_operations() {
         let output: TestArray = TestArrayDomain
-            .batch(|x| Ok(x.clone() + x.one_like()), TestArray::vector(vec![2.0, 4.0, 6.0]), Some(0), Some(0), None)
+            .batch(
+                |x| Ok(x.clone() + x.one_like()),
+                TestArray::vector(vec![2.0, 4.0, 6.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
             .unwrap();
 
         assert_eq!(output.values, vec![3.0, 5.0, 7.0]);
@@ -4449,8 +4456,8 @@ mod batching_tests {
             .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
                 (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
-                (BatchAxis::mapped(0), BatchAxis::mapped(0)),
-                (BatchAxis::mapped(0), BatchAxis::mapped(0)),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                (BatchAxis::new(0), BatchAxis::new(0)),
                 None,
             )
             .unwrap();
@@ -4465,8 +4472,8 @@ mod batching_tests {
             .batch(
                 |x| Ok(x.collective("i", CollectiveKind::PSum)),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
-                Some(0),
-                None,
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
                 BatchAxisSpecification::named("i"),
             )
             .unwrap();
@@ -4491,14 +4498,14 @@ mod batching_tests {
                         &context,
                         |scalar| Ok(scalar.collective("outer", CollectiveKind::PSum)),
                         row,
-                        Some(0),
-                        Some(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
                         BatchAxisSpecification::named("inner"),
                     )
                 },
                 x,
-                Some(0),
-                None,
+                BatchAxis::new(0),
+                BatchAxis::replicated(),
                 BatchAxisSpecification::named("outer"),
             )
             .unwrap();
@@ -4523,8 +4530,8 @@ mod batching_tests {
                     &context,
                     |(item, shift)| Ok(item * shift),
                     (y, x),
-                    (BatchAxis::mapped(0), BatchAxis::replicated()),
-                    Some(0),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
                     None,
                 )
                 .unwrap();
@@ -4546,8 +4553,8 @@ mod batching_tests {
                     DifferentiationContext::jvp(&context, |y| y.clone() * y, x.clone(), x.one_like())
                 },
                 TestArray::vector(vec![2.0, 3.0]),
-                Some(0),
-                (BatchAxis::mapped(0), BatchAxis::mapped(0)),
+                BatchAxis::new(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
                 None,
             )
             .unwrap();
@@ -4565,8 +4572,8 @@ mod batching_tests {
                     Ok(context.value_and_grad(|y| y.clone() * y, x).expect("scalar value_and_grad should succeed"))
                 },
                 TestArray::vector(vec![2.0, 3.0]),
-                Some(0),
-                (BatchAxis::mapped(0), BatchAxis::mapped(0)),
+                BatchAxis::new(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
                 None,
             )
             .unwrap();
@@ -4581,9 +4588,15 @@ mod batching_tests {
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    let output: crate::tracing_v2::NestedTracer<TestArrayDomain> =
-                        BatchContext::batch(&context, |item| Ok(item.clone() * item), x, Some(0), Some(0), None)
-                            .unwrap();
+                    let output: crate::tracing_v2::NestedTracer<TestArrayDomain> = BatchContext::batch(
+                        &context,
+                        |item| Ok(item.clone() * item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
                     output
                 },
                 TestArray::vector(vec![2.0, 3.0]),
@@ -4603,8 +4616,15 @@ mod batching_tests {
             &TestArrayDomain,
             |x| {
                 let context = x.context().clone();
-                let mapped: crate::tracing_v2::NestedTracer<TestArrayDomain> =
-                    BatchContext::batch(&context, |item| Ok(item.clone() * item), x, Some(0), Some(0), None).unwrap();
+                let mapped: crate::tracing_v2::NestedTracer<TestArrayDomain> = BatchContext::batch(
+                    &context,
+                    |item| Ok(item.clone() * item),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![2.0, 3.0]),
@@ -4637,7 +4657,7 @@ mod batching_tests {
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let outputs = ArrayOperation::<TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::mapped(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert!(outputs[0].value().values().iter().all(|value| (value - 2.0).abs() < 1e-12));
     }
 
@@ -4651,7 +4671,7 @@ mod batching_tests {
         let outputs =
             apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Neg(NegOperation), &[batched]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::mapped(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values(), &[-1.0, -2.0, -3.0]);
     }
 
@@ -4667,7 +4687,7 @@ mod batching_tests {
             apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Add(AddOperation), &[batched, replicated])
                 .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::mapped(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values(), &[11.0, 12.0, 13.0]);
     }
 
@@ -4682,11 +4702,18 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    BatchContext::batch(&context, |scalar| Ok(scalar.clone() * scalar), row, Some(0), Some(0), None)
+                    BatchContext::batch(
+                        &context,
+                        |scalar| Ok(scalar.clone() * scalar),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
                 },
                 x,
-                Some(0),
-                Some(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -4709,7 +4736,13 @@ mod batching_tests {
         let x = TestArray::matrix(3, 4, x_data);
 
         let output: TestArray = TestArrayDomain
-            .batch(|row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())), x, Some(0), Some(0), None)
+            .batch(
+                |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
             .unwrap();
 
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
@@ -4730,8 +4763,9 @@ mod batching_tests {
             values: x_data,
         };
 
-        let output: TestArray =
-            TestArrayDomain.batch(|row| row.transpose(vec![1, 0]), x, Some(0), Some(0), None).unwrap();
+        let output: TestArray = TestArrayDomain
+            .batch(|row| row.transpose(vec![1, 0]), x, BatchAxis::new(0), BatchAxis::new(0), None)
+            .unwrap();
 
         assert_eq!(
             output.r#type,
@@ -4752,8 +4786,8 @@ mod batching_tests {
             .batch(
                 |(left, right)| Ok(left + right),
                 (x, y),
-                (BatchAxis::mapped(0), BatchAxis::replicated()),
-                Some(0),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -4765,7 +4799,9 @@ mod batching_tests {
         // With explicit axis_size = Some(4), the batch size is pinned. A mapped input of size 4
         // must agree, and the batch size flows through to subsequent operations.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let output: TestArray = TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(4)).unwrap();
+        let output: TestArray = TestArrayDomain
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(4))
+            .unwrap();
         assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
     }
 
@@ -4777,7 +4813,7 @@ mod batching_tests {
         // apply an explicit reduction inside the function.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), None, None);
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::replicated(), None);
         assert!(matches!(result, Err(BatchingError::MismatchedOutputAxes { expected: None, actual: Some(0) })));
     }
 
@@ -4787,7 +4823,7 @@ mod batching_tests {
         // requests a mapped output; `batch` refuses to materialize the axis with an implicit broadcast.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, None, Some(0), Some(3));
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::replicated(), BatchAxis::new(0), Some(3));
         assert!(matches!(result, Err(BatchingError::MismatchedOutputAxes { expected: Some(0), actual: None })));
     }
 
@@ -4800,7 +4836,7 @@ mod batching_tests {
             values: vec![1.0, 2.0, 3.0],
         };
         let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), dynamic_input, Some(0), Some(0), None);
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), dynamic_input, BatchAxis::new(0), BatchAxis::new(0), None);
         assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis: 0, .. })));
     }
 
@@ -4809,7 +4845,7 @@ mod batching_tests {
         // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, Some(0), Some(0), Some(5));
+            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(5));
         assert!(matches!(result, Err(BatchingError::MismatchedBatchSizes { expected: 5, actual: 4 })));
     }
 
@@ -4820,7 +4856,8 @@ mod batching_tests {
         // output, which forces a transpose to swap the axes.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
-        let output: TestArray = TestArrayDomain.batch(|row| Ok(row), x, Some(0), Some(1), None).unwrap();
+        let output: TestArray =
+            TestArrayDomain.batch(|row| Ok(row), x, BatchAxis::new(0), BatchAxis::new(1), None).unwrap();
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
         // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
         // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
@@ -4848,14 +4885,14 @@ mod batching_tests {
                         &context,
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
-                        (BatchAxis::mapped(0), BatchAxis::replicated()),
-                        Some(0),
+                        (BatchAxis::new(0), BatchAxis::replicated()),
+                        BatchAxis::new(0),
                         None,
                     )
                 },
                 (x, bias),
-                (BatchAxis::mapped(0), BatchAxis::replicated()),
-                Some(0),
+                (BatchAxis::new(0), BatchAxis::replicated()),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -4878,7 +4915,13 @@ mod batching_tests {
         let x = TestArray::matrix(2, 6, x_data.clone());
 
         let output: TestArray = TestArrayDomain
-            .batch(|row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])), x, Some(0), Some(0), None)
+            .batch(
+                |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
             .unwrap();
 
         assert_eq!(
@@ -4913,8 +4956,8 @@ mod batching_tests {
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
-            (BatchAxis::replicated(), BatchAxis::mapped(0)),
-            Some(0),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
             None,
         )
         .unwrap();
@@ -4966,8 +5009,8 @@ mod batching_tests {
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
-            (BatchAxis::replicated(), BatchAxis::mapped(0)),
-            Some(0),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
             None,
         )
         .unwrap();
@@ -5009,8 +5052,8 @@ mod batching_tests {
                     Ok(outputs.into_iter().next().unwrap())
                 },
                 (predicate, operand),
-                (BatchAxis::mapped(0), BatchAxis::mapped(0)),
-                Some(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -5034,8 +5077,8 @@ mod batching_tests {
                     Ok(x + zero)
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
-                Some(0),
-                Some(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -5049,8 +5092,8 @@ mod batching_tests {
             .batch(
                 |x: DomainBatchingValue<TestArrayDomain>| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
-                Some(0),
-                Some(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -5112,14 +5155,14 @@ mod batching_tests {
         // The per-value `BatchAxis` metadata: a mapped batch dimension index or replicated.
         assert_eq!(BatchAxis::default(), BatchAxis::replicated());
         assert!(BatchAxis::replicated().is_replicated());
-        assert!(!BatchAxis::mapped(2).is_replicated());
+        assert!(!BatchAxis::new(2).is_replicated());
         assert_eq!(BatchAxis::replicated().axis(), None);
-        assert_eq!(BatchAxis::mapped(2).axis(), Some(2));
+        assert_eq!(BatchAxis::new(2).axis(), Some(2));
         assert_eq!(BatchAxis::from(None), BatchAxis::replicated());
-        assert_eq!(BatchAxis::from(Some(3)), BatchAxis::mapped(3));
-        assert_eq!(BatchAxis::from(3), BatchAxis::mapped(3));
-        assert_ne!(BatchAxis::mapped(0), BatchAxis::mapped(1));
-        assert_eq!(format!("{:?}", BatchAxis::mapped(1)), "BatchAxis(Some(1))");
+        assert_eq!(BatchAxis::from(Some(3)), BatchAxis::new(3));
+        assert_eq!(BatchAxis::from(3), BatchAxis::new(3));
+        assert_ne!(BatchAxis::new(0), BatchAxis::new(1));
+        assert_eq!(format!("{:?}", BatchAxis::new(1)), "BatchAxis(Some(1))");
     }
 
     #[test]
@@ -5127,10 +5170,7 @@ mod batching_tests {
         assert_eq!(BatchAxisSpecification::from(None), BatchAxisSpecification::default());
         assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::sized(4));
         assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::sized(4));
-        assert_eq!(
-            BatchAxisSpecification::sized_and_named(4, "i"),
-            BatchAxisSpecification::sized_and_named(4, "i").clone(),
-        );
+        assert_eq!(BatchAxisSpecification::new(4, "i"), BatchAxisSpecification::new(4, "i").clone());
         assert_ne!(BatchAxisSpecification::sized(4), BatchAxisSpecification::sized(5));
         assert_ne!(BatchAxisSpecification::named("i"), BatchAxisSpecification::named("j"));
         assert_ne!(BatchAxisSpecification::named("i"), BatchAxisSpecification::default());
@@ -5141,36 +5181,22 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_axes_specification_uniform_applies_one_spec_to_every_leaf() {
+    fn test_batch_broadcasts_a_single_axis_to_every_leaf() {
+        // A single `BatchAxis` for `in_axes`/`out_axes` broadcasts into the whole input/output parameter structure
+        // (JAX's `in_axes=0`), so both leaves of the pair are mapped on axis 0 without spelling out the structure.
         let x = TestArray::vector(vec![1.0, 3.0]);
         let y = TestArray::vector(vec![2.0, 4.0]);
         let output: (TestArray, TestArray) = TestArrayDomain
             .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
                 (x, y),
-                BatchAxesSpecification::Uniform(BatchAxis::mapped(0)),
-                BatchAxesSpecification::Uniform(BatchAxis::mapped(0)),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
         assert_eq!(output.0.values, vec![3.0, 7.0]);
         assert_eq!(output.1.values, vec![2.0, 12.0]);
-
-        // Plain per-leaf values convert to `BatchAxesSpecification::PerLeaf`.
-        assert_eq!(
-            BatchAxesSpecification::from((BatchAxis::mapped(0), BatchAxis::replicated())),
-            BatchAxesSpecification::PerLeaf((BatchAxis::mapped(0), BatchAxis::replicated())),
-        );
-        // A single bare `Option<usize>` / `usize` leaf converts ergonomically.
-        assert_eq!(
-            BatchAxesSpecification::<BatchAxis>::from(Some(0)),
-            BatchAxesSpecification::PerLeaf(BatchAxis::mapped(0)),
-        );
-        assert_eq!(BatchAxesSpecification::<BatchAxis>::from(0), BatchAxesSpecification::PerLeaf(BatchAxis::mapped(0)),);
-        assert_eq!(
-            format!("{:?}", BatchAxesSpecification::<BatchAxis>::Uniform(BatchAxis::mapped(1))),
-            "Uniform(BatchAxis(Some(1)))"
-        );
     }
 
     #[test]
@@ -5181,13 +5207,7 @@ mod batching_tests {
         let x = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let y = TestArray::vector(vec![10.0, 20.0]);
         let output: TestArray = TestArrayDomain
-            .batch(
-                |(row, shift)| Ok(row + shift),
-                (x, y),
-                BatchAxesSpecification::Uniform(BatchAxis::mapped(0)),
-                Some(0),
-                None,
-            )
+            .batch(|(row, shift)| Ok(row + shift), (x, y), BatchAxis::new(0), BatchAxis::new(0), None)
             .unwrap();
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
         assert_eq!(output.values, vec![11.0, 12.0, 13.0, 24.0, 25.0, 26.0]);
@@ -5211,8 +5231,8 @@ mod batching_tests {
                 Ok(x + bias)
             },
             input_tracer,
-            Some(0),
-            Some(0),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
             None,
         )
         .unwrap();
