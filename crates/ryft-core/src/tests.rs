@@ -4358,7 +4358,7 @@ mod batching_tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::batching::{ArrayBatch, BatchingError};
+    use crate::batching::{ArrayBatch, BatchableOperation, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
     use crate::operations::arithmetic::AddOperation;

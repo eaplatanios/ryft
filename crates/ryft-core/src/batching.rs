@@ -4,8 +4,9 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::operations::Operation;
 use crate::parameters::{Parameter, ParameterError};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{Program, ProgramError, Value};
 use crate::types::{ArrayType, Typed};
 
 /// Represents batching-related errors.
@@ -177,3 +178,85 @@ impl<V: Typed<ArrayType>> Typed<ArrayType> for ArrayBatch<V> {
 }
 
 impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
+
+/// Represents [`Operation`]s that can be batched (i.e., vectorized).
+pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
+    /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes,
+    /// using `context` for rules that need active transform state.
+    ///
+    /// # Contract
+    ///
+    ///   - **Axis Alignment:** If two or more inputs carry a mapped axis (i.e., `batch_axis.is_some()`), elementwise
+    ///     operations require them to agree on the axis position. When they disagree, this function returns
+    ///     [`BatchingError::MisalignedBatchAxes`] with an error message that names the misaligned axes and suggests the
+    ///     user repositions one of them with [`Transpose`](crate::Transpose) (i.e., the N-D axis permutation primitive)
+    ///     before invoking the operation. Operations with explicit axis arguments (e.g., `Dot`, `Transpose`, `Reshape`,
+    ///     etc.) rewrite those arguments to thread the mapped axis through correctly.
+    ///   - **Output Axes:** For elementwise operations, the output [`ArrayBatch::batch_axis`] matches the common input
+    ///     batch axis. For operations with explicit axis arguments, the output axis follows from the lifted axis
+    ///     arguments.
+    ///   - **Zero Propagation:** Linear batching rules preserve zero tangent payloads through their operation-specific
+    ///     semantics. Canonical staged zeros are handled before batching reaches concrete value-level interpretation.
+    ///
+    /// Note that in order to be able to provide [`BatchableOperation`] implementations for operation families that are
+    /// derived using our `#[derive(BatchableOperation)]` macro, it is a common convention for operations that can be
+    /// part of such operation families to implement this trait even if they do not support batching and to have this
+    /// function simply return a [`BatchingError::UnsupportedOperation`] error.
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
+}
+
+/// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over physical
+/// values whose mapped batch axes are specified by the caller. This policy controls how the replayed output tracers are
+/// packaged into the resulting program.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProgramBatchingOutputAxesPolicy {
+    /// Keep the output axes naturally produced by the per-operation batching rules. Replicated outputs remain
+    /// replicated and are reported as `None`.
+    Natural,
+
+    /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with
+    /// [`Transpose`](crate::Transpose) and broadcasting replicated outputs across the batch.
+    AlignAllTo(usize),
+}
+
+/// Represents closed [`Operation`] families whose captured flat [`Program`]s can be batched into standalone batched
+/// programs. This is the batching analogue of [`InterpretableProgramOperation`](crate::InterpretableProgramOperation).
+/// It names the recursive fixed point needed by higher-order batching helpers without requiring the full operation
+/// enum's [`BatchableOperation`] implementation while proving that implementation. Operation families implement it by
+/// replaying captured flat [`Program`]s through their operation-owned batching rules, via
+/// [`batch_program`](crate::batch_program).
+///
+/// The re-wrapping batch rules of [`CustomJvpOperation`](crate::CustomJvpOperation) and
+/// [`CustomVjpOperation`](crate::CustomVjpOperation) bound their captured-program operation type by this trait. Routing
+/// program-level batching through this dedicated, lifetime-free witness keeps the trait solver's recursion finite: the
+/// closed enum implementation discharges the derived batching-context obligations once, instead of every batching rule
+/// re-deriving them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
+pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
+    /// Batches a captured [`Program`] into a standalone program over batch-carrying physical types. Refer to
+    /// the documentation of [`batch_program`](crate::batch_program) for the input and output axis conventions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Captured program to batch, over per-item input and output types.
+    ///   - `batch_size`: Size of the batch axis (i.e., number of items being batched together).
+    ///   - `input_batch_axes`: Mapped batch-axis position for each program input, or `None` for a replicated input.
+    ///   - `output_axes_policy`: Policy for packaging the batched program's outputs.
+    fn batch_program(
+        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        batch_size: usize,
+        input_batch_axes: &[Option<usize>],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>;
+}
+
+impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
+    #[inline]
+    pub fn batched(
+        &self,
+        batch_size: usize,
+        input_batch_axes: &[Option<usize>],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
+        O::batch_program(self, batch_size, input_batch_axes, output_axes_policy)
+    }
+}

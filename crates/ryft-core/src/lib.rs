@@ -27,7 +27,9 @@ pub mod utilities;
 pub mod tests;
 
 // TODO(eaplatanios): Make all of the following more specific.
-pub use batching::{ArrayBatch, BatchingError};
+pub use batching::{
+    ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingError, ProgramBatchingOutputAxesPolicy,
+};
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
 pub use contexts::{Context, EagerContext, StagingContext, ValueResolution};
@@ -53,8 +55,9 @@ pub use programs::{
 pub use scalars::{Scalar, ScalarDomain};
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
-pub use tracing_v2::batching::Batch;
+pub use tracing_v2::batching::{Batch, BatchingContext, batch_program};
 pub use tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, materialize,
+    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, Linearization, materialize,
 };
+pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use types::*;
