@@ -161,6 +161,19 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
         };
         Ok(self.r#type.without_dimension(axis)?.0)
     }
+
+    /// Computes and validates the common batch size across `inputs`, returning `None` when no input is batched.
+    /// Returns [`BatchingError::MismatchedBatchSizes`] when two batched inputs disagree on their batch size and
+    /// [`BatchingError::DynamicBatchAxis`] when any batched input's mapped axis has a non-static size.
+    pub fn common_batch_size(inputs: &[Self]) -> Result<Option<usize>, BatchingError> {
+        inputs.iter().try_fold(None, |common_size, input| match (common_size, input.batch_size()?) {
+            (Some(common_size), Some(size)) if common_size != size => {
+                Err(BatchingError::MismatchedBatchSizes { expected: common_size, actual: size })
+            }
+            (None, Some(size)) => Ok(Some(size)),
+            (common_size, _) => Ok(common_size),
+        })
+    }
 }
 
 impl<V: Display> Display for ArrayBatch<V> {
@@ -261,5 +274,85 @@ impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V,
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<(Self, Vec<Option<usize>>), BatchingError> {
         O::batch_program(self, batch_size, input_batch_axes, output_axes_policy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, DataType, Shape, Size, Typed};
+
+    use super::*;
+
+    #[test]
+    fn test_array_batch() {
+        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix_type = matrix.r#type().into_owned();
+
+        // `new` builds a batched value when the mapped axis is in bounds, and the accessors report the packed value,
+        // its physical type, the batch size read off the mapped axis, and the per-item type with that axis removed.
+        let batched = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(0)).unwrap();
+        assert_eq!(batched.batch_axis(), Some(0));
+        assert_eq!(batched.value(), &matrix);
+        assert_eq!(*batched.r#type(), matrix_type);
+        assert_eq!(batched.batch_size(), Ok(Some(2)));
+        assert_eq!(batched.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
+        assert_eq!(batched.to_string(), "batch[f64[2, 3], axis=0]([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])");
+        assert_eq!(batched.into_value(), matrix);
+
+        // A different mapped axis reads the batch size and per-item type from that axis instead.
+        let batched_axis_one = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(1)).unwrap();
+        assert_eq!(batched_axis_one.batch_size(), Ok(Some(3)));
+        assert_eq!(
+            batched_axis_one.unbatched_type(),
+            Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))),
+        );
+
+        // `new` rejects an out-of-bounds mapped axis.
+        assert_eq!(
+            ArrayBatch::new(matrix_type.clone(), matrix, Some(2)),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: matrix_type, axis: 2 }),
+        );
+
+        // `replicated` shares the value unchanged across the batch: no mapped axis, no batch size, and the per-item
+        // type is the whole physical type.
+        let vector = TestArray::vector(vec![1.0, 2.0, 3.0]);
+        let vector_type = vector.r#type().into_owned();
+        let replicated = ArrayBatch::replicated(vector.clone());
+        assert_eq!(replicated.batch_axis(), None);
+        assert_eq!(*replicated.r#type(), vector_type);
+        assert_eq!(replicated.batch_size(), Ok(None));
+        assert_eq!(replicated.unbatched_type(), Ok(vector_type));
+        assert_eq!(replicated.to_string(), "batch[f64[3], replicated]([1.0, 2.0, 3.0])");
+        assert_eq!(replicated.into_value(), vector);
+    }
+
+    #[test]
+    fn test_array_batch_common_batch_size() {
+        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix_type = matrix.r#type().into_owned();
+        let vector = TestArray::vector(vec![7.0, 8.0]);
+
+        // All-replicated inputs pin no batch size.
+        let replicated = ArrayBatch::replicated(matrix.clone());
+        assert_eq!(ArrayBatch::common_batch_size(&[replicated.clone()]), Ok(None));
+
+        // A single batched input pins its own batch size, and a replicated input alongside it is ignored.
+        let batched_axis_zero = ArrayBatch::new(matrix_type.clone(), matrix.clone(), Some(0)).unwrap();
+        assert_eq!(ArrayBatch::common_batch_size(&[batched_axis_zero.clone()]), Ok(Some(2)));
+        assert_eq!(ArrayBatch::common_batch_size(&[replicated, batched_axis_zero.clone()]), Ok(Some(2)));
+
+        // Two batched inputs that agree on their batch size share it, even across different mapped axes.
+        let batched_vector = ArrayBatch::new(vector.r#type().into_owned(), vector, Some(0)).unwrap();
+        assert_eq!(ArrayBatch::common_batch_size(&[batched_axis_zero.clone(), batched_vector]), Ok(Some(2)));
+
+        // Two batched inputs that disagree on their batch size are rejected.
+        let batched_axis_one = ArrayBatch::new(matrix_type, matrix, Some(1)).unwrap();
+        assert_eq!(
+            ArrayBatch::common_batch_size(&[batched_axis_zero, batched_axis_one]),
+            Err(BatchingError::MismatchedBatchSizes { expected: 2, actual: 3 }),
+        );
     }
 }

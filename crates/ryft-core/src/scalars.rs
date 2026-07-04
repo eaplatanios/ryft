@@ -529,15 +529,79 @@ impl Compare for Scalar {
     }
 }
 
+// TODO(eaplatanios): Introduce a `Cast` trait if we do not have one already and also support it for arrays.
+impl Scalar {
+    /// Casts this [`Scalar`] to `target`, converting the carried numeric value. Only value-level type *promotion*
+    /// (widening) casts are supported: `self`'s [`DataType`] must equal or be promotable to `target`, which is
+    /// exactly what the eager value semantics need in order to match an operation's promoting type inference (for
+    /// example, promoting a `select` branch to the promotion of the two branch data types). A cast to the same data
+    /// type is the identity, and a non-promotable `target` is a [`TypeError`].
+    ///
+    /// Every such widening promotion is exact through an `f64` intermediate: an integer promotion target only ever
+    /// has sources that fit exactly in an `f64` (the only integers that do not, large `I64`/`U64` values, promote to
+    /// `F64` rather than to an integer target), and a floating-point target adopts the intended, possibly rounding,
+    /// promotion semantics.
+    fn cast(&self, target: DataType) -> Result<Scalar, ProgramError> {
+        let source = self.r#type().into_owned();
+        if source == target {
+            return Ok(*self);
+        }
+        if !source.is_promotable_to(target) {
+            return Err(
+                TypeError { message: format!("cannot promote scalar of data type {source} to {target}") }.into()
+            );
+        }
+        let value = match self {
+            Scalar::Bool(value) => f64::from(*value),
+            Scalar::I8(value) => *value as f64,
+            Scalar::I16(value) => *value as f64,
+            Scalar::I32(value) => *value as f64,
+            Scalar::I64(value) => *value as f64,
+            Scalar::U8(value) => *value as f64,
+            Scalar::U16(value) => *value as f64,
+            Scalar::U32(value) => *value as f64,
+            Scalar::U64(value) => *value as f64,
+            Scalar::BF16(value) => value.to_f64(),
+            Scalar::F16(value) => value.to_f64(),
+            Scalar::F32(value) => *value as f64,
+            Scalar::F64(value) => *value,
+        };
+        Ok(match target {
+            DataType::I8 => Scalar::I8(value as i8),
+            DataType::I16 => Scalar::I16(value as i16),
+            DataType::I32 => Scalar::I32(value as i32),
+            DataType::I64 => Scalar::I64(value as i64),
+            DataType::U8 => Scalar::U8(value as u8),
+            DataType::U16 => Scalar::U16(value as u16),
+            DataType::U32 => Scalar::U32(value as u32),
+            DataType::U64 => Scalar::U64(value as u64),
+            DataType::BF16 => Scalar::BF16(bf16::from_f64(value)),
+            DataType::F16 => Scalar::F16(f16::from_f64(value)),
+            DataType::F32 => Scalar::F32(value as f32),
+            DataType::F64 => Scalar::F64(value),
+            other => {
+                return Err(
+                    TypeError { message: format!("cannot cast scalar to unsupported data type {other}") }.into()
+                );
+            }
+        })
+    }
+}
+
 impl Select for Scalar {
     type Condition = bool;
 
-    /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the per-primitive scalar
-    /// selection semantics. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before reaching
-    /// here, so this only needs the resolved `bool`.
+    /// Selects between `on_true` and `on_false` based on a plain `condition`, mirroring the broadcasting
+    /// [`SelectOperation`](crate::operations::control_flow::SelectOperation) type-inference contract: the selected
+    /// branch is promoted to the promotion of the two branch data types, so `select(condition, f32, f64)` yields an
+    /// `f64` like `jnp.where`. The condition is decoded from a [`Scalar::Bool`] through [`BooleanLike`] before
+    /// reaching here, so this only needs the resolved `bool`.
     #[inline]
     fn select(condition: &bool, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        Ok(if *condition { *on_true } else { *on_false })
+        let target = DataType::promoted(&[on_true.r#type().into_owned(), on_false.r#type().into_owned()])
+            .map_err(|error| TypeError { message: error.to_string() })?;
+        let selected = if *condition { on_true } else { on_false };
+        selected.cast(target)
     }
 }
 
@@ -567,5 +631,25 @@ mod tests {
         // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
         assert_eq!(ScalarDomain::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(0.0)]));
         assert_eq!(ScalarDomain::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(1.0)]));
+    }
+
+    #[test]
+    fn test_scalar_cast_promotes_widening_and_rejects_narrowing() {
+        // A cast to the same data type is the identity.
+        assert_eq!(Scalar::from(2.5f32).cast(DataType::F32), Ok(Scalar::from(2.5f32)));
+
+        // Widening promotions convert the carried value exactly: float widening, integer-to-float, integer widening,
+        // and Boolean-to-numeric.
+        assert_eq!(Scalar::from(2.5f32).cast(DataType::F64), Ok(Scalar::from(2.5f64)));
+        assert_eq!(Scalar::from(3i32).cast(DataType::F64), Ok(Scalar::from(3.0f64)));
+        assert_eq!(Scalar::from(3i16).cast(DataType::I32), Ok(Scalar::from(3i32)));
+        assert_eq!(Scalar::from(true).cast(DataType::U16), Ok(Scalar::from(1u16)));
+        assert_eq!(Scalar::from(f16::from_f32(1.5)).cast(DataType::F32), Ok(Scalar::from(1.5f32)));
+
+        // Narrowing (non-promotable) casts are rejected rather than silently truncating.
+        assert_eq!(
+            Scalar::from(2.5f64).cast(DataType::I32),
+            Err(TypeError { message: "cannot promote scalar of data type f64 to i32".to_string() }.into()),
+        );
     }
 }

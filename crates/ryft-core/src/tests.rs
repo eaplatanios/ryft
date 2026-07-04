@@ -6,7 +6,7 @@
 //! payload, together with [`TestArrayDomain`], a minimal interpreting [`Domain`] whose operation set is
 //! [`ArrayOperation`]. They implement every value-level capability that [`ArrayOperation`] interpretation requires,
 //! so unit tests, doctests, and downstream crates can stage, transform, and interpret programs end-to-end without
-//! depending on an optimized array backend such as `ryft-ndarray`.
+//! depending on an optimized backend such as `ryft-xla`.
 //!
 //! These types prioritize transparency over performance: payloads are plain `f64` vectors with public fields, and
 //! every operation is implemented with straightforward index arithmetic. Do not use them outside of tests and
@@ -42,6 +42,7 @@ use crate::tracing_v2::{ArrayOperation, CoordinateValue, DifferentiationContext}
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
+// TODO(eaplatanios): Promote to a simple built-in `Array` type in `arrays.rs` parallel to `scalars.rs`.
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.
 #[derive(Clone, Debug, PartialEq)]
