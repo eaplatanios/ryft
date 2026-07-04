@@ -14,7 +14,6 @@ crate is an umbrella crate that re-exports functionality from a few different cr
   [`Parameterized`](https://docs.rs/ryft-core/latest/ryft_core/parameters/trait.Parameterized.html) API.
 - **`ryft-macros`:** Procedural macros used by `ryft` and `ryft-core` (e.g., parameter-related derivation macros).
 - **Backends:**
-  - **`ryft-ndarray`:** `ndarray` backend for `ryft`.
   - **`ryft-xla`:** XLA backend for `ryft`.
 - **Bindings:**
   - **`ryft-mlir`:** High-level, ownership-aware Rust bindings for MLIR and MLIR dialects used by XLA tooling.

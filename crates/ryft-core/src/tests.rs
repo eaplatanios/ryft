@@ -813,23 +813,31 @@ impl Select for TestArray {
     type Condition = Self;
 
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        // Mirrors the `SelectOperation` type-inference contract: the condition must be Boolean-typed and match the
-        // branch shapes.
+        // Mirrors the broadcasting `SelectOperation` type-inference contract: the condition must be Boolean-typed,
+        // the three operand shapes broadcast together, and the two branch data types promote together to the output
+        // data type. The condition is retyped to a branch data type before broadcasting so its Boolean data type
+        // acts as a mask rather than promoting into the output.
         assert_eq!(condition.r#type.data_type(), DataType::Boolean, "select condition must have a Boolean data type",);
-        assert_eq!(
-            condition.r#type.shape(),
-            on_true.r#type.shape(),
-            "select condition and on_true must share the same shape",
-        );
-        assert_eq!(on_true.r#type, on_false.r#type, "select on_true and on_false must share the same type");
+        let output_type = Broadcastable::broadcast(
+            &Broadcastable::broadcast(
+                &condition.r#type.clone().with_data_type(on_true.r#type.data_type()),
+                &on_true.r#type,
+            )
+            .unwrap(),
+            &on_false.r#type,
+        )
+        .unwrap();
+        let output_len = Self::element_count(&output_type);
+        let condition = condition.broadcast_values(output_len);
+        let on_true = on_true.broadcast_values(output_len);
+        let on_false = on_false.broadcast_values(output_len);
         let values: Vec<f64> = condition
-            .values
-            .iter()
-            .zip(on_true.values.iter())
-            .zip(on_false.values.iter())
-            .map(|((condition, t), f)| if *condition != 0.0 { *t } else { *f })
+            .into_iter()
+            .zip(on_true)
+            .zip(on_false)
+            .map(|((condition, t), f)| if condition != 0.0 { t } else { f })
             .collect();
-        Ok(Self { r#type: on_true.r#type.clone(), values })
+        Ok(Self { r#type: output_type, values })
     }
 }
 

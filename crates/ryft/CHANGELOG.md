@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Added `ryft-ndarray` and `ryft-xla`.
+- Added `ryft-xla`.
 - Updated the `ryft-core`, `ryft-mlir`, `ryft-pjrt`, and `ryft-xla-sys` dependencies.
 - Added propagation for the `mps` feature of `ryft-xla-sys`.
 

@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, ParameterError};
 use crate::programs::{Program, ProgramError, Value};
-use crate::types::{ArrayType, Typed};
+use crate::types::{ArrayType, TypeError, Typed};
 
 /// Represents batching-related errors.
 ///
@@ -49,6 +49,9 @@ pub enum BatchingError {
 
     #[error(transparent)]
     Parameter(#[from] ParameterError),
+
+    #[error(transparent)]
+    Type(#[from] TypeError),
 
     #[error(transparent)]
     Program(ProgramError),
@@ -96,7 +99,7 @@ pub struct ArrayBatch<V> {
 impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`].
     #[inline]
-    pub fn new(r#type: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, ProgramError> {
+    pub fn new(r#type: ArrayType, value: V, batch_axis: Option<usize>) -> Result<Self, BatchingError> {
         if let Some(axis) = batch_axis
             && axis >= r#type.rank()
         {
@@ -111,13 +114,13 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
         Self { r#type: value.r#type().into_owned(), value, batch_axis: None }
     }
 
-    /// Returns the axis in [`r#type`](Self::type) and [`value`](Self::value) that indexes the batch items, or `None`
-    /// when `value` is *replicated* (i.e., it carries no physical dimension for the batch and is interpreted as the
-    /// same value for every batch item). For example, a traced constant in `batch(|x| x + 1)` has a `None` batch axis,
-    /// while `x` carries the mapped input axis. Runtime control flow predicates may also require `None`, because a
-    /// single predicate may select one branch for the whole batch while a batch-varying predicate would need a
-    /// dedicated batching rule. Note that `None` is not limited to rank-0 (i.e., scalar) values. Any shaped constant
-    /// or operand is replicated when none of its physical dimensions indexes the batch.
+    /// Returns the axis in [`value`](Self::value) that indexes the batch items, or `None` when `value` is *replicated*
+    /// (i.e., it carries no physical dimension for the batch and is interpreted as the same value for every batch
+    /// item). For example, a traced constant in `batch(|x| x + 1)` has a `None` batch axis, while `x` carries the
+    /// mapped input axis. Runtime control flow predicates may also require `None`, because a single predicate may
+    /// select one branch for the whole batch while a batch-varying predicate would need a dedicated batching rule.
+    /// Note that `None` is not limited to rank-0 (i.e., scalar) values. Any shaped constant or operand is replicated
+    /// when none of its physical dimensions indexes the batch.
     #[inline]
     pub fn batch_axis(&self) -> Option<usize> {
         self.batch_axis
@@ -138,7 +141,7 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
     /// Returns the batch size of this [`ArrayBatch`] (i.e., the number of items that are batched together),
     /// or `None` if it is replicated (i.e., shared as-is across the whole batch).
     #[inline]
-    pub fn batch_size(&self) -> Result<Option<usize>, ProgramError> {
+    pub fn batch_size(&self) -> Result<Option<usize>, BatchingError> {
         let Some(axis) = self.batch_axis else {
             return Ok(None);
         };
@@ -152,7 +155,7 @@ impl<V: Typed<ArrayType>> ArrayBatch<V> {
 
     /// Returns the [`ArrayType`] of each item in the batch (i.e., with the batch axis removed, if any).
     #[inline]
-    pub fn unbatched_type(&self) -> Result<ArrayType, ProgramError> {
+    pub fn unbatched_type(&self) -> Result<ArrayType, BatchingError> {
         let Some(axis) = self.batch_axis else {
             return Ok(self.r#type.clone());
         };
@@ -202,7 +205,7 @@ pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
     /// derived using our `#[derive(BatchableOperation)]` macro, it is a common convention for operations that can be
     /// part of such operation families to implement this trait even if they do not support batching and to have this
     /// function simply return a [`BatchingError::UnsupportedOperation`] error.
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError>;
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError>;
 }
 
 /// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over physical
@@ -246,7 +249,7 @@ pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> +
         batch_size: usize,
         input_batch_axes: &[Option<usize>],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), ProgramError>;
+    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), BatchingError>;
 }
 
 impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
@@ -256,7 +259,7 @@ impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V,
         batch_size: usize,
         input_batch_axes: &[Option<usize>],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
+    ) -> Result<(Self, Vec<Option<usize>>), BatchingError> {
         O::batch_program(self, batch_size, input_batch_axes, output_axes_policy)
     }
 }

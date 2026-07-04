@@ -31,7 +31,6 @@ pre-release-replacements = [
 ryft-core.workspace = true
 ryft-macros.workspace = true
 ryft-mlir.workspace = true
-ryft-ndarray = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
 half.workspace = true
 ndarray = { workspace = true, optional = true }
@@ -48,7 +47,7 @@ tempfile.workspace = true
 [features]
 default = []
 benchmarking = ["ryft-core/benchmarking"]
-ndarray = ["dep:ndarray", "dep:ryft-ndarray"]
+ndarray = ["dep:ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]
 rocm-7 = ["ryft-pjrt/rocm-7"]
@@ -60,9 +59,4 @@ mps = ["ryft-pjrt/mps"]
 [[bin]]
 name = "ir_benchmark"
 path = "src/bin/ir_benchmark.rs"
-required-features = ["benchmarking", "ndarray"]
-
-[[bin]]
-name = "transform_benchmark"
-path = "src/bin/transform_benchmark.rs"
-required-features = ["benchmarking", "ndarray"]
+required-features = ["benchmarking"]
