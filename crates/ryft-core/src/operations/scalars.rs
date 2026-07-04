@@ -1,35 +1,23 @@
-use ryft_macros::{Operation, TransposableOperation};
+use ryft_macros::{DifferentiableOperation, Operation, TransposableOperation};
 
-use crate::domains::Domain;
 use crate::operations::BooleanLike;
-use crate::operations::arithmetic::{
-    AddOperation, DivOperation, MulOperation, NegOperation, ScaleOperation, SubOperation,
-};
+use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
 use crate::operations::compare::CompareOperation;
 use crate::operations::constants::{
-    ConstantOperation, MaybeZeroOperation, OneLikeOperation, OneOperation, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{SelectOperation, WhileOperation};
+use crate::operations::control_flow::{MaybeScan, MaybeWhile, SelectOperation, WhileOperation, WhileParts};
+use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
+use crate::operations::tag::{MaybeTag, TagOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
-use crate::payloads::Input;
-use crate::programs::{Program, ProgramError, Value};
-use crate::tracing::Tracer;
-use crate::tracing_v2::differentiation::{
-    CaptureParameterizedOperation, JvpTracer, LinearizationContextOf, NestedLinearization, TangentContext,
-};
+use crate::programs::Value;
+use crate::tracing_v2::DotDimensionNumbers;
 use crate::tracing_v2::operations::MaybeDot;
 use crate::tracing_v2::operations::custom_derivatives::{
-    CustomJvpOperation, CustomVjpCallOperation, CustomVjpOperation,
+    CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
-use crate::tracing_v2::operations::select::LinearSelectOperation;
-use crate::tracing_v2::rematerialization::{
-    MaybeRematerializationName, RematerializationNameOperation, RematerializeCallOperation, RematerializeOperation,
-};
-use crate::tracing_v2::{
-    DifferentiableOperation, DifferentiationContext, DotDimensionNumbers, LinearizableProgramOperation,
-    ResidualizedOperation, ValueOrCapture,
-};
+use crate::tracing_v2::rematerialization::RematerializeOperation;
 use crate::types::DataType;
 
 // TODO(eaplatanios): Review this file.
@@ -39,7 +27,7 @@ use crate::types::DataType;
 /// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar [`DataType`] metadata.
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
-#[derive(Clone, Debug, Operation)]
+#[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation)]
 #[ryft(bounds(interpretation(BooleanLike)))]
 pub enum ScalarOperation<V: Value<DataType>> {
     Zero(ZeroOperation<DataType>),
@@ -50,7 +38,6 @@ pub enum ScalarOperation<V: Value<DataType>> {
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
-    Scale(ScaleOperation<DataType, V>),
     Mul(MulOperation),
     Div(DivOperation),
     Sin(SinOperation),
@@ -59,250 +46,19 @@ pub enum ScalarOperation<V: Value<DataType>> {
     Select(SelectOperation),
     While(Box<WhileOperation<DataType, V, Self>>),
     StopGradient(StopGradientOperation),
-    RematerializationName(RematerializationNameOperation),
+    Tag(TagOperation),
+    Print(PrintOperation),
     CustomJvp(Box<CustomJvpOperation<DataType, V, Self>>),
     CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
+    CustomVjpTangent(Box<CustomVjpTangentOperation<DataType, V, Self>>),
     Rematerialize(Box<RematerializeOperation<DataType, V, Self>>),
 }
 
-impl<
-    C: DifferentiationContext<
-            Type = DataType,
-            Value: ZeroLike + BooleanLike,
-            Operation = ScalarOperation<<C as Domain>::Constant>,
-        >,
-> DifferentiableOperation<C> for ScalarOperation<C::Constant>
-where
-    ZeroOperation<DataType>: DifferentiableOperation<C>,
-    ZeroLikeOperation: DifferentiableOperation<C>,
-    OneOperation<DataType>: DifferentiableOperation<C>,
-    OneLikeOperation: DifferentiableOperation<C>,
-    ConstantOperation<DataType, C::Constant>: DifferentiableOperation<C>,
-    NegOperation: DifferentiableOperation<C>,
-    AddOperation: DifferentiableOperation<C>,
-    SubOperation: DifferentiableOperation<C>,
-    ScaleOperation<DataType, C::Constant>: DifferentiableOperation<C>,
-    MulOperation: DifferentiableOperation<C>,
-    DivOperation: DifferentiableOperation<C>,
-    SinOperation: DifferentiableOperation<C>,
-    CosOperation: DifferentiableOperation<C>,
-    CompareOperation: DifferentiableOperation<C>,
-    SelectOperation: DifferentiableOperation<C>,
-    StopGradientOperation: DifferentiableOperation<C>,
-    RematerializationNameOperation: DifferentiableOperation<C>,
-    ScalarOperation<C::Constant>: Clone + LinearizableProgramOperation<C>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<DataType>
-        + From<AddOperation>
-        + From<ZeroLikeOperation>
-        + From<NegOperation>
-        + From<SubOperation>
-        + From<ScaleOperation<DataType, ValueOrCapture<DataType, C::Value>, Input>>
-        + From<LinearSelectOperation<ValueOrCapture<DataType, C::Value>>>
-        + ResidualizedOperation<C>
-        + From<
-            CustomVjpCallOperation<
-                DataType,
-                C::Constant,
-                ScalarOperation<C::Constant>,
-                ValueOrCapture<DataType, C::Value>,
-            >,
-        > + CaptureParameterizedOperation<
-            DataType,
-            ValueOrCapture<DataType, C::Value>,
-            WithCapture<ValueOrCapture<DataType, C::Value>> = C::LinearOperation<
-                C::Tangent,
-                ValueOrCapture<C::Type, C::Value>,
-            >,
-        >,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<
-        RematerializeCallOperation<
-            DataType,
-            C::Constant,
-            ScalarOperation<C::Constant>,
-            ValueOrCapture<DataType, C::Value>,
-        >,
-    >,
-{
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        match self {
-            Self::Zero(operation) => operation.jvp(context, inputs),
-            Self::ZeroLike(operation) => operation.jvp(context, inputs),
-            Self::One(operation) => operation.jvp(context, inputs),
-            Self::OneLike(operation) => operation.jvp(context, inputs),
-            Self::Constant(operation) => operation.jvp(context, inputs),
-            Self::Neg(operation) => operation.jvp(context, inputs),
-            Self::Add(operation) => operation.jvp(context, inputs),
-            Self::Sub(operation) => operation.jvp(context, inputs),
-            Self::Scale(operation) => operation.jvp(context, inputs),
-            Self::Mul(operation) => operation.jvp(context, inputs),
-            Self::Div(operation) => operation.jvp(context, inputs),
-            Self::Sin(operation) => operation.jvp(context, inputs),
-            Self::Cos(operation) => operation.jvp(context, inputs),
-            Self::Compare(operation) => operation.jvp(context, inputs),
-            Self::Select(operation) => operation.jvp(context, inputs),
-            Self::While(operation) => operation.jvp(context, inputs),
-            Self::StopGradient(operation) => operation.jvp(context, inputs),
-            Self::RematerializationName(operation) => operation.jvp(context, inputs),
-            Self::CustomJvp(operation) => operation.jvp(context, inputs),
-            Self::CustomVjp(operation) => operation.jvp(context, inputs),
-            Self::Rematerialize(operation) => operation.jvp(context, inputs),
-        }
-    }
-}
-
-// TODO(eaplatanios): Should this be generated for all `DifferentiableOperation`s? Why do we need it?
-/// Nested symbolic linearization for the [`ScalarOperation`] sum type.
-///
-/// The where clauses spell the leaf closure required by
-/// [`Program::linearize`] instead of the recursive
-/// `Self: DifferentiableOperation<LinearizationContextOf<C, Self>>` bound, which avoids pushing that recursive
-/// obligation back into every consumer.
-impl<F, C> LinearizableProgramOperation<C> for ScalarOperation<F>
-where
-    F: Value<DataType>,
-    C: DifferentiationContext<Type = DataType, Constant = F>,
-    C::LinearOperation<C::Tangent, F>:
-        CaptureParameterizedOperation<DataType, F, WithCapture<F> = C::LinearOperation<C::Tangent, F>>,
-    <LinearizationContextOf<C, Self> as DifferentiationContext>::LinearOperation<
-        C::Tangent,
-        ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
-    >: MaybeZeroOperation<DataType>
-        + From<AddOperation>
-        + From<ZeroLikeOperation>
-        + From<NegOperation>
-        + From<SubOperation>
-        + From<ScaleOperation<DataType, ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>, Input>>
-        + ResidualizedOperation<LinearizationContextOf<C, Self>>
-        + From<ZeroOperation<DataType>>
-        + From<LinearSelectOperation<ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>>>
-        + From<
-            CustomVjpCallOperation<
-                DataType,
-                F,
-                Self,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
-            >,
-        > + From<
-            RematerializeCallOperation<
-                DataType,
-                F,
-                Self,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
-            >,
-        > + CaptureParameterizedOperation<
-            DataType,
-            ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
-            WithCapture<ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>> = <LinearizationContextOf<
-                C,
-                Self,
-            > as DifferentiationContext>::LinearOperation<
-                C::Tangent,
-                ValueOrCapture<DataType, Tracer<LinearizationContextOf<C, Self>>>,
-            >,
-            WithCapture<ValueOrCapture<DataType, C::Value>> = C::LinearOperation<
-                C::Tangent,
-                ValueOrCapture<C::Type, C::Value>,
-            >,
-        >,
-{
-    fn linearize_program(
-        differentiable: &C,
-        program: &Program<DataType, F, Self, Vec<F>, Vec<F>>,
-    ) -> Result<NestedLinearization<C, Self>, ProgramError> {
-        program.linearize(differentiable)
-    }
-}
-
-/// Closed scalar operation type for staged linear scalar programs.
-///
-/// The `V` parameter is the scalar tangent/cotangent value type carried by the linear program. It is also the linear
-/// program's constant-table type, so linear constants are typed as `V`. The `Constant` parameter is the primal context
-/// constant type used by user-supplied programs captured by [`CustomVjpCall`](Self::CustomVjpCall), which are written
-/// over context constants rather than over the linear value type `V` or captured-factor type `F`.
-///
-/// The variants mirror the linear scalar primitives: typed [`Zero`](Self::Zero)/[`One`](Self::One) and their
-/// exemplar-derived [`ZeroLike`](Self::ZeroLike)/[`OneLike`](Self::OneLike) maps, a typed
-/// [`Constant`](Self::Constant), [`Neg`](Self::Neg)/[`Add`](Self::Add)/[`Sub`](Self::Sub), scaling by a captured
-/// factor ([`Scale`](Self::Scale)), the captured-condition [`Select`](Self::Select)
-/// ([`LinearSelectOperation`]), linearized [`While`](Self::While) payloads, and the opaque
-/// [`CustomVjpCall`](Self::CustomVjpCall) staged by a `custom_vjp` linearization (its transpose replays the user's
-/// backward program).
-#[derive(Clone, Debug, Operation, TransposableOperation)]
-#[ryft(bounds(interpretation(BooleanLike)))]
-pub enum LinearScalarOperation<V: Value<DataType>, Constant: Value<DataType> = V, F: Value<DataType> = Constant> {
-    Zero(ZeroOperation<DataType>),
-    ZeroLike(ZeroLikeOperation),
-    One(OneOperation<DataType>),
-    OneLike(OneLikeOperation),
-    Constant(ConstantOperation<DataType, V, Input>),
-    Neg(NegOperation),
-    Add(AddOperation),
-    Sub(SubOperation),
-    Scale(ScaleOperation<DataType, F, Input>),
-    Select(LinearSelectOperation<F>),
-    While(Box<WhileOperation<DataType, V, Self, Input>>),
-    CustomVjpCall(Box<CustomVjpCallOperation<DataType, Constant, ScalarOperation<Constant>, F>>),
-    RematerializeCall(Box<RematerializeCallOperation<DataType, Constant, ScalarOperation<Constant>, F>>),
-}
-
-impl<V: Value<DataType>, Constant: Value<DataType>, F: Value<DataType>> CaptureParameterizedOperation<DataType, F>
-    for LinearScalarOperation<V, Constant, F>
-{
-    type WithCapture<MappedFactor: Value<DataType>> = LinearScalarOperation<V, Constant, MappedFactor>;
-
-    fn try_map_captures<MappedFactor: Value<DataType>, MapFactorFn>(
-        &self,
-        map_factor: &mut MapFactorFn,
-    ) -> Result<Self::WithCapture<MappedFactor>, ProgramError>
-    where
-        MapFactorFn: FnMut(&F) -> Result<MappedFactor, ProgramError>,
-    {
-        match self {
-            Self::Zero(operation) => Ok(operation.clone().into()),
-            Self::ZeroLike(operation) => Ok(operation.clone().into()),
-            Self::One(operation) => Ok(operation.clone().into()),
-            Self::OneLike(operation) => Ok(operation.clone().into()),
-            Self::Constant(operation) => Ok(operation.clone().into()),
-            Self::Neg(operation) => Ok(operation.clone().into()),
-            Self::Add(operation) => Ok(operation.clone().into()),
-            Self::Sub(operation) => Ok(operation.clone().into()),
-            Self::Scale(operation) => {
-                Ok(ScaleOperation::<DataType, MappedFactor, Input>::new(map_factor(operation.factor())?).into())
-            }
-            Self::Select(operation) => Ok(LinearSelectOperation::new(map_factor(operation.condition())?).into()),
-            Self::While(operation) => {
-                let condition = operation
-                    .condition()
-                    .map_operations(|operation| operation.try_map_captures::<MappedFactor, _>(map_factor))?;
-                let body = operation
-                    .body()
-                    .map_operations(|operation| operation.try_map_captures::<MappedFactor, _>(map_factor))?;
-                Ok(LinearScalarOperation::While(Box::new(
-                    WhileOperation::new(condition, body)?.with_iteration_bound(operation.iteration_bound())?,
-                )))
-            }
-            Self::CustomVjpCall(call) => {
-                Ok(LinearScalarOperation::CustomVjpCall(Box::new(call.map_captures(map_factor)?)))
-            }
-            Self::RematerializeCall(call) => {
-                Ok(LinearScalarOperation::RematerializeCall(Box::new(call.map_captures(map_factor)?)))
-            }
-        }
-    }
-}
-
-impl<V: Value<DataType>> MaybeRematerializationName for ScalarOperation<V> {
+impl<V: Value<DataType>> MaybeTag for ScalarOperation<V> {
     #[inline]
-    fn rematerialization_name(&self) -> Option<&str> {
+    fn key(&self) -> Option<&str> {
         match self {
-            Self::RematerializationName(operation) => Some(operation.tag()),
+            Self::Tag(operation) => Some(operation.key()),
             _ => None,
         }
     }
@@ -315,37 +71,57 @@ impl<V: Value<DataType>> MaybeDot for ScalarOperation<V> {
     }
 }
 
+impl<V: Value<DataType>> MaybeWhile<DataType, V, ScalarOperation<V>> for ScalarOperation<V> {
+    #[inline]
+    fn as_while(&self) -> Option<WhileParts<'_, DataType, V, ScalarOperation<V>>> {
+        match self {
+            Self::While(operation) => operation.as_while(),
+            _ => None,
+        }
+    }
+}
+
+/// [`ScalarOperation`] has no `scan` variant, so no residual ever needs scan-body provenance.
+impl<V: Value<DataType>> MaybeScan<DataType, V, ScalarOperation<V>> for ScalarOperation<V> {
+    #[inline]
+    fn scan_body(&self) -> Option<&crate::programs::Program<DataType, V, ScalarOperation<V>, Vec<V>, Vec<V>>> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::StagingContext;
+    use crate::domains::Domain;
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::control_flow::Select;
-    use crate::operations::{InterpretableOperation, Operation};
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::scalars::ScalarDomain;
-    use crate::tracing::trace;
+    use crate::scalars::{Scalar, ScalarDomain};
     use crate::tracing_v2::DifferentiationContext;
     use crate::types::TypeError;
 
     use super::*;
 
     /// Builds a carry-only scalar body program that maps `[carry]` to `[carry + carry]`.
-    fn scalar_doubling_body() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
-        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+    fn scalar_doubling_body() -> Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
         let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     /// Builds a scalar while condition that maps `[carry]` to `[carry < 8]`.
-    fn scalar_less_than_eight_condition() -> Program<DataType, f64, ScalarOperation<f64>, Vec<f64>, Vec<f64>> {
-        let mut builder = ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new();
+    fn scalar_less_than_eight_condition() -> Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>
+    {
+        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
-        let eight = builder.add_constant(8.0);
+        let eight = builder.add_constant(Scalar::from(8.0));
         let predicate = builder
             .add_instruction(CompareOperation::new(ComparisonDirection::LessThan), vec![carry, eight])
             .unwrap()[0];
@@ -355,11 +131,9 @@ mod tests {
     #[test]
     fn test_scalar_compare_and_select_program() {
         // `f(x, y) = select(x > y, x + x, y)` staged through `ScalarOperation` tracers.
-        let domain = ScalarDomain::<f64>::new();
-        let (output_type, program) = trace(
-            &domain,
+        let (output_type, program) = ScalarDomain::trace(
             |(x, y)| {
-                let mask = x.clone().greater_than(&y);
+                let mask = x.clone().greater_than(&y)?;
                 Select::select(&mask, &(x.clone() + x), &y)
             },
             (DataType::F64, DataType::F64),
@@ -379,13 +153,13 @@ mod tests {
         );
 
         // Interpreting the staged program exercises the in-band Boolean condition encoding of scalar values.
-        assert_eq!(program.interpret((3.0, 2.0)), Ok(6.0));
-        assert_eq!(program.interpret((1.0, 2.0)), Ok(2.0));
+        assert_eq!(program.interpret((Scalar::from(3.0), Scalar::from(2.0))), Ok(Scalar::from(6.0)));
+        assert_eq!(program.interpret((Scalar::from(1.0), Scalar::from(2.0))), Ok(Scalar::from(2.0)));
     }
 
     #[test]
     fn test_scalar_while() {
-        let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+        let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
             scalar_less_than_eight_condition(),
             scalar_doubling_body(),
         )
@@ -395,13 +169,15 @@ mod tests {
         assert_eq!(operation.state_types(), vec![DataType::F64]);
         assert_eq!(operation.iteration_bound(), None);
         assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(operation.interpret(&crate::EagerContext::new(), &[1.0]), Ok(vec![8.0]));
+        assert_eq!(
+            operation.interpret(&crate::EagerContext::<DataType, Scalar>::new(), &[Scalar::from(1.0)]),
+            Ok(vec![Scalar::from(8.0)])
+        );
 
-        let domain = ScalarDomain::<f64>::new();
-        let (output_type, program) = trace(
-            &domain,
+        let domain = ScalarDomain::new();
+        let (output_type, program) = ScalarDomain::trace(
             |carry| {
-                let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+                let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
                     scalar_less_than_eight_condition(),
                     scalar_doubling_body(),
                 )
@@ -434,46 +210,34 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(program.interpret(1.0), Ok(8.0));
+        assert_eq!(program.interpret(Scalar::from(1.0)), Ok(Scalar::from(8.0)));
 
-        let (primal, tangent): (f64, f64) = domain
+        let (primal, tangent): (Scalar, Scalar) = domain
             .jvp(
                 |carry| {
-                    let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
+                    let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
                         scalar_less_than_eight_condition(),
                         scalar_doubling_body(),
                     )
                     .unwrap();
                     carry.unary(operation)
                 },
-                1.0,
-                1.0,
+                Scalar::from(1.0),
+                Scalar::from(1.0),
             )
             .unwrap();
         assert_eq!(primal, 8.0);
         assert_eq!(tangent, 8.0);
-
-        let (_, pushforward) = domain
-            .linearize(
-                |carry| {
-                    let operation = WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(
-                        scalar_less_than_eight_condition(),
-                        scalar_doubling_body(),
-                    )
-                    .unwrap();
-                    Ok(carry.unary(operation))
-                },
-                1.0,
-            )
-            .unwrap();
-        assert_eq!(pushforward.apply(&crate::EagerContext::new(), 1.0), Ok(8.0));
     }
 
     #[test]
     fn test_scalar_while_rejects_non_boolean_condition() {
         assert_eq!(
-            WhileOperation::<DataType, f64, ScalarOperation<f64>>::new(scalar_doubling_body(), scalar_doubling_body())
-                .map(|_| ()),
+            WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
+                scalar_doubling_body(),
+                scalar_doubling_body()
+            )
+            .map(|_| ()),
             Err(TypeError { message: "while condition output type must be bool, but got f64".to_string() }),
         );
     }
