@@ -30,7 +30,7 @@ pub mod tests;
 pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
 pub use batching::{
     ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableProgramOperation, BatchingError,
-    ProgramBatchingOutputAxesPolicy,
+    InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;

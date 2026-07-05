@@ -5,6 +5,8 @@ use ryft_macros::Parameter;
 use thiserror::Error;
 
 use crate::axes::AxisError;
+use crate::interpretation::InterpretableOperation;
+use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, ParameterError};
 use crate::programs::{Program, ProgramError, Value};
@@ -444,12 +446,59 @@ impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V,
     }
 }
 
+/// Capability to interpret an [`Operation`] on batch-carrying operands and repackage its outputs as [`ArrayBatch`]es.
+/// This is the shared application path the per-operation [`BatchableOperation`] rules use once they have lifted an
+/// operation to its batch-carrying operands. Every [`InterpretableOperation`] over [`ArrayType`] values gets it for
+/// free through the blanket implementation below, so an operation earns it directly from its interpretation rule.
+pub trait InterpretableBatchableOperation<V: Value<ArrayType>, C> {
+    /// Interprets this operation on the *unpacked* values of batched `inputs` and repackages each output as an
+    /// [`ArrayBatch`] carrying the corresponding `output_batch_axes` entry.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Interpretation context, as in [`InterpretableOperation::interpret`].
+    ///   - `inputs`: Batch-carrying operands the lifted operation is interpreted over.
+    ///   - `output_batch_axes`: [`BatchAxis`] to attach to each produced output. This slice must have one entry per
+    ///     output that this [`Operation`] produces on these inputs.
+    fn interpret_with_batch_axes(
+        &self,
+        context: &C,
+        inputs: &[ArrayBatch<V>],
+        output_batch_axes: &[BatchAxis],
+    ) -> Result<Vec<ArrayBatch<V>>, BatchingError>;
+}
+
+impl<O: InterpretableOperation<ArrayType, V, C>, V: Value<ArrayType>, C> InterpretableBatchableOperation<V, C> for O {
+    fn interpret_with_batch_axes(
+        &self,
+        context: &C,
+        inputs: &[ArrayBatch<V>],
+        output_batch_axes: &[BatchAxis],
+    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+        // Every `InterpretableOperation` over `ArrayType` values is an `InterpretableBatchableOperation`. The batched
+        // interpretation unpacks the operand values, interprets the operation once through `interpret`, and repackages
+        // each output with its requested `BatchAxis`.
+        if inputs.is_empty() {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        }
+        let input_values: Vec<V> = inputs.iter().map(|input| input.value().clone()).collect();
+        let output_values = self.interpret(context, input_values.as_slice())?;
+        check_count!("output", output_values, output_batch_axes.len(), ProgramError);
+        output_values
+            .into_iter()
+            .zip(output_batch_axes.iter().copied())
+            .map(|(value, axis)| ArrayBatch::new(value.r#type().into_owned(), value, axis))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::operations::arithmetic::AddOperation;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
+    use crate::tests::{TestArray, TestArrayDomain};
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use super::*;
@@ -567,6 +616,32 @@ mod tests {
             error.downcast_custom::<BatchingError>(),
             Some(BatchingError::MisalignedBatchAxes { message })
                 if message.contains("mismatched batch axis sharding"),
+        ));
+    }
+
+    #[test]
+    fn test_interpret_with_batch_axes() {
+        // `interpret_with_batch_axes` interprets the operation on the unpacked operand values and repackages each
+        // output as an `ArrayBatch` carrying the requested output batch axis. Here two batched length-3 operands are
+        // added elementwise, yielding a single batched sum mapped on axis 0.
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
+        let right = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
+
+        let outputs = AddOperation
+            .interpret_with_batch_axes(&TestArrayDomain, &[left, right], &[BatchAxis::new(0)])
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(*outputs[0].r#type(), vector_type);
+        assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
+
+        // An `output_batch_axes` length that disagrees with the number of produced outputs is rejected.
+        let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
+        let right = ArrayBatch::new(vector_type, TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
+        assert!(matches!(
+            AddOperation.interpret_with_batch_axes(&TestArrayDomain, &[left, right], &[]),
+            Err(BatchingError::Program(_)),
         ));
     }
 }

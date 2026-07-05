@@ -18,7 +18,7 @@ pub trait InterpretableOperation<T: Type, V: Value<T>, C>: Operation<T> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Interpretation context; nullary and captured-payload implementations construct values through
+    ///   - `context`: Interpretation context. Nullary and captured-payload implementations construct values through
     ///     its context capabilities, while operand-driven value semantics ignore it.
     ///   - `inputs`: Input values to interpret this [`Operation`] on.
     fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError>;

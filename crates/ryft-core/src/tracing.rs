@@ -881,12 +881,12 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
+                if message == "'add' input types are not broadcast-compatible",
         ));
         assert!(matches!(
             builder.borrow().error().cloned(),
             Some(ProgramError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible"
+                if message == "'add' input types are not broadcast-compatible",
         ));
 
         // Test staging concrete constants through the context without requiring the context itself to be a domain.
@@ -989,7 +989,7 @@ mod tests {
         assert!(matches!(
             ScalarDomain::trace(|inputs| Ok(inputs.0 + inputs.1), (DataType::F8E3M4, DataType::F32)),
             Err(ProgramError::Type(TypeError { message }))
-                if message == "add input types are not broadcast-compatible",
+                if message == "'add' input types are not broadcast-compatible",
         ));
     }
 
