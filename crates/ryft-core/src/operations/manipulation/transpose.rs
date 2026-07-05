@@ -90,8 +90,7 @@ pub trait Transpose: Sized {
     /// `Vec<usize>` or a borrowed `&[usize]`), so callers can transpose without allocating a fresh permutation.
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError>;
 
-    // TODO(eaplatanios): Add unit test.
-    /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order . This is the
+    /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order. This is the
     /// analogue of NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html).
     /// Returns `self` unchanged when `from == to`.
     #[inline]
@@ -110,16 +109,24 @@ pub trait Transpose: Sized {
         )
     }
 
-    // TODO(eaplatanios): Add unit test.
     /// Swaps axes `i` and `j`, leaving every other axis in place. This is the analogue of NumPy's
     /// [`swapaxes`](https://numpy.org/doc/stable/reference/generated/numpy.swapaxes.html).
-    /// Returns `self` unchanged when `i == j`.
+    /// Returns `self` unchanged when `i == j`. An out-of-bounds axis yields a [`TypeError`] rather than a panic.
     #[inline]
     fn swap_axes(&self, i: usize, j: usize) -> Result<Self, ProgramError>
     where
         Self: Typed<ArrayType>,
     {
-        let mut permutation = (0..self.r#type().rank()).collect::<Vec<_>>();
+        let rank = self.r#type().rank();
+        for axis in [i, j] {
+            if axis >= rank {
+                return Err(TypeError {
+                    message: format!("'{TRANSPOSE_OPERATION_NAME}' swap axis {axis} is out of bounds"),
+                }
+                .into());
+            }
+        }
+        let mut permutation = (0..rank).collect::<Vec<_>>();
         permutation.swap(i, j);
         self.transpose(permutation)
     }
@@ -401,6 +408,62 @@ mod tests {
         assert!(matrix().transpose(vec![1]).is_err());
         assert!(matrix().transpose(vec![0, 2]).is_err());
         assert!(matrix().transpose(vec![0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_move_axis() {
+        // On a matrix, moving axis 0 to position 1 is a plain transpose: the [2, 3] payload becomes [3, 2].
+        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let output = matrix.move_axis(0, 1).unwrap();
+        assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
+        assert_eq!(output.values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+        // On a rank-3 array, moving axis 0 to the last position shifts the other axes left to preserve their relative
+        // order, so [2, 3, 4] becomes [3, 4, 2] (the permutation [1, 2, 0]).
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
+        let output = TestArray::new(input_type, values).move_axis(0, 2).unwrap();
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4), Size::Static(2)])),
+        );
+
+        // `from == to` leaves the array unchanged.
+        assert_eq!(matrix.move_axis(1, 1).unwrap(), matrix);
+
+        // An out-of-bounds source axis is a clean error rather than an out-of-bounds panic, since the built
+        // permutation is validated by the type-level transpose.
+        assert!(matrix.move_axis(2, 0).is_err());
+    }
+
+    #[test]
+    fn test_swap_axes() {
+        // Swapping axes 0 and 1 of a matrix is a plain transpose: the [2, 3] payload becomes [3, 2].
+        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let swapped = matrix.swap_axes(0, 1).unwrap();
+        assert_eq!(swapped.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
+        assert_eq!(swapped.values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+        // Swapping is symmetric in its axis arguments.
+        assert_eq!(matrix.swap_axes(1, 0).unwrap(), swapped);
+
+        // Swapping the outer two axes of a rank-3 array leaves the untouched trailing axis in place, so [2, 3, 4]
+        // becomes [3, 2, 4] (the permutation [1, 0, 2]).
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(4)]));
+        let values = (0..24).map(|value| value as f64).collect::<Vec<_>>();
+        let output = TestArray::new(input_type, values).swap_axes(0, 1).unwrap();
+        assert_eq!(
+            output.r#type,
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2), Size::Static(4)])),
+        );
+
+        // `i == j` leaves the array unchanged.
+        assert_eq!(matrix.swap_axes(1, 1).unwrap(), matrix);
+
+        // An out-of-bounds axis is a clean error rather than an out-of-bounds panic.
+        assert!(matrix.swap_axes(2, 0).is_err());
     }
 
     // TODO(eaplatanios): Review this function.
