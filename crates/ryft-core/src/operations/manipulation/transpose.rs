@@ -90,22 +90,30 @@ pub trait Transpose: Sized {
     /// `Vec<usize>` or a borrowed `&[usize]`), so callers can transpose without allocating a fresh permutation.
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError>;
 
-    // TODO(eaplatanios): Review this function.
-    /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order (the analogue of
-    /// NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html)). Returns `self`
-    /// unchanged when `from == to`.
+    // TODO(eaplatanios): Add unit test.
+    /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order . This is the
+    /// analogue of NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html).
+    /// Returns `self` unchanged when `from == to`.
     #[inline]
     fn move_axis(&self, from: usize, to: usize) -> Result<Self, ProgramError>
     where
         Self: Typed<ArrayType>,
     {
-        self.transpose(move_axis_permutation(self.r#type().rank(), from, to))
+        let rank = self.r#type().rank();
+        self.transpose(
+            (0..rank)
+                .filter(move |&axis| axis != from)
+                .take(to)
+                .chain([from])
+                .chain((0..rank).filter(move |&axis| axis != from).skip(to))
+                .collect::<Vec<_>>(),
+        )
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Swaps axes `i` and `j`, leaving every other axis in place (the analogue of NumPy's
-    /// [`swapaxes`](https://numpy.org/doc/stable/reference/generated/numpy.swapaxes.html)). Returns `self` unchanged
-    /// when `i == j`.
+    // TODO(eaplatanios): Add unit test.
+    /// Swaps axes `i` and `j`, leaving every other axis in place. This is the analogue of NumPy's
+    /// [`swapaxes`](https://numpy.org/doc/stable/reference/generated/numpy.swapaxes.html).
+    /// Returns `self` unchanged when `i == j`.
     #[inline]
     fn swap_axes(&self, i: usize, j: usize) -> Result<Self, ProgramError>
     where
@@ -215,15 +223,6 @@ pub fn inverse_permutation(permutation: &[usize]) -> Vec<usize> {
         inverse[*axis] = position;
     }
     inverse
-}
-
-// TODO(eaplatanios): Review this function.
-/// Returns the length-`rank` permutation that moves axis `from` to position `to`, shifting the other axes to preserve
-/// their relative order. Returns the identity permutation when `from == to`. This is the permutation backing
-/// [`Transpose::move_axis`].
-pub fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
-    let others = || (0..rank).filter(move |&axis| axis != from);
-    others().take(to).chain([from]).chain(others().skip(to)).collect()
 }
 
 #[cfg(test)]

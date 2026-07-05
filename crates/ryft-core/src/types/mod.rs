@@ -28,11 +28,11 @@ pub struct TypeError {
 /// descriptors for traced values.
 ///
 /// Note that [`Type`] requires [`Clone`] so that descriptors can be duplicated into staged [`Program`](crate::Program)s
-/// returned via [`Cow`] from [`Typed::r#type`](Typed::type), and stored in tracing data structures. It requires
-/// [`Debug`] and [`Display`] so diagnostics and rendered programs can show type descriptors consistently without
-/// forcing every call site to repeat those bounds. It also requires [`PartialEq`] because type equality is fundamental
-/// to type inference and validation, and so generic code bounded on [`Type`] can compare type descriptors without
-/// repeating that bound. Finally, it requires [`Parameter`] so that type descriptors can be used as leaves in
+/// returned via [`Cow`] using the [`Typed`] trait, and stored in tracing data structures. It requires [`Debug`] and
+/// [`Display`] so diagnostics and rendered programs can show type descriptors consistently without forcing every call
+/// site to repeat those bounds. It also requires [`PartialEq`] because type equality is fundamental to type inference
+/// and validation, and so generic code bounded on [`Type`] can compare type descriptors without repeating that bound.
+/// Finally, it requires [`Parameter`] so that type descriptors can be used as leaves in
 /// [`Parameterized`](crate::Parameterized) data structures.
 pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// Returns `true` if values described by this [`Type`] are compatible with the provided [`Type`]. The precise
