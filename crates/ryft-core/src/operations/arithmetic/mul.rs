@@ -59,33 +59,76 @@ impl ElementwiseOperation for MulOperation {
         2
     }
 
-    // TODO(eaplatanios): Review this function. Also, tests.
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        // Multiplication is bilinear and so its output sharding combines the operands' unreduced/reduced reduction
-        // state by the bilinear rule rather than the congruent rule that generic elementwise broadcasting applies.
-        // The operands cannot both be unreduced (the product of two distributed partial sums is not itself a partial
-        // sum), but an operand unreduced over some axes times one reduced over exactly those axes yields a result
-        // unreduced over them. The combination does not depend on the per-dimension placement, so it applies for every
-        // `MeshAxisType` rather than being gated to explicit axes. The placement is broadcast with the reduction state
-        // stripped (so the shared broadcast does not reject a legitimate unreduced/reduced pairing), then the reduction
-        // state is recomputed and reattached. Refer to https://blog.ezyang.com/2026/01/jax-sharding-type-system/ for
-        // some background on JAX's unreduced/reduced sharding type system that this rule mirrors (the relevant
-        // `_mul_ur_rule` lives in JAX's `jax/_src/lax/lax.py`).
+        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
+        // state by the bilinear rule (this is also what JAX does with its `_mul_ur_rule` implementation; refer to
+        // https://blog.ezyang.com/2026/01/jax-sharding-type-system/ for more information on that) rather than the
+        // congruent rule that generic elementwise broadcasting applies. The reduction state is combined independently
+        // of the per-dimension placement, so the placement is broadcast with that state stripped (otherwise the shared
+        // broadcast would reject a legitimate unreduced/reduced pairing) and the recomputed state is reattached
+        // afterward.
         check_count!("input", input_types, 2, TypeError);
         let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
         let output = self.broadcast_output_type(&stripped)?;
-        let (output_unreduced, output_reduced) = combine_bilinear_reduction_state(
-            input_types[0].unreduced_axes(),
-            input_types[0].reduced_axes(),
-            input_types[1].unreduced_axes(),
-            input_types[1].reduced_axes(),
-        )?;
+        let left_unreduced = input_types[0].unreduced_axes();
+        let left_reduced = input_types[0].reduced_axes();
+        let right_unreduced = input_types[1].unreduced_axes();
+        let right_reduced = input_types[1].reduced_axes();
+
+        // An operand unreduced over some axes is a partial sum still awaiting an all-reduce over them. The product of
+        // two partial sums is not a partial sum, so at most one operand may be unreduced. The other must then be
+        // reduced over exactly those axes, and the product stays unreduced over them (its matching reduced marker is
+        // consumed when the reduced set is computed below).
+        let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
+            (false, false) => {
+                return Err(TypeError {
+                    message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced"),
+                });
+            }
+            (false, true) => {
+                if left_unreduced != right_reduced {
+                    return Err(TypeError {
+                        message: format!(
+                            "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes \
+                             the first is unreduced over",
+                        ),
+                    });
+                }
+                left_unreduced.clone()
+            }
+            (true, false) => {
+                if right_unreduced != left_reduced {
+                    return Err(TypeError {
+                        message: format!(
+                            "'{MUL_OPERATION_NAME}' requires the first operand to be reduced over the axes \
+                             the second is unreduced over",
+                        ),
+                    });
+                }
+                right_unreduced.clone()
+            }
+            (true, true) => BTreeSet::new(),
+        };
+
+        // Plain reduced axes must agree when both operands carry them (either operand may leave the set unset), and any
+        // axis that just became unreduced is dropped from the reduced set since the product now tracks it as unreduced.
+        let mut output_reduced = if left_reduced.is_empty() {
+            right_reduced.clone()
+        } else if right_reduced.is_empty() || left_reduced == right_reduced {
+            left_reduced.clone()
+        } else {
+            return Err(TypeError {
+                message: format!("'{MUL_OPERATION_NAME}' operands must be reduced over the same axes"),
+            });
+        };
+        output_reduced.retain(|axis| !output_unreduced.contains(axis));
+
+        // A non-empty result reduction state means some operand was sharded, so the broadcast output (already stripped
+        // of reduction axes) carries a sharding onto which the recomputed state is reattached; otherwise it is already
+        // correct as is.
         if output_unreduced.is_empty() && output_reduced.is_empty() {
             return Ok(vec![output]);
         }
-
-        // Reduction state is only non-empty when an operand carried it, so the broadcast output has a sharding to
-        // rebuild with the recomputed reduction state.
         let sharding = output.sharding().expect("bilinear reduction state implies a sharded output");
         let rebuilt = Sharding::with_manual_axes(
             sharding.mesh().clone(),
@@ -97,59 +140,6 @@ impl ElementwiseOperation for MulOperation {
         .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
     }
-}
-
-// TODO(eaplatanios): Review this function. Also, tests.
-/// Combines two operands' `(unreduced, reduced)` reduction-state axis sets under the bilinear rule (JAX's
-/// `_mul_ur_rule`): the operands cannot both be unreduced; an operand unreduced over a set of axes requires the
-/// other to be reduced over exactly those axes and yields an unreduced result over them; reduced axes otherwise
-/// propagate when the operands agree, and any axis that ends up unreduced is removed from the reduced set.
-fn combine_bilinear_reduction_state(
-    left_unreduced: &BTreeSet<String>,
-    left_reduced: &BTreeSet<String>,
-    right_unreduced: &BTreeSet<String>,
-    right_reduced: &BTreeSet<String>,
-) -> Result<(BTreeSet<String>, BTreeSet<String>), TypeError> {
-    let output_unreduced = match (left_unreduced.is_empty(), right_unreduced.is_empty()) {
-        (false, false) => {
-            return Err(TypeError {
-                message: format!("{MUL_OPERATION_NAME} cannot multiply two operands that are both unreduced"),
-            });
-        }
-        (false, true) => {
-            if left_unreduced != right_reduced {
-                return Err(TypeError {
-                    message: format!(
-                        "{MUL_OPERATION_NAME} requires the second operand to be reduced over the axes the first is \
-                         unreduced over"
-                    ),
-                });
-            }
-            left_unreduced.clone()
-        }
-        (true, false) => {
-            if right_unreduced != left_reduced {
-                return Err(TypeError {
-                    message: format!(
-                        "{MUL_OPERATION_NAME} requires the first operand to be reduced over the axes the second is \
-                         unreduced over"
-                    ),
-                });
-            }
-            right_unreduced.clone()
-        }
-        (true, true) => BTreeSet::new(),
-    };
-
-    let mut output_reduced = if left_reduced.is_empty() {
-        right_reduced.clone()
-    } else if right_reduced.is_empty() || left_reduced == right_reduced {
-        left_reduced.clone()
-    } else {
-        return Err(TypeError { message: format!("{MUL_OPERATION_NAME} operands must be reduced over the same axes") });
-    };
-    output_reduced.retain(|axis| !output_unreduced.contains(axis));
-    Ok((output_unreduced, output_reduced))
 }
 
 impl<T: Type, V: Clone + Value<T> + Mul, C> InterpretableOperation<T, V, C> for MulOperation
@@ -355,7 +345,6 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_mul_combines_unreduced_and_reduced_operands_bilinearly() {
         let mesh = LogicalMesh::new(vec![

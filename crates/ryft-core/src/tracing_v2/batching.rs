@@ -1008,10 +1008,11 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                         // Collapsing a mapped output requires an explicit reduction inside the batched function, and
                         // materializing a missing axis requires an explicit broadcast; position-only disagreements are
                         // instead repaired with the staged transpose in the arm below.
-                        (None, Some(_)) | (Some(_), None) => {
-                            Err(BatchingError::MismatchedOutputAxes { expected: expected_axis, actual: current_axis }
-                                .into())
+                        (None, Some(_)) | (Some(_), None) => Err(BatchingError::MismatchedOutputAxes {
+                            expected: BatchAxis::from(expected_axis),
+                            actual: BatchAxis::from(current_axis),
                         }
+                        .into()),
                         (Some(current), Some(expected)) if current == expected => Ok(parent_tracer),
                         (Some(current), Some(expected)) => {
                             let rank = parent_tracer.r#type().as_ref().rank();

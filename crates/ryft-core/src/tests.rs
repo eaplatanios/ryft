@@ -4924,7 +4924,11 @@ mod batching_tests {
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::replicated(), None);
-        assert!(matches!(result, Err(BatchingError::MismatchedOutputAxes { expected: None, actual: Some(0) })));
+        assert!(matches!(
+            result,
+            Err(BatchingError::MismatchedOutputAxes { expected, actual })
+                if expected == BatchAxis::replicated() && actual == BatchAxis::new(0),
+        ));
     }
 
     #[test]
@@ -4934,7 +4938,11 @@ mod batching_tests {
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let result: Result<TestArray, BatchingError> =
             TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::replicated(), BatchAxis::new(0), Some(3));
-        assert!(matches!(result, Err(BatchingError::MismatchedOutputAxes { expected: Some(0), actual: None })));
+        assert!(matches!(
+            result,
+            Err(BatchingError::MismatchedOutputAxes { expected, actual })
+                if expected == BatchAxis::new(0) && actual == BatchAxis::replicated(),
+        ));
     }
 
     #[test]

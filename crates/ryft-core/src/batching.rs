@@ -46,8 +46,8 @@ pub enum BatchingError {
     #[error("{message}")]
     UnsupportedOperation { message: String },
 
-    #[error("mismatched batch output axes; expected {expected:?} but got {actual:?}")]
-    MismatchedOutputAxes { expected: Option<usize>, actual: Option<usize> },
+    #[error("mismatched batch output axes; expected {expected} but got {actual}")]
+    MismatchedOutputAxes { expected: BatchAxis, actual: BatchAxis },
 
     #[error(transparent)]
     Parameter(#[from] ParameterError),
@@ -94,7 +94,7 @@ impl From<BatchingError> for ProgramError {
 /// This is the batch axis carried by an [`ArrayBatch`] and, during the batching transform, by the
 /// [`Tracer`](crate::Tracer) metadata. Carrying it on the value itself lets the per-operation batching rules route the
 /// mapped batch axis straight from the value in hand.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Parameter)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
 pub struct BatchAxis(Option<usize>);
 
 impl BatchAxis {
@@ -121,6 +121,16 @@ impl BatchAxis {
     #[inline]
     pub fn is_replicated(&self) -> bool {
         self.0.is_none()
+    }
+}
+
+impl Display for BatchAxis {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(axis) => write!(formatter, "axis {axis}"),
+            None => write!(formatter, "replicated"),
+        }
     }
 }
 

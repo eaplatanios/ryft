@@ -37,16 +37,17 @@ pub use crate::operations::tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use crate::tracing::NestedTracer;
 pub use batching::{
-    ArrayBatch, Batch, BatchAxesSpecification, BatchAxis, BatchAxisSpecification, BatchContext, BatchableOperation,
-    BatchableProgramOperation, BatchingContext, BatchingTracer, DomainBatchingValue, ProgramBatchingContext,
-    ProgramBatchingOutputAxes, batch_program,
+    Batch, BatchContext, BatchingContext, BatchingMeta, BatchingTracer, DomainBatchingValue, batch_program,
 };
 pub use differentiation::{DifferentiationContext, DifferentiationError};
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,
 };
-pub use operations::collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
+pub use operations::collective::{
+    AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,
+    forward_collective_to_parent,
+};
 pub use operations::control_flow::transpose_primal_condition;
 pub use operations::custom_derivatives::transpose_primal_custom_vjp;
 pub use operations::dot::{Dot, DotDimensionNumbers, DotOperation, DotOps};

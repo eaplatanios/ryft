@@ -614,7 +614,7 @@ impl ArrayType {
     /// shared elementwise broadcast does not reject operands that only disagree on their reduction state, which those
     /// rules combine separately.
     #[inline]
-    pub fn without_reduction_state(&self) -> Self {
+    pub fn without_reduction_axes(&self) -> Self {
         let Some(sharding) = &self.sharding else {
             return self.clone();
         };
@@ -767,6 +767,8 @@ impl Value<ArrayType> for ArrayType {}
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use pretty_assertions::assert_eq;
 
     use crate::Error;
@@ -774,10 +776,9 @@ mod tests {
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
     use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
-    use crate::types::{
-        ArrayType, Layout, Memory, Shape, Size, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type,
-        TypeError,
-    };
+    use crate::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
+
+    use super::*;
 
     #[test]
     fn test_size_value() {
@@ -1031,6 +1032,46 @@ mod tests {
         assert_eq!(scalar.element_count(), Ok(Some(1)));
         assert_eq!(static_array_type.element_count(), Ok(Some(336)));
         assert_eq!(dynamic_array_type.element_count(), Ok(None));
+    }
+
+    #[test]
+    fn test_array_type_sharding() {
+        // An array type with no sharding reports `None` and empty reduction-axis sets, and stripping its reduction
+        // axes leaves it unchanged.
+        let unsharded = ArrayType::new(F32, Shape::new(vec![Size::Static(8)]));
+        assert_eq!(unsharded.sharding(), None);
+        assert_eq!(unsharded.unreduced_axes(), &BTreeSet::new());
+        assert_eq!(unsharded.reduced_axes(), &BTreeSet::new());
+        assert_eq!(unsharded.without_reduction_axes(), unsharded);
+
+        // A single sharding can carry unreduced axes, reduced axes, and varying manual axes at once (over distinct
+        // mesh axes), alongside a sharded placement dimension.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("a", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::with_manual_axes(mesh, vec![ShardingDimension::sharded(["a"])], ["x"], ["y"], ["m"]).unwrap();
+        let sharded = ArrayType::new(F32, Shape::new(vec![Size::Static(8)])).with_sharding(sharding.clone()).unwrap();
+
+        // `sharding` exposes the attached sharding, and the accessors surface its reduction-axis sets.
+        assert_eq!(sharded.sharding(), Some(&sharding));
+        assert_eq!(sharded.unreduced_axes(), &BTreeSet::from(["x".to_string()]));
+        assert_eq!(sharded.reduced_axes(), &BTreeSet::from(["y".to_string()]));
+
+        // `without_reduction_axes` clears both reduction-axis sets while preserving the placement dimensions and the
+        // varying manual axes.
+        let stripped = sharded.without_reduction_axes();
+        let stripped_sharding = stripped.sharding().unwrap();
+        assert_eq!(stripped_sharding.unreduced_axes(), &BTreeSet::new());
+        assert_eq!(stripped_sharding.reduced_axes(), &BTreeSet::new());
+        assert_eq!(stripped_sharding.dimensions(), sharding.dimensions());
+        assert_eq!(stripped_sharding.varying_manual_axes(), &BTreeSet::from(["m".to_string()]));
+        assert_eq!(stripped.unreduced_axes(), &BTreeSet::new());
+        assert_eq!(stripped.reduced_axes(), &BTreeSet::new());
     }
 
     #[test]
