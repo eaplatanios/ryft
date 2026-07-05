@@ -258,7 +258,6 @@ impl Transpose for ArrayType {
         }
         let permuted = permutation.iter().map(|axis| input.dimension(*axis as isize)).collect::<Vec<_>>();
 
-        // TODO(eaplatanios): Review this portion.
         // The output sharding permutes its dimension entries the same way as the array axes: the reduction-state and
         // manual-axis sets are unchanged. This mirrors JAX's `_transpose_sharding_rule` and is correct for every mesh
         // axis type (it is a pure reordering, not explicit-mode reasoning).
@@ -289,6 +288,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{DataType, Size, Typed};
 
@@ -385,11 +385,8 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_transpose_permutes_sharding_dimensions() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
