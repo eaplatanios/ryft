@@ -201,6 +201,36 @@ impl<O: crate::operations::Operation<ArrayType>> Fill<ArrayType, f64, TestArray>
     }
 }
 
+impl<O: crate::operations::Operation<ArrayType>> crate::operations::constants::Iota<ArrayType, TestArray>
+    for EagerContext<ArrayType, TestArray, O>
+{
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
+        let sizes = r#type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| {
+                dimension.value().ok_or_else(|| TypeError {
+                    message: format!("cannot materialize an iota of dynamically sized type {type}"),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if dimension >= sizes.len() {
+            return Err(TypeError {
+                message: format!("iota dimension {dimension} is out of bounds for array type {type}"),
+            }
+            .into());
+        }
+        // In row-major order, the index along `dimension` at flat position `flat` is `(flat / stride) % size`, where
+        // `stride` is the product of the sizes of the dimensions after `dimension`.
+        let size = sizes[dimension];
+        let stride: usize = sizes[dimension + 1..].iter().product();
+        let element_count = TestArray::materialized_element_count(r#type)?;
+        let values = (0..element_count).map(|flat| ((flat / stride) % size) as f64).collect();
+        Ok(TestArray { r#type: r#type.clone(), values })
+    }
+}
+
 impl ZeroLike for TestArray {
     fn zero_like(&self) -> Self {
         Self { r#type: self.r#type.clone(), values: vec![0.0; self.values.len()] }
@@ -1002,6 +1032,13 @@ impl Context for TestArrayDomain {
     }
 }
 
+/// An eager test domain binds no named axes: it is a leaf of the resolution stack, so every lookup returns `None`.
+impl crate::axes::NamedAxes for TestArrayDomain {
+    fn named_axis(&self, _name: &str) -> Option<crate::axes::NamedAxis> {
+        None
+    }
+}
+
 /// Eager-domain context capabilities: [`TestArrayDomain`] interprets operations directly over [`TestArray`]s, so
 /// its nullary-construction and constant-materialization semantics are exactly the zero-state
 /// [`EagerContext`]'s, to which these impls delegate.
@@ -1020,6 +1057,12 @@ impl One<ArrayType, TestArray> for TestArrayDomain {
 impl Fill<ArrayType, f64, TestArray> for TestArrayDomain {
     fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
         EagerContext::<ArrayType, TestArray>::new().fill(r#type, value)
+    }
+}
+
+impl crate::operations::constants::Iota<ArrayType, TestArray> for TestArrayDomain {
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
+        EagerContext::<ArrayType, TestArray>::new().iota(r#type, dimension)
     }
 }
 
@@ -4367,6 +4410,7 @@ mod batching_tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::axes::AxisIndex;
     use crate::batching::{ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
@@ -4470,7 +4514,7 @@ mod batching_tests {
     fn test_batch_named_axis_psum_reduces_over_batch() {
         let output: TestArray = TestArrayDomain
             .batch(
-                |x| Ok(x.collective("i", CollectiveKind::PSum)),
+                |x| x.collective("i", CollectiveKind::PSum),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
                 BatchAxis::new(0),
                 BatchAxis::replicated(),
@@ -4480,6 +4524,72 @@ mod batching_tests {
 
         assert_eq!(output.r#type, ArrayType::scalar(DataType::F64));
         assert_eq!(output.values, vec![6.0]);
+    }
+
+    #[test]
+    fn test_batch_axis_index_produces_per_item_indices() {
+        // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
+        // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
+        let output: TestArray = TestArrayDomain
+            .batch(
+                |item| item.context().axis_index("i"),
+                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("i"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(3)])));
+        assert_eq!(output.values, vec![0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_nested_batch_axis_index_forwards_outer_axis_through_inner_level() {
+        // Outer `batch` over axis 0 (size 2, named "o") of a [2, 3] matrix; inner `batch` over axis 0 (size 3, named
+        // "i") of each row. The inner body asks for `axis_index("o")`, which the inner level does not bind, so it is
+        // forwarded to the outer level and re-wrapped as replicated across the inner axis (the outer index does not
+        // vary over inner items). The inner output is therefore declared replicated (`out_axes = replicated`), and the
+        // outer level stacks the per-row outer index, giving the `u64` vector `[0, 1]`.
+        let x = TestArray::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let output: TestArray = TestArrayDomain
+            .batch(
+                |row| {
+                    let context = row.context().clone();
+                    BatchContext::batch(
+                        &context,
+                        |scalar| scalar.context().axis_index("o"),
+                        row,
+                        BatchAxis::new(0),
+                        BatchAxis::replicated(),
+                        BatchAxisSpecification::named("i"),
+                    )
+                },
+                x,
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("o"),
+            )
+            .unwrap();
+
+        assert_eq!(output.r#type, ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(2)])));
+        assert_eq!(output.values, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_batch_axis_index_rejects_unbound_axis() {
+        // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
+        let result: Result<TestArray, BatchingError> = TestArrayDomain.batch(
+            |item| item.context().axis_index("j"),
+            TestArray::vector(vec![10.0, 20.0, 30.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("i"),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            BatchingError::Axis(crate::axes::AxisError::UnboundAxisName { name: "j".to_string() }),
+        );
     }
 
     #[test]
@@ -4496,7 +4606,7 @@ mod batching_tests {
                     let context = row.context().clone();
                     BatchContext::batch(
                         &context,
-                        |scalar| Ok(scalar.collective("outer", CollectiveKind::PSum)),
+                        |scalar| scalar.collective("outer", CollectiveKind::PSum),
                         row,
                         BatchAxis::new(0),
                         BatchAxis::new(0),

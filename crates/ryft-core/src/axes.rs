@@ -85,3 +85,79 @@ impl<C: StagingContext<Operation: From<AxisIndexOperation>> + NamedAxes> AxisInd
         Ok(outputs.remove(0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::batching::BatchingError;
+    use crate::tests::TestArrayDomain;
+    use crate::tracing::DomainTracingContext;
+    use crate::types::{ArrayType, DataType};
+
+    use super::*;
+
+    #[test]
+    fn test_axis_error_renders_unbound_axis_name() {
+        let error = AxisError::UnboundAxisName { name: "batch".to_string() };
+        assert_eq!(error.to_string(), "axis name 'batch' is not bound by any enclosing transform");
+        assert_eq!(format!("{error:?}"), "UnboundAxisName { name: \"batch\" }");
+        assert_eq!(error, AxisError::UnboundAxisName { name: "batch".to_string() });
+        assert_ne!(error, AxisError::UnboundAxisName { name: "device".to_string() });
+    }
+
+    #[test]
+    fn test_named_axis_equality_and_hashing() {
+        assert_eq!(NamedAxis::Batched { size: 3 }, NamedAxis::Batched { size: 3 });
+        assert_ne!(NamedAxis::Batched { size: 3 }, NamedAxis::Batched { size: 4 });
+        assert_eq!(NamedAxis::Mesh { axis: 1, size: 2 }, NamedAxis::Mesh { axis: 1, size: 2 });
+        assert_ne!(NamedAxis::Mesh { axis: 0, size: 2 }, NamedAxis::Mesh { axis: 1, size: 2 });
+
+        // A batched axis never equals a mesh axis, even when their sizes match.
+        assert_ne!(NamedAxis::Batched { size: 2 }, NamedAxis::Mesh { axis: 0, size: 2 });
+
+        let axes = HashSet::from([NamedAxis::Batched { size: 3 }, NamedAxis::Mesh { axis: 1, size: 2 }]);
+        assert!(axes.contains(&NamedAxis::Batched { size: 3 }));
+        assert!(axes.contains(&NamedAxis::Mesh { axis: 1, size: 2 }));
+        assert!(!axes.contains(&NamedAxis::Batched { size: 2 }));
+    }
+
+    #[test]
+    fn test_axis_index_stages_a_nullary_operation_for_a_bound_axis() {
+        // Validate `name` against the seeded `NamedAxes` environment and stage a nullary `AxisIndexOperation`
+        // producing a scalar `u64`, regardless of whether the axis is batch- or mesh-bound.
+        let (output_type, program) = DomainTracingContext::<TestArrayDomain>::trace_with_named_axes(
+            |input| input.context().axis_index("device"),
+            ArrayType::scalar(DataType::F64),
+            vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::U64));
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:f64[] .
+                let %1:u64[] = axis_index [axis_name="device"]
+                in (%1)"#},
+        );
+    }
+
+    #[test]
+    fn test_axis_index_rejects_an_unbound_axis() {
+        // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
+        // `AxisError::UnboundAxisName` through the `BatchingError::Axis` channel riding `ProgramError`.
+        let error = DomainTracingContext::<TestArrayDomain>::trace_with_named_axes(
+            |input| input.context().axis_index("missing"),
+            ArrayType::scalar(DataType::F64),
+            vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_custom::<BatchingError>(),
+            Some(BatchingError::Axis(AxisError::UnboundAxisName { name })) if name == "missing",
+        ));
+    }
+}

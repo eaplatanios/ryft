@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
+use crate::axes::{NamedAxes, NamedAxis};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_builders;
 use crate::operations::Operation;
@@ -268,6 +269,14 @@ impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> Context for Ea
     #[inline]
     fn resolve(&self, value: &V) -> ValueResolution<V> {
         ValueResolution::Concrete(value.clone())
+    }
+}
+
+impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> NamedAxes for EagerContext<T, V, O> {
+    #[inline]
+    fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
+        // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
+        None
     }
 }
 

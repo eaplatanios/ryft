@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
+use crate::axes::{NamedAxes, NamedAxis};
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
@@ -241,6 +242,13 @@ pub struct TracingContext<T: Type, V: Value<T>, O: Operation<T>, C = V> {
     /// of forking it, and the [`RefCell`] supplies the interior mutability [`capture`](CapturingContext::capture) needs
     /// to push through a shared `&self`.
     captures: Rc<RefCell<Vec<C>>>,
+
+    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
+    /// trace binds no named axes and this stays empty. Traces that run inside a manual-parallelism region (e.g., a
+    /// `shard_map` body) are seeded with that region's device mesh axes so that named-axis readers (e.g., collectives)
+    /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
+    /// cloned contexts.
+    named_axes: Rc<Vec<(String, NamedAxis)>>,
 }
 
 impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
@@ -255,6 +263,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
         Self {
             builder: Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
+            named_axes: Rc::new(Vec::new()),
         }
     }
 
@@ -288,10 +297,28 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
         function: F,
         input_type: Input,
     ) -> Result<(Output::To<T>, Program<T, V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+        Self::trace_with_named_axes(function, input_type, Vec::new())
+    }
+
+    /// Traces `function` against `input_type` like [`trace`](Self::trace), but seeds the trace's context with the
+    /// provided named axes. Named-axis readers staged by `function` (e.g., collectives) resolve against these bindings.
+    pub fn trace_with_named_axes<
+        F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<T, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<T> + ParameterizedFamily<V>>,
+    >(
+        function: F,
+        input_type: Input,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<(Output::To<T>, Program<T, V, O, Input::To<V>, Output::To<V>>), ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_type.parameter_structure();
         let (output_types, outputs, output_structure) = {
-            let context = Self { builder: builder.clone(), captures: Rc::new(RefCell::new(Vec::new())) };
+            let context = Self {
+                builder: builder.clone(),
+                captures: Rc::new(RefCell::new(Vec::new())),
+                named_axes: Rc::new(named_axes),
+            };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
             builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
@@ -322,7 +349,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
 
 impl<T: Type, V: Value<T>, O: Operation<T>, C> Clone for TracingContext<T, V, O, C> {
     fn clone(&self) -> Self {
-        Self { builder: self.builder.clone(), captures: self.captures.clone() }
+        Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
     }
 }
 
@@ -370,6 +397,16 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> Context for TracingContext<T, V, 
             Some(constant) => ValueResolution::Concrete(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
+    }
+}
+
+impl<T: Type, V: Value<T>, O: Operation<T>, C> NamedAxes for TracingContext<T, V, O, C> {
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
+        // (e.g., a `shard_map` body's device mesh axes) and reports every other name unbound. Ordinary traces are
+        // seeded with no axes. Named-axis binders such as `BatchingContext` wrap a base trace and resolve against it.
+        self.named_axes.iter().find(|(axis_name, _)| axis_name == name).map(|(_, axis)| *axis)
     }
 }
 
@@ -476,6 +513,16 @@ impl<C: Context> Context for NestedTracingContext<C> {
             Some(constant) => ValueResolution::Concrete(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
+    }
+}
+
+impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A `NestedTracingContext` binds no named axes of its own, but named axes are dynamically scoped, so a lookup
+        // delegates to the parent context it is nested into. For example, a collective staged inside a nested tracing
+        // context still resolves an axis bound by an enclosing transform.
+        self.parent.named_axis(name)
     }
 }
 

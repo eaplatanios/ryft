@@ -4,6 +4,7 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 use thiserror::Error;
 
+use crate::axes::AxisError;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, ParameterError};
 use crate::programs::{Program, ProgramError, Value};
@@ -52,6 +53,9 @@ pub enum BatchingError {
 
     #[error(transparent)]
     Type(#[from] TypeError),
+
+    #[error(transparent)]
+    Axis(#[from] AxisError),
 
     #[error(transparent)]
     Program(ProgramError),
@@ -161,7 +165,7 @@ impl BatchAxisSpecification {
     pub fn new<N: Into<String>>(size: usize, name: N) -> Self {
         Self { size: Some(size), name: Some(name.into()) }
     }
-    
+
     /// Creates a [`BatchAxisSpecification`] with an explicit batch size.
     #[inline]
     pub fn sized(size: usize) -> Self {

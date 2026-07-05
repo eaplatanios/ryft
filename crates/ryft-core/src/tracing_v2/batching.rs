@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::rc::Rc;
 
 use crate::ElementwiseOperation;
+use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
@@ -518,6 +519,24 @@ where
     type Operation = C::Operation;
 }
 
+/// A batching level binds the axis it introduces: a lookup for this level's [`axis_name`](Self::axis_name) resolves to
+/// [`NamedAxis::Batched`] with this level's batch size, and any other name delegates to the parent context. Because
+/// nested `batch` composes by context wrapping, the delegation chain naturally shadows outer bindings with inner ones.
+impl<C> NamedAxes for BatchingContext<C>
+where
+    C: StagingContext<Type = ArrayType> + NamedAxes,
+    C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
+{
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        if self.axis_name.as_deref() == Some(name) {
+            Some(NamedAxis::Batched { size: self.axis_size })
+        } else {
+            self.parent_context.named_axis(name)
+        }
+    }
+}
+
 impl<C> Context for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType>,
@@ -583,23 +602,6 @@ where
                 .into_iter()
                 .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
                 .collect());
-        }
-
-        // Zero-input operations (e.g., `ZeroOperation`, `OneOperation`) are replicated by
-        // construction: every batch item receives the same constant value, and there is no input
-        // batch axis to lift through. Stage them directly into the parent's builder with an empty
-        // input list and surface the resulting parent atoms as replicated values (a default
-        // [`BatchAxis::replicated`] meta, via the default `tracer` path).
-        if inputs.is_empty() {
-            let parent_outputs = self.parent_context.stage_nullary_operation(operation)?;
-            return Ok(parent_outputs
-                .into_iter()
-                .map(|parent_value| -> Result<BatchingTracer<C>, ProgramError> {
-                    let parent_physical_type = parent_value.r#type().into_owned();
-                    let atom = parent_value.atom_id()?;
-                    Ok(self.tracer(atom, Some(parent_physical_type)))
-                })
-                .collect::<Result<Vec<_>, _>>()?);
         }
 
         // Build parent-level input batches. Each `ArrayBatch` wraps the same atom as a *parent* trace value at the
