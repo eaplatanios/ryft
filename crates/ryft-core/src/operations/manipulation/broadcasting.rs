@@ -99,6 +99,11 @@ impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> Partiall
 /// dimension, and every replicated axis (i.e., a static-1 input dimension or an unmapped output axis) must have a
 /// static output extent because replication requires a known count.
 ///
+/// [`broadcast_leading`](Broadcast::broadcast_leading) and [`broadcast_to`](Broadcast::broadcast_to) are convenience
+/// methods, implemented in terms of [`broadcast`](Broadcast::broadcast), covering two common cases: prepending new
+/// replicated leading axes, and broadcasting to a target [`Shape`] using NumPy-style right alignment. Both require the
+/// implementer to be [`Typed`] against [`ArrayType`] so they can read the input's own type.
+///
 /// # Examples
 ///
 /// The following examples show how to use [`Broadcast`] in practice:
@@ -150,6 +155,98 @@ pub trait Broadcast: Sized {
     ///   - `output_axes`: Slice that contains, for each axis `i` of the input, the output axis that it maps to. This
     ///     slice must have length equal to the input's rank and contain distinct values in `0..output_type.rank()`.
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError>;
+
+    /// Broadcasts `self` by prepending leading dimensions of the provided sizes, replicating it along those new
+    /// dimensions. This is the direct analogue of JAX's
+    /// [`lax.broadcast`]( https://docs.jax.dev/en/latest/_autosummary/jax.lax.broadcast.html).
+    /// `t.broadcast_leading([s0, s1, ...])` produces a value whose shape is `[s0, s1, ..., t.shape...]`, with the
+    /// original value replicated across the new leading axes. This is equivalent to
+    /// `t.broadcast(output_type, output_axes)` with `output_type` having shape `[s0, s1, ..., t.shape...]`
+    /// and `output_axes` mapping each input axis `i` to output axis `i + sizes.len()`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `sizes`: Sizes of the new leading dimensions to prepend, in order.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::operations::manipulation::Broadcast;
+    /// # use ryft_core::programs::ProgramError;
+    /// # use ryft_core::tests::{TestArray as Array};
+    /// #
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Broadcast a length-3 vector to a `[2, 3]` matrix by prepending one leading axis of size 2.
+    /// // This is equivalent to `jax.lax.broadcast(jnp.array([1, 2, 3]), sizes=(2,))` in JAX.
+    /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
+    /// let y = x.broadcast_leading(vec![2])?;
+    /// // `y` has shape [2, 3] with values:
+    /// //   [[1.0, 2.0, 3.0],
+    /// //    [1.0, 2.0, 3.0]]
+    /// assert_eq!(y.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn broadcast_leading(&self, sizes: Vec<usize>) -> Result<Self, ProgramError>
+    where
+        Self: Typed<ArrayType>,
+    {
+        let input_type = self.r#type().into_owned();
+        let mut output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
+        output_dimensions.extend(input_type.shape().dimensions().iter().copied());
+        let output_type = ArrayType::new(input_type.data_type(), Shape::new(output_dimensions));
+        let output_axes = (0..input_type.rank()).map(|axis| axis + sizes.len()).collect::<Vec<_>>();
+        self.broadcast(output_type, output_axes.as_slice())
+    }
+
+    /// Broadcasts `self` to `shape` using the broadcasting semantics of [`Broadcastable`](crate::Broadcastable).
+    /// This is the direct analogue of JAX's
+    /// [`jnp.broadcast_to`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.broadcast_to.html),
+    /// which itself mirrors NumPy's
+    /// [`numpy.broadcast_to`](https://numpy.org/doc/stable/reference/generated/numpy.broadcast_to.html).
+    /// `t.broadcast_to(shape)` right-aligns the input shape with `shape`: input axis `i` corresponds to output axis
+    /// `shape.rank() - input.rank() + i`. Each corresponding input dimension must equal the output dimension or be `1`,
+    /// in which case it is replicated. Missing leading input dimensions are treated as size `1`, and so a smaller-rank
+    /// array can be broadcast to a larger-rank target shape. This is equivalent to
+    /// `t.broadcast(output_type, output_axes)` with `output_axes` computed as the trailing range of indices.
+    ///
+    /// # Parameters
+    ///
+    ///   - `shape`: [`Shape`] to broadcast `self` to. This shape must have rank at least equal to the input's rank and
+    ///     must be compatible with the shape of the input in terms of broadcasting semantics.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use ryft_core::operations::manipulation::Broadcast;
+    /// # use ryft_core::programs::ProgramError;
+    /// # use ryft_core::tests::{TestArray as Array};
+    /// # use ryft_core::types::{Shape, Size};
+    /// #
+    /// # fn main() -> Result<(), ProgramError> {
+    /// // Broadcast a length-3 vector to a `[3, 3]` matrix by replicating the input across the leading axis.
+    /// // This is equivalent to `jnp.broadcast_to(jnp.array([1, 2, 3]), (3, 3))` in JAX.
+    /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
+    /// let y = x.broadcast_to(Shape::new(vec![Size::Static(3), Size::Static(3)]))?;
+    /// // `y` has shape [3, 3] with values:
+    /// //   [[1.0, 2.0, 3.0],
+    /// //    [1.0, 2.0, 3.0],
+    /// //    [1.0, 2.0, 3.0]]
+    /// assert_eq!(y.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn broadcast_to(&self, shape: Shape) -> Result<Self, ProgramError>
+    where
+        Self: Typed<ArrayType>,
+    {
+        let input_type = self.r#type().into_owned();
+        let input_rank = input_type.rank();
+        let offset = shape.rank().saturating_sub(input_rank);
+        let output_type = ArrayType::new(input_type.data_type(), shape);
+        let output_axes = (0..input_rank).map(|axis| axis + offset).collect::<Vec<_>>();
+        self.broadcast(output_type, output_axes.as_slice())
+    }
 }
 
 impl Broadcast for ArrayType {
@@ -262,115 +359,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> B
             .stage_operation(BroadcastOperation::new(output_type, output_axes.to_vec()), &[self])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents the ability to prepend leading dimensions of specific sizes to an array by replicating it along those
-/// dimensions. This is the direct analogue of JAX's
-/// [`lax.broadcast`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.broadcast.html).
-///
-/// `t.broadcast_leading([s0, s1, ...])` produces a value whose shape is `[s0, s1, ..., t.shape...]`, with the original
-/// value replicated across the new leading axes. This is equivalent to `t.broadcast(output_type, output_axes)` with
-/// `output_type` having shape `[s0, s1, ..., t.shape...]` and `output_axes` mapping each input axis `i` to output axis
-/// `i + sizes.len()`.
-///
-/// # Example
-///
-/// The following example shows how to use [`BroadcastLeading`] in practice:
-///
-/// ```rust
-/// # use ryft_core::operations::manipulation::BroadcastLeading;
-/// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
-/// #
-/// # fn main() -> Result<(), ProgramError> {
-/// // Broadcast a length-3 vector to a `[2, 3]` matrix by prepending one leading axis of size `2`. This is
-/// // equivalent to `jax.lax.broadcast(jnp.array([1, 2, 3]), sizes=(2,))` in JAX.
-/// let x = Array::vector(vec![1.0, 2.0, 3.0]);
-/// let y = x.broadcast_leading(vec![2])?;
-/// // `y` has shape [2, 3] with values:
-/// //   [[1.0, 2.0, 3.0],
-/// //    [1.0, 2.0, 3.0]]
-/// assert_eq!(y.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-/// # Ok(())
-/// # }
-/// ```
-pub trait BroadcastLeading: Sized {
-    /// Broadcasts `self` by prepending leading dimensions of the provided sizes. Refer to the documentation of this
-    /// trait for more information on what this operation does.
-    ///
-    /// # Parameters
-    ///
-    ///   - `sizes`: Sizes of the new leading dimensions to prepend, in order.
-    fn broadcast_leading(&self, sizes: Vec<usize>) -> Result<Self, ProgramError>;
-}
-
-impl<T: Typed<ArrayType> + Broadcast> BroadcastLeading for T {
-    fn broadcast_leading(&self, sizes: Vec<usize>) -> Result<Self, ProgramError> {
-        let input_type = self.r#type().into_owned();
-        let mut output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
-        output_dimensions.extend(input_type.shape().dimensions().iter().copied());
-        let output_type = ArrayType::new(input_type.data_type(), Shape::new(output_dimensions));
-        let output_axes = (0..input_type.rank()).map(|axis| axis + sizes.len()).collect::<Vec<_>>();
-        self.broadcast(output_type, output_axes.as_slice())
-    }
-}
-
-/// Represents the ability to broadcast an array to a target shape using the broadcasting semantics of
-/// [`Broadcastable`](crate::Broadcastable). This is the direct analogue of JAX's
-/// [`jnp.broadcast_to`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.broadcast_to.html), which itself mirrors
-/// NumPy's [`numpy.broadcast_to`](https://numpy.org/doc/stable/reference/generated/numpy.broadcast_to.html).
-///
-/// `t.broadcast_to(target_shape)` right-aligns the input shape with `target_shape`: input axis `i` corresponds to
-/// output axis `target_shape.rank() - input.rank() + i`. Each corresponding input dimension must equal the output
-/// dimension or be `1`, in which case it is replicated. Missing leading input dimensions are treated as size `1`,
-/// and so a smaller-rank array can be broadcast to a larger-rank target shape. This is equivalent to
-/// `t.broadcast(output_type, output_axes)` with `output_axes` computed as the trailing range of indices.
-///
-/// # Example
-///
-/// The following example shows how to use [`BroadcastTo`] in practice:
-///
-/// ```rust
-/// # use ryft_core::operations::manipulation::BroadcastTo;
-/// # use ryft_core::programs::ProgramError;
-/// # use ryft_core::tests::{TestArray as Array};
-/// # use ryft_core::types::{Shape, Size};
-/// #
-/// # fn main() -> Result<(), ProgramError> {
-/// // Broadcast a length-3 vector to a `[3, 3]` matrix by replicating the input across the leading axis. This is
-/// // equivalent to `jnp.broadcast_to(jnp.array([1, 2, 3]), (3, 3))` in JAX.
-/// let x = Array::vector(vec![1.0, 2.0, 3.0]);
-/// let y = x.broadcast_to(Shape::new(vec![Size::Static(3), Size::Static(3)]))?;
-/// // `y` has shape [3, 3] with values:
-/// //   [[1.0, 2.0, 3.0],
-/// //    [1.0, 2.0, 3.0],
-/// //    [1.0, 2.0, 3.0]]
-/// assert_eq!(y.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
-/// # Ok(())
-/// # }
-/// ```
-pub trait BroadcastTo: Sized {
-    /// Broadcasts `self` to `target_shape` using the broadcasting semantics of [`Broadcastable`](crate::Broadcastable).
-    /// Refer to the documentation of this trait for more information on what this operation does.
-    ///
-    /// # Parameters
-    ///
-    ///   - `target_shape`: [`Shape`] to broadcast `self` to. This shape must have rank at least equal to the input's
-    ///     rank and must be compatible with the shape of the input in terms of broadcasting semantics.
-    fn broadcast_to(&self, target_shape: Shape) -> Result<Self, ProgramError>;
-}
-
-impl<T: Typed<ArrayType> + Broadcast> BroadcastTo for T {
-    fn broadcast_to(&self, target_shape: Shape) -> Result<Self, ProgramError> {
-        let input_type = self.r#type().into_owned();
-        let input_rank = input_type.rank();
-        let offset = target_shape.rank().saturating_sub(input_rank);
-        let output_type = ArrayType::new(input_type.data_type(), target_shape);
-        let output_axes = (0..input_rank).map(|axis| axis + offset).collect::<Vec<_>>();
-        self.broadcast(output_type, output_axes.as_slice())
     }
 }
 
