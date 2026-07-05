@@ -976,7 +976,7 @@ impl<C> BatchContext for C where C: StagingContext<Type = ArrayType> {}
 /// dimensions to preserve their relative order. Returns the identity permutation when
 /// `from == to`.
 pub(crate) fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
-    let mut permutation: Vec<usize> = (0..rank).collect();
+    let mut permutation = (0..rank).collect::<Vec<_>>();
     let axis = permutation.remove(from);
     permutation.insert(to, axis);
     permutation

@@ -1,20 +1,20 @@
 use std::fmt::Display;
 
+use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
-// TODO(eaplatanios): Review this module.
-
 /// Canonical operation name for [`BroadcastOperation`].
 pub const BROADCAST_OPERATION_NAME: &'static str = "broadcast";
 
-/// [`Operation`] that performs general N-dimensional broadcasting. Refer to the documentation of [`Broadcast`]
-/// for more information.
+/// [`Operation`] that performs general N-dimensional broadcasting.
+/// Refer to the documentation of [`Broadcast`] for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BroadcastOperation {
     /// Output [`ArrayType`].
@@ -46,6 +46,7 @@ impl BroadcastOperation {
 }
 
 impl Display for BroadcastOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -57,6 +58,7 @@ impl Operation<ArrayType> for BroadcastOperation {
         BROADCAST_OPERATION_NAME
     }
 
+    #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         match input_types[0].broadcast(self.output_type.clone(), self.output_axes.as_slice()) {
@@ -66,6 +68,7 @@ impl Operation<ArrayType> for BroadcastOperation {
         }
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("output_type", &self.output_type)?;
@@ -74,22 +77,21 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Broadcast> InterpretableOperation<ArrayType, V> for BroadcastOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<ArrayType> + Broadcast, C> InterpretableOperation<ArrayType, V, C> for BroadcastOperation {
+    #[inline]
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone().broadcast(self.output_type.clone(), self.output_axes.as_slice())?])
     }
 }
 
-impl<V: Value<ArrayType>, O> PartiallyEvaluatableOperation<ArrayType, V, O> for BroadcastOperation {}
+impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> PartiallyEvaluatableOperation<C>
+    for BroadcastOperation
+{
+}
 
 /// Represents the ability to perform general N-dimensional broadcasting. This is the direct analogue of JAX's
 /// [`lax.broadcast_in_dim`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.broadcast_in_dim.html).
-///
 /// `t.broadcast(output_type, output_axes)` expands `t` to `output_type` by mapping each input axis `i` to output axis
 /// `output_axes[i]`, replicating the value along the axes of `output_type` that are not named in `output_axes`. For
 /// each `i`, the input dimension at axis `i` must either equal the corresponding output dimension or be `1` (in which
@@ -108,8 +110,8 @@ impl<V: Value<ArrayType>, O> PartiallyEvaluatableOperation<ArrayType, V, O> for 
 /// # use ryft_core::types::{ArrayType, DataType, Shape, Size};
 /// #
 /// # fn main() -> Result<(), ProgramError> {
-/// // Broadcast a length-3 vector to a `[2, 3]` matrix by mapping its single axis to output axis `1`. This is
-/// // equivalent to `jax.lax.broadcast_in_dim(jnp.array([1, 2, 3]), shape=(2, 3), broadcast_dimensions=(1,))` in JAX.
+/// // Broadcast a length-3 vector to a `[2, 3]` matrix by mapping its single axis to output axis 1. This is
+/// // equivalent to `broadcast_in_dim(jnp.array([1, 2, 3]), shape=(2, 3), broadcast_dimensions=(1,))` in JAX.
 /// let x = Array::vector(vec![1.0, 2.0, 3.0]);
 /// let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
 /// let y = x.broadcast(output_type, &[1])?;
@@ -118,9 +120,9 @@ impl<V: Value<ArrayType>, O> PartiallyEvaluatableOperation<ArrayType, V, O> for 
 /// //    [1.0, 2.0, 3.0]]
 /// assert_eq!(y.values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 ///
-/// // Broadcast a `[2, 2]` matrix over a new middle dimension of size `3` by mapping its axes to output axes `0` and
-/// // `2`. This is equivalent to
-/// // `jax.lax.broadcast_in_dim(jnp.array([[1, 2], [3, 4]]), shape=(2, 3, 2), broadcast_dimensions=(0, 2))` in JAX.
+/// // Broadcast a `[2, 2]` matrix over a new dimension of size 3 by mapping its axes to output axes 0 and 2. This is
+/// // equivalent to `broadcast_in_dim(jnp.array([[1, 2], [3, 4]]), shape=(2, 3, 2), broadcast_dimensions=(0, 2))`
+/// // in JAX.
 /// let x = Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
 /// let output_type = ArrayType::new(
 ///     DataType::F64,
@@ -188,7 +190,7 @@ impl Broadcast for ArrayType {
             }
             if seen[output_axis] {
                 return Err(TypeError {
-                    message: format!("broadcasting output axes map two input axes to output axis {output_axis}",),
+                    message: format!("broadcasting output axes map two input axes to output axis {output_axis}"),
                 }
                 .into());
             }
@@ -253,6 +255,7 @@ impl Broadcast for ArrayType {
 }
 
 impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> Broadcast for Tracer<C, C::Meta> {
+    #[inline]
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         let mut outputs = self
             .context()
@@ -261,6 +264,8 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> B
         Ok(outputs.remove(0))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents the ability to prepend leading dimensions of specific sizes to an array by replicating it along those
 /// dimensions. This is the direct analogue of JAX's
@@ -374,6 +379,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
@@ -402,7 +408,9 @@ mod tests {
 
         // Interpretation replicates the payload along the added axis.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<ArrayType, TestArray>::new(), std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
@@ -447,7 +455,11 @@ mod tests {
             Err(TypeError { message: "broadcasting input axis 0 has size 2, which is neither 3 nor 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+                &operation,
+                &EagerContext::<ArrayType, TestArray>::new(),
+                &[],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(

@@ -4748,7 +4748,7 @@ mod batching_tests {
     #[test]
     fn test_batching_rule_auto_aligns_unaligned_batch_axes() {
         // Both square so the batch sizes agree (4), but they sit on different batch axes.
-        // `apply_elementwise_batch` realigns the second operand to match the first batched
+        // The elementwise batching rule realigns the second operand to match the first batched
         // input's canonical axis (JAX's matchaxis policy), then computes elementwise add.
         //
         // Left is identity-like along axis 0; right is transposed (axis 1). Using row 0 of each
@@ -4772,30 +4772,28 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_apply_elementwise_batch_unary_op() {
+    fn test_elementwise_batch_unary_op() {
         // A unary elementwise op over a single batched operand preserves elementwise semantics and reports the
-        // operand's batch axis on its single output.
+        // operand's batch axis on its single output. `NegOperation` is elementwise, so its batching rule is the
+        // blanket elementwise `BatchableOperation` impl.
         let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap();
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let outputs =
-            apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Neg(NegOperation), &[batched]).unwrap();
+        let outputs = NegOperation.batch(&context, &[batched]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values(), &[-1.0, -2.0, -3.0]);
     }
 
     #[test]
-    fn test_apply_elementwise_batch_broadcasts_replicated_input() {
+    fn test_elementwise_batch_broadcasts_replicated_input() {
         // A batched operand (axis 0, size 3) added to a replicated scalar broadcasts the replicated operand to the
         // batched physical shape, so the single output carries the common batch axis and adds the scalar per item.
         let batched_value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(batched_value.r#type().into_owned(), batched_value, Some(0)).unwrap();
         let replicated = ArrayBatch::replicated(TestArray::scalar(10.0));
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
-        let outputs =
-            apply_elementwise_batch(&context, &ArrayOperation::<TestArray>::Add(AddOperation), &[batched, replicated])
-                .unwrap();
+        let outputs = AddOperation.batch(&context, &[batched, replicated]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values(), &[11.0, 12.0, 13.0]);
