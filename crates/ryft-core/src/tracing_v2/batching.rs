@@ -42,43 +42,32 @@ impl<
     }
 }
 
-/// Returns the [`ShardingDimension`] to insert at a newly introduced output batch axis, derived from the batched
-/// inputs' mapped-dimension shardings.
-///
-/// This mirrors JAX deriving the batched dimension's sharding from the inputs' mapped-dimension specs
-/// (`_mapped_axis_spec` feeding `get_sharding_for_vmap`): each genuinely batched input contributes the
-/// [`ShardingDimension`] of its mapped axis, batched inputs that disagree are a
-/// [`BatchingError::MisalignedBatchAxes`], and replicated inputs (or inputs without a
-/// [`Sharding`](crate::sharding::Sharding)) contribute nothing. When no batched input pins the axis the result is
-/// [`ShardingDimension::Replicated`], so the new batch dimension is replicated. Deriving from the original
-/// (pre-alignment) inputs avoids spuriously disagreeing with a replicated operand that batching later broadcasts to
-/// gain a singleton batch axis.
+/// Returns the [`ShardingDimension`] to place on the batch axis that batching introduces in each output, derived from
+/// how the provided batched inputs shard their own batch axis. Every input that is actually mapped on a batch axis and
+/// carries a [`Sharding`](crate::Sharding) contributes the [`ShardingDimension`] of that axis. Replicated inputs and
+/// inputs without a sharding contribute nothing. All contributing inputs must agree, otherwise the output batch axis
+/// has no well-defined sharding and this returns [`BatchingError::MisalignedBatchAxes`]. When nothing pins the axis the
+/// result is [`ShardingDimension::Replicated`], leaving the new batch dimension replicated. The dimensions are read
+/// from the inputs as given, before batching realigns or broadcasts them, so a replicated operand that later gains a
+/// singleton batch axis does not spuriously disagree with a genuinely batched operand.
 pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
     inputs: &[ArrayBatch<V>],
 ) -> Result<ShardingDimension, ProgramError> {
-    let mut result: Option<ShardingDimension> = None;
-    for input in inputs {
-        let Some(axis) = input.batch_axis().axis() else {
-            continue;
-        };
-        let physical_type = input.r#type();
-        let Some(sharding) = physical_type.sharding() else {
-            continue;
-        };
-        let dimension = sharding.dimensions()[axis].clone();
-        match &result {
-            Some(existing) if *existing != dimension => {
-                return Err(BatchingError::MisalignedBatchAxes {
-                    message: format!(
-                        "batched inputs disagree on the sharding of their mapped axis: {existing} and {dimension}"
-                    ),
+    let dimension = inputs
+        .iter()
+        .filter_map(|input| Some(input.r#type().sharding()?.dimensions()[input.batch_axis().axis()?].clone()))
+        .try_fold(None, |folded_dimension, current_dimension| -> Result<Option<ShardingDimension>, ProgramError> {
+            match folded_dimension {
+                Some(folded_dimension) if folded_dimension != current_dimension => {
+                    Err(BatchingError::MisalignedBatchAxes {
+                        message: format!("mismatched batch axis sharding: {folded_dimension} vs {current_dimension}"),
+                    }
+                    .into())
                 }
-                .into());
+                _ => Ok(Some(current_dimension)),
             }
-            _ => result = Some(dimension),
-        }
-    }
-    Ok(result.unwrap_or(ShardingDimension::Replicated))
+        })?;
+    Ok(dimension.unwrap_or(ShardingDimension::Replicated))
 }
 
 /// Applies a lifted operation to `inputs` via [`InterpretableOperation::interpret`] and packages
