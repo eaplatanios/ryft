@@ -1,3 +1,5 @@
+use crate::batching::BatchAxis;
+use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
@@ -7,7 +9,6 @@ use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::batching::{apply_elementwise_batch, apply_with_axes};
 use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
 use crate::types::{ArrayType, Shape, Size, Typed};
 use crate::{ArrayBatch, BatchableOperation, BatchingError, Broadcast, Transpose};
@@ -139,9 +140,10 @@ where
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let Some(k_in) = inputs[0].batch_axis() else {
-            // Replicated: reshape is the same elementwise op (no axis arithmetic needed).
-            return apply_elementwise_batch(context, self, inputs);
+        let Some(k_in) = inputs[0].batch_axis().axis() else {
+            // Replicated input: there is no batch axis to thread through the reshape, so interpret it as given and
+            // report the output replicated.
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let input_shape = inputs[0].unbatched_type()?.shape().clone();
@@ -158,6 +160,6 @@ where
             .into());
         };
         let lifted_op = ReshapeOperation::new(lifted_output_shape);
-        apply_with_axes(context, &lifted_op, inputs, &[Some(k_out)])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::new(k_out)])
     }
 }
