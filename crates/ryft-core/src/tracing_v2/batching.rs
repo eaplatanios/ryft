@@ -15,7 +15,6 @@ use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::sharding::ShardingDimension;
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
 use crate::tracing_v2::differentiation::{DifferentiationContext, replay_via_bind};
 use crate::types::{ArrayType, Size, Typed};
@@ -40,34 +39,6 @@ impl<
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         apply_elementwise_batch(context, self, inputs)
     }
-}
-
-/// Returns the [`ShardingDimension`] to place on the batch axis that batching introduces in each output, derived from
-/// how the provided batched inputs shard their own batch axis. Every input that is actually mapped on a batch axis and
-/// carries a [`Sharding`](crate::Sharding) contributes the [`ShardingDimension`] of that axis. Replicated inputs and
-/// inputs without a sharding contribute nothing. All contributing inputs must agree, otherwise the output batch axis
-/// has no well-defined sharding and this returns [`BatchingError::MisalignedBatchAxes`]. When nothing pins the axis the
-/// result is [`ShardingDimension::Replicated`], leaving the new batch dimension replicated. The dimensions are read
-/// from the inputs as given, before batching realigns or broadcasts them, so a replicated operand that later gains a
-/// singleton batch axis does not spuriously disagree with a genuinely batched operand.
-pub fn batch_dimension_sharding<V: Typed<ArrayType>>(
-    inputs: &[ArrayBatch<V>],
-) -> Result<ShardingDimension, ProgramError> {
-    let dimension = inputs
-        .iter()
-        .filter_map(|input| Some(input.r#type().sharding()?.dimensions()[input.batch_axis().axis()?].clone()))
-        .try_fold(None, |folded_dimension, current_dimension| -> Result<Option<ShardingDimension>, ProgramError> {
-            match folded_dimension {
-                Some(folded_dimension) if folded_dimension != current_dimension => {
-                    Err(BatchingError::MisalignedBatchAxes {
-                        message: format!("mismatched batch axis sharding: {folded_dimension} vs {current_dimension}"),
-                    }
-                    .into())
-                }
-                _ => Ok(Some(current_dimension)),
-            }
-        })?;
-    Ok(dimension.unwrap_or(ShardingDimension::Replicated))
 }
 
 /// Applies a lifted operation to `inputs` via [`InterpretableOperation::interpret`] and packages
