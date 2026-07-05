@@ -36,7 +36,7 @@ impl Operation<DataType> for MulOperation {
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible"),
+            message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
         })
     }
 }
@@ -311,7 +311,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
-            Err(TypeError { message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible") }),
+            Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
         );
         let error = <MulOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
@@ -323,7 +323,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            TypeError { message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible") },
+            TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") },
         );
 
         // Program rendering uses the canonical operation name.
@@ -390,7 +390,7 @@ mod tests {
                 &[unreduced("x"), unreduced("x")],
             ),
             Err(TypeError {
-                message: format!("{MUL_OPERATION_NAME} cannot multiply two operands that are both unreduced")
+                message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced")
             }),
         );
 
@@ -399,7 +399,7 @@ mod tests {
             <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[unreduced("x"), reduced("y")]),
             Err(TypeError {
                 message: format!(
-                    "{MUL_OPERATION_NAME} requires the second operand to be reduced over the axes the first is \
+                    "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes the first is \
                      unreduced over",
                 ),
             }),

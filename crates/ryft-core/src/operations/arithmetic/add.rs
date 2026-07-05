@@ -34,7 +34,7 @@ impl Operation<DataType> for AddOperation {
     fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("{ADD_OPERATION_NAME} input types are not broadcast-compatible"),
+            message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible"),
         })
     }
 }
@@ -227,7 +227,7 @@ mod tests {
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
-            Err(TypeError { message: format!("{ADD_OPERATION_NAME} input types are not broadcast-compatible") }),
+            Err(TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }),
         );
         let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
             &operation,
@@ -239,7 +239,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            TypeError { message: format!("{ADD_OPERATION_NAME} input types are not broadcast-compatible") }
+            TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }
         );
 
         // Program rendering uses the canonical operation name.
