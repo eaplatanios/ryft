@@ -1,4 +1,5 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::ops::Deref;
 
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
@@ -14,25 +15,83 @@ use crate::types::{ArrayType, Shape, TypeError, Typed};
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &'static str = "transpose";
 
+/// An axis permutation used by [`TransposeOperation`] and the [`Transpose`] capability. For each output axis `i`,
+/// `permutation[i]` is the input axis routed to it. [`Permutation`] is a thin wrapper over the axis vector. It
+/// [`Deref`]s to `[usize]` and implements `AsRef<[usize]>`, and so it composes with everything that already accepts
+/// an axis slice. Also, it supports [`From`] conversion from an owned `Vec<usize>` or a borrowed `&[usize]`. Validity
+/// (i.e., being a bijection of `0..len`) is not enforced at construction time. It is validated against a concrete input
+/// rank by the type-level [`Transpose`] rule.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Permutation(Vec<usize>);
+
+impl Permutation {
+    /// Returns the permutation axes as a slice, where element `i` is the input axis routed to output axis `i`.
+    #[inline]
+    pub fn as_slice(&self) -> &[usize] {
+        self.0.as_slice()
+    }
+
+    /// Returns the inverse [`Permutation`] of this one (i.e., the one that _undoes_ it). Transposing by a permutation
+    /// and then by its inverse restores the original axis order.
+    #[inline]
+    pub fn inverse(&self) -> Permutation {
+        let mut inverse = vec![0usize; self.0.len()];
+        for (position, axis) in self.0.iter().enumerate() {
+            inverse[*axis] = position;
+        }
+        Permutation(inverse)
+    }
+}
+
+impl Deref for Permutation {
+    type Target = [usize];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[usize]> for Permutation {
+    #[inline]
+    fn as_ref(&self) -> &[usize] {
+        &self.0
+    }
+}
+
+impl From<Vec<usize>> for Permutation {
+    #[inline]
+    fn from(axes: Vec<usize>) -> Self {
+        Self(axes)
+    }
+}
+
+impl From<&[usize]> for Permutation {
+    #[inline]
+    fn from(axes: &[usize]) -> Self {
+        Self(axes.to_vec())
+    }
+}
+
 /// [`Operation`] that reorders the axes of its input array according to a static permutation. The output shape is the
 /// input shape with its axes permuted. Output dimension `i` is set to input dimension `permutation[i]`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TransposeOperation {
-    /// Axis permutation of this [`TransposeOperation`].
-    permutation: Vec<usize>,
+    /// Axis [`Permutation`] of this [`TransposeOperation`].
+    permutation: Permutation,
 }
 
 impl TransposeOperation {
     /// Creates a new [`TransposeOperation`] with the provided axis permutation.
     #[inline]
-    pub fn new(permutation: Vec<usize>) -> Self {
-        Self { permutation }
+    pub fn new<P: Into<Permutation>>(permutation: P) -> Self {
+        Self { permutation: permutation.into() }
     }
 
-    /// Returns the axis permutation of this [`TransposeOperation`].
+    /// Returns the axis [`Permutation`] of this [`TransposeOperation`].
     #[inline]
-    pub fn permutation(&self) -> &[usize] {
-        self.permutation.as_slice()
+    pub fn permutation(&self) -> &Permutation {
+        &self.permutation
     }
 }
 
@@ -222,16 +281,6 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> T
     }
 }
 
-// TODO(eaplatanios): Review this function.
-/// Returns the inverse permutation of `permutation` (i.e., the permutation that undoes it).
-pub fn inverse_permutation(permutation: &[usize]) -> Vec<usize> {
-    let mut inverse = vec![0usize; permutation.len()];
-    for (position, axis) in permutation.iter().enumerate() {
-        inverse[*axis] = position;
-    }
-    inverse
-}
-
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -246,6 +295,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_permutation() {
+        // Empty and identity permutations are their own inverses.
+        assert_eq!(Permutation::from(vec![]).inverse(), Permutation::from(vec![]));
+        assert_eq!(Permutation::from(vec![0, 1, 2]).inverse(), Permutation::from(vec![0, 1, 2]));
+
+        // A swap is its own inverse, while a cycle inverts to the reverse cycle.
+        assert_eq!(Permutation::from(vec![1, 0]).inverse(), Permutation::from(vec![1, 0]));
+        assert_eq!(Permutation::from(vec![2, 0, 1]).inverse(), Permutation::from(vec![1, 2, 0]));
+
+        // Inverting twice recovers the original permutation, and applying the inverse after the permutation restores
+        // the identity ordering.
+        let permutation = Permutation::from(vec![3, 0, 2, 1]);
+        let inverse = permutation.inverse();
+        assert_eq!(inverse.inverse(), permutation);
+        let composed = inverse.iter().map(|axis| permutation[*axis]).collect::<Vec<_>>();
+        assert_eq!(composed, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
     fn test_transpose() {
         let operation = TransposeOperation::new(vec![1, 0]);
 
@@ -253,7 +321,7 @@ mod tests {
         assert_eq!(operation.name(), TRANSPOSE_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "TransposeOperation { permutation: [1, 0] }");
         assert_eq!(format!("{operation}"), "transpose [permutation=[1, 0]]");
-        assert_eq!(operation.permutation(), &[1, 0]);
+        assert_eq!(operation.permutation().as_slice(), &[1, 0]);
 
         // Type inference permutes the input shape, including dynamic dimension sizes.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
@@ -464,25 +532,5 @@ mod tests {
 
         // An out-of-bounds axis is a clean error rather than an out-of-bounds panic.
         assert!(matrix.swap_axes(2, 0).is_err());
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_inverse_permutation() {
-        // Empty and identity permutations are their own inverses.
-        assert_eq!(inverse_permutation(&[]), Vec::<usize>::new());
-        assert_eq!(inverse_permutation(&[0, 1, 2]), vec![0, 1, 2]);
-
-        // A swap is its own inverse, while a cycle inverts to the reverse cycle.
-        assert_eq!(inverse_permutation(&[1, 0]), vec![1, 0]);
-        assert_eq!(inverse_permutation(&[2, 0, 1]), vec![1, 2, 0]);
-
-        // Inverting twice recovers the original permutation, and applying the inverse after the
-        // permutation restores the identity ordering.
-        let permutation = vec![3, 0, 2, 1];
-        let inverse = inverse_permutation(permutation.as_slice());
-        assert_eq!(inverse_permutation(inverse.as_slice()), permutation);
-        let composed = inverse.iter().map(|axis| permutation[*axis]).collect::<Vec<_>>();
-        assert_eq!(composed, vec![0, 1, 2, 3]);
     }
 }
