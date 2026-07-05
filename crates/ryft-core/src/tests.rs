@@ -181,6 +181,45 @@ impl BooleanLike for TestArray {
     }
 }
 
+/// Batched while-predicate semantics for [`TestArray`]: `any_true` reduces the whole Boolean payload with `or`, and
+/// `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
+/// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
+impl crate::operations::control_flow::WhilePredicate for TestArray {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        if self.r#type.data_type() != DataType::Boolean {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type),
+            });
+        }
+        Ok(self.values.iter().any(|value| *value != 0.0))
+    }
+
+    fn mask_select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        if self.r#type.data_type() != DataType::Boolean
+            || on_true.r#type != on_false.r#type
+            || self.values.is_empty()
+            || on_true.values.len() % self.values.len() != 0
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "mask_select requires a Boolean predicate whose element count divides congruent operands, but \
+                     got predicate {} with operands {} and {}",
+                    self.r#type, on_true.r#type, on_false.r#type,
+                ),
+            });
+        }
+        let block = on_true.values.len() / self.values.len();
+        let values = on_true
+            .values
+            .iter()
+            .zip(on_false.values.iter())
+            .enumerate()
+            .map(|(index, (on_true, on_false))| if self.values[index / block] != 0.0 { *on_true } else { *on_false })
+            .collect();
+        Ok(Self { r#type: on_true.r#type.clone(), values })
+    }
+}
+
 impl<O: crate::operations::Operation<ArrayType>> Zero<ArrayType, TestArray> for EagerContext<ArrayType, TestArray, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
         Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::materialized_element_count(r#type)?] })

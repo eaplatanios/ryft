@@ -393,15 +393,21 @@ pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
 /// Policy for choosing a batched [`Program`]'s output axes. Program batching always replays the program over physical
 /// values whose mapped batch axes are specified by the caller. This policy controls how the replayed output tracers are
 /// packaged into the resulting program.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProgramBatchingOutputAxesPolicy {
-    /// Keep the output axes naturally produced by the per-operation batching rules. Replicated outputs remain
-    /// replicated and are reported as `None`.
+    /// Keep the output axes naturally produced by the per-operation batching rules.
+    /// Replicated outputs remain replicated.
     Natural,
 
     /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with
     /// [`Transpose`](crate::Transpose) and broadcasting replicated outputs across the batch.
     AlignAllTo(usize),
+
+    /// Align each output `i` to the mapped axis of the `i`-th entry, with one entry per program output. A *mapped*
+    /// entry forces the output to carry its batch axis at that position, moving an already-batched output with
+    /// [`Transpose`](crate::Transpose) and broadcasting a replicated output across the batch, while a *replicated*
+    /// entry keeps that output's natural axis (it is a lower bound, not an equality constraint).
+    AlignEachTo(Vec<BatchAxis>),
 }
 
 /// Represents closed [`Operation`] families whose captured flat [`Program`]s can be batched into standalone batched

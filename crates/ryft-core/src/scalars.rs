@@ -10,7 +10,7 @@ use crate::interpretation::InterpretableOperation;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::{Constant, One, OneLike, Zero, ZeroLike};
-use crate::operations::control_flow::{Select, SelectCondition};
+use crate::operations::control_flow::{Select, SelectCondition, WhilePredicate};
 use crate::operations::differentiation::StopGradient;
 use crate::operations::scalars::ScalarOperation;
 use crate::operations::tag::Tag;
@@ -236,6 +236,10 @@ impl BooleanLike for Scalar {
         })
     }
 }
+
+// A `Scalar` predicate is always rank-0 and so the scalar `WhilePredicate` defaults (its own truth value decides
+// continuation, and a true predicate takes the candidate wholesale) are exactly its semantics.
+impl WhilePredicate for Scalar {}
 
 impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
     #[inline]
