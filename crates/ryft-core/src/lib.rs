@@ -2,6 +2,7 @@
 // lets those same generated paths resolve when those macros are used inside `ryft-core` itself.
 extern crate self as ryft;
 
+pub mod axes;
 pub mod batching;
 pub mod broadcasting;
 pub mod compilation;
@@ -26,6 +27,7 @@ pub mod utilities;
 pub mod tests;
 
 // TODO(eaplatanios): Make all of the following more specific.
+pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
 pub use batching::{
     ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableProgramOperation, BatchingError,
     ProgramBatchingOutputAxesPolicy,
