@@ -44,6 +44,9 @@ mod tests {
 
     use pretty_assertions::assert_eq;
 
+    use crate::batching::ArrayBatch;
+    use crate::batching::BatchAxis;
+    use crate::batching::BatchableOperation;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
@@ -53,29 +56,31 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tracing_v2::{
-        ArrayBatch, BatchableOperation, DifferentiableDomainExtension, DifferentiationContext, jacrev,
-    };
+    use crate::tracing_v2::{DifferentiableDomainExtension, DifferentiationContext, jacrev};
     use crate::types::{Shape, Size, Typed};
 
     use super::*;
 
     #[test]
-    fn test_dot_batches_mixed_lhs_batched_rhs_lane_uniform() {
-        // LHS is mapped at axis 0 with per-lane shape [3]; RHS is lane-uniform with shape [3].
-        // Per-lane semantics: dot(lhs_row, rhs) over the shared K=3 dimension. The batching rule
+    fn test_dot_batches_mixed_lhs_batched_rhs_replicated() {
+        // LHS is mapped at axis 0 with per-item shape [3]; RHS is replicated with shape [3].
+        // Per-item semantics: dot(lhs_row, rhs) over the shared K=3 dimension. The batching rule
         // should broadcast the RHS to gain a singleton batch axis at position 0, then thread the
         // batch axis through `lift_dot_dimensions`.
         use crate::tracing_v2::operations::dot::{DotDimensionNumbers, DotOperation};
-        let lhs = ArrayBatch::mapped(TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 0).unwrap();
-        let rhs = ArrayBatch::unbatched(TestArray::vector(vec![10.0, 100.0, 1000.0]));
+        let lhs = {
+            let value = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let rhs = ArrayBatch::replicated(TestArray::vector(vec![10.0, 100.0, 1000.0]));
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
         let outputs = DotOperation::new(dimensions)
             .batch(&crate::EagerContext::<ArrayType, TestArray>::new(), &[lhs, rhs])
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        // Lane 0: 1*10 + 2*100 + 3*1000 = 3210; lane 1: 4*10 + 5*100 + 6*1000 = 6540.
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        // Batch item 0: 1*10 + 2*100 + 3*1000 = 3210; batch item 1: 4*10 + 5*100 + 6*1000 = 6540.
         assert_eq!(outputs[0].value().values(), &[3210.0, 6540.0]);
     }
 
@@ -107,11 +112,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lane_varying_while_terminates_lanes_independently() {
-        // Build a batched while loop with a per-lane termination predicate. Each lane starts at a
-        // different value and decrements by 1 until it reaches 0. Lane 0 (initial 3.0) iterates
-        // three times, lane 1 (initial 1.0) iterates once, lane 2 (initial 2.0) iterates twice;
-        // inactive lanes retain their final state via per-lane `Select` masking.
+    fn test_batch_varying_while_terminates_items_independently() {
+        // Build a batched while loop with a per-item termination predicate. Each batch item starts at a
+        // different value and decrements by 1 until it reaches 0. Batch item 0 (initial 3.0) iterates
+        // three times, batch item 1 (initial 1.0) iterates once, batch item 2 (initial 2.0) iterates twice;
+        // inactive batch items retain their final state via per-item `Select` masking.
         use crate::operations::compare::ComparisonDirection;
         use crate::operations::control_flow::WhileOperation;
         use crate::programs::Program;
@@ -142,23 +147,31 @@ mod tests {
         let while_op = WhileOperation::<ArrayType, TestArray, TestOp>::new(condition, body).unwrap();
         let context = EagerContext::<ArrayType, TestArray, TestOp>::new();
 
-        let initial_state = ArrayBatch::mapped(TestArray::vector(vec![3.0, 1.0, 2.0]), 0).unwrap();
+        let initial_state = {
+            let value = TestArray::vector(vec![3.0, 1.0, 2.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
         let outputs = while_op.batch(&context, &[initial_state]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
-        // Each lane terminates when its value reaches 0; inactive lanes retain their last value.
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        // Each batch item terminates when its value reaches 0; inactive batch items retain their last value.
         assert_eq!(outputs[0].value().values(), &[0.0, 0.0, 0.0]);
 
-        // A semantic iteration bound truncates the batched loop too: every lane performs at most two body
-        // applications, so lane 0 (initial 3.0) is cut off at 1.0 while the other lanes terminate through their
-        // own predicates first.
+        // A semantic iteration bound truncates the batched loop too: every batch item performs at most two body
+        // applications, so batch item 0 (initial 3.0) is cut off at 1.0 while the other batch items terminate through
+        // their own predicates first.
         let bounded_while_op = while_op.with_iteration_bound(2).unwrap();
-        let initial_state = ArrayBatch::mapped(TestArray::vector(vec![3.0, 1.0, 2.0]), 0).unwrap();
+        let initial_state = {
+            let value = TestArray::vector(vec![3.0, 1.0, 2.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
         let outputs = bounded_while_op.batch(&context, &[initial_state]).unwrap();
         assert_eq!(outputs[0].value().values(), &[1.0, 0.0, 0.0]);
 
-        // The lane-uniform batched loop respects the bound as well: an unbatched initial state of 5.0 stops at 3.0.
-        let initial_state = ArrayBatch::unbatched(TestArray::scalar(5.0));
+        // The replicated batched loop respects the bound as well: an unbatched initial state of 5.0 stops at 3.0.
+        let initial_state = ArrayBatch::replicated(TestArray::scalar(5.0));
         let outputs = bounded_while_op.batch(&context, &[initial_state]).unwrap();
         assert_eq!(outputs[0].value().values(), &[3.0]);
     }
@@ -284,42 +297,57 @@ mod tests {
         assert_close(triples[5].2, 1.0);
     }
 
-    /// Builds a lane-uniform scalar Boolean predicate batch with the provided truth value.
-    fn lane_uniform_predicate(value: bool) -> ArrayBatch<TestArray> {
-        ArrayBatch::unbatched(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![if value { 1.0 } else { 0.0 }]))
+    /// Builds a replicated scalar Boolean predicate batch with the provided truth value.
+    fn replicated_predicate(value: bool) -> ArrayBatch<TestArray> {
+        ArrayBatch::replicated(TestArray::new(
+            ArrayType::scalar(DataType::Boolean),
+            vec![if value { 1.0 } else { 0.0 }],
+        ))
     }
 
     #[test]
-    fn test_condition_batches_lane_uniform_true_predicate_over_array_batches() {
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+    fn test_condition_batches_replicated_true_predicate_over_array_batches() {
+        use crate::batching::ArrayBatch;
+        use crate::batching::BatchAxis;
+        use crate::batching::BatchableOperation;
 
-        // A lane-uniform `true` predicate selects scalar_scale_branch(2.0). Pass a 3-lane batched operand and
-        // verify each lane is independently scaled by 2.
+        // A replicated `true` predicate selects scalar_scale_branch(2.0). Pass a 3-item batched operand and
+        // verify each batch item is independently scaled by 2.
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
 
-        let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&context, &[lane_uniform_predicate(true), batched_input]).unwrap();
+        let batched_input = {
+            let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let outputs = operation.batch(&context, &[replicated_predicate(true), batched_input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output_batch = &outputs[0];
-        assert_eq!(output_batch.batch_axis(), Some(0));
+        assert_eq!(output_batch.batch_axis(), BatchAxis::new(0));
         assert_eq!(output_batch.value().values, vec![2.0, 8.0, 18.0]);
     }
 
     #[test]
-    fn test_condition_batches_false_branch_when_lane_uniform_predicate_is_false() {
-        use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
+    fn test_condition_batches_false_branch_when_replicated_predicate_is_false() {
+        use crate::batching::ArrayBatch;
+        use crate::batching::BatchAxis;
+        use crate::batching::BatchableOperation;
 
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
 
-        let batched_input = ArrayBatch::mapped(TestArray::vector(vec![1.0, 4.0, 9.0]), 0).unwrap();
-        let outputs = operation.batch(&context, &[lane_uniform_predicate(false), batched_input]).unwrap();
+        let batched_input = {
+            let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let outputs = operation.batch(&context, &[replicated_predicate(false), batched_input]).unwrap();
         assert_eq!(outputs.len(), 1);
         let output_batch = &outputs[0];
-        assert_eq!(output_batch.batch_axis(), Some(0));
+        assert_eq!(output_batch.batch_axis(), BatchAxis::new(0));
         assert_eq!(output_batch.value().values, vec![3.0, 12.0, 27.0]);
     }
 
@@ -381,7 +409,7 @@ mod tests {
         use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
 
         // jacrev internally batches the pullback's adjoint `dot` operations (their known operands riding as
-        // lane-uniform pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
+        // replicated pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
         // dot-based scalar function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
         let jacobian = jacrev(
             &TestArrayDomain,
@@ -417,9 +445,9 @@ mod tests {
     }
 
     #[test]
-    fn test_batching_lane_varying_condition_selects_per_lane() {
-        // Per-lane scalar branches: on_true scales by 2.0, on_false scales by 3.0. Operand is a
-        // [4]-vector; predicate is a [4]-vector with values [1.0, 0.0, 1.0, 0.0]. Expected per-lane
+    fn test_batching_batch_varying_condition_selects_per_item() {
+        // Per-item scalar branches: on_true scales by 2.0, on_false scales by 3.0. Operand is a
+        // [4]-vector; predicate is a [4]-vector with values [1.0, 0.0, 1.0, 0.0]. Expected per-item
         // output: [1*2, 2*3, 3*2, 4*3] = [2, 6, 6, 12].
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
@@ -435,7 +463,7 @@ mod tests {
         let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
         let outputs = operation.batch(&context, &[predicate_batch, operand_batch]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![2.0, 6.0, 6.0, 12.0]);
     }
 
@@ -481,11 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn test_select_batches_with_lane_uniform_predicate_via_broadcast() {
-        // Predicate is a rank-0 lane-uniform scalar; on_true / on_false are mapped vectors of
+    fn test_select_batches_with_replicated_predicate_via_broadcast() {
+        // Predicate is a rank-0 replicated scalar; on_true / on_false are mapped vectors of
         // size 3. With the JAX-style broadcasting elementwise rule, `apply_elementwise_batch`
-        // promotes the lane-uniform predicate to the batched physical shape before invoking
-        // `Select::select`, so the mixed-batching case succeeds with the expected per-lane
+        // promotes the replicated predicate to the batched physical shape before invoking
+        // `Select::select`, so the mixed-batching case succeeds with the expected per-item
         // pick.
         use crate::operations::control_flow::SelectOperation;
 
@@ -500,15 +528,15 @@ mod tests {
             .batch(&crate::EagerContext::<ArrayType, TestArray>::new(), &[pred_batch, on_true_batch, on_false_batch])
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
-    fn test_batching_rule_zero_operation_is_lane_uniform() {
+    fn test_batching_rule_zero_operation_is_replicated() {
         // `ZeroOperation` takes no inputs and produces a constant of its captured type. The same
-        // constant is the right value for every lane, so the per-op rule wraps the output as
-        // lane-uniform (`batch_axis = None`) with no inserted axis.
+        // constant is the right value for every batch item, so the per-op rule wraps the output as
+        // replicated (`batch_axis = None`) with no inserted axis.
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = crate::operations::constants::ZeroOperation::new(scalar.clone());
 
@@ -523,14 +551,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), None);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
         assert_eq!(outputs[0].value().values, vec![0.0]);
     }
 
     #[test]
-    fn test_batching_rule_one_operation_is_lane_uniform() {
-        // Symmetric to `ZeroOperation`: `OneOperation` is lane-uniform by construction.
+    fn test_batching_rule_one_operation_is_replicated() {
+        // Symmetric to `ZeroOperation`: `OneOperation` is replicated by construction.
         let scalar = ArrayType::scalar(DataType::F64);
         let operation = crate::operations::constants::OneOperation::new(scalar.clone());
 
@@ -545,9 +573,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), None);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].r#type().into_owned(), scalar);
         assert_eq!(outputs[0].value().values, vec![1.0]);
+    }
+
+    #[test]
+    fn test_batching_rule_enum_zero_input_variants_delegate_to_payload_rules() {
+        // The enum arms for zero-input variants delegate to the per-payload rules (interpret once under the active
+        // context and wrap the outputs replicated) instead of erroring. This is the path a nested-program
+        // `Zero`/`Fill` instruction takes when `BatchingContext::interpret_program` dispatches it through the enum's
+        // `batch` with no inputs.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+
+        let zero = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
+        let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &[]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().values, vec![0.0]);
+
+        let fill = ArrayOperation::<TestArray>::Fill(crate::operations::constants::FillOperation::new(scalar, 7.5));
+        let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &[]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().values, vec![7.5]);
     }
 
     #[test]
@@ -791,8 +841,8 @@ mod tests {
         );
     }
 
-    /// Builds the three-lane cumulative-product [`ScanOperation`] (body `[carry, x] -> [carry * x, carry * x]`)
-    /// used by the scan differentiation tests, optionally visiting the lanes in reverse order.
+    /// Builds the three-iteration cumulative-product [`ScanOperation`] (body `[carry, x] -> [carry * x, carry * x]`)
+    /// used by the scan differentiation tests, optionally visiting the iterations in reverse order.
     fn product_scan_operation(
         reverse: bool,
     ) -> crate::operations::control_flow::ScanOperation<ArrayType, TestArray, ArrayOperation<TestArray>> {
@@ -872,10 +922,10 @@ mod tests {
     }
 
     #[test]
-    fn test_reversed_scan_jvp_and_grad_align_lanes() {
-        // Pins the alignment invariant for `reverse = true`: the primal scan visits lanes from the back while
-        // output lane `i` stays aligned with input lane `i`, and the linear scan runs with the same direction so
-        // residual lane `i` is consumed exactly when tangent lane `i` is processed. The reversed cumulative
+    fn test_reversed_scan_jvp_and_grad_align_items() {
+        // Pins the alignment invariant for `reverse = true`: the primal scan visits iterations from the back while
+        // output iteration `i` stays aligned with input iteration `i`, and the linear scan runs with the same direction so
+        // residual iteration `i` is consumed exactly when tangent iteration `i` is processed. The reversed cumulative
         // product has `ys = [x0 x1 x2, x1 x2, x2] = [24, 12, 4]`, so a unit tangent on `x1` gives
         // `dys = [x0 x2, x2, 0] = [8, 4, 0]`.
         let scan = product_scan_operation(true);

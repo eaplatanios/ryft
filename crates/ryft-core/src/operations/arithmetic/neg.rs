@@ -1,8 +1,10 @@
 use std::fmt::Display;
 
+use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
@@ -53,22 +55,18 @@ impl ElementwiseOperation for NegOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Neg> InterpretableOperation<T, V> for NegOperation
+impl<T: Type, V: Clone + Value<T> + Neg, C> InterpretableOperation<T, V, C> for NegOperation
 where
     Self: Operation<T>,
 {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].neg()?])
     }
 }
 
-impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for NegOperation {}
+impl<C: Context> PartiallyEvaluatableOperation<C> for NegOperation where C::Operation: From<NegOperation> {}
 
 /// Value-level elementwise negation capability. [`Neg`] is the fallible Ryft counterpart to [`std::ops::Neg`]
 /// that [`NegOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
@@ -120,7 +118,7 @@ mod tests {
         assert_eq!(format!("{operation}"), NEG_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar>::interpret(
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0)],
@@ -128,10 +126,10 @@ mod tests {
             Ok(vec![Scalar::from(-2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
-                &[TestArray::scalar(2.0)]
+                &[TestArray::scalar(2.0)],
             ),
             Ok(vec![TestArray::scalar(-2.0)]),
         );
@@ -170,11 +168,19 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 

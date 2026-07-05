@@ -1,9 +1,11 @@
 use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
+use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
@@ -56,22 +58,18 @@ impl ElementwiseOperation for SubOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Sub> InterpretableOperation<T, V> for SubOperation
+impl<T: Type, V: Clone + Value<T> + Sub, C> InterpretableOperation<T, V, C> for SubOperation
 where
     Self: Operation<T>,
 {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].sub(&inputs[1])?])
     }
 }
 
-impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for SubOperation {}
+impl<C: Context> PartiallyEvaluatableOperation<C> for SubOperation where C::Operation: From<SubOperation> {}
 
 /// Value-level elementwise subtraction capability. [`Sub`] is the fallible Ryft counterpart to [`std::ops::Sub`] that
 /// [`SubOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of panicking.
@@ -128,7 +126,7 @@ mod tests {
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar>::interpret(
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0), Scalar::from(3.5)],
@@ -136,7 +134,7 @@ mod tests {
             Ok(vec![Scalar::from(-1.5)])
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
@@ -212,7 +210,7 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar>::interpret(
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0)],
@@ -220,7 +218,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0)]

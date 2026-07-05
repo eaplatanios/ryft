@@ -2,9 +2,11 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::contexts::{EagerContext, StagingContext};
+use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::payloads::{Captured, Input};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
@@ -58,6 +60,7 @@ impl<T: Type, V: Clone + Typed<T>, Payload> ConstantOperation<T, V, Payload> {
 }
 
 impl<T: Type, V: Clone + Debug + Typed<T>, Payload> Debug for ConstantOperation<T, V, Payload> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("ConstantOperation").field("value", &self.value).finish()
     }
@@ -88,23 +91,28 @@ impl<T: Type, V: Clone + Display + Typed<T>, Payload> Operation<T> for ConstantO
     }
 }
 
-impl<T: Type, V: Value<T, InterpretationContext: Constant<T, V, C, Payload>>, C: Clone + Display + Typed<T>, Payload>
-    InterpretableOperation<T, V> for ConstantOperation<T, C, Payload>
+impl<T: Type, V: Value<T>, C: Constant<T, V, Stored, Payload>, Stored: Clone + Display + Typed<T>, Payload>
+    InterpretableOperation<T, V, C> for ConstantOperation<T, Stored, Payload>
 {
     #[inline]
-    fn interpret(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![context.constant(self.value.clone())?])
     }
 }
 
+impl<
+    T: Type,
+    V: Clone + Typed<T>,
+    Payload: Clone,
+    C: Context<Type = T, Operation: From<ConstantOperation<T, V, Payload>>>,
+> PartiallyEvaluatableOperation<C> for ConstantOperation<T, V, Payload>
+{
+}
+
 /// Represents the ability to materialize a captured [`ConstantOperation`] payload and is typically implemented
-/// by [`Context`](crate::Context)s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero),
-/// [`One`](crate::One), and [`Fill`](crate::Fill). It typically lives on [`Context`](crate::Context)s because producing
+/// by [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero),
+/// [`One`](crate::One), and [`Fill`](crate::Fill). It typically lives on [`Context`]s because producing
 /// a runtime value from a captured payload can be context-dependent. For example, [`EagerContext`]s can return the
 /// value directly, ordinary [`StagingContext`]s record a builder constant, and nested [`StagingContext`]s may receive
 /// an already-staged [`Tracer`] that should be forwarded after builder validation.
@@ -125,16 +133,16 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Payload> Constant<T, V, V, Payload> 
     }
 }
 
-impl<C: StagingContext> Constant<C::Type, Tracer<C>, C::Constant, Captured> for C {
+impl<C: StagingContext> Constant<C::Type, Tracer<C, C::Meta>, C::Constant, Captured> for C {
     #[inline]
-    fn constant(&self, value: C::Constant) -> Result<Tracer<C>, ProgramError> {
+    fn constant(&self, value: C::Constant) -> Result<Tracer<C, C::Meta>, ProgramError> {
         Ok(StagingContext::constant(self, value))
     }
 }
 
-impl<C: StagingContext> Constant<C::Type, Tracer<C>, Tracer<C>, Input> for C {
+impl<C: StagingContext> Constant<C::Type, Tracer<C, C::Meta>, Tracer<C, C::Meta>, Input> for C {
     #[inline]
-    fn constant(&self, value: Tracer<C>) -> Result<Tracer<C>, ProgramError> {
+    fn constant(&self, value: Tracer<C, C::Meta>) -> Result<Tracer<C, C::Meta>, ProgramError> {
         check_builders!(self.builder(), value.context().builder()).map_err(|error| self.error(error))?;
         Ok(value)
     }
@@ -142,48 +150,53 @@ impl<C: StagingContext> Constant<C::Type, Tracer<C>, Tracer<C>, Input> for C {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::operations::scalars::ScalarOperation;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, ProgramBuilder, ProgramError};
-    use crate::scalars::ScalarDomain;
-    use crate::tracing::{Tracer, TracingContext};
+    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::tracing::{DomainTracingContext, Tracer};
     use crate::types::{DataType, TypeError};
 
     use super::*;
 
     #[test]
     fn test_constant() {
-        let operation = ConstantOperation::<DataType, f64>::new(3.5);
+        let operation = ConstantOperation::<DataType, Scalar>::new(Scalar::from(3.5));
 
         assert_eq!(Operation::<DataType>::name(&operation), CONSTANT_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "ConstantOperation { value: 3.5 }");
+        assert_eq!(format!("{operation:?}"), "ConstantOperation { value: F64(3.5) }");
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
-        assert_eq!(operation.value(), &3.5);
+        assert_eq!(operation.value(), &Scalar::from(3.5));
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
-            Ok(vec![3.5]),
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+                &operation,
+                &EagerContext::<DataType, Scalar>::new(),
+                &[]
+            ),
+            Ok(vec![Scalar::from(3.5)]),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[0.0]),
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+                &operation,
+                &EagerContext::<DataType, Scalar>::new(),
+                &[Scalar::from(0.0)],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 
-        let mut builder = ProgramBuilder::<DataType, f64, ConstantOperation<DataType, f64>>::new();
+        let mut builder = ProgramBuilder::<DataType, Scalar, ConstantOperation<DataType, Scalar>>::new();
         let output = builder.add_instruction(operation, vec![]).unwrap()[0];
-        let program = builder.build::<(), f64>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -197,15 +210,14 @@ mod tests {
 
     #[test]
     fn test_constant_captured_interpretation() {
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
-        let operation = ConstantOperation::<DataType, f64>::new(3.5);
-        let outputs = InterpretableOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>>::interpret(
-            &operation,
-            &context,
-            &[],
-        )
+        let context = DomainTracingContext::<ScalarDomain>::new();
+        let builder = context.builder().clone();
+        let operation = ConstantOperation::<DataType, Scalar>::new(Scalar::from(3.5));
+        let outputs = InterpretableOperation::<
+            DataType,
+            Tracer<DomainTracingContext<ScalarDomain>>,
+            DomainTracingContext<ScalarDomain>,
+        >::interpret(&operation, &context, &[])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
@@ -216,31 +228,30 @@ mod tests {
 
     #[test]
     fn test_constant_input_interpretation() {
-        let domain = ScalarDomain::<f64>::new();
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        let context = DomainTracingContext::<ScalarDomain>::new();
+        let builder = context.builder().clone();
         let input = context.input(DataType::F64);
         let operation =
-            ConstantOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>, Input>::new(input.clone());
-        let outputs = InterpretableOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>>::interpret(
-            &operation,
-            &context,
-            &[],
-        )
+            ConstantOperation::<DataType, Tracer<DomainTracingContext<ScalarDomain>>, Input>::new(input.clone());
+        let outputs = InterpretableOperation::<
+            DataType,
+            Tracer<DomainTracingContext<ScalarDomain>>,
+            DomainTracingContext<ScalarDomain>,
+        >::interpret(&operation, &context, &[])
         .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].atom_id(), input.atom_id());
         assert!(builder.borrow().instructions().is_empty());
 
         // Test that interpretation rejects a foreign builder.
-        let foreign_builder = Rc::new(RefCell::new(ProgramBuilder::<DataType, f64, ScalarOperation<f64>>::new()));
-        let foreign_context = TracingContext::new(&domain, foreign_builder.clone());
+        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
+        let foreign_builder = foreign_context.builder().clone();
         assert!(matches!(
-            InterpretableOperation::<DataType, Tracer<TracingContext<'_, ScalarDomain<f64>>>>::interpret(
-                &operation,
-                &foreign_context,
-                &[]
-            ),
+            InterpretableOperation::<
+                DataType,
+                Tracer<DomainTracingContext<ScalarDomain>>,
+                DomainTracingContext<ScalarDomain>,
+            >::interpret(&operation, &foreign_context, &[]),
             Err(ProgramError::MismatchedProgramBuilders),
         ));
         assert_eq!(builder.borrow().error().cloned(), None);

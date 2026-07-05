@@ -2,9 +2,11 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
+use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
@@ -59,26 +61,25 @@ impl ElementwiseOperation for MulOperation {
 
     // TODO(eaplatanios): Review this function. Also, tests.
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        // Multiplication is bilinear, so its output sharding combines the operands' unreduced/reduced reduction
-        // state by the bilinear rule (JAX's `_mul_ur_rule`) rather than the congruent rule that generic elementwise
-        // broadcasting applies: the operands cannot both be unreduced (the product of two distributed partial sums
-        // is not itself a partial sum), but an operand unreduced over some axes times one reduced over exactly those
-        // axes yields a result unreduced over them. The combination does not depend on the per-dimension placement,
-        // so it applies for every `MeshAxisType` rather than being gated to explicit axes. The placement is broadcast
-        // with the reduction state stripped (so the shared broadcast does not reject a legitimate unreduced/reduced
-        // pairing), then the reduction state is recomputed and reattached.
-        //
-        // Background on JAX's unreduced/reduced sharding type system that this rule mirrors:
-        // https://blog.ezyang.com/2026/01/jax-sharding-type-system/ (the `_mul_ur_rule` it references lives in JAX's
-        // `jax/_src/lax/lax.py`).
+        // Multiplication is bilinear and so its output sharding combines the operands' unreduced/reduced reduction
+        // state by the bilinear rule rather than the congruent rule that generic elementwise broadcasting applies.
+        // The operands cannot both be unreduced (the product of two distributed partial sums is not itself a partial
+        // sum), but an operand unreduced over some axes times one reduced over exactly those axes yields a result
+        // unreduced over them. The combination does not depend on the per-dimension placement, so it applies for every
+        // `MeshAxisType` rather than being gated to explicit axes. The placement is broadcast with the reduction state
+        // stripped (so the shared broadcast does not reject a legitimate unreduced/reduced pairing), then the reduction
+        // state is recomputed and reattached. Refer to https://blog.ezyang.com/2026/01/jax-sharding-type-system/ for
+        // some background on JAX's unreduced/reduced sharding type system that this rule mirrors (the relevant
+        // `_mul_ur_rule` lives in JAX's `jax/_src/lax/lax.py`).
         check_count!("input", input_types, 2, TypeError);
-        let stripped = [strip_reduction_state(&input_types[0]), strip_reduction_state(&input_types[1])];
+        let stripped = [input_types[0].without_reduction_axes(), input_types[1].without_reduction_axes()];
         let output = self.broadcast_output_type(&stripped)?;
-
-        let (left_unreduced, left_reduced) = reduction_state(&input_types[0]);
-        let (right_unreduced, right_reduced) = reduction_state(&input_types[1]);
-        let (output_unreduced, output_reduced) =
-            combine_bilinear_reduction_state(&left_unreduced, &left_reduced, &right_unreduced, &right_reduced)?;
+        let (output_unreduced, output_reduced) = combine_bilinear_reduction_state(
+            input_types[0].unreduced_axes(),
+            input_types[0].reduced_axes(),
+            input_types[1].unreduced_axes(),
+            input_types[1].reduced_axes(),
+        )?;
         if output_unreduced.is_empty() && output_reduced.is_empty() {
             return Ok(vec![output]);
         }
@@ -96,34 +97,6 @@ impl ElementwiseOperation for MulOperation {
         .map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![output.with_sharding(rebuilt).map_err(|error| TypeError { message: error.to_string() })?])
     }
-}
-
-// TODO(eaplatanios): Review this function. Also, tests.
-/// Returns the `(unreduced, reduced)` axis sets of an [`ArrayType`]'s [`Sharding`], or empty sets when it has none.
-fn reduction_state(input_type: &ArrayType) -> (BTreeSet<String>, BTreeSet<String>) {
-    match input_type.sharding() {
-        Some(sharding) => (sharding.unreduced_axes().clone(), sharding.reduced_axes().clone()),
-        None => (BTreeSet::new(), BTreeSet::new()),
-    }
-}
-
-// TODO(eaplatanios): Review this function. Also, tests.
-/// Returns a copy of `input_type` whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while
-/// its per-dimension placement and varying-manual axes are preserved, so the shared elementwise broadcast does not
-/// reject operands that disagree on their reduction state (which the bilinear rule combines separately).
-fn strip_reduction_state(input_type: &ArrayType) -> ArrayType {
-    let Some(sharding) = input_type.sharding() else {
-        return input_type.clone();
-    };
-    let stripped = Sharding::with_manual_axes(
-        sharding.mesh().clone(),
-        sharding.dimensions().to_vec(),
-        Vec::<String>::new(),
-        Vec::<String>::new(),
-        sharding.varying_manual_axes().clone(),
-    )
-    .expect("clearing reduction-state axes preserves a valid sharding");
-    input_type.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
 }
 
 // TODO(eaplatanios): Review this function. Also, tests.
@@ -179,22 +152,18 @@ fn combine_bilinear_reduction_state(
     Ok((output_unreduced, output_reduced))
 }
 
-impl<T: Type, V: Clone + Value<T> + Mul> InterpretableOperation<T, V> for MulOperation
+impl<T: Type, V: Clone + Value<T> + Mul, C> InterpretableOperation<T, V, C> for MulOperation
 where
     Self: Operation<T>,
 {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].mul(&inputs[1])?])
     }
 }
 
-impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for MulOperation {}
+impl<C: Context> PartiallyEvaluatableOperation<C> for MulOperation where C::Operation: From<MulOperation> {}
 
 /// Value-level elementwise multiplication capability. [`Mul`] is the fallible Ryft counterpart to [`std::ops::Mul`]
 /// that [`MulOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
@@ -251,7 +220,7 @@ mod tests {
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar>::interpret(
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0), Scalar::from(3.5)],
@@ -259,7 +228,7 @@ mod tests {
             Ok(vec![Scalar::from(7.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
@@ -335,7 +304,7 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar>::interpret(
+            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0)],
@@ -343,7 +312,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0)]
@@ -364,7 +333,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            TypeError { message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible") }
+            TypeError { message: format!("{MUL_OPERATION_NAME} input types are not broadcast-compatible") },
         );
 
         // Program rendering uses the canonical operation name.
@@ -429,7 +398,7 @@ mod tests {
         assert_eq!(
             <MulOperation as Operation<ArrayType>>::infer_output_types(
                 &MulOperation,
-                &[unreduced("x"), unreduced("x")]
+                &[unreduced("x"), unreduced("x")],
             ),
             Err(TypeError {
                 message: format!("{MUL_OPERATION_NAME} cannot multiply two operands that are both unreduced")
@@ -442,7 +411,7 @@ mod tests {
             Err(TypeError {
                 message: format!(
                     "{MUL_OPERATION_NAME} requires the second operand to be reduced over the axes the first is \
-                     unreduced over"
+                     unreduced over",
                 ),
             }),
         );

@@ -412,14 +412,14 @@ pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> +
     ///
     ///   - `program`: Captured program to batch, over per-item input and output types.
     ///   - `batch_size`: Size of the batch axis (i.e., number of items being batched together).
-    ///   - `input_batch_axes`: Mapped batch-axis position for each program input, or `None` for a replicated input.
+    ///   - `input_batch_axes`: [`BatchAxis`] for each program input (mapped at a position or replicated).
     ///   - `output_axes_policy`: Policy for packaging the batched program's outputs.
     fn batch_program(
         program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
         batch_size: usize,
-        input_batch_axes: &[Option<usize>],
+        input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<Option<usize>>), BatchingError>;
+    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>;
 }
 
 impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
@@ -427,9 +427,9 @@ impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V,
     pub fn batched(
         &self,
         batch_size: usize,
-        input_batch_axes: &[Option<usize>],
+        input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Self, Vec<Option<usize>>), BatchingError> {
+    ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
         O::batch_program(self, batch_size, input_batch_axes, output_axes_policy)
     }
 }

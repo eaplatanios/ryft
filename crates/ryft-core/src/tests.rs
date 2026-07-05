@@ -5212,55 +5212,6 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_dimension_sharding_derives_from_the_mapped_axis() {
-        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-        use crate::types::Size;
-
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                    .unwrap(),
-            )
-            .unwrap();
-
-        // A batched input whose mapped axis is sharded contributes that `ShardingDimension`.
-        let batched = {
-            let value = sharded_type.clone();
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        assert_eq!(
-            batch_dimension_sharding(std::slice::from_ref(&batched)).unwrap(),
-            ShardingDimension::sharded(["x"])
-        );
-
-        // A replicated batch input (no mapped axis) contributes no mapped-axis sharding, so the derived batch
-        // dimension defaults to replicated sharding.
-        let replicated = ArrayBatch::replicated(sharded_type);
-        assert_eq!(
-            batch_dimension_sharding(std::slice::from_ref(&replicated)).unwrap(),
-            ShardingDimension::replicated()
-        );
-
-        // Batched inputs that disagree on their mapped-axis sharding are rejected.
-        let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
-            .with_sharding(Sharding::replicated(mesh, 2))
-            .unwrap();
-        let other = {
-            let value = replicated_type;
-            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
-        }
-        .unwrap();
-        let error = batch_dimension_sharding(&[batched, other]).unwrap_err();
-        assert!(matches!(
-            error.downcast_custom::<BatchingError>(),
-            Some(BatchingError::MisalignedBatchAxes { message })
-                if message.contains("disagree on the sharding of their mapped axis"),
-        ));
-    }
-
-    #[test]
     fn test_batch_axis_per_value_batch_index() {
         // The per-value `BatchAxis` metadata: a mapped batch dimension index or replicated.
         assert_eq!(BatchAxis::default(), BatchAxis::replicated());

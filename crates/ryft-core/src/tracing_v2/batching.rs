@@ -55,7 +55,7 @@ pub fn apply_with_axes<V: Value<ArrayType>, C, O: InterpretableOperation<ArrayTy
     context: &C,
     lifted_op: &O,
     inputs: &[ArrayBatch<V>],
-    output_axes: &[Option<usize>],
+    output_axes: &[BatchAxis],
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -165,7 +165,7 @@ pub(crate) fn apply_elementwise_batch<
     let physical_input_types: Vec<ArrayType> =
         broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect();
     let output_count = operation.infer_output_types(physical_input_types.as_slice())?.len();
-    let output_axes = vec![common_axis; output_count];
+    let output_axes = vec![BatchAxis::from(common_axis); output_count];
     apply_with_axes(context, operation, &broadcasted_inputs, &output_axes)
 }
 
@@ -243,9 +243,9 @@ pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
 /// lifting every instruction through its [`BatchableOperation`] rule, and the resulting staged program is extracted
 /// together with the requested output-axis policy.
 ///
-/// Inputs whose `input_batch_axes[i]` is `Some(k)` consume the original logical input type with a mapped batch axis of
-/// size `axis_size` inserted at position `k`, while inputs with `None` enter replicated at their original logical
-/// types. [`ProgramBatchingOutputAxesPolicy::Natural`] keeps the mapped axes produced by the batching rules. This is what
+/// Inputs whose `input_batch_axes[i]` is mapped at position `k` consume the original logical input type with a mapped
+/// batch axis of size `axis_size` inserted at `k`, while replicated inputs enter at their original logical types.
+/// [`ProgramBatchingOutputAxesPolicy::Natural`] keeps the mapped axes produced by the batching rules. This is what
 /// staged control-flow batching needs, because branch/body outputs are normalized to the surrounding operation's
 /// signature afterward. [`ProgramBatchingOutputAxesPolicy::AlignAllTo`] imposes a canonical output axis, which is what
 /// custom-derivative re-wrapping needs so independently batched primal/JVP/forward/backward programs have mutually
@@ -255,14 +255,14 @@ pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
 ///
 ///   - `program`: Captured flat program over per-item (logical) input and output types.
 ///   - `axis_size`: Size of the mapped batch axis.
-///   - `input_batch_axes`: Mapped batch-axis position per program input, or `None` for a replicated input.
+///   - `input_batch_axes`: [`BatchAxis`] per program input (mapped at a position or replicated).
 ///   - `output_axes_policy`: Policy for packaging the batched program outputs.
 pub fn batch_program<V, O>(
     program: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
     axis_size: usize,
-    input_batch_axes: &[Option<usize>],
+    input_batch_axes: &[BatchAxis],
     output_axes_policy: ProgramBatchingOutputAxesPolicy,
-) -> Result<(Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<Option<usize>>), BatchingError>
+) -> Result<(Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
 where
     V: Value<ArrayType> + 'static,
     O: Clone + Operation<ArrayType> + 'static,
@@ -283,8 +283,8 @@ where
         let batching_context = BatchingContext::new(parent_context, axis_size);
         let mut input_values = Vec::with_capacity(input_count);
         for (logical_type, axis) in logical_input_types.iter().zip(input_batch_axes.iter()) {
-            let physical_type = match axis {
-                Some(position) => logical_type.with_inserted_dimension(*position, Size::Static(axis_size))?,
+            let physical_type = match axis.axis() {
+                Some(position) => logical_type.with_inserted_dimension(position, Size::Static(axis_size))?,
                 None => logical_type.clone(),
             };
             let atom = builder.borrow_mut().add_input(physical_type);
@@ -297,7 +297,7 @@ where
             match output_axes_policy {
                 ProgramBatchingOutputAxesPolicy::Natural => {
                     let atom = output_value.atom_id()?;
-                    output_axes.push(output_value.meta().batch_axis().axis());
+                    output_axes.push(output_value.meta().batch_axis());
                     output_atom_ids.push(atom);
                 }
                 ProgramBatchingOutputAxesPolicy::AlignAllTo(target_axis) => {
@@ -319,7 +319,7 @@ where
                         None => broadcast_to_batched(&parent_batch, target_axis, axis_size)?,
                     };
                     output_atom_ids.push(aligned_batch.into_value().atom_id()?);
-                    output_axes.push(Some(target_axis));
+                    output_axes.push(BatchAxis::new(target_axis));
                 }
             }
         }

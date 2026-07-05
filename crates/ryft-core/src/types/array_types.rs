@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::ops::Index;
 
@@ -445,6 +446,10 @@ pub struct ArrayType {
     pub(crate) memory: Memory,
 }
 
+// Shared empty batch axis set returned by `ArrayType::unreduced_axes` and `ArrayType::reduced_axes` for array types
+// that carry no `Sharding`, so that both accessors can hand back a borrow without allocating.
+static EMPTY_BATCH_AXES: BTreeSet<String> = BTreeSet::new();
+
 impl ArrayType {
     /// Constructs a new [`ArrayType`] with the provided [`DataType`] and [`Shape`], no [`Layout`] or [`Sharding`]
     /// information, and residing in the default [`Memory::Device`] memory space. Use [`Self::with_layout`],
@@ -587,6 +592,41 @@ impl ArrayType {
     #[inline]
     pub fn sharding(&self) -> Option<&Sharding> {
         self.sharding.as_ref()
+    }
+
+    /// Returns the mesh axes over which this array type's [`Sharding`] is *unreduced* (i.e.,
+    /// [`Sharding::unreduced_axes`]), or an empty set when the array type carries no [`Sharding`].
+    #[inline]
+    pub fn unreduced_axes(&self) -> &BTreeSet<String> {
+        self.sharding.as_ref().map(|sharding| sharding.unreduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
+    }
+
+    /// Returns the mesh axes over which this array type's [`Sharding`] is *reduced* (i.e.,
+    /// [`Sharding::reduced_axes`]), or an empty set when the array type carries no [`Sharding`].
+    #[inline]
+    pub fn reduced_axes(&self) -> &BTreeSet<String> {
+        self.sharding.as_ref().map(|sharding| sharding.reduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
+    }
+
+    /// Returns a copy of this [`ArrayType`] whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared
+    /// while its per-dimension placement and varying-manual axes are preserved. Array types with no [`Sharding`] are
+    /// returned unchanged. Bilinear type-inference rules (e.g., elementwise multiplication rules) use this so the
+    /// shared elementwise broadcast does not reject operands that only disagree on their reduction state, which those
+    /// rules combine separately.
+    #[inline]
+    pub fn without_reduction_state(&self) -> Self {
+        let Some(sharding) = &self.sharding else {
+            return self.clone();
+        };
+        let stripped = Sharding::with_manual_axes(
+            sharding.mesh().clone(),
+            sharding.dimensions().to_vec(),
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            sharding.varying_manual_axes().clone(),
+        )
+        .expect("clearing reduction-state axes preserves a valid sharding");
+        self.clone().with_sharding(stripped).expect("a same-rank sharding stays valid")
     }
 
     /// Returns the [`Memory`] space in which the array resides.
