@@ -131,9 +131,7 @@ pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
     if current_axis == target_axis {
         return Ok(input.clone());
     }
-    let rank = input.r#type().rank();
-    let permutation = move_axis_permutation(rank, current_axis, target_axis);
-    let permuted_value = input.value().clone().transpose(permutation)?;
+    let permuted_value = input.value().clone().move_axis(current_axis, target_axis)?;
     let permuted_type = permuted_value.r#type().into_owned();
     ArrayBatch::new(permuted_type, permuted_value, Some(target_axis))
 }
@@ -956,11 +954,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
                         }
                         .into()),
                         (Some(current), Some(expected)) if current == expected => Ok(parent_tracer),
-                        (Some(current), Some(expected)) => {
-                            let rank = parent_tracer.r#type().as_ref().rank();
-                            let permutation = move_axis_permutation(rank, current, expected);
-                            parent_tracer.transpose(permutation)
-                        }
+                        (Some(current), Some(expected)) => parent_tracer.move_axis(current, expected),
                     }
                 },
             )
@@ -971,13 +965,3 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
 }
 
 impl<C> BatchContext for C where C: StagingContext<Type = ArrayType> {}
-
-/// Returns the axis permutation that moves dimension `from` to position `to`, shifting the other
-/// dimensions to preserve their relative order. Returns the identity permutation when
-/// `from == to`.
-pub(crate) fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
-    let mut permutation = (0..rank).collect::<Vec<_>>();
-    let axis = permutation.remove(from);
-    permutation.insert(to, axis);
-    permutation
-}

@@ -1,14 +1,15 @@
 use std::fmt::Display;
 
+use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{Sharding, ShardingError};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, TypeError};
-
-// TODO(eaplatanios): Review this module.
+use crate::types::{ArrayType, Shape, TypeError, Typed};
 
 /// Canonical operation name for [`TransposeOperation`].
 pub const TRANSPOSE_OPERATION_NAME: &'static str = "transpose";
@@ -36,6 +37,7 @@ impl TransposeOperation {
 }
 
 impl Display for TransposeOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
@@ -47,6 +49,7 @@ impl Operation<ArrayType> for TransposeOperation {
         TRANSPOSE_OPERATION_NAME
     }
 
+    #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         match (&input_types[0]).transpose(&self.permutation) {
@@ -56,21 +59,26 @@ impl Operation<ArrayType> for TransposeOperation {
         }
     }
 
+    #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("permutation", format_args!("{:?}", self.permutation)))
     }
 }
 
-impl<V: Value<ArrayType> + Transpose> InterpretableOperation<ArrayType, V> for TransposeOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<ArrayType> + Transpose, C> InterpretableOperation<ArrayType, V, C> for TransposeOperation {
+    #[inline]
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].transpose(&self.permutation)?])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> PartiallyEvaluatableOperation<C>
+    for TransposeOperation
+{
 }
 
 /// Represents the ability to transpose the axes of an array. [`Transpose`] fills the same role for
@@ -81,14 +89,40 @@ pub trait Transpose: Sized {
     /// bijection of the input axes. The permutation is accepted as any `AsRef<[usize]>` (for example, an owned
     /// `Vec<usize>` or a borrowed `&[usize]`), so callers can transpose without allocating a fresh permutation.
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError>;
+
+    // TODO(eaplatanios): Review this function.
+    /// Moves axis `from` to position `to`, shifting the other axes to preserve their relative order (the analogue of
+    /// NumPy's [`moveaxis`](https://numpy.org/doc/stable/reference/generated/numpy.moveaxis.html)). Returns `self`
+    /// unchanged when `from == to`.
+    #[inline]
+    fn move_axis(&self, from: usize, to: usize) -> Result<Self, ProgramError>
+    where
+        Self: Typed<ArrayType>,
+    {
+        self.transpose(move_axis_permutation(self.r#type().rank(), from, to))
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Swaps axes `i` and `j`, leaving every other axis in place (the analogue of NumPy's
+    /// [`swapaxes`](https://numpy.org/doc/stable/reference/generated/numpy.swapaxes.html)). Returns `self` unchanged
+    /// when `i == j`.
+    #[inline]
+    fn swap_axes(&self, i: usize, j: usize) -> Result<Self, ProgramError>
+    where
+        Self: Typed<ArrayType>,
+    {
+        let mut permutation = (0..self.r#type().rank()).collect::<Vec<_>>();
+        permutation.swap(i, j);
+        self.transpose(permutation)
+    }
 }
 
 impl Transpose for Sharding {
-    /// Type-level transpose of a sharding: reorders the per-dimension [`ShardingDimension`](crate::ShardingDimension)
-    /// entries so that output dimension `i` carries the entry of input dimension `permutation[i]`, while the
-    /// reduction-state and manual-axis sets are left unchanged. This is the sharding-level analogue of an array axis
-    /// permutation. `permutation` must be a permutation of `0..rank` matching this sharding's rank; otherwise a type
-    /// error describing the offending dimension is returned.
+    /// Reorders the per-dimension [`ShardingDimension`](crate::ShardingDimension) entries so that output dimension `i`
+    /// carries the entry of input dimension `permutation[i]`, while the reduction-state and manual-axis sets are left
+    /// unchanged. This is the sharding-level analogue of an array axis permutation. `permutation` must be a permutation
+    /// of `0..rank` matching this sharding's rank; otherwise a type error describing the offending dimension is
+    /// returned.
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         let permutation = permutation.as_ref();
         let permute_dimensions = || -> Result<Self, ShardingError> {
@@ -126,7 +160,7 @@ impl Transpose for ArrayType {
         if permutation.len() != rank {
             return Err(TypeError {
                 message: format!(
-                    "{TRANSPOSE_OPERATION_NAME} permutation has length {} but input has rank {rank}",
+                    "'{TRANSPOSE_OPERATION_NAME}' permutation has length {} but input has rank {rank}",
                     permutation.len(),
                 ),
             }
@@ -136,13 +170,13 @@ impl Transpose for ArrayType {
         for axis in permutation {
             if *axis >= rank {
                 return Err(TypeError {
-                    message: format!("{TRANSPOSE_OPERATION_NAME} permutation axis {axis} is out of bounds"),
+                    message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation axis {axis} is out of bounds"),
                 }
                 .into());
             }
             if seen[*axis] {
                 return Err(TypeError {
-                    message: format!("{TRANSPOSE_OPERATION_NAME} permutation contains duplicate axis {axis}"),
+                    message: format!("'{TRANSPOSE_OPERATION_NAME}' permutation contains duplicate axis {axis}"),
                 }
                 .into());
             }
@@ -162,7 +196,7 @@ impl Transpose for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> Transpose for Tracer<C> {
+impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> Transpose for Tracer<C, C::Meta> {
     #[inline]
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         let permutation = permutation.as_ref();
@@ -173,6 +207,7 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> T
     }
 }
 
+// TODO(eaplatanios): Review this function.
 /// Returns the inverse permutation of `permutation` (i.e., the permutation that undoes it).
 pub fn inverse_permutation(permutation: &[usize]) -> Vec<usize> {
     let mut inverse = vec![0usize; permutation.len()];
@@ -182,11 +217,21 @@ pub fn inverse_permutation(permutation: &[usize]) -> Vec<usize> {
     inverse
 }
 
+// TODO(eaplatanios): Review this function.
+/// Returns the length-`rank` permutation that moves axis `from` to position `to`, shifting the other axes to preserve
+/// their relative order. Returns the identity permutation when `from == to`. This is the permutation backing
+/// [`Transpose::move_axis`].
+pub fn move_axis_permutation(rank: usize, from: usize, to: usize) -> Vec<usize> {
+    let others = || (0..rank).filter(move |&axis| axis != from);
+    others().take(to).chain([from]).chain(others().skip(to)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
@@ -218,7 +263,9 @@ mod tests {
 
         // Interpretation reorders the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
+        let output = operation
+            .interpret(&EagerContext::<ArrayType, TestArray>::new(), std::slice::from_ref(&input))
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
@@ -229,18 +276,22 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
-            Err(TypeError { message: "transpose permutation has length 2 but input has rank 1".to_string() }),
+            Err(TypeError { message: "'transpose' permutation has length 2 but input has rank 1".to_string() }),
         );
         assert_eq!(
             TransposeOperation::new(vec![0, 2]).infer_output_types(std::slice::from_ref(&input_type)),
-            Err(TypeError { message: "transpose permutation axis 2 is out of bounds".to_string() }),
+            Err(TypeError { message: "'transpose' permutation axis 2 is out of bounds".to_string() }),
         );
         assert_eq!(
             TransposeOperation::new(vec![0, 0]).infer_output_types(std::slice::from_ref(&input_type)),
-            Err(TypeError { message: "transpose permutation contains duplicate axis 0".to_string() }),
+            Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
+            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+                &operation,
+                &EagerContext::<ArrayType, TestArray>::new(),
+                &[],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
@@ -353,6 +404,7 @@ mod tests {
         assert!(matrix().transpose(vec![0, 0]).is_err());
     }
 
+    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_inverse_permutation() {
         // Empty and identity permutations are their own inverses.
