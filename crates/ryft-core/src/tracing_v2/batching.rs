@@ -78,7 +78,7 @@ where
                 None => logical_type.clone(),
             };
             let atom = builder.borrow_mut().add_input(physical_type);
-            input_values.push(batching_context.batched_value(atom, logical_type.clone(), *axis));
+            input_values.push(Tracer::batched(batching_context.clone(), atom, logical_type.clone(), *axis));
         }
         let output_values = batching_context.stage_program(program, input_values)?;
         // Resolve the policy into one alignment target per output: `None` keeps the natural axis, and a mapped target
@@ -152,7 +152,7 @@ where
 /// `axis_size` and optional `axis_name`, while primitive binds recursively pass through every
 /// parent context in order.
 #[derive(Debug, Clone)]
-pub struct BatchingContext<C: Context<Type = ArrayType>> {
+pub struct BatchingContext<C> {
     /// Parent trace context wrapped by this batching level.
     parent_context: C,
 
@@ -164,7 +164,20 @@ pub struct BatchingContext<C: Context<Type = ArrayType>> {
     axis_name: Option<String>,
 }
 
-impl<C: Context<Type = ArrayType>> BatchingContext<C> {
+impl<C> BatchingContext<C> {
+    /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied batch size.
+    #[inline]
+    pub fn new(parent_context: C, axis_size: usize) -> Self {
+        Self::with_axis_name(parent_context, axis_size, None)
+    }
+
+    /// Creates a new [`BatchingContext`] with an optionally named batched axis. Collectives such as `psum`,
+    /// `pmean`, and `pmax` can address a named axis from inside the batched function body.
+    #[inline]
+    pub fn with_axis_name(parent_context: C, axis_size: usize, axis_name: Option<String>) -> Self {
+        Self { parent_context, axis_size, axis_name }
+    }
+
     /// Returns the parent [`Context`] this batching context wraps. Batching rules use this to stage operations
     /// directly at the parent level — for example, [`forward_collective_to_parent`](
     /// crate::tracing_v2::operations::collective::forward_collective_to_parent) re-stages a collective that targets
@@ -189,52 +202,36 @@ impl<C: Context<Type = ArrayType>> BatchingContext<C> {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
-    /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied batch size.
-    #[inline]
-    pub fn new(parent_context: C, axis_size: usize) -> Self {
-        Self::with_axis_name(parent_context, axis_size, None)
-    }
-
-    /// Creates a new [`BatchingContext`] with an optionally named batched axis. Collectives such as `psum`,
-    /// `pmean`, and `pmax` can address a named axis from inside the batched function body.
-    #[inline]
-    pub fn with_axis_name(parent_context: C, axis_size: usize, axis_name: Option<String>) -> Self {
-        Self { parent_context, axis_size, axis_name }
-    }
-}
-
-impl<C> BatchingContext<C>
+impl<C> Tracer<BatchingContext<C>, BatchingMeta<C::Meta>>
 where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
+    C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, BatchingContext<C>>>,
 {
-    /// Creates a live [`BatchingTracer`] referring to `atom` in the parent builder, carrying the given logical
-    /// (per-item) type and mapped batch axis at this batching level.
-    ///
-    /// This is the axis-carrying counterpart of [`StagingContext::tracer`]: callers that have already staged an atom
-    /// at its physical type and know where its mapped batch axis sits use this to attach that axis to the flowing
-    /// value as the head of its [`Meta`](StagingContext::Meta) stack. The tail (the parent context's per-level axes)
-    /// is left replicated here, which is correct for a fresh program input that has no enclosing batched value;
-    /// an enclosing nested-`batch` level instead prepends its axis onto the *incoming* value's existing stack
-    /// directly (see [`BatchContext::batch`]).
+    /// Creates a live [`BatchingTracer`] for `atom_id` in `context`'s parent builder, carrying the given logical
+    /// (per-item) `r#type` and mapped `batch_axis` at this batching level. This is the axis-carrying counterpart of
+    /// [`Tracer::new`]/[`Tracer::new_with_meta`]: callers that have already staged an atom at its physical type and
+    /// know where its mapped batch axis sits use this to attach that axis to the flowing value as the head of its
+    /// [`Meta`](StagingContext::Meta) stack. The tail (the parent context's per-level axes) is left replicated here,
+    /// which is correct for a fresh program input that has no enclosing batched value; an enclosing nested-`batch`
+    /// level instead prepends its axis onto the *incoming* value's existing stack directly (see
+    /// [`BatchContext::batch`]).
     ///
     /// # Parameters
     ///
-    ///   - `atom`: Staged atom in the parent builder.
-    ///   - `logical_type`: Per-item (unbatched) type the value reports inside the batched body.
+    ///   - `context`: [`BatchingContext`] level this value flows through.
+    ///   - `atom_id`: Staged atom in the parent builder.
+    ///   - `r#type`: Per-item (unbatched) type the value reports inside the batched body.
     ///   - `batch_axis`: Mapped batch axis carried by the value ([`BatchAxis::replicated`] when replicated).
     #[inline]
-    pub fn batched_value(
-        &self,
-        atom: AtomId,
-        logical_type: ArrayType,
-        batch_axis: impl Into<BatchAxis>,
-    ) -> BatchingTracer<C> {
-        Tracer::new_with_meta(
-            self.clone(),
-            TracerState::Live(atom),
-            logical_type,
+    pub fn batched<A: Into<BatchAxis>>(
+        context: BatchingContext<C>,
+        atom_id: AtomId,
+        r#type: ArrayType,
+        batch_axis: A,
+    ) -> Self {
+        Self::new_with_meta(
+            context,
+            TracerState::Live(atom_id),
+            r#type,
             BatchingMeta::new(batch_axis.into(), C::Meta::default()),
         )
     }
