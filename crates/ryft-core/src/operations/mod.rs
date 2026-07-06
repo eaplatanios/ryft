@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::broadcasting::Broadcastable;
 use crate::compilation::CaptureReference;
 use crate::contexts::Context;
@@ -9,7 +10,7 @@ use crate::macros::check_count;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this file.
 
@@ -121,10 +122,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 
     /// Renders the provided nested field name-[`Program`] pair. This must be used for [`Program`]-valued fields.
     #[inline]
-    pub fn program<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>(
+    pub fn program<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
         name: &str,
-        program: &Program<T, V, O, Input, Output>,
+        program: &Program<V, O, Input, Output>,
     ) -> std::fmt::Result {
         self.is_multiline = true;
         for (name, value) in std::mem::take(&mut self.fields) {
@@ -184,10 +185,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - An [`Operation<T>`](Operation) implementation whose [`name`](Operation::name),
 ///     [`infer_output_types`](Operation::infer_output_types), and [`render`](Operation::render) methods forward to the
 ///     active variant payload.
-///   - An [`InterpretableOperation<T, V>`](crate::InterpretableOperation) implementation that forwards
+///   - An [`InterpretableOperation<V>`](crate::InterpretableOperation) implementation that forwards
 ///     [`interpret`](crate::InterpretableOperation::interpret) to the active variant payload. Operation-specific eager
 ///     or staged interpretation semantics still live on the payload implementations; the enum is only a dispatcher.
-///   - An [`InterpretableProgramOperation<T, V, C>`](crate::InterpretableProgramOperation) implementation that
+///   - An [`InterpretableProgramOperation<V, C>`](crate::InterpretableProgramOperation) implementation that
 ///     interprets nested flat [`Program`]s in the enum's closed operation family. This is the interpretation
 ///     fixed-point witness used by higher-order payloads such as condition, while, scan, and custom derivative calls.
 ///     The generated implementation performs a flat program walk and dispatches each instruction to the concrete
@@ -210,8 +211,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     Generating those conversions would overlap with concrete variant conversions when the generic parameter is
 ///     instantiated as one of the concrete payload types. The operation forwarding implementation still supports the
 ///     generic payload by adding an `Extension: Operation<T>` bound.
-///   - Each payload receives a generated `Payload: InterpretableOperation<T, V>` bound for the interpretation
-///     dispatcher. Payload-specific value or context requirements should live on the payload's own
+///   - Each payload receives a generated `Payload: InterpretableOperation<V>` bound for the interpretation dispatcher.
+///     Payload-specific value or context requirements should live on the payload's own
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation; the enum derivation carries them
 ///     through this generated payload bound.
 ///   - `#[ryft(bounds(interpretation(Bound1 + Bound2 + ...)))]` adds extra trait bounds to the generated interpretation
@@ -221,31 +222,33 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     the enum's stored constant or capture type should not be forced to implement those capabilities.
 ///     For example, an array operation enum that owns condition, while, and scan payloads can write
 ///     `#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]` while keeping its enum parameter
-///     declaration at `V: Value<ArrayType>`.
+///     declaration at `V: Value<Type = ArrayType>`.
 ///
 /// The operation type `T` is selected as follows:
 ///
-///   - If the enum has exactly one distinct generic bound of the form `Value<T>`, the derivation infers `T` from that
-///     bound. For example, `enum BackendOperation<V: Value<ArrayType>>` derives `Operation<ArrayType>`. Multiple
-///     generic parameters may use the same `T`. For example, `V: Value<ArrayType>, C: Value<ArrayType>` still infers
-///     `ArrayType`.
-///   - If no `Value<T>` bound is present, or if multiple distinct operation types are present (e.g., `Value<DataType>`
-///     and `Value<ArrayType>`), the derivation macro cannot choose an operation type and reports a compilation error.
-///     In those cases, the caller must split the enum by operation type or implement [`Operation`] manually.
+///   - If the enum has exactly one distinct generic bound of the form `Value<Type = T>`, the derivation infers `T` from
+///     that bound. For example, `enum BackendOperation<V: Value<Type = ArrayType>>` derives `Operation<ArrayType>`.
+///     Multiple generic parameters may use the same `T`. For example,
+///     `V: Value<Type = ArrayType>, C: Value<Type = ArrayType>` still infers `ArrayType`.
+///   - If no `Value<Type = T>` bound is present, or if multiple distinct operation types are present (e.g.,
+///     `Value<Type = DataType>` and `Value<Type = ArrayType>`), the derivation macro cannot choose an operation type
+///     and reports a compilation error. In those cases, the caller must split the enum by operation type or implement
+///     [`Operation`] manually.
 ///
-/// The value types used for interpretation are inferred from the enum's `Value<T>` generic parameters:
+/// The value types used for interpretation are inferred from the enum's `Value<Type = T>` generic parameters:
 ///
-///   - For enums with one `Value<T>` parameter, the payload parameter is treated as the nested program's captured
-///     constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation) implementation is
-///     generic over a runtime value `V`. The generated
+///   - For enums with one `Value<Type = T>` parameter, the payload parameter is treated as the nested program's
+///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
+///     implementation is generic over a runtime value `V`. The generated
 ///     [`InterpretableProgramOperation`](crate::InterpretableProgramOperation) implementation requires
 ///     `V::InterpretationContext` to be a [`Context`] that can lift constants from `C` into `V`. Interpretation-only
 ///     capabilities should be provided with `#[ryft(bounds(interpretation(...)))]` instead of being placed on the
 ///     enum's stored constant type.
-///   - For enums with two or more `Value<T>` parameters, the first value parameter is treated as both the runtime value
-///     type and the nested program constant type for direct program interpretation. Later value parameters remain
-///     payload-specific metadata unless the generated program witness needs to instantiate a direct-linear operation
-///     family, in which case extra value parameters after the first two are substituted with the first value parameter.
+///   - For enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as both the
+///     runtime value type and the nested program constant type for direct program interpretation. Later value
+///     parameters remain payload-specific metadata unless the generated program witness needs to instantiate a
+///     direct-linear operation family, in which case extra value parameters after the first two are substituted with
+///     the first value parameter.
 ///   - For recursive operation enums, the generated nested-program witness inherits value capabilities from
 ///     payload-owned [`InterpretableOperation`](crate::InterpretableOperation) implementations and from
 ///     `#[ryft(bounds(interpretation(...)))]`. If a higher-order payload needs a capability such as [`BooleanLike`] for
@@ -254,7 +257,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///   - Bounds provided through `#[ryft(bounds(interpretation(...)))]` are applied to the same generated interpretation
 ///     value type. For example, one-value-parameter enums apply them to the generated runtime value parameter, while
 ///     direct linear enums apply them to their first value parameter. When any interpretation bounds are provided, the
-///     macro also adds the standard companion requirement `C: Zero<T, V>` for the generated implementation value type.
+///     macro also adds the standard companion requirement `C: Zero<V>` for the generated implementation value type.
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
@@ -270,9 +273,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
-/// enum BackendOperation<V: Value<DataType>> {
+/// enum BackendOperation<V: Value<Type = DataType>> {
 ///     Zero(ZeroOperation<DataType>),
-///     Constant(ConstantOperation<DataType, V>),
+///     Constant(ConstantOperation<V>),
 /// }
 ///
 /// let operation = BackendOperation::<Scalar>::from(ZeroOperation::new(DataType::F32));
@@ -367,7 +370,7 @@ pub trait ElementwiseOperation: Operation<ArrayType> {
                     sharding.varying_manual_axes.clear();
                 }
                 let mut output = ArrayType::broadcasted(input_types.as_slice()).map_err(|_| TypeError {
-                    message: format!("{} input types are not broadcast-compatible", self.name()),
+                    message: format!("'{}' input types are not broadcast-compatible", self.name()),
                 })?;
                 if let Some(sharding) = &mut output.sharding {
                     sharding.varying_manual_axes = original_varying_manual_axes;
@@ -438,7 +441,7 @@ impl BooleanLike for ArrayType {
     }
 }
 
-impl<C: Context, Meta: Clone> BooleanLike for Tracer<C, Meta> {
+impl<C: Context> BooleanLike for Tracer<C> {
     #[inline]
     fn as_boolean(&self) -> Self {
         // Returns this `Tracer` unchanged. Tracers carry no concrete payload to reinterpret, and a staged Boolean
@@ -468,6 +471,28 @@ impl BooleanLike for CaptureReference<ArrayType> {
         Err(ProgramError::Concretization {
             message: "cannot extract a concrete boolean from a captured constant reference".to_string(),
         })
+    }
+}
+
+// A batch-carrying value's Boolean view uses its packed value's Boolean view. Branching on it via `boolean()` succeeds
+// only for a *replicated* value whose packed value is concrete.  A batched value has one Boolean per item and cannot
+// drive a single branch, and a staged value carries no concrete payload.
+impl<C: Context<Type = ArrayType, Value: BooleanLike>> BooleanLike for BatchingTracer<C> {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        let r#type = self.batch().r#type().as_boolean();
+        let batch = ArrayBatch::new(r#type, self.batch().value().as_boolean(), self.batch().batch_axis()).unwrap();
+        BatchingTracer::new(self.context().clone(), batch)
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        if !self.batch().batch_axis().is_replicated() {
+            return Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a batched value".to_string(),
+            });
+        }
+        self.batch().value().boolean()
     }
 }
 
@@ -503,7 +528,7 @@ mod tests {
         }
     }
 
-    impl<C> InterpretableOperation<DataType, Scalar, C> for IdentityOperation {
+    impl<C> InterpretableOperation<Scalar, C> for IdentityOperation {
         fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
             check_count!("input", inputs, 1, ProgramError);
             Ok(inputs.to_vec())
@@ -557,7 +582,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct NestedProgramOperation {
-        program: Program<DataType, Scalar, IdentityOperation, Scalar, Scalar>,
+        program: Program<Scalar, IdentityOperation, Scalar, Scalar>,
     }
 
     impl Operation<DataType> for NestedProgramOperation {
@@ -594,8 +619,8 @@ mod tests {
         RenderedOperation { operation, indentation: 0 }.to_string()
     }
 
-    fn identity_program() -> Program<DataType, Scalar, IdentityOperation, Scalar, Scalar> {
-        let mut builder = ProgramBuilder::<DataType, Scalar, IdentityOperation>::new();
+    fn identity_program() -> Program<Scalar, IdentityOperation, Scalar, Scalar> {
+        let mut builder = ProgramBuilder::<Scalar, IdentityOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(IdentityOperation, vec![input]).unwrap()[0];
         builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap()
@@ -616,11 +641,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() })
         );
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<DataType, Scalar>::new(), &[Scalar::from(3.0)]),
+            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(3.0)]),
             Ok(vec![Scalar::from(3.0)])
         );
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<DataType, Scalar>::new(), &[]),
+            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
     }
@@ -772,7 +797,7 @@ mod tests {
                 &operation,
                 &[dynamic_type, ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2), Size::Static(3)]))],
             ),
-            Err(TypeError { message: "elementwise_test input types are not broadcast-compatible".to_string() }),
+            Err(TypeError { message: "'elementwise_test' input types are not broadcast-compatible".to_string() }),
         );
     }
 }
