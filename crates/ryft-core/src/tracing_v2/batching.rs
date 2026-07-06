@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError, BatchingMeta,
-    ProgramBatchingOutputAxesPolicy,
+    BatchingTracer, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
@@ -68,7 +68,7 @@ where
     // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
     // builder below is a real ownership check.
     let (output_atom_ids, output_axes) = {
-        let batching_context = BatchingContext::new(parent_context, axis_size);
+        let batching_context = BatchingContext::new(parent_context, axis_size, None);
         let mut input_values = Vec::with_capacity(input_count);
         for (logical_type, axis) in logical_input_types.iter().zip(input_batch_axes.iter()) {
             let physical_type = match axis.axis() {
@@ -115,7 +115,7 @@ where
             };
             let parent_batch = ArrayBatch::new(
                 physical_type.clone(),
-                batching_context.parent_context().tracer(atom, Some(physical_type)),
+                batching_context.parent().tracer(atom, Some(physical_type)),
                 natural_axis,
             )?;
             let aligned_batch = match natural_axis.axis() {
@@ -186,7 +186,7 @@ impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
     {
         program.interpret_with(
             inputs,
-            |_, constant| Ok(ArrayBatch::replicated(self.parent_context().constant(constant.clone()))),
+            |_, constant| Ok(ArrayBatch::replicated(self.parent().constant(constant.clone()))),
             |instruction, instruction_inputs| instruction.operation().batch(self, instruction_inputs),
         )
     }
@@ -214,13 +214,6 @@ where
         false
     }
 }
-
-/// The [`Meta`](StagingContext::Meta) is a [`BatchingMeta`] cons-stack mirroring the context nesting: the head
-/// [`BatchAxis`] is *this* batching level's mapped batch axis, and the tail `C::Meta` is the parent context's metadata
-/// (itself another [`BatchingMeta`] stack for a nested `vmap`). This is what lets every level of a nested `batch`
-/// recover its own batch axis for a value without any side table — `batch` over `batch` simply prepends one more axis
-/// onto the incoming value's stack.
-pub type BatchingTracer<C> = Tracer<BatchingContext<C>, BatchingMeta<<C as StagingContext>::Meta>>;
 
 /// Batch-carrying batching value selected by an ordinary backend [`Domain`]. This is the [`BatchingTracer`] flowing
 /// through the [`BatchingContext`] that wraps a fresh trace over `D`'s constant and operation families.
@@ -475,7 +468,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
         let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
 
         let batching_context =
-            BatchingContext::with_axis_name(parent_context.clone(), resolved_axis_size, axis.name().map(String::from));
+            BatchingContext::new(parent_context.clone(), resolved_axis_size, axis.name().map(String::from));
         let parent_builder = parent_context.builder().clone();
 
         let mut batched_input_values = Vec::with_capacity(inputs_with_axes.len());

@@ -30,7 +30,7 @@ pub mod tests;
 pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
 pub use batching::{
     ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableProgramOperation, BatchingContext,
-    BatchingError, BatchingMeta, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
+    BatchingError, BatchingMeta, BatchingTracer, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
@@ -56,7 +56,7 @@ pub use programs::{
 pub use scalars::{Scalar, ScalarDomain};
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
-pub use tracing_v2::batching::{Batch, BatchingTracer, batch_program};
+pub use tracing_v2::batching::{Batch, batch_program};
 pub use tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, Linearization, materialize,
 };

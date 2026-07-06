@@ -17,8 +17,7 @@ use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::parameters::{Parameter, ParameterError};
 use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::ShardingDimension;
-use crate::tracing::{Tracer, TracerState};
-use crate::tracing_v2::batching::BatchingTracer;
+use crate::tracing::{NestedTracingContext, Tracer, TracerState};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Represents batching-related errors.
@@ -708,54 +707,41 @@ impl<Meta> BatchingMeta<Meta> {
 /// compose by wrapping contexts rather than by making each active transform pretend to be a backend domain.
 #[derive(Debug, Clone)]
 pub struct BatchingContext<C> {
-    // TODO(eaplatanios): Review from here onwards.
-    /// Parent trace context wrapped by this batching level.
-    parent_context: C,
+    /// [`Context`] that this [`BatchingContext`] is nested into.
+    parent: C,
 
-    /// Size of the batch axis this level introduces.
+    /// Size of the new batch axis.
     axis_size: usize,
 
-    /// Optional human-readable name for this batched axis. Collectives such as `psum`, `pmean`, and
-    /// `pmax` can address this axis by name from inside the batched function body.
+    /// Optional name for the new batch axis that enables [`Operation`]s (e.g., collective operations)
+    /// to address this axis by name.
     axis_name: Option<String>,
 }
 
-// TODO(eaplatanios): Review this implementation block.
 impl<C> BatchingContext<C> {
-    /// Creates a new anonymous [`BatchingContext`] that wraps `parent_context` with the supplied batch size.
+    /// Creates a new [`BatchingContext`].
     #[inline]
-    pub fn new(parent_context: C, axis_size: usize) -> Self {
-        Self::with_axis_name(parent_context, axis_size, None)
+    pub fn new(parent: C, axis_size: usize, axis_name: Option<String>) -> Self {
+        Self { parent, axis_size, axis_name }
     }
 
-    /// Creates a new [`BatchingContext`] with an optionally named batched axis. Collectives such as `psum`,
-    /// `pmean`, and `pmax` can address a named axis from inside the batched function body.
+    /// Returns the [`Context`] that this [`BatchingContext`] is nested into.
     #[inline]
-    pub fn with_axis_name(parent_context: C, axis_size: usize, axis_name: Option<String>) -> Self {
-        Self { parent_context, axis_size, axis_name }
+    pub fn parent(&self) -> &C {
+        &self.parent
     }
 
-    /// Returns the parent [`Context`](crate::Context) this batching context wraps. Batching rules use this to stage
-    /// operations directly at the parent level — for example, [`forward_collective_to_parent`](
-    /// crate::tracing_v2::operations::collective::forward_collective_to_parent) re-stages a collective that targets
-    /// an outer named axis.
-    #[inline]
-    pub fn parent_context(&self) -> &C {
-        &self.parent_context
-    }
-
-    /// Returns this batch level's named axis, if the enclosing `batch` call named one. Batching rules for
-    /// collective-like operations match their own axis name against this to decide whether to consume the mapped
-    /// batch axis at this level or forward the operation to [`BatchingContext::parent_context`].
-    #[inline]
-    pub fn axis_name(&self) -> Option<&str> {
-        self.axis_name.as_deref()
-    }
-
-    /// Returns this batch level's batch size.
+    /// Returns the size of the new batch axis.
     #[inline]
     pub fn axis_size(&self) -> usize {
         self.axis_size
+    }
+
+    /// Returns the optional name for the new batch axis that enables [`Operation`]s (e.g., collective operations)
+    /// to address this axis by name.
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
     }
 }
 
@@ -771,7 +757,7 @@ where
     type Operation = C::Operation;
 }
 
-// TODO(eaplatanios): Review this implementation block.
+// TODO(eaplatanios): Review this implementation block and add unit test.
 impl<C> Context for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType>,
@@ -810,7 +796,7 @@ where
     }
 }
 
-// TODO(eaplatanios): Review this implementation block.
+// TODO(eaplatanios): Review this implementation block and add unit test.
 impl<C> StagingContext for BatchingContext<C>
 where
     C: StagingContext<Type = ArrayType>,
@@ -820,7 +806,7 @@ where
 
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
-        self.parent_context().builder()
+        self.parent().builder()
     }
 
     fn stage_operation<P: Into<Self::Operation>, I: std::borrow::Borrow<BatchingTracer<C>>>(
@@ -863,7 +849,7 @@ where
                 None => logical_type,
             };
             let parent_value = Tracer::new_with_meta(
-                self.parent_context().clone(),
+                self.parent().clone(),
                 TracerState::Live(atom),
                 parent_physical_type.clone(),
                 input.meta().parent().clone(),
@@ -895,7 +881,7 @@ where
     }
 }
 
-// TODO(eaplatanios): Review this implementation block.
+// TODO(eaplatanios): Review this implementation block and add unit test.
 /// A batching level binds the axis it introduces: a lookup for this level's [`axis_name`](Self::axis_name) resolves to
 /// [`NamedAxis::Batched`] with this level's batch size, and any other name delegates to the parent context. Because
 /// nested `batch` composes by context wrapping, the delegation chain naturally shadows outer bindings with inner ones.
@@ -909,10 +895,13 @@ where
         if self.axis_name() == Some(name) {
             Some(NamedAxis::Batched { size: self.axis_size() })
         } else {
-            self.parent_context().named_axis(name)
+            self.parent().named_axis(name)
         }
     }
 }
+
+/// [`Tracer`] that is compatible with [`BatchingContext`]s and uses [`BatchingMeta`] for the metadata that it carries.
+pub type BatchingTracer<C> = Tracer<BatchingContext<C>, BatchingMeta<<C as StagingContext>::Meta>>;
 
 #[cfg(test)]
 mod tests {
