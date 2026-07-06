@@ -63,12 +63,12 @@ where
     let logical_input_types = program.input_types();
     let input_count = logical_input_types.len();
     check_count!("input", input_batch_axes, input_count, ProgramError);
-    let parent_context: TracingContext<ArrayType, V, O, V> = TracingContext::new();
-    let builder = parent_context.builder().clone();
+    let parent: TracingContext<ArrayType, V, O, V> = TracingContext::new();
+    let builder = parent.builder().clone();
     // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
     // builder below is a real ownership check.
     let (output_atom_ids, output_axes) = {
-        let batching_context = BatchingContext::new(parent_context, axis_size, None);
+        let batching_context = BatchingContext::new(parent, axis_size, None);
         let mut input_values = Vec::with_capacity(input_count);
         for (logical_type, axis) in logical_input_types.iter().zip(input_batch_axes.iter()) {
             let physical_type = match axis.axis() {
@@ -327,27 +327,27 @@ pub trait Batch: Domain<Type = ArrayType> {
     {
         let structure = input.parameter_structure();
         let input_values = input.into_parameters().collect::<Vec<_>>();
-        let parent_context: DomainTracingContext<Self> = TracingContext::new();
-        let builder = parent_context.builder().clone();
+        let parent: DomainTracingContext<Self> = TracingContext::new();
+        let builder = parent.builder().clone();
         let mut input_tracers = Vec::with_capacity(input_values.len());
         for value in input_values.iter() {
             let physical_type = value.r#type().into_owned();
             let atom = builder.borrow_mut().add_input(physical_type.clone());
-            input_tracers.push(parent_context.tracer(atom, Some(physical_type)));
+            input_tracers.push(parent.tracer(atom, Some(physical_type)));
         }
         let traced_input = I::To::<DomainTracer<Self>>::from_parameters(structure.clone(), input_tracers)?;
         // Batching rules ride up the `ProgramError`-typed staging kernel as `ProgramError::Custom` payloads; the
         // `From<ProgramError>` conversions behind the `?` operators below re-type them so the public `batch` surfaces
         // a transform-owned `BatchingError`, mirroring how `value_and_grad` surfaces a `DifferentiationError`.
         let traced_output: O::To<DomainTracer<Self>> =
-            BatchContext::batch(&parent_context, function, traced_input, in_axes, out_axes, axis)?;
+            BatchContext::batch(&parent, function, traced_input, in_axes, out_axes, axis)?;
         if let Some(error) = builder.borrow_mut().error.take() {
             return Err(error.into());
         }
         let output_structure = traced_output.parameter_structure();
         let output_atom_ids = traced_output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
         drop(traced_output);
-        drop(parent_context);
+        drop(parent);
 
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program: Program<ArrayType, Self::Constant, Self::Operation, I::To<Self::Constant>, O::To<Self::Constant>> =
@@ -423,7 +423,7 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
         F: FnOnce(I::To<BatchingTracer<Self>>) -> Result<O, ProgramError>,
     {
         let axis = axis.into();
-        let parent_context = self.clone();
+        let parent = self.clone();
         let input_structure = input.parameter_structure();
         let input_tracers = input.into_parameters().collect::<Vec<_>>();
         // Broadcast the caller's `in_axes` into the input parameter structure: a single `BatchAxis` leaf fills every
@@ -467,9 +467,8 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
         }
         let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
 
-        let batching_context =
-            BatchingContext::new(parent_context.clone(), resolved_axis_size, axis.name().map(String::from));
-        let parent_builder = parent_context.builder().clone();
+        let batching_context = BatchingContext::new(parent.clone(), resolved_axis_size, axis.name().map(String::from));
+        let parent_builder = parent.builder().clone();
 
         let mut batched_input_values = Vec::with_capacity(inputs_with_axes.len());
         for (parent_tracer, axis, logical_type) in inputs_with_axes.iter() {
@@ -513,13 +512,9 @@ pub trait BatchContext: StagingContext<Type = ArrayType> {
             .zip(out_axes_values.iter().map(|axis| axis.axis()))
             .map(
                 |((atom, current_axis, parent_meta), expected_axis)| -> Result<Tracer<Self, Self::Meta>, ProgramError> {
-                    let physical_type = parent_context.builder().borrow().atoms()[atom.index()].r#type().into_owned();
-                    let parent_tracer = Tracer::new_with_meta(
-                        parent_context.clone(),
-                        TracerState::Live(atom),
-                        physical_type,
-                        parent_meta,
-                    );
+                    let physical_type = parent.builder().borrow().atoms()[atom.index()].r#type().into_owned();
+                    let parent_tracer =
+                        Tracer::new_with_meta(parent.clone(), TracerState::Live(atom), physical_type, parent_meta);
                     match (current_axis, expected_axis) {
                         (None, None) => Ok(parent_tracer),
                         // The output's mapped-axis presence disagrees with the caller's `out_axes` declaration.
