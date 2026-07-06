@@ -129,13 +129,21 @@ impl Display for TestArray {
     }
 }
 
-impl Typed<ArrayType> for TestArray {
+impl Typed for TestArray {
+    type Type = ArrayType;
+
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl Value<ArrayType> for TestArray {}
+impl Value for TestArray {
+    type Domain = EagerContext<Self>;
+
+    fn domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+}
 
 impl Tag for TestArray {
     #[inline]
@@ -220,28 +228,26 @@ impl crate::operations::control_flow::WhilePredicate for TestArray {
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> Zero<ArrayType, TestArray> for EagerContext<ArrayType, TestArray, O> {
+impl<O: crate::operations::Operation<ArrayType>> Zero<TestArray> for EagerContext<TestArray, O> {
     fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
         Ok(TestArray { r#type: r#type.clone(), values: vec![0.0; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> One<ArrayType, TestArray> for EagerContext<ArrayType, TestArray, O> {
+impl<O: crate::operations::Operation<ArrayType>> One<TestArray> for EagerContext<TestArray, O> {
     fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
         Ok(TestArray { r#type: r#type.clone(), values: vec![1.0; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> Fill<ArrayType, f64, TestArray>
-    for EagerContext<ArrayType, TestArray, O>
-{
+impl<O: crate::operations::Operation<ArrayType>> Fill<f64, TestArray> for EagerContext<TestArray, O> {
     fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
         Ok(TestArray { r#type: r#type.clone(), values: vec![value; TestArray::materialized_element_count(r#type)?] })
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> crate::operations::constants::Iota<ArrayType, TestArray>
-    for EagerContext<ArrayType, TestArray, O>
+impl<O: crate::operations::Operation<ArrayType>> crate::operations::constants::Iota<TestArray>
+    for EagerContext<TestArray, O>
 {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
         let sizes = r#type
@@ -1063,7 +1069,7 @@ impl Context for TestArrayDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         let operation = operation.into();
-        operation.interpret(&EagerContext::<ArrayType, TestArray, Self::Operation>::new(), inputs)
+        operation.interpret(&EagerContext::<TestArray, Self::Operation>::new(), inputs)
     }
 
     fn resolve(&self, value: &TestArray) -> ValueResolution<TestArray> {
@@ -1081,31 +1087,31 @@ impl crate::axes::NamedAxes for TestArrayDomain {
 /// Eager-domain context capabilities: [`TestArrayDomain`] interprets operations directly over [`TestArray`]s, so
 /// its nullary-construction and constant-materialization semantics are exactly the zero-state
 /// [`EagerContext`]'s, to which these impls delegate.
-impl Zero<ArrayType, TestArray> for TestArrayDomain {
+impl Zero<TestArray> for TestArrayDomain {
     fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-        EagerContext::<ArrayType, TestArray>::new().zero(r#type)
+        EagerContext::<TestArray>::new().zero(r#type)
     }
 }
 
-impl One<ArrayType, TestArray> for TestArrayDomain {
+impl One<TestArray> for TestArrayDomain {
     fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-        EagerContext::<ArrayType, TestArray>::new().one(r#type)
+        EagerContext::<TestArray>::new().one(r#type)
     }
 }
 
-impl Fill<ArrayType, f64, TestArray> for TestArrayDomain {
+impl Fill<f64, TestArray> for TestArrayDomain {
     fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
-        EagerContext::<ArrayType, TestArray>::new().fill(r#type, value)
+        EagerContext::<TestArray>::new().fill(r#type, value)
     }
 }
 
-impl crate::operations::constants::Iota<ArrayType, TestArray> for TestArrayDomain {
+impl crate::operations::constants::Iota<TestArray> for TestArrayDomain {
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
-        EagerContext::<ArrayType, TestArray>::new().iota(r#type, dimension)
+        EagerContext::<TestArray>::new().iota(r#type, dimension)
     }
 }
 
-impl<Payload> crate::operations::constants::Constant<ArrayType, TestArray, TestArray, Payload> for TestArrayDomain {
+impl<Payload> crate::operations::constants::Constant<TestArray, TestArray, Payload> for TestArrayDomain {
     #[inline]
     fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
         Ok(value)
@@ -1126,7 +1132,7 @@ mod tests {
         // instead of panicking.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(3)]));
         let expected_message = "cannot materialize a value of dynamically sized type f64[*, 3]";
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
         assert!(matches!(
             context.zero(&dynamic_type),
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,
@@ -1390,7 +1396,7 @@ mod differentiation_tests {
         // `[cotangent ++ residuals]` and applying `Pullback::apply` to the same cotangent must agree, for two distinct
         // cotangents. `f(x) = x * sin(x)`.
         let domain = ScalarDomain::new();
-        let context = crate::contexts::EagerContext::<crate::types::DataType, Scalar>::new();
+        let context = crate::contexts::EagerContext::<Scalar>::new();
         let function = |x: NestedTracer<ScalarDomain>| Ok(x.clone() * x.sin()?);
 
         let (output, pullback) = domain.vjp_fn(function, Scalar::from(0.7)).unwrap();
@@ -1414,7 +1420,7 @@ mod differentiation_tests {
         // The array-domain, multi-input `vjp_fn`: `f(a, b) = a * b` returns one scalar output whose pullback maps the
         // output cotangent to `(b * cotangent, a * cotangent)`. The callable's reshaped input cotangents must match the
         // raw pullback interpreted manually.
-        let context = crate::contexts::EagerContext::<crate::types::ArrayType, TestArray>::new();
+        let context = crate::contexts::EagerContext::<TestArray>::new();
         let function = |(a, b): (NestedTracer<TestArrayDomain>, NestedTracer<TestArrayDomain>)| Ok(a * b);
         let (output, pullback) =
             TestArrayDomain.vjp_fn(function, (TestArray::scalar(3.0), TestArray::scalar(2.0))).unwrap();
@@ -1438,7 +1444,6 @@ mod differentiation_tests {
     /// Builds the eager unbounded `while x < 8 { x = x + x }` doubling loop over the array domain used by the
     /// forward-linearization control-flow test.
     fn doubling_while_for_linearize() -> crate::operations::control_flow::WhileOperation<
-        crate::types::ArrayType,
         crate::tests::TestArray,
         crate::tracing_v2::ArrayOperation<crate::tests::TestArray>,
     > {
@@ -1453,7 +1458,7 @@ mod differentiation_tests {
         type TestOp = ArrayOperation<TestArray>;
         let scalar_f64 = ArrayType::scalar(DataType::F64);
 
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(8.0));
         let predicate = condition_builder
@@ -1463,7 +1468,7 @@ mod differentiation_tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let body_state = body_builder.add_input(scalar_f64);
         let doubled = body_builder.add_instruction(AddOperation, vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
@@ -1477,7 +1482,6 @@ mod differentiation_tests {
     /// (body `[carry, x] -> [carry * x, carry * x]`, one scanned input, length 3) used by the forward-linearization
     /// scan test.
     fn product_scan_for_linearize() -> crate::operations::control_flow::ScanOperation<
-        crate::types::ArrayType,
         crate::tests::TestArray,
         crate::tracing_v2::ArrayOperation<crate::tests::TestArray>,
     > {
@@ -1489,7 +1493,7 @@ mod differentiation_tests {
         use crate::types::{ArrayType, DataType};
 
         type TestOp = ArrayOperation<TestArray>;
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestOp>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, TestOp>::new();
         let carry = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let x = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let product = body_builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
@@ -1565,7 +1569,7 @@ mod linearization_tests {
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(linearize_function, primals.clone())
             .unwrap();
         let linearization = primal_program.linearize().unwrap();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
         // primal outputs that the linearization core no longer caches.
@@ -1625,7 +1629,7 @@ mod linearization_tests {
         function: Function,
         primals: Vec<Scalar>,
     ) -> Result<
-        (Vec<Scalar>, Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>, Vec<Scalar>),
+        (Vec<Scalar>, Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>, Vec<Scalar>),
         ProgramError,
     >
     where
@@ -1660,7 +1664,7 @@ mod linearization_tests {
         LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
     {
         let domain = ScalarDomain::new();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
 
         let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
         let mut reference_inputs = output_cotangents.clone();
@@ -1677,12 +1681,12 @@ mod linearization_tests {
     /// Builds the eager, data-dependent `while x < 100 { x = x * x }` loop over the `f64` scalar domain. Its trip count
     /// depends on the runtime value and the loop carries no iteration bound, so it is the kind of unbounded loop the
     /// front end rejects unless the eager unroll-then-fuse pre-pass first unrolls it at the concrete primal.
-    fn scalar_squaring_while() -> WhileOperation<DataType, Scalar, ScalarOperation<Scalar>> {
+    fn scalar_squaring_while() -> WhileOperation<Scalar, ScalarOperation<Scalar>> {
         use crate::operations::arithmetic::MulOperation;
         use crate::operations::compare::{CompareOperation, ComparisonDirection};
 
         let condition = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let threshold = builder.add_constant(Scalar::from(100.0));
             let predicate = builder
@@ -1693,7 +1697,7 @@ mod linearization_tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let squared = builder.add_instruction(MulOperation, vec![carry, carry]).unwrap()[0];
             builder
@@ -1732,12 +1736,12 @@ mod linearization_tests {
     /// below the threshold, and its body stages an inner unbounded `while t < 100 { t = t + t }` started from the outer
     /// carry. Both loops are unbounded, so this exercises recursive nested-`while` unrolling: the inner loop is just
     /// another instruction encountered while the outer body is rewritten, so it is unrolled by the same pre-pass.
-    fn scalar_nested_while() -> WhileOperation<DataType, Scalar, ScalarOperation<Scalar>> {
+    fn scalar_nested_while() -> WhileOperation<Scalar, ScalarOperation<Scalar>> {
         use crate::operations::arithmetic::AddOperation;
         use crate::operations::compare::{CompareOperation, ComparisonDirection};
 
         let inner = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let threshold = builder.add_constant(Scalar::from(100.0));
             let predicate = builder
@@ -1748,7 +1752,7 @@ mod linearization_tests {
                 .unwrap()
         };
         let inner_body = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
             builder
@@ -1758,7 +1762,7 @@ mod linearization_tests {
         let inner_while = WhileOperation::new(inner, inner_body).unwrap();
 
         let outer = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let threshold = builder.add_constant(Scalar::from(5000.0));
             let predicate = builder
@@ -1769,7 +1773,7 @@ mod linearization_tests {
                 .unwrap()
         };
         let outer_body = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let inner_output = builder.add_instruction(inner_while, vec![carry]).unwrap()[0];
             let next = builder.add_instruction(AddOperation, vec![carry, inner_output]).unwrap()[0];
@@ -1812,7 +1816,7 @@ mod linearization_tests {
         // now succeeds and must reproduce the established eager `vjp`. The direct-transpose pullback consumes the
         // residuals as ordinary inputs, so it is interpreted at `output_cotangents ++ residuals`.
         let domain = ScalarDomain::new();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
 
         let (_, reference_pullback, reference_residuals) = domain
             .vjp(|inputs| Ok(vec![inputs[0].clone().unary(scalar_squaring_while())]), vec![Scalar::from(1.5)])
@@ -1980,7 +1984,7 @@ mod linearization_tests {
         // Recover the residuals by interpreting the primal sub-program at the primals, then feed `(dx, dy, residuals)`
         // through the tangent sub-program. The restored `dy` slot must be reinserted for the tangent program to accept
         // both tangent inputs even though `stop_gradient` blocks `y`'s tangent and `dy` feeds nothing.
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let primal_outputs = linearization
             .primal_program
             .interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.3)])
@@ -2013,11 +2017,11 @@ mod linearization_tests {
         // proves the absence of symbolic captures: the program's operation family is `ScalarOperation<Scalar>`, the
         // ordinary primal operation family, rather than a capture-keyed linear operation family. This binding
         // documents that distinction at the type level.
-        let _capture_free: &Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> = &jvp_program;
+        let _capture_free: &Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> = &jvp_program;
 
         // Interpreting the program at (primal, tangent) = (0.7, 1.0) reproduces the function value and its
         // derivative `sin(x) + x*cos(x)`.
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.0)]).unwrap();
         let expected_primal = 0.7 * 0.7_f64.sin();
         let expected_tangent = 0.7_f64.sin() + 0.7 * 0.7_f64.cos();
@@ -2036,7 +2040,7 @@ mod linearization_tests {
         // A `while` loop is a nested-program operation: its tangent is a linearized loop, not primal-enum operand
         // arithmetic, so the front end must reject it rather than mis-evaluate it.
         let condition = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let eight = builder.add_constant(Scalar::from(8.0));
             let predicate = builder
@@ -2047,7 +2051,7 @@ mod linearization_tests {
                 .unwrap()
         };
         let body = {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let carry = builder.add_input(DataType::F64);
             let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
             builder
@@ -2059,7 +2063,7 @@ mod linearization_tests {
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 move |inputs| {
-                    let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(condition, body)?;
+                    let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(condition, body)?;
                     let mut outputs = inputs[0].context().stage_operation(operation, &[inputs[0].clone()])?;
                     Ok(vec![outputs.remove(0)])
                 },
@@ -2084,7 +2088,7 @@ mod linearization_tests {
         // prune the structurally dead zero tangents the replay synthesizes for the Boolean codomain and the
         // severed branch — including a `zero` of Boolean type that the `f64` interpreter cannot evaluate.
         let domain = ScalarDomain::new();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
 
         // f(x) = select(x > 1, x * x, x + x): the comparison contributes a zero tangent and `select` routes the chosen
         // branch's tangent. For x > 1 the derivative is `2x`; otherwise it is `2`.
@@ -2200,6 +2204,33 @@ mod linearization_tests {
     }
 
     #[test]
+    fn test_jvp_direct_branches_on_concrete_primal() {
+        use crate::NestedTracer;
+        use crate::operations::BooleanLike;
+        use crate::operations::arithmetic::{Mul, Neg};
+        use crate::operations::trigonometric::Sin;
+        use crate::tracing_v2::differentiation::JvpTracer;
+
+        // `jvp_direct` runs the closure directly on concrete duals, so ordinary Rust control flow can branch on the
+        // primal — impossible in `jvp`/`jvp_interleaved`, whose closures see tracers. `f(x) = if x != 0 { x * sin(x) }
+        // else { -x }`.
+        let domain = ScalarDomain::new();
+        let branching = |x: JvpTracer<ScalarDomain>| -> Result<JvpTracer<ScalarDomain>, ProgramError> {
+            if x.primal().boolean()? { x.mul(&x.sin()?) } else { x.neg() }
+        };
+        let (primal, tangent): (Scalar, Scalar) =
+            domain.jvp_direct(branching, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
+
+        // `0.7` decodes as `true`, so the `x * sin(x)` branch runs; its primal and tangent match `jvp` of that
+        // straight-line function.
+        let (reference_primal, reference_tangent): (Scalar, Scalar) = domain
+            .jvp(|x: NestedTracer<ScalarDomain>| x.clone() * x.sin().unwrap(), Scalar::from(0.7), Scalar::from(1.0))
+            .unwrap();
+        assert_eq!(primal, reference_primal);
+        assert_eq!(tangent, reference_tangent);
+    }
+
+    #[test]
     fn test_program_keeps_structural_zero_tangents_symbolic() {
         // f(x) = stop_gradient(x * x) + x: the severed tangent is a structural zero that must stay symbolic — the
         // `add` rule drops the zero term instead of staging `add(zero, dx)`, so the *unsimplified* fused program
@@ -2241,7 +2272,7 @@ mod linearization_tests {
         assert_eq!(zero_count, 1, "expected exactly one boundary zero, but got:\n{jvp_program}");
 
         // The fused program still evaluates correctly: primal passes through and the tangent output is zero.
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(1.5), Scalar::from(1.0)]).unwrap();
         assert_close(&outputs, &[Scalar::from(1.5), Scalar::from(0.0)], "boundary-zero jvp");
     }
@@ -2260,7 +2291,7 @@ mod linearization_tests {
         //
         // f(x) = 2*x + one_like(x) + one() + zero_like(x): primal = 2x + 1 + 1 + 0 = 2x + 2; tangent = 2*dx (only the
         // product term carries a tangent).
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let factor = builder.add_constant(Scalar::from(2.0));
         let scaled = builder.add_instruction(MulOperation, vec![input, factor]).unwrap()[0];
@@ -2275,7 +2306,7 @@ mod linearization_tests {
             .unwrap();
 
         let jvp_program = build_jvp_program(&primal_program).unwrap();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(4.0), Scalar::from(1.0)]).unwrap();
         // primal = 2*4 + 2 = 10; tangent = 2*1 = 2.
         assert_close(&outputs, &[Scalar::from(10.0), Scalar::from(2.0)], "constant scaling and nullary constants");
@@ -2383,7 +2414,7 @@ mod linearization_tests {
             .build::<Vec<Scalar>, Vec<Scalar>>(output_atoms, vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
 
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let staged_outputs = staged
             .interpret_in_context(
                 &context,
@@ -2449,7 +2480,7 @@ mod linearization_tests {
             .build::<Vec<Scalar>, Vec<Scalar>>(output_atoms, vec![Placeholder; 2], vec![Placeholder; 1])
             .unwrap();
 
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let staged_cotangents =
             staged.interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.0)]).unwrap();
 
@@ -2470,11 +2501,11 @@ mod linearization_tests {
     }
 
     /// Builds the scalar primal program `x -> sin(x)`, the primal half of the deliberately wrong custom-JVP oracle.
-    fn scalar_custom_jvp_sin_primal() -> Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+    fn scalar_custom_jvp_sin_primal() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         use crate::operations::trigonometric::SinOperation;
         use crate::programs::ProgramBuilder;
 
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -2483,13 +2514,12 @@ mod linearization_tests {
     /// Builds the deliberately wrong scalar custom-JVP rule `(x, dx) -> (sin(x), 2 * cos(x) * dx)`, detectably
     /// different from the true `cos(x) * dx`, so a passing equivalence proves the spliced rule governs both forward and
     /// reverse mode.
-    fn scalar_custom_jvp_sin_doubled_rule()
-    -> Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+    fn scalar_custom_jvp_sin_doubled_rule() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         use crate::operations::arithmetic::MulOperation;
         use crate::operations::trigonometric::{CosOperation, SinOperation};
         use crate::programs::ProgramBuilder;
 
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let x = builder.add_input(DataType::F64);
         let dx = builder.add_input(DataType::F64);
         let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
@@ -2595,19 +2625,19 @@ mod linearization_tests {
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
 
-        let mut primal_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut primal_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let primal_input = primal_builder.add_input(DataType::F64);
         let primal_output = primal_builder.add_instruction(SinOperation, vec![primal_input]).unwrap()[0];
         let primal = primal_builder.build(vec![primal_output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        let mut forward_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut forward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let x = forward_builder.add_input(DataType::F64);
         let y = forward_builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
         let residual = forward_builder.add_instruction(CosOperation, vec![x]).unwrap()[0];
         let forward =
             forward_builder.build(vec![y, residual], vec![Placeholder], vec![Placeholder, Placeholder]).unwrap();
 
-        let mut backward_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut backward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let backward_residual = backward_builder.add_input(DataType::F64);
         let cotangent = backward_builder.add_input(DataType::F64);
         let three = backward_builder.add_constant(Scalar::from(3.0));
@@ -2629,7 +2659,7 @@ mod linearization_tests {
         // wrong zero gradient). The re-key path is intentionally not exercised: the primal-enum carrier has no linear
         // operation family variant to re-key into.
         let domain = ScalarDomain::new();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
 
         let (_, reference_pullback, reference_residuals) =
             domain.vjp(scalar_custom_vjp_function, vec![Scalar::from(0.7)]).unwrap();
@@ -2670,19 +2700,19 @@ mod linearization_tests {
             use crate::contexts::StagingContext;
             use crate::operations::trigonometric::{CosOperation, SinOperation};
 
-            let mut primal_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut primal_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let a = primal_builder.add_input(DataType::F64);
             let b = primal_builder.add_input(DataType::F64);
             let y = primal_builder.add_instruction(AddOperation, vec![a, b]).unwrap()[0];
             let primal = primal_builder.build(vec![y], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
 
-            let mut forward_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut forward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let a = forward_builder.add_input(DataType::F64);
             let b = forward_builder.add_input(DataType::F64);
             let y = forward_builder.add_instruction(AddOperation, vec![a, b]).unwrap()[0];
             let forward = forward_builder.build(vec![y], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
 
-            let mut backward_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut backward_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let cotangent = backward_builder.add_input(DataType::F64);
             let zero = backward_builder.add_instruction(ZeroOperation::new(DataType::F64), Vec::new()).unwrap()[0];
             let backward = backward_builder
@@ -2696,7 +2726,7 @@ mod linearization_tests {
         }
 
         let domain = ScalarDomain::new();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let (_, pullback, residuals) = vjp_direct(&domain, function, vec![Scalar::from(0.7)]).unwrap();
         let mut pullback_inputs = vec![Scalar::from(2.5)];
         pullback_inputs.extend(residuals);
@@ -2741,7 +2771,7 @@ mod linearization_tests {
     fn test_linearize_composes_under_an_outer_staging_trace() {
         use crate::tracing::TracingContext;
 
-        type Outer = TracingContext<DataType, Scalar, ScalarOperation<Scalar>>;
+        type Outer = TracingContext<Scalar, ScalarOperation<Scalar>>;
 
         let primal_values = vec![Scalar::from(0.7), Scalar::from(1.3)];
         let tangent_values = vec![Scalar::from(1.0), Scalar::from(0.5)];
@@ -2803,7 +2833,7 @@ mod linearization_tests {
         use crate::tracing_v2::test_util::scalar_scale_branch;
         use crate::types::ArrayType;
 
-        type Outer = TracingContext<ArrayType, TestArray, ArrayOperation<TestArray>>;
+        type Outer = TracingContext<TestArray, ArrayOperation<TestArray>>;
 
         let condition_function = |x: Tracer<NestedTracingContext<Outer>>| {
             let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
@@ -2852,7 +2882,7 @@ mod linearization_tests {
         use crate::tracing::TracingContext;
 
         let domain = ScalarDomain::new();
-        let context = EagerContext::<DataType, Scalar>::new();
+        let context = EagerContext::<Scalar>::new();
         let primals = vec![Scalar::from(0.7), Scalar::from(1.3)];
         let tangents = vec![Scalar::from(1.0), Scalar::from(0.5)];
 
@@ -2875,7 +2905,7 @@ mod linearization_tests {
         // Generic trace: partially evaluate the same fused JVP program with `C` = a fresh staging context, primals
         // seeded `Known(C.input(..))` and tangents `Unknown(type)`.
         let jvp_program = build_jvp_program(&primal_program).unwrap().into_simplified().unwrap();
-        let outer = TracingContext::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let outer = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
         let primal_count = primals.len();
         let mut knowledge = Vec::with_capacity(2 * primal_count);
         for _ in 0..primal_count {
@@ -2968,7 +2998,7 @@ mod array_linearization_tests {
         domain: &TestArrayDomain,
         function: Function,
         primals: Vec<TestArray>,
-    ) -> Result<Linearization<ArrayType, TestArray, ArrayOperation<TestArray>>, ProgramError>
+    ) -> Result<Linearization<TestArray, ArrayOperation<TestArray>>, ProgramError>
     where
         Function: FnOnce(
             Vec<Tracer<NestedTracingContext<TestArrayDomain>>>,
@@ -3037,7 +3067,7 @@ mod array_linearization_tests {
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
         let linearization = array_linearize(&domain, linearize_function, primals.clone()).unwrap();
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
         // primal outputs that the linearization core no longer caches.
@@ -3078,7 +3108,7 @@ mod array_linearization_tests {
         LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
         let domain = TestArrayDomain;
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
 
         let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
         let mut reference_inputs = output_cotangents.clone();
@@ -3124,11 +3154,7 @@ mod array_linearization_tests {
         function: Function,
         primals: Vec<TestArray>,
     ) -> Result<
-        (
-            Vec<TestArray>,
-            Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
-            Vec<TestArray>,
-        ),
+        (Vec<TestArray>, Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>, Vec<TestArray>),
         ProgramError,
     >
     where
@@ -3169,7 +3195,7 @@ mod array_linearization_tests {
         DirectFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
         let domain = TestArrayDomain;
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
 
         // Reference: the established `vjp` pullback emits one input cotangent per primal input and consumes
         // `output_cotangents ++ residuals`.
@@ -3236,14 +3262,14 @@ mod array_linearization_tests {
     /// [`iteration_bound`](crate::operations::control_flow::WhileOperation::iteration_bound), so it is the kind of
     /// unbounded loop the front end rejects unless the eager unroll-then-fuse pre-pass first unrolls it at the
     /// concrete primal.
-    fn array_squaring_while() -> WhileOperation<ArrayType, TestArray, ArrayOperation<TestArray>> {
+    fn array_squaring_while() -> WhileOperation<TestArray, ArrayOperation<TestArray>> {
         use crate::operations::arithmetic::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(100.0));
         let predicate = condition_builder
@@ -3252,7 +3278,7 @@ mod array_linearization_tests {
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
         let squared = body_builder.add_instruction(MulOperation, vec![state, state]).unwrap()[0];
         let body = body_builder
@@ -3281,7 +3307,7 @@ mod array_linearization_tests {
         // now succeeds and must reproduce the established eager `vjp`. The direct-transpose pullback consumes the
         // residuals as ordinary inputs, so it is interpreted at `output_cotangents ++ residuals`.
         let domain = TestArrayDomain;
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
 
         let (_, reference_pullback, reference_residuals) = domain
             .vjp(|inputs| Ok(vec![inputs[0].clone().unary(array_squaring_while())]), vec![TestArray::scalar(1.5)])
@@ -3590,7 +3616,7 @@ mod array_linearization_tests {
         // forward tangent reproduced in reverse rather than the capture-based `vjp` (whose reduce-max transpose is not
         // implemented).
         let domain = TestArrayDomain;
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
 
         let primals = vec![TestArray::vector(vec![1.0, 4.0, 2.0, 3.0])];
         let output_cotangents = vec![TestArray::scalar(2.5)];
@@ -3624,12 +3650,12 @@ mod array_linearization_tests {
         // the absence of symbolic captures: the program's operation family is `ArrayOperation<TestArray>`, the ordinary
         // primal operation family, rather than a capture-keyed linear operation family. This binding documents that
         // distinction at the type level.
-        let _capture_free: &Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> =
+        let _capture_free: &Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> =
             &jvp_program;
 
         // Interpreting the program at primal x = [1, 2, 3] and tangent t = [1, 1, 1] reproduces the value
         // x . x = 14 and its directional derivative 2 * (x . t) = 2 * 6 = 12.
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
         let inputs = vec![TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::vector(vec![1.0, 1.0, 1.0])];
         let outputs = jvp_program.interpret_in_context(&context, inputs).unwrap();
         assert_eq!(outputs.len(), 2);
@@ -3697,13 +3723,13 @@ mod array_linearization_tests {
 
     /// Builds the flat scalar branch `x -> x * 2 + 1`, which linearizes with no residuals (its tangent `2 * dx`
     /// holds no primal-derived coefficient). Shared by the condition equivalence tests as the true branch.
-    fn affine_branch() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn affine_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::arithmetic::{AddOperation, MulOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let two = builder.add_constant(TestArray::scalar(2.0));
         let scaled = builder.add_instruction(MulOperation, vec![input, two]).unwrap()[0];
@@ -3715,13 +3741,13 @@ mod array_linearization_tests {
     /// Builds the flat scalar branch `x -> sin(x)`, which linearizes with one residual (its tangent
     /// `cos(x) * dx` carries the primal-derived `cos(x)` coefficient). Shared by the condition equivalence tests as the
     /// false branch, so the two branches have asymmetric residual counts and exercise the residual join.
-    fn sine_branch() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn sine_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::trigonometric::SinOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -3769,7 +3795,7 @@ mod array_linearization_tests {
         let jvp_program = build_jvp_program(&primal_program).unwrap();
 
         // The program takes `(primals ++ tangents)` and produces `(primal_outputs ++ tangent_outputs)`.
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
         let inputs = vec![predicate_value, TestArray::scalar(x), predicate_tangent, TestArray::scalar(dx)];
         let outputs = jvp_program.interpret_in_context(&context, inputs).unwrap();
         let (primal_outputs, tangent_outputs) = outputs.split_at(reference_primals.len());
@@ -3794,13 +3820,13 @@ mod array_linearization_tests {
     /// with two per-iteration residuals (the primal `carry` and `x`), so the scan rule stacks both into
     /// `[length, ...]` residual outputs and re-keys two scan-local captures on reverse. Shared by the scan equivalence
     /// tests.
-    fn scan_product_body() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn scan_product_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::arithmetic::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
@@ -3888,14 +3914,13 @@ mod array_linearization_tests {
         use crate::operations::constants::ZeroOperation;
         use crate::programs::Value;
         use crate::tracing_v2::differentiation::DifferentiableProgramOperation;
-        use crate::types::Type;
 
-        fn assert_linearizable<T: Type, V: Value<T>, O>()
+        fn assert_linearizable<V: Value, O>()
         where
-            O: Clone + Operation<T> + From<ZeroOperation<T>> + DifferentiableProgramOperation<T, V, O>,
+            O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>> + DifferentiableProgramOperation<V, O>,
         {
         }
-        assert_linearizable::<ArrayType, TestArray, ArrayOperation<TestArray>>();
+        assert_linearizable::<TestArray, ArrayOperation<TestArray>>();
     }
 
     /// Builds the `while (x < threshold) { x = x * x }` loop with the provided semantic iteration bound. Squaring
@@ -3904,7 +3929,7 @@ mod array_linearization_tests {
     fn bounded_squaring_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> crate::operations::control_flow::WhileOperation<ArrayType, TestArray, ArrayOperation<TestArray>> {
+    ) -> crate::operations::control_flow::WhileOperation<TestArray, ArrayOperation<TestArray>> {
         use crate::operations::arithmetic::MulOperation;
         use crate::operations::compare::CompareOperation;
         use crate::operations::control_flow::WhileOperation;
@@ -3914,7 +3939,7 @@ mod array_linearization_tests {
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
 
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(threshold));
         let predicate = condition_builder
@@ -3924,7 +3949,7 @@ mod array_linearization_tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
         let squared = body_builder.add_instruction(MulOperation, vec![state, state]).unwrap()[0];
         let body = body_builder
@@ -3986,7 +4011,7 @@ mod array_linearization_tests {
         // An unbounded while loop (no iteration bound) has no statically shaped residual stack and no transposable
         // forward-mode form, so the front end reports `UnsupportedOperation` rather than mis-evaluating.
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(100.0));
         let predicate = condition_builder
@@ -3995,7 +4020,7 @@ mod array_linearization_tests {
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
         let squared = body_builder.add_instruction(MulOperation, vec![state, state]).unwrap()[0];
         let body = body_builder
@@ -4021,14 +4046,13 @@ mod array_linearization_tests {
     /// Builds the single-input primal program `x -> sin(x)` over a scalar, the primal half of the deliberately wrong
     /// custom-JVP oracle shared with the [`custom_derivatives`](crate::tracing_v2::operations::custom_derivatives)
     /// tests.
-    fn custom_jvp_sin_primal()
-    -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn custom_jvp_sin_primal() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::trigonometric::SinOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -4037,15 +4061,14 @@ mod array_linearization_tests {
     /// Builds the deliberately wrong custom-JVP rule program `(x, dx) -> (sin(x), 2 * cos(x) * dx)`, detectably
     /// different from the true `cos(x) * dx`, so a passing equivalence proves the spliced rule (and not the primal
     /// body) governs both forward and reverse mode. Shared in shape with the `custom_derivatives` tests.
-    fn custom_jvp_sin_doubled_rule()
-    -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn custom_jvp_sin_doubled_rule() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::arithmetic::MulOperation;
         use crate::operations::trigonometric::{CosOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let dx = builder.add_input(ArrayType::scalar(DataType::F64));
         let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
@@ -4159,14 +4182,13 @@ mod array_linearization_tests {
     /// Builds the single-input primal program `x -> sin(x)` over a scalar, the primal half of the deliberately wrong
     /// custom-VJP oracle shared with the [`custom_derivatives`](crate::tracing_v2::operations::custom_derivatives)
     /// tests.
-    fn custom_vjp_sin_primal()
-    -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn custom_vjp_sin_primal() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::trigonometric::SinOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(SinOperation, vec![input]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -4174,14 +4196,13 @@ mod array_linearization_tests {
 
     /// Builds the forward program `x -> (sin(x), cos(x))`, exposing `cos(x)` as the single residual consumed by the
     /// backward program.
-    fn custom_vjp_sin_forward()
-    -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn custom_vjp_sin_forward() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
         use crate::operations::trigonometric::{CosOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
         let residual = builder.add_instruction(CosOperation, vec![x]).unwrap()[0];
@@ -4192,14 +4213,14 @@ mod array_linearization_tests {
     /// different from the true `cos(x) * cotangent`, so a passing equivalence proves the carrier actually replays the
     /// user backward program (a folded zero or the primal derivative would give a different, wrong answer). Shared in
     /// shape with the `custom_derivatives` tests.
-    fn custom_vjp_sin_tripled_backward()
-    -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+    fn custom_vjp_sin_tripled_backward() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>
+    {
         use crate::operations::arithmetic::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
 
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let residual = builder.add_input(ArrayType::scalar(DataType::F64));
         let cotangent = builder.add_input(ArrayType::scalar(DataType::F64));
         let three = builder.add_constant(TestArray::scalar(3.0));
@@ -4232,7 +4253,7 @@ mod array_linearization_tests {
         // primal-enum `CustomVjpTangent` carrier into the linear operation family, which has no such variant. The
         // carrier exists precisely so the direct-transpose path can keep the tangent program in the primal enum.
         let domain = TestArrayDomain;
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
         let primals = vec![TestArray::scalar(0.7)];
         let output_cotangents = vec![TestArray::scalar(2.5)];
 
@@ -4280,7 +4301,7 @@ mod array_linearization_tests {
     fn bounded_doubling_while_operation(
         threshold: f64,
         bound: usize,
-    ) -> WhileOperation<ArrayType, TestArray, ArrayOperation<TestArray>> {
+    ) -> WhileOperation<TestArray, ArrayOperation<TestArray>> {
         use crate::operations::arithmetic::AddOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
@@ -4288,7 +4309,7 @@ mod array_linearization_tests {
 
         let scalar_f64 = ArrayType::scalar(DataType::F64);
 
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let threshold = condition_builder.add_constant(TestArray::scalar(threshold));
         let predicate = condition_builder
@@ -4298,7 +4319,7 @@ mod array_linearization_tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let state = body_builder.add_input(scalar_f64);
         let doubled = body_builder.add_instruction(AddOperation, vec![state, state]).unwrap()[0];
         let body = body_builder
@@ -4323,7 +4344,7 @@ mod array_linearization_tests {
             |item| {
                 let while_operation = bounded_doubling_while_operation(8.0, 5);
                 let mut outputs =
-                    item.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&item])?;
+                    item.context().bind(ArrayOperation::While(Box::new(while_operation)), &[item.clone()])?;
                 Ok(outputs.remove(0))
             },
             inputs[0].clone(),
@@ -4348,7 +4369,7 @@ mod array_linearization_tests {
         let tangents = vec![TestArray::vector(vec![1.0, 1.0, 1.0])];
 
         let linearization = array_linearize(&domain, batched_bounded_while_function, primals.clone()).unwrap();
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
 
         // The known side computes the primal outputs followed by the residuals; its primal half is [8, 10, 9].
         let mut known_outputs = linearization.primal_program.interpret_in_context(&context, primals).unwrap();
@@ -4427,7 +4448,7 @@ mod array_linearization_tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(output_atoms, vec![Placeholder; 2], vec![Placeholder; 1])
             .unwrap();
 
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
         let sample_x = TestArray::vector(vec![0.7, -1.2, 2.0]);
         let sample_cotangent = TestArray::vector(vec![2.5, 1.0, -0.5]);
         let staged_cotangents =
@@ -4450,7 +4471,9 @@ mod batching_tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::AxisIndex;
-    use crate::batching::{ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError};
+    use crate::batching::{
+        ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, BatchingTracer,
+    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
@@ -4595,14 +4618,14 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    BatchContext::batch(
+                    Ok(BatchContext::batch(
                         &context,
                         |scalar| scalar.context().axis_index("o"),
                         row,
                         BatchAxis::new(0),
                         BatchAxis::replicated(),
                         BatchAxisSpecification::named("i"),
-                    )
+                    )?)
                 },
                 x,
                 BatchAxis::new(0),
@@ -4643,14 +4666,14 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    BatchContext::batch(
+                    Ok(BatchContext::batch(
                         &context,
                         |scalar| scalar.collective("outer", CollectiveKind::PSum),
                         row,
                         BatchAxis::new(0),
                         BatchAxis::new(0),
                         BatchAxisSpecification::named("inner"),
-                    )
+                    )?)
                 },
                 x,
                 BatchAxis::new(0),
@@ -4803,7 +4826,7 @@ mod batching_tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
         }
         .unwrap();
-        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let outputs = ArrayOperation::<TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -4817,7 +4840,7 @@ mod batching_tests {
         // blanket elementwise `BatchableOperation` impl.
         let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap();
-        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let outputs = NegOperation.batch(&context, &[batched]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -4831,7 +4854,7 @@ mod batching_tests {
         let batched_value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(batched_value.r#type().into_owned(), batched_value, Some(0)).unwrap();
         let replicated = ArrayBatch::replicated(TestArray::scalar(10.0));
-        let context = EagerContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let outputs = AddOperation.batch(&context, &[batched, replicated]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -4849,14 +4872,14 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    BatchContext::batch(
+                    Ok(BatchContext::batch(
                         &context,
                         |scalar| Ok(scalar.clone() * scalar),
                         row,
                         BatchAxis::new(0),
                         BatchAxis::new(0),
                         None,
-                    )
+                    )?)
                 },
                 x,
                 BatchAxis::new(0),
@@ -5036,14 +5059,14 @@ mod batching_tests {
             .batch(
                 |(row, bias_inner)| {
                     let context = row.context().clone();
-                    BatchContext::batch(
+                    Ok(BatchContext::batch(
                         &context,
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
                         (BatchAxis::new(0), BatchAxis::replicated()),
                         BatchAxis::new(0),
                         None,
-                    )
+                    )?)
                 },
                 (x, bias),
                 (BatchAxis::new(0), BatchAxis::replicated()),
@@ -5094,20 +5117,20 @@ mod batching_tests {
         // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
         // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
         // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
-        let parent_context = DomainTracingContext::<TestArrayDomain>::new();
-        let builder = parent_context.builder().clone();
+        let parent = DomainTracingContext::<TestArrayDomain>::new();
+        let builder = parent.builder().clone();
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let predicate_atom = builder.borrow_mut().add_input(predicate_type.clone());
         let operand_atom = builder.borrow_mut().add_input(operand_type);
-        let predicate_tracer = parent_context.tracer(predicate_atom, None);
-        let operand_tracer = parent_context.tracer(operand_atom, None);
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
         let output = BatchContext::batch(
-            &parent_context,
+            &parent,
             |(predicate, x)| {
                 let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
                 let op = ArrayOperation::Condition(Box::new(condition));
-                let outputs = x.context().stage_operation(op, &[&predicate, &x])?;
+                let outputs = x.context().bind(op, &[predicate.clone(), x.clone()])?;
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
@@ -5141,26 +5164,26 @@ mod batching_tests {
         // true branch scales the batched operand per batch item (axis 0) while the false branch returns a replicated
         // constant (no batch axis). The staged rule normalizes the false branch by appending a broadcast at its
         // tail, so the staged condition stays well-typed and both predicate values interpret correctly per batch item.
-        let mut constant_builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut constant_builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         constant_builder.add_input(ArrayType::scalar(DataType::F64));
         let constant_output = constant_builder.add_constant(TestArray::scalar(7.0));
         let constant_branch = constant_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let parent_context = DomainTracingContext::<TestArrayDomain>::new();
-        let builder = parent_context.builder().clone();
+        let parent = DomainTracingContext::<TestArrayDomain>::new();
+        let builder = parent.builder().clone();
         let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
         let operand_atom =
             builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
-        let predicate_tracer = parent_context.tracer(predicate_atom, None);
-        let operand_tracer = parent_context.tracer(operand_atom, None);
+        let predicate_tracer = parent.tracer(predicate_atom, None);
+        let operand_tracer = parent.tracer(operand_atom, None);
         let output = BatchContext::batch(
-            &parent_context,
+            &parent,
             |(predicate, x)| {
                 let condition = ConditionOperation::new(scalar_scale_branch(2.0), constant_branch).unwrap();
                 let op = ArrayOperation::Condition(Box::new(condition));
-                let outputs = x.context().stage_operation(op, &[&predicate, &x])?;
+                let outputs = x.context().bind(op, &[predicate.clone(), x.clone()])?;
                 Ok(outputs.into_iter().next().unwrap())
             },
             (predicate_tracer, operand_tracer),
@@ -5203,7 +5226,7 @@ mod batching_tests {
                     let condition =
                         ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
                     let op = ArrayOperation::Condition(Box::new(condition));
-                    let outputs = pred.context().stage_operation(op, &[&pred, &operand])?;
+                    let outputs = pred.context().bind(op, &[pred.clone(), operand.clone()])?;
                     Ok(outputs.into_iter().next().unwrap())
                 },
                 (predicate, operand),
@@ -5228,7 +5251,7 @@ mod batching_tests {
                     let zero_op = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(
                         ArrayType::scalar(DataType::F64),
                     ));
-                    let zero = x.context().stage_nullary_operation(zero_op)?.into_iter().next().unwrap();
+                    let zero = x.context().bind(zero_op, &[])?.into_iter().next().unwrap();
                     Ok(x + zero)
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
@@ -5245,7 +5268,7 @@ mod batching_tests {
     fn test_batch() {
         let output: TestArray = TestArrayDomain
             .batch(
-                |x: DomainBatchingValue<TestArrayDomain>| Ok(x.clone() * x),
+                |x: BatchingTracer<TestArrayDomain>| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
@@ -5325,15 +5348,15 @@ mod batching_tests {
         // materializes a `BroadcastOperation` to the full common batched shape so the staged
         // add receives shape-congruent operands — required for backends such as XLA whose
         // elementwise lowerings (e.g., `stablehlo.add`) have no implicit broadcasting.
-        let parent_context = DomainTracingContext::<TestArrayDomain>::new();
-        let builder = parent_context.builder().clone();
+        let parent = DomainTracingContext::<TestArrayDomain>::new();
+        let builder = parent.builder().clone();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
-        let input_tracer = parent_context.tracer(input_atom, None);
+        let input_tracer = parent.tracer(input_atom, None);
         let output = BatchContext::batch(
-            &parent_context,
+            &parent,
             |x| {
-                let bias = x.context().constant(TestArray::scalar(1.0));
+                let bias = x.context().lift(TestArray::scalar(1.0))?;
                 Ok(x + bias)
             },
             input_tracer,

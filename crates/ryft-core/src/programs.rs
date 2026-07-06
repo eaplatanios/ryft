@@ -9,12 +9,13 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::contexts::Domain;
 use crate::effects::Effects;
 use crate::errors::CustomError;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::types::{Type, TypeError, Typed};
+use crate::types::{TypeError, Typed};
 
 /// Represents errors related to [`Program`]s in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -82,10 +83,26 @@ impl ProgramError {
 
 /// Represents leaf values that can participate in traced [`Program`]s. [`Value`] is implemented by every type that
 /// can appear as a leaf in a staged [`Program`]: both concrete data types such as `f32`, `f64`, and backend arrays, and
-/// tracing wrappers such as [`Tracer`](crate::Tracer). It ties each leaf to a type descriptor `T` via [`Typed`] and
-/// requires [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their
-/// carried values directly.
-pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized {}
+/// tracing wrappers such as [`Tracer`](crate::Tracer). It inherits its type descriptor from [`Typed`], so generic code
+/// recovers the descriptor as `V::Type` and pinning sites write `V: Value<Type = ArrayType>`. It additionally requires
+/// [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their carried
+/// values directly.
+pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
+    /// [`Domain`] that this [`Value`] is defined in. The bound is deliberately [`Domain`] rather than
+    /// [`Context`](crate::Context): value-ness names the universe a value inhabits without certifying that the universe
+    /// can execute operations. Call sites that need to [`bind`](crate::Context::bind) refine the domain locally with a
+    /// `V::Domain: Context` bound, which keeps the heavy transform capability stacks (e.g., interpretability,
+    /// differentiability, batchability, etc.) out of every `V: Value` obligation.
+    type Domain: Domain<Type = Self::Type, Value = Self>;
+
+    /// Returns the [`Domain`] this [`Value`] is defined in. [`Context`](crate::Context)-generic staging entry points
+    /// (e.g., a custom-derivative `call` that binds one operation over its input) recover the active context from an
+    /// input value, refining `Self::Domain` with a [`Context`](crate::Context) bound, and
+    /// [`bind`](crate::Context::bind) against it, so that they work for *any* transform value (e.g., a staged
+    /// [`Tracer`](crate::Tracer), a [`BatchingTracer`](crate::BatchingTracer), a [`JvpTracer`](crate::JvpTracer),
+    /// etc.) rather than only a plain staged trace.
+    fn domain(&self) -> Self::Domain;
+}
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`]. [`MaybeZero`] is the
 /// symbolic-zero representation shared by transforms like forward-mode and reverse-mode differentiation where it is the
@@ -99,15 +116,15 @@ pub trait Value<T: Type>: Clone + Debug + Display + Parameter + Typed<T> + Sized
 /// structurally required (e.g., a nested sub-program operand, a program output, or an eagerly returned tangent),
 /// which is also where its carried [`Type`] is consumed.
 #[derive(Clone, Debug)]
-pub enum MaybeZero<T: Type, V: Typed<T>> {
+pub enum MaybeZero<V: Typed> {
     /// Structural zero of the carried [`Type`] (i.e., no value exists and nothing has been staged or computed for it).
-    Zero(T),
+    Zero(V::Type),
 
     /// Value that is not known to be structurally equal to zero.
     Value(V),
 }
 
-impl<T: Type, V: Typed<T>> MaybeZero<T, V> {
+impl<V: Typed> MaybeZero<V> {
     /// Returns `true` if this is a [`MaybeZero::Zero`].
     #[inline]
     pub const fn is_zero(&self) -> bool {
@@ -127,7 +144,7 @@ impl<T: Type, V: Typed<T>> MaybeZero<T, V> {
     /// its carried [`Type`] unchanged. If this is [`MaybeZero::Zero`], then [`MaybeZero::Zero`] will be returned
     /// irrespective of what `function` is provided.
     #[inline]
-    pub fn map<W: Typed<T>, F: FnOnce(V) -> W>(self, function: F) -> MaybeZero<T, W> {
+    pub fn map<W: Typed<Type = V::Type>, F: FnOnce(V) -> W>(self, function: F) -> MaybeZero<W> {
         match self {
             Self::Zero(r#type) => MaybeZero::Zero(r#type),
             Self::Value(value) => MaybeZero::Value(function(value)),
@@ -135,9 +152,11 @@ impl<T: Type, V: Typed<T>> MaybeZero<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T>> Typed<T> for MaybeZero<T, V> {
+impl<V: Typed> Typed for MaybeZero<V> {
+    type Type = V::Type;
+
     #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
+    fn r#type(&self) -> Cow<'_, V::Type> {
         match self {
             Self::Zero(r#type) => Cow::Borrowed(r#type),
             Self::Value(value) => value.r#type(),
@@ -145,7 +164,7 @@ impl<T: Type, V: Typed<T>> Typed<T> for MaybeZero<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T>> From<V> for MaybeZero<T, V> {
+impl<V: Typed> From<V> for MaybeZero<V> {
     #[inline]
     fn from(value: V) -> Self {
         Self::Value(value)
@@ -154,15 +173,15 @@ impl<T: Type, V: Typed<T>> From<V> for MaybeZero<T, V> {
 
 /// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
 #[derive(Clone, Debug, Parameter)]
-pub enum Atom<T: Type, V: Typed<T>> {
+pub enum Atom<V: Typed> {
     /// Literal constant value that appears in a [`Program`].
     Constant(V),
 
     /// Non-constant variable of a specific [`Type`] that appears in a [`Program`].
-    Variable(T),
+    Variable(V::Type),
 }
 
-impl<T: Type, V: Typed<T>> Atom<T, V> {
+impl<V: Typed> Atom<V> {
     /// Returns `true` if this [`Atom`] is an [`Atom::Constant`].
     #[inline]
     pub fn is_constant(&self) -> bool {
@@ -185,8 +204,10 @@ impl<T: Type, V: Typed<T>> Atom<T, V> {
     }
 }
 
-impl<T: Type, V: Typed<T>> Typed<T> for Atom<T, V> {
-    fn r#type(&self) -> Cow<'_, T> {
+impl<V: Typed> Typed for Atom<V> {
+    type Type = V::Type;
+
+    fn r#type(&self) -> Cow<'_, V::Type> {
         match self {
             Self::Constant(value) => value.r#type(),
             Self::Variable(r#type) => Cow::Borrowed(r#type),
@@ -275,9 +296,9 @@ impl<O> Instruction<O> {
 /// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like
 /// automatic differentiation and just-in-time compilation).
 #[derive(Debug)]
-pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
+pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
     /// [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
-    pub(crate) atoms: Vec<Atom<T, V>>,
+    pub(crate) atoms: Vec<Atom<V>>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
     pub(crate) input_ids: Vec<AtomId>,
@@ -299,12 +320,10 @@ pub struct Program<T: Type, V: Typed<T> + Parameter, O, Input: Parameterized<V>,
     pub(crate) marker: PhantomData<(Input, Output)>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<T, V, O, Input, Output>
-{
+impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
     /// Returns the [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
     #[inline]
-    pub fn atoms(&self) -> &[Atom<T, V>] {
+    pub fn atoms(&self) -> &[Atom<V>] {
         &self.atoms
     }
 
@@ -315,23 +334,23 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 
     /// Returns the [`Type`]s of the inputs of this [`Program`], in order.
-    pub fn input_types(&self) -> Vec<T> {
+    pub fn input_types(&self) -> Vec<V::Type> {
         self.inputs().map(|input| input.r#type().into_owned()).collect()
     }
 
     /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
     #[inline]
-    pub fn inputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
+    pub fn inputs(&self) -> impl Iterator<Item = &Atom<V>> {
         self.input_ids.iter().map(|input_id| &self.atoms[input_id.index])
     }
 
     /// Returns the structured `Input` of this [`Program`] parameterized by the corresponding [`Atom`]s.
     #[inline]
-    pub fn input(&self) -> Result<Input::To<Atom<T, V>>, ParameterError>
+    pub fn input(&self) -> Result<Input::To<Atom<V>>, ParameterError>
     where
-        Input::Family: ParameterizedFamily<Atom<T, V>>,
+        Input::Family: ParameterizedFamily<Atom<V>>,
     {
-        Input::To::<Atom<T, V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
+        Input::To::<Atom<V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
     }
 
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
@@ -342,23 +361,23 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 
     /// Returns the [`Type`]s of the outputs of this [`Program`], in order.
-    pub fn output_types(&self) -> Vec<T> {
+    pub fn output_types(&self) -> Vec<V::Type> {
         self.outputs().map(|output| output.r#type().into_owned()).collect()
     }
 
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
     #[inline]
-    pub fn outputs(&self) -> impl Iterator<Item = &Atom<T, V>> {
+    pub fn outputs(&self) -> impl Iterator<Item = &Atom<V>> {
         self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
     }
 
     /// Returns the structured `Output` of this [`Program`] parameterized by the corresponding [`Atom`]s.
     #[inline]
-    pub fn output(&self) -> Result<Output::To<Atom<T, V>>, ParameterError>
+    pub fn output(&self) -> Result<Output::To<Atom<V>>, ParameterError>
     where
-        Output::Family: ParameterizedFamily<Atom<T, V>>,
+        Output::Family: ParameterizedFamily<Atom<V>>,
     {
-        Output::To::<Atom<T, V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
+        Output::To::<Atom<V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
     }
 
     /// Returns the ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`].
@@ -430,7 +449,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// [`Self::live_sets`], this function is fallible because `propagate_liveness` may fail.
     #[inline]
     pub fn live_sets_with<
-        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), ProgramError>,
+        F: FnMut(&Program<V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), ProgramError>,
     >(
         &self,
         propagate_liveness: F,
@@ -464,7 +483,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// value per instruction input. Conservative callers can mark all inputs live whenever any output is live, while
     /// primitive-aware callers can avoid marking inputs that are not needed for the selected outputs.
     pub fn live_sets_for_atoms_with<
-        F: FnMut(&Program<T, V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), ProgramError>,
+        F: FnMut(&Program<V, O, Input, Output>, &Instruction<O>, &[bool], &mut Vec<bool>) -> Result<(), ProgramError>,
     >(
         &self,
         output_ids: &[AtomId],
@@ -532,10 +551,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// values. Before interpreting that program, the mapping closure can receive each linear operation, call the
     /// operation's factor-mapping hook, and replace each residual reference with the concrete residual value captured
     /// by the corresponding linearization run.
-    pub fn map_operations<P: Operation<T>, F: FnMut(&O) -> Result<P, ProgramError>>(
+    pub fn map_operations<P: Operation<V::Type>, F: FnMut(&O) -> Result<P, ProgramError>>(
         &self,
         mut map_fn: F,
-    ) -> Result<Program<T, V, P, Input, Output>, ProgramError> {
+    ) -> Result<Program<V, P, Input, Output>, ProgramError> {
         Ok(Program {
             atoms: self.atoms.clone(),
             input_ids: self.input_ids.clone(),
@@ -562,7 +581,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// `Input` and `Output` type parameters change to `Vec<V>`, with placeholder structures sized to the flat input and
     /// output arities. This is useful for higher-order operations that store nested [`Program`]s as operation payloads
     /// and replay them positionally, without needing to preserve the caller's original [`Parameterized`] type.
-    pub fn to_flat_program(&self) -> Program<T, V, O, Vec<V>, Vec<V>>
+    pub fn to_flat_program(&self) -> Program<V, O, Vec<V>, Vec<V>>
     where
         O: Clone,
     {
@@ -581,7 +600,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     /// counterpart of [`Program::to_flat_program`]. It preserves the atom table, input atom identifiers, output atom
     /// identifiers, and instruction sequence without cloning them, and only replaces the structured input and output
     /// metadata with [`Placeholder`] vector structures sized to the flat arities.
-    pub fn into_flat_program(self) -> Program<T, V, O, Vec<V>, Vec<V>> {
+    pub fn into_flat_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         let input_structure = vec![Placeholder; self.input_ids.len()];
         let output_structure = vec![Placeholder; self.output_ids.len()];
         Program {
@@ -765,7 +784,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         inputs: &[AtomId],
         outputs: &[AtomId],
         keep_alive: &[AtomId],
-    ) -> Result<(Program<T, V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError>
+    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError>
     where
         O: Clone,
     {
@@ -831,7 +850,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
         inputs: &[AtomId],
         outputs: &[AtomId],
         keep_alive: &[AtomId],
-    ) -> Result<(Program<T, V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
+    ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
         let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let Program { atoms, instructions, .. } = self;
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
@@ -973,9 +992,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<T, V, O, Input, Output>
-{
+impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
     /// are nested within other programs like with control flow [`Operation`]s.
     pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -1046,9 +1063,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Par
     }
 }
 
-impl<T: Type, V: Value<T>, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone
-    for Program<T, V, O, Input, Output>
-{
+impl<V: Value, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone for Program<V, O, Input, Output> {
     fn clone(&self) -> Self {
         Self {
             atoms: self.atoms.clone(),
@@ -1062,8 +1077,8 @@ impl<T: Type, V: Value<T>, O: Clone, Input: Parameterized<V>, Output: Parameteri
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>> Display
-    for Program<T, V, O, Input, Output>
+impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Display
+    for Program<V, O, Input, Output>
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
@@ -1107,9 +1122,9 @@ impl ProgramLiveSets {
 /// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
 /// but also carries an optional [`ProgramError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
-pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Operation<T>> {
+pub struct ProgramBuilder<V: Typed + Parameter, O: Operation<V::Type>> {
     /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
-    pub(crate) atoms: Vec<Atom<T, V>>,
+    pub(crate) atoms: Vec<Atom<V>>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of the [`Program`] being built.
     pub(crate) input_ids: Vec<AtomId>,
@@ -1121,7 +1136,7 @@ pub struct ProgramBuilder<T: Type, V: Typed<T> + Parameter, O: Operation<T>> {
     pub(crate) error: Option<ProgramError>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Creates a new [`ProgramBuilder`].
     #[inline]
     pub fn new() -> Self {
@@ -1130,7 +1145,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
 
     /// Returns the atoms currently owned by this builder.
     #[inline]
-    pub fn atoms(&self) -> &[Atom<T, V>] {
+    pub fn atoms(&self) -> &[Atom<V>] {
         &self.atoms
     }
 
@@ -1154,7 +1169,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
 
     /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
-    pub fn add_input(&mut self, r#type: T) -> AtomId {
+    pub fn add_input(&mut self, r#type: V::Type) -> AtomId {
         let id = self.add_variable(r#type);
         self.input_ids.push(id);
         id
@@ -1170,7 +1185,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
 
     /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`].
     #[inline]
-    pub fn add_variable(&mut self, r#type: T) -> AtomId {
+    pub fn add_variable(&mut self, r#type: V::Type) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
         self.atoms.push(Atom::Variable(r#type));
         id
@@ -1219,7 +1234,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     #[inline]
     pub fn add_program<Input: Parameterized<V>, Output: Parameterized<V>>(
         &mut self,
-        program: &Program<T, V, O, Input, Output>,
+        program: &Program<V, O, Input, Output>,
         inputs: &[AtomId],
     ) -> Result<Vec<AtomId>, ProgramError>
     where
@@ -1244,7 +1259,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
         output_ids: Vec<AtomId>,
         input_structure: Input::ParameterStructure,
         output_structure: Output::ParameterStructure,
-    ) -> Result<Program<T, V, O, Input, Output>, ProgramError> {
+    ) -> Result<Program<V, O, Input, Output>, ProgramError> {
         if let Some(error) = self.error {
             return Err(error);
         }
@@ -1317,7 +1332,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>> ProgramBuilder<T, V, O> {
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> Default for ProgramBuilder<V, O> {
     fn default() -> Self {
         Self::new()
     }
@@ -1329,16 +1344,15 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Default for ProgramBuilder<T, V, O> 
 /// [`Atom::Variable`]s are reconstructed from their producing [`Instruction`]. A reachable variable that is neither
 /// mapped nor produced by an instruction is reported as a [`ProgramError::MalformedProgram`].
 fn add_atom_to_program_builder<
-    T: Type,
-    V: Value<T>,
-    O: Clone + Operation<T>,
+    V: Value,
+    O: Clone + Operation<V::Type>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 >(
-    program_builder: &mut ProgramBuilder<T, V, O>,
+    program_builder: &mut ProgramBuilder<V, O>,
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
-    program: &Program<T, V, O, Input, Output>,
+    program: &Program<V, O, Input, Output>,
     instruction_by_output: &[Option<usize>],
 ) -> Result<AtomId, ProgramError> {
     if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
@@ -1383,13 +1397,13 @@ fn add_atom_to_program_builder<
 /// of cloning them, so each is taken from its slot at most once. Atoms already present in the mapping are reused, and a
 /// reachable variable that is neither mapped nor produced by an instruction is reported as a
 /// [`ProgramError::MalformedProgram`].
-fn move_atom_to_program<T: Type, V: Value<T>, O: Operation<T>>(
+fn move_atom_to_program<V: Value, O: Operation<V::Type>>(
     atom_id_mapping: &mut HashMap<AtomId, AtomId>,
     atom_id: AtomId,
-    atoms: &mut [Option<Atom<T, V>>],
+    atoms: &mut [Option<Atom<V>>],
     instructions: &mut [Option<Instruction<O>>],
     instruction_by_output: &[Option<usize>],
-    new_atoms: &mut Vec<Atom<T, V>>,
+    new_atoms: &mut Vec<Atom<V>>,
     new_instructions: &mut Vec<Instruction<O>>,
 ) -> Result<AtomId, ProgramError> {
     if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
@@ -1513,8 +1527,8 @@ mod tests {
 
     #[test]
     fn test_atom() {
-        let constant = Atom::<DataType, Scalar>::Constant(Scalar::from(3.0));
-        let variable = Atom::<DataType, Scalar>::Variable(DataType::F64);
+        let constant = Atom::<Scalar>::Constant(Scalar::from(3.0));
+        let variable = Atom::<Scalar>::Variable(DataType::F64);
 
         assert!(constant.is_constant());
         assert!(!constant.is_variable());
@@ -1534,7 +1548,7 @@ mod tests {
     #[test]
     fn test_program() {
         // Test simple program with one argument.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(3.0f64));
         let o0 = builder.add_instruction(AddOperation, vec![i0, c0]).unwrap()[0];
@@ -1557,7 +1571,7 @@ mod tests {
         assert!(matches!(output, Atom::Variable(r#type) if r#type == DataType::F64));
 
         // Test simple program with two arguments.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
@@ -1585,7 +1599,7 @@ mod tests {
         assert!(matches!(output, Atom::Variable(r#type) if r#type == DataType::F64));
 
         // Test a program that contains an operation with long metadata that should be rendered on multiple lines.
-        let mut builder = ProgramBuilder::<DataType, Scalar, LongMetadataOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, LongMetadataOperation>::new();
         let i0 = builder.add_input(DataType::F64);
         let o0 = builder.add_instruction(LongMetadataOperation, vec![i0]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -1609,7 +1623,7 @@ mod tests {
         assert!(matches!(output, Atom::Variable(r#type) if r#type == DataType::F64));
 
         // Test a program with two outputs that are copies of the same value.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F32);
         let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
         let program = builder
@@ -1631,7 +1645,7 @@ mod tests {
         assert!(matches!(output.1, Atom::Variable(r#type) if r#type == DataType::F32));
 
         // Test a case where we have an output atom with no parent instruction.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         builder.add_input(DataType::F64);
         let o0 = builder.add_variable(DataType::F64);
         assert!(matches!(
@@ -1640,7 +1654,7 @@ mod tests {
         ));
 
         // Test a case where we have an instruction input atom with no parent instruction.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let v0 = builder.add_variable(DataType::F64);
         let o0 = builder.add_instruction(AddOperation, vec![i0, v0]).unwrap()[0];
@@ -1652,7 +1666,7 @@ mod tests {
 
     #[test]
     fn test_program_inputs_mask() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let first_input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
         let second_input = builder.add_input(DataType::F64);
@@ -1676,7 +1690,7 @@ mod tests {
 
     #[test]
     fn test_program_instruction_by_output() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
         let scaled = builder.add_instruction(NegOperation, vec![input]).unwrap()[0];
@@ -1699,7 +1713,7 @@ mod tests {
 
     #[test]
     fn test_program_live_sets() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let live_input = builder.add_input(DataType::F64);
         let dead_input = builder.add_input(DataType::F64);
         let live_constant = builder.add_constant(Scalar::from(3.0f64));
@@ -1812,7 +1826,7 @@ mod tests {
 
     #[test]
     fn test_program_map_operations() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(3.0f64));
         let negated = builder.add_instruction(NegOperation, vec![input]).unwrap()[0];
@@ -1873,7 +1887,7 @@ mod tests {
 
     #[test]
     fn test_program_to_flat_program_and_into_flat_program() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let v0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
@@ -1895,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_program_simplified() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
         let c1 = builder.add_constant(Scalar::from(3.0f64));
@@ -1936,7 +1950,7 @@ mod tests {
         // the print's output below, so only its effect keeps it in the simplified program.
         assert_eq!(program.effects(), Effects::PURE);
         let build = || {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let input = builder.add_input(DataType::F64);
             let doubled = builder.add_instruction(AddOperation, vec![input, input]).unwrap()[0];
             let _printed = builder.add_instruction(PrintOperation::new("x"), vec![input]).unwrap()[0];
@@ -1982,16 +1996,24 @@ mod tests {
             }
         }
 
-        impl Typed<DataType> for CloneCountingValue {
+        impl Typed for CloneCountingValue {
+            type Type = DataType;
+
             fn r#type(&self) -> Cow<'_, DataType> {
                 Cow::Owned(DataType::F64)
             }
         }
 
-        impl Value<DataType> for CloneCountingValue {}
+        impl Value for CloneCountingValue {
+            type Domain = crate::EagerContext<Self>;
+
+            fn domain(&self) -> crate::EagerContext<Self> {
+                crate::EagerContext::new()
+            }
+        }
 
         let value_clone_count = Rc::new(Cell::new(0));
-        let mut builder = ProgramBuilder::<_, _, ScalarOperation<CloneCountingValue>>::new();
+        let mut builder = ProgramBuilder::<_, ScalarOperation<CloneCountingValue>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(CloneCountingValue::new(2.0, Rc::clone(&value_clone_count)));
         let c1 = builder.add_constant(CloneCountingValue::new(3.0, Rc::clone(&value_clone_count)));
@@ -2044,7 +2066,7 @@ mod tests {
 
     #[test]
     fn test_program_filtered() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
@@ -2102,7 +2124,7 @@ mod tests {
         // Build the same program twice, so that the consuming `into_filtered` can be compared
         // against the borrowing `filter`.
         let build = || {
-            let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+            let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let i0 = builder.add_input(DataType::F64);
             let i1 = builder.add_input(DataType::F64);
             let c0 = builder.add_constant(Scalar::from(2.0f64));
@@ -2138,7 +2160,7 @@ mod tests {
 
     #[test]
     fn test_program_builder() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let i1 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(2.0f64));
@@ -2179,7 +2201,7 @@ mod tests {
         // `add_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to the
         // provided builder atoms and returning the builder atoms for its outputs. The program's `2.0` constant is dead
         // (i.e., no instruction consumes it), and so only the two reachable instructions are rebuilt.
-        let mut outer = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut outer = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a0 = outer.add_input(DataType::F64);
         let a1 = outer.add_input(DataType::F64);
         let outputs = outer.add_program(&program, &[a0, a1]).unwrap();
@@ -2192,14 +2214,14 @@ mod tests {
 
     #[test]
     fn test_program_builder_rejects_unbound_instruction_inputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let v0 = builder.add_instruction(AddOperation, vec![AtomId { index: 42 }, AtomId { index: 99 }]);
         assert!(matches!(v0, Err(ProgramError::UnboundAtomId { id }) if id == AtomId { index: 42 }));
     }
 
     #[test]
     fn test_program_builder_build_returns_error() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         builder.error = Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
         assert!(matches!(
             builder.build::<Scalar, Scalar>(Vec::new(), Placeholder, Placeholder),
@@ -2209,7 +2231,7 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_rejects_invalid_input_count() {
-        let builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         assert!(matches!(
             builder.build::<Scalar, ()>(Vec::new(), Placeholder, ()),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -2218,7 +2240,7 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_rejects_invalid_output_count() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         builder.add_input(DataType::F64);
         assert!(matches!(
             builder.build::<Scalar, Scalar>(Vec::new(), Placeholder, Placeholder),
@@ -2228,7 +2250,7 @@ mod tests {
 
     #[test]
     fn test_program_builder_build_rejects_malformed_atom_providers() {
-        let mut duplicate_input_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut duplicate_input_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = duplicate_input_builder.add_input(DataType::F64);
         duplicate_input_builder.input_ids.push(input);
         assert!(matches!(
@@ -2241,7 +2263,7 @@ mod tests {
                 if message == format!("program input atom {input} appears more than once")
         ));
 
-        let mut input_output_overlap_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut input_output_overlap_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = input_output_overlap_builder.add_input(DataType::F64);
         input_output_overlap_builder.add_instruction_unchecked(Instruction::new(
             ScalarOperation::Neg(NegOperation),
@@ -2258,7 +2280,7 @@ mod tests {
                 if message == format!("instruction output atom {input} is a program input")
         ));
 
-        let mut duplicate_output_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut duplicate_output_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = duplicate_output_builder.add_input(DataType::F64);
         let output = duplicate_output_builder.add_variable(DataType::F64);
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(

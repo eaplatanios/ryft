@@ -78,11 +78,15 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 /// is the value-level counterpart to [`Type`]. While [`Type`] models relationships between abstract type descriptors,
 /// [`Typed`] lets a concrete value produce the descriptor that should represent it during tracing, staging, type
 /// checking, and other forms of abstract reasoning.
-pub trait Typed<T: Type> {
+pub trait Typed {
+    /// [`Type`] descriptor family this value is typed against (e.g., [`DataType`] for scalars,
+    /// [`ArrayType`] for arrays, etc.).
+    type Type: Type;
+
     /// Returns the [`Type`] description of this value. The returned [`Type`] should capture the structural information
     /// that Ryft needs to reason about the value without having to inspect its contents. Note that returning a [`Cow`]
     /// lets implementors lend out a stored [`Type`] by borrow when one is cached on the value, while still supporting
     /// values that compute their [`Type`] on the fly (and return [`Cow::Owned`]). Callers that need ownership can call
     /// [`Cow::into_owned`] to clone on demand.
-    fn r#type(&self) -> Cow<'_, T>;
+    fn r#type(&self) -> Cow<'_, Self::Type>;
 }

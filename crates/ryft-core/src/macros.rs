@@ -91,10 +91,10 @@ macro_rules! check_sharding {
 macro_rules! check_builders {
     ($reference:expr, [$others:expr] $(,)?) => {{
         let reference = $reference;
-        let mut result = Ok(());
+        let mut result = ::std::result::Result::Ok(());
         for other in $others {
             if !std::rc::Rc::ptr_eq(reference, other) {
-                result = Err($crate::ProgramError::MismatchedProgramBuilders);
+                result = ::std::result::Result::Err($crate::ProgramError::MismatchedProgramBuilders);
                 break;
             }
         }
@@ -104,9 +104,9 @@ macro_rules! check_builders {
         let reference = $reference;
         let other = $other;
         if std::rc::Rc::ptr_eq(reference, other) {
-            Ok(())
+            ::std::result::Result::Ok(())
         } else {
-            Err($crate::ProgramError::MismatchedProgramBuilders)
+            ::std::result::Result::Err($crate::ProgramError::MismatchedProgramBuilders)
         }
     }};
 }

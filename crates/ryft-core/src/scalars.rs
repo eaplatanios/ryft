@@ -59,7 +59,7 @@ impl Context for ScalarDomain {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         // `ScalarDomain` is an eager `Context` whose `bind` interprets the operation directly over `Scalar` values.
-        operation.into().interpret(&EagerContext::<DataType, Scalar, Self::Operation>::new(), inputs)
+        operation.into().interpret(&EagerContext::<Scalar, Self::Operation>::new(), inputs)
     }
 
     #[inline]
@@ -70,11 +70,11 @@ impl Context for ScalarDomain {
 
 /// [`EagerContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] values with the
 /// [`ScalarOperation`] family.
-pub type ScalarEagerContext = EagerContext<DataType, Scalar, ScalarOperation<Scalar>>;
+pub type ScalarEagerContext = EagerContext<Scalar, ScalarOperation<Scalar>>;
 
 /// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the
 /// [`ScalarOperation`] family.
-pub type ScalarTracingContext = TracingContext<DataType, Scalar, ScalarOperation<Scalar>>;
+pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 
 /// Scalar [`Value`] whose [`Type`](crate::Type) is a [`DataType`] and which is meant to be used primarily for testing
 /// the Ryft infrastructure and machinery with programs that do not involve multidimensional arrays.
@@ -129,7 +129,9 @@ impl Display for Scalar {
     }
 }
 
-impl Typed<DataType> for Scalar {
+impl Typed for Scalar {
+    type Type = DataType;
+
     fn r#type(&self) -> Cow<'_, DataType> {
         Cow::Owned(match self {
             Scalar::Bool(_) => DataType::Boolean,
@@ -149,7 +151,13 @@ impl Typed<DataType> for Scalar {
     }
 }
 
-impl Value<DataType> for Scalar {}
+impl Value for Scalar {
+    type Domain = EagerContext<Scalar>;
+
+    fn domain(&self) -> EagerContext<Scalar> {
+        EagerContext::new()
+    }
+}
 
 // Conversions from each supported Rust primitive into the corresponding [`Scalar`] variant. These let later stages
 // and numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
@@ -241,7 +249,7 @@ impl BooleanLike for Scalar {
 // continuation, and a true predicate takes the candidate wholesale) are exactly its semantics.
 impl WhilePredicate for Scalar {}
 
-impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
+impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
         Ok(match r#type {
@@ -267,21 +275,21 @@ impl<O: Operation<DataType>> Zero<DataType, Scalar> for EagerContext<DataType, S
     }
 }
 
-impl Zero<DataType, Scalar> for ScalarDomain {
+impl Zero<Scalar> for ScalarDomain {
     #[inline]
     fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
-        EagerContext::<DataType, Scalar>::new().zero(r#type)
+        EagerContext::<Scalar>::new().zero(r#type)
     }
 }
 
-impl One<DataType, Scalar> for ScalarDomain {
+impl One<Scalar> for ScalarDomain {
     #[inline]
     fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
-        EagerContext::<DataType, Scalar>::new().one(r#type)
+        EagerContext::<Scalar>::new().one(r#type)
     }
 }
 
-impl<Payload> Constant<DataType, Scalar, Scalar, Payload> for ScalarDomain {
+impl<Payload> Constant<Scalar, Scalar, Payload> for ScalarDomain {
     #[inline]
     fn constant(&self, value: Scalar) -> Result<Scalar, ProgramError> {
         Ok(value)
@@ -309,7 +317,7 @@ impl ZeroLike for Scalar {
     }
 }
 
-impl<O: Operation<DataType>> One<DataType, Scalar> for EagerContext<DataType, Scalar, O> {
+impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
     #[inline]
     fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
         Ok(match r#type {

@@ -5,8 +5,9 @@ use std::ops::Index;
 
 use ryft_macros::Parameter;
 
-use crate::Error;
 use crate::broadcasting::Broadcastable;
+use crate::contexts::EagerContext;
+use crate::errors::Error;
 use crate::parameters::Parameter;
 use crate::programs::Value;
 use crate::sharding::{DeviceMesh, Sharding, ShardingDimension, ShardingError};
@@ -750,7 +751,9 @@ impl Type for ArrayType {
 }
 
 // TODO(eaplatanios): Move this to a top-level `ryft_core::arrays` module, parallel to `ryft_core::scalars`.
-impl Typed<ArrayType> for ArrayType {
+impl Typed for ArrayType {
+    type Type = ArrayType;
+
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(self)
@@ -761,9 +764,15 @@ impl Typed<ArrayType> for ArrayType {
 // Some staged XLA programs use `ArrayType` itself as the value carrier (e.g., with `T = ArrayType` and `V = ArrayType`)
 // because the program stores boundary metadata rather than runtime arrays. In that mode the abstract value is
 // self-describing: its value-type descriptor is itself. This is not a type-theoretic universe claim (i.e.,
-// `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<ArrayType>` for metadata-only program
+// `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program
 // storage, lowering, and transformation.
-impl Value<ArrayType> for ArrayType {}
+impl Value for ArrayType {
+    type Context = EagerContext<Self>;
+
+    fn context(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {

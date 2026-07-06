@@ -9,11 +9,11 @@ use crate::types::{Type, TypeError, Typed};
 
 /// Represents [`Operation`]s that can be interpreted (i.e., executed) over a chosen value semantics. The interpretation
 /// [`Context`] `C` is deliberately *unbounded* at the trait level. [`EagerContext`]'s [`Context`] implementation
-/// requires `O: InterpretableOperation<T, V, Self>`, and so any [`Context`] bound reachable from an interpretation
+/// requires `O: InterpretableOperation<V, Self>`, and so any [`Context`] bound reachable from an interpretation
 /// implementation would make that obligation self-referential and overflow the trait solver. Implementations therefore
-/// bound `C` only by the context capabilities they actually use (e.g., `C: Zero<T, V>` for nullary construction or
-/// `C: Constant<T, V, Stored, Payload>` for captured-constant materialization), and never by [`Context`] itself.
-pub trait InterpretableOperation<T: Type, V: Value<T>, C>: Operation<T> {
+/// bound `C` only by the context capabilities they actually use (e.g., `C: Zero<V>` for nullary construction or
+/// `C: Constant<V, Stored, Payload>` for captured-constant materialization), and never by [`Context`] itself.
+pub trait InterpretableOperation<V: Value, C>: Operation<V::Type> {
     /// Interprets this [`Operation`] given the provided input values and returns the resulting output values.
     ///
     /// # Parameters
@@ -33,7 +33,9 @@ pub trait InterpretableOperation<T: Type, V: Value<T>, C>: Operation<T> {
 /// linear programs whose constants are already runtime values. Captured higher-order programs and custom derivative
 /// bodies can set `Constant` to their captured constant type and let the implementation decide how to lift those
 /// constants into `V`.
-pub trait InterpretableProgramOperation<T: Type, V: Value<T>, C, Constant: Value<T> = V>: Operation<T> + Sized {
+pub trait InterpretableProgramOperation<V: Value, C, Constant: Value<Type = V::Type> = V>:
+    Operation<V::Type> + Sized
+{
     /// Interprets a nested flat [`Program`].
     ///
     /// # Parameters
@@ -43,18 +45,18 @@ pub trait InterpretableProgramOperation<T: Type, V: Value<T>, C, Constant: Value
     ///   - `input`: Input values to use for interpreting the provided [`Program`].
     fn interpret_program(
         context: &C,
-        program: &Program<T, Constant, Self, Vec<Constant>, Vec<Constant>>,
+        program: &Program<Constant, Self, Vec<Constant>, Vec<Constant>>,
         input: Vec<V>,
     ) -> Result<Vec<V>, ProgramError>;
 }
 
 impl<
     T: Type,
-    V: Value<T>,
+    V: Value<Type = T>,
     O: Operation<T>,
     Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
     Output: Parameterized<V>,
-> Program<T, V, O, Input, Output>
+> Program<V, O, Input, Output>
 {
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
     /// [`Program`]s. It checks that the provided input value matches the program's expected input structure and type,
@@ -63,9 +65,9 @@ impl<
     #[inline]
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
-        O: InterpretableOperation<T, V, EagerContext<T, V, O>>,
+        O: InterpretableOperation<V, EagerContext<V, O>>,
     {
-        self.interpret_in_context(&EagerContext::<T, V, O>::new(), input)
+        self.interpret_in_context(&EagerContext::<V, O>::new(), input)
     }
 
     /// Interprets/executes this [`Program`] with the provided input, within the supplied interpretation context.
@@ -76,7 +78,7 @@ impl<
     /// here so that a single replay path handles both eager and traced values.
     pub fn interpret_in_context<C: Context<Type = T>>(&self, context: &C, input: Input) -> Result<Output, ProgramError>
     where
-        O: InterpretableOperation<T, V, C>,
+        O: InterpretableOperation<V, C>,
     {
         // Validate that the caller supplied an input with the expected parameter structure.
         let input_structure = input.parameter_structure();
@@ -119,9 +121,7 @@ impl<
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<T, V, O, Input, Output>
-{
+impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
     /// Interprets/executes this [`Program`]'s [`Instruction`]s using the caller-supplied value and error semantics.
     /// Transforms and backends specialize this interpretation by choosing a runtime value type `V`, an error type `E`,
     /// a constant-lifting closure `lift_fn`, and an instruction-interpretation closure `interpret_fn`. Inputs and
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_program_interpret_materializes_duplicate_outputs() {
         // A program whose two outputs are the same atom materializes that value into both output positions.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F32);
         let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
         let program = builder
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_lifts_live_constants_once() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let c0 = builder.add_constant(Scalar::from(7.0f64));
         let c1 = builder.add_constant(Scalar::from(3.0f64));
@@ -289,9 +289,7 @@ mod tests {
                     lifted_constants.push((atom_id, *value));
                     Ok(*value)
                 },
-                |instruction, inputs| instruction
-                    .operation()
-                    .interpret(&EagerContext::<DataType, Scalar>::new(), inputs),
+                |instruction, inputs| instruction.operation().interpret(&EagerContext::<Scalar>::new(), inputs),
             ),
             Ok(vec![Scalar::from(5.0f64)]),
         );
@@ -301,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_mismatched_parameter_structures() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let program = builder.build::<Vec<Scalar>, Scalar>(vec![i0], vec![Placeholder], Placeholder).unwrap();
         assert!(matches!(
@@ -317,7 +315,7 @@ mod tests {
     #[test]
     fn test_program_interpret_input_type_checking() {
         // A statically typed program input rejects values whose concrete types do not match it exactly.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, AddOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)])));
         let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -330,7 +328,7 @@ mod tests {
 
         // An unbounded dynamically sized program input accepts concrete values of any size, so one staged program
         // replays at several concrete sizes. Rank mismatches are still rejected.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, AddOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])));
         let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -343,7 +341,7 @@ mod tests {
         ));
 
         // A bounded dynamically sized program input enforces its exclusive upper bound on concrete sizes.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, AddOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, AddOperation>::new();
         let i0 = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(3))])));
         let o0 = builder.add_instruction(AddOperation, vec![i0, i0]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![o0], Placeholder, Placeholder).unwrap();
@@ -357,16 +355,14 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_wrong_number_of_operation_inputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let program = builder.build::<Scalar, Scalar>(vec![i0], Placeholder, Placeholder).unwrap();
         assert!(matches!(
             program.interpret_with(
                 Vec::<Scalar>::new(),
                 |_, value| Ok(*value),
-                |instruction, inputs| instruction
-                    .operation()
-                    .interpret(&EagerContext::<DataType, Scalar>::new(), inputs),
+                |instruction, inputs| instruction.operation().interpret(&EagerContext::<Scalar>::new(), inputs),
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         ));
@@ -374,7 +370,7 @@ mod tests {
 
     #[test]
     fn test_program_interpret_with_wrong_number_of_operation_outputs() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let i0 = builder.add_input(DataType::F64);
         let o0 = builder.add_instruction(NegOperation, vec![i0]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![o0], Placeholder, Placeholder).unwrap();

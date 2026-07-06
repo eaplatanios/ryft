@@ -29,12 +29,8 @@ pub enum TracerState {
 /// Value used while tracing [`Program`]s through an active [`Context`], substituting actual runtime values, and
 /// recording the executed [`Operation`]s in that [`Context`]. When tracing fails, later operations return _poisoned_
 /// tracers which are represented using [`TracerState::Poison`].
-///
-/// The `Meta` type parameter carries transform-specific metadata alongside each staged value. Ordinary tracing leaves
-/// it as the default `()`, while transform contexts can specialize it (e.g., to a partial-evaluation known/unknown
-/// classification or a batch axis).
 #[derive(Clone, Parameter)]
-pub struct Tracer<C: Context, Meta = ()> {
+pub struct Tracer<C: Context> {
     /// [`Context`] associated with this [`Tracer`].
     context: C,
 
@@ -43,25 +39,13 @@ pub struct Tracer<C: Context, Meta = ()> {
 
     /// [`Type`] of the value that this [`Tracer`] represents.
     r#type: C::Type,
-
-    /// Transform-specific metadata carried alongside this [`Tracer`].
-    meta: Meta,
 }
 
-impl<C: Context, Meta> Tracer<C, Meta> {
-    /// Creates a new [`Tracer`] with a default `Meta`.
+impl<C: Context> Tracer<C> {
+    /// Creates a new [`Tracer`].
     #[inline]
-    pub fn new(context: C, state: TracerState, r#type: C::Type) -> Self
-    where
-        Meta: Default,
-    {
-        Self { context, state, r#type, meta: Meta::default() }
-    }
-
-    /// Creates a new [`Tracer`] carrying the provided `meta`.
-    #[inline]
-    pub fn new_with_meta(context: C, state: TracerState, r#type: C::Type, meta: Meta) -> Self {
-        Self { context, state, r#type, meta }
+    pub fn new(context: C, state: TracerState, r#type: C::Type) -> Self {
+        Self { context, state, r#type }
     }
 
     /// Returns the [`TracerState`] of this [`Tracer`].
@@ -76,12 +60,6 @@ impl<C: Context, Meta> Tracer<C, Meta> {
         &self.context
     }
 
-    /// Returns the transform-specific metadata carried by this [`Tracer`].
-    #[inline]
-    pub fn meta(&self) -> &Meta {
-        &self.meta
-    }
-
     /// Returns the staged [`AtomId`] for this [`Tracer`] if it is _live_,
     /// and [`ProgramError::PoisonedValue`] otherwise.
     #[inline]
@@ -93,25 +71,23 @@ impl<C: Context, Meta> Tracer<C, Meta> {
     }
 }
 
-// `Tracer` equality is *staging identity*, not value equality. Two tracers are equal if and only if they carry equal
-// metadata and correspond to the same staged `Atom` of the same `ProgramBuilder` (or are both poisoned in the same
-// builder). Two tracers that would evaluate to equal runtime values but were staged as distinct atoms are considered
-// unequal, which is the conservative answer trace-time analyses need. For example, the loop invariance fixed points of
-// the `scan` and `while` partial evaluation rules degrade to syntactic passthrough detection under a staging known-side
-// context precisely because of these semantics.
-impl<C: StagingContext, Meta: PartialEq> PartialEq for Tracer<C, Meta> {
+// `Tracer` equality is *staging identity*, not value equality. Two tracers are equal if and only if they correspond to
+// the same staged `Atom` of the same `ProgramBuilder` (or are both poisoned in the same builder). Two tracers that
+// would evaluate to equal runtime values but were staged as distinct atoms are considered unequal, which is the
+// conservative answer trace-time analyses need. For example, the loop invariance fixed points of the `scan` and `while`
+// partial evaluation rules degrade to syntactic passthrough detection under a staging known-side context precisely
+// because of these semantics.
+impl<C: StagingContext> PartialEq for Tracer<C> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(self.context.builder(), other.context.builder())
-            && self.state == other.state
-            && self.meta == other.meta
+        Rc::ptr_eq(self.context.builder(), other.context.builder()) && self.state == other.state
     }
 }
 
-impl<C: StagingContext> Tracer<C, C::Meta> {
+impl<C: StagingContext> Tracer<C> {
     /// Returns the [`ProgramBuilder`] associated with this [`Tracer`].
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>> {
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>> {
         self.context.builder()
     }
 
@@ -124,21 +100,11 @@ impl<C: StagingContext> Tracer<C, C::Meta> {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
-                Self {
-                    state: TracerState::Poison,
-                    r#type: self.r#type.clone(),
-                    context: self.context.clone(),
-                    meta: self.meta.clone(),
-                }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
                 self.context.error(error);
-                Self {
-                    state: TracerState::Poison,
-                    r#type: self.r#type.clone(),
-                    context: self.context.clone(),
-                    meta: self.meta.clone(),
-                }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
         }
     }
@@ -153,39 +119,28 @@ impl<C: StagingContext> Tracer<C, C::Meta> {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
                 self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
-                Self {
-                    state: TracerState::Poison,
-                    r#type: self.r#type.clone(),
-                    context: self.context.clone(),
-                    meta: self.meta.clone(),
-                }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
                 self.context.error(error);
-                Self {
-                    state: TracerState::Poison,
-                    r#type: self.r#type.clone(),
-                    context: self.context.clone(),
-                    meta: self.meta.clone(),
-                }
+                Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
         }
     }
 }
 
-impl<C: Context, Meta: Debug> Debug for Tracer<C, Meta> {
+impl<C: Context> Debug for Tracer<C> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Tracer")
             .field("state", &self.state)
             .field("type", &self.r#type)
-            .field("meta", &self.meta)
             .finish_non_exhaustive()
     }
 }
 
-impl<C: Context, Meta> Display for Tracer<C, Meta> {
+impl<C: Context> Display for Tracer<C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.state {
             TracerState::Live(atom_id) => write!(formatter, "{atom_id}"),
@@ -194,18 +149,27 @@ impl<C: Context, Meta> Display for Tracer<C, Meta> {
     }
 }
 
-impl<C: Context, Meta> Typed<C::Type> for Tracer<C, Meta> {
+impl<C: Context> Typed for Tracer<C> {
+    type Type = C::Type;
+
     #[inline]
     fn r#type(&self) -> Cow<'_, C::Type> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<C: Context, Meta: Clone + Debug> Value<C::Type> for Tracer<C, Meta> {}
+impl<C: StagingContext> Value for Tracer<C> {
+    type Domain = C;
+
+    #[inline]
+    fn domain(&self) -> C {
+        self.context().clone()
+    }
+}
 
 /// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs the
-/// type, staged-constant, and operation representations `(T, V, O)` of a program with the [`ProgramBuilder`] used for
-/// one tracing invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
+/// staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one tracing
+/// invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
 /// [`Constant`](Domain::Constant) is `V`. Its default [`StagingContext::stage_operation`] behavior records each
 /// primitive bind as a program instruction. Transform contexts wrap or replace this context when they need different
 /// binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
@@ -217,7 +181,7 @@ impl<C: Context, Meta: Clone + Debug> Value<C::Type> for Tracer<C, Meta> {}
 /// use a runtime device buffer for `C` versus a [`CaptureReference`] reference for `V`. `C` defaults to `V` for the
 /// common non-capturing case, where no capture table exists and the distinction is moot. Refer to [`CapturingContext`]
 /// and [`CaptureReference`] for more information on what captures are and how they are used in practice.
-pub struct TracingContext<T: Type, V: Value<T>, O: Operation<T>, C = V> {
+pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
     /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
     /// A [`Tracer`] holds its [`Context`] by value, and tracing freely clones tracers (and hence their contexts) as
@@ -226,7 +190,7 @@ pub struct TracingContext<T: Type, V: Value<T>, O: Operation<T>, C = V> {
     /// *forked* on every context clone, and so [`Tracer`]s created at different points in the trace would accumulate
     /// into divergent programs rather than the one program the trace is building. Furthermore, the nested [`RefCell`]
     /// supplies the interior mutability that staging needs.
-    builder: Rc<RefCell<ProgramBuilder<T, V, O>>>,
+    builder: Rc<RefCell<ProgramBuilder<V, O>>>,
 
     /// Capture table of closed-over runtime values, referenced symbolically from the staged [`Program`] via
     /// [`CaptureReference`]s. It stays empty for ordinary (i.e., non-capturing) tracing and is filled only when tracing
@@ -251,8 +215,8 @@ pub struct TracingContext<T: Type, V: Value<T>, O: Operation<T>, C = V> {
     named_axes: Rc<Vec<(String, NamedAxis)>>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
-    /// Creates a new [`TracingContext`] over the `(T, V, O)` type universe with a fresh, empty [`ProgramBuilder`] and a
+impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
+    /// Creates a new [`TracingContext`] over the `(V, O)` type universe with a fresh, empty [`ProgramBuilder`] and a
     /// fresh, empty capture table. Use [`builder`](Self::builder) afterward to read or finalize the staged program, and
     /// [`captures`](Self::captures) to read any values registered through [`capture`](CapturingContext::capture). To
     /// instead compose further staging onto a trace that already owns prior instructions, do not create a context at
@@ -261,7 +225,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
     #[inline]
     pub fn new() -> Self {
         Self {
-            builder: Rc::new(RefCell::new(ProgramBuilder::<T, V, O>::new())),
+            builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
             named_axes: Rc::new(Vec::new()),
         }
@@ -269,7 +233,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
 
     /// Returns the [`ProgramBuilder`] that this [`TracingContext`] stages into.
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<T, V, O>>> {
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<V, O>>> {
         &self.builder
     }
 
@@ -282,7 +246,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
     }
 
     /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
-    /// point. It creates a fresh [`TracingContext`] over the `(T, V, O)` type universe, executes `function` once on
+    /// point. It creates a fresh [`TracingContext`] over the `(V, O)` type universe, executes `function` once on
     /// [`Tracer`] inputs standing in for `input_type`, and returns the output types plus the finalized program.
     /// Operation binds are handled by the context's [`StagingContext::stage_operation`] implementation. The type
     /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
@@ -291,12 +255,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
     /// [`Constant`](Domain::Constant)) observe that same context type.
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
-        Input: Parameterized<T, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
-        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<T> + ParameterizedFamily<V>>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
         input_type: Input,
-    ) -> Result<(Output::To<T>, Program<T, V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
         Self::trace_with_named_axes(function, input_type, Vec::new())
     }
 
@@ -304,13 +268,13 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
     /// provided named axes. Named-axis readers staged by `function` (e.g., collectives) resolve against these bindings.
     pub fn trace_with_named_axes<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
-        Input: Parameterized<T, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
-        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<T> + ParameterizedFamily<V>>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
         input_type: Input,
         named_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<(Output::To<T>, Program<T, V, O, Input::To<V>, Output::To<V>>), ProgramError> {
+    ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_type.parameter_structure();
         let (output_types, outputs, output_structure) = {
@@ -337,44 +301,44 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> TracingContext<T, V, O, C> {
     #[inline]
     pub fn infer_output_type<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
-        Input: Parameterized<T, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
-        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<T> + ParameterizedFamily<V>>,
+        Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
+        Output: Parameterized<Tracer<Self>, Family: ParameterizedFamily<V::Type> + ParameterizedFamily<V>>,
     >(
         function: F,
         input_type: Input,
-    ) -> Result<Output::To<T>, ProgramError> {
+    ) -> Result<Output::To<V::Type>, ProgramError> {
         Ok(Self::trace(function, input_type)?.0)
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> Clone for TracingContext<T, V, O, C> {
+impl<V: Value, O: Operation<V::Type>, C> Clone for TracingContext<V, O, C> {
     fn clone(&self) -> Self {
         Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> Debug for TracingContext<T, V, O, C> {
+impl<V: Value, O: Operation<V::Type>, C> Debug for TracingContext<V, O, C> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("TracingContext").finish_non_exhaustive()
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> Default for TracingContext<T, V, O, C> {
+impl<V: Value, O: Operation<V::Type>, C> Default for TracingContext<V, O, C> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> Domain for TracingContext<T, V, O, C> {
-    type Type = T;
+impl<V: Value, O: Operation<V::Type>, C> Domain for TracingContext<V, O, C> {
+    type Type = V::Type;
     type Value = Tracer<Self>;
     type Constant = V;
     type Operation = O;
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> Context for TracingContext<T, V, O, C> {
+impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     #[inline]
     fn lift(&self, constant: V) -> Result<Tracer<Self>, ProgramError> {
         Ok(self.constant(constant))
@@ -400,7 +364,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> Context for TracingContext<T, V, 
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> NamedAxes for TracingContext<T, V, O, C> {
+impl<V: Value, O: Operation<V::Type>, C> NamedAxes for TracingContext<V, O, C> {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
@@ -410,16 +374,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C> NamedAxes for TracingContext<T, V
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C> StagingContext for TracingContext<T, V, O, C> {
-    type Meta = ();
-
+impl<V: Value, O: Operation<V::Type>, C> StagingContext for TracingContext<V, O, C> {
     #[inline]
-    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
     }
 }
 
-impl<T: Type, O: Operation<T>, C: Value<T>> CapturingContext<C> for TracingContext<T, CaptureReference<T>, O, C> {
+impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext<C> for TracingContext<CaptureReference<T>, O, C> {
     #[inline]
     fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
         let mut captures = self.captures.borrow_mut();
@@ -429,22 +391,21 @@ impl<T: Type, O: Operation<T>, C: Value<T>> CapturingContext<C> for TracingConte
     }
 }
 
-/// Represents a nested [`TracingContext`] that is used to trace a closure into a [`Program`] expressed
-/// in an *enclosing* [`Context`]'s universe rather than in a raw `(T, V, O)` type universe of its own.
-/// Where [`TracingContext`] is keyed by the `(T, V, O)` types it stages and owns its own capture table,
-/// [`NestedTracingContext`] is keyed by the enclosing [`Context`] `C`. It derives its [`Type`](Domain::Type),
-/// [`Constant`](Domain::Constant), and [`Operation`](Domain::Operation) from `C`, owns a fresh [`ProgramBuilder`] for
-/// the nested [`Program`] it stages, and holds a clone of `C`. Runtime capture registration is *not* owned by this
-/// context but is rather delegated to the enclosing context through [`CapturingContext`], and so values captured while
-/// tracing the nested program flow into `C`'s table along the same nesting path as ordinary operation staging. As with
-/// [`TracingContext`], the [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the
-/// *same* nested program.
+/// Represents a nested [`TracingContext`] that is used to trace a closure into a [`Program`] expressed in an
+/// *enclosing* [`Context`]'s universe rather than in a raw `(V, O)` type universe of its own. Where [`TracingContext`]
+/// is keyed by the `(V, O)` types it stages and owns its own capture table, [`NestedTracingContext`] is keyed by the
+/// enclosing [`Context`] `C`. It derives its [`Type`](Domain::Type), [`Constant`](Domain::Constant), and
+/// [`Operation`](Domain::Operation) from `C`, owns a fresh [`ProgramBuilder`] for the nested [`Program`] it stages,
+/// and holds a clone of `C`. Runtime capture registration is *not* owned by this context but is rather delegated to the
+/// enclosing context through [`CapturingContext`], and so values captured while tracing the nested program flow into
+/// `C`'s table along the same nesting path as ordinary operation staging. As with [`TracingContext`], the
+/// [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the *same* nested program.
 pub struct NestedTracingContext<C: Context> {
     /// [`Context`] that this [`NestedTracingContext`] is nested into.
     parent: C,
 
     /// [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
-    builder: Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>>,
+    builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
 }
 
 impl<C: Context> NestedTracingContext<C> {
@@ -461,7 +422,7 @@ impl<C: Context> NestedTracingContext<C> {
 
     /// Returns the [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
     #[inline]
-    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Type, C::Constant, C::Operation>>> {
+    pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>> {
         &self.builder
     }
 }
@@ -527,10 +488,8 @@ impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
 }
 
 impl<C: Context> StagingContext for NestedTracingContext<C> {
-    type Meta = ();
-
     #[inline]
-    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
     }
 }
@@ -541,17 +500,17 @@ impl<C: Context> StagingContext for NestedTracingContext<C> {
 /// representation, matching the default capture type of [`TracingContext::new`]. Closed program traces over a backend
 /// whose runtime [`Value`](Domain::Value) differs from its staged [`Constant`](Domain::Constant) pin `C` to that
 /// runtime value type explicitly. Use this alias at call sites that already hold a [`Domain`] and want to name the
-/// matching tracing context. Use [`TracingContext`] directly at sites that already work in terms of a `(T, V, O)`
+/// matching tracing context. Use [`TracingContext`] directly at sites that already work in terms of a `(V, O)`
 /// universe.
 pub type DomainTracingContext<D, C = <D as Domain>::Constant> =
-    TracingContext<<D as Domain>::Type, <D as Domain>::Constant, <D as Domain>::Operation, C>;
+    TracingContext<<D as Domain>::Constant, <D as Domain>::Operation, C>;
 
 /// [`Tracer`] flowing through a [`DomainTracingContext`] for a backend [`Domain`] `D`. This is the value that stands in
 /// for a `D`-typed runtime value while a function is being traced into a [`Program`]. Each [`Operation`] bound on these
 /// tracers records a program instruction and yields further [`DomainTracer`]s, and so ordinary backend traces flow
 /// entirely in them. The [`Domain`] is a pure type witness, and so the tracer borrows nothing from it. The backend-less
 /// specialization used during symbolic program tracing and transposition is a [`Tracer`] over a plain
-/// [`TracingContext<T, V, O>`](TracingContext).
+/// [`TracingContext<V, O>`](TracingContext).
 pub type DomainTracer<D> = Tracer<DomainTracingContext<D>>;
 
 /// [`Tracer`] flowing through a [`NestedTracingContext`] over an enclosing context `C`. This is the value used while
@@ -632,9 +591,9 @@ mod tests {
         assert!(Rc::ptr_eq(cloned_tracer.builder(), &builder));
         assert!(matches!(tracer.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
         assert_eq!(tracer.to_string(), "%0");
-        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, meta: (), .. }");
+        assert_eq!(format!("{tracer:?}"), "Tracer { state: Live(AtomId { index: 0 }), type: F64, .. }");
         assert_eq!(poisoned.to_string(), "<poison:f64>");
-        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, meta: (), .. }");
+        assert_eq!(format!("{poisoned:?}"), "Tracer { state: Poison, type: F64, .. }");
 
         // Test staging value-level identity helpers through the tracer convenience API.
         let zero = tracer.zero_like();
@@ -740,14 +699,14 @@ mod tests {
             }
         }
 
-        impl<C> InterpretableOperation<DataType, Scalar, C> for NoOutputOperation {
+        impl<C> InterpretableOperation<Scalar, C> for NoOutputOperation {
             #[inline]
             fn interpret(&self, _context: &C, _inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
                 Ok(Vec::new())
             }
         }
 
-        let context = TracingContext::<DataType, Scalar, NoOutputOperation>::new();
+        let context = TracingContext::<Scalar, NoOutputOperation>::new();
         let builder = context.builder().clone();
         let input_type = DataType::F64;
         let tracer = context.input(input_type);
@@ -924,7 +883,7 @@ mod tests {
         );
 
         // Test staging an existing program through the context, including lifting embedded constants.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let constant = builder.add_constant(Scalar::from(4.0));
         let output = builder.add_instruction(AddOperation, vec![input, constant]).unwrap()[0];
@@ -1104,7 +1063,7 @@ mod tests {
 
         // Runtime captures are not owned by the nested context. They delegate to the enclosing capturing context,
         // so a value captured through the nested context lands in the parent's shared capture table.
-        let capturing_parent = TracingContext::<DataType, CaptureReference<DataType>, NegOperation, Scalar>::new();
+        let capturing_parent = TracingContext::<CaptureReference<DataType>, NegOperation, Scalar>::new();
         let nested = NestedTracingContext::new(capturing_parent.clone());
         let reference = nested.capture(Scalar::from(7.0)).expect("capture should delegate to the enclosing context");
         assert_eq!(reference.r#type().into_owned(), DataType::F64);

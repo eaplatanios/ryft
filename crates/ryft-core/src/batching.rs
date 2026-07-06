@@ -1,7 +1,5 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
 use std::fmt::Display;
-use std::rc::Rc;
 
 use ryft_macros::Parameter;
 use thiserror::Error;
@@ -9,15 +7,14 @@ use thiserror::Error;
 use crate::ElementwiseOperation;
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
+use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_builders, check_count};
-use crate::operations::Operation;
+use crate::macros::check_count;
 use crate::operations::manipulation::{Broadcast, Transpose};
+use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameter, ParameterError};
-use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{Program, ProgramError, Value};
 use crate::sharding::ShardingDimension;
-use crate::tracing::{Tracer, TracerState};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Represents batching-related errors.
@@ -245,7 +242,7 @@ pub struct ArrayBatch<V> {
     batch_axis: BatchAxis,
 }
 
-impl<V: Value<ArrayType>> ArrayBatch<V> {
+impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`].
     #[inline]
     pub fn new<A: Into<BatchAxis>>(r#type: ArrayType, value: V, batch_axis: A) -> Result<Self, BatchingError> {
@@ -436,17 +433,26 @@ impl<V: Display> Display for ArrayBatch<V> {
     }
 }
 
-impl<V: Typed<ArrayType>> Typed<ArrayType> for ArrayBatch<V> {
+impl<V: Typed<Type = ArrayType>> Typed for ArrayBatch<V> {
+    type Type = ArrayType;
+
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<V: Value<ArrayType>> Value<ArrayType> for ArrayBatch<V> {}
+impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
+    type Domain = EagerContext<Self>;
+
+    #[inline]
+    fn domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+}
 
 /// Represents [`Operation`]s that can be batched (i.e., vectorized).
-pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
+pub trait BatchableOperation<V: Value<Type = ArrayType>, C>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes,
     /// using `context` for rules that need active transform state.
     ///
@@ -485,9 +491,9 @@ pub trait BatchableOperation<V: Value<ArrayType>, C>: Operation<ArrayType> {
 // with the batch axis inserted at that position. Operands whose per-item shapes are not broadcast-compatible are left
 // at their batch-axis-inserted shapes so the operation surfaces its own shape error.
 impl<
-    V: Value<ArrayType> + Broadcast + Transpose,
+    V: Value<Type = ArrayType> + Broadcast + Transpose,
     C,
-    O: Clone + ElementwiseOperation + InterpretableOperation<ArrayType, V, C>,
+    O: Clone + ElementwiseOperation + InterpretableOperation<V, C>,
 > BatchableOperation<V, C> for O
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
@@ -588,7 +594,7 @@ pub enum ProgramBatchingOutputAxesPolicy {
 /// program-level batching through this dedicated, lifetime-free witness keeps the trait solver's recursion finite: the
 /// closed enum implementation discharges the derived batching-context obligations once, instead of every batching rule
 /// re-deriving them with fresh higher-ranked lifetimes (which defeats the solver's cycle detection and overflows).
-pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> + Sized {
+pub trait BatchableProgramOperation<V: Value<Type = ArrayType>>: Operation<ArrayType> + Sized {
     /// Batches a captured [`Program`] into a standalone program over batch-carrying physical types. Refer to
     /// the documentation of [`batch_program`](crate::batch_program) for the input and output axis conventions.
     ///
@@ -599,14 +605,14 @@ pub trait BatchableProgramOperation<V: Value<ArrayType>>: Operation<ArrayType> +
     ///   - `input_batch_axes`: [`BatchAxis`] for each program input (mapped at a position or replicated).
     ///   - `output_axes_policy`: Policy for packaging the batched program's outputs.
     fn batch_program(
-        program: &Program<ArrayType, V, Self, Vec<V>, Vec<V>>,
+        program: &Program<V, Self, Vec<V>, Vec<V>>,
         batch_size: usize,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<(Program<ArrayType, V, Self, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>;
+    ) -> Result<(Program<V, Self, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>;
 }
 
-impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V, O, Vec<V>, Vec<V>> {
+impl<V: Value<Type = ArrayType>, O: BatchableProgramOperation<V>> Program<V, O, Vec<V>, Vec<V>> {
     #[inline]
     pub fn batched(
         &self,
@@ -622,7 +628,7 @@ impl<V: Value<ArrayType>, O: BatchableProgramOperation<V>> Program<ArrayType, V,
 /// This is the shared application path the per-operation [`BatchableOperation`] rules use once they have lifted an
 /// operation to its batch-carrying inputs. Every [`InterpretableOperation`] over [`ArrayType`] values gets it for
 /// free through the blanket implementation below, so an operation earns it directly from its interpretation rule.
-pub trait InterpretableBatchableOperation<V: Value<ArrayType>, C> {
+pub trait InterpretableBatchableOperation<V: Value<Type = ArrayType>, C> {
     /// Interprets this operation on the *unpacked* values of batched `inputs` and repackages each output as an
     /// [`ArrayBatch`] carrying the corresponding `output_batch_axes` entry.
     ///
@@ -640,7 +646,7 @@ pub trait InterpretableBatchableOperation<V: Value<ArrayType>, C> {
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>;
 }
 
-impl<O: InterpretableOperation<ArrayType, V, C>, V: Value<ArrayType>, C> InterpretableBatchableOperation<V, C> for O {
+impl<O: InterpretableOperation<V, C>, V: Value<Type = ArrayType>, C> InterpretableBatchableOperation<V, C> for O {
     fn interpret_with_batch_axes(
         &self,
         context: &C,
@@ -661,41 +667,6 @@ impl<O: InterpretableOperation<ArrayType, V, C>, V: Value<ArrayType>, C> Interpr
             .zip(output_batch_axes.iter().copied())
             .map(|(value, axis)| ArrayBatch::new(value.r#type().into_owned(), value, axis))
             .collect()
-    }
-}
-
-/// Metadata attached to [`Tracer`]s that are used for the batching transform and which provides information about
-/// the [`BatchAxis`] used for batching. The batch axis rides on the value itself, so that the per-operation
-/// [`BatchableOperation`] rules route the mapped batch axis through tracing/staging. Note that [`BatchingMeta`] also
-/// carry the _parent_ metadata so that we can handle nested transforms, each potentially using its own metadata type.
-/// Note that this includes support for things like nested batching transforms where the [`BatchAxis`] of each transform
-/// is carried through the [`BatchingMeta`]'s parent field.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct BatchingMeta<Meta> {
-    /// Parent context's metadata.
-    parent: Meta,
-
-    /// [`BatchAxis`] introduced at this batching level.
-    batch_axis: BatchAxis,
-}
-
-impl<Meta> BatchingMeta<Meta> {
-    /// Creates a [`BatchingMeta`] pairing this level's `batch_axis` with the `parent` context's metadata tail.
-    #[inline]
-    pub fn new(batch_axis: BatchAxis, parent: Meta) -> Self {
-        Self { batch_axis, parent }
-    }
-
-    /// Returns the parent context's metadata.
-    #[inline]
-    pub fn parent(&self) -> &Meta {
-        &self.parent
-    }
-
-    /// Returns this batching level's mapped [`BatchAxis`].
-    #[inline]
-    pub fn batch_axis(&self) -> BatchAxis {
-        self.batch_axis
     }
 }
 
@@ -745,28 +716,26 @@ impl<C> BatchingContext<C> {
     }
 }
 
-// TODO(eaplatanios): Review this implementation block.
-impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, Self>>> Domain
-    for BatchingContext<C>
-{
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>> Domain for BatchingContext<C> {
     type Type = ArrayType;
     type Value = BatchingTracer<C>;
     type Constant = C::Constant;
     type Operation = C::Operation;
 }
 
-// TODO(eaplatanios): Review this implementation block and add unit test.
-impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, Self>>> Context
-    for BatchingContext<C>
-{
-    /// Lifts a constant payload into this batching context by recording it as a replicated [`BatchingTracer`].
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>> Context for BatchingContext<C> {
+    /// Lifts a constant by lifting it in the parent context and replicating it across the batch.
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {
-        Ok(self.constant(constant))
+        Ok(BatchingTracer::new(self.clone(), ArrayBatch::replicated(self.parent().lift(constant)?)))
     }
 
-    /// Binding in a batching context routes through [`StagingContext::stage_operation`], which lifts the operation over
-    /// each input's mapped batch axis through the operation's [`BatchableOperation`] rule.
+    /// Binding routes the operation through its [`BatchableOperation`] implementation against the batch-carrying
+    /// inputs. The implementation dispatches primitive work through the parent context, executing eagerly under an
+    /// eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
+    /// collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
+    /// [`Instruction`](crate::Instruction) becoming two branches plus a per-item select instruction) emerges
+    /// automatically.
     #[inline]
     fn bind<P: Into<Self::Operation>>(
         &self,
@@ -774,118 +743,27 @@ impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C,
         inputs: &[BatchingTracer<C>],
     ) -> Result<Vec<BatchingTracer<C>>, ProgramError> {
         let operation = operation.into();
-        self.stage_operation(operation, inputs)
+        let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
+        let output_batches = operation.batch(self, input_batches.as_slice())?;
+        Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())
     }
 
     #[inline]
     fn resolve(&self, value: &BatchingTracer<C>) -> ValueResolution<C::Constant> {
-        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
-            return ValueResolution::Opaque;
-        }
-        let Ok(atom_id) = value.atom_id() else {
-            return ValueResolution::Opaque;
-        };
-        match self.builder().borrow().atoms().get(atom_id.index()).and_then(|atom| atom.as_constant()) {
-            Some(constant) => ValueResolution::Concrete(constant.clone()),
-            None => ValueResolution::Staged(atom_id),
-        }
+        // A batching value resolves exactly as the parent context resolves the value it packs.
+        self.parent().resolve(value.batch().value())
     }
 }
 
-// TODO(eaplatanios): Review this implementation block and add unit test.
-impl<C> StagingContext for BatchingContext<C>
-where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
-{
-    type Meta = BatchingMeta<C::Meta>;
-
-    #[inline]
-    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>> {
-        self.parent().builder()
-    }
-
-    fn stage_operation<P: Into<Self::Operation>, I: std::borrow::Borrow<BatchingTracer<C>>>(
-        &self,
-        operation: P,
-        inputs: &[I],
-    ) -> Result<Vec<BatchingTracer<C>>, ProgramError> {
-        let operation = operation.into();
-        check_builders!(self.builder(), [inputs.iter().map(|input| input.borrow().context().builder())])
-            .map_err(|error| self.error(error))?;
-        if self.builder().borrow().error.is_some() {
-            let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
-            let output_types = operation.infer_output_types(input_types.as_slice())?;
-            return Ok(output_types
-                .into_iter()
-                .map(|r#type| Tracer::new(self.clone(), TracerState::Poison, r#type))
-                .collect());
-        }
-
-        // Build parent-level input batches. Each `ArrayBatch` wraps the same atom as a *parent* trace value at the
-        // parent-physical (= this level's physical) type, with this level's mapped batch axis. This level's axis for
-        // each input is the head of the value's `Meta` cons-stack (`input.meta().batch_axis()`), and the parent value
-        // the rule dispatches through carries the *tail* of that stack (`input.meta().parent()`), which is exactly the
-        // parent context's own per-level axes — so when the parent is itself a `BatchingContext` (nested `batch`), that
-        // parent's `stage_operation` reads *its* axis straight off the value in hand, with no side table. The rule's
-        // body (`operation.batch(...)`) then dispatches through the parent value's primitive impls, staging directly
-        // into the parent context; multi-op staging (e.g., batch-varying `Condition` lowering to two branches + a
-        // per-item `Select`) emerges automatically.
-        let mut parent_input_batches: Vec<ArrayBatch<C::Value>> = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let input = input.borrow();
-            let atom = match input.atom_id() {
-                Ok(atom) => atom,
-                Err(error) => return Err(self.error(error)),
-            };
-            let logical_type = input.r#type().into_owned();
-            let axis = input.meta().batch_axis().axis();
-            let parent_physical_type = match axis {
-                Some(k) => logical_type.with_inserted_dimension(k, Size::Static(self.axis_size()))?,
-                None => logical_type,
-            };
-            let parent_value = Tracer::new_with_meta(
-                self.parent().clone(),
-                TracerState::Live(atom),
-                parent_physical_type.clone(),
-                input.meta().parent().clone(),
-            );
-            parent_input_batches.push(ArrayBatch::new(parent_physical_type, parent_value, axis)?);
-        }
-        let output_batches = operation.batch(self, parent_input_batches.as_slice())?;
-
-        let mut output_values = Vec::with_capacity(output_batches.len());
-        for output_batch in output_batches {
-            let axis = output_batch.batch_axis().axis();
-            let parent_value = output_batch.into_value();
-            let parent_physical_type = parent_value.r#type().into_owned();
-            let atom = parent_value.atom_id()?;
-            let logical_type = match axis {
-                Some(k) => parent_physical_type.without_dimension(k)?.0,
-                None => parent_physical_type,
-            };
-            // The output value's `Meta` stack is this level's output axis (head) on top of the rule's parent output
-            // value's stack (tail), so the outer levels' axes for this freshly staged atom are carried through.
-            output_values.push(Tracer::new_with_meta(
-                self.clone(),
-                TracerState::Live(atom),
-                logical_type,
-                BatchingMeta::new(BatchAxis::from(axis), parent_value.meta().clone()),
-            ));
-        }
-        Ok(output_values)
-    }
-}
-
-// TODO(eaplatanios): Review this implementation block and add unit test.
-/// A batching level binds the axis it introduces: a lookup for this level's [`axis_name`](Self::axis_name) resolves to
-/// [`NamedAxis::Batched`] with this level's batch size, and any other name delegates to the parent context. Because
-/// nested `batch` composes by context wrapping, the delegation chain naturally shadows outer bindings with inner ones.
-impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, Self>> + NamedAxes> NamedAxes
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>> + NamedAxes> NamedAxes
     for BatchingContext<C>
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to
+        // `NamedAxis::Batched` with this level's batch size, and any other name delegates to the parent context.
+        // Because nested batching composes by context wrapping, the delegation chain naturally shadows outer
+        // bindings with inner ones.
         if self.axis_name() == Some(name) {
             Some(NamedAxis::Batched { size: self.axis_size() })
         } else {
@@ -894,8 +772,134 @@ impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C,
     }
 }
 
-/// [`Tracer`] that is compatible with [`BatchingContext`]s and uses [`BatchingMeta`] for the metadata that it carries.
-pub type BatchingTracer<C> = Tracer<BatchingContext<C>, BatchingMeta<<C as StagingContext>::Meta>>;
+// TODO(eaplatanios): Review from here onwards.
+
+/// Batch-carrying value flowing through a [`BatchingContext`]: a parent-context value packed with its mapped
+/// [`BatchAxis`] (an [`ArrayBatch`]), together with the [`BatchingContext`] it flows through. The function being
+/// batched computes on these directly; each operation dispatches through the stamped context via
+/// [`Context::bind`](Context::bind), which applies the operation's [`BatchableOperation`] rule against the
+/// parent. Over an eager parent the packed value is concrete, so the closure sees real per-item values (it can branch
+/// on a replicated value, print it, and so on); over a staging parent it is a [`Tracer`] staged into the enclosing
+/// trace. Its [`Typed`] view is the *logical* per-item [`ArrayType`] (the mapped batch axis removed), while the inner
+/// [`ArrayBatch`] carries the physical type and axis.
+pub struct BatchingTracer<C: Context> {
+    /// [`BatchingContext`] this value flows through, used to dispatch its value-capability sugar.
+    context: BatchingContext<C>,
+
+    /// Parent-context value packed with its mapped [`BatchAxis`].
+    batch: ArrayBatch<C::Value>,
+}
+
+impl<C: Context> BatchingTracer<C> {
+    /// Creates a batching value packing `batch` and flowing through `context`.
+    #[inline]
+    pub fn new(context: BatchingContext<C>, batch: ArrayBatch<C::Value>) -> Self {
+        Self { context, batch }
+    }
+
+    /// Returns the [`BatchingContext`] this value flows through.
+    #[inline]
+    pub(crate) fn context(&self) -> &BatchingContext<C> {
+        &self.context
+    }
+
+    /// Returns the packed [`ArrayBatch`] carrying the parent-context value and its mapped [`BatchAxis`].
+    #[inline]
+    pub fn batch(&self) -> &ArrayBatch<C::Value> {
+        &self.batch
+    }
+
+    /// Consumes this value and returns the packed [`ArrayBatch`].
+    #[inline]
+    pub fn into_batch(self) -> ArrayBatch<C::Value> {
+        self.batch
+    }
+}
+
+impl<C: Context<Type = ArrayType>> BatchingTracer<C> {
+    /// Returns this value's mapped [`BatchAxis`].
+    #[inline]
+    pub fn batch_axis(&self) -> BatchAxis {
+        self.batch.batch_axis()
+    }
+}
+
+impl<C: Context> Clone for BatchingTracer<C> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { context: self.context.clone(), batch: self.batch.clone() }
+    }
+}
+
+impl<C: Context> std::fmt::Debug for BatchingTracer<C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("BatchingTracer").field("batch", &self.batch).finish()
+    }
+}
+
+impl<C: Context<Type = ArrayType>> std::fmt::Display for BatchingTracer<C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.batch)
+    }
+}
+
+impl<C: Context<Type = ArrayType>> Typed for BatchingTracer<C> {
+    type Type = ArrayType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayType> {
+        // The logical (per-item) type is the physical type with the mapped batch axis removed. `unbatched_type` only
+        // fails on an out-of-bounds axis, which `ArrayBatch::new` rejects at construction, so it cannot fail here.
+        Cow::Owned(self.batch.unbatched_type().expect("a valid `ArrayBatch` has an in-bounds batch axis"))
+    }
+}
+
+impl<C: Context<Type = ArrayType>> Parameter for BatchingTracer<C> {}
+
+/// A batching value flows through the [`BatchingContext`] stamped on it.
+impl<C> Value for BatchingTracer<C>
+where
+    C: Context<Type = ArrayType>,
+    BatchingContext<C>: Domain<Type = ArrayType, Value = BatchingTracer<C>>,
+{
+    type Domain = BatchingContext<C>;
+
+    #[inline]
+    fn domain(&self) -> BatchingContext<C> {
+        self.context().clone()
+    }
+}
+
+// The elementwise/arithmetic/trigonometric and other operation-specific capability implementations for `BatchingTracer`
+// are hand-written in each operation's own module (bind-forwarding through the stamped `BatchingContext`). The
+// capabilities whose signatures do not fit that shape are implemented by hand below.
+
+/// A batch-carrying value's Boolean view uses its packed value's. Branching on it (via
+/// [`boolean`](BooleanLike::boolean)) succeeds only for a *replicated* value whose packed value is concrete — a mapped
+/// (batched) value has one Boolean per item and cannot drive a single branch, and a staged value carries no concrete
+/// payload.
+impl<C: Context<Type = ArrayType>> BooleanLike for BatchingTracer<C>
+where
+    C::Value: BooleanLike,
+{
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        let boolean_type = self.batch.r#type().as_boolean();
+        let batch = ArrayBatch::new(boolean_type, self.batch.value().as_boolean(), self.batch.batch_axis())
+            .expect("reinterpreting a valid batch's data type as Boolean preserves its shape and axis");
+        BatchingTracer::new(self.context.clone(), batch)
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        if !self.batch.batch_axis().is_replicated() {
+            return Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a batched (mapped) value".to_string(),
+            });
+        }
+        self.batch.value().boolean()
+    }
+}
 
 #[cfg(test)]
 mod tests {

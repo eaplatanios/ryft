@@ -32,12 +32,12 @@ pub trait Domain: Sized {
     /// [`Value`] types supported by this [`Domain`]. Instances of this type are what [`Program`] interpretation and
     /// eager transforms operate on. [`Domain::Type`] represents abstract staging metadata, while [`Domain::Value`]
     /// represents the runtime values that inhabit traced programs during execution.
-    type Value: Value<Self::Type>;
+    type Value: Value<Type = Self::Type>;
 
     /// Constant payload type stored in traced [`Program`]s for this [`Domain`]. For eager domains this is usually the
     /// same type as [`Domain::Value`]. Compiled backends may use a lifetime-free abstract representation here while
     /// reserving [`Domain::Value`] for concrete runtime values.
-    type Constant: Value<Self::Type>;
+    type Constant: Value<Type = Self::Type>;
 
     /// [`Operation`] representation supported by this [`Domain`] for ordinary traced [`Program`]s.
     type Operation: Operation<Self::Type>;
@@ -63,7 +63,7 @@ pub trait Domain: Sized {
     ) -> Result<
         (
             Output::To<Self::Type>,
-            Program<Self::Type, Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
+            Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
     > {
@@ -139,16 +139,14 @@ pub trait Context: Domain + Clone {
     /// the same input. The runtime values flow through `self`, which supplies the concrete value type and the
     /// constant-lifting behavior.
     fn interpret_and_trace<
-        F: FnOnce(
-            Input::To<Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>>,
-        ) -> Result<Output, ProgramError>,
+        F: FnOnce(Input::To<Tracer<TracingContext<Self::Constant, Self::Operation>>>) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 Self::Value,
                 Family: ParameterizedFamily<Self::Constant>
-                            + ParameterizedFamily<Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>>,
+                            + ParameterizedFamily<Tracer<TracingContext<Self::Constant, Self::Operation>>>,
             >,
         Output: Parameterized<
-                Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>,
+                Tracer<TracingContext<Self::Constant, Self::Operation>>,
                 Family: ParameterizedFamily<Self::Value> + ParameterizedFamily<Self::Constant>,
             >,
     >(
@@ -158,7 +156,7 @@ pub trait Context: Domain + Clone {
     ) -> Result<
         (
             Output::To<Self::Value>,
-            Program<Self::Type, Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
+            Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
         ),
         ProgramError,
     >
@@ -169,18 +167,18 @@ pub trait Context: Domain + Clone {
         let input_values = input.into_parameters().collect::<Vec<_>>();
         let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let mut output_structure = None;
-        let (_, flat_program) =
-            Self::trace(
-                |flat_input| {
-                    let input = <Input::To<
-                    Tracer<TracingContext<Self::Type, Self::Constant, Self::Operation>>,
-                >>::from_parameters(input_structure.clone(), flat_input)?;
-                    let output = function(input)?;
-                    output_structure = Some(output.parameter_structure());
-                    Ok(output.into_parameters().collect::<Vec<_>>())
-                },
-                input_types,
-            )?;
+        let (_, flat_program) = Self::trace(
+            |flat_input| {
+                let input = <Input::To<Tracer<TracingContext<Self::Constant, Self::Operation>>>>::from_parameters(
+                    input_structure.clone(),
+                    flat_input,
+                )?;
+                let output = function(input)?;
+                output_structure = Some(output.parameter_structure());
+                Ok(output.into_parameters().collect::<Vec<_>>())
+            },
+            input_types,
+        )?;
         let output_structure = output_structure.unwrap();
         let flat_program = flat_program.into_simplified()?;
         let output_values = flat_program.interpret_with(
@@ -208,16 +206,16 @@ pub trait Context: Domain + Clone {
 /// interpretation contexts explicit in generic code that otherwise has no backend-owned eager context value to pass
 /// around.
 ///
-/// The default operation family is [`ConstantOperation<T, V>`](ConstantOperation), which is the minimal operation
-/// family needed by ordinary eager value contexts that only materialize constants and expose context capabilities such
-/// as zero, one, fill, and scale. Code that binds or batches a richer operation family should still specify `O`
-/// explicitly, such as `EagerContext<ArrayType, V, ArrayOperation<V>>`.
-pub struct EagerContext<T: Type, V: Value<T>, O: Operation<T> = ConstantOperation<T, V>> {
+/// The default operation family is [`ConstantOperation`], which is the minimal operation family needed by ordinary
+/// eager value contexts that only materialize constants and expose context capabilities such as zero, one, fill, etc.
+/// Code that binds or batches a richer operation family should still specify `O` explicitly, such as
+/// `EagerContext<V, ArrayOperation<V>>`.
+pub struct EagerContext<V: Value, O: Operation<V::Type> = ConstantOperation<V>> {
     /// [`PhantomData`] marker tying this zero-sized context to its associated types.
-    marker: PhantomData<fn() -> (T, V, O)>,
+    marker: PhantomData<fn() -> (V, O)>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> EagerContext<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> EagerContext<V, O> {
     /// Creates a new [`EagerContext`].
     #[inline]
     pub const fn new() -> Self {
@@ -225,37 +223,37 @@ impl<T: Type, V: Value<T>, O: Operation<T>> EagerContext<T, V, O> {
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Copy for EagerContext<T, V, O> {}
+impl<V: Value, O: Operation<V::Type>> Copy for EagerContext<V, O> {}
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Clone for EagerContext<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> Clone for EagerContext<V, O> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> std::fmt::Debug for EagerContext<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> std::fmt::Debug for EagerContext<V, O> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("EagerContext")
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Default for EagerContext<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> Default for EagerContext<V, O> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Domain for EagerContext<T, V, O> {
-    type Type = T;
+impl<V: Value, O: Operation<V::Type>> Domain for EagerContext<V, O> {
+    type Type = V::Type;
     type Value = V;
     type Constant = V;
     type Operation = O;
 }
 
-impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> Context for EagerContext<T, V, O> {
+impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O> {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
         Ok(constant)
@@ -272,7 +270,7 @@ impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> Context for Ea
     }
 }
 
-impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> NamedAxes for EagerContext<T, V, O> {
+impl<V: Value, O: InterpretableOperation<V, Self>> NamedAxes for EagerContext<V, O> {
     #[inline]
     fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
         // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
@@ -288,20 +286,11 @@ impl<T: Type, V: Value<T>, O: InterpretableOperation<T, V, Self>> NamedAxes for 
 /// Ordinary backend tracing implements it through [`TracingContext`]. Stackable transform contexts such as batching
 /// or linearization implement it by delegating to a parent context.
 ///
-/// The flowing value is pinned to [`Tracer<Self, Self::Meta>`](Tracer). Every staging context flows a [`Tracer`], and
-/// the associated [`Meta`](StagingContext::Meta) selects the transform-specific metadata carried alongside each staged
-/// value (e.g., a partial evaluation known/unknown classification or a batch axis).
-pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>::Meta>> {
-    /// Transform-specific metadata carried alongside each staged [`Tracer`] flowing through this context (e.g., a
-    /// partial evaluation known/unknown classification or a batch axis). This type requires [`Clone`] and [`Debug`]
-    /// because the flowing [`Domain::Value`] is pinned to [`Tracer<Self, Self::Meta>`](Tracer), which is a [`Value`]
-    /// (and hence the [`Clone`] and [`Debug`] bounds) only when its metadata is. It also requires [`Default`] because
-    /// the staging functions (i.e., [`input`](Self::input), [`constant`](Self::constant), and [`tracer`](Self::tracer))
-    /// create fresh tracers via [`Tracer::new`], seeding their metadata from [`Default::default`].
-    type Meta: Clone + Debug + Default;
-
+/// The flowing value is pinned to [`Tracer<Self>`](Tracer): every staging context records operation invocations as
+/// [`Program`] instructions and hands back [`Tracer`]s standing in for their results.
+pub trait StagingContext: Context<Value = Tracer<Self>> {
     /// Returns the shared [`ProgramBuilder`] owned by this [`StagingContext`].
-    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Type, Self::Constant, Self::Operation>>>;
+    fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>>;
 
     /// Creates a constant [`Tracer`] in this context with the provided constant payload.
     #[inline]
@@ -396,7 +385,7 @@ pub trait StagingContext: Context<Value = Tracer<Self, <Self as StagingContext>:
     #[inline]
     fn stage_program<Input: Parameterized<Self::Constant>, Output: Parameterized<Self::Constant>>(
         &self,
-        program: &Program<Self::Type, Self::Constant, Self::Operation, Input, Output>,
+        program: &Program<Self::Constant, Self::Operation, Input, Output>,
         inputs: Vec<Self::Value>,
     ) -> Result<Vec<Self::Value>, ProgramError>
     where
@@ -484,8 +473,8 @@ mod tests {
 
     #[test]
     fn test_eager_context_binds_and_lifts_values() {
-        let context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::new();
-        let default_context = EagerContext::<DataType, Scalar, ScalarOperation<Scalar>>::default();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let default_context = EagerContext::<Scalar, ScalarOperation<Scalar>>::default();
         let copied_context = context;
         let cloned_context = copied_context.clone();
 
@@ -593,7 +582,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_stages_programs_by_lifting_constants_and_replaying_instructions() {
-        let mut source_builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let source_input = source_builder.add_input(DataType::F64);
         let source_constant = source_builder.add_constant(Scalar::from(4.0));
         let source_output =

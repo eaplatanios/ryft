@@ -9,7 +9,7 @@ use crate::operations::Operation;
 use crate::parameters::Placeholder;
 use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::TracingContext;
-use crate::types::{Type, Typed};
+use crate::types::Typed;
 
 /// State of a [`Value`] during partial evaluation. A [`PartialValue`] is the value domain the partial evaluator
 /// interprets a [`Program`] over. Every [`Atom`] and every intermediate result is either [`Known`](Self::Known)
@@ -17,15 +17,15 @@ use crate::types::{Type, Typed};
 /// the residual program runs). For more information on partial evaluation, refer to the documentation of
 /// [`Program::partially_evaluate`].
 #[derive(Clone, Debug)]
-pub enum PartialValue<T: Type, V: Value<T>> {
+pub enum PartialValue<V: Value> {
     /// [`Value`] that is fully known at partial-evaluation time and can be folded forward.
     Known(V),
 
     /// [`Value`] that is not known until the residual program runs and only its [`Type`] is known.
-    Unknown(T),
+    Unknown(V::Type),
 }
 
-impl<T: Type, V: Value<T>> PartialValue<T, V> {
+impl<V: Value> PartialValue<V> {
     /// Returns `true` if this value is [`Known`](Self::Known).
     #[inline]
     pub fn is_known(&self) -> bool {
@@ -48,9 +48,11 @@ impl<T: Type, V: Value<T>> PartialValue<T, V> {
     }
 }
 
-impl<T: Type, V: Value<T>> Typed<T> for PartialValue<T, V> {
+impl<V: Value> Typed for PartialValue<V> {
+    type Type = V::Type;
+
     #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
+    fn r#type(&self) -> Cow<'_, V::Type> {
         match self {
             Self::Known(value) => value.r#type(),
             Self::Unknown(r#type) => Cow::Borrowed(r#type),
@@ -100,9 +102,9 @@ pub enum PartialValueMaterialization {
 
 /// Represents the [`Value`] type used by [`PartialEvaluator`]s while partially evaluating [`Program`]s.
 #[derive(Clone, Debug)]
-pub struct PartialEvaluationValue<T: Type, V: Value<T>> {
+pub struct PartialEvaluationValue<V: Value> {
     /// Underlying [`PartialValue`] that represents the abstract known/unknown classification of the value.
-    value: PartialValue<T, V>,
+    value: PartialValue<V>,
 
     /// [`PartialValueMaterialization`] that describes how the underlying value is represented at the residual program
     /// boundary. This is deliberately separate from the underlying [`PartialValue`] because it answers a different
@@ -113,7 +115,7 @@ pub struct PartialEvaluationValue<T: Type, V: Value<T>> {
     materialization: PartialValueMaterialization,
 }
 
-impl<T: Type, V: Value<T>> PartialEvaluationValue<T, V> {
+impl<V: Value> PartialEvaluationValue<V> {
     /// Creates a known [`PartialEvaluationValue`] with [`PartialValueMaterialization::Undecided`].
     #[inline]
     pub fn known(value: V) -> Self {
@@ -137,7 +139,7 @@ impl<T: Type, V: Value<T>> PartialEvaluationValue<T, V> {
 
     /// Creates an unknown [`PartialEvaluationValue`] with [`PartialValueMaterialization::Variable`].
     #[inline]
-    pub fn variable(r#type: T, residual_atom: AtomId) -> Self {
+    pub fn variable(r#type: V::Type, residual_atom: AtomId) -> Self {
         Self {
             value: PartialValue::Unknown(r#type),
             materialization: PartialValueMaterialization::Variable { residual_atom },
@@ -146,7 +148,7 @@ impl<T: Type, V: Value<T>> PartialEvaluationValue<T, V> {
 
     /// Returns the underlying [`PartialValue`].
     #[inline]
-    pub fn value(&self) -> &PartialValue<T, V> {
+    pub fn value(&self) -> &PartialValue<V> {
         &self.value
     }
 
@@ -175,9 +177,11 @@ impl<T: Type, V: Value<T>> PartialEvaluationValue<T, V> {
     }
 }
 
-impl<T: Type, V: Value<T>> Typed<T> for PartialEvaluationValue<T, V> {
+impl<V: Value> Typed for PartialEvaluationValue<V> {
+    type Type = V::Type;
+
     #[inline]
-    fn r#type(&self) -> Cow<'_, T> {
+    fn r#type(&self) -> Cow<'_, V::Type> {
         self.value.r#type()
     }
 }
@@ -252,7 +256,7 @@ impl<V> PartialEvaluationOutput<V> {
 /// For more information on partial evaluation, refer to the documentation of [`Program::partially_evaluate`].
 pub struct PartialEvaluation<C: Context> {
     /// Refer to the documentation of [`program`](Self::program) for more information.
-    pub(crate) program: Program<C::Type, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+    pub(crate) program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
 
     /// Refer to the documentation of [`inputs`](Self::inputs) for more information.
     pub(crate) inputs: Vec<PartialEvaluationInput<C::Value>>,
@@ -265,7 +269,7 @@ impl<C: Context> PartialEvaluation<C> {
     /// Returns the residual [`Program`] of this [`PartialEvaluation`], over the surviving unknown inputs plus the known
     /// residuals, aligned with [`inputs`](Self::inputs) and producing the unknown outputs in their original order.
     #[inline]
-    pub fn program(&self) -> &Program<C::Type, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
+    pub fn program(&self) -> &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
         &self.program
     }
 
@@ -351,12 +355,12 @@ impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
 /// [`Program`] that has been partitioned into a _known_ program and a _residual_ program based on information about
 /// which of its inputs are _known_. This is the result of calling [`Program::partition`]. This is typically passed to
 /// [`PartialEvaluator::inline_partitioned_program`] to inline it as part of an ongoing partial evaluation transform.
-pub struct PartitionedProgram<T: Type, V: Value<T>, O: Operation<T>> {
+pub struct PartitionedProgram<V: Value, O: Operation<V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
-    pub(crate) known_program: Program<T, V, O, Vec<V>, Vec<V>>,
+    pub(crate) known_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Refer to the documentation of [`residual_program`](Self::residual_program) for more information.
-    pub(crate) residual_program: Program<T, V, O, Vec<V>, Vec<V>>,
+    pub(crate) residual_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Refer to the documentation of [`known_input_indices`](Self::known_input_indices) for more information.
     pub(crate) known_input_indices: Vec<usize>,
@@ -368,7 +372,7 @@ pub struct PartitionedProgram<T: Type, V: Value<T>, O: Operation<T>> {
     pub(crate) outputs: Vec<PartialEvaluationOutput<usize>>,
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> PartitionedProgram<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
     /// Returns the known-side [`Program`] of this [`PartitionedProgram`], which represents the known work reified
     /// through a fresh trace, taking the original inputs identified by
     /// [`known_input_indices`](Self::known_input_indices) and producing the fully known outputs followed by the
@@ -376,14 +380,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>> PartitionedProgram<T, V, O> {
     /// this program has no outputs and (since simplification keeps only effectful dead work around) usually no
     /// instructions, in which case there is no known-side work worth wrapping in a boundary operation.
     #[inline]
-    pub fn known_program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+    pub fn known_program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.known_program
     }
 
     /// Returns the residual-side [`Program`] of this [`PartitionedProgram`], which represents the callee's partial
     /// evaluation residual program, whose inputs are described by [`residual_inputs`](Self::residual_inputs).
     #[inline]
-    pub fn residual_program(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+    pub fn residual_program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.residual_program
     }
 
@@ -460,8 +464,8 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     fn partially_evaluate(
         &self,
         evaluator: &mut PartialEvaluator<C>,
-        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         evaluator.fold_or_residualize(self.clone(), inputs)
     }
 }
@@ -488,8 +492,8 @@ pub trait PartiallyEvaluatableProgramOperation<C: Context<Operation = Self>>: Op
     ///   - `inputs`: Input [`PartialValue`]s to use for partially evaluating the provided [`Program`].
     fn partially_evaluate_program(
         context: &C,
-        program: &Program<C::Type, C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
-        inputs: &[PartialValue<C::Type, C::Value>],
+        program: &Program<C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
+        inputs: &[PartialValue<C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError>;
 }
 
@@ -497,8 +501,8 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> PartiallyEvaluatab
     #[inline]
     fn partially_evaluate_program(
         context: &C,
-        program: &Program<C::Type, C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
-        inputs: &[PartialValue<C::Type, C::Value>],
+        program: &Program<C::Constant, Self, Vec<C::Constant>, Vec<C::Constant>>,
+        inputs: &[PartialValue<C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError> {
         program.partially_evaluate_in_context(context, inputs)
     }
@@ -516,7 +520,7 @@ pub struct PartialEvaluator<C: Context> {
     context: C,
 
     /// [`ProgramBuilder`] accumulating the residual program's [`Atom`]s and [`Instruction`](crate::Instruction)s.
-    builder: ProgramBuilder<C::Type, C::Constant, C::Operation>,
+    builder: ProgramBuilder<C::Constant, C::Operation>,
 
     /// [`PartialEvaluationInput`]s for the residual program, in residual program input order.
     inputs: Vec<PartialEvaluationInput<C::Value>>,
@@ -611,8 +615,8 @@ impl<C: Context> PartialEvaluator<C> {
     pub fn fold_or_residualize<P: Into<C::Operation>>(
         &mut self,
         operation: P,
-        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let operation = operation.into();
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
@@ -643,8 +647,8 @@ impl<C: Context> PartialEvaluator<C> {
     pub fn residualize<P: Into<C::Operation>>(
         &mut self,
         operation: P,
-        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Materialize each known input into a residual-program atom. The deduplication fast-paths return early,
         // and a genuine error rides `?` out through the `collect` into `residualize`.
         let input_atoms = inputs
@@ -767,9 +771,9 @@ impl<C: Context> PartialEvaluator<C> {
     /// through [`Context::resolve`].
     pub fn inline_program(
         &mut self,
-        program: &Program<C::Type, C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        inputs: Vec<PartialEvaluationValue<C::Type, C::Value>>,
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError>
+        program: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        inputs: Vec<PartialEvaluationValue<C::Value>>,
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
     where
         C::Operation: PartiallyEvaluatableOperation<C>,
     {
@@ -777,7 +781,7 @@ impl<C: Context> PartialEvaluator<C> {
         // The walk runs inside a closure so the scope is popped on every exit path, including error paths, keeping
         // the scope stack balanced.
         self.materialization_scopes.push(vec![None; program.atoms.len()]);
-        let result = (|| -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+        let result = (|| -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
             // Walk-time value of each atom in `program`, populated as the forward pass reaches it. Bind each
             // known input to its program atom, making that atom its materialization deduplication key.
             let mut values = vec![None; program.atoms.len()];
@@ -858,18 +862,18 @@ impl<C: Context> PartialEvaluator<C> {
     ///   - `build_known_operation`: Wraps the provided known [`Program`] in the known-side boundary operation.
     ///   - `build_residual_operation`: Wraps the provided residual [`Program`] in the residual boundary operation.
     pub fn inline_partitioned_program<
-        V: Value<C::Type>,
+        V: Value<Type = C::Type>,
         O: Operation<C::Type>,
         P: Into<C::Operation>,
-        BuildKnownProgramOperation: FnOnce(Program<C::Type, V, O, Vec<V>, Vec<V>>) -> P,
-        BuildResidualProgramOperation: FnOnce(Program<C::Type, V, O, Vec<V>, Vec<V>>) -> P,
+        BuildKnownProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> P,
+        BuildResidualProgramOperation: FnOnce(Program<V, O, Vec<V>, Vec<V>>) -> P,
     >(
         &mut self,
-        program: PartitionedProgram<C::Type, V, O>,
-        inputs: &[PartialEvaluationValue<C::Type, C::Value>],
+        program: PartitionedProgram<V, O>,
+        inputs: &[PartialEvaluationValue<C::Value>],
         build_known_operation: BuildKnownProgramOperation,
         build_residual_operation: BuildResidualProgramOperation,
-    ) -> Result<Vec<PartialEvaluationValue<C::Type, C::Value>>, ProgramError> {
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Bind the known-side operation into the known-side context over the original known inputs.
         let known_inputs = program
             .known_input_indices
@@ -971,7 +975,7 @@ impl<C: Context> PartialEvaluator<C> {
     /// (i.e., it is a genuine [`Tracer`](crate::Tracer) into a live outer trace). This is the signal online boundary
     /// rules split on: all-concrete knowledge keeps the default fold-or-residualize behavior.
     #[inline]
-    pub fn any_known_is_symbolic(&self, inputs: &[PartialEvaluationValue<C::Type, C::Value>]) -> bool {
+    pub fn any_known_is_symbolic(&self, inputs: &[PartialEvaluationValue<C::Value>]) -> bool {
         inputs.iter().any(|input| match input.value() {
             PartialValue::Known(value) => !self.context.resolve(value).is_concrete(),
             PartialValue::Unknown(_) => false,
@@ -979,7 +983,7 @@ impl<C: Context> PartialEvaluator<C> {
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
+impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Partially evaluates this [`Program`] against the provided [`PartialValue`] inputs, folding known work eagerly.
     /// This is the main partial evaluation entry point, instantiated at this program's own [`EagerContext`] so that
     /// known values are concrete values and folding interprets each all-known [`Instruction`](crate::Instruction)
@@ -1020,10 +1024,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
     #[inline]
     pub fn partially_evaluate(
         &self,
-        inputs: &[PartialValue<T, V>],
-    ) -> Result<PartialEvaluation<EagerContext<T, V, O>>, ProgramError>
+        inputs: &[PartialValue<V>],
+    ) -> Result<PartialEvaluation<EagerContext<V, O>>, ProgramError>
     where
-        O: InterpretableOperation<T, V, EagerContext<T, V, O>> + PartiallyEvaluatableOperation<EagerContext<T, V, O>>,
+        O: InterpretableOperation<V, EagerContext<V, O>> + PartiallyEvaluatableOperation<EagerContext<V, O>>,
     {
         self.partially_evaluate_in_context(&EagerContext::new(), inputs)
     }
@@ -1031,10 +1035,10 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
     /// Partially evaluates this [`Program`] against the provided [`PartialValue`] inputs, folding known work through
     /// the provided known-side [`Context`]. This is the context-taking core behind
     /// [`partially_evaluate`](Self::partially_evaluate).
-    pub fn partially_evaluate_in_context<C: Context<Type = T, Constant = V, Operation = O>>(
+    pub fn partially_evaluate_in_context<C: Context<Type = V::Type, Constant = V, Operation = O>>(
         &self,
         context: &C,
-        inputs: &[PartialValue<T, C::Value>],
+        inputs: &[PartialValue<C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError>
     where
         O: PartiallyEvaluatableOperation<C>,
@@ -1103,14 +1107,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Program<T, V, O, Vec<V>, Vec<V>> {
     ///
     ///   - `input_known`: Known-ness of each program input, in input order. The length of this slice must match the
     ///     number of inputs of this [`Program`].
-    pub fn partition(&self, input_known: &[bool]) -> Result<PartitionedProgram<T, V, O>, ProgramError>
+    pub fn partition(&self, input_known: &[bool]) -> Result<PartitionedProgram<V, O>, ProgramError>
     where
-        O: PartiallyEvaluatableOperation<TracingContext<T, V, O>>,
+        O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
     {
         let input_types = self.input_types();
         check_count!("input", input_known, input_types.len(), ProgramError);
 
-        let context = TracingContext::<T, V, O>::new();
+        let context = TracingContext::<V, O>::new();
         let inputs = input_types
             .iter()
             .zip(input_known.iter())
@@ -1211,7 +1215,7 @@ mod tests {
         // Build a residual program `g(x, r) = x * r + 3`, with `x` standing for the original program's surviving
         // unknown input and `r` for a known residual feeder carrying the folded value `2`, and pair it with an
         // original output report whose first output folded to `5`.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let x = builder.add_input(DataType::F64);
         let r = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(3.0));
@@ -1346,7 +1350,7 @@ mod tests {
 
         // `inline_program` walks a program over seed values. All-known seeds fold every instruction, lifting the
         // program constant into the known-side context on first use, and so the walk returns folded values.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
@@ -1380,7 +1384,7 @@ mod tests {
         // operation, and the original outputs are reassembled from the two operations' outputs. The partitioned sides
         // of `f(a, x) = sin(a) * x` are a single `sin` and a single `mul`, and so those operations themselves serve as
         // arity-matching boundary operations.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
@@ -1403,7 +1407,7 @@ mod tests {
 
         // An all-known partitioned program folds entirely through the known-side boundary operation, and so the
         // reassembled outputs are known values even though the (empty) residual operation is still emitted.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let sine = builder.add_instruction(SinOperation, vec![a]).unwrap()[0];
         let program =
@@ -1437,7 +1441,7 @@ mod tests {
 
         // `all_knowns_are_concrete` checks every known feeder and folded output of a partial evaluation, which is only
         // non-trivial under a staging known-side context where knowns can be live tracers.
-        let empty = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new()
+        let empty = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new()
             .build::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), Vec::new(), Vec::new())
             .unwrap();
         assert!(evaluator.all_knowns_are_concrete(&PartialEvaluation::<ScalarEagerContext> {
@@ -1472,7 +1476,7 @@ mod tests {
         // `f(a, x) = (a * a, a * a * x + 1, a * a + x)` with `a` known and `x` unknown: the `a * a` subcomputation
         // folds to a known output, its two residual consumers share one residual feeder, and the literal is rebuilt
         // inline as a residual constant instead of becoming a feeder.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
@@ -1571,7 +1575,7 @@ mod tests {
         // Effectful operations place by input known-ness. An all-known `print` folds (firing its effect at partial
         // evaluation time), while a mixed-input `print` residualizes and is kept in the residual program even when
         // no output consumes it.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let printed = builder.add_instruction(PrintOperation::new("known"), vec![a]).unwrap()[0];
@@ -1610,7 +1614,7 @@ mod tests {
         // `f(a, x) = (a * a) * x + 1` with `a` known as a live tracer of an enclosing trace and `x` unknown: the known
         // `a * a` folds by staging into the outer program, the residual program consumes its staged result through a
         // known feeder naming the outer atom, and the literal is rebuilt inline as a residual constant.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let c = builder.add_constant(Scalar::from(1.0));
@@ -1673,7 +1677,7 @@ mod tests {
         // `f(a, x) = (a + a, sin(a) * x)` partitioned with `a` known and `x` unknown: `a + a` is a fully known output,
         // `sin(a)` is a residual edge trailing it among the known program's outputs, and the residual program computes
         // the mixed output over the surviving unknown input plus the edge.
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let a = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
         let doubled = builder.add_instruction(AddOperation, vec![a, a]).unwrap()[0];

@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 use crate::batching::BatchingError;
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::programs::ProgramError;
 use crate::tracing_v2::operations::collective::AxisIndexOperation;
@@ -64,23 +64,23 @@ pub trait AxisIndex: Context {
     fn axis_index(&self, name: &str) -> Result<Self::Value, ProgramError>;
 }
 
-impl<C: StagingContext<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for C {
+impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for C {
     fn axis_index(&self, name: &str) -> Result<Self::Value, ProgramError> {
-        // Every staging context reads an axis index the same way: validate `name` against the active `NamedAxes`
-        // environment and then stage a nullary `AxisIndexOperation`, so the reader needs no knowledge of whether `name`
-        // is a batching or mesh axis. That staged operation carries the per-axis-kind resolution as it flows outward
-        // through `stage_operation`: the batching level that bound `name` consumes it (its batching rule materializes
-        // the per-element index) an inner batching level re-stages it into its parent, and a mesh axis survives into
-        // the base program to lower during sharded execution (refer to the documentation of `AxisIndexOperation`).
-        // Because resolution happens as the operation is consumed, a batched axis reached across a non-batching wrapper
-        // that *interprets* a nested program (e.g., an outer batch addressed from inside a `jvp` trace, whose primal
-        // program is spliced by interpretation) is not supported; the operation is interpreted before any batching rule
-        // can consume it and reports `ProgramError::UnsupportedOperation`. Mesh axes are unaffected, as they are meant
-        // to survive interpretation.
+        // Every context reads an axis index the same way. It validates `name` against the active `NamedAxes`
+        // environment and then binds a nullary `AxisIndexOperation`, so the caller needs no knowledge of whether `name`
+        // is a batching or mesh axis. That operation carries the per-axis-kind resolution as it flows outward: the
+        // batching level that bound `name` consumes it (its batching rule materializes the per-element index), an inner
+        // batching level re-binds it into its parent, and a mesh axis survives into the base program to lower during
+        // sharded execution (refer to the documentation of `AxisIndexOperation`). Because resolution happens as the
+        // operation is consumed, a batched axis reached across a non-batching wrapper that *interprets* a nested
+        // program (e.g., an outer batch addressed from inside a `jvp` trace, whose primal program is spliced by
+        // interpretation) is not supported. The operation is interpreted before any batching rule can consume it
+        // and reports `ProgramError::UnsupportedOperation`. Mesh axes are unaffected, as they are meant to survive
+        // interpretation.
         if self.named_axis(name).is_none() {
             return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: name.to_string() }).into());
         }
-        let mut outputs = self.stage_nullary_operation(AxisIndexOperation::new(name.to_string()))?;
+        let mut outputs = self.bind(AxisIndexOperation::new(name.to_string()), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
