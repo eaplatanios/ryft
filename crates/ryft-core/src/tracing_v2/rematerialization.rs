@@ -11,128 +11,45 @@
 //! recomputes the remaining linearization residuals before replaying the transposed tangent map, and the tangent
 //! program replays the pushforward for forward mode.
 //!
-//! This module also owns the [`rematerialization_name`](RematerializationName) value-tagging primitive
-//! ([`RematerializationNameOperation`]) consumed by the name-based [`RematerializationPolicy`] members.
+//! The name-based [`RematerializationPolicy`] members classify residuals by the
+//! [`tag`](crate::operations::tag::Tag::tag) key carried by [`TagOperation`](crate::operations::tag::TagOperation).
 
 use std::cell::RefCell;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use half::{bf16, f16};
-
-use crate::contexts::{Context, EagerContext, StagingContext};
-use crate::differentiation::{Cotangent, DifferentiableType, TransposableOperation};
-use crate::domains::Domain;
+use crate::batching::ArrayBatch;
+use crate::batching::BatchingContext;
+use crate::batching::BatchingError;
+use crate::batching::{BatchableOperation, BatchableProgramOperation};
+use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::differentiation::{DifferentiableType, TransposableOperation};
+use crate::effects::Effects;
+use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
+use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
-use crate::operations::manipulation::{Broadcast, Transpose};
-use crate::operations::{ElementwiseOperation, InterpretableOperation, InterpretableProgramOperation, Operation};
+use crate::operations::constants::{Constant as ConstantCapability, Zero, ZeroOperation};
+use crate::operations::control_flow::MaybeScan;
+use crate::operations::manipulation::{BroadcastOperation, TransposeOperation};
+use crate::operations::tag::MaybeTag;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{AtomId, Program, ProgramError, Value};
+use crate::payloads::Captured;
+use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, BatchableProgramOperation, BatchingContext};
 use crate::tracing_v2::differentiation::DifferentiationContext;
-use crate::tracing_v2::linearization::{
+use crate::tracing_v2::differentiation::materialize;
+use crate::tracing_v2::differentiation::{
     DifferentiableOperation, JvpTracer, replay_via_bind, transpose_tangent_partitioned,
 };
-use crate::tracing_v2::linearization_trace::LinearizationContext;
-use crate::tracing_v2::operations::control_flow::stage_cotangent;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_program_inline, batch_rewrapped_program, stage_rewrapped_custom_call,
 };
 use crate::tracing_v2::operations::dot::{DotDimensionNumbers, MaybeDot};
 use crate::tracing_v2::operations::memory::{TransferToMemory, TransferToMemoryOperation};
-use crate::types::{ArrayType, DataType, Memory, Type, TypeError, Typed};
-
-/// Canonical operation name for [`RematerializationNameOperation`].
-pub const REMATERIALIZATION_NAME_OPERATION_NAME: &'static str = "rematerialization_name";
-
-/// [`Operation`] that returns its input unchanged while tagging it with a name visible to rematerialization policies — the
-/// direct analogue of JAX's
-/// [`jax.ad_checkpoint.checkpoint_name`](https://docs.jax.dev/en/latest/gradient-checkpointing.html#custom-policies-for-offloadable-and-saveable-names).
-///
-/// Interpretation, batching, and backend lowering all treat this operation as the identity, and differentiation
-/// passes the tangent through unchanged while re-tagging the primal — so the tag is visible on the instructions that
-/// define linearization residuals, which is exactly what the name-based members of
-/// [`RematerializationPolicy`] classify.
-#[derive(Clone, Debug)]
-pub struct RematerializationNameOperation {
-    /// Name tagging the operation's output value.
-    name: String,
-}
-
-impl RematerializationNameOperation {
-    /// Creates a new [`RematerializationNameOperation`] with the provided tag name.
-    pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
-    }
-
-    /// Returns the tag name carried by this operation.
-    #[inline]
-    pub fn tag(&self) -> &str {
-        self.name.as_str()
-    }
-}
-
-impl Display for RematerializationNameOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{REMATERIALIZATION_NAME_OPERATION_NAME}[{}]", self.name)
-    }
-}
-
-impl Operation<DataType> for RematerializationNameOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        REMATERIALIZATION_NAME_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl Operation<ArrayType> for RematerializationNameOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        REMATERIALIZATION_NAME_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for RematerializationNameOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-}
-
-impl<T: Type, V: Clone + Value<T>> InterpretableOperation<T, V> for RematerializationNameOperation
-where
-    Self: Operation<T>,
-{
-    #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].clone()])
-    }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for RematerializationNameOperation {}
+use crate::types::{ArrayType, Memory, Type, TypeError, Typed};
 
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
@@ -270,20 +187,27 @@ impl<T: Type, V: Value<T>, O: Operation<T>> Operation<T> for RematerializeOperat
         check_types!("rematerialize input", &self.input_types(), input_types);
         Ok(self.output_types())
     }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        // The forward, backward, and tangent programs replay the primal, so the primal's summary covers them; the
+        // union guards derived programs that stage extra effectful work (none do today).
+        self.primal
+            .effects()
+            .union(self.forward.effects())
+            .union(self.backward.effects())
+            .union(self.tangent.effects())
+    }
 }
 
-impl<T, Constant, O, V> InterpretableOperation<T, V> for RematerializeOperation<T, Constant, O>
+impl<T, Constant, O, V, C> InterpretableOperation<T, V, C> for RematerializeOperation<T, Constant, O>
 where
     T: Type,
     Constant: Value<T>,
     V: Value<T>,
-    O: InterpretableProgramOperation<T, V, Constant>,
+    O: InterpretableProgramOperation<T, V, C, Constant>,
 {
-    fn interpret(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         O::interpret_program(context, &self.primal, inputs.to_vec())
     }
 }
@@ -291,8 +215,10 @@ where
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<T: Type, V: Value<T>, O: Operation<T>> PartiallyEvaluatableOperation<T, V, O>
+impl<T: Type, V: Value<T>, O: Clone + Operation<T>, C: Context<Type = T>> PartiallyEvaluatableOperation<C>
     for RematerializeOperation<T, V, O>
+where
+    C::Operation: From<RematerializeOperation<T, V, O>>,
 {
 }
 
@@ -311,16 +237,17 @@ impl<T: Type, V: Value<T>, O: Operation<T>> PartiallyEvaluatableOperation<T, V, 
 ///   3. Each primal output is paired with its staged output tangent into a [`JvpTracer`].
 ///
 /// Because both spliced programs are straight-line primal-enum operations referencing the staged tracers directly,
-/// the rule introduces no symbolic capture and the enclosing
-/// [`partition`](crate::Program::partition) discovers the residual operand edges structurally — so
-/// this is a leaf rule needing no [`DifferentiableProgramOperation`](crate::tracing_v2::linearization::DifferentiableProgramOperation)
+/// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
+/// operand edges structurally — so
+/// this is a leaf rule needing no [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation)
 /// witness, and reverse mode transposes the spliced recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).
-impl<C: StagingContext> DifferentiableOperation<C> for RematerializeOperation<C::Type, C::Constant, C::Operation>
+impl<C: Context + Zero<C::Type, C::Value>> DifferentiableOperation<C>
+    for RematerializeOperation<C::Type, C::Constant, C::Operation>
 where
     C::Constant: Clone,
-    C::Operation: Clone + MaybeZeroOperation<C::Type> + From<ZeroOperation<C::Type>>,
+    C::Operation: Clone,
 {
     fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         let output_count = self.output_types().len();
@@ -343,7 +270,10 @@ where
         // Splice the tangent program on `(forward_tail..., input_tangents...)`, yielding one output tangent per primal
         // output.
         let mut tangent_operands = forward_tail;
-        tangent_operands.extend(inputs.iter().map(|input| input.tangent().clone()));
+        // The rematerialize call takes every input tangent as a real operand, so materialize structural zeros.
+        for input in inputs {
+            tangent_operands.push(materialize(context, input.tangent().clone())?);
+        }
         let tangent_outputs = replay_via_bind(context, self.tangent(), tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
@@ -352,6 +282,30 @@ where
             .zip(tangent_outputs)
             .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
             .collect())
+    }
+}
+
+/// Transpose rule for [`RematerializeOperation`]: the call is a higher-order primal boundary rather than a linear
+/// map, so a tangent program never contains it on a linear operand (linearization splices the derived forward and
+/// tangent programs instead) and the rule reports an
+/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+impl<T, V, O, W, OLinear> TransposableOperation<T, W, OLinear> for RematerializeOperation<T, V, O>
+where
+    T: Type,
+    V: Value<T>,
+    W: Value<T>,
+    O: Operation<T>,
+    OLinear: Operation<T>,
+{
+    fn transpose(
+        &self,
+        _context: &mut TracingContext<T, W, OLinear>,
+        _inputs: &[PartialValue<T, Tracer<TracingContext<T, W, OLinear>>>],
+        _outputs: &[MaybeZero<T, Tracer<TracingContext<T, W, OLinear>>>],
+    ) -> Result<Vec<MaybeZero<T, Tracer<TracingContext<T, W, OLinear>>>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+        })
     }
 }
 
@@ -365,28 +319,30 @@ where
         &self,
         context: &EagerContext<ArrayType, V, O>,
         inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         batch_program_inline(context, &self.primal, inputs)
     }
 }
 
 /// Traced batching for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
 /// programs so the rematerialization boundary survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<Tracer<C>, BatchingContext<C>> for RematerializeOperation<ArrayType, C::Constant, O>
+impl<C, O> BatchableOperation<Tracer<C, C::Meta>, BatchingContext<C>>
+    for RematerializeOperation<ArrayType, C::Constant, O>
 where
-    C: StagingContext<Type = ArrayType, Value = Tracer<C>, Operation = O>,
+    C: StagingContext<Type = ArrayType, Operation = O>,
     C::Constant: Value<ArrayType>,
     O: Clone
         + Operation<ArrayType>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>
         + From<RematerializeOperation<ArrayType, C::Constant, O>>
         + BatchableProgramOperation<C::Constant>,
-    Tracer<C>: Broadcast + Transpose,
 {
     fn batch(
         &self,
         context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<Tracer<C>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C>>>, ProgramError> {
+        inputs: &[ArrayBatch<Tracer<C, C::Meta>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<C, C::Meta>>>, BatchingError> {
         stage_rewrapped_custom_call(context, inputs, |batched| match batched {
             None => Ok(O::from(self.clone())),
             Some(axis_size) => Ok(O::from(
@@ -531,29 +487,31 @@ impl<T: Type, V: Value<T>, F: Value<T>, O: Operation<T>> Operation<T> for Remate
             Ok(self.tangent.output_types())
         }
     }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        self.backward.effects().union(self.tangent.effects())
+    }
 }
 
-impl<T, Constant, O, F, V> InterpretableOperation<T, V> for RematerializeCallOperation<T, Constant, O, F>
+impl<T, Constant, O, F, V, C> InterpretableOperation<T, V, C> for RematerializeCallOperation<T, Constant, O, F>
 where
     T: Type,
     Constant: Value<T>,
-    V: Value<T, InterpretationContext: Context<Type = T, Constant = Constant, Value = V>>,
+    V: Value<T>,
     F: CustomVjpResidual<T, V>,
-    O: InterpretableOperation<T, V> + Operation<T>,
+    O: InterpretableOperation<T, V, C> + Operation<T>,
+    C: ConstantCapability<T, V, Constant, Captured>,
     Vec<Constant>: Parameterized<Constant, ParameterStructure: Debug + PartialEq>,
 {
-    fn interpret(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let program = if self.transposed { &self.backward } else { &self.tangent };
         let mut values =
             self.residuals.iter().map(|residual| residual.residual_value()).collect::<Result<Vec<_>, _>>()?;
         values.extend(inputs.iter().cloned());
         program.interpret_with(
             values,
-            |_, constant| context.lift(constant.clone()),
+            |_, constant| context.constant(constant.clone()),
             |instruction, inputs| instruction.operation().interpret(context, inputs),
         )
     }
@@ -563,8 +521,10 @@ where
 /// [`RematerializeCallOperation`]. The residual operation family `O` is independent of the call's primal operation
 /// family `CallOperation`, because partial evaluation never inlines a nested program here and so never builds a
 /// residual program of its own.
-impl<T: Type, V: Value<T>, CallOperation: Operation<T>, F: Value<T>, ValueType: Value<T>, O>
-    PartiallyEvaluatableOperation<T, ValueType, O> for RematerializeCallOperation<T, V, CallOperation, F>
+impl<T: Type, V: Value<T>, CallOperation: Clone + Operation<T>, F: Value<T>, C: Context<Type = T>>
+    PartiallyEvaluatableOperation<C> for RematerializeCallOperation<T, V, CallOperation, F>
+where
+    C::Operation: From<RematerializeCallOperation<T, V, CallOperation, F>>,
 {
 }
 
@@ -582,15 +542,14 @@ where
         &self,
         context: &mut TracingContext<T, W, OLinear>,
         _inputs: &[PartialValue<T, Tracer<TracingContext<T, W, OLinear>>>],
-        outputs: &[Cotangent<T, W, OLinear>],
-    ) -> Result<Vec<Cotangent<T, W, OLinear>>, ProgramError> {
+        outputs: &[MaybeZero<T, Tracer<TracingContext<T, W, OLinear>>>],
+    ) -> Result<Vec<MaybeZero<T, Tracer<TracingContext<T, W, OLinear>>>>, ProgramError> {
         let cotangent_types = if self.transposed { self.tangent_input_types() } else { self.cotangent_types() };
         check_count!("output", outputs, cotangent_types.len(), ProgramError);
         let cotangent_tracers = outputs
             .iter()
-            .zip(cotangent_types.iter())
-            .map(|(cotangent, r#type)| stage_cotangent(context, cotangent, r#type))
-            .collect::<Vec<_>>();
+            .map(|cotangent| materialize(context, cotangent.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
         let call = OLinear::from(RematerializeCallOperation {
             backward: self.backward.clone(),
             tangent: self.tangent.clone(),
@@ -599,7 +558,7 @@ where
             prevent_cse: self.prevent_cse,
         });
         let outputs = context.stage_operation(call, cotangent_tracers.as_slice())?;
-        Ok(outputs.into_iter().map(Cotangent::Staged).collect())
+        Ok(outputs.into_iter().map(MaybeZero::Value).collect())
     }
 }
 
@@ -614,81 +573,26 @@ where
         &self,
         context: &EagerContext<ArrayType, V, O>,
         inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         let program = if self.transposed { &self.backward } else { &self.tangent };
         let mut values = self
             .residuals
             .iter()
-            .map(|residual| Ok(ArrayBatch::unbatched(residual.residual_value()?)))
+            .map(|residual| Ok(ArrayBatch::replicated(residual.residual_value()?)))
             .collect::<Result<Vec<_>, ProgramError>>()?;
         values.extend(inputs.iter().cloned());
         program.interpret_with(
             values,
-            |_, constant: &V| Ok(ArrayBatch::unbatched(constant.clone())),
+            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
             |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
         )
-    }
-}
-
-/// Query trait classifying operations as rematerialization-name tags. Backend-owned closed operation enums implement this
-/// trait so that the name-based members of [`RematerializationPolicy`] can
-/// classify staged instructions without knowing the concrete operation enum.
-pub trait MaybeRematerializationName {
-    /// Returns the tag name when this operation is a [`RematerializationNameOperation`], and [`None`] otherwise.
-    fn rematerialization_name(&self) -> Option<&str>;
-}
-
-/// Value-level rematerialization-name tagging. [`RematerializationName`] is the identity on concrete values, while on
-/// traced values it stages a [`RematerializationNameOperation`] so the tag is visible to rematerialization policies.
-pub trait RematerializationName: Sized {
-    /// Returns this value unchanged while tagging it with `name` for rematerialization policies.
-    fn rematerialization_name(self, name: &str) -> Self;
-}
-
-macro_rules! impl_rematerialization_name_identity {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl RematerializationName for $ty {
-                #[inline]
-                fn rematerialization_name(self, _name: &str) -> Self {
-                    self
-                }
-            }
-        )*
-    };
-}
-
-impl_rematerialization_name_identity!(bf16, f16, f32, f64);
-
-impl<C: StagingContext<Value = Tracer<C>, Operation: From<RematerializationNameOperation>>> RematerializationName
-    for Tracer<C>
-{
-    #[inline]
-    fn rematerialization_name(self, name: &str) -> Self {
-        self.unary(RematerializationNameOperation::new(name))
-    }
-}
-
-/// Forward-mode rule for [`RematerializationNameOperation`]: the primal operation re-tags its input for residual
-/// classification and the input tangent passes through unchanged, matching the identity tangent of the tag.
-impl<C: StagingContext> DifferentiableOperation<C> for RematerializationNameOperation
-where
-    C::Operation:
-        Clone + MaybeZeroOperation<C::Type> + From<ZeroOperation<C::Type>> + From<RematerializationNameOperation>,
-    C::Value: RematerializationName,
-    RematerializationNameOperation: Operation<C::Type>,
-{
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().rematerialization_name(self.tag());
-        Ok(vec![JvpTracer::new(primal, inputs[0].tangent().clone())])
     }
 }
 
 /// Classification facts about one linearization residual, exposed to [`RematerializationPolicy::Custom`] policies.
 ///
 /// A candidate describes the instruction that produced the residual — its operation name, dot classification, and
-/// [`rematerialization_name`](RematerializationName) tag — together with the residual's staged type, mirroring the
+/// [`tag`](crate::operations::tag::Tag::tag) key — together with the residual's staged type, mirroring the
 /// information JAX exposes to custom `jax.checkpoint` policies (the primitive and its abstract values).
 #[derive(Clone, Debug)]
 pub struct RematerializationCandidate<'a, T: Type> {
@@ -698,8 +602,8 @@ pub struct RematerializationCandidate<'a, T: Type> {
     /// Dimension numbers of the producing operation when it is a dot-like contraction.
     dot_dimensions: Option<&'a DotDimensionNumbers>,
 
-    /// [`rematerialization_name`](RematerializationName) tag on the producing operation, if any.
-    rematerialization_name: Option<&'a str>,
+    /// [`tag`](crate::operations::tag::Tag::tag) key on the producing operation, if any.
+    key: Option<&'a str>,
 
     /// Staged type of the residual value.
     residual_type: T,
@@ -724,10 +628,10 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
         self.dot_dimensions
     }
 
-    /// Returns the [`rematerialization_name`](RematerializationName) tag on the producing operation, if any.
+    /// Returns the [`tag`](crate::operations::tag::Tag::tag) key on the producing operation, if any.
     #[inline]
-    pub fn rematerialization_name(&self) -> Option<&'a str> {
-        self.rematerialization_name
+    pub fn key(&self) -> Option<&'a str> {
+        self.key
     }
 
     /// Returns the staged type of the residual value.
@@ -743,7 +647,7 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
     /// inputs and constants), which policies never save; see the [`RematerializationPolicy`] documentation.
     ///
     /// This recovers the same producing-operation provenance the symbolic linearization residual tracers carried — the
-    /// operation name, dot dimension numbers, and [`rematerialization_name`](RematerializationName) tag — directly from
+    /// operation name, dot dimension numbers, and [`tag`](crate::operations::tag::Tag::tag) key — directly from
     /// the residual-producing instruction of the linearization's primal sub-program, whose trailing outputs are
     /// the residuals.
     ///
@@ -759,18 +663,33 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
     ) -> Option<RematerializationCandidate<'a, T>>
     where
         V: Value<T>,
-        O: Operation<T> + MaybeDot + MaybeRematerializationName,
+        O: Operation<T> + MaybeDot + MaybeTag + MaybeScan<T, V, O>,
     {
-        let instruction = program
-            .instructions()
-            .iter()
-            .rev()
-            .find(|instruction| instruction.outputs().contains(&residual_atom))?;
-        let operation = instruction.operation();
+        let mut program = program;
+        let mut atom = residual_atom;
+        let operation = loop {
+            let instruction =
+                program.instructions().iter().rev().find(|instruction| instruction.outputs().contains(&atom))?;
+            let operation = instruction.operation();
+            match operation.scan_body() {
+                // Look through the scan boundary: scan outputs and body outputs are index-aligned
+                // (`[final_carries..., stacked...]` versus `[next_carries..., slices...]`), so the stacked residual
+                // at this scan output is produced per iteration by the body instruction defining the same-index
+                // body output. Nested scans recurse naturally, and a body output that is a pass-through input or a
+                // constant has no producing instruction, so the residual is never saved — the same contract as at
+                // the top level.
+                Some(body) => {
+                    let index = instruction.outputs().iter().position(|output| *output == atom).unwrap();
+                    atom = body.output_ids()[index];
+                    program = body;
+                }
+                None => break operation,
+            }
+        };
         Some(RematerializationCandidate {
             operation_name: operation.name(),
             dot_dimensions: operation.dot_dimensions(),
-            rematerialization_name: operation.rematerialization_name(),
+            key: operation.key(),
             residual_type,
         })
     }
@@ -786,8 +705,16 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
 /// the backward program from the saved values. Residuals that are region inputs or constants are never stored: the
 /// backward program always receives the region inputs, and constants are re-created in place.
 ///
-/// The name-based members classify residuals by [`rematerialization_name`](RematerializationName)
-/// tags applied inside the body, [`Custom`](Self::Custom) policies classify them through a
+/// Custom-derivative boundaries stay opaque to policies: candidates are classified from the operations that produce
+/// residuals in the rematerialized region's own linearization, so a
+/// [`CustomVjpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation) (or
+/// [`CustomJvpOperation`](crate::tracing_v2::operations::custom_derivatives::CustomJvpOperation)) call inside the
+/// body keeps its user-supplied derivative, the only residuals a custom-VJP call contributes are the ones its
+/// user-authored forward rule declares, and the call's user-owned backward program is neither inspected nor
+/// re-classified by the policy.
+///
+/// The name-based members classify residuals by [`tag`](crate::operations::tag::Tag::tag)
+/// keys applied inside the body, [`Custom`](Self::Custom) policies classify them through a
 /// [`RematerializationCandidate`], and [`SaveFromBothPolicies`](Self::SaveFromBothPolicies) combines two policies.
 /// Every member answers save-or-recompute only; policies that can also *offload* saved residuals into another
 /// memory space (JAX's `save_and_offload_only_these_names` / `offload_dot_with_no_batch_dims`) live in the separate
@@ -815,7 +742,7 @@ pub enum RematerializationPolicy<T: Type = ArrayType> {
     DotsWithNoBatchDimsSaveable,
 
     /// Save only residuals tagged with one of the provided
-    /// [`rematerialization_name`](RematerializationName) names and recompute everything else.
+    /// [`tag`](crate::operations::tag::Tag::tag) keys and recompute everything else.
     /// Matches JAX's `save_only_these_names`.
     SaveOnlyTheseNames(Vec<String>),
 
@@ -839,6 +766,7 @@ pub enum RematerializationPolicy<T: Type = ArrayType> {
 }
 
 impl<T: Type> Debug for RematerializationPolicy<T> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NothingSaveable => formatter.write_str("NothingSaveable"),
@@ -893,14 +821,10 @@ impl<T: Type> RematerializationPolicy<T> {
             Self::DotsWithNoBatchDimsSaveable => candidate.dot_dimensions().is_some_and(|dimensions| {
                 dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
             }),
-            Self::SaveOnlyTheseNames(names) => {
-                candidate.rematerialization_name().is_some_and(|name| names.iter().any(|n| n == name))
-            }
-            Self::SaveAnyNamesButThese(names) => {
-                candidate.rematerialization_name().is_some_and(|name| !names.iter().any(|n| n == name))
-            }
+            Self::SaveOnlyTheseNames(names) => candidate.key().is_some_and(|name| names.iter().any(|n| n == name)),
+            Self::SaveAnyNamesButThese(names) => candidate.key().is_some_and(|name| !names.iter().any(|n| n == name)),
             Self::SaveAnythingExceptTheseNames(names) => {
-                !candidate.rematerialization_name().is_some_and(|name| names.iter().any(|n| n == name))
+                !candidate.key().is_some_and(|name| names.iter().any(|n| n == name))
             }
             Self::SaveFromBothPolicies(first, second) => {
                 first.saves_candidate(candidate) || second.saves_candidate(candidate)
@@ -952,7 +876,7 @@ pub enum OffloadingRematerializationPolicy {
     /// (for example, inside [`SaveFromBothPolicies`](Self::SaveFromBothPolicies)).
     Base(RematerializationPolicy<ArrayType>),
 
-    /// Saves residuals tagged with one of the `saveable` [`rematerialization_name`](RematerializationName) names in
+    /// Saves residuals tagged with one of the `saveable` [`tag`](crate::operations::tag::Tag::tag) keys in
     /// place, offloads residuals tagged with one of the `offloadable` names to `destination`, and recomputes
     /// everything else (including unnamed residuals). Matches JAX's `save_and_offload_only_these_names`.
     SaveAndOffloadOnlyTheseNames {
@@ -985,6 +909,7 @@ pub enum OffloadingRematerializationPolicy {
 }
 
 impl Debug for OffloadingRematerializationPolicy {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Base(policy) => formatter.debug_tuple("Base").field(policy).finish(),
@@ -1052,15 +977,13 @@ impl OffloadingRematerializationPolicy {
                 true => RematerializationVerdict::Save,
                 false => RematerializationVerdict::Recompute,
             },
-            Self::SaveAndOffloadOnlyTheseNames { saveable, offloadable, destination } => {
-                match candidate.rematerialization_name() {
-                    Some(name) if saveable.iter().any(|n| n == name) => RematerializationVerdict::Save,
-                    Some(name) if offloadable.iter().any(|n| n == name) => {
-                        RematerializationVerdict::Offload { destination: *destination }
-                    }
-                    _ => RematerializationVerdict::Recompute,
+            Self::SaveAndOffloadOnlyTheseNames { saveable, offloadable, destination } => match candidate.key() {
+                Some(name) if saveable.iter().any(|n| n == name) => RematerializationVerdict::Save,
+                Some(name) if offloadable.iter().any(|n| n == name) => {
+                    RematerializationVerdict::Offload { destination: *destination }
                 }
-            }
+                _ => RematerializationVerdict::Recompute,
+            },
             Self::OffloadDotsWithNoBatchDims { destination } => {
                 let unbatched_dot = candidate.dot_dimensions().is_some_and(|dimensions| {
                     dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
@@ -1122,7 +1045,7 @@ pub trait ResidualHandling<D: Domain> {
 
 impl<D> ResidualHandling<D> for RematerializationPolicy<<D as Domain>::Type>
 where
-    D: Domain<Operation: MaybeDot + MaybeRematerializationName>,
+    D: Domain<Operation: MaybeDot + MaybeTag>,
 {
     fn saves_residual(&self, candidate: &RematerializationCandidate<'_, <D as Domain>::Type>) -> bool {
         self.saves_candidate(candidate)
@@ -1148,8 +1071,8 @@ where
     }
 }
 
-impl<D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeRematerializationName + From<TransferToMemoryOperation>>>
-    ResidualHandling<D> for OffloadingRematerializationPolicy
+impl<D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeTag + From<TransferToMemoryOperation>>> ResidualHandling<D>
+    for OffloadingRematerializationPolicy
 {
     fn saves_residual(&self, candidate: &RematerializationCandidate<'_, ArrayType>) -> bool {
         !matches!(self.classify_candidate(candidate), RematerializationVerdict::Recompute)
@@ -1326,13 +1249,14 @@ where
         >,
     <D as Domain>::Operation: Clone
         + MaybeDot
-        + MaybeRematerializationName
-        + MaybeZeroOperation<D::Type>
+        + MaybeTag
+        + MaybeScan<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>
         + From<RematerializeOperation<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>
         + From<ZeroOperation<D::Type>>
         + From<AddOperation>
         + TransposableOperation<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>
-        + DifferentiableOperation<LinearizationContext<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>,
+        + DifferentiableOperation<TracingContext<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>
+        + PartiallyEvaluatableOperation<TracingContext<D::Type, <D as Domain>::Constant, <D as Domain>::Operation>>,
     Vec<D::Type>: Parameterized<
             D::Type,
             Family: ParameterizedFamily<<D as Domain>::Constant> + ParameterizedFamily<DomainTracer<D>>,
@@ -1359,20 +1283,15 @@ where
     pub fn call<C, ICT>(
         &self,
         input: ICT,
-    ) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>, ProgramError>
+    ) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C, C::Meta>>, ProgramError>
     where
         <D as Domain>::Type: DifferentiableType,
-        C: StagingContext<
-                Type = D::Type,
-                Value = Tracer<C>,
-                Constant = <D as Domain>::Constant,
-                Operation = <D as Domain>::Operation,
-            >,
-        IT::Family: ParameterizedFamily<Tracer<C>>,
-        OT::Family: ParameterizedFamily<Tracer<C>>,
-        ICT: Parameterized<Tracer<C>, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
-        <OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C>>: Parameterized<
-                Tracer<C>,
+        C: StagingContext<Type = D::Type, Constant = <D as Domain>::Constant, Operation = <D as Domain>::Operation>,
+        IT::Family: ParameterizedFamily<Tracer<C, C::Meta>>,
+        OT::Family: ParameterizedFamily<Tracer<C, C::Meta>>,
+        ICT: Parameterized<Tracer<C, C::Meta>, Family = IT::Family, To<D::Type> = IT::To<D::Type>>,
+        <OT::To<D::Type> as Parameterized<D::Type>>::To<Tracer<C, C::Meta>>: Parameterized<
+                Tracer<C, C::Meta>,
                 Family = OT::Family,
                 ParameterStructure = <OT::To<D::Type> as Parameterized<D::Type>>::ParameterStructure,
             >,
@@ -1403,8 +1322,7 @@ where
             return Ok(Parameterized::from_parameters(output_structure, outputs)?);
         }
 
-        let (structured_output_types, primal) =
-            D::trace(|xs| (self.body)(xs), structured_input_types.clone())?;
+        let (structured_output_types, primal) = D::trace(|xs| (self.body)(xs), structured_input_types.clone())?;
         let primal = primal.to_flat_program();
         let output_types = structured_output_types.parameters().cloned().collect::<Vec<_>>();
         let output_count = output_types.len();
@@ -1416,8 +1334,7 @@ where
         // below all replay these two sub-programs, so the residual order is fixed once here and shared across them.
         let linearization = primal.linearize()?;
         let residual_count = linearization.residual_count;
-        let residual_atoms =
-            linearization.primal_program.output_ids()[output_count..].to_vec();
+        let residual_atoms = linearization.primal_program.output_ids()[output_count..].to_vec();
         let residual_types = linearization.primal_program.output_types().split_off(output_count);
 
         // Classify each residual from the producing-operation provenance recovered from the primal sub-program (the
@@ -1541,7 +1458,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::operations::trigonometric::Sin;
+    use crate::batching::BatchAxis;
+    use crate::contexts::EagerContext;
+    use crate::operations::tag::Tag;
+    use crate::operations::trigonometric::{Cos, Sin};
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::scalars::{Scalar, ScalarDomain};
     use crate::tests::{TestArray, TestArrayDomain};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -1558,13 +1479,11 @@ mod tests {
         V: Clone + Sin + Dot + std::ops::Mul<Output = V>,
     {
         let u = x.dot(&x, &DotDimensionNumbers::inner_product());
-        u.clone() * u.sin()
+        u.clone() * u.sin().unwrap()
     }
 
     /// [`dot_sine`] in the closure shape consumed by [`rematerialization`].
-    fn dot_sine_body(
-        input: DomainTracer<TestArrayDomain>,
-    ) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
+    fn dot_sine_body(input: DomainTracer<TestArrayDomain>) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
         Ok(dot_sine(input))
     }
 
@@ -1597,6 +1516,73 @@ mod tests {
                 assert_close(direct_gradient.values[index], *expected);
             }
         }
+    }
+
+    /// Candidate classification follows stacked residual edges through `scan` boundaries to the body instructions
+    /// that produce them, so structural policies see loop-interior operations: `DotsSaveable` saves exactly the
+    /// per-iteration dot stack of a loop body (one more forward output than `NothingSaveable`), and every policy
+    /// still produces the reference gradient (unsaved loop residuals recompute through the replayed known scan).
+    #[test]
+    fn test_rematerialization_policies_classify_residuals_inside_scan_bodies() {
+        use crate::operations::control_flow::ScanOperation;
+        use crate::tracing_v2::ArrayOperation;
+        use crate::types::Shape;
+
+        // Loop body `[c, x] -> [c * (x · x)]` over three two-element rows: `f(c0) = c0 * Π |xᵢ|²`.
+        let rows = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let squared_norms: Vec<f64> = rows.iter().map(|row| row.iter().map(|value| value * value).sum()).collect();
+        let expected_gradient: f64 = squared_norms.iter().product();
+
+        let body = {
+            use crate::parameters::Placeholder;
+            use crate::programs::ProgramBuilder;
+
+            let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+            let carry = builder.add_input(ArrayType::scalar(DataType::F64));
+            let row = builder.add_input(vector_type(2));
+            let dot = builder
+                .add_instruction(
+                    crate::tracing_v2::operations::DotOperation::new(DotDimensionNumbers::inner_product()),
+                    vec![row, row],
+                )
+                .unwrap()[0];
+            let next =
+                builder.add_instruction(crate::operations::arithmetic::MulOperation, vec![carry, dot]).unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
+                .unwrap()
+        };
+        let stacked = TestArray::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+            rows.iter().flatten().copied().collect(),
+        );
+        let scan_body = |carry: DomainTracer<TestArrayDomain>| -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
+            let context = carry.context().clone();
+            let xs = StagingContext::constant(&context, stacked.clone());
+            let scan = ScanOperation::new(body.clone(), 1, 3)?;
+            let outputs = context.stage_operation(ArrayOperation::Scan(Box::new(scan)), &[carry, xs])?;
+            Ok(outputs.into_iter().next().unwrap())
+        };
+
+        let mut forward_output_counts = Vec::new();
+        for policy in [RematerializationPolicy::NothingSaveable, RematerializationPolicy::DotsSaveable] {
+            let function = rematerialize::<TestArrayDomain, _, _, _>(scan_body).with_policy(policy);
+            let (_, program) =
+                TestArrayDomain::trace(|carry| function.call(carry), ArrayType::scalar(DataType::F64)).unwrap();
+            let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+                panic!("rematerialization should stage a rematerialize call");
+            };
+            forward_output_counts.push(operation.forward().output_types().len());
+
+            let (value, gradient) =
+                value_and_grad(&TestArrayDomain, |carry| function.call(carry).unwrap(), TestArray::scalar(2.0))
+                    .unwrap();
+            assert_close(value.values[0], 2.0 * expected_gradient);
+            assert_close(gradient.values[0], expected_gradient);
+        }
+        // `DotsSaveable` saves exactly the stacked per-iteration dot outputs (one `[3]`-shaped residual) beyond the
+        // `NothingSaveable` baseline of region output plus region input.
+        assert_eq!(forward_output_counts[1], forward_output_counts[0] + 1);
     }
 
     #[test]
@@ -1634,27 +1620,25 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialization_name_is_transparent_to_differentiation() {
+    fn test_tag_is_transparent_to_differentiation() {
         let domain = ScalarDomain::new();
-        let (primal, tangent) = domain
-            .jvp(|x| (x.clone() * x).rematerialization_name("square"), Scalar::from(2.0), Scalar::from(1.0))
-            .unwrap();
+        let (primal, tangent) =
+            domain.jvp(|x| (x.clone() * x).tag("square"), Scalar::from(2.0), Scalar::from(1.0)).unwrap();
         assert_eq!(primal, 4.0);
         assert_eq!(tangent, 4.0);
-        let (value, gradient) =
-            value_and_grad(&domain, |x| (x.clone() * x).rematerialization_name("square"), Scalar::from(3.0)).unwrap();
+        let (value, gradient) = value_and_grad(&domain, |x| (x.clone() * x).tag("square"), Scalar::from(3.0)).unwrap();
         assert_eq!(value, 9.0);
         assert_eq!(gradient, 6.0);
     }
 
     #[test]
     fn test_name_based_rematerialization_policies_classify_tagged_residuals() {
-        // `f(x) = u * sin(u)` with `u = rematerialization_name(x · x, "u")`: the tagged dot output is one of the three
+        // `f(x) = u * sin(u)` with `u = (x · x).tag("u")`: the tagged dot output is one of the three
         // instruction-produced residuals (`u`, `sin(u)`, and the sine rule's `cos(u)` factor), so name-based
         // policies can select it (or its complement) by tag.
         fn body(x: DomainTracer<TestArrayDomain>) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
-            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
-            Ok(u.clone() * u.sin())
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
+            Ok(u.clone() * u.sin()?)
         }
         let domain = TestArrayDomain;
         let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
@@ -1692,7 +1676,8 @@ mod tests {
         let domain = ScalarDomain::new();
         for policy in [RematerializationPolicy::NothingSaveable, RematerializationPolicy::EverythingSaveable] {
             let function =
-                rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin())).with_policy(policy);
+                rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin()?))
+                    .with_policy(policy);
             let (value, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
             assert_scalar_close(value, 4.0f64.sin());
             assert_scalar_close(gradient, 4.0f64.cos() * 4.0);
@@ -1718,6 +1703,50 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
+        use crate::tracing_v2::operations::custom_derivatives::custom_vjp;
+
+        // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
+        // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
+        // through the rematerialized region.
+        let custom = custom_vjp::<TestArrayDomain, _, _, _, _, _, _>(
+            |x: DomainTracer<TestArrayDomain>| Ok(x.sin()?),
+            |x: DomainTracer<TestArrayDomain>| Ok((x.sin()?, x.cos()?)),
+            |residual, cotangent| {
+                let product = residual * cotangent;
+                Ok(product.clone() + product.clone() + product)
+            },
+        );
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(move |x: DomainTracer<TestArrayDomain>| custom.call(x))
+                .with_policy(RematerializationPolicy::EverythingSaveable);
+        let domain = TestArrayDomain;
+        let (value, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
+        assert_close(value.values[0], 2.0f64.sin());
+        assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
+
+        // The custom-VJP boundary stays opaque to the policy: the rematerialized primal program preserves the
+        // custom_vjp call intact, and even `EverythingSaveable` saves only the residual the user's forward rule
+        // declares (`cos(x)`) — never values from inside the user-owned backward program — so the forward program
+        // outputs exactly the body output, the region input, and that one residual.
+        let scalar_type = ArrayType::new(DataType::F64, Shape::new(Vec::new()));
+        let (_, program) = TestArrayDomain::trace(|x| function.call(x), scalar_type).unwrap();
+        assert_eq!(program.instructions().len(), 1);
+        let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
+            panic!("rematerialization should stage a rematerialize call");
+        };
+        assert!(
+            operation
+                .primal()
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), ArrayOperation::CustomVjp(_))),
+            "the rematerialized primal program should preserve the custom_vjp call",
+        );
+        assert_eq!(operation.forward().output_types().len(), 3);
+    }
+
+    #[test]
     fn test_prevent_cse_is_carried_on_the_staged_rematerialize_operation() {
         // `prevent_cse` defaults to enabled (JAX parity) and is carried on the staged operation as a backend
         // lowering hint; user-authored custom VJPs (constructed directly) leave it disabled.
@@ -1734,12 +1763,71 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialize_remains_opaque_to_partial_evaluation() {
+        let input_type = vector_type(2);
+        let function = rematerialize::<TestArrayDomain, _, _, _>(dot_sine_body);
+        let (_, program) = TestArrayDomain::trace(|x| function.call(x), input_type.clone()).unwrap();
+        let program = program.to_flat_program();
+
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(input_type)]).unwrap();
+
+        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let ArrayOperation::Rematerialize(operation) = evaluation.program.instructions()[0].operation() else {
+            panic!("partial evaluation should preserve the rematerialize boundary");
+        };
+        assert!(operation.prevent_cse());
+    }
+
+    /// Under a *staging* known-side context, a mixed rematerialized call stays fully opaque: nothing folds across
+    /// the boundary (no intermediate crosses it as a residual edge), nothing is staged into the live outer trace,
+    /// and the whole call residualizes with the symbolic known input as a residual-input feeder. This is precisely
+    /// the memory profile rematerialization asks for — the residual side recomputes from the saved *inputs* instead
+    /// of storing intermediates — so the conservative default rule is also the semantically correct online behavior;
+    /// finer-grained save-versus-recompute choices belong to the policy-driven structural split (see
+    /// `.tasks/plan_partition_policies.md`).
+    #[test]
+    fn test_rematerialize_remains_opaque_to_partial_evaluation_under_staging() {
+        use crate::contexts::StagingContext;
+        use crate::partial::PartialEvaluationInput;
+        use crate::tracing::TracingContext;
+
+        let input_type = vector_type(2);
+        let function = rematerialize::<TestArrayDomain, _, _, _>(
+            |(a, x): (DomainTracer<TestArrayDomain>, DomainTracer<TestArrayDomain>)| {
+                Ok((a * x.clone()).sin()?.dot(&x, &DotDimensionNumbers::inner_product()))
+            },
+        );
+        let (_, program) =
+            TestArrayDomain::trace(|inputs| function.call(inputs), (input_type.clone(), input_type.clone())).unwrap();
+        let program = program.to_flat_program();
+
+        let outer = TracingContext::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let known = outer.input(input_type.clone());
+        let evaluation = program
+            .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(input_type)])
+            .unwrap();
+
+        assert!(outer.builder().borrow().instructions().is_empty());
+        assert!(matches!(evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let ArrayOperation::Rematerialize(operation) = evaluation.program.instructions()[0].operation() else {
+            panic!("staged partial evaluation should preserve the rematerialize boundary");
+        };
+        assert!(operation.prevent_cse());
+        assert_eq!(evaluation.inputs.len(), 2);
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Known(value) if value.atom_id().is_ok()));
+    }
+
+    #[test]
     fn test_nested_rematerialization_matches_the_unrematerialized_gradient() {
         // The analogue of JAX's sqrt-schedule idiom: rematerialized regions nest, with each level storing only its
         // own region inputs. Differentiating the outer call replays the inner call's backward program inside the
         // outer backward derivation, which interprets the inner (transposed) rematerialize call over tracers.
         let domain = TestArrayDomain;
-        let inner = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let inner =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let outer = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| {
             let y = inner.call(x.clone())?;
             Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
@@ -1757,7 +1845,8 @@ mod tests {
 
     #[test]
     fn test_nested_rematerialization_preserves_the_nested_call_structure_and_residual_accounting() {
-        let inner = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let inner =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let outer = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| {
             let y = inner.call(x.clone())?;
             Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
@@ -1786,7 +1875,8 @@ mod tests {
         // Forward mode through nested rematerialized calls exercises the un-transposed rematerialize call replay over
         // tracers: deriving the outer tangent program interprets the inner call's tangent program inside the outer
         // tangent trace.
-        let inner = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let inner =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let outer = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| {
             let y = inner.call(x.clone())?;
             Ok(y.dot(&x, &DotDimensionNumbers::inner_product()))
@@ -1810,7 +1900,7 @@ mod tests {
     #[test]
     fn test_nested_scalar_rematerialization_matches_the_unrematerialized_gradient() {
         let domain = ScalarDomain::new();
-        let inner = rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin()));
+        let inner = rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin()?));
         let outer = rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| {
             let y = inner.call(x.clone())?;
             Ok(y * x)
@@ -1828,7 +1918,7 @@ mod tests {
         // Batching a rematerialized call re-wraps it around batched programs instead of inlining the primal, so
         // the memory-saving structure survives `vmap`: the staged program holds exactly one rematerialize call whose
         // batched forward program still stores only the body output and the region input plus the policy-saved
-        // residuals — each now carrying the lane axis.
+        // residuals — each now carrying the batch axis.
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         for (policy, expected_forward_outputs) in [
             (RematerializationPolicy::NothingSaveable, 2),
@@ -1839,8 +1929,15 @@ mod tests {
             let (_, program) = TestArrayDomain::trace(
                 |x| {
                     let context = x.context().clone();
-                    BatchContext::batch(&context, |lane| function.call(lane), x, Some(0), Some(0), None)
-                        .map_err(ProgramError::from)
+                    BatchContext::batch(
+                        &context,
+                        |item| function.call(item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .map_err(ProgramError::from)
                 },
                 matrix_type.clone(),
             )
@@ -1855,12 +1952,12 @@ mod tests {
                 expected_forward_outputs,
                 "unexpected batched forward output count for policy {policy:?}",
             );
-            // Every batched forward output carries the lane axis at position 0.
+            // Every batched forward output carries the batch axis at position 0.
             for output_type in &forward_output_types {
                 assert_eq!(
                     output_type.shape().dimensions().first().copied(),
                     Some(Size::Static(2)),
-                    "batched forward outputs should carry the lane axis for policy {policy:?}",
+                    "batched forward outputs should carry the batch axis for policy {policy:?}",
                 );
             }
         }
@@ -1868,20 +1965,28 @@ mod tests {
 
     #[test]
     fn test_rematerialized_gradients_are_correct_through_batching() {
-        use crate::tracing_v2::LinearizationTracer;
+        use crate::tracing_v2::NestedTracer;
         use crate::tracing_v2::batching::BatchContext;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         // `grad(vmap(rematerialize::<TestArrayDomain, _, _, _>(f)))`: the gradient flows through the re-wrapped batched call's derived
-        // backward program and matches the analytic per-lane gradients.
+        // backward program and matches the analytic per-item gradients.
         let domain = TestArrayDomain;
-        let function = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let (value, gradient) = value_and_grad(
             &domain,
             |x| {
                 let context = x.context().clone();
-                let mapped: LinearizationTracer<'_, TestArrayDomain> =
-                    BatchContext::batch(&context, |lane| function.call(lane), x, Some(0), Some(0), None).unwrap();
+                let mapped: NestedTracer<TestArrayDomain> = BatchContext::batch(
+                    &context,
+                    |item| function.call(item),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::new(vector_type(2), vec![0.5, 1.0]),
@@ -1904,7 +2009,7 @@ mod tests {
         let counter = trace_count.clone();
         let function = rematerialize::<TestArrayDomain, _, _, _>(move |x: DomainTracer<TestArrayDomain>| {
             counter.set(counter.get() + 1);
-            Ok((x.clone() * x).sin())
+            Ok((x.clone() * x).sin()?)
         });
 
         // Two calls with equal input types derive once, both within one trace and across separate traces.
@@ -1953,7 +2058,7 @@ mod tests {
             let batched = DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]);
             let u = x.dot(&x, &batched);
             let v = u.dot(&u, &DotDimensionNumbers::inner_product());
-            Ok(v.clone() * v.sin())
+            Ok(v.clone() * v.sin()?)
         }
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let cases =
@@ -1978,7 +2083,7 @@ mod tests {
         // combinator saves the union of what its two members save.
         fn body(x: DomainTracer<TestArrayDomain>) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product());
-            let s = u.sin().rematerialization_name("s");
+            let s = u.sin()?.tag("s");
             Ok(u * s)
         }
         let cases = [
@@ -2013,14 +2118,14 @@ mod tests {
         // operation name; and both observe the residuals' staged types.
         fn body(x: DomainTracer<TestArrayDomain>) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
             let u = x.dot(&x, &DotDimensionNumbers::inner_product());
-            let s = u.sin().rematerialization_name("s");
+            let s = u.sin()?.tag("s");
             Ok(u * s)
         }
         let domain = TestArrayDomain;
         let dot_or_named =
             RematerializationPolicy::Custom(Rc::new(|candidate: &RematerializationCandidate<'_, ArrayType>| {
                 assert!(candidate.residual_type().shape().dimensions().is_empty());
-                candidate.is_dot() || candidate.rematerialization_name() == Some("s")
+                candidate.is_dot() || candidate.key() == Some("s")
             }));
         let cosines_only =
             RematerializationPolicy::Custom(Rc::new(|candidate: &RematerializationCandidate<'_, ArrayType>| {
@@ -2059,7 +2164,8 @@ mod tests {
         // backward program over tracers (inlining it into the gradient program), and the outer pass differentiates
         // the result. f(x) = sin(x²), so f''(x) = 2 cos(x²) - 4x² sin(x²).
         let domain = TestArrayDomain;
-        let function = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let hessian = domain.hessian(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         let (_, _, block) = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
@@ -2073,20 +2179,22 @@ mod tests {
         // The scalar counterpart of the test above, staged manually (the dense `hessian` API is array-only):
         // trace the rematerialized gradient, then push a unit tangent through its linearization at the same point.
         let domain = ScalarDomain::new();
-        let function = rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin()));
-        let (_, gradient_program) = domain.interpret_and_trace(
-            |x: DomainTracer<ScalarDomain>| {
-                let context = x.context().clone();
-                DifferentiationContext::value_and_gradient(&context, |y| function.call(y).unwrap(), x).map_err(
-                    |error| match error {
-                        DifferentiationError::Program(error) => error,
-                        error => ProgramError::MalformedProgram(error.to_string()),
-                    },
-                )
-            },
-            Scalar::from(0.7),
-        )
-        .unwrap();
+        let function =
+            rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin()?));
+        let (_, gradient_program) = domain
+            .interpret_and_trace(
+                |x: DomainTracer<ScalarDomain>| {
+                    let context = x.context().clone();
+                    DifferentiationContext::value_and_gradient(&context, |y| function.call(y).unwrap(), x).map_err(
+                        |error| match error {
+                            DifferentiationError::Program(error) => error,
+                            error => ProgramError::MalformedProgram(error.to_string()),
+                        },
+                    )
+                },
+                Scalar::from(0.7),
+            )
+            .unwrap();
         // Linearize the gradient program at `x = 0.7`. Its primal sub-program computes the gradient value
         // `g(0.7) = f'(0.7)` followed by the linearization residuals, and its tangent sub-program is the linear map
         // `[input_tangent ++ residuals] -> [g'(0.7)]`. Pushing a unit tangent through that map yields `g'(0.7) =
@@ -2099,8 +2207,7 @@ mod tests {
         let gradient = primal_side.remove(0);
         let mut tangent_inputs = vec![Scalar::from(1.0)];
         tangent_inputs.extend(residuals);
-        let mut tangent_outputs =
-            linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
+        let mut tangent_outputs = linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
         let second_derivative = tangent_outputs.remove(0);
         let x: f64 = 0.7;
         assert_scalar_close(gradient, 2.0 * x * (x * x).cos());
@@ -2114,7 +2221,8 @@ mod tests {
         // direct-transpose pullback at `[1.0 ++ residuals]` recovers the tangent map. f(x) = sin(x²), so the recovered
         // value is f'(0.7) = 2·0.7·cos(0.7²).
         let domain = TestArrayDomain;
-        let function = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let (_, pullback, residuals) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
         let mut pullback_inputs = vec![TestArray::scalar(1.0)];
         pullback_inputs.extend(residuals);
@@ -2130,7 +2238,8 @@ mod tests {
         // The Jacobian of elementwise `sin(x * x)` is the diagonal matrix `diag(cos(x²) * 2x)`; `jacrev` exercises
         // the batched replay of the derived backward program.
         let domain = TestArrayDomain;
-        let function = rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()));
+        let function =
+            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok((x.clone() * x).sin()?));
         let jacobian = jacrev(&domain, |x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
         let (_, _, block) = jacobian.iter_blocks().next().unwrap();
         assert_close(block.values()[0], 0.25f64.cos());
@@ -2143,11 +2252,9 @@ mod tests {
     const PINNED_HOST: Memory = Memory::Host { pinned: true };
 
     /// [`dot_sine`] with the dot output tagged `"u"`, so name-based offloading policies can select it.
-    fn tagged_dot_sine_body(
-        x: DomainTracer<TestArrayDomain>,
-    ) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
-        let u = x.dot(&x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
-        Ok(u.clone() * u.sin())
+    fn tagged_dot_sine_body(x: DomainTracer<TestArrayDomain>) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
+        let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
+        Ok(u.clone() * u.sin()?)
     }
 
     /// Returns whether `program` stages any memory transfers.
@@ -2274,13 +2381,13 @@ mod tests {
         // the forward program emits four outputs whose final two are the device-resident `u` and the host-parked
         // `v`.
         fn body(x: DomainTracer<TestArrayDomain>) -> Result<DomainTracer<TestArrayDomain>, ProgramError> {
-            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).rematerialization_name("u");
-            let v = u.sin().rematerialization_name("v");
+            let u = x.dot(&x, &DotDimensionNumbers::inner_product()).tag("u");
+            let v = u.sin()?.tag("v");
             Ok(u * v)
         }
         let domain = TestArrayDomain;
         let policy = OffloadingRematerializationPolicy::Custom(Rc::new(
-            |candidate: &RematerializationCandidate<'_, ArrayType>| match candidate.rematerialization_name() {
+            |candidate: &RematerializationCandidate<'_, ArrayType>| match candidate.key() {
                 Some("u") => RematerializationVerdict::Save,
                 Some("v") => RematerializationVerdict::Offload { destination: PINNED_HOST },
                 _ => RematerializationVerdict::Recompute,
@@ -2312,12 +2419,12 @@ mod tests {
 
     #[test]
     fn test_offloaded_rematerialization_survives_batching_with_host_parked_saved_types() {
-        use crate::tracing_v2::LinearizationTracer;
+        use crate::tracing_v2::NestedTracer;
         use crate::tracing_v2::batching::BatchContext;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
-        // its host placement with the lane axis prepended to its shape.
+        // its host placement with the batch axis prepended to its shape.
         let domain = TestArrayDomain;
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let function = rematerialize::<TestArrayDomain, _, _, _>(tagged_dot_sine_body).with_policy(
@@ -2330,7 +2437,7 @@ mod tests {
         let (_, program) = TestArrayDomain::trace(
             |x| {
                 let context = x.context().clone();
-                BatchContext::batch(&context, |lane| function.call(lane), x, Some(0), Some(0), None)
+                BatchContext::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
                     .map_err(ProgramError::from)
             },
             matrix_type.clone(),
@@ -2346,14 +2453,21 @@ mod tests {
         assert_eq!(saved_type.shape().dimensions().first().copied(), Some(Size::Static(2)));
         assert_eq!(saved_type.memory(), PINNED_HOST);
 
-        // `grad(vmap(...))` through the offloaded call matches the analytic per-lane gradients.
+        // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.
         let rows = [[0.5, 1.5, 1.0], [0.25, 0.75, 1.25]];
         let (_, gradient) = value_and_grad(
             &domain,
             |x| {
                 let context = x.context().clone();
-                let mapped: LinearizationTracer<'_, TestArrayDomain> =
-                    BatchContext::batch(&context, |lane| function.call(lane), x, Some(0), Some(0), None).unwrap();
+                let mapped: NestedTracer<TestArrayDomain> = BatchContext::batch(
+                    &context,
+                    |item| function.call(item),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::new(matrix_type, rows.as_flattened().to_vec()),

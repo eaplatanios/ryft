@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_leading_prepends_axes() {
-        use crate::operations::manipulation::BroadcastLeading;
+        use crate::operations::manipulation::Broadcast;
 
         // `t.broadcast_leading([2])` prepends a leading axis of size 2 and replicates the original
         // values across it. Matches `jax.lax.broadcast(t, [2])`.
@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn test_broadcast_to_uses_numpy_right_alignment() {
-        use crate::operations::manipulation::BroadcastTo;
+        use crate::operations::manipulation::Broadcast;
 
         // A scalar (rank-0) broadcasts to shape [2, 3] by replicating across both axes.
         let scalar = TestArray::scalar(7.0);
@@ -511,8 +511,8 @@ mod tests {
     #[test]
     fn test_select_batches_with_replicated_predicate_via_broadcast() {
         // Predicate is a rank-0 replicated scalar; on_true / on_false are mapped vectors of
-        // size 3. With the JAX-style broadcasting elementwise rule, `apply_elementwise_batch`
-        // promotes the replicated predicate to the batched physical shape before invoking
+        // size 3. With the JAX-style broadcasting elementwise batching rule, the replicated
+        // predicate is promoted to the batched physical shape before invoking
         // `Select::select`, so the mixed-batching case succeeds with the expected per-item
         // pick.
         use crate::operations::control_flow::SelectOperation;

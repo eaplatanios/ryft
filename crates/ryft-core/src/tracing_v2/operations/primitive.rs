@@ -7,10 +7,11 @@ use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
 use crate::operations::compare::CompareOperation;
 use crate::operations::constants::{
-    ConstantOperation, FillOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{
     ConditionOperation, MaybeScan, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts,
+    WhilePredicate,
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
@@ -24,7 +25,7 @@ use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation}
 use crate::operations::tag::{MaybeTag, TagOperation};
 use crate::operations::trigonometric::{CosOperation, SinOperation};
 use crate::programs::Value;
-use crate::tracing_v2::operations::collective::CollectiveOperation;
+use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
@@ -46,7 +47,7 @@ use crate::types::ArrayType;
 #[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation, BatchableOperation)]
 // TODO(eaplatanios): Verify that we need all of these bounds / that they cannot be simplified.
 #[ryft(bounds(
-    interpretation(BooleanLike + Slice + UpdateSlice + Reshape),
+    interpretation(BooleanLike + WhilePredicate + Slice + UpdateSlice + Reshape),
     partial_evaluation(PartialEq + BooleanLike),
     differentiation(PartialEq + BooleanLike),
     batching(
@@ -61,6 +62,7 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
     Constant(ConstantOperation<ArrayType, V>),
     // TODO(eaplatanios): Why is this limited to `f64`?
     Fill(FillOperation<ArrayType, f64>),
+    Iota(IotaOperation<ArrayType>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
@@ -94,6 +96,8 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
     Xor(XorOperation),
     #[ryft(batching(active))]
     Collective(CollectiveOperation),
+    #[ryft(batching(active))]
+    AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
     Condition(Box<ConditionOperation<ArrayType, V, Self>>),
     While(Box<WhileOperation<ArrayType, V, Self>>),

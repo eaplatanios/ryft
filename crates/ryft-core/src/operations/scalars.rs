@@ -6,7 +6,9 @@ use crate::operations::compare::CompareOperation;
 use crate::operations::constants::{
     ConstantOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
-use crate::operations::control_flow::{MaybeScan, MaybeWhile, SelectOperation, WhileOperation, WhileParts};
+use crate::operations::control_flow::{
+    MaybeScan, MaybeWhile, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
+};
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::tag::{MaybeTag, TagOperation};
@@ -28,7 +30,7 @@ use crate::types::DataType;
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation)]
-#[ryft(bounds(interpretation(BooleanLike)))]
+#[ryft(bounds(interpretation(BooleanLike + WhilePredicate)))]
 pub enum ScalarOperation<V: Value<DataType>> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
@@ -94,8 +96,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::StagingContext;
-    use crate::domains::Domain;
+    use crate::contexts::{Domain, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
     use crate::operations::compare::{Compare, ComparisonDirection};
@@ -238,7 +239,7 @@ mod tests {
                 scalar_doubling_body()
             )
             .map(|_| ()),
-            Err(TypeError { message: "while condition output type must be bool, but got f64".to_string() }),
+            Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),
         );
     }
 }
