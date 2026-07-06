@@ -660,6 +660,41 @@ impl<O: InterpretableOperation<ArrayType, V, C>, V: Value<ArrayType>, C> Interpr
     }
 }
 
+/// Metadata attached to [`Tracer`](crate::Tracer)s that are used for the batching transform and which provides
+/// information about the [`BatchAxis`] used for batching. The batch axis rides on the value itself, so that the
+/// per-operation [`BatchableOperation`] rules route the mapped batch axis through tracing/staging. Note that
+/// [`BatchingMeta`] also carry the _parent_ metadata so that we can handle nested transforms, each potentially using
+/// its own metadata type. Note that this includes support for things like nested batching transforms where the
+/// [`BatchAxis`] of each transform is carried through the [`BatchingMeta`]'s parent field.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct BatchingMeta<Meta> {
+    /// Parent context's metadata.
+    parent: Meta,
+
+    /// [`BatchAxis`] introduced at this batching level.
+    batch_axis: BatchAxis,
+}
+
+impl<Meta> BatchingMeta<Meta> {
+    /// Creates a [`BatchingMeta`] pairing this level's `batch_axis` with the `parent` context's metadata tail.
+    #[inline]
+    pub fn new(batch_axis: BatchAxis, parent: Meta) -> Self {
+        Self { batch_axis, parent }
+    }
+
+    /// Returns the parent context's metadata.
+    #[inline]
+    pub fn parent(&self) -> &Meta {
+        &self.parent
+    }
+
+    /// Returns this batching level's mapped [`BatchAxis`].
+    #[inline]
+    pub fn batch_axis(&self) -> BatchAxis {
+        self.batch_axis
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;

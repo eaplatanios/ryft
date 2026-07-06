@@ -4,7 +4,8 @@ use std::rc::Rc;
 
 use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{
-    ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, ProgramBatchingOutputAxesPolicy,
+    ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, BatchingMeta,
+    ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
@@ -432,54 +433,6 @@ where
     #[inline]
     fn supports_primal_concretization(&self) -> bool {
         false
-    }
-}
-
-/// Value flowing through a [`BatchingContext<C>`]: the unified [`Tracer`] specialized to carry a [`BatchAxis`] as its
-/// metadata. The batch axis rides on the value itself, so the per-operation [`BatchableOperation`] rules route the
-/// mapped batch axis through [`StagingContext::stage_operation`] from the value in hand. Its capability impls
-/// (arithmetic, `Broadcast`, `Dot`, `Reduce`, `Select`, …) are the shared `Tracer<C, C::Meta>` impls, so batching needs
-/// no bespoke value-level operation impls of its own.
-///
-/// The carried [`ArrayType`] is the *logical* (per-item, unbatched) type, matching what the staged value reports to
-/// the batched function body; the physical type with the mapped axis inserted is reconstructed from the value's
-/// [`BatchAxis`] when it is handed to a batching rule.
-///
-/// Per-level batching metadata carried by a [`BatchingTracer`]: a recursive cons-stack whose head is *this* batching
-/// level's mapped [`BatchAxis`] and whose tail is the parent context's metadata.
-///
-/// For an outer plain trace the tail is `()`; for a nested `vmap` it is itself another [`BatchingMeta`], so the stack
-/// grows by one axis per enclosing `batch`. Carrying the axis on the value this way is what lets every level of a
-/// nested `batch` recover its own batch axis without any side table — `batch` over `batch` simply prepends one more
-/// axis onto the incoming value's stack.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct BatchingMeta<Meta> {
-    /// Mapped batch axis introduced at this batching level ([`BatchAxis::replicated`] when this level does not map the
-    /// value).
-    batch_axis: BatchAxis,
-
-    /// Parent context's metadata: the tail of the cons-stack (`()` for an outer plain trace, another [`BatchingMeta`]
-    /// for a nested `vmap`).
-    parent: Meta,
-}
-
-impl<Meta> BatchingMeta<Meta> {
-    /// Creates a [`BatchingMeta`] pairing this level's `batch_axis` with the `parent` context's metadata tail.
-    #[inline]
-    pub fn new(batch_axis: BatchAxis, parent: Meta) -> Self {
-        Self { batch_axis, parent }
-    }
-
-    /// Returns this batching level's mapped batch axis (the head of the cons-stack).
-    #[inline]
-    pub fn batch_axis(&self) -> BatchAxis {
-        self.batch_axis
-    }
-
-    /// Returns the parent context's metadata (the tail of the cons-stack).
-    #[inline]
-    pub fn parent(&self) -> &Meta {
-        &self.parent
     }
 }
 
