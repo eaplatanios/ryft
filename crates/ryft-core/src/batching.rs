@@ -17,7 +17,7 @@ use crate::operations::manipulation::{Broadcast, Transpose};
 use crate::parameters::{Parameter, ParameterError};
 use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
 use crate::sharding::ShardingDimension;
-use crate::tracing::{NestedTracingContext, Tracer, TracerState};
+use crate::tracing::{Tracer, TracerState};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Represents batching-related errors.
@@ -746,10 +746,8 @@ impl<C> BatchingContext<C> {
 }
 
 // TODO(eaplatanios): Review this implementation block.
-impl<C> Domain for BatchingContext<C>
-where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
+impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, Self>>> Domain
+    for BatchingContext<C>
 {
     type Type = ArrayType;
     type Value = BatchingTracer<C>;
@@ -758,10 +756,8 @@ where
 }
 
 // TODO(eaplatanios): Review this implementation block and add unit test.
-impl<C> Context for BatchingContext<C>
-where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
+impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, Self>>> Context
+    for BatchingContext<C>
 {
     /// Lifts a constant payload into this batching context by recording it as a replicated [`BatchingTracer`].
     #[inline]
@@ -885,10 +881,8 @@ where
 /// A batching level binds the axis it introduces: a lookup for this level's [`axis_name`](Self::axis_name) resolves to
 /// [`NamedAxis::Batched`] with this level's batch size, and any other name delegates to the parent context. Because
 /// nested `batch` composes by context wrapping, the delegation chain naturally shadows outer bindings with inner ones.
-impl<C> NamedAxes for BatchingContext<C>
-where
-    C: StagingContext<Type = ArrayType> + NamedAxes,
-    C::Operation: BatchableOperation<Tracer<C, C::Meta>, Self>,
+impl<C: StagingContext<Type = ArrayType, Operation: BatchableOperation<Tracer<C, C::Meta>, Self>> + NamedAxes> NamedAxes
+    for BatchingContext<C>
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
