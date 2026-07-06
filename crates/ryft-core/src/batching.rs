@@ -315,24 +315,78 @@ impl<V: Value<ArrayType>> ArrayBatch<V> {
         })
     }
 
-    /// Returns a copy of this [`ArrayBatch`] with its mapped batch axis moved to `target_axis`, staging a transpose on
-    /// the packed value via [`Transpose::move_axis`] to realign it. This is the analogue of JAX's `matchaxis`, used
-    /// to bring inputs that map their batch axis at different positions onto a common axis before an elementwise
-    /// operation is applied. A replicated value (i.e., one with no mapped axis), or one already mapped at
-    /// `target_axis`, is returned unchanged.
-    pub fn match_batch_axis(&self, target_axis: usize) -> Result<Self, BatchingError>
+    /// Returns a copy of this _replicated_ [`ArrayBatch`] broadcast to gain a singleton batch axis of size `axis_size`
+    /// at `axis`. This is the analogue of JAX's `batching.broadcast` and is the canonical building block for mixed
+    /// batched/replicated primitive rules (e.g., the batching rule of the `dot` operation) and for lifting replicated
+    /// residuals during linearization. It returns an error if called on an already-batched value, since such callers
+    /// are expected to dispatch the replicated case explicitly (the blanket elementwise [`BatchableOperation`]
+    /// implementation instead broadcasts replicated inputs to the full common batched shape).
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Position of the inserted batch axis in the output.
+    ///   - `axis_size`: Size of the inserted batch axis.
+    pub fn broadcast(&self, axis: usize, axis_size: usize) -> Result<Self, BatchingError>
+    where
+        V: Broadcast,
+    {
+        if !self.batch_axis().is_replicated() {
+            return Err(BatchingError::MisalignedBatchAxes {
+                message: "'ArrayBatch::broadcast' expects a replicated operand but received a batched value"
+                    .to_string(),
+            }
+            .into());
+        }
+        let per_item_type = self.unbatched_type()?;
+        let physical_type = per_item_type.with_inserted_dimension(axis, Size::Static(axis_size))?;
+        let output_axes = (0..per_item_type.rank())
+            .map(|dimension| if dimension < axis { dimension } else { dimension + 1 })
+            .collect::<Vec<_>>();
+        let broadcasted = self.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
+        ArrayBatch::new(physical_type, broadcasted, Some(axis))
+    }
+
+    /// Returns a copy of this [`ArrayBatch`] with its mapped batch axis moved to `axis`, staging a transpose on the
+    /// packed value via [`Transpose::move_axis`] to realign it. This is the *move* half of JAX's `matchaxis` (i.e., a
+    /// `moveaxis` on the batch dimension). The full move-or-broadcast behavior lives on
+    /// [`match_axis`](Self::match_axis). It brings inputs that map their batch axis at different positions onto a
+    /// common axis before an elementwise operation is applied. A replicated value (i.e., one with no mapped axis),
+    /// or one already mapped at `axis`, is returned unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Position the mapped batch axis should occupy in the returned [`ArrayBatch`].
+    pub fn move_axis(&self, axis: usize) -> Result<Self, BatchingError>
     where
         V: Transpose,
     {
         let Some(current_axis) = self.batch_axis().axis() else {
             return Ok(self.clone());
         };
-        if current_axis == target_axis {
+        if current_axis == axis {
             return Ok(self.clone());
         }
-        let permuted_value = self.value().clone().move_axis(current_axis, target_axis)?;
+        let permuted_value = self.value().clone().move_axis(current_axis, axis)?;
         let permuted_type = permuted_value.r#type().into_owned();
-        ArrayBatch::new(permuted_type, permuted_value, Some(target_axis))
+        ArrayBatch::new(permuted_type, permuted_value, Some(axis))
+    }
+
+    /// Returns a copy of this [`ArrayBatch`] with a batch axis of size `axis_size` materialized at `axis`. An
+    /// already-batched value has its mapped axis realigned to `axis` via [`Self::move_axis`], while a replicated
+    /// value is broadcast to gain a batch axis there via [`Self::broadcast`]. This is the analogue of JAX's
+    /// `batching.matchaxis`, used by rules whose inputs must agree on one physical batch axis (e.g., `pad`,
+    /// `concatenate`, etc.).
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Position the batch axis should occupy in the output.
+    ///   - `axis_size`: Size of the batch axis.
+    #[inline]
+    pub fn match_axis(&self, axis: usize, axis_size: usize) -> Result<Self, BatchingError>
+    where
+        V: Broadcast + Transpose,
+    {
+        if self.batch_axis().is_replicated() { self.broadcast(axis, axis_size) } else { self.move_axis(axis) }
     }
 
     /// Returns the [`ShardingDimension`] to place on the batch axis that batching introduces in each output, derived
@@ -447,7 +501,7 @@ impl<
         // to the common batched physical shape.
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
         let unbatched_types = inputs.iter().map(|input| input.unbatched_type()).collect::<Result<Vec<_>, _>>()?;
-        let inputs = inputs.iter().map(|input| input.match_batch_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
+        let inputs = inputs.iter().map(|input| input.move_axis(batch_axis)).collect::<Result<Vec<_>, _>>()?;
 
         // The common per-item shape every input broadcasts to, or `None` when the per-item shapes are not
         // broadcast-compatible, in which case each input keeps its own per-item shape below and the operation
@@ -688,26 +742,80 @@ mod tests {
     }
 
     #[test]
-    fn test_match_batch_axis() {
+    fn test_array_batch_broadcast() {
+        // Broadcasting a replicated vector to gain a leading batch axis of size 2 replicates it across the batch.
+        let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
+        let broadcasted = replicated.broadcast(0, 2).unwrap();
+        assert_eq!(broadcasted.batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            *broadcasted.r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+        );
+        assert_eq!(broadcasted.value(), &TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
+        assert_eq!(broadcasted.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
+
+        // Broadcasting to a trailing batch axis keeps the per-item dimensions before it in place.
+        // The input's own axis stays at position 0 and the size-2 batch axis is inserted at position 1.
+        let broadcasted = replicated.broadcast(1, 2).unwrap();
+        assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            *broadcasted.r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+        );
+        assert_eq!(broadcasted.value(), &TestArray::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
+
+        // Broadcasting rejects an already-batched value.
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let batched = ArrayBatch::new(vector_type, TestArray::vector(vec![1.0, 2.0]), Some(0)).unwrap();
+        assert!(matches!(batched.broadcast(0, 2), Err(BatchingError::MisalignedBatchAxes { .. })));
+    }
+
+    #[test]
+    fn test_array_batch_move_axis() {
         let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let matrix_type = matrix.r#type().into_owned();
         let batched = ArrayBatch::new(matrix_type.clone(), matrix, Some(0)).unwrap();
 
-        // Matching to the axis the value already maps returns it unchanged.
-        assert_eq!(batched.match_batch_axis(0).unwrap(), batched);
+        // Moving to the axis the value already maps returns it unchanged.
+        assert_eq!(batched.move_axis(0).unwrap(), batched);
 
         // Moving the mapped batch axis from 0 to 1 transposes the packed value (from [2, 3] to [3, 2]) and records the
         // new mapped axis, while the per-item type ([3]) and the batch size (2) are preserved.
-        let moved = batched.match_batch_axis(1).unwrap();
+        let moved = batched.move_axis(1).unwrap();
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
         assert_eq!(*moved.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
         assert_eq!(moved.value(), &TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
         assert_eq!(moved.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
         assert_eq!(moved.batch_size(), Ok(Some(2)));
 
-        // A replicated value has no mapped axis, so matching to any axis is a no-op.
+        // A replicated value has no mapped axis, so moving to any axis is a no-op.
         let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        assert_eq!(replicated.match_batch_axis(1).unwrap(), replicated);
+        assert_eq!(replicated.move_axis(1).unwrap(), replicated);
+    }
+
+    #[test]
+    fn test_array_batch_match_axis() {
+        // `match_axis` on a batched value moves its mapped axis to the target (like `move_axis`). [2, 3] mapped at 0
+        // becomes [3, 2] mapped at 1, and the `axis_size` argument is unused for an already-batched value.
+        let batched = ArrayBatch::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            Some(0),
+        )
+        .unwrap();
+        let matched = batched.match_axis(1, 2).unwrap();
+        assert_eq!(matched.batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            *matched.r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+        );
+        assert_eq!(matched.value(), &TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+
+        // `match_axis` on a replicated value broadcasts it to gain a batch axis there (like `broadcast`).
+        let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
+        let matched = replicated.match_axis(0, 2).unwrap();
+        assert_eq!(matched.batch_axis(), BatchAxis::new(0));
+        assert_eq!(matched.value(), &TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
     }
 
     #[test]

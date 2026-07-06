@@ -9,7 +9,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
-use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::manipulation::{BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
@@ -17,41 +17,6 @@ use crate::tracing_v2::differentiation::{DifferentiationContext, replay_via_bind
 use crate::types::{ArrayType, Size, Typed};
 
 // TODO(eaplatanios): Review this module.
-
-/// Broadcasts a replicated `operand` to gain a singleton batch axis at `target_axis`.
-///
-/// This is the canonical building block for mixed batched/unbatched primitive rules (e.g.,
-/// [`DotOperation::batch`](crate::tracing_v2::operations::dot::DotOperation)) and for lifting
-/// replicated residuals during linearization: it inserts a new axis at `target_axis` in the
-/// operand's type, broadcasts the value to that shape, and returns the result as a batched
-/// [`ArrayBatch`]. The blanket elementwise [`BatchableOperation`] impl instead broadcasts replicated operands to the
-/// full common batched shape.
-///
-/// Returns an error when called on an already-batched input — callers are expected to dispatch
-/// the replicated case explicitly.
-///
-/// # Parameters
-///
-///   - `operand`: Replicated input to lift.
-///   - `target_axis`: Position of the inserted batch axis in the output.
-///   - `axis_size`: Size of the inserted batch axis.
-pub(crate) fn broadcast_to_batched<V: Value<ArrayType> + Broadcast>(
-    operand: &ArrayBatch<V>,
-    target_axis: usize,
-    axis_size: usize,
-) -> Result<ArrayBatch<V>, BatchingError> {
-    if !operand.batch_axis().is_replicated() {
-        return Err(BatchingError::MisalignedBatchAxes {
-            message: "broadcast_to_batched expects a replicated operand but received a batched value".to_string(),
-        }
-        .into());
-    }
-    let per_item_type = operand.unbatched_type()?;
-    let physical_type = per_item_type.with_inserted_dimension(target_axis, Size::Static(axis_size))?;
-    let output_axes: Vec<usize> = (0..per_item_type.rank()).map(|i| if i < target_axis { i } else { i + 1 }).collect();
-    let broadcasted = operand.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
-    ArrayBatch::new(physical_type, broadcasted, Some(target_axis))
-}
 
 // TODO(eaplatanios): Should this be moved to `Program::batched`?
 /// Batches a captured program into a standalone program over batch-carrying physical types.
@@ -155,8 +120,8 @@ where
                 natural_axis,
             )?;
             let aligned_batch = match natural_axis.axis() {
-                Some(_) => parent_batch.match_batch_axis(target_axis)?,
-                None => broadcast_to_batched(&parent_batch, target_axis, axis_size)?,
+                Some(_) => parent_batch.move_axis(target_axis)?,
+                None => parent_batch.broadcast(target_axis, axis_size)?,
             };
             output_atom_ids.push(aligned_batch.into_value().atom_id()?);
             output_axes.push(BatchAxis::new(target_axis));
@@ -185,7 +150,7 @@ where
 /// value type remains `C::Value` regardless of the nesting depth. Each level owns its own
 /// `axis_size` and optional `axis_name`, while primitive binds recursively pass through every
 /// parent context in order.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BatchingContext<C: Context<Type = ArrayType>> {
     /// Parent trace context wrapped by this batching level.
     parent_context: C,
@@ -196,6 +161,31 @@ pub struct BatchingContext<C: Context<Type = ArrayType>> {
     /// Optional human-readable name for this batched axis. Collectives such as `psum`, `pmean`, and
     /// `pmax` can address this axis by name from inside the batched function body.
     axis_name: Option<String>,
+}
+
+impl<C: Context<Type = ArrayType>> BatchingContext<C> {
+    /// Returns the parent [`Context`] this batching context wraps. Batching rules use this to stage operations
+    /// directly at the parent level — for example, [`forward_collective_to_parent`](
+    /// crate::tracing_v2::operations::collective::forward_collective_to_parent) re-stages a collective that targets
+    /// an outer named axis.
+    #[inline]
+    pub fn parent_context(&self) -> &C {
+        &self.parent_context
+    }
+
+    /// Returns this batch level's named axis, if the enclosing `batch` call named one. Batching rules for
+    /// collective-like operations match their own axis name against this to decide whether to consume the mapped
+    /// batch axis at this level or forward the operation to [`BatchingContext::parent_context`].
+    #[inline]
+    pub fn axis_name(&self) -> Option<&str> {
+        self.axis_name.as_deref()
+    }
+
+    /// Returns this batch level's batch size.
+    #[inline]
+    pub fn axis_size(&self) -> usize {
+        self.axis_size
+    }
 }
 
 impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
@@ -268,41 +258,6 @@ impl<C: StagingContext<Type = ArrayType>> BatchingContext<C> {
             |_, constant| Ok(ArrayBatch::replicated(self.parent_context.constant(constant.clone()))),
             |instruction, instruction_inputs| instruction.operation().batch(self, instruction_inputs),
         )
-    }
-}
-
-impl<C: Context<Type = ArrayType>> BatchingContext<C> {
-    /// Returns the parent [`Context`] this batching context wraps. Batching rules use this to stage operations
-    /// directly at the parent level — for example, [`forward_collective_to_parent`](
-    /// crate::tracing_v2::operations::collective::forward_collective_to_parent) re-stages a collective that targets
-    /// an outer named axis.
-    #[inline]
-    pub fn parent_context(&self) -> &C {
-        &self.parent_context
-    }
-
-    /// Returns this batch level's named axis, if the enclosing `batch` call named one. Batching rules for
-    /// collective-like operations match their own axis name against this to decide whether to consume the mapped
-    /// batch axis at this level or forward the operation to [`BatchingContext::parent_context`].
-    #[inline]
-    pub fn axis_name(&self) -> Option<&str> {
-        self.axis_name.as_deref()
-    }
-
-    /// Returns this batch level's batch size.
-    #[inline]
-    pub fn axis_size(&self) -> usize {
-        self.axis_size
-    }
-}
-
-impl<C: Context<Type = ArrayType>> Clone for BatchingContext<C> {
-    fn clone(&self) -> Self {
-        Self {
-            parent_context: self.parent_context.clone(),
-            axis_size: self.axis_size,
-            axis_name: self.axis_name.clone(),
-        }
     }
 }
 
