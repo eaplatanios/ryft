@@ -4,8 +4,10 @@ use std::rc::Rc;
 use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, TransposableOperation};
 
 use ryft_core::batching::ArrayBatch;
+use ryft_core::batching::BatchAxis;
 use ryft_core::batching::BatchableOperation;
 use ryft_core::batching::BatchingError;
+use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
 use ryft_core::compilation::CaptureReference;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::TransposableOperation;
@@ -16,26 +18,26 @@ use ryft_core::materialize;
 use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::constants::{
-    ConstantOperation, FillOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_core::operations::control_flow::{
     ConditionOperation, MaybeScan, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts,
+    WhilePredicate,
 };
 use ryft_core::operations::differentiation::StopGradientOperation;
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
+    GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
 use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
-use ryft_core::parameters::Placeholder;
 use ryft_core::partial::{PartialEvaluationValue, PartialEvaluator, PartialValue, PartiallyEvaluatableOperation};
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
-use ryft_core::tracing::{DomainTracingContext, Tracer, TracingContext};
-use ryft_core::tracing_v2::batching::BatchingContext;
+use ryft_core::tracing::{Tracer, TracingContext};
+use ryft_core::tracing_v2::batching::batch_program;
 
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::tag::TagOperation;
@@ -46,10 +48,9 @@ use ryft_core::tracing_v2::operations::custom_derivatives::{
 use ryft_core::tracing_v2::operations::memory::TransferToMemoryOperation;
 use ryft_core::tracing_v2::operations::reduce::{Reduce as ReduceValue, ReduceOperation};
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
-use ryft_core::tracing_v2::{ArrayOperation, CollectiveOperation, DotOperation};
-use ryft_core::types::{ArrayType, Size, TypeError, Typed};
+use ryft_core::tracing_v2::{ArrayOperation, AxisIndexOperation, CollectiveOperation, DotOperation};
+use ryft_core::types::{ArrayType, TypeError, Typed};
 
-use crate::experimental::domains::XlaDomain;
 use crate::experimental::operations::ShardMapOperation;
 
 /// Lifetime-free reference to a concrete XLA value captured by a compiled program.
@@ -63,21 +64,22 @@ pub type XlaConstant = CaptureReference<ArrayType>;
 #[derive(Clone, Debug, Operation, TransposableOperation, DifferentiableOperation, BatchableOperation)]
 #[ryft(crate = "ryft_core")]
 #[ryft(bounds(
-    interpretation(BooleanLike + Slice + UpdateSlice + Reshape),
+    interpretation(BooleanLike + WhilePredicate + Slice + UpdateSlice + Reshape),
     partial_evaluation(PartialEq + BooleanLike),
     differentiation(PartialEq + BooleanLike),
     batching(
-        BooleanLike + BitAnd<Output = V> + Select<Condition = V> + Broadcast + ReduceValue + Slice + UpdateSlice
-            + Reshape
+        BooleanLike + BitAnd<Output = V> + Select<Condition = V> + Broadcast + Transpose + ReduceValue + Slice
+            + UpdateSlice + Reshape
     ),
 ))]
-pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
+pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<ArrayType, V>),
+    Constant(ConstantOperation<V>),
     Fill(FillOperation<ArrayType, f64>),
+    Iota(IotaOperation<ArrayType>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
@@ -111,28 +113,30 @@ pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
     Xor(XorOperation),
     #[ryft(batching(active))]
     Collective(CollectiveOperation),
+    #[ryft(batching(active))]
+    AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
     /// Backend-owned condition whose branch bodies can contain XLA operations.
-    Condition(Box<ConditionOperation<ArrayType, V, Self>>),
+    Condition(Box<ConditionOperation<V, Self>>),
 
     /// Backend-owned loop whose condition and body programs can contain XLA operations.
-    While(Box<WhileOperation<ArrayType, V, Self>>),
+    While(Box<WhileOperation<V, Self>>),
 
     /// Backend-owned scan whose body program can contain XLA operations.
-    Scan(Box<ScanOperation<ArrayType, V, Self>>),
+    Scan(Box<ScanOperation<V, Self>>),
 
     /// Backend-owned custom JVP call whose nested programs can contain XLA operations.
-    CustomJvp(Box<CustomJvpOperation<ArrayType, V, Self>>),
+    CustomJvp(Box<CustomJvpOperation<V, Self>>),
 
     /// Backend-owned custom VJP call whose nested programs can contain XLA operations.
-    CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
+    CustomVjp(Box<CustomVjpOperation<V, Self>>),
 
     /// Backend-owned opaque custom-VJP tangent carrier, staged by the capture-free forward of a
     /// [`CustomVjp`](Self::CustomVjp) call. Its nested backward program can contain XLA operations.
-    CustomVjpTangent(Box<CustomVjpTangentOperation<ArrayType, V, Self>>),
+    CustomVjpTangent(Box<CustomVjpTangentOperation<V, Self>>),
 
     /// Backend-owned rematerialized call whose nested programs can contain XLA operations.
-    Rematerialize(Box<RematerializeOperation<ArrayType, V, Self>>),
+    Rematerialize(Box<RematerializeOperation<V, Self>>),
 
     /// Call to a flat jitted XLA sub-program.
     JitCall(Box<JitCallOperation>),
@@ -142,17 +146,17 @@ pub enum XlaOperation<V: Value<ArrayType> = XlaConstant> {
 }
 
 fn map_core_xla_program<V>(
-    program: &Program<ArrayType, V, ArrayOperation<V>, Vec<V>, Vec<V>>,
-) -> Program<ArrayType, V, XlaOperation<V>, Vec<V>, Vec<V>>
+    program: &Program<V, ArrayOperation<V>, Vec<V>, Vec<V>>,
+) -> Program<V, XlaOperation<V>, Vec<V>, Vec<V>>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
     program.map_operations(|operation| Ok(XlaOperation::from(operation.clone()))).unwrap()
 }
 
 impl<V> From<ArrayOperation<V>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
     fn from(operation: ArrayOperation<V>) -> Self {
         match operation {
@@ -162,6 +166,7 @@ where
             ArrayOperation::OneLike(operation) => Self::OneLike(operation),
             ArrayOperation::Constant(operation) => Self::Constant(operation),
             ArrayOperation::Fill(operation) => Self::Fill(operation),
+            ArrayOperation::Iota(operation) => Self::Iota(operation),
             ArrayOperation::Neg(operation) => Self::Neg(operation),
             ArrayOperation::Add(operation) => Self::Add(operation),
             ArrayOperation::Sub(operation) => Self::Sub(operation),
@@ -194,6 +199,7 @@ where
             ArrayOperation::Or(operation) => Self::Or(operation),
             ArrayOperation::Xor(operation) => Self::Xor(operation),
             ArrayOperation::Collective(operation) => Self::Collective(operation),
+            ArrayOperation::AxisIndex(operation) => Self::AxisIndex(operation),
             ArrayOperation::Select(operation) => Self::Select(operation),
             ArrayOperation::Condition(operation) => XlaOperation::from(*operation),
             ArrayOperation::While(operation) => XlaOperation::from(*operation),
@@ -206,11 +212,11 @@ where
     }
 }
 
-impl<V> From<ConditionOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<ConditionOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: ConditionOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: ConditionOperation<V, ArrayOperation<V>>) -> Self {
         Self::Condition(Box::new(
             ConditionOperation::new(
                 map_core_xla_program(operation.true_branch()),
@@ -221,11 +227,11 @@ where
     }
 }
 
-impl<V> From<WhileOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<WhileOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: WhileOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: WhileOperation<V, ArrayOperation<V>>) -> Self {
         Self::While(Box::new(
             WhileOperation::new(map_core_xla_program(operation.condition()), map_core_xla_program(operation.body()))
                 .unwrap()
@@ -235,11 +241,11 @@ where
     }
 }
 
-impl<V> From<ScanOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<ScanOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: ScanOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: ScanOperation<V, ArrayOperation<V>>) -> Self {
         Self::Scan(Box::new(
             ScanOperation::new(map_core_xla_program(operation.body()), operation.carry_count(), operation.length())
                 .unwrap()
@@ -251,11 +257,11 @@ where
     }
 }
 
-impl<V> From<CustomJvpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<CustomJvpOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: CustomJvpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: CustomJvpOperation<V, ArrayOperation<V>>) -> Self {
         Self::CustomJvp(Box::new(
             CustomJvpOperation::new(
                 map_core_xla_program(operation.primal()),
@@ -266,11 +272,11 @@ where
     }
 }
 
-impl<V> From<CustomVjpOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<CustomVjpOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: CustomVjpOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: CustomVjpOperation<V, ArrayOperation<V>>) -> Self {
         Self::CustomVjp(Box::new(
             CustomVjpOperation::new(
                 map_core_xla_program(operation.primal()),
@@ -282,11 +288,11 @@ where
     }
 }
 
-impl<V> From<CustomVjpTangentOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<CustomVjpTangentOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: CustomVjpTangentOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: CustomVjpTangentOperation<V, ArrayOperation<V>>) -> Self {
         Self::CustomVjpTangent(Box::new(CustomVjpTangentOperation::new(
             map_core_xla_program(operation.backward()),
             operation.residual_count(),
@@ -295,11 +301,11 @@ where
     }
 }
 
-impl<V> From<RematerializeOperation<ArrayType, V, ArrayOperation<V>>> for XlaOperation<V>
+impl<V> From<RematerializeOperation<V, ArrayOperation<V>>> for XlaOperation<V>
 where
-    V: Value<ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + BooleanLike + Slice + UpdateSlice + Reshape,
 {
-    fn from(operation: RematerializeOperation<ArrayType, V, ArrayOperation<V>>) -> Self {
+    fn from(operation: RematerializeOperation<V, ArrayOperation<V>>) -> Self {
         Self::Rematerialize(Box::new(
             RematerializeOperation::new(
                 map_core_xla_program(operation.primal()),
@@ -315,7 +321,7 @@ where
 
 impl<V> ryft_core::tracing_v2::operations::MaybeDot for XlaOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&ryft_core::tracing_v2::DotDimensionNumbers> {
@@ -328,7 +334,7 @@ where
 
 impl<V> ryft_core::operations::tag::MaybeTag for XlaOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
     fn key(&self) -> Option<&str> {
@@ -339,12 +345,12 @@ where
     }
 }
 
-impl<V> MaybeWhile<ArrayType, V, XlaOperation<V>> for XlaOperation<V>
+impl<V> MaybeWhile<V, XlaOperation<V>> for XlaOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
-    fn as_while(&self) -> Option<WhileParts<'_, ArrayType, V, XlaOperation<V>>> {
+    fn as_while(&self) -> Option<WhileParts<'_, V, XlaOperation<V>>> {
         match self {
             Self::While(operation) => operation.as_while(),
             _ => None,
@@ -352,12 +358,12 @@ where
     }
 }
 
-impl<V> MaybeScan<ArrayType, V, XlaOperation<V>> for XlaOperation<V>
+impl<V> MaybeScan<V, XlaOperation<V>> for XlaOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
-    fn scan_body(&self) -> Option<&Program<ArrayType, V, XlaOperation<V>, Vec<V>, Vec<V>>> {
+    fn scan_body(&self) -> Option<&Program<V, XlaOperation<V>, Vec<V>, Vec<V>>> {
         match self {
             Self::Scan(operation) => Some(operation.body()),
             _ => None,
@@ -367,31 +373,31 @@ where
 
 /// Staged replay of a jitted call over tracers stages the call operation whole onto the trace the context owns,
 /// preserving the compilation boundary instead of inlining the callee.
-impl<C> InterpretableOperation<ArrayType, Tracer<C, C::Meta>, C> for JitCallOperation
+impl<C> InterpretableOperation<Tracer<C>, C> for JitCallOperation
 where
     C: StagingContext<Type = ArrayType, Operation: From<JitCallOperation>>,
 {
-    fn interpret(&self, context: &C, inputs: &[Tracer<C, C::Meta>]) -> Result<Vec<Tracer<C, C::Meta>>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
         context.stage_operation(self.clone(), inputs)
     }
 }
 
 /// Staged replay of a captured-body shard map over tracers stages the operation whole onto the trace the context
 /// owns, preserving the sharding boundary instead of inlining the local body.
-impl<C> InterpretableOperation<ArrayType, Tracer<C, C::Meta>, C> for ShardMapOperation<CaptureReference<ArrayType>>
+impl<C> InterpretableOperation<Tracer<C>, C> for ShardMapOperation<CaptureReference<ArrayType>>
 where
     C: StagingContext<Type = ArrayType, Operation: From<ShardMapOperation<CaptureReference<ArrayType>>>>,
 {
-    fn interpret(&self, context: &C, inputs: &[Tracer<C, C::Meta>]) -> Result<Vec<Tracer<C, C::Meta>>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[Tracer<C>]) -> Result<Vec<Tracer<C>>, ProgramError> {
         context.stage_operation(self.clone(), inputs)
     }
 }
 
 /// Staged XLA program specialized to the backend-owned XLA op universe.
-pub type XlaProgram<Input, Output> = Program<ArrayType, XlaConstant, XlaOperation, Input, Output>;
+pub type XlaProgram<Input, Output> = Program<XlaConstant, XlaOperation, Input, Output>;
 
 /// Program builder specialized to the backend-owned XLA op universe.
-pub type XlaProgramBuilder = ProgramBuilder<ArrayType, XlaConstant, XlaOperation>;
+pub type XlaProgramBuilder = ProgramBuilder<XlaConstant, XlaOperation>;
 
 /// Flat XLA program payload used by staged call operations.
 pub type FlatXlaProgram = XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>;
@@ -436,7 +442,7 @@ fn ensure_call_input_types(
     if expected_types.len() != input_types.len() {
         return Err(TypeError {
             message: format!(
-                "{operation_name} expected {} input(s) but got {}",
+                "'{operation_name}' expected {} input(s) but got {}",
                 expected_types.len(),
                 input_types.len(),
             ),
@@ -445,7 +451,7 @@ fn ensure_call_input_types(
     for (index, (expected, actual)) in expected_types.iter().zip(input_types).enumerate() {
         if expected != actual {
             return Err(TypeError {
-                message: format!("{operation_name} input #{index} expected {expected} but got {actual}"),
+                message: format!("'{operation_name}' input #{index} expected {expected} but got {actual}"),
             });
         }
     }
@@ -457,42 +463,13 @@ fn build_batched_call_program(
     batch_axes: &[Option<usize>],
     axis_size: usize,
 ) -> Result<(FlatXlaProgram, Vec<Option<usize>>), ProgramError> {
-    let logical_input_types = program.input_types();
-    check_count!("input", batch_axes, logical_input_types.len(), ProgramError);
-    let physical_input_types = logical_input_types
-        .iter()
-        .zip(batch_axes)
-        .map(|(logical_type, axis)| match axis {
-            Some(axis) => logical_type.with_inserted_dimension(*axis, Size::Static(axis_size)),
-            None => Ok(logical_type.clone()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let parent_context = DomainTracingContext::<XlaDomain<'static>>::new();
-    let builder = parent_context.builder().clone();
-    let batching_context = BatchingContext::new(parent_context, axis_size);
-    let mut input_values = Vec::with_capacity(physical_input_types.len());
-    for ((physical_type, logical_type), axis) in physical_input_types.iter().zip(&logical_input_types).zip(batch_axes) {
-        let atom = builder.borrow_mut().add_input(physical_type.clone());
-        input_values.push(batching_context.batched_value(atom, logical_type.clone(), *axis));
-    }
-    let output_values = batching_context.stage_program(program, input_values)?;
-    let output_atom_ids = output_values.iter().map(|value| value.atom_id()).collect::<Result<Vec<_>, _>>()?;
-    // This is a single batching level, so each output value's head `BatchAxis` metadata is the authoritative mapped
-    // axis.
-    let output_axes = output_values.iter().map(|value| value.meta().0.axis()).collect::<Vec<_>>();
-    drop(output_values);
-    drop(batching_context);
-
-    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let batched_program = builder
-        .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
-            output_atom_ids,
-            vec![Placeholder; physical_input_types.len()],
-            vec![Placeholder; output_axes.len()],
-        )?
-        .into_simplified()?;
-    Ok((batched_program, output_axes))
+    // Delegate to the core program-batching pass, which replays `program` through a `BatchingContext` over a fresh
+    // trace and packages the batched program with its natural (rule-produced) output axes.
+    let input_batch_axes = batch_axes.iter().map(|axis| BatchAxis::from(*axis)).collect::<Vec<_>>();
+    let (batched_program, output_axes) =
+        batch_program(program, axis_size, input_batch_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
+    let output_axes = output_axes.iter().map(BatchAxis::axis).collect();
+    Ok((batched_program.into_simplified()?, output_axes))
 }
 
 impl Operation<ArrayType> for JitCallOperation {
@@ -535,14 +512,14 @@ impl Operation<ArrayType> for JitCallOperation {
 /// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Operation = XlaOperation<V>>,
 {
     fn partially_evaluate(
         &self,
         evaluator: &mut PartialEvaluator<C>,
-        inputs: &[PartialEvaluationValue<ArrayType, C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<ArrayType, C::Value>>, ProgramError> {
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed call with at least one known-but-symbolic input; everything else keeps the default
         // fold-or-residualize behavior and therefore the original boundary.
         if !evaluator.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
@@ -571,11 +548,11 @@ where
 
 impl JitCallOperation {
     /// Returns the call operation and output-axis metadata for batching this call.
-    fn batched_call_operation<V: Typed<ArrayType>>(
+    fn batched_call_operation<V: Value<Type = ArrayType>>(
         &self,
         inputs: &[ArrayBatch<V>],
     ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
         match ArrayBatch::common_batch_size(inputs)? {
             Some(axis_size) => {
                 let (batched_program, output_axes) =
@@ -604,15 +581,15 @@ impl<C> BatchableOperation<ArrayType, C> for JitCallOperation {
     }
 }
 
-impl<S, C> BatchableOperation<Tracer<S, S::Meta>, C> for JitCallOperation
+impl<S, C> BatchableOperation<Tracer<S>, C> for JitCallOperation
 where
     S: StagingContext<Type = ArrayType, Operation = XlaOperation>,
 {
     fn batch(
         &self,
         _context: &C,
-        inputs: &[ArrayBatch<Tracer<S, S::Meta>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<S, S::Meta>>>, BatchingError> {
+        inputs: &[ArrayBatch<Tracer<S>>],
+    ) -> Result<Vec<ArrayBatch<Tracer<S>>>, BatchingError> {
         let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
@@ -652,7 +629,7 @@ where
 impl<C, V> DifferentiableOperation<C> for JitCallOperation
 where
     C: StagingContext<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         let output_count = self.program().output_types().len();
@@ -736,12 +713,12 @@ where
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
-pub fn transpose_primal_jit_call<V: Value<ArrayType>>(
+pub fn transpose_primal_jit_call<V: Value<Type = ArrayType>>(
     operation: &JitCallOperation,
-    context: &mut TracingContext<ArrayType, V, XlaOperation<V>>,
-    inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, XlaOperation<V>>>>],
-    outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, XlaOperation<V>>>>],
-) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, XlaOperation<V>>>>>, ProgramError> {
+    context: &mut TracingContext<V, XlaOperation<V>>,
+    inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
         return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
@@ -810,13 +787,13 @@ pub fn transpose_primal_jit_call<V: Value<ArrayType>>(
 /// transposition happens on the concretely [`XlaConstant`]-keyed [`FlatXlaProgram`], so the recursion is resolved once
 /// at definition time and instantiating this implementation introduces no recursive [`TransposableOperation`]
 /// obligation on [`XlaOperation`].
-impl<V: Value<ArrayType>> TransposableOperation<ArrayType, V, XlaOperation<V>> for JitCallOperation {
+impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for JitCallOperation {
     fn transpose(
         &self,
-        context: &mut TracingContext<ArrayType, V, XlaOperation<V>>,
-        inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, XlaOperation<V>>>>],
-        outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, XlaOperation<V>>>>],
-    ) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, XlaOperation<V>>>>>, ProgramError> {
+        context: &mut TracingContext<V, XlaOperation<V>>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
         transpose_primal_jit_call(self, context, inputs, outputs)
     }
 }
@@ -831,7 +808,7 @@ mod tests {
     use ryft_core::programs::ProgramBuilder;
     use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-    use super::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation};
+    use super::{JitCallOperation, XlaConstant, XlaOperation};
 
     fn vector_type() -> ArrayType {
         ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))
@@ -852,7 +829,7 @@ mod tests {
 
         // Callee `f(a, x) = (a + c, x * c, (a + c) * x)` over a known `a`, an unknown `x`, and a literal `c`.
         let callee = {
-            let mut builder = ProgramBuilder::<ArrayType, XlaConstant, XlaOperation>::new();
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
             let known_input = builder.add_input(r#type.clone());
             let runtime_input = builder.add_input(r#type.clone());
             let literal = builder.add_constant(XlaConstant::new(0, r#type.clone()));
@@ -869,7 +846,7 @@ mod tests {
         };
 
         // Enclosing program staging one call to the callee over `[a, x]`.
-        let mut builder = ProgramBuilder::<ArrayType, XlaConstant, XlaOperation>::new();
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
         let known_input = builder.add_input(r#type.clone());
         let runtime_input = builder.add_input(r#type.clone());
         let call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(callee))));
@@ -878,7 +855,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 3])
             .unwrap();
 
-        let outer = TracingContext::<ArrayType, XlaConstant, XlaOperation>::new();
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type.clone())])

@@ -64,7 +64,7 @@ pub trait CompilationDomain: Domain {
     /// bakes whatever [`Self::execute`] needs into the artifact.
     fn compile<Input: Parameterized<Self::Constant>, Output: Parameterized<Self::Constant>>(
         &self,
-        program: &Program<Self::Type, Self::Constant, Self::Operation, Input, Output>,
+        program: &Program<Self::Constant, Self::Operation, Input, Output>,
         options: &Self::Options,
     ) -> Result<Self::CompiledProgram, Self::Error>;
 

@@ -37,7 +37,7 @@ pub struct CompiledFunction<
 
     /// Source [`Program`] that produced [`Self::program`]. Retained so callers can inspect the
     /// traced IR (printing, instruction counts, graph rendering).
-    source_program: Program<D::Type, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>>,
+    source_program: Program<D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>>,
 
     /// PyTree shape of the output. Used by [`Self::call`] to reassemble the executor's flat
     /// output buffer list back into the user's expected output tree.
@@ -99,7 +99,7 @@ impl<
     #[inline]
     pub fn source_program(
         &self,
-    ) -> &Program<D::Type, D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
+    ) -> &Program<D::Constant, D::Operation, Input::To<D::Constant>, Output::To<D::Constant>> {
         &self.source_program
     }
 

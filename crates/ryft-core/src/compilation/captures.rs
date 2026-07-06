@@ -58,14 +58,22 @@ impl<T: Type> Display for CaptureReference<T> {
     }
 }
 
-impl<T: Type> Typed<T> for CaptureReference<T> {
+impl<T: Type> Typed for CaptureReference<T> {
+    type Type = T;
+
     #[inline]
     fn r#type(&self) -> Cow<'_, T> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl<T: Type> Value<T> for CaptureReference<T> {}
+impl<T: Type> Value for CaptureReference<T> {
+    type Domain = crate::EagerContext<Self>;
+
+    fn domain(&self) -> crate::EagerContext<Self> {
+        crate::EagerContext::new()
+    }
+}
 
 /// A staged [`Program`] paired with the concrete runtime values referenced by its captured
 /// constants.
@@ -74,34 +82,32 @@ impl<T: Type> Value<T> for CaptureReference<T> {}
 /// `V` live only in [`Self::captures`], and atom-table constants are
 /// [`CaptureReference<T>`] references into that side table.
 pub struct ClosedProgram<
-    T: Type,
-    V: Value<T>,
+    V: Value,
     O,
-    Input: Parameterized<CaptureReference<T>>,
-    Output: Parameterized<CaptureReference<T>>,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
 > {
     /// Staged program whose constants are capture references.
-    program: Program<T, CaptureReference<T>, O, Input, Output>,
+    program: Program<CaptureReference<V::Type>, O, Input, Output>,
 
     /// Concrete captured values referenced by [`CaptureReference`] indices in [`Self::program`].
     captures: Vec<V>,
 }
 
 impl<
-    T: Type,
-    V: Value<T>,
+    V: Value,
     O: Clone,
-    Input: Parameterized<CaptureReference<T>>,
-    Output: Parameterized<CaptureReference<T>>,
-> Clone for ClosedProgram<T, V, O, Input, Output>
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> Clone for ClosedProgram<V, O, Input, Output>
 {
     fn clone(&self) -> Self {
         Self { program: self.program.clone(), captures: self.captures.clone() }
     }
 }
 
-impl<T: Type, V: Value<T>, O, Input: Parameterized<CaptureReference<T>>, Output: Parameterized<CaptureReference<T>>>
-    Debug for ClosedProgram<T, V, O, Input, Output>
+impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
+    Debug for ClosedProgram<V, O, Input, Output>
 {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -112,18 +118,18 @@ impl<T: Type, V: Value<T>, O, Input: Parameterized<CaptureReference<T>>, Output:
     }
 }
 
-impl<T: Type, V: Value<T>, O, Input: Parameterized<CaptureReference<T>>, Output: Parameterized<CaptureReference<T>>>
-    ClosedProgram<T, V, O, Input, Output>
+impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
+    ClosedProgram<V, O, Input, Output>
 {
     /// Creates a captured program from an already capture-referenced program and capture table.
     #[inline]
-    pub fn new(program: Program<T, CaptureReference<T>, O, Input, Output>, captures: Vec<V>) -> Self {
+    pub fn new(program: Program<CaptureReference<V::Type>, O, Input, Output>, captures: Vec<V>) -> Self {
         Self { program, captures }
     }
 
     /// Returns the staged program.
     #[inline]
-    pub fn program(&self) -> &Program<T, CaptureReference<T>, O, Input, Output> {
+    pub fn program(&self) -> &Program<CaptureReference<V::Type>, O, Input, Output> {
         &self.program
     }
 
@@ -135,12 +141,11 @@ impl<T: Type, V: Value<T>, O, Input: Parameterized<CaptureReference<T>>, Output:
 }
 
 impl<
-    T: Type,
-    V: Value<T>,
-    O: Operation<T>,
-    Input: Parameterized<CaptureReference<T>>,
-    Output: Parameterized<CaptureReference<T>>,
-> ClosedProgram<T, V, O, Input, Output>
+    V: Value,
+    O: Operation<V::Type>,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> ClosedProgram<V, O, Input, Output>
 {
     /// Validates that every captured-constant atom references an existing capture with the same type.
     pub fn validate_capture_references(&self) -> Result<(), ProgramError> {
@@ -173,7 +178,7 @@ impl<
     /// Capture input indices belong to the caller's capture table and may differ from this program's local capture
     /// indices. This validates the positional arity and types that matter after captures are opened as leading flat
     /// inputs.
-    pub fn validate_capture_inputs(&self, capture_inputs: &[CaptureReference<T>]) -> Result<(), ProgramError> {
+    pub fn validate_capture_inputs(&self, capture_inputs: &[CaptureReference<V::Type>]) -> Result<(), ProgramError> {
         check_count!("input", capture_inputs, self.captures.len(), ProgramError);
         for (index, (expected, actual)) in self.captures.iter().zip(capture_inputs).enumerate() {
             let expected_type = expected.r#type();
@@ -213,20 +218,21 @@ impl<
 }
 
 impl<
-    T: Type,
-    V: Value<T>,
-    O: Clone + Operation<T>,
-    Input: Parameterized<CaptureReference<T>>,
-    Output: Parameterized<CaptureReference<T>>,
-> ClosedProgram<T, V, O, Input, Output>
+    V: Value,
+    O: Clone + Operation<V::Type>,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> ClosedProgram<V, O, Input, Output>
 {
     /// Returns a flat program where captures are explicit leading inputs followed by the original program inputs.
     pub fn open_captures_as_inputs(
         &self,
-    ) -> Result<Program<T, CaptureReference<T>, O, Vec<CaptureReference<T>>, Vec<CaptureReference<T>>>, ProgramError>
-    {
+    ) -> Result<
+        Program<CaptureReference<V::Type>, O, Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>,
+        ProgramError,
+    > {
         fn map_atom<T: Type>(
-            atoms: &[Atom<T, CaptureReference<T>>],
+            atoms: &[Atom<CaptureReference<T>>],
             mapped_atoms: &[Option<AtomId>],
             capture_inputs: &[AtomId],
             atom_id: AtomId,
@@ -283,7 +289,7 @@ impl<
             .copied()
             .map(|output| map_atom(self.program.atoms(), mapped_atoms.as_slice(), capture_inputs.as_slice(), output))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.build::<Vec<CaptureReference<T>>, Vec<CaptureReference<T>>>(
+        builder.build::<Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>(
             output_ids,
             vec![Placeholder; self.captures.len() + self.program.input_ids().len()],
             vec![Placeholder; self.program.output_ids().len()],
@@ -292,12 +298,11 @@ impl<
 }
 
 impl<
-    T: Type,
-    V: Clone + Value<T>,
-    O: Clone + Operation<T>,
-    Input: Parameterized<CaptureReference<T>>,
-    Output: Parameterized<CaptureReference<T>>,
-> ClosedProgram<T, V, O, Input, Output>
+    V: Clone + Value,
+    O: Clone + Operation<V::Type>,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> ClosedProgram<V, O, Input, Output>
 {
     /// Rebuilds this program with its capture table replaced by `new_captures` and every
     /// [`CaptureReference`] reindexed through `capture_index_map`.
@@ -317,7 +322,7 @@ impl<
 
         // Materializes the rebuilt atom identifier for `atom_id`, lazily re-adding referenced capture constants with
         // their reindexed reference so atoms shared across instructions map to a single rebuilt constant.
-        let map_atom = |builder: &mut ProgramBuilder<T, CaptureReference<T>, O>,
+        let map_atom = |builder: &mut ProgramBuilder<CaptureReference<V::Type>, O>,
                         mapped_atoms: &mut [Option<AtomId>],
                         atom_id: AtomId|
          -> Result<AtomId, ProgramError> {
@@ -488,20 +493,15 @@ mod tests {
         }
     }
 
-    impl<C> InterpretableOperation<DataType, Scalar, C> for TestAddOperation {
+    impl<C> InterpretableOperation<Scalar, C> for TestAddOperation {
         fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
             check_count!("input", inputs, 2, ProgramError);
             Ok(vec![inputs[0] + inputs[1]])
         }
     }
 
-    fn captured_add_program() -> ClosedProgram<
-        DataType,
-        Scalar,
-        TestAddOperation,
-        Vec<CaptureReference<DataType>>,
-        Vec<CaptureReference<DataType>>,
-    > {
+    fn captured_add_program()
+    -> ClosedProgram<Scalar, TestAddOperation, Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>> {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
@@ -524,9 +524,7 @@ mod tests {
             .interpret_with_captures(
                 vec![Scalar::from(2.0)],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| {
-                    instruction.operation().interpret(&crate::EagerContext::<DataType, Scalar>::new(), inputs)
-                },
+                |instruction, inputs| instruction.operation().interpret(&crate::EagerContext::<Scalar>::new(), inputs),
             )
             .unwrap();
 
@@ -544,9 +542,7 @@ mod tests {
             .interpret_with(
                 vec![Scalar::from(3.0), Scalar::from(2.0)],
                 |_, constant| Ok::<_, ProgramError>(Scalar::from(constant.index() as f64)),
-                |instruction, inputs| {
-                    instruction.operation().interpret(&crate::EagerContext::<DataType, Scalar>::new(), inputs)
-                },
+                |instruction, inputs| instruction.operation().interpret(&crate::EagerContext::<Scalar>::new(), inputs),
             )
             .unwrap();
 
@@ -555,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_captured_program_rejects_missing_capture_index() {
-        let mut builder = ProgramBuilder::<DataType, CaptureReference<DataType>, TestAddOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
         let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
@@ -576,7 +572,7 @@ mod tests {
     #[test]
     fn test_prune_unused_captures_drops_dead_capture_and_reindexes() {
         // The program references only capture #1; capture #0 (value 3.0) is dead.
-        let mut builder = ProgramBuilder::<DataType, CaptureReference<DataType>, TestAddOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
         let output = builder.add_instruction(TestAddOperation, vec![input, capture]).unwrap()[0];
@@ -606,9 +602,7 @@ mod tests {
             .interpret_with_captures(
                 vec![Scalar::from(2.0)],
                 |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| {
-                    instruction.operation().interpret(&crate::EagerContext::<DataType, Scalar>::new(), inputs)
-                },
+                |instruction, inputs| instruction.operation().interpret(&crate::EagerContext::<Scalar>::new(), inputs),
             )
             .unwrap();
         assert_eq!(output, vec![101.0]);
@@ -617,7 +611,7 @@ mod tests {
     #[test]
     fn test_deduplicate_captures_merges_equal_captures() {
         // Both captures hold the same value (7) and are referenced by two distinct constant atoms.
-        let mut builder = ProgramBuilder::<DataType, CaptureReference<DataType>, TestAddOperation>::new();
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
         let first = builder.add_constant(CaptureReference::new(0, DataType::I64));
         let second = builder.add_constant(CaptureReference::new(1, DataType::I64));
         let output = builder.add_instruction(TestAddOperation, vec![first, second]).unwrap()[0];

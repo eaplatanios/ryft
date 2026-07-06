@@ -6,10 +6,10 @@ use std::sync::Mutex;
 
 use lru::LruCache;
 
+use crate::batching::BatchingContext;
 use crate::contexts::Context;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::NestedTracingContext;
-use crate::tracing_v2::batching::BatchingContext;
 use crate::types::ArrayType;
 
 use super::disk_cache::{CacheDigest, DiskCache};
@@ -181,7 +181,7 @@ impl<D: CompilationDomain> Default for CompilationContext<D> {
 /// of that value's concrete data, so the compiled program depends only on its abstract type — which enables executable
 /// reuse across captured values, keeps captured device buffers on-device, and avoids bloating the IR. See
 /// [`CaptureReference`](super::captures::CaptureReference) for the full rationale.
-pub trait CapturingContext<C: Value<Self::Type>>: Context {
+pub trait CapturingContext<C: Value<Type = Self::Type>>: Context {
     /// Appends `value` to the active capture table and returns the constant payload that refers to it.
     fn capture(&self, value: C) -> Result<Self::Constant, ProgramError>;
 }
@@ -190,15 +190,17 @@ impl<C, Capture> CapturingContext<Capture> for BatchingContext<C>
 where
     C: CapturingContext<Capture, Type = ArrayType>,
     BatchingContext<C>: Context<Type = ArrayType, Constant = C::Constant>,
-    Capture: Value<ArrayType>,
+    Capture: Value<Type = ArrayType>,
 {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
-        self.parent_context().capture(value)
+        self.parent().capture(value)
     }
 }
 
-impl<C: CapturingContext<Capture>, Capture: Value<C::Type>> CapturingContext<Capture> for NestedTracingContext<C> {
+impl<C: CapturingContext<Capture>, Capture: Value<Type = C::Type>> CapturingContext<Capture>
+    for NestedTracingContext<C>
+{
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
