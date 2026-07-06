@@ -688,6 +688,29 @@ mod tests {
     }
 
     #[test]
+    fn test_match_batch_axis() {
+        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix_type = matrix.r#type().into_owned();
+        let batched = ArrayBatch::new(matrix_type.clone(), matrix, Some(0)).unwrap();
+
+        // Matching to the axis the value already maps returns it unchanged.
+        assert_eq!(batched.match_batch_axis(0).unwrap(), batched);
+
+        // Moving the mapped batch axis from 0 to 1 transposes the packed value (from [2, 3] to [3, 2]) and records the
+        // new mapped axis, while the per-item type ([3]) and the batch size (2) are preserved.
+        let moved = batched.match_batch_axis(1).unwrap();
+        assert_eq!(moved.batch_axis(), BatchAxis::new(1));
+        assert_eq!(*moved.r#type(), ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])));
+        assert_eq!(moved.value(), &TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+        assert_eq!(moved.unbatched_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]))));
+        assert_eq!(moved.batch_size(), Ok(Some(2)));
+
+        // A replicated value has no mapped axis, so matching to any axis is a no-op.
+        let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
+        assert_eq!(replicated.match_batch_axis(1).unwrap(), replicated);
+    }
+
+    #[test]
     fn test_array_batch_sharding_for_inputs() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))
@@ -731,6 +754,46 @@ mod tests {
             Some(BatchingError::MisalignedBatchAxes { message })
                 if message.contains("mismatched batch axis sharding"),
         ));
+    }
+
+    #[test]
+    fn test_elementwise_operation_batch() {
+        // The blanket `BatchableOperation` for elementwise operations lifts `interpret` over the mapped batch axis.
+        // It realigns every mapped operand onto the common axis, broadcasts replicated operands across the batch,
+        // and reports each output on that common axis.
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let make_batch = |r#type: &ArrayType, values: Vec<f64>, axis: Option<usize>| {
+            ArrayBatch::new(r#type.clone(), TestArray::new(r#type.clone(), values), axis).unwrap()
+        };
+
+        // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
+        let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
+        let right = make_batch(&matrix_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], Some(0));
+        let outputs = AddOperation.batch(&TestArrayDomain, &[left.clone(), right]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
+
+        // A replicated operand is broadcast across the mapped operand's batch before adding.
+        let replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
+        let outputs = AddOperation.batch(&TestArrayDomain, &[left.clone(), replicated]).unwrap();
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
+
+        // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
+        let transposed_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
+        let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
+        let outputs = AddOperation.batch(&TestArrayDomain, &[left, right_axis_one]).unwrap();
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
+
+        // With no operand mapped, the operands are interpreted as given and the output is replicated.
+        let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
+        let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
+        let outputs = AddOperation.batch(&TestArrayDomain, &[left_replicated, right_replicated]).unwrap();
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
     }
 
     #[test]

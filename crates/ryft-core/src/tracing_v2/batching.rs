@@ -2,15 +2,11 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::rc::Rc;
 
-use crate::ElementwiseOperation;
 use crate::axes::{NamedAxes, NamedAxis};
-use crate::batching::InterpretableBatchableOperation;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, ProgramBatchingOutputAxesPolicy,
 };
-use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
-use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
@@ -21,120 +17,6 @@ use crate::tracing_v2::differentiation::{DifferentiationContext, replay_via_bind
 use crate::types::{ArrayType, Size, Typed};
 
 // TODO(eaplatanios): Review this module.
-
-/// Blanket [`BatchableOperation`] impl for any [`ElementwiseOperation`], so per-op [`BatchableOperation`] impls do not
-/// have to be written for elementwise primitives (`Add`, `Sub`, `Mul`, `Div`, `Neg`, `Sin`, `Cos`, `Select`,
-/// `ZeroLike`, `OneLike`, …). Ops with non-trivial axis arithmetic (`Dot`, `Transpose`, `Reshape`, …) and the
-/// [`ArrayOperation`](crate::tracing_v2::ArrayOperation) operation enum (whose impls live with the enum in
-/// [`operations::primitive`](crate::tracing_v2::operations::primitive)) keep their explicit impls; coherence is
-/// preserved because none of those types implement [`ElementwiseOperation`].
-///
-/// The rule follows JAX's `defbroadcasting` policy: every operand is broadcast to the common batched physical shape
-/// before the operation is applied, so the value-level primitive only ever sees operands that agree on shape. When no
-/// operand is mapped there is no batch axis to thread, so the operands are interpreted as given and every output is
-/// reported replicated. Otherwise the common batch axis is the first mapped operand's position; every mapped operand is
-/// realigned to it with a staged [`TransposeOperation`] (via [`align_batch_axis`], matching JAX's `matchaxis`), and
-/// every operand is then broadcast to the common per-item shape with the batch axis inserted at that position. Operands
-/// whose per-item shapes are not broadcast-compatible are left at their batch-axis-inserted shapes so the operation
-/// surfaces its own shape error.
-impl<
-    O: Clone + ElementwiseOperation + InterpretableOperation<ArrayType, V, C>,
-    V: Value<ArrayType> + Broadcast + Transpose,
-    C,
-> BatchableOperation<V, C> for O
-{
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let operand_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
-
-        // No operand carries the batch axis: interpret the operands as given and report every output replicated. Any
-        // per-item shape broadcasting between replicated operands is the operation's own concern.
-        let Some(batch_axis) = operand_axes.iter().copied().flatten().next() else {
-            let physical_types: Vec<ArrayType> = inputs.iter().map(|input| input.r#type().into_owned()).collect();
-            let output_count = Operation::infer_output_types(self, physical_types.as_slice())?.len();
-            return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_count]);
-        };
-
-        // Realign every mapped operand's batch axis to the common position, then broadcast every operand to the common
-        // batched physical shape.
-        let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped operand pins the batch size");
-        let unbatched_types: Vec<ArrayType> =
-            inputs.iter().map(|input| input.unbatched_type()).collect::<Result<Vec<_>, _>>()?;
-        let aligned_inputs: Vec<ArrayBatch<V>> =
-            inputs.iter().map(|input| align_batch_axis(input, batch_axis)).collect::<Result<Vec<_>, _>>()?;
-
-        // The common per-item shape every operand broadcasts to (right-aligned, JAX `defbroadcasting`), or `None` when
-        // the per-item shapes are not broadcast-compatible — in which case each operand keeps its own per-item shape
-        // below and the operation reports the incompatibility itself.
-        let common_unbatched = Broadcastable::broadcasted(unbatched_types.as_slice()).ok();
-        let broadcasted_inputs: Vec<ArrayBatch<V>> = aligned_inputs
-            .iter()
-            .zip(operand_axes.iter())
-            .zip(unbatched_types.iter())
-            .map(|((aligned, operand_axis), unbatched_type)| -> Result<ArrayBatch<V>, BatchingError> {
-                // Target physical type: the common per-item shape (falling back to this operand's own when
-                // incompatible) carrying this operand's own data type (e.g. a Boolean select condition stays Boolean
-                // against numeric branches), with the batch axis inserted at `batch_axis`.
-                let mut target = common_unbatched.as_ref().unwrap_or(unbatched_type).clone();
-                target.data_type = unbatched_type.data_type();
-                let physical_type = target.with_inserted_dimension(batch_axis, Size::Static(axis_size))?;
-                if physical_type == *aligned.r#type() {
-                    return Ok(aligned.clone());
-                }
-                // Map each aligned dimension to its position in the target: the batch axis maps to itself, and the
-                // per-item dimensions right-align within the target's per-item dimensions, skipping the inserted batch
-                // axis.
-                let target_unbatched_rank = physical_type.rank() - 1;
-                let is_mapped = operand_axis.is_some();
-                let output_axes: Vec<usize> = (0..aligned.r#type().rank())
-                    .map(|dimension| {
-                        if is_mapped && dimension == batch_axis {
-                            return batch_axis;
-                        }
-                        let per_item_index =
-                            if is_mapped && dimension > batch_axis { dimension - 1 } else { dimension };
-                        let position = (target_unbatched_rank - unbatched_type.rank()) + per_item_index;
-                        if position < batch_axis { position } else { position + 1 }
-                    })
-                    .collect();
-                let broadcasted = aligned.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
-                ArrayBatch::new(physical_type, broadcasted, batch_axis)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // The lifted operation is the original applied to the batch-carrying operands; every output takes the common
-        // batch axis. Broadcast-incompatible per-item shapes surface the operation's own shape error at this inference.
-        let physical_input_types: Vec<ArrayType> =
-            broadcasted_inputs.iter().map(|input| input.r#type().into_owned()).collect();
-        let output_count = Operation::infer_output_types(self, physical_input_types.as_slice())?.len();
-        let output_batch_axes = vec![BatchAxis::new(batch_axis); output_count];
-        self.interpret_with_batch_axes(context, &broadcasted_inputs, &output_batch_axes)
-    }
-}
-
-/// Realigns a batched input by moving its mapped batch axis to `target_axis`.
-///
-/// Identity case (already at `target_axis`, or unbatched) returns the input unchanged. Otherwise
-/// stages a [`TransposeOperation`] via the receiver's [`Transpose`] impl and returns a new
-/// [`ArrayBatch`] whose physical type and value reflect the realigned axis.
-///
-/// # Parameters
-///
-///   - `input`: Batched input to realign.
-///   - `target_axis`: Desired position of the mapped batch axis in the output.
-pub(crate) fn align_batch_axis<V: Value<ArrayType> + Transpose>(
-    input: &ArrayBatch<V>,
-    target_axis: usize,
-) -> Result<ArrayBatch<V>, BatchingError> {
-    let Some(current_axis) = input.batch_axis().axis() else {
-        return Ok(input.clone());
-    };
-    if current_axis == target_axis {
-        return Ok(input.clone());
-    }
-    let permuted_value = input.value().clone().move_axis(current_axis, target_axis)?;
-    let permuted_type = permuted_value.r#type().into_owned();
-    ArrayBatch::new(permuted_type, permuted_value, Some(target_axis))
-}
 
 /// Broadcasts a replicated `operand` to gain a singleton batch axis at `target_axis`.
 ///
@@ -273,7 +155,7 @@ where
                 natural_axis,
             )?;
             let aligned_batch = match natural_axis.axis() {
-                Some(_) => align_batch_axis(&parent_batch, target_axis)?,
+                Some(_) => parent_batch.match_batch_axis(target_axis)?,
                 None => broadcast_to_batched(&parent_batch, target_axis, axis_size)?,
             };
             output_atom_ids.push(aligned_batch.into_value().atom_id()?);
