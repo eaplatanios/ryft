@@ -41,7 +41,6 @@ use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_via_bind, transpose_tangent_partitioned};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
@@ -271,7 +270,7 @@ where
         let mut tangent_operands = forward_tail;
         // The rematerialize call takes every input tangent as a real operand, so materialize structural zeros.
         for input in inputs {
-            tangent_operands.push(materialize(context, input.tangent().clone())?);
+            tangent_operands.push(input.tangent().clone().materialize(context)?);
         }
         let tangent_outputs = replay_via_bind(context, self.tangent(), tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
@@ -544,7 +543,7 @@ where
         check_count!("output", outputs, cotangent_types.len(), ProgramError);
         let cotangent_tracers = outputs
             .iter()
-            .map(|cotangent| materialize(context, cotangent.clone()))
+            .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         let call = OLinear::from(RematerializeCallOperation {
             backward: self.backward.clone(),

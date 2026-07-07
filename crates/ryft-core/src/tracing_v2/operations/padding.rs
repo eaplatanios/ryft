@@ -23,7 +23,6 @@ use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::types::{ArrayType, TypeError, Typed};
 
 use super::slicing::batch_by_item_expansion;
-use crate::tracing_v2::differentiation::materialize;
 
 /// Transpose (vector-Jacobian product) for a [`PadOperation`].
 ///
@@ -108,7 +107,7 @@ where
                 let sliced_sum = if input_is_empty {
                     // The strided slice covered no positions, so its sum is a scalar zero of the padding value's
                     // type.
-                    materialize(context, MaybeZero::Zero(inputs[1].r#type().into_owned()))?
+                    MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?
                 } else {
                     let sliced_sums = context.stage_operation(
                         ReduceOperation::new(all_axes, ReductionKind::Sum),
@@ -150,8 +149,8 @@ where
         )?;
         // The pad needs both the operand and padding-value tangents as real values, so materialize the structurally
         // zero side (the shared all-zero fast path already handled the case where both are zero).
-        let operand_tangent = materialize(context, inputs[0].tangent().clone())?;
-        let padding_tangent = materialize(context, inputs[1].tangent().clone())?;
+        let operand_tangent = inputs[0].tangent().clone().materialize(context)?;
+        let padding_tangent = inputs[1].tangent().clone().materialize(context)?;
         let tangent = operand_tangent.pad(
             &padding_tangent,
             self.edge_padding_low(),

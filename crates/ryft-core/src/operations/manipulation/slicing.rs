@@ -12,7 +12,6 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::scan::render_factor_list;
 use crate::tracing_v2::operations::slicing::static_update_sizes;
@@ -1093,7 +1092,7 @@ where
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
             MaybeZero::Value(cotangent) => {
-                let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let outputs = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
                     &[zeros, cotangent.clone()],
@@ -1132,7 +1131,7 @@ where
             inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect::<Vec<_>>();
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let start_indices = read_known_start_indices(&inputs[1..]);
-            let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+            let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
             let mut operands = Vec::with_capacity(2 + start_indices.len());
             operands.push(zeros);
             operands.push(cotangent.clone());
@@ -1252,7 +1251,7 @@ where
             ]),
             MaybeZero::Value(cotangent) => {
                 let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
-                let zeros = materialize(context, MaybeZero::Zero(inputs[1].r#type().into_owned()))?;
+                let zeros = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     LinearDynamicUpdateSliceOperation::new(self.start_indices().to_vec()),
                     &[cotangent.clone(), zeros],
@@ -1318,7 +1317,7 @@ where
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let update_sizes = static_update_sizes("'dynamic_update_slice' transpose", &inputs[1].r#type())?;
             let start_indices = read_known_start_indices(&inputs[2..]);
-            let zeros = materialize(context, MaybeZero::Zero(inputs[1].r#type().into_owned()))?;
+            let zeros = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
             // Input cotangent: the output cotangent with the update window overwritten by zeros.
             let mut input_operands = Vec::with_capacity(2 + start_indices.len());
             input_operands.push(cotangent.clone());

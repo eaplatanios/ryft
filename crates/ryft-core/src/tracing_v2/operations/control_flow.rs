@@ -25,7 +25,7 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::differentiation::DifferentiationDual;
 use crate::operations::control_flow::MaybeWhile;
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, Linearization, materialize, replay_via_bind,
+    DifferentiableOperation, DifferentiableProgramOperation, Linearization, replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
@@ -148,7 +148,7 @@ where
     let mut operands = Vec::with_capacity(1 + output_types.len() + residuals.len());
     operands.push(predicate);
     for cotangent in outputs {
-        operands.push(materialize(context, cotangent.clone())?);
+        operands.push(cotangent.clone().materialize(context)?);
     }
     operands.extend(residuals);
     let branch_cotangents = context.stage_operation(O::from(transposed_condition), operands.as_slice())?;
@@ -388,7 +388,7 @@ where
         condition_operands.extend(operands.iter().map(|operand| operand.primal().clone()));
         // The fused branches take every operand tangent as a real program input, so materialize structural zeros.
         for operand in operands {
-            condition_operands.push(materialize(context, operand.tangent().clone())?);
+            condition_operands.push(operand.tangent().clone().materialize(context)?);
         }
         let outputs = context.bind(fused_condition, &condition_operands)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
@@ -634,7 +634,7 @@ where
         // The tangent scan takes every carry tangent as a real program input, so materialize structural zeros.
         let mut tangent_operands = inputs
             .iter()
-            .map(|input| materialize(context, input.tangent().clone()))
+            .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residual_stacks);
         tangent_operands.extend(mask_stacks);
@@ -702,7 +702,7 @@ where
     let mut tangent_carries = Vec::with_capacity(state_count);
     for input in inputs {
         primal_carries.push(input.primal().clone());
-        tangent_carries.push(materialize(context, input.tangent().clone())?);
+        tangent_carries.push(input.tangent().clone().materialize(context)?);
     }
 
     let mut completed_iterations = 0;
@@ -1555,7 +1555,7 @@ where
         )?;
         let materialized = outputs
             .iter()
-            .map(|cotangent| materialize(context, cotangent.clone()))
+            .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         let cotangents = context.stage_operation(transposed_condition, materialized.as_slice())?;
         check_count!("output", cotangents, self.true_branch().input_types().len(), ProgramError);

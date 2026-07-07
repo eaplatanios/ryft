@@ -27,7 +27,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, materialize};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -65,8 +65,8 @@ where
         } else {
             // One of the two linear tangents may still be a structural zero; scatter-add needs both as real values,
             // so materialize the zero side before staging the tangent scatter.
-            let operand_tangent = materialize(context, operand.tangent().clone())?;
-            let updates_tangent = materialize(context, updates.tangent().clone())?;
+            let operand_tangent = operand.tangent().clone().materialize(context)?;
+            let updates_tangent = updates.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.scatter(indices, &updates_tangent, self)?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])

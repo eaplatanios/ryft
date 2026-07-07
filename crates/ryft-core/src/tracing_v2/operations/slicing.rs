@@ -18,7 +18,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, materialize};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`SliceOperation`].
@@ -52,7 +52,7 @@ where
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
             MaybeZero::Value(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
-                let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let outputs = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     &[zeros, cotangent.clone()],
@@ -89,7 +89,7 @@ where
                     edge_padding_high.push(high);
                     interior_padding.push(stride - 1);
                 }
-                let zero = materialize(context, MaybeZero::Zero(ArrayType::scalar(input_type.data_type())))?;
+                let zero = MaybeZero::Zero(ArrayType::scalar(input_type.data_type())).materialize(context)?;
                 let outputs = context.stage_operation(
                     PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
                     &[cotangent.clone(), zero],
@@ -128,7 +128,7 @@ where
             MaybeZero::Value(cotangent) => {
                 let update_type = inputs[1].r#type();
                 let update_sizes = static_update_sizes(UPDATE_SLICE_TRANSPOSE_CONTEXT, &update_type)?;
-                let zeros = materialize(context, MaybeZero::Zero(update_type.clone().into_owned()))?;
+                let zeros = MaybeZero::Zero(update_type.clone().into_owned()).materialize(context)?;
                 let input_cotangents = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     &[cotangent.clone(), zeros],
@@ -223,8 +223,8 @@ where
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().into_owned())
         } else {
-            let operand_tangent = materialize(context, operand.tangent().clone())?;
-            let update_tangent = materialize(context, update.tangent().clone())?;
+            let operand_tangent = operand.tangent().clone().materialize(context)?;
+            let update_tangent = update.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.dynamic_update_slice(&update_tangent, &primal_starts)?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])
@@ -276,8 +276,8 @@ where
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().into_owned())
         } else {
-            let operand_tangent = materialize(context, operand.tangent().clone())?;
-            let update_tangent = materialize(context, update.tangent().clone())?;
+            let operand_tangent = operand.tangent().clone().materialize(context)?;
+            let update_tangent = update.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.update_slice(&update_tangent, self.start_indices())?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)])

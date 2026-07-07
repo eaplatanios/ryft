@@ -12,7 +12,9 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for [`FillOperation`].
 pub const FILL_OPERATION_NAME: &'static str = "fill";
@@ -97,9 +99,9 @@ impl<T: Type, Constant: Clone + Display, C: Context<Type = T, Operation: From<Fi
 
 /// Represents the ability to synthesize a value for a given [`Type`] filled with a captured scalar in an interpretation
 /// context. [`Fill`] is the [`Type`]-driven counterpart needed by [`FillOperation`] for its [`InterpretableOperation`]
-/// implementation. It sits alongside [`Zero`](super::Zero) and [`One`](super::One) in the same type-driven family, but
-/// generalizes the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
-pub trait Fill<S, V: Value> {
+/// implementation. It sits alongside [`Zero`] and [`One`](crate::One) in the same type-driven family, but generalizes
+/// the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
+pub trait Fill<S, V: Typed> {
     /// Returns a value of `type` with every element set to `value`.
     fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
 }

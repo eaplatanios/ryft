@@ -1094,8 +1094,7 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
 
 impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
 
-// TODO(eaplatanios): Review from here onwards.
-
+// TODO(eaplatanios): Review this docstring.
 /// Batches `function` over the mapped axes of `input`, running it once over whole batches instead of once per batch
 /// item. This is the batching (i.e., vectorization) transform — the analogue of
 /// [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html).
@@ -1138,28 +1137,22 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
 ///   - `input_batch_axes`: [`BatchAxis`] selection for the input leaves, broadcast into the input's structure.
 ///   - `output_batch_axes`: [`BatchAxis`] selection for the output leaves, broadcast into the output's structure.
 ///   - `batch_axis`: [`BatchAxisSpecification`] carrying an optional explicit batch size and an optional axis name.
-pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes, S: Into<BatchAxisSpecification>>(
+#[inline]
+pub fn batch<
+    V: Value<Type = ArrayType, ExecutionDomain: Context> + Transpose,
+    F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
+    I: Parameterized<V, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::ExecutionDomain>>>,
+    O: Parameterized<BatchingTracer<V::ExecutionDomain>, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>>,
+    InputBatchAxes: Parameterized<BatchAxis>,
+    OutputBatchAxes: Parameterized<BatchAxis>,
+    Specification: Into<BatchAxisSpecification>,
+>(
     function: F,
     input: I,
     input_batch_axes: InputBatchAxes,
     output_batch_axes: OutputBatchAxes,
-    batch_axis: S,
-) -> Result<O::To<V>, BatchingError>
-where
-    V: Value<Type = ArrayType> + Transpose,
-    V::ExecutionDomain: Context,
-    InputBatchAxes: Parameterized<BatchAxis>,
-    OutputBatchAxes: Parameterized<BatchAxis>,
-    I: Parameterized<
-            V,
-            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::ExecutionDomain>>,
-        >,
-    O: Parameterized<
-            BatchingTracer<V::ExecutionDomain>,
-            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
-        >,
-    F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
-{
+    batch_axis: Specification,
+) -> Result<O::To<V>, BatchingError> {
     let Some(context) = input.parameters().next().map(Value::execution_domain) else {
         return Err(BatchingError::EmptyBatch);
     };
@@ -1324,6 +1317,44 @@ mod tests {
         let matched = replicated.match_axis(0, 2).unwrap();
         assert_eq!(matched.batch_axis(), BatchAxis::new(0));
         assert_eq!(matched.value(), &TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]));
+    }
+
+    #[test]
+    fn test_array_batch_align_axis() {
+        let batched = ArrayBatch::new(
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
+            TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            Some(0),
+        )
+        .unwrap();
+
+        // Aligning a batched value to the axis it already maps returns it unchanged.
+        assert_eq!(batched.align_axis(BatchAxis::new(0)).unwrap(), batched);
+
+        // Aligning to a different mapped position stages a transpose (like `move_axis`). [2, 3] mapped at 0 becomes
+        // [3, 2] mapped at 1. Unlike `match_axis`, presence never changes, so no `axis_size` is needed.
+        let aligned = batched.align_axis(BatchAxis::new(1)).unwrap();
+        assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            *aligned.r#type(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)])),
+        );
+        assert_eq!(aligned.value(), &TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+
+        // Aligning a replicated value to a replicated declaration returns it unchanged.
+        let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
+        assert_eq!(replicated.align_axis(BatchAxis::replicated()).unwrap(), replicated);
+
+        // Presence disagreements are rejected: unlike `match_axis`, `align_axis` never broadcasts a replicated value
+        // to gain an axis nor collapses a mapped one, so both directions surface `MismatchedOutputAxes`.
+        assert_eq!(
+            replicated.align_axis(BatchAxis::new(0)),
+            Err(BatchingError::MismatchedOutputAxes { expected: BatchAxis::new(0), actual: BatchAxis::replicated() }),
+        );
+        assert_eq!(
+            batched.align_axis(BatchAxis::replicated()),
+            Err(BatchingError::MismatchedOutputAxes { expected: BatchAxis::replicated(), actual: BatchAxis::new(0) }),
+        );
     }
 
     #[test]

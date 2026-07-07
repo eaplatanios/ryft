@@ -19,7 +19,7 @@ use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiableProgramOperation, materialize};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiableProgramOperation};
 use crate::types::{ArrayType, DataType, Shape, Size, Type, Typed};
 
 /// Renders a compact comma-separated list of capture-like payloads.
@@ -88,11 +88,11 @@ where
         let mut operands = Vec::with_capacity(2 * body_input_count);
         operands.extend(inputs[..carry_count].iter().map(|input| input.primal().clone()));
         for input in &inputs[..carry_count] {
-            operands.push(materialize(context, input.tangent().clone())?);
+            operands.push(input.tangent().clone().materialize(context)?);
         }
         operands.extend(inputs[carry_count..].iter().map(|input| input.primal().clone()));
         for input in &inputs[carry_count..] {
-            operands.push(materialize(context, input.tangent().clone())?);
+            operands.push(input.tangent().clone().materialize(context)?);
         }
         let outputs = context.bind(C::Operation::from(fused_scan), &operands)?;
         check_count!("output", outputs, 2 * body_output_count, ProgramError);
@@ -398,7 +398,7 @@ where
         check_count!("output", outputs, output_types.len(), ProgramError);
         let materialized = outputs
             .iter()
-            .map(|cotangent| materialize(context, cotangent.clone()))
+            .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         let cotangents = context.stage_operation(O::from(transposed), materialized.as_slice())?;
         check_count!("output", cotangents, inputs.len(), ProgramError);
@@ -539,7 +539,7 @@ where
     check_count!("output", outputs, output_types.len(), ProgramError);
     let mut operands = Vec::with_capacity(output_types.len() + operand_linear.len());
     for cotangent in outputs {
-        operands.push(materialize(context, cotangent.clone())?);
+        operands.push(cotangent.clone().materialize(context)?);
     }
 
     // Append one scanned operand per known body input, in body order, to feed the transposed body's known-value
@@ -632,7 +632,7 @@ where
         .with_captures(operation.captures().to_vec());
         let materialized = outputs
             .iter()
-            .map(|cotangent| materialize(context, cotangent.clone()))
+            .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         let cotangents = context.stage_operation(Target::from(transposed), materialized.as_slice())?;
         check_count!("output", cotangents, inputs.len(), ProgramError);

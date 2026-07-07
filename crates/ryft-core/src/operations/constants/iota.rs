@@ -12,7 +12,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -101,7 +101,7 @@ impl<T: Type, C: Context<Type = T>> PartiallyEvaluatableOperation<C> for IotaOpe
 /// dimension in an interpretation context. [`Iota`] is the [`Type`]-driven capability needed by [`IotaOperation`] for
 /// its [`InterpretableOperation`] implementation, sitting alongside [`Zero`](super::Zero), [`One`](super::One), and
 /// [`Fill`](super::Fill) in the same type-driven family.
-pub trait Iota<V: Value> {
+pub trait Iota<V: Typed> {
     /// Returns a value of `type` whose elements increase from `0` along `dimension` and are constant along every other
     /// dimension.
     ///

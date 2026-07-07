@@ -14,7 +14,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, materialize};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
@@ -172,7 +172,7 @@ where
                 MaybeZero::Zero(inputs[1].r#type().into_owned()),
             ]),
             MaybeZero::Value(cotangent) => {
-                let zero = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+                let zero = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let operation = || O::from(LinearSelectOperation::new(self.condition().clone()));
                 let on_true = context.stage_operation(operation(), &[cotangent.clone(), zero.clone()])?;
                 check_count!("output", on_true, 1, ProgramError);
@@ -222,7 +222,7 @@ where
                     .as_known()
                     .expect("dispatch guarantees a known operand carries its pullback value")
                     .clone();
-                let zero = materialize(context, MaybeZero::Zero(inputs[1].r#type().into_owned()))?;
+                let zero = MaybeZero::Zero(inputs[1].r#type().into_owned()).materialize(context)?;
                 let on_true =
                     context.stage_operation(SelectOperation, &[condition.clone(), cotangent.clone(), zero.clone()])?;
                 check_count!("output", on_true, 1, ProgramError);
@@ -269,8 +269,8 @@ where
             MaybeZero::Zero(primal.r#type().into_owned())
         } else {
             // A select needs both branch tangents as real values, so materialize the structurally zero side.
-            let on_true_tangent = materialize(context, on_true.tangent().clone())?;
-            let on_false_tangent = materialize(context, on_false.tangent().clone())?;
+            let on_true_tangent = on_true.tangent().clone().materialize(context)?;
+            let on_false_tangent = on_false.tangent().clone().materialize(context)?;
             let mut tangents =
                 context.bind(SelectOperation, &[condition.primal().clone(), on_true_tangent, on_false_tangent])?;
             check_count!("output", tangents, 1, ProgramError);

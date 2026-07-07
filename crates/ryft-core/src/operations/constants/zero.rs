@@ -11,7 +11,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ZeroOperation`].
 pub const ZERO_OPERATION_NAME: &'static str = "zero";
@@ -104,7 +104,7 @@ where
 /// the [`Type`]-driven counterpart to [`ZeroLike`](super::ZeroLike). It is what [`ZeroOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
 /// backend- or context-dependent.
-pub trait Zero<V: Value> {
+pub trait Zero<V: Typed> {
     /// Returns a _zero_ value for the provided [`Type`].
     fn zero(&self, r#type: &V::Type) -> Result<V, ProgramError>;
 }

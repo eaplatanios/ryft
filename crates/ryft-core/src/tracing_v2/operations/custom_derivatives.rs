@@ -22,7 +22,6 @@ use crate::payloads::Captured;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_via_bind};
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -166,7 +165,7 @@ where
         // The user's JVP program takes every input tangent as a real program input, so materialize structural
         // zeros.
         for input in inputs {
-            jvp_inputs.push(materialize(context, input.tangent().clone())?);
+            jvp_inputs.push(input.tangent().clone().materialize(context)?);
         }
         let mut outputs = replay_via_bind(context, self.jvp_program(), jvp_inputs)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
@@ -738,7 +737,7 @@ where
         check_count!("output", outputs, cotangent_types.len(), ProgramError);
         let cotangent_tracers = outputs
             .iter()
-            .map(|cotangent| materialize(context, cotangent.clone()))
+            .map(|cotangent| cotangent.clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         let call = OLinear::from(CustomVjpCallOperation {
             backward: self.backward.clone(),
@@ -833,7 +832,7 @@ where
         // The opaque carrier takes every input tangent as a real operand, so materialize structural zeros.
         let mut carrier_operands = inputs
             .iter()
-            .map(|input| materialize(context, input.tangent().clone()))
+            .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         carrier_operands.extend(residuals);
         let carrier = CustomVjpTangentOperation::new(self.backward.clone(), residual_count, false);
@@ -1122,7 +1121,7 @@ where
     check_count!("output", outputs, cotangent_types.len(), ProgramError);
     let mut backward_inputs = residuals;
     for cotangent in outputs {
-        backward_inputs.push(materialize(context, cotangent.clone())?);
+        backward_inputs.push(cotangent.clone().materialize(context)?);
     }
     let input_cotangents = replay_via_bind(context, operation.backward(), backward_inputs)?;
     check_count!("output", input_cotangents, tangent_count, ProgramError);

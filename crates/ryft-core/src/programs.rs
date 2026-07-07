@@ -9,11 +9,12 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::contexts::Domain;
+use crate::contexts::{Context, Domain};
 use crate::effects::Effects;
 use crate::errors::CustomError;
 use crate::macros::check_count;
 use crate::operations::Operation;
+use crate::operations::constants::Zero;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::types::{TypeError, Typed};
 
@@ -168,6 +169,17 @@ impl<V: Typed> MaybeZero<V> {
         match self {
             Self::Zero(r#type) => MaybeZero::Zero(r#type),
             Self::Value(value) => MaybeZero::Value(function(value)),
+        }
+    }
+
+    /// Returns the value inside this [`MaybeZero`], materializing a structural [`MaybeZero::Zero`] as a real typed
+    /// zero value in the provided [`Context`] through its [`Zero`] capability (a staging context stages a typed
+    /// [`ZeroOperation`](crate::ZeroOperation) instruction, while an eager context constructs a concrete zero value).
+    #[inline]
+    pub fn materialize<C: Context<Value = V> + Zero<V>>(self, context: &C) -> Result<V, ProgramError> {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::Zero(r#type) => context.zero(&r#type),
         }
     }
 }

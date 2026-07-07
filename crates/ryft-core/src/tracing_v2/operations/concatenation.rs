@@ -15,7 +15,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, materialize};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`ConcatenateOperation`].
@@ -114,7 +114,7 @@ where
         // (the shared all-zero fast path already handled the case where every operand tangent is zero).
         let tangents = inputs
             .iter()
-            .map(|dual| materialize(context, dual.tangent().clone()))
+            .map(|dual| dual.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         let primal = Concatenate::concatenate(&primals, self.axis())?;
         let tangent = Concatenate::concatenate(&tangents, self.axis())?;

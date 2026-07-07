@@ -13,7 +13,6 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
@@ -880,7 +879,7 @@ where
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
             MaybeZero::Value(cotangent) => {
-                let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let dimensions = self.operation().dimensions();
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     dimensions.offset_dimensions().to_vec(),
@@ -938,7 +937,7 @@ where
                     .as_known()
                     .expect("dispatch guarantees a known operand carries its pullback value")
                     .clone();
-                let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+                let zeros = MaybeZero::Zero(inputs[0].r#type().into_owned()).materialize(context)?;
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     self.dimensions().offset_dimensions().to_vec(),
                     self.dimensions().collapsed_slice_dimensions().to_vec(),

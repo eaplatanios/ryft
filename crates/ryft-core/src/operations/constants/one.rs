@@ -12,7 +12,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
-use crate::types::{ArrayType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &'static str = "one";
@@ -82,7 +82,7 @@ impl<T: Type, C: Context<Type = T, Operation: From<OneOperation<T>>>> PartiallyE
 /// is the [`Type`]-driven counterpart to [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
 /// backend- or context-dependent.
-pub trait One<V: Value> {
+pub trait One<V: Typed> {
     /// Returns a _one_ value for the provided [`Type`].
     fn one(&self, r#type: &V::Type) -> Result<V, ProgramError>;
 }

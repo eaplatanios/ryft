@@ -119,7 +119,7 @@ impl<V: Clone + Typed, Payload: Clone, C: Context<Type = V::Type, Operation: Fro
 /// path. [`Captured`] payloads are values carried by the operation and may need to be inserted into the context, while
 /// [`Input`] payloads are already context values and should be reused rather than re-materialized. This type-level tag
 /// keeps those semantics explicit even when the payload value type itself is otherwise the same.
-pub trait Constant<V: Value, C, Payload = Captured> {
+pub trait Constant<V, C, Payload = Captured> {
     /// Returns the runtime value represented by `value`.
     fn constant(&self, value: C) -> Result<V, ProgramError>;
 }

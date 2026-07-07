@@ -205,7 +205,7 @@ pub trait Differentiate: Context {
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         for dual in output_duals {
             let (primal, tangent) = dual.into_dual().into_parts();
-            tangent_outputs.push(materialize(self, tangent)?);
+            tangent_outputs.push(tangent.materialize(self)?);
             primal_outputs.push(primal);
         }
         let primal_output =
@@ -1062,7 +1062,7 @@ where
             .copied()
             .map(|output_atom| {
                 let tangent = recorded_tangent(&primals, &tangents, output_atom)?;
-                materialize(&context, tangent)?.atom_id()
+                tangent.materialize(&context)?.atom_id()
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -1090,24 +1090,6 @@ fn recorded_tangent<V: Typed + Clone>(
     }
     let primal = primals[atom.index()].as_ref().ok_or(ProgramError::UnboundAtomId { id: atom })?;
     Ok(MaybeZero::Zero(primal.r#type().into_owned()))
-}
-
-/// Returns the value inside the provided symbolic `value`, materializing a structural zero as a real typed zero in
-/// the provided [`Context`] through its [`Zero`] capability: a staging context stages a typed
-/// [`ZeroOperation`] instruction, while an eager context constructs a concrete zero value. This is the
-/// instantiate-zeros boundary shared by forward-mode replay and transposition: call it exactly where a symbolic zero
-/// must become a real value — a nested sub-program operand, a program output, an eagerly returned tangent — and
-/// match on the [`MaybeZero`] everywhere else so zeros stay symbolic. Public so backend crates can materialize zeros
-/// in their own higher-order [`DifferentiableOperation`] and [`TransposableOperation`]
-/// rules.
-pub fn materialize<C>(context: &C, value: MaybeZero<C::Value>) -> Result<C::Value, ProgramError>
-where
-    C: Context + Zero<C::Value>,
-{
-    match value {
-        MaybeZero::Value(value) => Ok(value),
-        MaybeZero::Zero(r#type) => context.zero(&r#type),
-    }
 }
 
 /// Result of [`Program::linearize`](crate::Program::linearize): the partially evaluated known (primal) and unknown
