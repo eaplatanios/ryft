@@ -450,7 +450,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::{Scalar};
     use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
 
@@ -458,9 +458,9 @@ mod tests {
 
     #[test]
     fn test_domain() {
-        // [`ScalarDomain`] is an eager `Context` over the self-describing [`Scalar`] value type, so binding a nullary
+        // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is an eager `Context` over the self-describing [`Scalar`] value type, so binding a nullary
         // zero/one `Operation` interprets it directly to the [`Scalar`] variant matching the requested [`DataType`].
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(domain.bind(ZeroOperation::new(DataType::BF16), &[]), Ok(vec![Scalar::BF16(bf16::ZERO)]));
         assert_eq!(domain.bind(OneOperation::new(DataType::BF16), &[]), Ok(vec![Scalar::BF16(bf16::ONE)]));
         assert_eq!(domain.bind(ZeroOperation::new(DataType::F16), &[]), Ok(vec![Scalar::F16(f16::ZERO)]));
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_creates_inputs_constants_and_tracers() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = context.builder().clone();
 
         let input = context.input(DataType::F64);
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_stages_nullary_and_regular_operations() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = context.builder().clone();
 
         let mut nullary_outputs = context.stage_nullary_operation(ZeroOperation::new(DataType::F64)).unwrap();
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_records_errors_and_returns_poisoned_outputs_after_failure() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
 
@@ -567,10 +567,10 @@ mod tests {
         assert_eq!(output.r#type().into_owned(), DataType::F64);
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
-        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
+        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let foreign_input = foreign_context.input(DataType::F64);
 
         assert!(matches!(
@@ -590,7 +590,7 @@ mod tests {
         let source_program =
             source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
 
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = context.builder().clone();
         let input = context.input(DataType::F64);
         let mut outputs = context.stage_program(&source_program, vec![input]).unwrap();
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_staging_context_resolve() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let input = context.input(DataType::F64);
         let constant = context.constant(Scalar::from(2.5));
         let mut add_outputs = context.stage_operation(AddOperation, &[&input, &constant]).unwrap();
@@ -632,7 +632,7 @@ mod tests {
         assert_eq!(context.resolve(&sum), ValueResolution::Staged(AtomId::new(2)));
 
         // Tracers belonging to a different builder are opaque, in both directions.
-        let foreign_context = DomainTracingContext::<ScalarDomain>::new();
+        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let foreign_input = foreign_context.input(DataType::F64);
         assert_eq!(context.resolve(&foreign_input), ValueResolution::Opaque);
         assert_eq!(foreign_context.resolve(&input), ValueResolution::Opaque);

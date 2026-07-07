@@ -94,8 +94,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::batching::BatchingError;
-    use crate::tests::TestArrayDomain;
+    use crate::contexts::EagerContext;
+    use crate::tests::TestArray;
     use crate::tracing::DomainTracingContext;
+    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
@@ -129,12 +131,13 @@ mod tests {
     fn test_axis_index_stages_a_nullary_operation_for_a_bound_axis() {
         // Validate `name` against the seeded `NamedAxes` environment and stage a nullary `AxisIndexOperation`
         // producing a scalar `u64`, regardless of whether the axis is batch- or mesh-bound.
-        let (output_type, program) = DomainTracingContext::<TestArrayDomain>::trace_with_named_axes(
-            |input| input.context().axis_index("device"),
-            ArrayType::scalar(DataType::F64),
-            vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
-        )
-        .unwrap();
+        let (output_type, program) =
+            DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::trace_with_named_axes(
+                |input| input.context().axis_index("device"),
+                ArrayType::scalar(DataType::F64),
+                vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],
+            )
+            .unwrap();
         assert_eq!(output_type, ArrayType::scalar(DataType::U64));
         assert_eq!(
             program.to_string(),
@@ -149,7 +152,7 @@ mod tests {
     fn test_axis_index_rejects_an_unbound_axis() {
         // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
         // `AxisError::UnboundAxisName` through the `BatchingError::Axis` channel riding `ProgramError`.
-        let error = DomainTracingContext::<TestArrayDomain>::trace_with_named_axes(
+        let error = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::trace_with_named_axes(
             |input| input.context().axis_index("missing"),
             ArrayType::scalar(DataType::F64),
             vec![("device".to_string(), NamedAxis::Mesh { axis: 0, size: 4 })],

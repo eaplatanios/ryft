@@ -21,57 +21,6 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::TracingContext;
 use crate::types::{DataType, TypeError, Typed};
 
-/// Stateless [`Domain`] that uses [`DataType`] to represent [`Type`](crate::Type)s and [`Scalar`] to represent runtime
-/// [`Value`]s. [`ScalarDomain`] is the minimal scalar-only backend used throughout tests and examples in this crate.
-/// It demonstrates the intended role of an eager [`Context`] in the smallest possible form. There are no device
-/// handles, no mesh states, and no backend registries. There are just the built-in [`ScalarOperation`] variants plus
-/// [`DataType`]-driven construction of scalar values. Note that because [`Scalar`] reports the [`DataType`] of
-/// whichever variant it holds, this single non-generic domain interprets scalar [`Program`](crate::Program)s over
-/// every supported scalar [`DataType`] without monomorphizing over one Rust primitive at a time.
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ScalarDomain;
-
-impl ScalarDomain {
-    /// Creates a new [`ScalarDomain`].
-    #[inline]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Domain for ScalarDomain {
-    type Type = DataType;
-    type Value = Scalar;
-    type Constant = Scalar;
-    type Operation = ScalarOperation<Scalar>;
-}
-
-impl Context for ScalarDomain {
-    #[inline]
-    fn lift(&self, constant: Scalar) -> Result<Scalar, ProgramError> {
-        Ok(constant)
-    }
-
-    #[inline]
-    fn bind<P: Into<Self::Operation>>(
-        &self,
-        operation: P,
-        inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        // `ScalarDomain` is an eager `Context` whose `bind` interprets the operation directly over `Scalar` values.
-        operation.into().interpret(&EagerContext::<Scalar, Self::Operation>::new(), inputs)
-    }
-
-    #[inline]
-    fn resolve(&self, value: &Scalar) -> ValueResolution<Scalar> {
-        ValueResolution::Concrete(*value)
-    }
-}
-
-/// [`EagerContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] values with the
-/// [`ScalarOperation`] family.
-pub type ScalarEagerContext = EagerContext<Scalar, ScalarOperation<Scalar>>;
-
 /// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the
 /// [`ScalarOperation`] family.
 pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
@@ -152,9 +101,16 @@ impl Typed for Scalar {
 }
 
 impl Value for Scalar {
-    type Domain = EagerContext<Scalar>;
+    type DispatchDomain = EagerContext<Scalar>;
+    type ExecutionDomain = EagerContext<Scalar, ScalarOperation<Scalar>>;
 
-    fn domain(&self) -> EagerContext<Scalar> {
+    #[inline]
+    fn dispatch_domain(&self) -> EagerContext<Scalar> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> EagerContext<Scalar, ScalarOperation<Scalar>> {
         EagerContext::new()
     }
 }
@@ -272,27 +228,6 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
                 );
             }
         })
-    }
-}
-
-impl Zero<Scalar> for ScalarDomain {
-    #[inline]
-    fn zero(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
-        EagerContext::<Scalar>::new().zero(r#type)
-    }
-}
-
-impl One<Scalar> for ScalarDomain {
-    #[inline]
-    fn one(&self, r#type: &DataType) -> Result<Scalar, ProgramError> {
-        EagerContext::<Scalar>::new().one(r#type)
-    }
-}
-
-impl<Payload> Constant<Scalar, Scalar, Payload> for ScalarDomain {
-    #[inline]
-    fn constant(&self, value: Scalar) -> Result<Scalar, ProgramError> {
-        Ok(value)
     }
 }
 
@@ -635,13 +570,19 @@ mod tests {
 
     #[test]
     fn test_scalar_domain() {
-        // [`ScalarDomain`] is a zero-sized token.
-        assert_eq!(size_of::<ScalarDomain>(), 0);
+        // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is a zero-sized token.
+        assert_eq!(size_of::<EagerContext<Scalar, ScalarOperation<Scalar>>>(), 0);
 
         // It is an eager `Context`. Binding a nullary zero/one operation interprets it directly over concrete
         // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
-        assert_eq!(ScalarDomain::new().bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(0.0)]));
-        assert_eq!(ScalarDomain::default().bind(OneOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::F64), &[]),
+            Ok(vec![Scalar::from(0.0)]),
+        );
+        assert_eq!(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(OneOperation::new(DataType::F64), &[]),
+            Ok(vec![Scalar::from(1.0)]),
+        );
     }
 
     #[test]

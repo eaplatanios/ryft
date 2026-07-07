@@ -18,8 +18,9 @@ use crate::partial::{
     PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialValue, PartiallyEvaluatableOperation,
     PartitionedProgram,
 };
+use crate::operations::scalars::ScalarOperation;
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
-use crate::scalars::{Scalar, ScalarDomain};
+use crate::scalars::Scalar;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::types::{Type, Typed};
@@ -71,7 +72,7 @@ pub enum DifferentiationError {
 ///
 /// Both eager backends (e.g. an `ndarray` domain, whose value is concrete) and staging contexts ([`TracingContext`],
 /// batching contexts) implement it; whether a transform runs eagerly or stages a program is decided by the context's
-/// [`Domain::Value`] (concrete vs [`Tracer`]), not by a separate trait.
+/// [`DispatchDomain::Value`] (concrete vs [`Tracer`]), not by a separate trait.
 pub trait DifferentiationContext: Context {
     /// Tangent value type staged in the active linear program.
     type Tangent: Value<Type = Self::Type>;
@@ -87,16 +88,19 @@ pub trait DifferentiationContext: Context {
         Ok(())
     }
 
-    // TODO(eaplatanios): Do we really need this function?
     /// Returns `true` if this context's primal values are concrete, so concretizing extractions such as
     /// [`BooleanLike::boolean`] on primal values can succeed and the trip count of a data-dependent loop is decidable
-    /// at rule time.
+    /// while differentiating.
     ///
-    /// Eager domains use the default. Staging contexts (whose primal values are [`Tracer`]s, and abstract domains
-    /// whose primal values carry only type metadata) override this to return `false` so that higher-order rules —
-    /// in particular the [`WhileOperation`](crate::operations::control_flow::WhileOperation) JVP rule — choose
-    /// staged, non-concretizing strategies (the masked-scan or linear-loop paths) instead of eagerly unrolling
-    /// a loop whose primal state cannot be evaluated.
+    /// This gates the eager unroll-then-fuse pre-pass (`unroll_concretizable_whiles`) that every differentiation
+    /// entry point runs on the traced primal [`Program`] before differentiating it. Eager domains use the default: their `bind` computes
+    /// concrete values, so the pre-pass can evaluate each `while` condition at the concrete primals and unroll
+    /// data-dependent loops onto the capture-free differentiation path. Staging contexts (whose primal values are
+    /// [`Tracer`]s) override this to return `false` so the pre-pass leaves the program unchanged — folding it through
+    /// a live trace would stage the probe work into the enclosing builder — keeping the staged bounded-`while`
+    /// differentiation strategies instead. This must be a context-level predicate rather than a per-value
+    /// [`resolve`](Context::resolve) check because it answers a question about `bind`'s evaluation semantics: under a
+    /// live trace even literal-backed (concretely resolvable) primals must not be folded.
     #[inline]
     fn supports_primal_concretization(&self) -> bool {
         true
@@ -811,7 +815,23 @@ impl<V: Value, O: Operation<V::Type>, Capture> DifferentiationContext for Tracin
     }
 }
 
-impl DifferentiationContext for ScalarDomain {
+impl<C: Context> DifferentiationContext for NestedTracingContext<C> {
+    type Tangent = Tracer<NestedTracingContext<C>>;
+
+    #[inline]
+    fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
+        check_builders!(self.builder(), primal.context().builder()).map_err(|error| self.error(error))
+    }
+
+    /// Nested tracing contexts stage primal values as tracers, so concretizing extractions on them cannot succeed.
+    #[inline]
+    fn supports_primal_concretization(&self) -> bool {
+        false
+    }
+}
+
+/// The eager scalar domain differentiates eagerly with concrete [`Scalar`] tangents.
+impl DifferentiationContext for EagerContext<Scalar, ScalarOperation<Scalar>> {
     type Tangent = Scalar;
 }
 
@@ -821,7 +841,7 @@ impl DifferentiationContext for ScalarDomain {
 /// produced by ordinary tracer arithmetic on the primal tracer
 /// (for example, `primal.cos()` stages a fresh `Cos` operation) rather than by capturing a residual factor. Both the
 /// primal SSA values and the tangent SSA values of a linearization live in that one [`TracingContext`],
-/// whose [`Domain::Operation`] is the ordinary primal operation family `O`, so a tangent tracer staged there is an
+/// whose [`DispatchDomain::Operation`] is the ordinary primal operation family `O`, so a tangent tracer staged there is an
 /// ordinary primal operation (a `Mul`, `Add`, `Sin`, ...) rather than a linear operation with capture factors — which
 /// is precisely how the front end avoids symbolic capture entirely. Under an eager context (through a
 /// [`JvpContext`]) both components are concrete runtime values instead, and the same rules compute them directly.
@@ -933,10 +953,16 @@ impl<C: Context> Parameter for JvpTracer<C> {}
 
 /// A JVP dual flows through the [`JvpContext`] stamped on it.
 impl<C: Context> Value for JvpTracer<C> {
-    type Domain = JvpContext<C>;
+    type DispatchDomain = JvpContext<C>;
+    type ExecutionDomain = JvpContext<C>;
 
     #[inline]
-    fn domain(&self) -> JvpContext<C> {
+    fn dispatch_domain(&self) -> JvpContext<C> {
+        self.context().clone()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> JvpContext<C> {
         self.context().clone()
     }
 }
@@ -1673,7 +1699,7 @@ where
 /// instruction is bound with [`Context::bind`]. This gives the eager/staging duality for free — an eager `bind`
 /// computes the operation immediately, while a staging `bind` splices it into the active trace. Because every
 /// value-level differentiation context has [`Tangent`](DifferentiationContext::Tangent) equal to its
-/// [`Value`](Domain::Value), the tangent sub-program (whose leaves are tangents) is replayed through the same `bind`
+/// [`Value`](DispatchDomain::Value), the tangent sub-program (whose leaves are tangents) is replayed through the same `bind`
 /// with no tangent-context bridging.
 ///
 /// This is the plain-program sibling of [`PartialEvaluation::interpret`], which replays a partial-evaluation
@@ -1901,5 +1927,82 @@ where
         let context = EagerContext::<<C as Domain>::Value, <C as Domain>::Operation>::new();
         let input_cotangents = self.program.interpret_in_context(&context, inputs)?;
         Ok(Input::To::<C::Tangent>::from_parameters(self.input_structure.clone(), input_cotangents)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::operations::trigonometric::Sin;
+    use crate::scalars::{Scalar, ScalarOperation};
+    use crate::tracing_v2::test_util::assert_scalar_close;
+
+    use super::DifferentiationContext;
+
+    #[test]
+    fn test_nested_value_and_grad_computes_the_analytic_second_derivative() {
+        // Reverse-over-reverse through closure-level nesting: the outer transform differentiates a closure that
+        // itself calls `value_and_gradient` on the nested tracing context its tracer flows in. For f(x) = sin(x²),
+        // the outer value is f'(x) = 2x cos(x²) and the outer gradient is f''(x) = 2 cos(x²) - 4x² sin(x²).
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (value, gradient) = domain
+            .value_and_grad(
+                |x| {
+                    let context = x.context().clone();
+                    context.value_and_gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
+                },
+                Scalar::from(0.7),
+            )
+            .unwrap();
+        let x: f64 = 0.7;
+        assert_scalar_close(value, 2.0 * x * (x * x).cos());
+        assert_scalar_close(gradient, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+    }
+
+    #[test]
+    fn test_triple_nested_value_and_grad_computes_the_analytic_third_derivative() {
+        // Three levels of closure nesting exercise the recursive `NestedTracingContext<NestedTracingContext<...>>`
+        // types through the trait solver. For f(x) = sin(x²), f'''(x) = -12x sin(x²) - 8x³ cos(x²).
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (value, gradient) = domain
+            .value_and_grad(
+                |x| {
+                    let context = x.context().clone();
+                    context
+                        .value_and_gradient(
+                            |y| {
+                                let context = y.context().clone();
+                                context.value_and_gradient(|z| (z.clone() * z).sin().unwrap(), y).unwrap()
+                            },
+                            x,
+                        )
+                        .unwrap()
+                },
+                Scalar::from(0.7),
+            )
+            .unwrap();
+        let x: f64 = 0.7;
+        assert_scalar_close(value, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+        assert_scalar_close(gradient, -12.0 * x * (x * x).sin() - 8.0 * x * x * x * (x * x).cos());
+    }
+
+    #[test]
+    fn test_jvp_over_nested_gradient_computes_a_hessian_vector_product() {
+        // Forward-over-reverse: pushing a tangent through the gradient of f computes the Hessian-vector product
+        // f''(x)·v without materializing a dense Hessian. For f(x) = sin(x²) at x = 0.7 with v = 2, the primal is
+        // f'(0.7) and the tangent is 2·f''(0.7).
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent) = domain
+            .jvp(
+                |x| {
+                    let context = x.context().clone();
+                    context.value_and_gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
+                },
+                Scalar::from(0.7),
+                Scalar::from(2.0),
+            )
+            .unwrap();
+        let x: f64 = 0.7;
+        assert_scalar_close(primal, 2.0 * x * (x * x).cos());
+        assert_scalar_close(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()));
     }
 }

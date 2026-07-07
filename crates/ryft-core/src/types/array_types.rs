@@ -767,9 +767,16 @@ impl Typed for ArrayType {
 // `ArrayType : ArrayType`). It is the `Typed` witness required by `Value<Type = ArrayType>` for metadata-only program
 // storage, lowering, and transformation.
 impl Value for ArrayType {
-    type Domain = EagerContext<Self>;
+    type DispatchDomain = EagerContext<Self>;
+    type ExecutionDomain = EagerContext<Self>;
 
-    fn domain(&self) -> EagerContext<Self> {
+    #[inline]
+    fn dispatch_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 }

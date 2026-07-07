@@ -88,20 +88,40 @@ impl ProgramError {
 /// [`Debug`] and [`Display`] so that diagnostics, constants, and [`Operation`] metadata can render their carried
 /// values directly.
 pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
-    /// [`Domain`] that this [`Value`] is defined in. The bound is deliberately [`Domain`] rather than
-    /// [`Context`](crate::Context): value-ness names the universe a value inhabits without certifying that the universe
-    /// can execute operations. Call sites that need to [`bind`](crate::Context::bind) refine the domain locally with a
-    /// `V::Domain: Context` bound, which keeps the heavy transform capability stacks (e.g., interpretability,
-    /// differentiability, batchability, etc.) out of every `V: Value` obligation.
-    type Domain: Domain<Type = Self::Type, Value = Self>;
+    /// [`Domain`] that operations involving this [`Value`] *dispatch* through. Every value names two domains:
+    /// capability function calls dispatch through the [`DispatchDomain`](Self::DispatchDomain), while transform work
+    /// executes in the [`ExecutionDomain`](Self::ExecutionDomain). The two domains coincide for every transform and
+    /// staged value (e.g., a staged [`Tracer`](crate::Tracer)'s trace, a [`BatchingTracer`](crate::BatchingTracer)'s
+    /// batching level, etc.): dispatch and execution both happen in the live context such a value flows through.
+    /// However, they become separate for concrete backend values (e.g., concrete arrays). In those cases, the
+    /// [`DispatchDomain`](Self::DispatchDomain) is the constant-only [`EagerContext`](crate::EagerContext) such that
+    /// capability calls dispatch to direct implementations instead of a context, while the
+    /// [`ExecutionDomain`](Self::ExecutionDomain) names the backend's *rich*, operation-executing eager domain. Backend
+    /// values whose rich domain requires state or defaults that cannot be derived from a value (e.g., a client handle)
+    /// keep the constant-only domain here too, which simply means free transform entry points do not serve them and an
+    /// explicit context must be used instead.
+    ///
+    /// Blanket capability implementations (e.g., the value-level arithmetic sugar) bind through this domain and use its
+    /// operation universe as their coherence discriminator: the sugar applies when `V::DispatchDomain::Operation` can
+    /// accept the operation being bound. A staged [`Tracer`](crate::Tracer)'s dispatch domain is its live trace, so the
+    /// sugar records instructions there. A concrete backend value's dispatch domain is the constant-only
+    /// [`EagerContext`](crate::EagerContext), whose [`ConstantOperation`](crate::ConstantOperation) universe accepts
+    /// nothing. This is precisely what keeps the blanket implementations coherent with (i.e., disjoint from) the direct
+    /// capability implementations that concrete values provide instead.
+    type DispatchDomain: Domain<Type = Self::Type, Value = Self>;
 
-    /// Returns the [`Domain`] this [`Value`] is defined in. [`Context`](crate::Context)-generic staging entry points
-    /// (e.g., a custom-derivative `call` that binds one operation over its input) recover the active context from an
-    /// input value, refining `Self::Domain` with a [`Context`](crate::Context) bound, and
-    /// [`bind`](crate::Context::bind) against it, so that they work for *any* transform value (e.g., a staged
-    /// [`Tracer`](crate::Tracer), a [`BatchingTracer`](crate::BatchingTracer), a [`JvpTracer`](crate::JvpTracer),
-    /// etc.) rather than only a plain staged trace.
-    fn domain(&self) -> Self::Domain;
+    /// [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the documentation of
+    /// [`DispatchDomain`](Self::DispatchDomain) for information on the two types of [`Domain`]s that each value
+    /// provides.
+    type ExecutionDomain: Domain<Type = Self::Type, Value = Self>;
+
+    /// Returns the [`Domain`] that operations involving this [`Value`] *dispatch* through. Refer to the
+    /// documentation of [`DispatchDomain`](Self::DispatchDomain) for more information.
+    fn dispatch_domain(&self) -> Self::DispatchDomain;
+
+    /// Returns the [`Domain`] that transform work involving this [`Value`] *executes* in. Refer to the
+    /// documentation of [`ExecutionDomain`](Self::ExecutionDomain) for more information.
+    fn execution_domain(&self) -> Self::ExecutionDomain;
 }
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`]. [`MaybeZero`] is the
@@ -2005,9 +2025,14 @@ mod tests {
         }
 
         impl Value for CloneCountingValue {
-            type Domain = crate::EagerContext<Self>;
+            type DispatchDomain = crate::EagerContext<Self>;
+            type ExecutionDomain = crate::EagerContext<Self>;
 
-            fn domain(&self) -> crate::EagerContext<Self> {
+            fn dispatch_domain(&self) -> crate::EagerContext<Self> {
+                crate::EagerContext::new()
+            }
+
+            fn execution_domain(&self) -> crate::EagerContext<Self> {
                 crate::EagerContext::new()
             }
         }

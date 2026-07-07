@@ -159,10 +159,16 @@ impl<C: Context> Typed for Tracer<C> {
 }
 
 impl<C: StagingContext> Value for Tracer<C> {
-    type Domain = C;
+    type DispatchDomain = C;
+    type ExecutionDomain = C;
 
     #[inline]
-    fn domain(&self) -> C {
+    fn dispatch_domain(&self) -> C {
+        self.context().clone()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> C {
         self.context().clone()
     }
 }
@@ -170,7 +176,7 @@ impl<C: StagingContext> Value for Tracer<C> {
 /// Ordinary active tracing [`Context`] over a [`Type`]/[`Value`]/[`Operation`] universe. [`TracingContext`] pairs the
 /// staged-constant and operation representations `(V, O)` of a program with the [`ProgramBuilder`] used for one tracing
 /// invocation. It presents itself as a [`Domain`] whose [`Value`] is [`Tracer<Self>`](Tracer) and whose
-/// [`Constant`](Domain::Constant) is `V`. Its default [`StagingContext::stage_operation`] behavior records each
+/// [`Constant`](DispatchDomain::Constant) is `V`. Its default [`StagingContext::stage_operation`] behavior records each
 /// primitive bind as a program instruction. Transform contexts wrap or replace this context when they need different
 /// binding behavior, but they still share the same [`Context`] protocol used by [`Tracer`] values.
 ///
@@ -251,8 +257,8 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     /// Operation binds are handled by the context's [`StagingContext::stage_operation`] implementation. The type
     /// universe only supplies the staged constant and operation types used by that program. The capture parameter `C`
     /// is preserved on the staged [`Tracer`] leaves so that callers tracing in a context with a non-default capture
-    /// type (such as a backend whose runtime [`Value`](Domain::Value) differs from its staged
-    /// [`Constant`](Domain::Constant)) observe that same context type.
+    /// type (such as a backend whose runtime [`Value`](DispatchDomain::Value) differs from its staged
+    /// [`Constant`](DispatchDomain::Constant)) observe that same context type.
     pub fn trace<
         F: FnOnce(Input::To<Tracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<V::Type, Family: ParameterizedFamily<V> + ParameterizedFamily<Tracer<Self>>>,
@@ -394,12 +400,12 @@ impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext<C> for Traci
 /// Represents a nested [`TracingContext`] that is used to trace a closure into a [`Program`] expressed in an
 /// *enclosing* [`Context`]'s universe rather than in a raw `(V, O)` type universe of its own. Where [`TracingContext`]
 /// is keyed by the `(V, O)` types it stages and owns its own capture table, [`NestedTracingContext`] is keyed by the
-/// enclosing [`Context`] `C`. It derives its [`Type`](Domain::Type), [`Constant`](Domain::Constant), and
-/// [`Operation`](Domain::Operation) from `C`, owns a fresh [`ProgramBuilder`] for the nested [`Program`] it stages,
-/// and holds a clone of `C`. Runtime capture registration is *not* owned by this context but is rather delegated to the
-/// enclosing context through [`CapturingContext`], and so values captured while tracing the nested program flow into
-/// `C`'s table along the same nesting path as ordinary operation staging. As with [`TracingContext`], the
-/// [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the *same* nested program.
+/// enclosing [`Context`] `C`. It derives its [`Type`](DispatchDomain::Type), [`Constant`](DispatchDomain::Constant),
+/// and [`Operation`](DispatchDomain::Operation) from `C`, owns a fresh [`ProgramBuilder`] for the nested [`Program`]
+/// it stages, and holds a clone of `C`. Runtime capture registration is *not* owned by this context but is rather
+/// delegated to the enclosing context through [`CapturingContext`], and so values captured while tracing the nested
+/// program flow into `C`'s table along the same nesting path as ordinary operation staging. As with [`TracingContext`],
+/// the [`ProgramBuilder`] is shared behind an [`Rc`] so cloned contexts keep appending to the *same* nested program.
 pub struct NestedTracingContext<C: Context> {
     /// [`Context`] that this [`NestedTracingContext`] is nested into.
     parent: C,
@@ -498,9 +504,9 @@ impl<C: Context> StagingContext for NestedTracingContext<C> {
 /// type, staged constant, and [`Operation`] representations, and so it is the active tracing context that stages a
 /// [`Program`] expressed in `D`'s universe. The optional capture parameter `C` defaults to `D`'s staged constant
 /// representation, matching the default capture type of [`TracingContext::new`]. Closed program traces over a backend
-/// whose runtime [`Value`](Domain::Value) differs from its staged [`Constant`](Domain::Constant) pin `C` to that
-/// runtime value type explicitly. Use this alias at call sites that already hold a [`Domain`] and want to name the
-/// matching tracing context. Use [`TracingContext`] directly at sites that already work in terms of a `(V, O)`
+/// whose runtime [`Value`](DispatchDomain::Value) differs from its staged [`Constant`](DispatchDomain::Constant) pin
+/// `C` to that runtime value type explicitly. Use this alias at call sites that already hold a [`Domain`] and want to
+/// name the matching tracing context. Use [`TracingContext`] directly at sites that already work in terms of a `(V, O)`
 /// universe.
 pub type DomainTracingContext<D, C = <D as Domain>::Constant> =
     TracingContext<<D as Domain>::Constant, <D as Domain>::Operation, C>;
@@ -537,21 +543,23 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
+    use crate::contexts::EagerContext;
 
     #[test]
     fn test_trace() {
-        let (output_type, program) = ScalarDomain::trace(|x| Ok(x.clone() * x), DataType::F64).unwrap();
+        let (output_type, program) =
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|x| Ok(x.clone() * x), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
         assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(9.0)));
     }
 
     #[test]
     fn test_interpret_and_trace() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (output, program) =
             domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Scalar::from(2.0)).unwrap();
         assert_eq!(output, 2.0 * 2.0 + 2.0f64.sin());
@@ -560,7 +568,9 @@ mod tests {
 
     #[test]
     fn test_infer_output_type() {
-        let output_type = ScalarDomain::infer_output_type(|x| Ok(x.sin()?), DataType::F64).unwrap();
+        let output_type =
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::infer_output_type(|x| Ok(x.sin()?), DataType::F64)
+                .unwrap();
         assert_eq!(output_type, DataType::F64);
     }
 
@@ -577,7 +587,7 @@ mod tests {
     #[test]
     fn test_tracer() {
         // Test handles, atom lookup, cloning, typing, and rendering.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let tracer = tracing_context.tracer(atom, None);
@@ -620,7 +630,7 @@ mod tests {
         );
 
         // Test staging a unary operation through the tracer convenience API.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let tracer = tracing_context.tracer(atom, None);
@@ -644,7 +654,7 @@ mod tests {
         );
 
         // Test staging a binary operation through the tracer convenience API.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
@@ -670,8 +680,8 @@ mod tests {
         );
 
         // Test that binary operations poison the result when inputs belong to different builders.
-        let context_a = DomainTracingContext::<ScalarDomain>::new();
-        let context_b = DomainTracingContext::<ScalarDomain>::new();
+        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder_a = context_a.builder().clone();
         let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
         let atom_b = context_b.builder().borrow_mut().add_input(DataType::F64);
@@ -721,10 +731,10 @@ mod tests {
 
     #[test]
     fn test_tracing_context() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         // Test construction, cloning, and debug formatting.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let cloned_context = tracing_context.clone();
         assert!(Rc::ptr_eq(tracing_context.builder(), &builder));
@@ -753,7 +763,7 @@ mod tests {
         );
 
         // Test constructing tracers from builder-owned and explicitly cached types.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let atom = tracing_context.builder().borrow_mut().add_input(DataType::F64);
         let builder_typed = tracing_context.tracer(atom, None);
         let cached_typed = tracing_context.tracer(atom, Some(DataType::F64));
@@ -761,7 +771,7 @@ mod tests {
         assert!(matches!(cached_typed.r#type(), Cow::Borrowed(r#type) if *r#type == DataType::F64));
 
         // Test that only the first recorded builder error is retained.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let first_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
         let second_error = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
@@ -770,7 +780,7 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(first_error));
 
         // Test staging a valid operation through the context.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(DataType::F64);
         let rhs_atom = builder.borrow_mut().add_input(DataType::F64);
@@ -798,8 +808,8 @@ mod tests {
         );
 
         // Test rejecting inputs that belong to a different program builder.
-        let context_a = DomainTracingContext::<ScalarDomain>::new();
-        let context_b = DomainTracingContext::<ScalarDomain>::new();
+        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder_a = context_a.builder().clone();
         let atom_a = builder_a.borrow_mut().add_input(DataType::F64);
         let atom_b = context_b.builder().borrow_mut().add_input(DataType::F64);
@@ -812,7 +822,7 @@ mod tests {
         assert_eq!(builder_a.borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
 
         // Test tracing after a builder failure by returning poisoned tracers when output types can still be inferred.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let atom = builder.borrow_mut().add_input(DataType::F64);
         let builder_error = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
@@ -830,7 +840,7 @@ mod tests {
         assert_eq!(builder.borrow().error().cloned(), Some(builder_error));
 
         // Test propagating abstract-evaluation errors and recording them on the builder.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let lhs_atom = builder.borrow_mut().add_input(DataType::F8E3M4);
         let rhs_atom = builder.borrow_mut().add_input(DataType::F32);
@@ -849,7 +859,7 @@ mod tests {
         ));
 
         // Test staging concrete constants through the context without requiring the context itself to be a domain.
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let zero = tracing_context
             .constant(domain.bind(ZeroOperation::new(DataType::F64), &[]).unwrap().into_iter().next().unwrap());
@@ -888,7 +898,7 @@ mod tests {
         let constant = builder.add_constant(Scalar::from(4.0));
         let output = builder.add_instruction(AddOperation, vec![input, constant]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
         let input = tracing_context.input(DataType::F64);
         let outputs = tracing_context.stage_program(&program, vec![input]).unwrap();
@@ -915,8 +925,11 @@ mod tests {
 
     #[test]
     fn test_tracing_context_trace() {
-        let (output_type, program) =
-            ScalarDomain::trace(|x| Ok(x.clone() * x.clone() + x.one_like()), DataType::F64).unwrap();
+        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+            |x| Ok(x.clone() * x.clone() + x.one_like()),
+            DataType::F64,
+        )
+        .unwrap();
         assert_eq!(output_type, DataType::F64);
         assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(10.0)));
         assert_eq!(
@@ -934,7 +947,7 @@ mod tests {
         // Test using an escaped [`ProgramBuilder`].
         let escaped_builder = Rc::new(RefCell::new(None));
         assert!(matches!(
-            ScalarDomain::trace(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
                 |x| {
                     *escaped_builder.borrow_mut() = Some(x.builder().clone());
                     Ok(x)
@@ -946,7 +959,7 @@ mod tests {
 
         // Test that [`TypeError`]s are returned in certain cases.
         assert!(matches!(
-            ScalarDomain::trace(|inputs| Ok(inputs.0 + inputs.1), (DataType::F8E3M4, DataType::F32)),
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|inputs| Ok(inputs.0 + inputs.1), (DataType::F8E3M4, DataType::F32)),
             Err(ProgramError::Type(TypeError { message }))
                 if message == "'add' input types are not broadcast-compatible",
         ));
@@ -954,7 +967,7 @@ mod tests {
 
     #[test]
     fn test_tracing_context_interpret_and_trace() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (output, program) =
             domain.interpret_and_trace(|x| Ok(x.clone() * x.clone() + x.sin()?), Scalar::from(2.0)).unwrap();
         assert_eq!(output, 2.0f64 * 2.0f64 + 2.0f64.sin());
@@ -1028,9 +1041,9 @@ mod tests {
 
     #[test]
     fn test_nested_tracing_context() {
-        // A nested trace over an eager `ScalarDomain` parent stages its own independent primal program and,
+        // A nested trace over an eager `EagerContext<Scalar, ScalarOperation<Scalar>>` parent stages its own independent primal program and,
         // like the root `TracingContext`, shares that program's builder across cloned contexts.
-        let nested = NestedTracingContext::new(ScalarDomain::new());
+        let nested = NestedTracingContext::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
         let builder = nested.builder().clone();
         let cloned_context = nested.clone();
         assert!(Rc::ptr_eq(nested.builder(), &builder));

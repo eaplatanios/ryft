@@ -446,10 +446,16 @@ impl<V: Typed<Type = ArrayType>> Typed for ArrayBatch<V> {
 }
 
 impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
-    type Domain = EagerContext<Self>;
+    type DispatchDomain = EagerContext<Self>;
+    type ExecutionDomain = EagerContext<Self>;
 
     #[inline]
-    fn domain(&self) -> EagerContext<Self> {
+    fn dispatch_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> EagerContext<Self> {
         EagerContext::new()
     }
 }
@@ -840,10 +846,16 @@ impl<C: Context<Type = ArrayType>> Value for BatchingTracer<C>
 where
     BatchingContext<C>: Domain<Type = ArrayType, Value = BatchingTracer<C>>,
 {
-    type Domain = BatchingContext<C>;
+    type DispatchDomain = BatchingContext<C>;
+    type ExecutionDomain = BatchingContext<C>;
 
     #[inline]
-    fn domain(&self) -> BatchingContext<C> {
+    fn dispatch_domain(&self) -> BatchingContext<C> {
+        self.context().clone()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> BatchingContext<C> {
         self.context().clone()
     }
 }
@@ -1106,53 +1118,17 @@ pub trait Batch: Context<Type = ArrayType> {
 impl<C> Batch for C where C: Context<Type = ArrayType> {}
 
 // TODO(eaplatanios): Review this trait.
-/// [`Value`]s that can name and recover the active array [`Context`] that executes operations involving them. This
-/// is the context-recovery hook behind the free [`batch`] function.
-///
-/// Transform and staged values earn this through the blanket implementation: their [`Value::Domain`] *is* the active
-/// context (a staged [`Tracer`]'s trace, a [`BatchingTracer`]'s batching level, a JVP dual's differentiation
-/// context). Backend-concrete values opt in individually by naming their backend's rich eager context (e.g.,
-/// `TestArray` names `TestArrayDomain`), because their [`Value::Domain`] is the constant-only [`EagerContext`]
-/// (which cannot bind operations — the blanket tracer capability implementations are coherent with concrete values'
-/// own precisely because of this) and because constructing a backend context can involve backend state and defaults
-/// (e.g., a client handle or compilation options) that only the backend can choose. The `From<TransposeOperation>`
-/// bound on the blanket both keeps it coherent with (disjoint from) those concrete implementations and reflects a
-/// real obligation of the batching transform: batch-axis realignment stages transposes.
-pub trait BatchInput: Value<Type = ArrayType> {
-    /// Active [`Context`] that executes operations involving this value.
-    type Context: Context<Type = ArrayType, Value = Self>;
-
-    /// Returns the active [`Context`] that executes operations involving this value.
-    fn batch_context(&self) -> Self::Context;
-}
-
-// TODO(eaplatanios): Review this implementation.
-impl<V: Value<Type = ArrayType>> BatchInput for V
-where
-    V::Domain: Context,
-    <V::Domain as Domain>::Operation: From<TransposeOperation>,
-{
-    type Context = V::Domain;
-
-    #[inline]
-    fn batch_context(&self) -> V::Domain {
-        self.domain()
-    }
-}
-
-// TODO(eaplatanios): Review this function.
-/// Batches `function` over the mapped axes of `input`, recovering the active [`Context`] from the input's first leaf
-/// value via [`BatchInput::batch_context`] — the analogue of
-/// [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html), which likewise discovers the
-/// interpreter for its inputs (the innermost active trace, or the default eager backend for concrete arrays) instead
-/// of threading it explicitly. This is a thin delegator to [`Batch::batch`]; refer to its documentation for the
-/// `in_axes`/`out_axes`/`axis` conventions.
+// TODO(eaplatanios): This should have the main documentation and the docstring of `Batch::batch` should refer to this
+//  and not the other way around.
+/// Batches `function` over the mapped axes of `input`. This is a thin delegator to [`Batch::batch`] and is the analogue
+/// of [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html). Refer to the documentation of
+/// [`Batch::batch`] for more information on what it does and on its arguments.
 ///
 /// Staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their batching level (so `batch` nests inside
 /// `batch`), JVP duals recover their differentiation context, and backend-concrete values recover the eager backend
-/// context they name through their own [`BatchInput`] implementations. Inputs with *no leaf values* are the one case
-/// this form cannot serve: with nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
-/// `axis` supplies an explicit batch size — call [`Batch::batch`] on an explicit context instead.
+/// context they name through their own [`Value::ExecutionDomain`] declarations. Inputs with *no leaf values* are the
+/// one case this form cannot serve: with nothing to recover a context from, it returns [`BatchingError::EmptyBatch`]
+/// even when `axis` supplies an explicit batch size — call [`Batch::batch`] on an explicit context instead.
 pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes>(
     function: F,
     input: I,
@@ -1161,24 +1137,25 @@ pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes>(
     axis: impl Into<BatchAxisSpecification>,
 ) -> Result<O::To<V>, BatchingError>
 where
-    V: BatchInput + Transpose,
+    V: Value<Type = ArrayType> + Transpose,
+    V::ExecutionDomain: Context<Type = ArrayType>,
     InputBatchAxes: Parameterized<BatchAxis>,
     OutputBatchAxes: Parameterized<BatchAxis>,
     I: Parameterized<
             V,
             ParameterStructure: Debug + PartialEq,
-            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::Context>>,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::ExecutionDomain>>,
         >,
     O: Parameterized<
-            BatchingTracer<V::Context>,
+            BatchingTracer<V::ExecutionDomain>,
             ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
         >,
     I::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = I::ParameterStructure>,
     O::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = O::ParameterStructure>,
-    F: FnOnce(I::To<BatchingTracer<V::Context>>) -> Result<O, ProgramError>,
+    F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
 {
-    let Some(context) = input.parameters().next().map(BatchInput::batch_context) else {
+    let Some(context) = input.parameters().next().map(Value::execution_domain) else {
         return Err(BatchingError::EmptyBatch);
     };
     context.batch(function, input, in_axes, out_axes, axis)
@@ -1188,9 +1165,11 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::arithmetic::AddOperation;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 
     use super::*;
@@ -1402,28 +1381,36 @@ mod tests {
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
         let right = make_batch(&matrix_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], Some(0));
-        let outputs = AddOperation.batch(&TestArrayDomain, &[left.clone(), right]).unwrap();
+        let outputs = AddOperation
+            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left.clone(), right])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // A replicated operand is broadcast across the mapped operand's batch before adding.
         let replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&TestArrayDomain, &[left.clone(), replicated]).unwrap();
+        let outputs = AddOperation
+            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left.clone(), replicated])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
 
         // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
         let transposed_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
-        let outputs = AddOperation.batch(&TestArrayDomain, &[left, right_axis_one]).unwrap();
+        let outputs = AddOperation
+            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left, right_axis_one])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation.batch(&TestArrayDomain, &[left_replicated, right_replicated]).unwrap();
+        let outputs = AddOperation
+            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left_replicated, right_replicated])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
     }
@@ -1438,7 +1425,11 @@ mod tests {
         let right = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
 
         let outputs = AddOperation
-            .interpret_with_batch_axes(&TestArrayDomain, &[left, right], &[BatchAxis::new(0)])
+            .interpret_with_batch_axes(
+                &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+                &[left, right],
+                &[BatchAxis::new(0)],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -1449,7 +1440,11 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type, TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
         assert!(matches!(
-            AddOperation.interpret_with_batch_axes(&TestArrayDomain, &[left, right], &[]),
+            AddOperation.interpret_with_batch_axes(
+                &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+                &[left, right],
+                &[]
+            ),
             Err(BatchingError::Program(_)),
         ));
     }
@@ -1459,7 +1454,7 @@ mod tests {
     fn test_program_batched() {
         // Trace a per-item squaring function into a flat program over per-item (logical) vector types.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let (_, program) = TestArrayDomain::trace(
+        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
             |inputs: Vec<_>| Ok(vec![inputs[0].clone() * inputs[0].clone()]),
             vec![vector_type.clone()],
         )
@@ -1492,7 +1487,7 @@ mod tests {
     fn test_batch() {
         // `Batch::batch` on an explicit context maps the closure over the mapped input axis: each item of the
         // length-3 batch is squared, and the output carries its mapped axis back at the requested position.
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
@@ -1503,7 +1498,7 @@ mod tests {
             .unwrap();
         assert_eq!(output, TestArray::vector(vec![1.0, 4.0, 9.0]));
 
-        // The free `batch` serves top-level concrete values through their `BatchInput` implementations: a plain
+        // The free `batch` serves top-level concrete values through their `Value::ExecutionDomain` declarations: a plain
         // `TestArray` input recovers the test backend's rich eager domain, mirroring how JAX's `vmap` falls back to
         // the default eager interpreter for concrete arrays.
         let output: TestArray = batch(
@@ -1520,7 +1515,7 @@ mod tests {
         // `vmap` composes inside traced code without threading a context. The traced function squares each row of
         // its `[2, 3]` input by batching a per-item squaring closure over axis 0.
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let (_, program) = TestArrayDomain::trace(
+        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
             |inputs: Vec<_>| {
                 let mapped =
                     batch(|x| Ok(x.clone() * x), inputs[0].clone(), BatchAxis::new(0), BatchAxis::new(0), None)?;
@@ -1536,7 +1531,7 @@ mod tests {
         // Nested inside an eager `batch`, the inner free `batch` recovers the outer `BatchingContext` from its
         // `BatchingTracer` input, so `vmap` nests inside `vmap`: the outer level maps rows and the inner level maps
         // items within each row.
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |row| Ok(batch(|item| Ok(item.clone() * item), row, BatchAxis::new(0), BatchAxis::new(0), None)?),
                 TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -1549,7 +1544,7 @@ mod tests {
 
         // A replicated input with an explicit batch size runs the closure on the shared value and returns a
         // replicated output.
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
@@ -1562,7 +1557,7 @@ mod tests {
 
         // Declaring a mapped output as replicated is rejected: collapsing a mapped axis requires an explicit
         // reduction inside the batched function.
-        let error = TestArrayDomain
+        let error = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
@@ -1574,7 +1569,7 @@ mod tests {
         assert!(matches!(error, BatchingError::MismatchedOutputAxes { .. }));
 
         // With no mapped input and no explicit batch size, the batch size is unobservable.
-        let error = TestArrayDomain
+        let error = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
@@ -1588,7 +1583,7 @@ mod tests {
         // With no leaf value to recover a context from, the free `batch` reports an empty batch even when an
         // explicit batch size is provided.
         let error = batch(
-            |x: Vec<BatchingTracer<TestArrayDomain>>| Ok(x),
+            |x: Vec<BatchingTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>>| Ok(x),
             Vec::<TestArray>::new(),
             BatchAxis::replicated(),
             BatchAxis::replicated(),

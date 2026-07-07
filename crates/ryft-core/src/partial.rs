@@ -428,11 +428,11 @@ impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
 /// # Type Parameters
 ///
 ///   - `C`: Known-side [`Context`] that partial evaluation folds known work through. Its
-///     [`Operation`](crate::Domain::Operation) is the operation family of the residual [`Program`] and of any inlined
-///     nested programs (e.g., the enum this operation may belong to). Its [`Constant`](crate::Domain::Constant) is the
-///     staged constant space those programs store. Finally, its [`Value`](crate::Domain::Value) is the space known
-///     values flow in (i.e., concrete values under eager contexts and [`Tracer`](crate::Tracer)s into the outer program
-///     under [`StagingContext`]s).
+///     [`Operation`](crate::DispatchDomain::Operation) is the operation family of the residual [`Program`] and of any
+///     inlined nested programs (e.g., the enum this operation may belong to). Its
+///     [`Constant`](crate::DispatchDomain::Constant) is the staged constant space those programs store. Finally, its
+///     [`Value`](crate::DispatchDomain::Value) is the space known values flow in (i.e., concrete values under eager
+///     contexts and [`Tracer`](crate::Tracer)s into the outer program under [`StagingContext`]s).
 pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
     /// Partially evaluates this [`PartiallyEvaluatableOperation`] for the provided [`PartialEvaluationValue`]s. Unless
     /// overridden, this function will default to calling [`PartialEvaluator::fold_or_residualize`] which uses the
@@ -1205,7 +1205,7 @@ mod tests {
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::{Scalar, ScalarEagerContext, ScalarTracingContext};
+    use crate::scalars::{Scalar, ScalarTracingContext};
     use crate::types::DataType;
 
     use super::*;
@@ -1224,7 +1224,7 @@ mod tests {
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let evaluation = PartialEvaluation::<ScalarEagerContext> {
+        let evaluation = PartialEvaluation::<EagerContext<Scalar, ScalarOperation<Scalar>>> {
             program: program.clone(),
             inputs: vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Scalar::from(2.0))],
             outputs: vec![PartialEvaluationOutput::Known(Scalar::from(5.0)), PartialEvaluationOutput::Unknown(0)],
@@ -1233,7 +1233,7 @@ mod tests {
         // Interpretation takes exactly one value per `Unknown` feeder, feeds `Known` feeders from their carried values,
         // returns folded outputs directly, and reads the rest from the replayed residual program:
         // `(5, 4 * 2 + 3) = (5, 11)`.
-        let context = ScalarEagerContext::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
             evaluation.interpret(&context, &[Scalar::from(4.0)]),
             Ok(vec![Scalar::from(5.0), Scalar::from(11.0)]),
@@ -1249,7 +1249,7 @@ mod tests {
 
         // An output that references a residual output the residual program does not produce is reported as a
         // malformed program.
-        let evaluation = PartialEvaluation::<ScalarEagerContext> {
+        let evaluation = PartialEvaluation::<EagerContext<Scalar, ScalarOperation<Scalar>>> {
             program: program.clone(),
             inputs: evaluation.inputs,
             outputs: vec![PartialEvaluationOutput::Unknown(1)],
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_partial_evaluator() {
-        let mut evaluator = PartialEvaluator::new(ScalarEagerContext::new());
+        let mut evaluator = PartialEvaluator::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
         assert_eq!(
             evaluator.context().bind(AddOperation, &[Scalar::from(1.0), Scalar::from(2.0)]),
             Ok(vec![Scalar::from(3.0)]),
@@ -1444,11 +1444,13 @@ mod tests {
         let empty = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new()
             .build::<Vec<Scalar>, Vec<Scalar>>(Vec::new(), Vec::new(), Vec::new())
             .unwrap();
-        assert!(evaluator.all_knowns_are_concrete(&PartialEvaluation::<ScalarEagerContext> {
-            program: empty.clone(),
-            inputs: vec![PartialEvaluationInput::Known(Scalar::from(1.0)), PartialEvaluationInput::Unknown(0)],
-            outputs: vec![PartialEvaluationOutput::Known(Scalar::from(2.0))],
-        }));
+        assert!(evaluator.all_knowns_are_concrete(
+            &PartialEvaluation::<EagerContext<Scalar, ScalarOperation<Scalar>>> {
+                program: empty.clone(),
+                inputs: vec![PartialEvaluationInput::Known(Scalar::from(1.0)), PartialEvaluationInput::Unknown(0)],
+                outputs: vec![PartialEvaluationOutput::Known(Scalar::from(2.0))],
+            }
+        ));
         assert!(!staging_evaluator.all_knowns_are_concrete(&PartialEvaluation::<ScalarTracingContext> {
             program: empty.clone(),
             inputs: vec![PartialEvaluationInput::Known(symbolic.clone())],
@@ -1521,7 +1523,7 @@ mod tests {
 
         // Replaying the partial evaluation at a concrete unknown input matches interpreting the original program.
         assert_eq!(
-            evaluation.interpret(&ScalarEagerContext::new(), &[Scalar::from(4.0)]),
+            evaluation.interpret(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), &[Scalar::from(4.0)]),
             Ok(vec![Scalar::from(9.0), Scalar::from(37.0), Scalar::from(13.0)]),
         );
         assert_eq!(

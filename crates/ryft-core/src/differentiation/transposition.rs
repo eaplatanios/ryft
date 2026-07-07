@@ -640,21 +640,23 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
     use crate::macros::check_count;
     use crate::operations::Operation;
     use crate::operations::arithmetic::AddOperation;
     use crate::operations::constants::ZeroOperation;
+    use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
     use crate::types::{DataType, TypeError};
 
-    use super::TransposableOperation;
+    use super::*;
 
-    type TestTracingValue = DomainTracer<ScalarDomain>;
+    type TestTracingValue = DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
 
     /// Test-only linear operation type used to exercise transposition validation paths. Most variants model tiny scalar
     /// primitives so the generated programs stay readable. The sentinel variants intentionally violate transpose rule
@@ -1030,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_tracing_context_transpose_materializes_disconnected_input_zero_as_zero_instruction() {
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let outer_builder = tracing_context.builder().clone();
         let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
         let connected_input = builder.add_input(DataType::F64);
@@ -1074,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_tracing_context_transpose_materializes_staged_zero_contribution_as_zero_instruction() {
-        let tracing_context = DomainTracingContext::<ScalarDomain>::new();
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let outer_builder = tracing_context.builder().clone();
         let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);

@@ -3,7 +3,7 @@
 //! Reference test value types for exercising `ryft` programs without a real backend.
 //!
 //! This module provides [`TestArray`], a deliberately simple dense array value backed by a flat row-major `Vec<f64>`
-//! payload, together with [`TestArrayDomain`], a minimal interpreting [`Domain`] whose operation set is
+//! payload, together with [`EagerContext<TestArray, ArrayOperation<TestArray>>`], a minimal interpreting [`Domain`] whose operation set is
 //! [`ArrayOperation`]. They implement every value-level capability that [`ArrayOperation`] interpretation requires,
 //! so unit tests, doctests, and downstream crates can stage, transform, and interpret programs end-to-end without
 //! depending on an optimized backend such as `ryft-xla`.
@@ -23,8 +23,9 @@ use std::fmt::Display;
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::EagerContext;
+#[cfg(test)]
+use crate::contexts::{Context, Domain};
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
@@ -138,9 +139,17 @@ impl Typed for TestArray {
 }
 
 impl Value for TestArray {
-    type Domain = EagerContext<Self>;
+    type DispatchDomain = EagerContext<Self>;
+    // A concrete `TestArray`'s active context is the test backend's rich eager domain (unlike the constant-only
+    // `EagerContext<TestArray>` it declares as its `Value::DispatchDomain`, which cannot bind operations), so free transform
+    // entry points such as `crate::batching::batch` serve top-level concrete values.
+    type ExecutionDomain = EagerContext<Self, ArrayOperation<Self>>;
 
-    fn domain(&self) -> EagerContext<Self> {
+    fn dispatch_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    fn execution_domain(&self) -> EagerContext<Self, ArrayOperation<Self>> {
         EagerContext::new()
     }
 }
@@ -1046,79 +1055,9 @@ impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
     }
 }
 
-/// Minimal interpreting array [`Domain`] over [`TestArray`] values and [`ArrayOperation`]s. Refer to the [module
-/// documentation](crate::tests) for more information.
-#[derive(Copy, Clone, Debug)]
-pub struct TestArrayDomain;
-
-impl Domain for TestArrayDomain {
-    type Type = ArrayType;
-    type Value = TestArray;
-    type Constant = TestArray;
-    type Operation = ArrayOperation<TestArray>;
-}
-
-impl Context for TestArrayDomain {
-    fn lift(&self, constant: TestArray) -> Result<TestArray, ProgramError> {
-        Ok(constant)
-    }
-
-    fn bind<O: Into<Self::Operation>>(
-        &self,
-        operation: O,
-        inputs: &[Self::Value],
-    ) -> Result<Vec<Self::Value>, ProgramError> {
-        let operation = operation.into();
-        operation.interpret(&EagerContext::<TestArray, Self::Operation>::new(), inputs)
-    }
-
-    fn resolve(&self, value: &TestArray) -> ValueResolution<TestArray> {
-        ValueResolution::Concrete(value.clone())
-    }
-}
-
-/// An eager test domain binds no named axes: it is a leaf of the resolution stack, so every lookup returns `None`.
-impl crate::axes::NamedAxes for TestArrayDomain {
-    fn named_axis(&self, _name: &str) -> Option<crate::axes::NamedAxis> {
-        None
-    }
-}
-
-/// Eager-domain context capabilities: [`TestArrayDomain`] interprets operations directly over [`TestArray`]s, so
-/// its nullary-construction and constant-materialization semantics are exactly the zero-state
-/// [`EagerContext`]'s, to which these impls delegate.
-impl Zero<TestArray> for TestArrayDomain {
-    fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-        EagerContext::<TestArray>::new().zero(r#type)
-    }
-}
-
-impl One<TestArray> for TestArrayDomain {
-    fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-        EagerContext::<TestArray>::new().one(r#type)
-    }
-}
-
-impl Fill<f64, TestArray> for TestArrayDomain {
-    fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
-        EagerContext::<TestArray>::new().fill(r#type, value)
-    }
-}
-
-impl crate::operations::constants::Iota<TestArray> for TestArrayDomain {
-    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
-        EagerContext::<TestArray>::new().iota(r#type, dimension)
-    }
-}
-
-impl<Payload> crate::operations::constants::Constant<TestArray, TestArray, Payload> for TestArrayDomain {
-    #[inline]
-    fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
-        Ok(value)
-    }
-}
-
-impl DifferentiationContext for TestArrayDomain {
+/// The test backend's interpreting eager domain, `EagerContext<TestArray, ArrayOperation<TestArray>>`,
+/// differentiates eagerly with concrete [`TestArray`] tangents.
+impl DifferentiationContext for EagerContext<TestArray, ArrayOperation<TestArray>> {
     type Tangent = TestArray;
 }
 
@@ -1153,16 +1092,18 @@ mod differentiation_tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::tracing_v2::NestedTracer;
 
     use super::DifferentiationContext;
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
         // The unified domain interprets each half-precision [`DataType`] through the matching [`Scalar`] variant, so
         // the former `bf16`- and `f16`-specific domains are now two variants exercised over the one domain.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
             domain.jvp(|x| x.clone() + x, Scalar::BF16(bf16::from_f32(3.0)), Scalar::BF16(bf16::ONE)),
             Ok((Scalar::BF16(bf16::from_f32(6.0)), Scalar::BF16(bf16::from_f32(2.0))))
@@ -1175,9 +1116,11 @@ mod differentiation_tests {
 
     #[test]
     fn test_jvp_takes_the_symbolic_zero_fast_path_for_rule_less_operations() {
+        use crate::contexts::EagerContext;
         use crate::contexts::StagingContext;
         use crate::operations::differentiation::StopGradient;
-        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tests::TestArray;
+        use crate::tracing_v2::ArrayOperation;
         use crate::tracing_v2::NestedTracer;
         use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
 
@@ -1186,9 +1129,9 @@ mod differentiation_tests {
         // output tangent without consulting the per-operation rule. The function is `f(x) = x + psum(stop_gradient(x))`,
         // which differentiates like `x + c`, so the tangent equals the input tangent. `jvp` traces the closure into a
         // primal program first, so the fast path fires during the replay rather than during value-level interpretation.
-        let (primal, tangent) = TestArrayDomain
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
-                |x: NestedTracer<TestArrayDomain>| {
+                |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                     let severed = x.stop_gradient();
                     let mut outputs = severed
                         .context()
@@ -1209,13 +1152,15 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_scalar_straight_line_matches_jvp() {
+        use crate::contexts::EagerContext;
+        use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
         // `f(x) = x * sin(x)`: the linearized map's primal output equals `jvp`'s primal output, and applying it to two
         // distinct tangents reproduces `jvp`'s tangent output each time. Linearizing once and applying many times is
         // the headline `linearize` capability.
-        let domain = ScalarDomain::new();
-        let function = |x: NestedTracer<ScalarDomain>| x.clone() * x.sin().unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let function = |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap();
         let (output, forward) = domain.linearize(function, Scalar::from(0.7)).unwrap();
 
         let (reference_primal, _) = domain.jvp(function, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
@@ -1229,13 +1174,17 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_scalar_multi_input_matches_jvp() {
+        use crate::contexts::EagerContext;
+        use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
         // `f(a, b) = a * b + sin(a)`: a two-input function whose linearization is applied at two distinct tangent
         // pairs, exercising the residual-input routing for several primal inputs.
-        let domain = ScalarDomain::new();
-        let function =
-            |(a, b): (NestedTracer<ScalarDomain>, NestedTracer<ScalarDomain>)| a.clone() * b + a.sin().unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let function = |(a, b): (
+            NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+        )| a.clone() * b + a.sin().unwrap();
         let (output, forward) = domain.linearize(function, (Scalar::from(0.5), Scalar::from(1.3))).unwrap();
 
         let (reference_primal, _) = domain
@@ -1254,21 +1203,28 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_array_straight_line_matches_jvp() {
+        use crate::contexts::EagerContext;
         use crate::operations::trigonometric::Sin;
-        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tests::TestArray;
+        use crate::tracing_v2::ArrayOperation;
 
         // The array-domain counterpart of the straight-line scalar test: `f(x) = x * sin(x)` over a `TestArray`. Two
         // distinct tangents are applied through the one linearization and each matches `jvp`.
-        let function = |x: NestedTracer<TestArrayDomain>| x.clone() * x.sin().unwrap();
-        let (output, forward) = TestArrayDomain.linearize(function, TestArray::scalar(0.7)).unwrap();
+        let function =
+            |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| x.clone() * x.sin().unwrap();
+        let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .linearize(function, TestArray::scalar(0.7))
+            .unwrap();
 
-        let (reference_primal, _) =
-            TestArrayDomain.jvp(function, TestArray::scalar(0.7), TestArray::scalar(1.0)).unwrap();
+        let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(function, TestArray::scalar(0.7), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(output.values, reference_primal.values);
 
         for tangent in [1.0, -2.5] {
-            let (_, reference_tangent) =
-                TestArrayDomain.jvp(function, TestArray::scalar(0.7), TestArray::scalar(tangent)).unwrap();
+            let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .jvp(function, TestArray::scalar(0.7), TestArray::scalar(tangent))
+                .unwrap();
             let result = forward.apply(TestArray::scalar(tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
         }
@@ -1276,9 +1232,10 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_through_condition_matches_jvp() {
+        use crate::contexts::EagerContext;
         use crate::contexts::StagingContext;
         use crate::operations::control_flow::ConditionOperation;
-        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
         use crate::tracing_v2::test_util::scalar_scale_branch;
         use crate::types::{ArrayType, DataType};
@@ -1288,7 +1245,7 @@ mod differentiation_tests {
         // with the input tangent unknown — the known-predicate `condition` inlines its selected branch through its
         // executable partial-evaluation rule, so the residual tangent map is the scale-by-2 linear map. The result
         // must match `jvp` both for the primal and the tangent.
-        let condition_function = |x: NestedTracer<TestArrayDomain>| {
+        let condition_function = |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
             let predicate = x.context().constant(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
             let mut outputs = x
@@ -1298,15 +1255,19 @@ mod differentiation_tests {
             outputs.remove(0)
         };
 
-        let (output, forward) = TestArrayDomain.linearize(condition_function, TestArray::scalar(4.0)).unwrap();
-        let (reference_primal, _) =
-            TestArrayDomain.jvp(condition_function, TestArray::scalar(4.0), TestArray::scalar(1.0)).unwrap();
+        let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .linearize(condition_function, TestArray::scalar(4.0))
+            .unwrap();
+        let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(condition_function, TestArray::scalar(4.0), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(output.values, reference_primal.values);
         assert_eq!(output.values, vec![8.0]);
 
         for tangent in [1.0, 3.0] {
-            let (_, reference_tangent) =
-                TestArrayDomain.jvp(condition_function, TestArray::scalar(4.0), TestArray::scalar(tangent)).unwrap();
+            let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .jvp(condition_function, TestArray::scalar(4.0), TestArray::scalar(tangent))
+                .unwrap();
             let result = forward.apply(TestArray::scalar(tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
             // The selected branch scales by 2, so the directional derivative is `2 * tangent`.
@@ -1320,27 +1281,32 @@ mod differentiation_tests {
         // pre-pass unrolls the loop at the concrete primal, so the fused JVP program is straight-line and partially
         // evaluates cleanly. From `x = 1` the loop doubles three times, so `f(x) = 8 x` locally; the primal is 8 and
         // every directional derivative is `8 * tangent`. This matches `jvp`, which unrolls the same loop.
+        use crate::contexts::EagerContext;
         use crate::contexts::StagingContext;
-        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
 
-        let while_function = |x: NestedTracer<TestArrayDomain>| {
+        let while_function = |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let while_operation = doubling_while_for_linearize();
             let mut outputs =
                 x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
             outputs.remove(0)
         };
 
-        let (output, forward) = TestArrayDomain.linearize(while_function, TestArray::scalar(1.0)).unwrap();
+        let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .linearize(while_function, TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(output.values, vec![8.0]);
 
-        let (reference_primal, _) =
-            TestArrayDomain.jvp(while_function, TestArray::scalar(1.0), TestArray::scalar(1.0)).unwrap();
+        let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(while_function, TestArray::scalar(1.0), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(output.values, reference_primal.values);
 
         for tangent in [1.0, 2.0] {
-            let (_, reference_tangent) =
-                TestArrayDomain.jvp(while_function, TestArray::scalar(1.0), TestArray::scalar(tangent)).unwrap();
+            let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .jvp(while_function, TestArray::scalar(1.0), TestArray::scalar(tangent))
+                .unwrap();
             let result = forward.apply(TestArray::scalar(tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
             assert_eq!(result.values, vec![8.0 * tangent]);
@@ -1349,8 +1315,9 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_through_scan_matches_jvp() {
+        use crate::contexts::EagerContext;
         use crate::contexts::StagingContext;
-        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
 
         // Forward linearization through a statically-sized cumulative-product `scan` (body `[carry, x] -> [carry*x,
@@ -1358,7 +1325,10 @@ mod differentiation_tests {
         // value-carrying partial-evaluation rule with the carry/scanned tangents unknown. `f(init, xs)` is the final
         // carry `init * xs[0] * xs[1] * xs[2] = 24` at `init = 1, xs = [2, 3, 4]`. The result must match `jvp` for the
         // primal and for several distinct tangent pairs.
-        let scan_function = |(init, xs): (NestedTracer<TestArrayDomain>, NestedTracer<TestArrayDomain>)| {
+        let scan_function = |(init, xs): (
+            NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+        )| {
             let scan = product_scan_for_linearize();
             let mut outputs =
                 init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
@@ -1366,10 +1336,12 @@ mod differentiation_tests {
         };
 
         let primals = (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0]));
-        let (output, forward) = TestArrayDomain.linearize(scan_function, primals.clone()).unwrap();
+        let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .linearize(scan_function, primals.clone())
+            .unwrap();
         assert_eq!(output.values, vec![24.0]);
 
-        let (reference_primal, _) = TestArrayDomain
+        let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(scan_function, primals.clone(), (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 0.0, 0.0])))
             .unwrap();
         assert_eq!(output.values, reference_primal.values);
@@ -1380,7 +1352,7 @@ mod differentiation_tests {
             (TestArray::scalar(0.5), TestArray::vector(vec![1.0, -1.0, 2.0])),
         ];
         for (init_tangent, xs_tangent) in tangents {
-            let (_, reference_tangent) = TestArrayDomain
+            let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
                 .jvp(scan_function, primals.clone(), (init_tangent.clone(), xs_tangent.clone()))
                 .unwrap();
             let result = forward.apply((init_tangent, xs_tangent)).unwrap();
@@ -1390,14 +1362,16 @@ mod differentiation_tests {
 
     #[test]
     fn test_vjp_fn_scalar_matches_raw_vjp() {
+        use crate::contexts::EagerContext;
+        use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
         // The `vjp_fn` callable surface must reproduce the raw `vjp` pullback: interpreting the raw pullback manually at
         // `[cotangent ++ residuals]` and applying `Pullback::apply` to the same cotangent must agree, for two distinct
         // cotangents. `f(x) = x * sin(x)`.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = crate::contexts::EagerContext::<Scalar>::new();
-        let function = |x: NestedTracer<ScalarDomain>| Ok(x.clone() * x.sin()?);
+        let function = |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
 
         let (output, pullback) = domain.vjp_fn(function, Scalar::from(0.7)).unwrap();
         let (reference_output, reference_pullback, reference_residuals) =
@@ -1415,17 +1389,24 @@ mod differentiation_tests {
 
     #[test]
     fn test_vjp_fn_array_multi_input_matches_raw_vjp() {
-        use crate::tests::{TestArray, TestArrayDomain};
+        use crate::contexts::EagerContext;
+        use crate::tests::TestArray;
+        use crate::tracing_v2::ArrayOperation;
 
         // The array-domain, multi-input `vjp_fn`: `f(a, b) = a * b` returns one scalar output whose pullback maps the
         // output cotangent to `(b * cotangent, a * cotangent)`. The callable's reshaped input cotangents must match the
         // raw pullback interpreted manually.
         let context = crate::contexts::EagerContext::<TestArray>::new();
-        let function = |(a, b): (NestedTracer<TestArrayDomain>, NestedTracer<TestArrayDomain>)| Ok(a * b);
-        let (output, pullback) =
-            TestArrayDomain.vjp_fn(function, (TestArray::scalar(3.0), TestArray::scalar(2.0))).unwrap();
-        let (_, reference_pullback, reference_residuals) =
-            TestArrayDomain.vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0))).unwrap();
+        let function = |(a, b): (
+            NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+        )| Ok(a * b);
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp_fn(function, (TestArray::scalar(3.0), TestArray::scalar(2.0)))
+            .unwrap();
+        let (_, reference_pullback, reference_residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0)))
+            .unwrap();
         assert_eq!(output.values, vec![6.0]);
 
         for cotangent in [1.0, 4.0] {
@@ -1519,7 +1500,7 @@ mod linearization_tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::differentiation::*;
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
@@ -1528,7 +1509,7 @@ mod linearization_tests {
     use super::*;
 
     /// Tracer leaf seen by the scalar test closures.
-    type ScalarTracer = Tracer<NestedTracingContext<ScalarDomain>>;
+    type ScalarTracer = Tracer<NestedTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
     const TOLERANCE: f64 = 1e-12;
@@ -1561,7 +1542,7 @@ mod linearization_tests {
         JvpFunction: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
         LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
     {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (reference_primals, reference_tangents) =
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
@@ -1601,7 +1582,7 @@ mod linearization_tests {
     /// direct interpretation at `(primals ++ tangents)` — so the packaged [`DifferentiationContext::jvp`] surface can
     /// be compared against the pipeline it wraps. Returns the flat primal and tangent outputs.
     fn jvp_direct<Function>(
-        domain: &ScalarDomain,
+        domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
         function: Function,
         primals: Vec<Scalar>,
         tangents: Vec<Scalar>,
@@ -1625,7 +1606,7 @@ mod linearization_tests {
     /// the packaged [`DifferentiationContext::vjp`] surface can be compared against the pipeline it wraps. Returns
     /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
     fn vjp_direct<Function>(
-        domain: &ScalarDomain,
+        domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
         function: Function,
         primals: Vec<Scalar>,
     ) -> Result<
@@ -1663,7 +1644,7 @@ mod linearization_tests {
         VjpFunction: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
         LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
     {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar>::new();
 
         let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
@@ -1712,7 +1693,7 @@ mod linearization_tests {
         // The eager unroll-then-fuse pre-pass unrolls the unbounded `while x < 100 { x = x * x }` at the concrete
         // primal, so forward mode through it now succeeds on the capture-free path and must reproduce the
         // established eager `jvp`, which unrolls the same loop. From `x = 1.5` the loop runs four squarings.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (reference_primals, reference_tangents) = domain
             .jvp(
                 |inputs| vec![inputs[0].clone().unary(scalar_squaring_while())],
@@ -1788,7 +1769,7 @@ mod linearization_tests {
         // so the rewritten program is control-flow-free and computes the same concrete value as the original. This is
         // the capability that lets the path differentiate nested loops the legacy eager `while` JVP rule cannot
         // (it linearizes the body symbolically, which has no staged form for a nested unbounded loop).
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (program, _, _, input_values) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 |inputs| Ok(vec![inputs[0].clone().unary(scalar_nested_while())]),
@@ -1815,7 +1796,7 @@ mod linearization_tests {
         // the existing partitioned transposition, so reverse mode through the unbounded `while x < 100 { x = x * x }`
         // now succeeds and must reproduce the established eager `vjp`. The direct-transpose pullback consumes the
         // residuals as ordinary inputs, so it is interpreted at `output_cotangents ++ residuals`.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar>::new();
 
         let (_, reference_pullback, reference_residuals) = domain
@@ -1959,7 +1940,7 @@ mod linearization_tests {
         // pruning drops it from the unknown sub-program. The canonical tangent arity must be restored (a fresh
         // zero-typed `dy` slot reinserted) so the tangent program still presents `[dx, dy, residuals...]`. This
         // exercises the input-restoration branch of `linearize` that straight-line all-differentiable programs do not.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
@@ -2001,7 +1982,7 @@ mod linearization_tests {
     fn test_program_is_capture_free_and_has_expected_shape() {
         // f(x) = x * sin(x) has one primal input and one primal output, so the program takes two inputs (primal +
         // tangent) and produces two outputs (primal + tangent).
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
@@ -2059,7 +2040,7 @@ mod linearization_tests {
                 .unwrap()
         };
 
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 move |inputs| {
@@ -2087,7 +2068,7 @@ mod linearization_tests {
         // interpreting the whole program directly at `(primal, tangent)`. The program is simplified first to
         // prune the structurally dead zero tangents the replay synthesizes for the Boolean codomain and the
         // severed branch — including a `zero` of Boolean type that the `f64` interpreter cannot evaluate.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar>::new();
 
         // f(x) = select(x > 1, x * x, x + x): the comparison contributes a zero tangent and `select` routes the chosen
@@ -2135,7 +2116,7 @@ mod linearization_tests {
         // The interleaved forward mode (one walk over the primal program with `JvpTracer` duals under a
         // `JvpContext`) must agree with the fused-program `jvp` path on values and derivatives, including through
         // piecewise `select` derivatives, severed `stop_gradient` tangents, and zero input tangents.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         // f(x) = x * sin(x): derivative sin(x) + x * cos(x).
         let (fused_value, fused_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
@@ -2214,8 +2195,8 @@ mod linearization_tests {
         // `jvp_direct` runs the closure directly on concrete duals, so ordinary Rust control flow can branch on the
         // primal — impossible in `jvp`/`jvp_interleaved`, whose closures see tracers. `f(x) = if x != 0 { x * sin(x) }
         // else { -x }`.
-        let domain = ScalarDomain::new();
-        let branching = |x: JvpTracer<ScalarDomain>| -> Result<JvpTracer<ScalarDomain>, ProgramError> {
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let branching = |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| -> Result<JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>, ProgramError> {
             if x.primal().boolean()? { x.mul(&x.sin()?) } else { x.neg() }
         };
         let (primal, tangent): (Scalar, Scalar) =
@@ -2224,7 +2205,11 @@ mod linearization_tests {
         // `0.7` decodes as `true`, so the `x * sin(x)` branch runs; its primal and tangent match `jvp` of that
         // straight-line function.
         let (reference_primal, reference_tangent): (Scalar, Scalar) = domain
-            .jvp(|x: NestedTracer<ScalarDomain>| x.clone() * x.sin().unwrap(), Scalar::from(0.7), Scalar::from(1.0))
+            .jvp(
+                |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap(),
+                Scalar::from(0.7),
+                Scalar::from(1.0),
+            )
             .unwrap();
         assert_eq!(primal, reference_primal);
         assert_eq!(tangent, reference_tangent);
@@ -2235,7 +2220,7 @@ mod linearization_tests {
         // f(x) = stop_gradient(x * x) + x: the severed tangent is a structural zero that must stay symbolic — the
         // `add` rule drops the zero term instead of staging `add(zero, dx)`, so the *unsimplified* fused program
         // contains no `zero` instruction at all and its tangent output is the tangent input directly.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + inputs[0].clone()]),
@@ -2255,7 +2240,7 @@ mod linearization_tests {
         // f(x) = stop_gradient(x): the sole tangent output is a structural zero, which must be materialized as
         // exactly one typed `zero` instruction at the output boundary to preserve the
         // `(primal_outputs ++ tangent_outputs)` program contract.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
                 |inputs| Ok(vec![inputs[0].clone().stop_gradient()]),
@@ -2324,7 +2309,7 @@ mod linearization_tests {
         JvpFunction: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
         LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
     {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (reference_primals, reference_tangents) =
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
@@ -2381,9 +2366,9 @@ mod linearization_tests {
         // jvp-under-tracing duality: running `jvp` against an enclosing `TracingContext` (whose values are
         // tracers) must splice both the primal replay and the tangent replay into the enclosing trace through the same
         // `bind` path the eager domain uses to compute. We trace `f(a, b) = a * b + sin(a)` under an outer trace and
-        // assert the staged program, interpreted eagerly, equals the eager `ScalarDomain` jvp at a sample point.
-        let domain = ScalarDomain::new();
-        let outer_context = DomainTracingContext::<ScalarDomain>::new();
+        // assert the staged program, interpreted eagerly, equals the eager `EagerContext<Scalar, ScalarOperation<Scalar>>` jvp at a sample point.
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let outer_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let outer_builder = outer_context.builder().clone();
 
         // The outer trace's inputs are the two primals followed by the two tangents, so that interpreting the staged
@@ -2395,9 +2380,9 @@ mod linearization_tests {
 
         let (primal_outputs, tangent_outputs) = outer_context
             .jvp(
-                |inputs: Vec<Tracer<NestedTracingContext<DomainTracingContext<ScalarDomain>>>>| {
-                    vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()]
-                },
+                |inputs: Vec<
+                    Tracer<NestedTracingContext<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>,
+                >| { vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()] },
                 vec![primal_a, primal_b],
                 vec![tangent_a, tangent_b],
             )
@@ -2443,8 +2428,8 @@ mod linearization_tests {
         // trace `f(x) = x * sin(x)` (a nonlinear scalar function) under an outer trace, interpret the tracer-valued
         // pullback at an outer cotangent tracer to stage the backward pass into that trace, then interpret the staged
         // program eagerly and assert the input cotangent equals the established `vjp` pullback at the same point.
-        let domain = ScalarDomain::new();
-        let outer_context = DomainTracingContext::<ScalarDomain>::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let outer_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let outer_builder = outer_context.builder().clone();
 
         // The outer trace's input is the primal `x` followed by the output cotangent, so interpreting the staged
@@ -2454,9 +2439,9 @@ mod linearization_tests {
 
         let (primal_outputs, pullback, residuals) = outer_context
             .vjp(
-                |inputs: Vec<Tracer<NestedTracingContext<DomainTracingContext<ScalarDomain>>>>| {
-                    Ok(vec![inputs[0].clone() * inputs[0].sin()?])
-                },
+                |inputs: Vec<
+                    Tracer<NestedTracingContext<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>,
+                >| { Ok(vec![inputs[0].clone() * inputs[0].sin()?]) },
                 vec![primal_x],
             )
             .unwrap();
@@ -2575,9 +2560,11 @@ mod linearization_tests {
         use crate::tracing::DomainTracer;
         use crate::tracing_v2::rematerialize;
 
-        let function =
-            rematerialize::<ScalarDomain, _, _, _>(|x: DomainTracer<ScalarDomain>| Ok((x.clone() * x).sin()?));
-        let (_, program) = ScalarDomain::trace(|x| function.call(x), DataType::F64).unwrap();
+        let function = rematerialize::<EagerContext<Scalar, ScalarOperation<Scalar>>, _, _, _>(
+            |x: DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok((x.clone() * x).sin()?),
+        );
+        let (_, program) =
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|x| function.call(x), DataType::F64).unwrap();
         let ScalarOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
             panic!("rematerialize should stage a rematerialize call");
         };
@@ -2658,7 +2645,7 @@ mod linearization_tests {
         // custom-VJP call, proving the carrier actually runs `backward` (a folded zero tangent would silently give a
         // wrong zero gradient). The re-key path is intentionally not exercised: the primal-enum carrier has no linear
         // operation family variant to re-key into.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar>::new();
 
         let (_, reference_pullback, reference_residuals) =
@@ -2725,7 +2712,7 @@ mod linearization_tests {
             inputs[0].context().stage_operation(ScalarOperation::CustomVjp(Box::new(operation)), &[&a, &b])
         }
 
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar>::new();
         let (_, pullback, residuals) = vjp_direct(&domain, function, vec![Scalar::from(0.7)]).unwrap();
         let mut pullback_inputs = vec![Scalar::from(2.5)];
@@ -2749,7 +2736,7 @@ mod linearization_tests {
         // carrier, whose interpretation rejects forward mode with the canonical reverse-only error.
         use crate::types::TypeError;
 
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         match domain.jvp(
             |inputs: Vec<ScalarTracer>| scalar_custom_vjp_function(inputs).unwrap(),
             vec![Scalar::from(0.7)],
@@ -2777,7 +2764,7 @@ mod linearization_tests {
         let tangent_values = vec![Scalar::from(1.0), Scalar::from(0.5)];
 
         // Reference: eager linearize at the concrete primals.
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (reference_primal, reference_forward) = domain
             .linearize::<_, Vec<Scalar>, Vec<ScalarTracer>>(
                 |inputs| vec![inputs[0].sin().unwrap() * inputs[1].clone()],
@@ -2881,7 +2868,7 @@ mod linearization_tests {
         use crate::partial::{PartialEvaluationInput, PartialEvaluationOutput};
         use crate::tracing::TracingContext;
 
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar>::new();
         let primals = vec![Scalar::from(0.7), Scalar::from(1.3)];
         let tangents = vec![Scalar::from(1.0), Scalar::from(0.5)];
@@ -2984,7 +2971,7 @@ mod array_linearization_tests {
     /// linear tangent sub-program, and the metadata needed to reassemble their outputs and transpose the tangent side; the
     /// concrete primal outputs are recovered by interpreting [`primal_program`](Linearization::primal_program).
     ///
-    /// This entry point is specialized to [`TestArrayDomain`] and to straight-line array functions over the supported
+    /// This entry point is specialized to [`EagerContext<TestArray, ArrayOperation<TestArray>>`] and to straight-line array functions over the supported
     /// slice, mirroring the array partial-evaluation driver whose array linearization-context obligations also do not
     /// discharge generically; functions reaching unsupported operations fail with an
     /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
@@ -2995,14 +2982,17 @@ mod array_linearization_tests {
     ///   - `function`: Array closure to linearize; it is traced once into a primal program.
     ///   - `primals`: Structured primal input values at which to linearize.
     fn array_linearize<Function>(
-        domain: &TestArrayDomain,
+        domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
         function: Function,
         primals: Vec<TestArray>,
     ) -> Result<Linearization<TestArray, ArrayOperation<TestArray>>, ProgramError>
     where
         Function: FnOnce(
-            Vec<Tracer<NestedTracingContext<TestArrayDomain>>>,
-        ) -> Result<Vec<Tracer<NestedTracingContext<TestArrayDomain>>>, ProgramError>,
+            Vec<Tracer<NestedTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>>,
+        ) -> Result<
+            Vec<Tracer<NestedTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>>,
+            ProgramError,
+        >,
     {
         let (primal_program, _input_structure, _output_structure, _input_values) =
             domain.trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(function, primals)?;
@@ -3028,7 +3018,7 @@ mod array_linearization_tests {
     use super::*;
 
     /// Tracer leaf seen by the array test closures.
-    type ArrayTracer = Tracer<NestedTracingContext<TestArrayDomain>>;
+    type ArrayTracer = Tracer<NestedTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
     const TOLERANCE: f64 = 1e-12;
@@ -3062,7 +3052,7 @@ mod array_linearization_tests {
         JvpFunction: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
         LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (reference_primals, reference_tangents) =
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
@@ -3107,7 +3097,7 @@ mod array_linearization_tests {
         VjpFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
         LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray>::new();
 
         let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
@@ -3126,7 +3116,7 @@ mod array_linearization_tests {
     /// direct interpretation at `(primals ++ tangents)` — so the packaged [`DifferentiationContext::jvp`] surface can
     /// be compared against the pipeline it wraps. Returns the flat primal and tangent outputs.
     fn jvp_direct<Function>(
-        domain: &TestArrayDomain,
+        domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
         function: Function,
         primals: Vec<TestArray>,
         tangents: Vec<TestArray>,
@@ -3150,7 +3140,7 @@ mod array_linearization_tests {
     /// the packaged [`DifferentiationContext::vjp`] surface can be compared against the pipeline it wraps. Returns
     /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
     fn vjp_direct<Function>(
-        domain: &TestArrayDomain,
+        domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
         function: Function,
         primals: Vec<TestArray>,
     ) -> Result<
@@ -3194,7 +3184,7 @@ mod array_linearization_tests {
         VjpFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
         DirectFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray>::new();
 
         // Reference: the established `vjp` pullback emits one input cotangent per primal input and consumes
@@ -3257,7 +3247,7 @@ mod array_linearization_tests {
         );
     }
 
-    /// Builds the eager, data-dependent `while x < 100 { x = x * x }` loop over [`TestArrayDomain`]'s scalar arrays.
+    /// Builds the eager, data-dependent `while x < 100 { x = x * x }` loop over [`EagerContext<TestArray, ArrayOperation<TestArray>>`]'s scalar arrays.
     /// Its trip count depends on the runtime value and the loop carries no
     /// [`iteration_bound`](crate::operations::control_flow::WhileOperation::iteration_bound), so it is the kind of
     /// unbounded loop the front end rejects unless the eager unroll-then-fuse pre-pass first unrolls it at the
@@ -3306,7 +3296,7 @@ mod array_linearization_tests {
         // the existing partitioned transposition, so reverse mode through the unbounded `while x < 100 { x = x * x }`
         // now succeeds and must reproduce the established eager `vjp`. The direct-transpose pullback consumes the
         // residuals as ordinary inputs, so it is interpreted at `output_cotangents ++ residuals`.
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray>::new();
 
         let (_, reference_pullback, reference_residuals) = domain
@@ -3615,7 +3605,7 @@ mod array_linearization_tests {
         // pullback is only wired on the direct-transpose path, so the equivalence is gated against the
         // forward tangent reproduced in reverse rather than the capture-based `vjp` (whose reduce-max transpose is not
         // implemented).
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray>::new();
 
         let primals = vec![TestArray::vector(vec![1.0, 4.0, 2.0, 3.0])];
@@ -3633,7 +3623,7 @@ mod array_linearization_tests {
     fn test_array_program_is_capture_free_and_has_expected_shape() {
         // f(x) = x . x over a vector has one primal input and one (scalar) primal output, so the program takes
         // two inputs (primal + tangent) and produces two outputs (primal + tangent).
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (primal_program, _, _, _) = domain
             .trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(
                 |inputs: Vec<ArrayTracer>| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
@@ -3665,7 +3655,7 @@ mod array_linearization_tests {
 
     /// Asserts that the generic [`jvp_direct`] reproduces both the primal and the tangent outputs of
     /// [`DifferentiationContext::jvp`] for an array `function` at `primals` with the given `tangents`, replaying the
-    /// sub-programs through the eager [`TestArrayDomain`]'s [`bind`](crate::contexts::Context::bind).
+    /// sub-programs through the eager [`EagerContext<TestArray, ArrayOperation<TestArray>>`]'s [`bind`](crate::contexts::Context::bind).
     fn assert_array_jvp_direct_equivalent<JvpFunction, LinearizeFunction>(
         jvp_function: JvpFunction,
         linearize_function: LinearizeFunction,
@@ -3675,7 +3665,7 @@ mod array_linearization_tests {
         JvpFunction: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
         LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
     {
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (reference_primals, reference_tangents) =
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
@@ -3775,7 +3765,7 @@ mod array_linearization_tests {
     fn assert_condition_forward_equivalent_to_jvp(predicate: bool, x: f64, dx: f64) {
         use crate::types::DataType;
 
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let predicate_value = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![predicate as u8 as f64]);
         let predicate_tangent = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
         let (reference_primals, reference_tangents) = domain
@@ -4028,7 +4018,7 @@ mod array_linearization_tests {
             .unwrap();
         let while_operation = WhileOperation::new(condition, body).unwrap();
 
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let result = array_linearize(
             &domain,
             move |inputs| {
@@ -4143,9 +4133,11 @@ mod array_linearization_tests {
         use crate::types::{DataType, Shape, Size};
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        let function =
-            rematerialize::<TestArrayDomain, _, _, _>(|x: DomainTracer<TestArrayDomain>| Ok(remat_dot_sine_body(x)));
-        let (_, program) = TestArrayDomain::trace(|x| function.call(x), vector_type).unwrap();
+        let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
+            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(remat_dot_sine_body(x)),
+        );
+        let (_, program) =
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(|x| function.call(x), vector_type).unwrap();
         let ArrayOperation::Rematerialize(operation) = program.instructions()[0].operation() else {
             panic!("rematerialize should stage a rematerialize call");
         };
@@ -4252,7 +4244,7 @@ mod array_linearization_tests {
         // A re-key reverse path is intentionally not exercised here: it would need to re-key the
         // primal-enum `CustomVjpTangent` carrier into the linear operation family, which has no such variant. The
         // carrier exists precisely so the direct-transpose path can keep the tangent program in the primal enum.
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray>::new();
         let primals = vec![TestArray::scalar(0.7)];
         let output_cotangents = vec![TestArray::scalar(2.5)];
@@ -4281,7 +4273,7 @@ mod array_linearization_tests {
         // silently producing a wrong tangent.
         use crate::types::TypeError;
 
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         match domain.jvp(
             |inputs: Vec<ArrayTracer>| custom_vjp_function(inputs).unwrap(),
             vec![TestArray::scalar(0.7)],
@@ -4364,7 +4356,7 @@ mod array_linearization_tests {
         // plus masked tangent scan composes instead of tripping the rule's input-count check. Batch items [1, 5, 9]
         // double 3, 1, and 0 times under the threshold `x < 8`, so the primal is [8, 10, 9] and the per-item tangent
         // scale is `2^iterations = [8, 2, 1]`.
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let primals = vec![TestArray::vector(vec![1.0, 5.0, 9.0])];
         let tangents = vec![TestArray::vector(vec![1.0, 1.0, 1.0])];
 
@@ -4411,9 +4403,9 @@ mod array_linearization_tests {
         // trace, interpret the tracer-valued pullback at an outer cotangent tracer to stage the backward pass into the
         // trace, then interpret the staged program eagerly and assert the input cotangent equals the established `vjp`
         // pullback at the same point.
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let vector_type = TestArray::vector(vec![0.0; 3]).r#type;
-        let outer_context = DomainTracingContext::<TestArrayDomain>::new();
+        let outer_context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
         let outer_builder = outer_context.builder().clone();
 
         // The outer trace's input is the primal `x` followed by the output cotangent, so interpreting the staged
@@ -4423,9 +4415,11 @@ mod array_linearization_tests {
 
         let (primal_outputs, pullback, residuals) = outer_context
             .vjp(
-                |inputs: Vec<Tracer<NestedTracingContext<DomainTracingContext<TestArrayDomain>>>>| {
-                    Ok(vec![inputs[0].clone() * inputs[0].sin()?])
-                },
+                |inputs: Vec<
+                    Tracer<
+                        NestedTracingContext<DomainTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>,
+                    >,
+                >| { Ok(vec![inputs[0].clone() * inputs[0].sin()?]) },
                 vec![primal_x],
             )
             .unwrap();
@@ -4524,7 +4518,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_uses_one_packed_array_value() {
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() * x.clone() + x.sin()?),
                 TestArray::vector(vec![0.0, 1.0, 2.0]),
@@ -4542,7 +4536,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_broadcasts_scalar_constants_inside_packed_operations() {
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() + x.one_like()),
                 TestArray::vector(vec![2.0, 4.0, 6.0]),
@@ -4557,7 +4551,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_maps_structured_packed_inputs_and_outputs() {
-        let output: (TestArray, TestArray) = TestArrayDomain
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
                 (TestArray::vector(vec![1.0, 3.0]), TestArray::vector(vec![2.0, 4.0])),
@@ -4573,7 +4567,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_named_axis_psum_reduces_over_batch() {
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| x.collective("i", CollectiveKind::PSum),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
@@ -4591,7 +4585,7 @@ mod batching_tests {
     fn test_batch_axis_index_produces_per_item_indices() {
         // `axis_index("i")` gives each batch item its own position along the mapped axis `"i"` (size 3), so the
         // batched result is the `u64` index vector `[0, 1, 2]` regardless of the operand values.
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |item| item.context().axis_index("i"),
                 TestArray::vector(vec![10.0, 20.0, 30.0]),
@@ -4613,7 +4607,7 @@ mod batching_tests {
         // vary over inner items). The inner output is therefore declared replicated (`out_axes = replicated`), and the
         // outer level stacks the per-row outer index, giving the `u64` vector `[0, 1]`.
         let x = TestArray::matrix(2, 3, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |row| {
                     let context = row.context().clone();
@@ -4640,13 +4634,14 @@ mod batching_tests {
     #[test]
     fn test_batch_axis_index_rejects_unbound_axis() {
         // `axis_index` over a name no enclosing batch binds fails fast, mirroring the collective readers.
-        let result: Result<TestArray, BatchingError> = TestArrayDomain.batch(
-            |item| item.context().axis_index("j"),
-            TestArray::vector(vec![10.0, 20.0, 30.0]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("i"),
-        );
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |item| item.context().axis_index("j"),
+                TestArray::vector(vec![10.0, 20.0, 30.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("i"),
+            );
         assert_eq!(
             result.unwrap_err(),
             BatchingError::Axis(crate::axes::AxisError::UnboundAxisName { name: "j".to_string() }),
@@ -4661,7 +4656,7 @@ mod batching_tests {
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(2)])),
             vec![1.0, 2.0, 3.0, 4.0],
         );
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |row| {
                     let context = row.context().clone();
@@ -4693,11 +4688,11 @@ mod batching_tests {
         // stages a `Broadcast` on the differentiated value; the gradient must flow back
         // through the broadcast's transpose rule (a sum-reduction over the batch axis).
         let (value, gradient) = crate::tracing_v2::value_and_grad(
-            &TestArrayDomain,
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
                 let y = context.constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]));
-                let mapped: NestedTracer<TestArrayDomain> = Batch::batch(
+                let mapped: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                     &context,
                     |(item, shift)| Ok(item * shift),
                     (y, x),
@@ -4717,7 +4712,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_composes_with_context_jvp() {
-        let output: (TestArray, TestArray) = TestArrayDomain
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| {
                     let context = x.context().clone();
@@ -4736,7 +4731,7 @@ mod batching_tests {
 
     #[test]
     fn test_batch_composes_with_context_value_and_grad() {
-        let output: (TestArray, TestArray) = TestArrayDomain
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| {
                     let context = x.context().clone();
@@ -4755,19 +4750,20 @@ mod batching_tests {
 
     #[test]
     fn test_context_batch_composes_inside_jvp() {
-        let (primal, tangent): (TestArray, TestArray) = TestArrayDomain
+        let (primal, tangent): (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    let output: crate::tracing_v2::NestedTracer<TestArrayDomain> = Batch::batch(
-                        &context,
-                        |item| Ok(item.clone() * item),
-                        x,
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        None,
-                    )
-                    .unwrap();
+                    let output: crate::tracing_v2::NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
+                        Batch::batch(
+                            &context,
+                            |item| Ok(item.clone() * item),
+                            x,
+                            BatchAxis::new(0),
+                            BatchAxis::new(0),
+                            None,
+                        )
+                        .unwrap();
                     output
                 },
                 TestArray::vector(vec![2.0, 3.0]),
@@ -4784,18 +4780,19 @@ mod batching_tests {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_grad(
-            &TestArrayDomain,
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
-                let mapped: crate::tracing_v2::NestedTracer<TestArrayDomain> = Batch::batch(
-                    &context,
-                    |item| Ok(item.clone() * item),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap();
+                let mapped: crate::tracing_v2::NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
+                    Batch::batch(
+                        &context,
+                        |item| Ok(item.clone() * item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![2.0, 3.0]),
@@ -4867,7 +4864,7 @@ mod batching_tests {
         let x_data: Vec<f64> = (0..12).map(|i| i as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |row| {
                     let context = row.context().clone();
@@ -4904,7 +4901,7 @@ mod batching_tests {
         let x_data: Vec<f64> = (1..=12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data);
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |row| Ok(row.dot(&row, &DotDimensionNumbers::inner_product())),
                 x,
@@ -4932,7 +4929,7 @@ mod batching_tests {
             values: x_data,
         };
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(|row| row.transpose(vec![1, 0]), x, BatchAxis::new(0), BatchAxis::new(0), None)
             .unwrap();
 
@@ -4951,7 +4948,7 @@ mod batching_tests {
         // added to every batch item. The output should be element-wise `x + y` over the 4 batch items.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let y = TestArray::scalar(10.0);
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |(left, right)| Ok(left + right),
                 (x, y),
@@ -4968,7 +4965,7 @@ mod batching_tests {
         // With explicit axis_size = Some(4), the batch size is pinned. A mapped input of size 4
         // must agree, and the batch size flows through to subsequent operations.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(4))
             .unwrap();
         assert_eq!(output.values, vec![2.0, 4.0, 6.0, 8.0]);
@@ -4981,8 +4978,8 @@ mod batching_tests {
         // computed output is genuinely per-item; users wanting to collapse the batch axis must
         // apply an explicit reduction inside the function.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::replicated(), None);
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::replicated(), None);
         assert!(matches!(
             result,
             Err(BatchingError::MismatchedOutputAxes { expected, actual })
@@ -4995,8 +4992,8 @@ mod batching_tests {
         // No input is mapped, so the output never picks up the batch axis, but `out_axes = Some(0)`
         // requests a mapped output; `batch` refuses to materialize the axis with an implicit broadcast.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::replicated(), BatchAxis::new(0), Some(3));
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::replicated(), BatchAxis::new(0), Some(3));
         assert!(matches!(
             result,
             Err(BatchingError::MismatchedOutputAxes { expected, actual })
@@ -5012,8 +5009,8 @@ mod batching_tests {
             r#type: ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)])),
             values: vec![1.0, 2.0, 3.0],
         };
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), dynamic_input, BatchAxis::new(0), BatchAxis::new(0), None);
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), dynamic_input, BatchAxis::new(0), BatchAxis::new(0), None);
         assert!(matches!(result, Err(BatchingError::DynamicBatchAxis { axis: 0, .. })));
     }
 
@@ -5021,8 +5018,8 @@ mod batching_tests {
     fn test_batch_with_mismatched_axis_size_rejects_mapped_input() {
         // axis_size=Some(5) conflicts with the mapped input of length 4; this should be detected.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
-        let result: Result<TestArray, BatchingError> =
-            TestArrayDomain.batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(5));
+        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::new(0), BatchAxis::new(0), Some(5));
         assert!(matches!(result, Err(BatchingError::MismatchedBatchSizes { expected: 5, actual: 4 })));
     }
 
@@ -5033,8 +5030,9 @@ mod batching_tests {
         // output, which forces a transpose to swap the axes.
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(3, 4, x_data.clone());
-        let output: TestArray =
-            TestArrayDomain.batch(|row| Ok(row), x, BatchAxis::new(0), BatchAxis::new(1), None).unwrap();
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|row| Ok(row), x, BatchAxis::new(0), BatchAxis::new(1), None)
+            .unwrap();
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4), Size::Static(3)])),);
         // Transpose of [3, 4]: output[i, j] = x[j, i]. Row-major flat indexing:
         // x[j, i] = x_data[j*4 + i]; output[i, j] = output_values[i*3 + j].
@@ -5054,7 +5052,7 @@ mod batching_tests {
         let x = TestArray::matrix(3, 4, x_data.clone());
         let bias = TestArray::scalar(0.5);
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |(row, bias_inner)| {
                     let context = row.context().clone();
@@ -5091,7 +5089,7 @@ mod batching_tests {
         let x_data: Vec<f64> = (0..12).map(|value| value as f64).collect();
         let x = TestArray::matrix(2, 6, x_data.clone());
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |row| row.reshape(Shape::new(vec![Size::Static(2), Size::Static(3)])),
                 x,
@@ -5116,7 +5114,7 @@ mod batching_tests {
         // branch programs at the operand batch axes and stages exactly one `condition` operation over them, with the
         // unbatched predicate passed through. Interpreting the staged batched program with both concrete predicate
         // values matches the eager operational path item for item (scale by 2 when true and by 3 when false).
-        let parent = DomainTracingContext::<TestArrayDomain>::new();
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
         let builder = parent.builder().clone();
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let operand_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
@@ -5170,7 +5168,7 @@ mod batching_tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![constant_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let parent = DomainTracingContext::<TestArrayDomain>::new();
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
         let builder = parent.builder().clone();
         let predicate_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::Boolean));
         let operand_atom =
@@ -5219,7 +5217,7 @@ mod batching_tests {
         );
         let operand = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |(pred, operand)| {
                     let condition =
@@ -5244,7 +5242,7 @@ mod batching_tests {
         // value at the per-item scalar type. Verifies that the trace-time stage hook accepts a
         // zero-input operation and that the post-trace replay materializes the same zero for
         // every batch item through the replicated broadcast path.
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| {
                     let zero_op = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(
@@ -5265,9 +5263,9 @@ mod batching_tests {
 
     #[test]
     fn test_batch() {
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
-                |x: BatchingTracer<TestArrayDomain>| Ok(x.clone() * x),
+                |x: BatchingTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
                 BatchAxis::new(0),
                 BatchAxis::new(0),
@@ -5314,7 +5312,7 @@ mod batching_tests {
         // (JAX's `in_axes=0`), so both leaves of the pair are mapped on axis 0 without spelling out the structure.
         let x = TestArray::vector(vec![1.0, 3.0]);
         let y = TestArray::vector(vec![2.0, 4.0]);
-        let output: (TestArray, TestArray) = TestArrayDomain
+        let output: (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |(left, right)| Ok((left.clone() + right.clone(), left * right)),
                 (x, y),
@@ -5334,7 +5332,7 @@ mod batching_tests {
         // each batch item computes `row + shift` with its own shift.
         let x = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let y = TestArray::vector(vec![10.0, 20.0]);
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(|(row, shift)| Ok(row + shift), (x, y), BatchAxis::new(0), BatchAxis::new(0), None)
             .unwrap();
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),);
@@ -5347,7 +5345,7 @@ mod batching_tests {
         // materializes a `BroadcastOperation` to the full common batched shape so the staged
         // add receives shape-congruent operands — required for backends such as XLA whose
         // elementwise lowerings (e.g., `stablehlo.add`) have no implicit broadcasting.
-        let parent = DomainTracingContext::<TestArrayDomain>::new();
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
         let builder = parent.builder().clone();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
