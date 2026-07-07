@@ -1009,13 +1009,13 @@ pub trait Batch: Context<Type = ArrayType> {
     /// [`BatchAxis::new(k)`](BatchAxis::new) requests position `k` (an explicit transpose is staged when the natural
     /// output axis differs), and [`BatchAxis::replicated`] declares the corresponding output to be replicated (e.g., a
     /// value produced from broadcast inputs without staging any per-item work).
-    fn batch<F, I, O, InputBatchAxes, OutputBatchAxes>(
+    fn batch<F, I, O, InputBatchAxes, OutputBatchAxes, S: Into<BatchAxisSpecification>>(
         &self,
         function: F,
         input: I,
         in_axes: InputBatchAxes,
         out_axes: OutputBatchAxes,
-        axis: impl Into<BatchAxisSpecification>,
+        axis: S,
     ) -> Result<O::To<Self::Value>, BatchingError>
     where
         InputBatchAxes: Parameterized<BatchAxis>,
@@ -1142,12 +1142,12 @@ impl<C> Batch for C where C: Context<Type = ArrayType> {}
 /// context they name through their own [`Value::ExecutionDomain`] declarations. Inputs with *no leaf values* are the
 /// one case this form cannot serve: with nothing to recover a context from, it returns [`BatchingError::EmptyBatch`]
 /// even when `axis` supplies an explicit batch size — call [`Batch::batch`] on an explicit context instead.
-pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes>(
+pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes, S: Into<BatchAxisSpecification>>(
     function: F,
     input: I,
     in_axes: InputBatchAxes,
     out_axes: OutputBatchAxes,
-    axis: impl Into<BatchAxisSpecification>,
+    axis: S,
 ) -> Result<O::To<V>, BatchingError>
 where
     V: Value<Type = ArrayType> + Transpose,
