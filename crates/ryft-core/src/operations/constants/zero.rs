@@ -9,6 +9,9 @@ use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{
+    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
+};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`ZeroOperation`].
@@ -123,6 +126,16 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Batchi
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().zero(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
+    }
+}
+
+impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>> Zero<DifferentiationTracer<C>>
+    for DifferentiationContext<C>
+{
+    #[inline]
+    fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().zero(r#type)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 

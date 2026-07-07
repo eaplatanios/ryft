@@ -7,8 +7,10 @@ use std::sync::Mutex;
 use crate::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::contexts::Context;
+use crate::operations::constants::Zero;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::NestedTracingContext;
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::types::ArrayType;
 use lru::LruCache;
 
@@ -205,6 +207,17 @@ where
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
+    }
+}
+
+impl<
+    Capture: Value<Type = C::Type>,
+    C: CapturingContext<Capture, Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>,
+> CapturingContext<Capture> for DifferentiationContext<C>
+{
+    #[inline]
+    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+        self.context().capture(value)
     }
 }
 

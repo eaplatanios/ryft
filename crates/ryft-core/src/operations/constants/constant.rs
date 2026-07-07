@@ -6,11 +6,13 @@ use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
+use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::payloads::{Captured, Input};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Canonical operation name for [`ConstantOperation`].
@@ -156,6 +158,15 @@ impl<
         let physical_type = parent_value.r#type().into_owned();
         let batch = ArrayBatch::new(physical_type, parent_value, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
+    }
+}
+
+impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
+    Constant<DifferentiationTracer<C>, C::Constant> for DifferentiationContext<C>
+{
+    #[inline]
+    fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
+        self.lift(value)
     }
 }
 

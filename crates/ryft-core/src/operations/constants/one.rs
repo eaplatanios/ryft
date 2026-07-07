@@ -5,10 +5,14 @@ use crate::contexts::Context;
 use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{
+    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
+};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`OneOperation`].
@@ -100,6 +104,16 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Batchi
     fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().one(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
+    }
+}
+
+impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> + One<C::Value>>
+    One<DifferentiationTracer<C>> for DifferentiationContext<C>
+{
+    #[inline]
+    fn one(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().one(r#type)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 

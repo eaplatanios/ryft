@@ -5,10 +5,14 @@ use crate::contexts::Context;
 use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{
+    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
+};
 use crate::types::{ArrayType, Type, TypeError};
 
 // TODO(eaplatanios): Review this module.
@@ -125,6 +129,16 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Batchi
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
+    }
+}
+
+impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> + Iota<C::Value>>
+    Iota<DifferentiationTracer<C>> for DifferentiationContext<C>
+{
+    #[inline]
+    fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().iota(r#type, dimension)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 

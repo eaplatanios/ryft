@@ -5,10 +5,14 @@ use crate::contexts::Context;
 use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
+use crate::tracing_v2::differentiation::{
+    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
+};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`FillOperation`].
@@ -117,6 +121,16 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Batchi
     fn fill(&self, r#type: &ArrayType, value: S) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
+    }
+}
+
+impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> + Fill<S, C::Value>, S>
+    Fill<S, DifferentiationTracer<C>> for DifferentiationContext<C>
+{
+    #[inline]
+    fn fill(&self, r#type: &C::Type, value: S) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().fill(r#type, value)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 
