@@ -902,12 +902,15 @@ impl<
         let input_count = self.input_count();
         check_count!("input", input_batch_axes, input_count, ProgramError);
 
-        let context = BatchingContext::new(TracingContext::<V, O>::new(), axis_size, None);
-        let builder = context.parent().builder().clone();
+        let parent_context = TracingContext::<V, O>::new();
+        let builder = parent_context.builder().clone();
 
         // Keep every tracer and context that holds a clone of `builder` inside the following scope so that recovering
-        // the builder later on (below) is a real ownership check.
+        // the builder later on (below) is a real ownership check. In particular, `context` (which owns a clone of the
+        // builder through its parent trace) must be created *inside* this scope so it is dropped before the builder is
+        // recovered below; leaving it in the enclosing scope leaks a builder clone past the recovery.
         let (output_atom_ids, output_axes) = {
+            let batching_context = BatchingContext::new(parent_context, axis_size, None);
             let inputs = self
                 .input_types()
                 .iter()
@@ -918,11 +921,11 @@ impl<
                         None => unbatched_type.clone(),
                     };
                     let input = builder.borrow_mut().add_input(batched_type.clone());
-                    let value = context.parent().tracer(input, Some(batched_type.clone()));
+                    let value = batching_context.parent().tracer(input, Some(batched_type.clone()));
                     Ok(ArrayBatch::new(batched_type, value, *batch_axis)?)
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            let outputs = context.interpret_program(self, inputs)?;
+            let outputs = batching_context.interpret_program(self, inputs)?;
 
             // Resolve `output_axes_policy` into one alignment target per output. `None` keeps the natural axis, and a
             // mapped target forces the output to carry its batch axis at that position (a replicated `AlignEachTo`
@@ -980,7 +983,7 @@ impl<
 
 // TODO(eaplatanios): Review this trait.
 /// Extension trait that exposes batching (`vmap`) as a method on any array [`Context`] — the single `batch` entry
-/// point, mirroring how `jvp` sits on [`DifferentiationContext`](crate::tracing_v2::differentiation::DifferentiationContext).
+/// point, mirroring how `jvp` sits on [`Differentiate`](crate::tracing_v2::differentiation::Differentiate).
 ///
 /// `context.batch(function, input, in_axes, out_axes, axis)` wraps the receiver in a [`BatchingContext`] and runs
 /// `function` on concrete [`BatchingTracer`] values, so every primitive bind inside the closure flows through the

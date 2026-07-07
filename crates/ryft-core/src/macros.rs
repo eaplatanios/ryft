@@ -159,10 +159,9 @@ macro_rules! implement_tracer_operator {
             }
         }
 
-        // TODO(eaplatanios): Clean this up once we clean up the differentiation module.
         impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
         where
-            $crate::tracing_v2::differentiation::JvpContext<C>:
+            $crate::DifferentiationContext<C>:
                 $crate::Context<Value = $crate::DifferentiationTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
@@ -196,10 +195,9 @@ macro_rules! implement_tracer_operator {
             }
         }
 
-        // TODO(eaplatanios): Clean this up once we clean up the differentiation module.
         impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
         where
-            $crate::tracing_v2::differentiation::JvpContext<C>:
+            $crate::DifferentiationContext<C>:
                 $crate::Context<Value = $crate::DifferentiationTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;

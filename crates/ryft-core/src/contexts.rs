@@ -129,7 +129,6 @@ pub trait Context: Domain + Clone {
     /// differentiating. Transform contexts that wrap other contexts (e.g., batching and forward-mode differentiation)
     /// delegate to the wrapped context, so that the answer reflects the innermost context that actually executes the
     /// bound operations.
-    #[inline]
     fn is_eager(&self) -> bool;
 
     /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible

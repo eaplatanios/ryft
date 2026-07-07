@@ -737,10 +737,26 @@ impl Type for ArrayType {
 
     #[inline]
     fn is_refined_by(&self, other: &Self) -> bool {
+        // `DataType`s and `Memory` placements must match exactly and shapes follow `Shape::is_refined_by`. The optional
+        // `Layout` and `Sharding` metadata components follow the same directional declared-vs-actual reading as dynamic
+        // dimensions where a declared `None` leaves the component unspecified and admits every actual value (including
+        // one that carries the component), while a declared `Some` requires the actual type to carry the exact same
+        // component. This is what lets declared types staged without placement information (e.g., program input types
+        // traced from metadata-free exemplars) accept concrete runtime values whose types carry normalized shardings.
+        let is_layout_refined_by_other = match (&self.layout, &other.layout) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(declared), Some(actual)) => declared == actual,
+        };
+        let is_sharding_refined_by_other = match (&self.sharding, &other.sharding) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(declared), Some(actual)) => declared == actual,
+        };
         self.data_type == other.data_type
             && self.shape.is_refined_by(&other.shape)
-            && self.layout == other.layout
-            && self.sharding == other.sharding
+            && is_layout_refined_by_other
+            && is_sharding_refined_by_other
             && self.memory == other.memory
     }
 
@@ -1279,22 +1295,36 @@ mod tests {
         assert!(!declared.is_refined_by(&ArrayType::new(F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))));
         assert!(!actual.is_refined_by(&ArrayType::new(F32, Shape::new(vec![Size::Static(3)]))));
 
-        // Layout, sharding, and memory metadata must match exactly.
+        // A declared type without optional layout metadata leaves the layout unspecified and is refined by actual
+        // types that carry one, while a declared layout must be carried exactly by the actual type.
         let strided = actual.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
-        assert!(!declared.is_refined_by(&strided));
+        assert!(declared.is_refined_by(&strided));
         assert!(strided.is_refined_by(&strided));
+        assert!(!strided.is_refined_by(&actual));
+        assert!(!strided.is_refined_by(&actual.clone().with_layout(Layout::Strided(StridedLayout::new(vec![3, 1])))));
+
+        // Optional sharding metadata follows the same directional reading: an unsharded declared type admits sharded
+        // actual types, a declared sharding must match the actual sharding exactly, and a sharded declared type is
+        // never refined by an unsharded actual type.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded = actual
             .clone()
             .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
             )
             .unwrap();
-        assert!(!declared.is_refined_by(&sharded));
+        assert!(declared.is_refined_by(&sharded));
         assert!(sharded.is_refined_by(&sharded));
+        assert!(!sharded.is_refined_by(&actual));
+        let replicated = actual.clone().with_sharding(Sharding::replicated(mesh, 2)).unwrap();
+        assert!(!sharded.is_refined_by(&replicated));
+
+        // Memory placement is not optional and must always match exactly.
         let pinned = actual.clone().with_memory(Memory::Host { pinned: true });
         assert!(!declared.is_refined_by(&pinned));
         assert!(pinned.is_refined_by(&pinned));
+        assert!(!pinned.is_refined_by(&actual));
     }
 
     #[test]

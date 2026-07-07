@@ -1090,7 +1090,7 @@ mod differentiation_tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
     use crate::tracing_v2::differentiation::DifferentiationTracer;
-    use crate::tracing_v2::{DifferentiationContext, NestedTracer};
+    use crate::tracing_v2::{Differentiate, NestedTracer};
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
@@ -1116,7 +1116,7 @@ mod differentiation_tests {
         use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
 
         // `stop_gradient` severs the incoming tangent, making every downstream collective input tangent a symbolic
-        // zero, so `JvpContext::bind`'s all-zero fast path computes the primal by binding the operation and emits a
+        // zero, so `DifferentiationContext::bind`'s all-zero fast path computes the primal by binding the operation and emits a
         // zero output tangent without consulting the per-operation rule. The function is
         // `f(x) = x + psum(stop_gradient(x))`, which differentiates like `x + c`, so the tangent equals the input
         // tangent. `jvp` runs the closure directly on duals, so the fast path fires as the closure binds the
@@ -1150,7 +1150,8 @@ mod differentiation_tests {
         // the headline `linearize` capability.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let function = |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap();
-        let jvp_function = |x: DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
+        let jvp_function =
+            |x: DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = domain.linearize(function, Scalar::from(0.7)).unwrap();
 
         let (reference_primal, _) = domain.jvp(jvp_function, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
@@ -1206,7 +1207,8 @@ mod differentiation_tests {
         // distinct tangents are applied through the one linearization and each matches `jvp`.
         let function =
             |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| x.clone() * x.sin().unwrap();
-        let jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
+        let jvp_function =
+            |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .linearize(function, TestArray::scalar(0.7))
             .unwrap();
@@ -1551,7 +1553,7 @@ mod linearization_tests {
     }
 
     /// Asserts forward equivalence: the primal and tangent sub-programs, reassembled, equal the outputs of
-    /// [`DifferentiationContext::jvp`] for `function` at `primals` with the given `tangents`.
+    /// [`Differentiate::jvp`] for `function` at `primals` with the given `tangents`.
     fn assert_forward_equivalent<JvpFunction, LinearizeFunction>(
         jvp_function: JvpFunction,
         linearize_function: LinearizeFunction,
@@ -1599,7 +1601,7 @@ mod linearization_tests {
 
     /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
     /// simplification, and direct interpretation at `(primals ++ tangents)` — as an independent oracle for
-    /// [`DifferentiationContext::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
+    /// [`Differentiate::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
     /// agree with the program-level pipeline. Returns the flat primal and tangent outputs.
     fn fused_pipeline_jvp<Function>(
         domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
@@ -1623,7 +1625,7 @@ mod linearization_tests {
 
     /// Reverse-mode-differentiates `function` at `primals` through the raw linearize-then-transpose pipeline —
     /// trace, eager `while` unroll, fused JVP known-ness split, primal replay, and partitioned transposition — so
-    /// the packaged [`DifferentiationContext::vjp`] surface can be compared against the pipeline it wraps. Returns
+    /// the packaged [`Differentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
     /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
     fn vjp_direct<Function>(
         domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
@@ -1650,7 +1652,7 @@ mod linearization_tests {
 
     /// Asserts reverse equivalence: the raw-pipeline pullback (built by [`vjp_direct`], which transposes the tangent
     /// sub-program in the primal `ScalarOperation` enum) yields the same input cotangents as the packaged
-    /// [`DifferentiationContext::vjp`] pullback for `function` at `primals`, for the given `output_cotangents`. The
+    /// [`Differentiate::vjp`] pullback for `function` at `primals`, for the given `output_cotangents`. The
     /// same `function` is supplied twice because each consuming entry point traces it once into a primal program.
     ///
     /// Both pullbacks consume the residuals as ordinary pullback inputs, so each is interpreted at
@@ -2170,7 +2172,7 @@ mod linearization_tests {
         use crate::operations::arithmetic::Mul;
         use crate::operations::trigonometric::Sin;
 
-        // A zero input tangent flows through the all-zero fast path of `JvpContext::bind` (the rule is skipped and
+        // A zero input tangent flows through the all-zero fast path of `DifferentiationContext::bind` (the rule is skipped and
         // the primal operation binds directly): the derivative is zero and the value matches the primal evaluation.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (value, tangent): (Scalar, Scalar) =
@@ -2362,9 +2364,9 @@ mod linearization_tests {
 
         let (primal_outputs, tangent_outputs) = outer_context
             .jvp(
-                |inputs: Vec<DifferentiationTracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>| {
-                    Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?])
-                },
+                |inputs: Vec<
+                    DifferentiationTracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
+                >| { Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]) },
                 vec![primal_a, primal_b],
                 vec![tangent_a, tangent_b],
             )
@@ -3010,7 +3012,7 @@ mod array_linearization_tests {
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::differentiation::{
-        DifferentiationContext, DifferentiationTracer, Linearization, build_jvp_program, replay_via_bind,
+        Differentiate, DifferentiationTracer, Linearization, build_jvp_program, replay_via_bind,
         transpose_tangent_partitioned,
     };
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -3047,7 +3049,7 @@ mod array_linearization_tests {
     }
 
     /// Asserts forward equivalence for array functions: the primal and tangent sub-programs, reassembled, equal
-    /// the outputs of [`DifferentiationContext::jvp`] for `function` at `primals` with the given `tangents`.
+    /// the outputs of [`Differentiate::jvp`] for `function` at `primals` with the given `tangents`.
     fn assert_array_forward_equivalent<JvpFunction, LinearizeFunction>(
         jvp_function: JvpFunction,
         linearize_function: LinearizeFunction,
@@ -3091,7 +3093,7 @@ mod array_linearization_tests {
     }
 
     /// Asserts reverse equivalence for array functions: transposing the tangent sub-program yields the same input
-    /// cotangents as the [`DifferentiationContext::vjp`] pullback for `function` at `primals`, for the given
+    /// cotangents as the [`Differentiate::vjp`] pullback for `function` at `primals`, for the given
     /// `output_cotangents`.
     fn assert_array_reverse_equivalent<VjpFunction, LinearizeFunction>(
         vjp_function: VjpFunction,
@@ -3119,7 +3121,7 @@ mod array_linearization_tests {
 
     /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
     /// simplification, and direct interpretation at `(primals ++ tangents)` — as an independent oracle for
-    /// [`DifferentiationContext::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
+    /// [`Differentiate::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
     /// agree with the program-level pipeline. Returns the flat primal and tangent outputs.
     fn fused_pipeline_jvp<Function>(
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
@@ -3143,7 +3145,7 @@ mod array_linearization_tests {
 
     /// Reverse-mode-differentiates `function` at `primals` through the raw linearize-then-transpose pipeline —
     /// trace, eager `while` unroll, fused JVP known-ness split, primal replay, and partitioned transposition — so
-    /// the packaged [`DifferentiationContext::vjp`] surface can be compared against the pipeline it wraps. Returns
+    /// the packaged [`Differentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
     /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
     fn vjp_direct<Function>(
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
@@ -3171,14 +3173,14 @@ mod array_linearization_tests {
     /// Asserts the control-flow reverse-mode equivalence gate: the direct-transpose pullback (built by
     /// [`vjp_direct`], which transposes the primal `Scan` / `Condition` operations of the tangent
     /// sub-program directly) produces the same linear-input cotangents as the established
-    /// [`DifferentiationContext::vjp`] pullback, for a control-flow `function` at `primals` and the given
+    /// [`Differentiate::vjp`] pullback, for a control-flow `function` at `primals` and the given
     /// `output_cotangents`. The same `function` is supplied twice because each consuming entry point traces it once
     /// into a primal program.
     ///
     /// The direct pullback consumes the residuals as ordinary pullback inputs, so it is interpreted at
     /// `output_cotangents ++ residuals`. It prunes any dead operand tangent — for example the Boolean predicate of a
     /// `condition`, which has no tangent space — so it emits one cotangent per *live* operand, whereas
-    /// [`DifferentiationContext::vjp`] emits a typed zero for every primal input including the predicate. The direct-transpose
+    /// [`Differentiate::vjp`] emits a typed zero for every primal input including the predicate. The direct-transpose
     /// path is correct precisely when its cotangents equal the trailing (live-operand) cotangents of `vjp`, which this
     /// asserts by comparing against the last `direct.len()` entries of the reference cotangents.
     fn assert_array_control_flow_reverse_equivalent_to_vjp<VjpFunction, DirectFunction>(
@@ -3804,7 +3806,7 @@ mod array_linearization_tests {
     }
 
     /// Asserts that the full JVP program for `condition_function` at `(predicate, x)` with tangent `(0, dx)`,
-    /// interpreted directly, reproduces both the primal and the tangent outputs of [`DifferentiationContext::jvp`].
+    /// interpreted directly, reproduces both the primal and the tangent outputs of [`Differentiate::jvp`].
     ///
     /// The condition's predicate is a scalar-boolean operand whose tangent input is dead (Boolean predicates have
     /// no tangent space), so the partial-evaluation split prunes it and the reassembling
@@ -4574,7 +4576,7 @@ mod batching_tests {
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
-    use crate::tracing_v2::{DifferentiationContext, NestedTracer};
+    use crate::tracing_v2::{Differentiate, NestedTracer};
     use crate::types::{DataType, Shape};
 
     use super::*;
@@ -4809,7 +4811,7 @@ mod batching_tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    DifferentiationContext::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
+                    Differentiate::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 BatchAxis::new(0),

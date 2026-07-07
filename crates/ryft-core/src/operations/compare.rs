@@ -2,7 +2,6 @@ use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::Context;
-use crate::contexts::Domain;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{BooleanLike, ElementwiseOperation, Operation, OperationFormatter};

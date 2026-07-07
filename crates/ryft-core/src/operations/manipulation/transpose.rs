@@ -2,7 +2,6 @@ use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
 use crate::contexts::Context;
-use crate::contexts::Domain;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
