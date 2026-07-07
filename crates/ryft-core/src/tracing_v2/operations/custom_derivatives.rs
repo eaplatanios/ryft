@@ -22,7 +22,7 @@ use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
 use crate::tracing_v2::differentiation::materialize;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_via_bind};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_via_bind};
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
@@ -152,7 +152,11 @@ where
     C::Constant: Clone,
     C::Operation: Clone,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let output_count = self.output_types().len();
         check_count!("input", inputs, self.input_types().len(), ProgramError);
         // The JVP program consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
@@ -166,7 +170,11 @@ where
         let mut outputs = replay_via_bind(context, self.jvp_program(), jvp_inputs)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
-        Ok(outputs.into_iter().zip(tangents).map(|(primal, tangent)| JvpTracer::new(primal, tangent)).collect())
+        Ok(outputs
+            .into_iter()
+            .zip(tangents)
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
+            .collect())
     }
 }
 
@@ -798,7 +806,11 @@ where
     C::Constant: Clone,
     C::Operation: Clone + From<CustomVjpTangentOperation<C::Constant, C::Operation>>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let output_count = self.output_types().len();
         check_count!("input", inputs, self.input_types().len(), ProgramError);
         // Replay the forward program on the dual primals, recovering the primal outputs followed by the residuals.
@@ -830,7 +842,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(output_tangents)
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect())
     }
 }
@@ -1013,7 +1025,11 @@ impl<C: Context> DifferentiableOperation<C> for CustomVjpTangentOperation<C::Con
 where
     C::Operation: Clone,
 {
-    fn jvp(&self, _context: &C, _inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only", self.name()),
         })
@@ -1426,7 +1442,7 @@ mod tests {
 
     use super::*;
     use crate::batching::BatchAxis;
-    use crate::tracing_v2::differentiation::DifferentiationContext;
+    use crate::tracing_v2::differentiation::Differentiate;
     use crate::tracing_v2::value_and_grad;
 
     /// Returns the canonical test array type with the provided dimensions.

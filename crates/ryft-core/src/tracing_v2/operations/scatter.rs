@@ -26,7 +26,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, materialize};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, materialize};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -41,7 +41,11 @@ where
     C::Operation: Clone + From<ScatterOperation>,
     C::Value: Scatter,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         let operand = &inputs[0];
         let indices = inputs[1].primal();
@@ -64,7 +68,7 @@ where
             let updates_tangent = materialize(context, updates.tangent().clone())?;
             MaybeZero::Value(operand_tangent.scatter(indices, &updates_tangent, self)?)
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

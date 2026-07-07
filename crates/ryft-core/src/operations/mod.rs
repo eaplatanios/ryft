@@ -56,6 +56,7 @@ pub mod trigonometric;
 // TODO(eaplatanios): We should be importing specific symbols here.
 // The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
 // they do not shadow their `std::ops` counterparts; reach them through `crate::operations::arithmetic` instead.
+use crate::{DifferentiationDual, DifferentiationTracer, MaybeZero};
 pub use arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
     NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation,
@@ -493,6 +494,24 @@ impl<C: Context<Type = ArrayType, Value: BooleanLike>> BooleanLike for BatchingT
             });
         }
         self.batch().value().boolean()
+    }
+}
+
+// TODO(eaplatanios): Review this implementation.
+// A dual's Boolean view uses its primal's: [`as_boolean`](BooleanLike::as_boolean) reinterprets the primal with a
+// structural zero tangent, and [`boolean`](BooleanLike::boolean) decodes the primal — so branching on a dual in a
+// closure succeeds exactly when the primal is a concrete (eager) value and errors when it is a staged tracer.
+impl<C: Context<Value: BooleanLike>> BooleanLike for DifferentiationTracer<C> {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        let primal = self.primal().as_boolean();
+        let tangent = MaybeZero::Zero(primal.r#type().into_owned());
+        Self::new(DifferentiationDual::new(primal, tangent), self.context().clone())
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        self.primal().boolean()
     }
 }
 

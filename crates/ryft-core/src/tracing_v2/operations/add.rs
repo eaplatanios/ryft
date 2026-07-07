@@ -9,7 +9,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, combine_terms};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, combine_terms};
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where
@@ -33,7 +33,11 @@ where
     C::Value: Add<Output = C::Value>,
     AddOperation: Operation<C::Type>,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let primal = inputs[0].primal().clone() + inputs[1].primal().clone();
         // Structural zeros are dropped so the tangent program never stages `Add(zero, ..)`, which the
@@ -41,7 +45,7 @@ where
         let left = inputs[0].tangent().as_value().cloned();
         let right = inputs[1].tangent().as_value().cloned();
         let tangent = combine_terms(left, right, &primal);
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -50,7 +54,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_grad};
 
     #[test]
     fn test_add_jvp_and_gradient_are_linear() {

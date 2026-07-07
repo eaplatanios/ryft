@@ -5,7 +5,7 @@ use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOpe
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_zero_tangent};
 use crate::types::ArrayType;
 
 /// Implements the erroring [`TransposableOperation`] rule for Boolean-codomain logical operations: they are not
@@ -41,7 +41,11 @@ where
     C::Operation: Clone + From<NotOperation>,
     NotOperation: Operation<ArrayType>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -53,7 +57,11 @@ where
     C::Operation: Clone + From<AndOperation>,
     AndOperation: Operation<ArrayType>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -65,7 +73,11 @@ where
     C::Operation: Clone + From<OrOperation>,
     OrOperation: Operation<ArrayType>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -77,7 +89,11 @@ where
     C::Operation: Clone + From<XorOperation>,
     XorOperation: Operation<ArrayType>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -93,13 +109,13 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::DifferentiationContext;
-    use crate::tracing_v2::differentiation::JvpTracer;
+    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::differentiation::DifferentiationTracer;
 
     /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
     fn masked_select(
-        x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-    ) -> Result<JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+    ) -> Result<DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
         let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
         let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan)?;
         let mask = positive & above_one;

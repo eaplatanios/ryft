@@ -10,7 +10,7 @@ use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::{ArrayType, Type, TypeError};
 
 // TODO(eaplatanios): Review this module.
@@ -123,14 +123,18 @@ impl<C: StagingContext<Operation: From<PrintOperation>>> Print for Tracer<C> {
 impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<PrintOperation>>> DifferentiableOperation<C>
     for PrintOperation
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         // We re-print the input primal so the effect survives differentiation, while letting the input tangent pass
         // through unchanged (printing tangents would change the observable output of the differentiated program).
         // The print binds through the context so the rule works uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
         let mut primal = context.bind(PrintOperation::new(self.label()), std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
-        Ok(vec![JvpTracer::new(primal.remove(0), inputs[0].tangent().clone())])
+        Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }
 }
 

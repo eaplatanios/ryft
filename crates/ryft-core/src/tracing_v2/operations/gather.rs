@@ -17,7 +17,7 @@ use crate::operations::manipulation::{
 };
 use crate::programs::{MaybeZero, ProgramError, Value};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, Typed};
 
@@ -29,7 +29,11 @@ where
     C::Operation: Clone + From<GatherOperation>,
     C::Value: Gather,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let indices = inputs[1].primal();
         let primal = inputs[0].primal().gather(indices, self)?;
@@ -37,7 +41,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

@@ -20,7 +20,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
@@ -531,7 +531,11 @@ where
         Clone + From<ReduceOperation> + From<BroadcastOperation> + From<CompareOperation> + From<MulOperation>,
     C::Value: Reduce + Broadcast + Compare<Output = C::Value> + Mul<Output = C::Value>,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         match self.kind() {
             ReductionKind::Sum | ReductionKind::Mean => {
@@ -540,7 +544,7 @@ where
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
                     MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reduce(self.axes(), self.kind())),
                 };
-                Ok(vec![JvpTracer::new(primal, tangent)])
+                Ok(vec![DifferentiationDual::new(primal, tangent)])
             }
             kind @ (ReductionKind::Max | ReductionKind::Min) => {
                 // Stage the argmax mask from the operand primal capture-free: `compare` the operand primal against the
@@ -559,7 +563,7 @@ where
                         MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum))
                     }
                 };
-                Ok(vec![JvpTracer::new(primal, tangent)])
+                Ok(vec![DifferentiationDual::new(primal, tangent)])
             }
             kind => Err(ProgramError::UnsupportedOperation {
                 message: format!(

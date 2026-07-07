@@ -9,7 +9,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::Typed;
 
 impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for SubOperation
@@ -39,7 +39,11 @@ where
     C::Value: Sub<Output = C::Value> + Neg<Output = C::Value>,
     SubOperation: Operation<C::Type>,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let primal = inputs[0].primal().clone() - inputs[1].primal().clone();
         // Structural zeros are dropped; a zero minuend collapses to the negated subtrahend so the tangent
@@ -52,7 +56,7 @@ where
             (None, Some(term)) => MaybeZero::Value(-term),
             (None, None) => MaybeZero::Zero(primal.r#type().into_owned()),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -63,7 +67,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::DifferentiationContext;
+    use crate::tracing_v2::Differentiate;
 
     #[test]
     fn test_sub_jvp_matches_the_difference_rule() {

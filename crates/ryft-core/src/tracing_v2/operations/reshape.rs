@@ -9,7 +9,7 @@ use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::{ArrayType, Shape, Size, Typed};
 use crate::{ArrayBatch, BatchableOperation, BatchingError, Broadcast, Transpose};
 
@@ -123,14 +123,18 @@ where
     C::Operation: Clone + From<ReshapeOperation>,
     C::Value: Reshape,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reshape(self.output_shape().clone())?;
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshape(self.output_shape().clone())?),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

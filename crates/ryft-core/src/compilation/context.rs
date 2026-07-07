@@ -201,8 +201,6 @@ impl<
     Capture: Value<Type = ArrayType>,
     C: CapturingContext<Capture, Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>,
 > CapturingContext<Capture> for BatchingContext<C>
-where
-    BatchingContext<C>: Context<Type = ArrayType, Constant = C::Constant>,
 {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {

@@ -8,7 +8,7 @@ use crate::operations::trigonometric::{Cos, Sin, SinOperation};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 
 impl<C: Context> DifferentiableOperation<C> for SinOperation
 where
@@ -16,7 +16,11 @@ where
     C::Value: Sin + Cos + Mul<Output = C::Value>,
     SinOperation: Operation<C::Type>,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().sin()?;
@@ -26,7 +30,7 @@ where
             MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
             MaybeZero::Value(tangent) => MaybeZero::Value(input.primal().cos()? * tangent.clone()),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -56,7 +60,7 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::scalars::Scalar;
     use crate::tracing_v2::test_util::assert_scalar_close;
-    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_grad};
 
     #[test]
     fn test_sin_jvp_and_gradient_scale_by_cosine() {

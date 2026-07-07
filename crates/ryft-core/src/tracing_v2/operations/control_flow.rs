@@ -24,7 +24,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::operations::control_flow::MaybeWhile;
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, Linearization, materialize, replay_via_bind,
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiationDual, Linearization, materialize,
+    replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
@@ -367,7 +368,11 @@ where
         + From<ConditionOperation<C::Constant, C::Operation>>
         + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, self.true_branch().input_types().len() + 1, ProgramError);
         let predicate_primal = inputs[0].primal().clone();
         let operands = &inputs[1..];
@@ -389,13 +394,13 @@ where
         check_count!("output", outputs, 2 * output_count, ProgramError);
 
         // The fused conditional's outputs are the primal outputs followed by the tangent outputs; zip the halves
-        // back into `JvpTracer`s in the original output order.
+        // back into `DifferentiationDual`s in the original output order.
         let (primal_outputs, tangent_outputs) = outputs.split_at(output_count);
         Ok(primal_outputs
             .iter()
             .cloned()
             .zip(tangent_outputs.iter().cloned())
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect())
     }
 }
@@ -414,8 +419,8 @@ where
     fn jvp_while(
         operation: &WhileOperation<C::Constant, C::Operation>,
         context: &C,
-        inputs: &[JvpTracer<C>],
-    ) -> Result<Vec<JvpTracer<C>>, ProgramError>;
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
 }
 
 /// Capture-free forward-mode (JVP) rule for the bounded [`WhileOperation`], staging an augmented primal `while`
@@ -453,7 +458,7 @@ where
 ///      extra scanned input, so iteration `item` reads its own shape-congruent mask slice. The scan body input order is
 ///      therefore `[state_tangent..., residual_slice..., mask_slice...]`, with the leading `state_count` carry tangents
 ///      linear and the trailing residual and mask slices treated as scanned (known) operand edges.
-///   3. Pairs each primal output tracer with its tangent output tracer into a [`JvpTracer`].
+///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
 ///
 /// Reverse mode is total with no while-specific transpose code: the staged tangent scan re-keys through the existing
 /// scan re-key path into a captured-stack linear scan whose body re-keys the per-iteration `select` over its mask-item
@@ -481,8 +486,8 @@ where
     fn jvp_while(
         operation: &WhileOperation<C::Constant, C::Operation>,
         context: &C,
-        inputs: &[JvpTracer<C>],
-    ) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let state_types = operation.state_types();
         let state_count = state_types.len();
         check_count!("input", inputs, state_count, ProgramError);
@@ -502,7 +507,7 @@ where
             let mut initial_mask = replay_via_bind(context, operation.condition(), primal_operands)?;
             check_count!("output", initial_mask, 1, ProgramError);
             let mut extended_inputs = inputs.to_vec();
-            extended_inputs.push(JvpTracer::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type)));
+            extended_inputs.push(DifferentiationDual::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type)));
             let mut outputs = masked_while.jvp(context, extended_inputs.as_slice())?;
             check_count!("output", outputs, state_count + 1, ProgramError);
             outputs.truncate(state_count);
@@ -639,7 +644,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect())
     }
 }
@@ -655,8 +660,8 @@ where
     fn jvp_while(
         operation: &WhileOperation<C::Constant, C::Operation>,
         _context: &C,
-        _inputs: &[JvpTracer<C>],
-    ) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no capture-free forward-mode linearization rule", operation.name()),
         })
@@ -681,8 +686,8 @@ where
 fn jvp_while_eagerly<C>(
     operation: &WhileOperation<C::Constant, C::Operation>,
     context: &C,
-    inputs: &[JvpTracer<C>],
-) -> Result<Option<Vec<JvpTracer<C>>>, ProgramError>
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, ProgramError>
 where
     C: Context + Zero<C::Value>,
     C::Value: BooleanLike,
@@ -740,7 +745,7 @@ where
         primal_carries
             .into_iter()
             .zip(tangent_carries)
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect(),
     ))
 }
@@ -761,7 +766,11 @@ where
         + From<ZeroOperation<C::Type>>
         + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         if context.is_eager()
             && let Some(outputs) = jvp_while_eagerly(self, context, inputs)?
         {
@@ -1595,7 +1604,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::reduce::ReduceOperation;
-    use crate::tracing_v2::{ArrayOperation, DifferentiationContext};
+    use crate::tracing_v2::{ArrayOperation, Differentiate};
     use crate::types::{DataType, Shape, Size, TypeError};
 
     use super::*;

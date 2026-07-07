@@ -13,7 +13,7 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, materialize};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, materialize};
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
@@ -246,7 +246,11 @@ where
     C::Operation: Clone + From<SelectOperation>,
     SelectOperation: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
         let on_true = &inputs[1];
@@ -271,7 +275,7 @@ where
             check_count!("output", tangents, 1, ProgramError);
             MaybeZero::Value(tangents.remove(0))
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -372,7 +376,7 @@ mod tests {
         // there, so the derivative reaches only the selected branch's input.
         use crate::operations::scalars::ScalarOperation;
         use crate::scalars::Scalar;
-        use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+        use crate::tracing_v2::{Differentiate, value_and_grad};
 
         fn piecewise<V>(x: V, y: V) -> Result<V, crate::programs::ProgramError>
         where

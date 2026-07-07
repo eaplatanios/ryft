@@ -5,7 +5,7 @@ use crate::operations::compare::CompareOperation;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_zero_tangent};
 
 /// Forward-mode rule for [`CompareOperation`]: comparisons map into a discrete (Boolean) codomain, so the primal
 /// operation is replayed on the input primals and each Boolean output is paired with a canonical typed zero tangent.
@@ -14,7 +14,11 @@ where
     C::Operation: Clone + From<CompareOperation>,
     CompareOperation: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -50,13 +54,13 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::DifferentiationContext;
-    use crate::tracing_v2::differentiation::JvpTracer;
+    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::differentiation::DifferentiationTracer;
 
     /// `f(x) = select(x > 0, 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
     fn piecewise_select(
-        x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-    ) -> Result<JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+    ) -> Result<DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
         let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
         Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
     }

@@ -15,7 +15,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, combine_terms};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, combine_terms};
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
@@ -670,7 +670,11 @@ where
     C::Operation: Clone + From<DotOperation>,
     C::Value: Dot + std::ops::Add<Output = C::Value>,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
@@ -682,7 +686,7 @@ where
         let left_term = left.tangent().as_value().map(|tangent| stage_dot(tangent, right.primal()));
         let right_term = right.tangent().as_value().map(|tangent| stage_dot(left.primal(), tangent));
         let tangent = combine_terms(left_term, right_term, &primal);
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

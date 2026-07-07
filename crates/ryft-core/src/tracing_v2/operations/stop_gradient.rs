@@ -5,7 +5,7 @@ use crate::operations::stop_gradient::StopGradientOperation;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_zero_tangent};
 
 /// Forward-mode rule for [`StopGradientOperation`]: the operation is the identity on the primal but severs the
 /// tangent, so the primal is replayed (re-tagging the stop-gradient boundary) and paired with a typed zero tangent.
@@ -14,7 +14,11 @@ where
     C::Operation: Clone + From<StopGradientOperation>,
     StopGradientOperation: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -44,7 +48,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::stop_gradient::StopGradient;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_grad};
 
     #[test]
     fn test_stop_gradient_jvp_severs_the_tangent() {

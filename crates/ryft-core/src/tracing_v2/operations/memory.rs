@@ -15,7 +15,7 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::{ArrayType, Memory, TypeError, Typed};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].
@@ -163,14 +163,18 @@ where
     C::Operation: Clone + From<TransferToMemoryOperation>,
     C::Value: TransferToMemory,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().transfer_to_memory(self.destination());
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transfer_to_memory(self.destination())),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -217,7 +221,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size, Typed};
 
     use super::*;
-    use crate::tracing_v2::differentiation::DifferentiationContext;
+    use crate::tracing_v2::differentiation::Differentiate;
     use crate::tracing_v2::value_and_grad;
 
     const PINNED_HOST: Memory = Memory::Host { pinned: true };

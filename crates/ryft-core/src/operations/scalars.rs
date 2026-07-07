@@ -104,7 +104,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::scalars::Scalar;
-    use crate::tracing_v2::DifferentiationContext;
+    use crate::tracing_v2::Differentiate;
     use crate::types::TypeError;
 
     use super::*;

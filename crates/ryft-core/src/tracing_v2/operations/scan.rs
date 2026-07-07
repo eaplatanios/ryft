@@ -19,7 +19,7 @@ use crate::partial::PartialValue;
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, materialize,
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiationDual, materialize,
 };
 use crate::types::{ArrayType, DataType, Shape, Size, Type, Typed};
 
@@ -60,7 +60,11 @@ where
         + From<ScanOperation<C::Constant, C::Operation>>
         + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let carry_count = self.carry_count();
         let length = self.length();
         let reverse = self.reverse();
@@ -95,14 +99,14 @@ where
         check_count!("output", outputs, 2 * body_output_count, ProgramError);
 
         // The fused scan's outputs are `[primal_final_carries..., tangent_final_carries..., primal_stacked...,
-        // tangent_stacked...]`; zip the matching halves back into `JvpTracer`s in the original output order.
+        // tangent_stacked...]`; zip the matching halves back into `DifferentiationDual`s in the original output order.
         let scanned_output_count = body_output_count - carry_count;
         let mut jvp_outputs = Vec::with_capacity(body_output_count);
         for index in 0..carry_count {
-            jvp_outputs.push(JvpTracer::new(outputs[index].clone(), outputs[carry_count + index].clone()));
+            jvp_outputs.push(DifferentiationDual::new(outputs[index].clone(), outputs[carry_count + index].clone()));
         }
         for index in 0..scanned_output_count {
-            jvp_outputs.push(JvpTracer::new(
+            jvp_outputs.push(DifferentiationDual::new(
                 outputs[2 * carry_count + index].clone(),
                 outputs[2 * carry_count + scanned_output_count + index].clone(),
             ));
@@ -669,7 +673,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::differentiation::DifferentiationContext;
+    use crate::tracing_v2::differentiation::Differentiate;
 
     use crate::types::DataType;
 

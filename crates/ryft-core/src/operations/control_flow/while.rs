@@ -14,7 +14,7 @@ use crate::partial::{
 };
 use crate::payloads::{Captured, Input};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing_v2::differentiation::JvpTracer;
+use crate::tracing_v2::differentiation::DifferentiationTracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
 use crate::{CaptureReference, Tracer};
 
@@ -137,7 +137,7 @@ impl<C: Context> WhilePredicate for Tracer<C> {}
 impl WhilePredicate for CaptureReference<ArrayType> {}
 
 impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C> where C::Value: BooleanLike {}
-impl<C: Context> WhilePredicate for JvpTracer<C> where C::Value: BooleanLike {}
+impl<C: Context> WhilePredicate for DifferentiationTracer<C> where C::Value: BooleanLike {}
 
 /// [`Operation`] that repeatedly applies a nested body [`Program`] to a loop-carried state while a nested condition
 /// [`Program`] over that same state produces a true scalar Boolean predicate. The condition and body consume identical

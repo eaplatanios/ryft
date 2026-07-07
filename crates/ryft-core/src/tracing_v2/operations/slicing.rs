@@ -17,7 +17,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, materialize};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, materialize};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`SliceOperation`].
@@ -181,7 +181,11 @@ where
     C::Operation: Clone + From<DynamicSliceOperation>,
     C::Value: DynamicSlice,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let (operand, start_indices) =
             inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
@@ -190,7 +194,7 @@ where
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.dynamic_slice(&primal_starts, self.sizes())?),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -203,7 +207,11 @@ where
     C::Operation: Clone + From<DynamicUpdateSliceOperation>,
     C::Value: DynamicUpdateSlice,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -218,7 +226,7 @@ where
             let update_tangent = materialize(context, update.tangent().clone())?;
             MaybeZero::Value(operand_tangent.dynamic_update_slice(&update_tangent, &primal_starts)?)
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -230,7 +238,11 @@ where
     C::Operation: Clone + From<SliceOperation>,
     C::Value: Slice,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().slice(self.start_indices(), self.limit_indices(), self.strides())?;
         let tangent = match inputs[0].tangent() {
@@ -239,7 +251,7 @@ where
                 MaybeZero::Value(tangent.slice(self.start_indices(), self.limit_indices(), self.strides())?)
             }
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -251,7 +263,11 @@ where
     C::Operation: Clone + From<UpdateSliceOperation>,
     C::Value: UpdateSlice,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let operand = &inputs[0];
         let update = &inputs[1];
@@ -263,7 +279,7 @@ where
             let update_tangent = materialize(context, update.tangent().clone())?;
             MaybeZero::Value(operand_tangent.update_slice(&update_tangent, self.start_indices())?)
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

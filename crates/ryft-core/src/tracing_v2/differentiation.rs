@@ -3,13 +3,12 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{Constant, Fill, Iota, One, OneOperation, Zero, ZeroOperation};
+use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::MaybeWhile;
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};

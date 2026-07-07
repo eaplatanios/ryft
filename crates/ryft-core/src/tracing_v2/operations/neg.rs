@@ -9,7 +9,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 
 impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for NegOperation
 where
@@ -36,12 +36,16 @@ where
     C::Value: Neg<Output = C::Value>,
     NegOperation: Operation<C::Type>,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = -inputs[0].primal().clone();
         // A negated structural zero stays a structural zero, keeping `Neg(zero)` out of the tangent program.
         let tangent = inputs[0].tangent().clone().map(|tangent| -tangent);
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -50,7 +54,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::{DifferentiationContext, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_grad};
 
     #[test]
     fn test_neg_jvp_and_gradient_negate() {

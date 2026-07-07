@@ -14,7 +14,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, materialize};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, materialize};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`ConcatenateOperation`].
@@ -103,7 +103,11 @@ where
     C::Operation: Clone + From<ConcatenateOperation>,
     C::Value: Concatenate,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let primals = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         // The concatenation needs every operand tangent as a real value, so materialize the structurally zero ones
         // (the shared all-zero fast path already handled the case where every operand tangent is zero).
@@ -113,7 +117,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let primal = Concatenate::concatenate(&primals, self.axis())?;
         let tangent = Concatenate::concatenate(&tangents, self.axis())?;
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

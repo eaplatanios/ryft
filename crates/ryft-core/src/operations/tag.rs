@@ -9,7 +9,7 @@ use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`TagOperation`].
@@ -108,14 +108,18 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
 impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperation>>> DifferentiableOperation<C>
     for TagOperation
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         // We re-tag the input primal for downstream classification while letting the input tangent pass through
         // unchanged, matching the identity tangent of the tag. The tag binds through the context so the rule works
         // uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
         let mut primal = context.bind(TagOperation::new(self.key()), std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
-        Ok(vec![JvpTracer::new(primal.remove(0), inputs[0].tangent().clone())])
+        Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }
 }
 

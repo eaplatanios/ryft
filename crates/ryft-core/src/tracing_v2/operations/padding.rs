@@ -17,7 +17,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::tracing_v2::operations::reduce::{ReduceOperation, ReductionKind};
 use crate::types::{ArrayType, TypeError, Typed};
 
@@ -135,7 +135,11 @@ where
     C::Operation: Clone + From<PadOperation>,
     C::Value: Pad,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         let primal = inputs[0].primal().pad(
             inputs[1].primal(),
@@ -153,7 +157,7 @@ where
             self.edge_padding_high(),
             self.interior_padding(),
         )?;
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 

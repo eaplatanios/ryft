@@ -15,7 +15,7 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_zero_tangent};
 use crate::types::{ArrayType, Type, Typed};
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
@@ -192,7 +192,11 @@ where
     C::Operation: Clone + From<ZeroOperation<C::Type>>,
     ZeroOperation<C::Type>: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -204,7 +208,11 @@ where
     C::Operation: Clone + From<OneOperation<C::Type>>,
     OneOperation<C::Type>: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -216,7 +224,11 @@ where
     C::Operation: Clone + From<ConstantOperation<C::Constant>>,
     ConstantOperation<C::Constant>: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -228,7 +240,11 @@ where
     C::Operation: Clone + From<ZeroLikeOperation>,
     ZeroLikeOperation: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, *self, inputs)
     }
 }
@@ -240,7 +256,11 @@ where
     C::Operation: Clone + From<OneLikeOperation>,
     OneLikeOperation: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, *self, inputs)
     }
 }
@@ -252,7 +272,11 @@ where
     C::Operation: Clone + From<FillOperation<C::Type, f64>>,
     FillOperation<C::Type, f64>: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }
@@ -264,7 +288,11 @@ where
     C::Operation: Clone + From<IotaOperation<C::Type>>,
     IotaOperation<C::Type>: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         replay_zero_tangent(context, self.clone(), inputs)
     }
 }

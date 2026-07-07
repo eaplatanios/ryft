@@ -120,7 +120,10 @@ pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), T
     Ok(())
 }
 
-/// Returns the stacked variant of a scan body slice type, prepending a static `length` dimension to its shape.
+/// Returns the stacked variant of a scan body slice type, prepending a static `length` dimension to its shape. The
+/// stacked type carries no optional layout or sharding metadata, so it is a declared type whose optional components
+/// are unspecified and scan input validation compares it against actual input types with
+/// [`Type::is_refined_by`](crate::types::Type::is_refined_by).
 pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayType {
     let mut dimensions = Vec::with_capacity(slice_type.rank() + 1);
     dimensions.push(Size::Static(length));
@@ -130,6 +133,14 @@ pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayT
 
 /// Validates `[carry..., stacked_xs...]` input types against a scan body signature and returns the
 /// `[carry..., stacked_ys...]` output types. This backs type inference for [`ScanOperation`].
+///
+/// The expected input types are declared types derived from the body signature (with stacked types built by
+/// [`stacked_scan_type`], which carries no optional metadata), while the provided `input_types` may be actual runtime
+/// value types carrying more precise optional metadata, such as the normalized [`Sharding`](crate::Sharding)s that
+/// every concrete backend array type carries. Validation therefore uses the directional declared-vs-actual
+/// [`Type::is_refined_by`] relation instead of strict type equality. The returned output types are declared types
+/// built the same way and thus leave optional metadata unspecified for downstream consumers (e.g., sharding
+/// propagation) to resolve.
 pub(crate) fn scan_output_types(
     body_input_types: &[ArrayType],
     body_output_types: &[ArrayType],
@@ -141,7 +152,15 @@ pub(crate) fn scan_output_types(
     expected_input_types
         .extend(body_input_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
     check_count!("input", input_types, expected_input_types.len(), TypeError);
-    check_types!("scan input", &expected_input_types, input_types);
+    for (index, (expected, actual)) in expected_input_types.iter().zip(input_types).enumerate() {
+        if !expected.is_refined_by(actual) {
+            return Err(TypeError {
+                message: format!(
+                    "scan input {index} has type {actual} which is incompatible with the expected type {expected}",
+                ),
+            });
+        }
+    }
     let mut output_types = body_output_types[..carry_count].to_vec();
     output_types
         .extend(body_output_types[carry_count..].iter().map(|slice_type| stacked_scan_type(slice_type, length)));
@@ -1338,8 +1357,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[scalar_f64.clone(), scalar_f64.clone()]),
             Err(TypeError {
-                message: "scan input type signature mismatch: expected [f64[], f64[3]] but got [f64[], f64[]]"
-                    .to_string(),
+                message: "scan input 1 has type f64[] which is incompatible with the expected type f64[3]".to_string(),
             }),
         );
 
@@ -1526,6 +1544,47 @@ mod tests {
                 in (%2, %3)
             "}
             .trim_end(),
+        );
+    }
+
+    /// Scan input validation compares the declared types derived from the body signature against actual input types
+    /// with `Type::is_refined_by`, so actual types carrying optional metadata that the declared types leave
+    /// unspecified (e.g., the normalized shardings every concrete backend array type carries) are accepted, while
+    /// data type and shape mismatches are still rejected.
+    #[test]
+    fn test_scan_input_type_refinement() {
+        use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+
+        let scalar_f64 = ArrayType::scalar(DataType::F64);
+        let stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let operation = TestScanOperation::new(product_body(), 1, 3).unwrap();
+
+        // Sharded actual input types refine the metadata-free declared carry and stacked input types, and the
+        // inferred output types stay declared (i.e., metadata-free) rather than inheriting the input shardings.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharded_carry = scalar_f64.clone().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let sharded_stacked = stacked_f64
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[sharded_carry, sharded_stacked]),
+            Ok(vec![scalar_f64.clone(), stacked_f64.clone()]),
+        );
+
+        // Data type and shape mismatches are still rejected with the declared-vs-actual framing.
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::scalar(DataType::F32), stacked_f64.clone()]),
+            Err(TypeError {
+                message: "scan input 0 has type f32[] which is incompatible with the expected type f64[]".to_string(),
+            }),
+        );
+        assert_eq!(
+            operation
+                .infer_output_types(&[scalar_f64, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]))]),
+            Err(TypeError {
+                message: "scan input 1 has type f64[4] which is incompatible with the expected type f64[3]".to_string(),
+            }),
         );
     }
 

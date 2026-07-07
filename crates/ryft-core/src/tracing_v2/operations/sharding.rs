@@ -29,7 +29,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::types::{ArrayType, Typed};
 
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent
@@ -68,14 +68,18 @@ where
     C::Operation: Clone + From<ReshardOperation>,
     C::Value: Reshard,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reshard(self.sharding());
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.reshard(self.sharding())),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -135,14 +139,18 @@ where
     C::Operation: Clone + From<ShardingConstraintOperation>,
     C::Value: ConstrainSharding,
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().constrain_sharding(self.sharding());
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.constrain_sharding(self.sharding())),
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -188,7 +196,7 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::NestedTracer;
-    use crate::tracing_v2::differentiation::DifferentiationContext;
+    use crate::tracing_v2::differentiation::Differentiate;
 
     fn mesh() -> LogicalMesh {
         LogicalMesh::new(vec![

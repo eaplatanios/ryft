@@ -14,7 +14,7 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 
@@ -223,7 +223,11 @@ impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for CollectiveOper
 where
     C::Operation: Clone + From<CollectiveOperation>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         if matches!(self.kind, CollectiveKind::PMax) {
             return Err(ProgramError::UnsupportedOperation {
@@ -239,7 +243,7 @@ where
                 MaybeZero::Value(stage_collective(context, &self.axis_name, self.kind, tangent)?)
             }
         };
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }
 
@@ -519,7 +523,11 @@ where
     C::Operation: Clone + From<AxisIndexOperation>,
     AxisIndexOperation: Operation<C::Type>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         crate::tracing_v2::differentiation::replay_zero_tangent(context, self.clone(), inputs)
     }
 }
