@@ -4335,11 +4335,11 @@ mod array_linearization_tests {
     /// item's tangent is structurally zero, so partial evaluation prunes that tangent input and the linearization
     /// must restore the canonical `[carry_tangents..., residuals...]` arity the bounded-`while` rule assumes.
     fn batched_bounded_while_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
+        use crate::batching::Batch;
         use crate::batching::BatchAxis;
-        use crate::tracing_v2::batching::BatchContext;
 
         let context = inputs[0].context().clone();
-        let mapped = BatchContext::batch(
+        let mapped = Batch::batch(
             &context,
             |item| {
                 let while_operation = bounded_doubling_while_operation(8.0, 5);
@@ -4472,7 +4472,7 @@ mod batching_tests {
 
     use crate::axes::AxisIndex;
     use crate::batching::{
-        ArrayBatch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, BatchingTracer,
+        ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, BatchingTracer,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Operation;
@@ -4485,7 +4485,6 @@ mod batching_tests {
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::NestedTracer;
-    use crate::tracing_v2::batching::*;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
@@ -4618,7 +4617,7 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    Ok(BatchContext::batch(
+                    Ok(Batch::batch(
                         &context,
                         |scalar| scalar.context().axis_index("o"),
                         row,
@@ -4666,7 +4665,7 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    Ok(BatchContext::batch(
+                    Ok(Batch::batch(
                         &context,
                         |scalar| scalar.collective("outer", CollectiveKind::PSum),
                         row,
@@ -4698,7 +4697,7 @@ mod batching_tests {
             |x| {
                 let context = x.context().clone();
                 let y = context.constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]));
-                let mapped: NestedTracer<TestArrayDomain> = BatchContext::batch(
+                let mapped: NestedTracer<TestArrayDomain> = Batch::batch(
                     &context,
                     |(item, shift)| Ok(item * shift),
                     (y, x),
@@ -4760,7 +4759,7 @@ mod batching_tests {
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    let output: crate::tracing_v2::NestedTracer<TestArrayDomain> = BatchContext::batch(
+                    let output: crate::tracing_v2::NestedTracer<TestArrayDomain> = Batch::batch(
                         &context,
                         |item| Ok(item.clone() * item),
                         x,
@@ -4788,7 +4787,7 @@ mod batching_tests {
             &TestArrayDomain,
             |x| {
                 let context = x.context().clone();
-                let mapped: crate::tracing_v2::NestedTracer<TestArrayDomain> = BatchContext::batch(
+                let mapped: crate::tracing_v2::NestedTracer<TestArrayDomain> = Batch::batch(
                     &context,
                     |item| Ok(item.clone() * item),
                     x,
@@ -4872,7 +4871,7 @@ mod batching_tests {
             .batch(
                 |row| {
                     let context = row.context().clone();
-                    Ok(BatchContext::batch(
+                    Ok(Batch::batch(
                         &context,
                         |scalar| Ok(scalar.clone() * scalar),
                         row,
@@ -5059,7 +5058,7 @@ mod batching_tests {
             .batch(
                 |(row, bias_inner)| {
                     let context = row.context().clone();
-                    Ok(BatchContext::batch(
+                    Ok(Batch::batch(
                         &context,
                         |(scalar, bias_inner)| Ok(scalar + bias_inner),
                         (row, bias_inner),
@@ -5125,7 +5124,7 @@ mod batching_tests {
         let operand_atom = builder.borrow_mut().add_input(operand_type);
         let predicate_tracer = parent.tracer(predicate_atom, None);
         let operand_tracer = parent.tracer(operand_atom, None);
-        let output = BatchContext::batch(
+        let output = Batch::batch(
             &parent,
             |(predicate, x)| {
                 let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
@@ -5178,7 +5177,7 @@ mod batching_tests {
             builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
         let predicate_tracer = parent.tracer(predicate_atom, None);
         let operand_tracer = parent.tracer(operand_atom, None);
-        let output = BatchContext::batch(
+        let output = Batch::batch(
             &parent,
             |(predicate, x)| {
                 let condition = ConditionOperation::new(scalar_scale_branch(2.0), constant_branch).unwrap();
@@ -5353,7 +5352,7 @@ mod batching_tests {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
         let input_tracer = parent.tracer(input_atom, None);
-        let output = BatchContext::batch(
+        let output = Batch::batch(
             &parent,
             |x| {
                 let bias = x.context().lift(TestArray::scalar(1.0))?;

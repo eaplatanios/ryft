@@ -111,4 +111,106 @@ macro_rules! check_builders {
     }};
 }
 
-pub use crate::{check_builders, check_count, check_sharding, check_types};
+// TODO(eaplatanios): Review from here onwards.
+
+/// Implements a foreign `std::ops` operator trait as panicking sugar for the three core transform tracer types
+/// (i.e., [`Tracer`](crate::Tracer), [`BatchingTracer`](crate::BatchingTracer), and [`JvpTracer`](crate::JvpTracer))
+/// by binding the operation through each tracer's own context. The operator traits (i.e., `std::ops::Add`,
+/// `std::ops::Neg`, `std::ops::BitAnd`, etc.) are foreign and so a single `impl<V: Value>` blanket implementation
+/// (i.e., the shape used for the fallible in-crate capability traits) is not allowed due to the orphan rule. This macro
+/// stamps out the implementations that a blanket would otherwise cover. Note also that because an operator must return
+/// `Self`, the two error modes differ by tracer and cannot be collapsed: a staged [`Tracer`](crate::Tracer) records
+/// through its [`unary`](crate::Tracer::unary) / [`binary`](crate::Tracer::binary) helpers, which *poison* on a failed
+/// bind so that the error surfaces later at tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer) and
+/// [`JvpTracer`](crate::JvpTracer) have no deferral point and bind directly, panicking with `$message` if the bind
+/// fails. Binding directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal
+/// (e.g., no `Type = ArrayType` pin is needed on the batching arm).
+///
+/// The `unary` arm produces `fn(self) -> Self` operators and the `binary` arm produces `fn(self, Self) -> Self`
+/// operators. The `$operation` path is a unit-struct operation used both as the `From` bound target and as the bound
+/// value, and `$message` is the panic message used when an eager tracer's bind fails.
+#[macro_export]
+macro_rules! implement_tracer_operator {
+    (unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+        impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
+        where
+            C::Operation: ::std::convert::From<$operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                self.unary($operation)
+            }
+        }
+
+        impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
+        where
+            $crate::BatchingContext<C>: $crate::Context<Value = $crate::BatchingTracer<C>>,
+            <$crate::BatchingContext<C> as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                self.context().bind($operation, &[self.clone()]).expect($message).remove(0)
+            }
+        }
+
+        impl<C: $crate::Context> $trait for $crate::JvpTracer<C>
+        where
+            $crate::tracing_v2::differentiation::JvpContext<C>: $crate::Context<Value = $crate::JvpTracer<C>>,
+            <$crate::tracing_v2::differentiation::JvpContext<C> as $crate::Domain>::Operation:
+                ::std::convert::From<$operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                self.context().bind($operation, &[self.clone()]).expect($message).remove(0)
+            }
+        }
+    };
+    (binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+        impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
+        where
+            C::Operation: ::std::convert::From<$operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, rhs: Self) -> Self {
+                self.binary(&rhs, $operation)
+            }
+        }
+
+        impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
+        where
+            $crate::BatchingContext<C>: $crate::Context<Value = $crate::BatchingTracer<C>>,
+            <$crate::BatchingContext<C> as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, rhs: Self) -> Self {
+                self.context().bind($operation, &[self.clone(), rhs.clone()]).expect($message).remove(0)
+            }
+        }
+
+        impl<C: $crate::Context> $trait for $crate::JvpTracer<C>
+        where
+            $crate::tracing_v2::differentiation::JvpContext<C>: $crate::Context<Value = $crate::JvpTracer<C>>,
+            <$crate::tracing_v2::differentiation::JvpContext<C> as $crate::Domain>::Operation:
+                ::std::convert::From<$operation>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, rhs: Self) -> Self {
+                self.context().bind($operation, &[self.clone(), rhs.clone()]).expect($message).remove(0)
+            }
+        }
+    };
+}
+
+pub use crate::{check_builders, check_count, check_sharding, check_types, implement_tracer_operator};
