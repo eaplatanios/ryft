@@ -390,7 +390,7 @@ where
         for operand in operands {
             condition_operands.push(materialize(context, operand.tangent().clone())?);
         }
-        let outputs = context.bind(fused_condition, condition_operands.as_slice())?;
+        let outputs = context.bind(fused_condition, &condition_operands)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
 
         // The fused conditional's outputs are the primal outputs followed by the tangent outputs; zip the halves
@@ -551,7 +551,7 @@ where
             check_count!("output", zeros, 1, ProgramError);
             primal_operands.push(zeros.remove(0));
         }
-        let mut while_outputs = context.bind(C::Operation::from(augmented_while), primal_operands.as_slice())?;
+        let mut while_outputs = context.bind(C::Operation::from(augmented_while), &primal_operands)?;
         check_count!("output", while_outputs, state_count + 2 + stack_types.len(), ProgramError);
         let mask_stack = while_outputs.pop().unwrap();
         let residual_stacks = while_outputs.split_off(state_count + 1);
@@ -638,7 +638,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residual_stacks);
         tangent_operands.extend(mask_stacks);
-        let tangent_outputs = context.bind(C::Operation::from(tangent_scan), tangent_operands.as_slice())?;
+        let tangent_outputs = context.bind(C::Operation::from(tangent_scan), &tangent_operands)?;
         check_count!("output", tangent_outputs, state_count, ProgramError);
 
         Ok(primal_outputs
@@ -982,7 +982,7 @@ where
         let mut staged_inputs = Vec::with_capacity(inputs.len());
         staged_inputs.push(predicate_batch.value().clone());
         staged_inputs.extend(operand_inputs.iter().map(|input| input.value().clone()));
-        let outputs = context.parent().bind(batched_condition, staged_inputs.as_slice())?;
+        let outputs = context.parent().bind(batched_condition, &staged_inputs)?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
         outputs
             .into_iter()
@@ -1209,7 +1209,7 @@ where
         if !batch_varying {
             let batched_while =
                 WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
-            let outputs = context.parent().bind(batched_while, state_values.as_slice())?;
+            let outputs = context.parent().bind(batched_while, &state_values)?;
             check_count!("output", outputs, state_count, ProgramError);
             return outputs
                 .into_iter()
@@ -1238,7 +1238,7 @@ where
         check_count!("output", condition_axes, 1, ProgramError);
         let batched_while =
             WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
-        let outputs = context.parent().bind(batched_while, state_values.as_slice())?;
+        let outputs = context.parent().bind(batched_while, &state_values)?;
         check_count!("output", outputs, state_count, ProgramError);
         outputs
             .into_iter()

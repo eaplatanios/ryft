@@ -239,7 +239,7 @@ where
     if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
         let operation = make_operation(None)?;
         let parent_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let outputs = context.parent().bind(operation, parent_inputs.as_slice())?;
+        let outputs = context.parent().bind(operation, &parent_inputs)?;
         return outputs
             .into_iter()
             .map(|tracer| {
@@ -258,7 +258,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let operation = make_operation(Some(axis_size))?;
     let parent_inputs = aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-    let outputs = context.parent().bind(operation, parent_inputs.as_slice())?;
+    let outputs = context.parent().bind(operation, &parent_inputs)?;
     outputs
         .into_iter()
         .map(|tracer| {
@@ -837,7 +837,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         carrier_operands.extend(residuals);
         let carrier = CustomVjpTangentOperation::new(self.backward.clone(), residual_count, false);
-        let output_tangents = context.bind(carrier, carrier_operands.as_slice())?;
+        let output_tangents = context.bind(carrier, &carrier_operands)?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -1283,7 +1283,7 @@ where
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
         // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, input_values.as_slice())?;
+        let outputs = context.bind(operation, &input_values)?;
         let output_structure = output_types.0.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -1418,7 +1418,7 @@ where
         )?);
         // Bind through whatever context the inputs flow, so `custom_vjp` composes under `vmap`/`jvp`.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, input_values.as_slice())?;
+        let outputs = context.bind(operation, &input_values)?;
         let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }

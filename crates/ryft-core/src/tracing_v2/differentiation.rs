@@ -772,7 +772,7 @@ where
         let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
             let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             self.context
-                .bind(operation, primal_inputs.as_slice())?
+                .bind(operation, &primal_inputs)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect()
@@ -897,7 +897,7 @@ where
 {
     let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
     Ok(context
-        .bind(operation, primal_inputs.as_slice())?
+        .bind(operation, &primal_inputs)?
         .into_iter()
         .map(DifferentiationDual::new_with_zero_tangent)
         .collect())

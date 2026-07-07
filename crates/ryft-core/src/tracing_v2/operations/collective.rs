@@ -363,7 +363,7 @@ where
     C: Context<Type = ArrayType>,
 {
     let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
-    let parent_outputs = context.parent().bind(parent_operation, parent_input_values.as_slice())?;
+    let parent_outputs = context.parent().bind(parent_operation, &parent_input_values)?;
     check_count!("output", parent_outputs, inputs.len(), ProgramError);
     parent_outputs
         .into_iter()

@@ -94,7 +94,7 @@ where
         for input in &inputs[carry_count..] {
             operands.push(materialize(context, input.tangent().clone())?);
         }
-        let outputs = context.bind(C::Operation::from(fused_scan), operands.as_slice())?;
+        let outputs = context.bind(C::Operation::from(fused_scan), &operands)?;
         check_count!("output", outputs, 2 * body_output_count, ProgramError);
 
         // The fused scan's outputs are `[primal_final_carries..., tangent_final_carries..., primal_stacked...,

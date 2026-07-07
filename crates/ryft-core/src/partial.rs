@@ -620,12 +620,7 @@ impl<C: Context> PartialEvaluator<C> {
         let operation = operation.into();
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
-            Ok(self
-                .context
-                .bind(operation, known.as_slice())?
-                .into_iter()
-                .map(PartialEvaluationValue::known)
-                .collect())
+            Ok(self.context.bind(operation, &known)?.into_iter().map(PartialEvaluationValue::known).collect())
         } else {
             self.residualize(operation, inputs)
         }

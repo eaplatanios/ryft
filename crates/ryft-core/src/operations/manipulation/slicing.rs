@@ -792,10 +792,7 @@ where
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
         inputs.push(self.clone());
         inputs.extend(start_indices.iter().cloned());
-        Ok(self
-            .dispatch_domain()
-            .bind(DynamicSliceOperation::new(sizes.to_vec()), inputs.as_slice())?
-            .remove(0))
+        Ok(self.dispatch_domain().bind(DynamicSliceOperation::new(sizes.to_vec()), &inputs)?.remove(0))
     }
 }
 
@@ -983,7 +980,7 @@ where
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend(start_indices.iter().cloned());
-        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, inputs.as_slice())?;
+        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
