@@ -1,5 +1,5 @@
 error: operation enum variants must be tuple variants with one payload field
-  --> tests/operations/error_bad_variant.rs:16:5
+  --> tests/operations/error_bad_variant.rs:18:5
    |
-16 |     Add,
+18 |     Add,
    |     ^^^

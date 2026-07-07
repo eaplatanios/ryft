@@ -10,12 +10,13 @@ use ryft_mlir::dialects::shardy::{
 };
 use thiserror::Error;
 
-use ryft_core::contexts::{Domain, StagingContext};
+use ryft_core::axes::NamedAxis;
+use ryft_core::contexts::StagingContext;
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use ryft_core::programs::{Atom, AtomId, Instruction, ProgramError};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use ryft_core::tracing::Tracer;
+use ryft_core::tracing::{DomainTracingContext, Tracer};
 use ryft_core::types::{ArrayType, Shape, Size, Typed};
 
 use crate::experimental::domains::{XlaDomain, XlaTracer};
@@ -217,7 +218,7 @@ pub(crate) type ShardMapTracer = XlaTracer<'static>;
 
 /// Rebuilds an [`XlaProgram`] through [`XlaProgramBuilder`] using the public program-construction API.
 fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
-    atoms: Vec<Atom<ArrayType, XlaConstant>>,
+    atoms: Vec<Atom<XlaConstant>>,
     input_ids: Vec<AtomId>,
     output_ids: Vec<AtomId>,
     instructions: Vec<Instruction<XlaOperation>>,
@@ -452,7 +453,7 @@ where
         ParameterizedFamily<ArrayType> + ParameterizedFamily<XlaConstant> + ParameterizedFamily<ShardMapTracer>,
     Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
 {
-    let (global_output_types, program) = trace_xla_function(function, &global_input_types)?;
+    let (global_output_types, program) = trace_xla_function(function, &global_input_types, Vec::new())?;
     Ok(TracedXlaProgram { global_input_types, global_output_types, program })
 }
 
@@ -466,14 +467,14 @@ fn stage_sharding_control_per_leaf<C, Input>(
 ) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C, C::Meta>, To<Tracer<C, C::Meta>> = Input>,
+    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     fn stage_leaf<C>(
-        input: Tracer<C, C::Meta>,
+        input: Tracer<C>,
         sharding: Sharding,
         make_operation: &impl Fn(Sharding) -> XlaOperation,
-    ) -> Result<Tracer<C, C::Meta>, ShardMapTraceError>
+    ) -> Result<Tracer<C>, ShardMapTraceError>
     where
         C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
     {
@@ -523,7 +524,7 @@ where
 pub fn reshard<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C, C::Meta>, To<Tracer<C, C::Meta>> = Input>,
+    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
@@ -549,7 +550,7 @@ where
 pub fn sharding_constraint<C, Input>(input: Input, shardings: Input::To<Sharding>) -> Result<Input, ShardMapTraceError>
 where
     C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C, C::Meta>, To<Tracer<C, C::Meta>> = Input>,
+    Input: Parameterized<Tracer<C>, To<Tracer<C>> = Input>,
     Input::Family: ParameterizedFamily<Sharding>,
 {
     stage_sharding_control_per_leaf::<C, Input>(input, shardings, |sharding| {
@@ -929,7 +930,8 @@ impl ShardMap {
     {
         let global_input_types = derive_global_input_types(self, &global_input_types)?;
         let local_input_types = derive_local_input_types(self, &global_input_types)?;
-        let (local_output_types, program) = trace_xla_function(function, &local_input_types)?;
+        let (local_output_types, program) =
+            trace_xla_function(function, &local_input_types, shard_map_named_axes(self))?;
         let global_output_types = derive_global_output_types(self, &local_output_types)?;
 
         Ok(TracedShardMap {
@@ -1441,6 +1443,7 @@ fn trace_xla_function<
 >(
     function: F,
     input_types: &Input,
+    named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<(Output, XlaProgram<Input::To<XlaConstant>, ShardMapCapturedOutput<Output>>), ShardMapTraceError>
 where
     Input::Family:
@@ -1455,11 +1458,30 @@ where
             input_types.parameters().cloned().collect::<Vec<_>>(),
         )?;
         {
-            let (output_types, program) = XlaDomain::<'static>::trace(|input| Ok(function(input)), cloned_input_types)?;
+            let (output_types, program) = DomainTracingContext::<XlaDomain<'static>>::trace_with_named_axes(
+                |input| Ok(function(input)),
+                cloned_input_types,
+                named_axes,
+            )?;
             (output_types, program.simplified()?)
         }
     };
     Ok((output_types, program))
+}
+
+/// Returns the named-axis bindings a `shard_map` body trace is seeded with: one [`NamedAxis::Mesh`] binding per
+/// manual mesh axis of `shard_map`, so collectives staged inside the body resolve those axes by name.
+fn shard_map_named_axes(shard_map: &ShardMap) -> Vec<(String, NamedAxis)> {
+    let mesh = shard_map.mesh();
+    shard_map
+        .manual_axes()
+        .iter()
+        .map(|name| {
+            let axis = mesh.axis_index(name).expect("manual axes are validated against the mesh at construction");
+            let size = mesh.axis_size(name).expect("manual axes are validated against the mesh at construction");
+            (name.clone(), NamedAxis::Mesh { axis, size })
+        })
+        .collect()
 }
 
 pub(crate) fn derive_global_output_types<Output: Parameterized<ArrayType>>(
@@ -3309,5 +3331,603 @@ mod tests {
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
             assert_eq!(values, *expected_values_by_device.get(&device_id).unwrap());
         }
+    }
+
+    #[test]
+    fn test_shard_map_psum_lowers_to_all_reduce_and_executes_on_cpu() {
+        use ryft_core::tracing_v2::{Collective, CollectiveKind};
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .expect("failed to create 4-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // `psum` over the manual mesh axis `"x"` resolves against the seeded body trace and lowers to a
+        // `stablehlo.all_reduce` whose replica group spans the four devices along `"x"`, so every shard receives the
+        // elementwise sum of all four local shards.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PSum).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with psum should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %2 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            static_sharded_array_type(DataType::F32, &[8], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 4);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap();
+
+        // Shards are [1, 2], [3, 4], [5, 6], [7, 8], so every device receives [1+3+5+7, 2+4+6+8] = [16, 20].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for output in outputs {
+            output.done.r#await().unwrap();
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, [16.0, 20.0]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_pmean_lowers_to_all_reduce_with_axis_size_division() {
+        use ryft_core::tracing_v2::{Collective, CollectiveKind};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PMean).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with pmean should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %4 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %4 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      %cst = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                      %2 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                      %3 = stablehlo.divide %1, %2 : tensor<2xf32>
+                      sdy.return %3 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_batch_inside_shard_map_forwards_mesh_collective_to_all_reduce() {
+        use ryft_core::Batch;
+        use ryft_core::batching::{BatchAxis, BatchAxisSpecification};
+        use ryft_core::tracing_v2::{Collective, CollectiveKind};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // A named `batch` level inside the shard_map body binds `"b"`, while `psum` names the *mesh* axis `"x"`: the
+        // batching rule forwards the collective through the batch level to the seeded base trace (which binds `"x"`),
+        // so it lands in the body program on the batched physical value and lowers to the same `all_reduce` as a
+        // direct `psum` — resolution composes across binder kinds.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            let context = local_x.context().clone();
+                            let summed: ShardMapTracer = Batch::batch(
+                                &context,
+                                |item| item.collective("x", CollectiveKind::PSum),
+                                local_x,
+                                BatchAxis::new(0),
+                                BatchAxis::new(0),
+                                BatchAxisSpecification::named("b"),
+                            )
+                            .expect("vmap inside shard_map should trace");
+                            summed
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with vmapped psum should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        // The module is identical to the direct-psum module: the batch level forwarded the mesh collective untouched.
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %2 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %1 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_collective_inside_condition_inside_shard_map_lowers_to_all_reduce() {
+        use ryft_core::operations::control_flow::ConditionOperation;
+        use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
+        use ryft_core::tracing_v2::{CollectiveKind, CollectiveOperation};
+        use ryft_core::{Compare, ComparisonDirection};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // The `psum` sits inside a `condition` branch inside the shard_map body, so it lowers through the nested
+        // control-flow path: the threaded collective lowering state resolves the manual mesh axis inside the
+        // `stablehlo.if` region and emits the same `all_reduce` as a body-level `psum` would.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            let local_type = local_x.r#type().into_owned();
+                            let psum_branch = {
+                                let mut builder = XlaProgramBuilder::new();
+                                let input = builder.add_input(local_type.clone());
+                                let output = builder
+                                    .add_instruction(
+                                        CollectiveOperation::new("x".to_string(), CollectiveKind::PSum),
+                                        vec![input],
+                                    )
+                                    .unwrap()[0];
+                                builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+                            };
+                            let identity_branch = {
+                                let mut builder = XlaProgramBuilder::new();
+                                let input = builder.add_input(local_type);
+                                builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+                            };
+                            let condition = ConditionOperation::new(psum_branch, identity_branch).unwrap();
+                            let predicate = local_x
+                                .compare(&local_x, ComparisonDirection::Equal)
+                                .unwrap()
+                                .reduce(&[0], ReductionKind::Any);
+                            let context = local_x.context().clone();
+                            let mut outputs = context
+                                .stage_operation(XlaOperation::Condition(Box::new(condition)), &[predicate, local_x])
+                                .unwrap();
+                            outputs.remove(0)
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with psum inside a condition should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %1 = stablehlo.compare EQ, %arg1, %arg1, FLOAT : (tensor<2xf32>, tensor<2xf32>) -> tensor<2xi1>
+                      %c = stablehlo.constant dense<false> : tensor<i1>
+                      %2 = stablehlo.reduce(%1 init: %c) applies stablehlo.or across dimensions = [0] : (tensor<2xi1>, tensor<i1>) -> tensor<i1>
+                      %3 = "stablehlo.if"(%2) ({
+                        %4 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                        ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                          %5 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                          stablehlo.return %5 : tensor<f32>
+                        }) : (tensor<2xf32>) -> tensor<2xf32>
+                        stablehlo.return %4 : tensor<2xf32>
+                      }, {
+                        stablehlo.return %arg1 : tensor<2xf32>
+                      }) : (tensor<i1>) -> tensor<2xf32>
+                      sdy.return %3 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_two_shard_maps_with_collectives_receive_unique_channel_ids() {
+        use ryft_core::tracing_v2::{Collective, CollectiveKind};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // Two manual regions in one module each emit a channeled `all_reduce`: the module-scoped channel allocator
+        // hands out distinct handles (1 and 2), which XLA requires across a module.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    let first = shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PSum).unwrap(),
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("first shard_map should trace");
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| local_x.collective("x", CollectiveKind::PSum).unwrap(),
+                        first,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("second shard_map should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %2 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    %1 = sdy.manual_computation(%0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<2xf32>) {
+                      %2 = "stablehlo.all_reduce"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 2, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %3 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %3 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      sdy.return %2 : tensor<2xf32>
+                    } : (tensor<8xf32>) -> tensor<8xf32>
+                    return %1 : tensor<8xf32>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_shard_map_axis_index_lowers_to_partition_id_coordinate_and_executes_on_cpu() {
+        use ryft_core::axes::AxisIndex;
+        use ryft_core::operations::manipulation::Broadcast;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .expect("failed to create 4-device CPU client");
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(4)]));
+
+        // `axis_index("x")` gives each device its own coordinate along the manual mesh axis `"x"`, added to the local
+        // shard. The single-axis mesh has unit stride and full-size axis, so the coordinate is just `partition_id`.
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = device_mesh.logical_mesh().clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            // `axis_index` is a scalar per device; broadcast it to the shard shape so the add has
+                            // shape-congruent operands (StableHLO has no implicit broadcasting).
+                            let local_type = local_x.r#type().into_owned();
+                            let index = local_x.context().axis_index("x").unwrap();
+                            let index = index.broadcast(local_type, &[]).unwrap();
+                            local_x + index
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with axis_index should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        let mlir_program = traced.to_mlir_module("main").unwrap();
+        assert_eq!(
+            mlir_program,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=4]>
+                  func.func @main(%arg0: tensor<4xui64>) -> tensor<4xui64> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"} (%arg1: tensor<1xui64>) {
+                      %1 = stablehlo.partition_id : tensor<ui32>
+                      %2 = stablehlo.convert %1 : (tensor<ui32>) -> tensor<ui64>
+                      %3 = stablehlo.broadcast_in_dim %2, dims = [] : (tensor<ui64>) -> tensor<1xui64>
+                      %4 = stablehlo.add %arg1, %3 : tensor<1xui64>
+                      sdy.return %4 : tensor<1xui64>
+                    } : (tensor<4xui64>) -> tensor<4xui64>
+                    return %0 : tensor<4xui64>
+                  }
+                }
+            "#}
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .map(|device| {
+                client
+                    .buffer(
+                        values_to_bytes::<u64>(&[10u64]).as_slice(),
+                        BufferType::U64,
+                        [1u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            static_sharded_array_type(DataType::U64, &[4], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let execute_arguments =
+            Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap();
+
+        // Each device d holds shard [10] and adds its coordinate d, so device d outputs [10 + d].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            output.done.r#await().unwrap();
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [u64; 1] = values_from_bytes::<u64>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, [10 + device_index as u64]);
+        }
+    }
+
+    #[test]
+    fn test_shard_map_axis_index_of_major_mesh_axis_lowers_to_divide_and_remainder() {
+        use ryft_core::axes::AxisIndex;
+        use ryft_core::operations::manipulation::Broadcast;
+
+        // A 2x2 mesh: `axis_index("x")` addresses the major axis (row-major stride 2, size 2), so the device
+        // coordinate is `(partition_id / 2) % 2` — exercising both the divide and the remainder that a single-axis
+        // mesh skips.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::U64, Shape::new(vec![Size::Static(4)]));
+
+        let traced: TracedXlaProgram<ArrayType, ArrayType> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            let local_type = local_x.r#type().into_owned();
+                            let index = local_x.context().axis_index("x").unwrap();
+                            index.broadcast(local_type, &[]).unwrap()
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map with axis_index of the major axis should trace")
+                }
+            },
+            global_input_type,
+        )
+        .unwrap();
+
+        assert_eq!(
+            traced.to_mlir_module("main").unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<4xui64>) -> tensor<4xui64> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x", "y"}]>] out_shardings=[<@mesh, [{"x", "y"}]>] manual_axes={"x", "y"} (%arg1: tensor<1xui64>) {
+                      %1 = stablehlo.partition_id : tensor<ui32>
+                      %2 = stablehlo.convert %1 : (tensor<ui32>) -> tensor<ui64>
+                      %c = stablehlo.constant dense<2> : tensor<ui64>
+                      %3 = stablehlo.divide %2, %c : tensor<ui64>
+                      %c_0 = stablehlo.constant dense<2> : tensor<ui64>
+                      %4 = stablehlo.remainder %3, %c_0 : tensor<ui64>
+                      %5 = stablehlo.broadcast_in_dim %4, dims = [] : (tensor<ui64>) -> tensor<1xui64>
+                      sdy.return %5 : tensor<1xui64>
+                    } : (tensor<4xui64>) -> tensor<4xui64>
+                    return %0 : tensor<4xui64>
+                  }
+                }
+            "#}
+        );
+    }
+
+    #[test]
+    fn test_shard_map_collective_over_unbound_axis_is_rejected_at_trace_time() {
+        use ryft_core::axes::AxisError;
+        use ryft_core::batching::BatchingError;
+        use ryft_core::tracing_v2::{Collective, CollectiveKind};
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
+
+        // The shard_map body binds only the manual mesh axis `"x"`, so a collective naming `"y"` fails fast at
+        // staging time with an unbound-axis error instead of tracing as a silent identity.
+        let result: Result<TracedXlaProgram<ArrayType, ArrayType>, ShardMapTraceError> = trace(
+            {
+                let mesh = mesh.clone();
+                let sharding = sharding.clone();
+                move |x: ShardMapTracer| {
+                    shard_map::<_, _, ArrayType, _>(
+                        |local_x: ShardMapTracer| {
+                            let error = local_x.collective("y", CollectiveKind::PSum).unwrap_err();
+                            assert!(matches!(
+                                error.downcast_custom::<BatchingError>(),
+                                Some(BatchingError::Axis(AxisError::UnboundAxisName { name })) if name == "y",
+                            ));
+                            local_x
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        sharding.clone(),
+                    )
+                    .expect("shard_map should trace after handling the collective error")
+                }
+            },
+            global_input_type,
+        );
+        assert!(result.is_ok());
     }
 }

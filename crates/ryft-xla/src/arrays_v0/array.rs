@@ -17,7 +17,7 @@ impl<'o> Array<'o> {
     /// analogue of JAX's `jax.device_put(arr, sharding, donate=False)`.
     ///
     /// `target` is resolved to a concrete [`DeviceMesh`] and [`Sharding`] via
-    /// [`DevicePutTarget::resolve`]. When the resolved placement matches the array's current
+    /// `DevicePutTarget::resolve`. When the resolved placement matches the array's current
     /// placement, the method returns a cheap clone of `self`. Otherwise it tries three
     /// strategies in order:
     ///

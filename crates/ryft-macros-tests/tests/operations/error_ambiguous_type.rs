@@ -3,10 +3,12 @@ use std::marker::PhantomData;
 struct DataType;
 struct ArrayType;
 
-trait Value<T> {}
+trait Value {
+    type Type;
+}
 
 #[derive(ryft::Operation)]
-enum BadOperation<V: Value<DataType>, W: Value<ArrayType>> {
+enum BadOperation<V: Value<Type = DataType>, W: Value<Type = ArrayType>> {
     Add(AddOperation<V, W>),
 }
 

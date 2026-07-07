@@ -37,7 +37,6 @@ use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
 use ryft_core::partial::{PartialEvaluationValue, PartialEvaluator, PartialValue, PartiallyEvaluatableOperation};
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
-use ryft_core::tracing_v2::batching::batch_program;
 
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::tag::TagOperation;
@@ -467,7 +466,7 @@ fn build_batched_call_program(
     // trace and packages the batched program with its natural (rule-produced) output axes.
     let input_batch_axes = batch_axes.iter().map(|axis| BatchAxis::from(*axis)).collect::<Vec<_>>();
     let (batched_program, output_axes) =
-        batch_program(program, axis_size, input_batch_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
+        program.batched(axis_size, input_batch_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
     let output_axes = output_axes.iter().map(BatchAxis::axis).collect();
     Ok((batched_program.into_simplified()?, output_axes))
 }

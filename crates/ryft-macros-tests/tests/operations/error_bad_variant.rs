@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 struct DataType;
 struct TypeError;
 
-trait Value<T> {}
+trait Value {
+    type Type;
+}
 
 trait Operation<T> {
     fn name(&self) -> &'static str;
@@ -12,7 +14,7 @@ trait Operation<T> {
 }
 
 #[derive(ryft::Operation)]
-enum BadOperation<V: Value<DataType>> {
+enum BadOperation<V: Value<Type = DataType>> {
     Add,
     Marker(PhantomData<V>),
 }

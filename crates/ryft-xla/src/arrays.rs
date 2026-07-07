@@ -401,18 +401,24 @@ impl Display for Array<'_> {
     }
 }
 
-impl Typed<ArrayType> for Array<'_> {
+impl Typed for Array<'_> {
+    type Type = ArrayType;
+
     fn r#type(&self) -> Cow<'_, ArrayType> {
         Cow::Borrowed(&self.r#type)
     }
 }
 
-impl Value<ArrayType> for Array<'_> {
-    type InterpretationContext = EagerContext<ArrayType, Self>;
+impl Value for Array<'_> {
+    type DispatchDomain = EagerContext<Self>;
+    type ExecutionDomain = EagerContext<Self>;
 
-    #[inline]
-    fn interpretation_context(&self) -> Option<Self::InterpretationContext> {
-        Some(EagerContext::new())
+    fn dispatch_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
+    }
+
+    fn execution_domain(&self) -> EagerContext<Self> {
+        EagerContext::new()
     }
 }
 

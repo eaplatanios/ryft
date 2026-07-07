@@ -8,7 +8,6 @@ use ryft_core::tracing_v2::benchmarking::{
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
 use ryft_core::tracing_v2::{DifferentiationContext, Dot};
 
-use crate::experimental::operations::LinearShardMapEvalMode;
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
 use crate::experimental::lowering::to_mlir_module_for_program;
@@ -115,38 +114,9 @@ fn summarize_nested_body(
 fn summarize_xla_program<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
     program: &XlaProgram<Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
-    fn summarize_linear_eval_mode(
-        label: &'static str,
-        eval_mode: &LinearShardMapEvalMode,
-    ) -> Result<Vec<IrNestedRegionSummary>, BenchmarkError> {
-        match eval_mode {
-            LinearShardMapEvalMode::Body(body) => Ok(vec![summarize_nested_body(label, body)?]),
-            LinearShardMapEvalMode::FactorizedTranspose(factorized) => Ok(vec![
-                summarize_nested_body("linear_shard_map.residual_body", factorized.residual_body())?,
-                summarize_nested_body("linear_shard_map.apply_body", factorized.apply_body())?,
-            ]),
-        }
-    }
-
     summarize_program(program, |op| {
         if let XlaOperation::ShardMap(shard_map_op) = op {
             return Ok(vec![summarize_nested_body("shard_map.body", shard_map_op.body())?]);
-        }
-
-        if let XlaOperation::LinearShardMap(shard_map_op) = op {
-            let mut nested_regions = vec![summarize_nested_body("shard_map.body", shard_map_op.body())?];
-            nested_regions.extend(summarize_linear_eval_mode(
-                "linear_shard_map.eval_body",
-                shard_map_op.linear_state().eval_mode(),
-            )?);
-            #[cfg(feature = "benchmarking")]
-            {
-                nested_regions.extend(summarize_linear_eval_mode(
-                    "linear_shard_map.transpose_body",
-                    shard_map_op.linear_state().transpose_mode(),
-                )?);
-            }
-            return Ok(nested_regions);
         }
 
         Ok(Vec::new())

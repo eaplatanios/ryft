@@ -1,4 +1,4 @@
-error: could not infer an operation type because no generic parameter is bounded by 'Value<T>'
+error: could not infer an operation type because no generic parameter is bounded by 'Value<Type = T>'
  --> tests/operations/error_missing_type.rs:4:6
   |
 4 | enum BadOperation {

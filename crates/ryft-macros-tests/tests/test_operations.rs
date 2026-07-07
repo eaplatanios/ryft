@@ -1769,18 +1769,20 @@ trait BatchableProgramOperation<V: Value<Type = ArrayType>>: Operation<ArrayType
     ) -> Result<(Program<V, Self, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>;
 }
 
-/// Stand-in for `ryft_core::batch_program`.
-fn batch_program<V, O>(
-    program: &Program<V, O, Vec<V>, Vec<V>>,
-    _axis_size: usize,
-    input_batch_axes: &[BatchAxis],
-    _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>), BatchingError>
+impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayType>,
     O: Clone + Operation<ArrayType>,
 {
-    Ok((program.clone(), input_batch_axes.to_vec()))
+    /// Stand-in for `ryft_core::Program::batched`.
+    fn batched(
+        &self,
+        _axis_size: usize,
+        input_batch_axes: &[BatchAxis],
+        _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
+        Ok((self.clone(), input_batch_axes.to_vec()))
+    }
 }
 
 /// Stand-in value capability required by one payload's batching rule and by the recursive payload's leaf bounds,
