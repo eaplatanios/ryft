@@ -845,9 +845,8 @@ impl<C: Context<Type = ArrayType>> Typed for BatchingTracer<C> {
 }
 
 /// A batching value flows through the [`BatchingContext`] stamped on it.
-impl<C: Context<Type = ArrayType>> Value for BatchingTracer<C>
-where
-    BatchingContext<C>: Domain<Type = ArrayType, Value = BatchingTracer<C>>,
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>> Value
+    for BatchingTracer<C>
 {
     type DispatchDomain = BatchingContext<C>;
     type ExecutionDomain = BatchingContext<C>;
@@ -864,12 +863,12 @@ where
 }
 
 // TODO(eaplatanios): Review this implementation block.
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
-where
-    V: Value<Type = ArrayType> + 'static,
-    O: Clone + Operation<ArrayType> + 'static,
-    O: BatchableOperation<Tracer<TracingContext<V, O, V>>, BatchingContext<TracingContext<V, O, V>>>,
-    O: From<TransposeOperation> + From<BroadcastOperation>,
+impl<
+    V: Value<Type = ArrayType>,
+    O: BatchableOperation<Tracer<TracingContext<V, O>>, BatchingContext<TracingContext<V, O>>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
+> Program<V, O, Vec<V>, Vec<V>>
 {
     /// Batches this captured program into a standalone program over batch-carrying physical types.
     ///
@@ -877,8 +876,7 @@ where
     /// batching rules use it to batch captured programs *without* concretizing any batch-item values, so that batched
     /// control-flow and custom-derivative structure can be staged back into the enclosing trace. Unlike linearization,
     /// batching does not split value spaces — the batched replay stays in one tracer space — so the packaging is one
-    /// fresh replay: the program is replayed through a [`BatchingContext`] over a fresh [`TracingContext`] trace (with
-    /// the capture parameter pinned to `V`, so bounds written against it match their obligations syntactically),
+    /// fresh replay: the program is replayed through a [`BatchingContext`] over a fresh [`TracingContext`] trace,
     /// lifting every instruction through its [`BatchableOperation`] rule, and the resulting staged program is extracted
     /// together with the requested output-axis policy.
     ///
@@ -903,75 +901,77 @@ where
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<(Self, Vec<BatchAxis>), BatchingError> {
-        let logical_input_types = self.input_types();
-        let input_count = logical_input_types.len();
+        let input_count = self.input_count();
         check_count!("input", input_batch_axes, input_count, ProgramError);
-        let parent: TracingContext<V, O, V> = TracingContext::new();
-        let builder = parent.builder().clone();
+
+        let context = BatchingContext::new(TracingContext::<V, O>::new(), axis_size, None);
+        let builder = context.parent().builder().clone();
+
         // Keep every tracer and context that holds a clone of `builder` inside this scope so that recovering the
-        // builder below is a real ownership check.
+        // builder later on (below) is a real ownership check.
         let (output_atom_ids, output_axes) = {
-            let batching_context = BatchingContext::new(parent, axis_size, None);
-            let mut input_values = Vec::with_capacity(input_count);
-            for (logical_type, axis) in logical_input_types.iter().zip(input_batch_axes.iter()) {
+            let mut inputs = Vec::with_capacity(input_count);
+            for (r#type, axis) in self.input_types().iter().zip(input_batch_axes.iter()) {
                 let physical_type = match axis.axis() {
-                    Some(position) => logical_type.with_inserted_dimension(position, Size::Static(axis_size))?,
-                    None => logical_type.clone(),
+                    Some(position) => r#type.with_inserted_dimension(position, Size::Static(axis_size))?,
+                    None => r#type.clone(),
                 };
                 let atom = builder.borrow_mut().add_input(physical_type.clone());
-                let parent_value = batching_context.parent().tracer(atom, Some(physical_type.clone()));
-                input_values.push(ArrayBatch::new(physical_type, parent_value, *axis)?);
+                let parent_value = context.parent().tracer(atom, Some(physical_type.clone()));
+                inputs.push(ArrayBatch::new(physical_type, parent_value, *axis)?);
             }
-            let output_batches = batching_context.interpret_program(self, input_values)?;
+            let outputs = context.interpret_program(self, inputs)?;
             // Resolve the policy into one alignment target per output: `None` keeps the natural axis, and a mapped target
             // forces the output to carry its batch axis at that position (a replicated `AlignEachTo` entry is a lower
             // bound, not an equality constraint, mirroring JAX's `instantiate`).
             let output_targets: Vec<Option<usize>> = match &output_axes_policy {
-                ProgramBatchingOutputAxesPolicy::Natural => vec![None; output_batches.len()],
+                ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
                 ProgramBatchingOutputAxesPolicy::AlignAllTo(target_axis) => {
-                    vec![Some(*target_axis); output_batches.len()]
+                    vec![Some(*target_axis); outputs.len()]
                 }
                 ProgramBatchingOutputAxesPolicy::AlignEachTo(targets) => {
-                    check_count!("output", output_batches, targets.len(), ProgramError);
+                    check_count!("output", outputs, targets.len(), ProgramError);
                     targets.iter().map(|target| target.axis()).collect()
                 }
             };
-            let mut output_atom_ids = Vec::with_capacity(output_batches.len());
-            let mut output_axes = Vec::with_capacity(output_batches.len());
-            for (output_batch, target) in output_batches.into_iter().zip(output_targets) {
+            let mut output_atom_ids = Vec::with_capacity(outputs.len());
+            let mut output_axes = Vec::with_capacity(outputs.len());
+            for (output, target) in outputs.into_iter().zip(output_targets) {
                 // The batched outputs must belong to this batched trace: a foreign tracer's atom id would silently
                 // alias whichever atom shares its index in this builder, so the boundary rejects it with a
                 // builder-identity check.
-                check_builders!(&builder, output_batch.value().builder())?;
-                let natural_axis = output_batch.batch_axis();
+                check_builders!(&builder, output.value().builder())?;
+                let natural_axis = output.batch_axis();
                 // Untargeted (or already-aligned) output: keep the axis the batching rules produced.
                 let Some(target_axis) = target else {
-                    output_atom_ids.push(output_batch.value().atom_id()?);
+                    output_atom_ids.push(output.value().atom_id()?);
                     output_axes.push(natural_axis);
                     continue;
                 };
                 if natural_axis.axis() == Some(target_axis) {
-                    output_atom_ids.push(output_batch.value().atom_id()?);
+                    output_atom_ids.push(output.value().atom_id()?);
                     output_axes.push(natural_axis);
                     continue;
                 }
                 // Move a mapped output to the target axis, or broadcast a replicated output across the batch, staging the
                 // axis-adjusting operation into the batched program while its outputs are still live tracers.
                 let aligned_batch = match natural_axis.axis() {
-                    Some(_) => output_batch.move_axis(target_axis)?,
-                    None => output_batch.broadcast(target_axis, axis_size)?,
+                    Some(_) => output.move_axis(target_axis)?,
+                    None => output.broadcast(target_axis, axis_size)?,
                 };
                 output_atom_ids.push(aligned_batch.into_value().atom_id()?);
                 output_axes.push(BatchAxis::new(target_axis));
             }
+
             Ok::<_, ProgramError>((output_atom_ids, output_axes))
         }?;
+
         let output_count = output_atom_ids.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let batched_program = builder
+        let program = builder
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
-        Ok((batched_program, output_axes))
+        Ok((program, output_axes))
     }
 }
 

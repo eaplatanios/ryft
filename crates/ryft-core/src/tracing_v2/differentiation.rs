@@ -6,7 +6,7 @@ use std::rc::Rc;
 use thiserror::Error;
 
 use crate::compilation::context::CapturingContext;
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
@@ -515,7 +515,7 @@ pub trait DifferentiationContext: Context {
     {
         let input_structure = primals.parameter_structure();
         let (output, program, residuals) = self.vjp(function, primals)?;
-        Ok((output, Pullback { program, residuals, input_structure, marker: PhantomData }))
+        Ok((output, Pullback { context: self.clone(), program, residuals, input_structure, marker: PhantomData }))
     }
 
     /// Returns the traced scalar output and reverse-mode gradient for `function`.
@@ -682,7 +682,7 @@ impl<C: Context> JvpTracer<C> {
     /// Returns this dual with `context` stamped as its flowing [`JvpContext`]. [`JvpContext::bind`] and
     /// [`JvpContext::lift`] use this to stamp the values they hand back to the user closure.
     #[inline]
-    fn with_context(mut self, context: JvpContext<C>) -> Self {
+    pub(crate) fn with_context(mut self, context: JvpContext<C>) -> Self {
         self.context = Some(context);
         self
     }
@@ -745,26 +745,6 @@ impl<C: Context> Value for JvpTracer<C> {
 // The elementwise/arithmetic/trigonometric and other operation-specific capability implementations for `JvpTracer`
 // are hand-written in each operation's own module (bind-forwarding through the stamped `JvpContext`). The
 // capabilities whose signatures do not fit that shape are implemented by hand below.
-
-/// A dual's Boolean view uses its primal's: [`as_boolean`](BooleanLike::as_boolean) reinterprets the primal with a
-/// structural zero tangent, and [`boolean`](BooleanLike::boolean) decodes the primal — so branching on a dual in a
-/// closure succeeds exactly when the primal is a concrete (eager) value and errors when it is a staged tracer.
-impl<C: Context> BooleanLike for JvpTracer<C>
-where
-    C::Value: BooleanLike,
-{
-    #[inline]
-    fn as_boolean(&self) -> Self {
-        let primal = self.primal.as_boolean();
-        let tangent = MaybeZero::Zero(primal.r#type().into_owned());
-        Self { primal, tangent, context: self.context.clone() }
-    }
-
-    #[inline]
-    fn boolean(&self) -> Result<bool, ProgramError> {
-        self.primal.boolean()
-    }
-}
 
 /// A forward-mode differentiation [`Context`] that interleaves [`DifferentiableOperation`] rules with an inner
 /// [`Context`], without building a program: its values are [`JvpTracer`] duals over the inner context's values, and
@@ -1752,6 +1732,10 @@ where
     C: Domain,
     Input: Parameterized<<C as Domain>::Value>,
 {
+    /// Differentiation context the pullback was built in; [`apply`](Self::apply) replays the pullback program in it,
+    /// mirroring how [`ForwardLinearization`] replays its tangent map.
+    pub(crate) context: C,
+
     /// Pullback program over the primal operation family, mapping `[output_cotangents ++ residuals]` to flat input
     /// cotangents.
     pub(crate) program:
@@ -1772,8 +1756,7 @@ where
 impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>
 where
     C: Context,
-    <C as Domain>::Operation: Clone
-        + InterpretableOperation<<C as Domain>::Value, EagerContext<<C as Domain>::Value, <C as Domain>::Operation>>,
+    <C as Domain>::Operation: Clone + InterpretableOperation<<C as Domain>::Value, C>,
     Input: Parameterized<<C as Domain>::Value>,
     Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     TracedOutput: Parameterized<<C as Domain>::Value>,
@@ -1781,8 +1764,11 @@ where
     /// Pulls the structured output cotangents `cotangents` back to the closure's input cotangents.
     ///
     /// The cotangents are flattened, the linearization-point residuals are appended, the pullback program is
-    /// interpreted at that vector under the domain's eager [`EagerContext`], and the flat
-    /// input cotangents are reshaped against the closure's input structure.
+    /// interpreted at that vector in the differentiation context this pullback was built in — the single replay path
+    /// for both context flavors: an eager domain (a stateless [`EagerContext`](crate::contexts::EagerContext) or a
+    /// backend domain such as a PJRT-client-backed one) interprets the pullback immediately, while a staging domain
+    /// stages it into the enclosing trace — and the flat input cotangents are reshaped against the closure's input
+    /// structure.
     ///
     /// # Parameters
     ///
@@ -1793,8 +1779,7 @@ where
     ) -> Result<Input::To<<C as Domain>::Value>, ProgramError> {
         let mut inputs = cotangents.into_parameters().collect::<Vec<_>>();
         inputs.extend(self.residuals.iter().cloned());
-        let context = EagerContext::<<C as Domain>::Value, <C as Domain>::Operation>::new();
-        let input_cotangents = self.program.interpret_in_context(&context, inputs)?;
+        let input_cotangents = self.program.interpret_in_context(&self.context, inputs)?;
         Ok(Input::To::<<C as Domain>::Value>::from_parameters(self.input_structure.clone(), input_cotangents)?)
     }
 }

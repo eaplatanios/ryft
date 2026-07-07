@@ -347,6 +347,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         &self.atoms
     }
 
+    /// Returns the number of input [`Atom`]s (i.e., arguments) of this [`Program`].
+    #[inline]
+    pub fn input_count(&self) -> usize {
+        self.input_ids.len()
+    }
+
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
     #[inline]
     pub fn input_ids(&self) -> &[AtomId] {
@@ -371,6 +377,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         Input::Family: ParameterizedFamily<Atom<V>>,
     {
         Input::To::<Atom<V>>::from_parameters(self.input_structure.clone(), self.inputs().cloned())
+    }
+
+    /// Returns the number of output [`Atom`]s (i.e., return values) of this [`Program`].
+    #[inline]
+    pub fn output_count(&self) -> usize {
+        self.output_ids.len()
     }
 
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
