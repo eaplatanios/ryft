@@ -13,7 +13,7 @@ pub mod benchmarking;
 /// with tangent coefficients carried as plain operand edges rather than symbolic captures — which is then partially
 /// evaluated into a known primal sub-program and an unknown linear tangent sub-program
 /// ([`Program::linearize`](crate::Program::linearize)), whose tangent half transposes directly in the primal
-/// operation family for reverse mode. The value-level entry points on [`DifferentiationContext`] — `jvp`,
+/// operation family for reverse mode. The value-level entry points on [`Differentiate`] — `jvp`,
 /// `linearize`, `vjp`, `value_and_grad`, `value_and_gradient` — are sugar that traces the closure into a primal
 /// program and then differentiates it on that path, so whether a transform runs eagerly or stages a program is
 /// decided by the context's value type rather than by a mode flag.
@@ -36,7 +36,7 @@ pub(crate) mod test_util;
 pub use crate::operations::tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use crate::tracing::NestedTracer;
-pub use differentiation::{DifferentiationContext, DifferentiationError};
+pub use differentiation::{Differentiate, DifferentiationError};
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,

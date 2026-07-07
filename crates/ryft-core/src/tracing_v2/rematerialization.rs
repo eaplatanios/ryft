@@ -42,7 +42,7 @@ use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
 use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, JvpTracer, replay_via_bind, transpose_tangent_partitioned,
+    DifferentiableOperation, DifferentiationDual, replay_via_bind, transpose_tangent_partitioned,
 };
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
@@ -231,7 +231,7 @@ where
 ///      followed by the input tangents (per [`RematerializeOperation::new`]'s signature validation), so the tail is
 ///      spliced verbatim ahead of the dual tangents and replayed to produce the output tangents. The tangent program
 ///      recomputes any unsaved residuals from the tail internally, so no residual reconstruction is needed here.
-///   3. Each primal output is paired with its staged output tangent into a [`JvpTracer`].
+///   3. Each primal output is paired with its staged output tangent into a [`DifferentiationDual`].
 ///
 /// Because both spliced programs are straight-line primal-enum operations referencing the staged tracers directly,
 /// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
@@ -245,7 +245,11 @@ where
     C::Constant: Clone,
     C::Operation: Clone,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let output_count = self.output_types().len();
         check_count!("input", inputs, self.input_types().len(), ProgramError);
 
@@ -276,7 +280,7 @@ where
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect())
     }
 }
@@ -1462,7 +1466,7 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
-    use crate::tracing_v2::{ArrayOperation, DifferentiationContext};
+    use crate::tracing_v2::{ArrayOperation, Differentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
@@ -2228,7 +2232,7 @@ mod tests {
     #[test]
     fn test_scalar_second_order_through_rematerialization_matches_the_analytic_second_derivative() {
         use crate::operations::scalars::ScalarOperation;
-        use crate::tracing_v2::DifferentiationContext;
+        use crate::tracing_v2::Differentiate;
 
         // The scalar counterpart of the test above, composed through nested transforms: the outer reverse pass
         // differentiates a closure that takes the rematerialized gradient on its nested tracing context.

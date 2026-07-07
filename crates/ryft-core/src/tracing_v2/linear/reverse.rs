@@ -9,14 +9,14 @@ use crate::operations::control_flow::MaybeWhile;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::tracing::TracingContext;
 use crate::tracing_v2::differentiation::DifferentiableOperation;
-use crate::tracing_v2::{DifferentiationContext, DifferentiationError, NestedTracer};
+use crate::tracing_v2::{Differentiate, DifferentiationError, NestedTracer};
 use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
 /// This is the most direct reverse-mode API when the caller needs both the function value and the
 /// gradient at the same primal point. The function must return exactly one rank-0 scalar array
-/// leaf. Use [`DifferentiationContext::vjp`] directly for vector-valued functions that need an explicit output
+/// leaf. Use [`Differentiate::vjp`] directly for vector-valued functions that need an explicit output
 /// cotangent.
 #[allow(private_bounds)]
 pub fn value_and_grad<C, F, Input>(
@@ -230,7 +230,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext};
-    use crate::tracing_v2::{DifferentiationContext, DifferentiationError};
+    use crate::tracing_v2::{Differentiate, DifferentiationError};
     use crate::types::DataType;
 
     use super::*;

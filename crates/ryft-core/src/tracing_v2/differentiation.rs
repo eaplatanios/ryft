@@ -75,7 +75,7 @@ pub enum DifferentiationError {
 /// detected lazily, like everything else about staging: a foreign tracer fails the builder-identity check either
 /// when an operation binds it ([`StagingContext::stage_operation`]) or when it escapes through a trace boundary
 /// (the boundary output checks), with [`ProgramError::MismatchedProgramBuilders`].
-pub trait DifferentiationContext: Context {
+pub trait Differentiate: Context {
     /// Traces `function` into a flat primal [`Program`] over this context's types.
     ///
     /// This is the shared tracing prologue of the program-level entry points that consume a primal program:
@@ -163,11 +163,11 @@ pub trait DifferentiationContext: Context {
     }
 
     /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the
-    /// closure **directly on [`JvpTracer`] duals** — the single forward-mode entry point, and the analogue of
+    /// closure **directly on [`DifferentiationTracer`] duals** — the single forward-mode entry point, and the analogue of
     /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html).
     ///
     /// Like [`batch`](crate::batching::Batch::batch), this is a context-wrapping transform: each input is paired
-    /// with its tangent as a dual over a [`JvpContext`] wrapping this context, and `function` runs directly on those
+    /// with its tangent as a dual over a [`DifferentiationContext`] wrapping this context, and `function` runs directly on those
     /// duals, with each operation the closure performs (`x.sin()`, `x * y`, …) dispatching its
     /// [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`]. Eager-versus-staged behavior is
     /// absorbed entirely by this context:
@@ -183,7 +183,7 @@ pub trait DifferentiationContext: Context {
     /// The closure executes exactly as written: no dead code is trimmed, and observable effects fire as the closure
     /// runs. Structural zero tangents stay symbolic between operations and are materialized through this context's
     /// [`Zero`] capability only at the output boundary. Transforms nest: inside the closure, an inner transform
-    /// invoked on a dual's [`JvpContext`] (a [`DifferentiationContext`] itself) differentiates through the duals,
+    /// invoked on a dual's [`DifferentiationContext`] (a [`Differentiate`] itself) differentiates through the duals,
     /// composing reverse-over-forward and higher-order forward modes.
     fn jvp<F, Input, Output>(
         &self,
@@ -193,16 +193,16 @@ pub trait DifferentiationContext: Context {
     ) -> Result<(Output::To<<Self as Domain>::Value>, Output::To<<Self as Domain>::Value>), ProgramError>
     where
         Self: Zero<<Self as Domain>::Value>,
-        JvpContext<Self>: Context<Value = JvpTracer<Self>>,
+        DifferentiationContext<Self>: Context<Value = DifferentiationTracer<Self>>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self>,
-        F: FnOnce(Input::To<JvpTracer<Self>>) -> Result<Output, ProgramError>,
+        F: FnOnce(Input::To<DifferentiationTracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
-                Family: ParameterizedFamily<JvpTracer<Self>> + ParameterizedFamily<<Self as Domain>::Value>,
+                Family: ParameterizedFamily<DifferentiationTracer<Self>> + ParameterizedFamily<<Self as Domain>::Value>,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
-                JvpTracer<Self>,
+                DifferentiationTracer<Self>,
                 Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<<Self as Domain>::Value>,
             >,
     {
@@ -222,13 +222,15 @@ pub trait DifferentiationContext: Context {
 
         // Wrap each (primal, tangent) as a dual stamped with the forward-mode context so the closure's value sugar
         // dispatches through it, then run the closure directly on those duals.
-        let context = JvpContext::new(self.clone());
+        let context = DifferentiationContext::new(self.clone());
         let input_duals = primals
             .into_parameters()
             .zip(tangents.into_parameters())
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent).with_context(context.clone()))
+            .map(|(primal, tangent)| {
+                DifferentiationTracer::new(DifferentiationDual::new(primal, tangent), context.clone())
+            })
             .collect::<Vec<_>>();
-        let input = Input::To::<JvpTracer<Self>>::from_parameters(primal_structure, input_duals)?;
+        let input = Input::To::<DifferentiationTracer<Self>>::from_parameters(primal_structure, input_duals)?;
         let output = function(input)?;
 
         // Split each output dual into its primal value and its materialized tangent.
@@ -237,7 +239,7 @@ pub trait DifferentiationContext: Context {
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         for dual in output_duals {
-            let JvpTracer { primal, tangent, .. } = dual;
+            let (primal, tangent) = dual.into_dual().into_parts();
             tangent_outputs.push(materialize(self, tangent)?);
             primal_outputs.push(primal);
         }
@@ -521,7 +523,7 @@ pub trait DifferentiationContext: Context {
     /// Returns the traced scalar output and reverse-mode gradient for `function`.
     ///
     /// This is the active-context counterpart of [`crate::tracing_v2::value_and_grad`]. It uses
-    /// [`DifferentiationContext::vjp`] directly, so nested reverse mode composes with any enclosing context that
+    /// [`Differentiate::vjp`] directly, so nested reverse mode composes with any enclosing context that
     /// implements this trait instead of going through a separate tracer dispatch path.
     fn value_and_grad<F, Input>(
         &self,
@@ -608,169 +610,223 @@ pub trait DifferentiationContext: Context {
     }
 }
 
-impl<C: Context> DifferentiationContext for C {}
+impl<C: Context> Differentiate for C {}
 
-/// A dual value: a primal value paired with its symbolic tangent, both flowing through the same [`Context`] `C`.
+/// A context-free dual number: a primal value paired with its symbolic tangent.
+///
+/// This is the data the per-operation [`jvp`](DifferentiableOperation::jvp) rules consume and produce — the
+/// forward-mode analogue of [`ArrayBatch`](crate::batching::ArrayBatch) in batching. It carries no context, so a rule
+/// body constructs its outputs with [`DifferentiationDual::new`] / [`DifferentiationDual::with_zero_tangent`] without
+/// threading a [`DifferentiationContext`]; the context is attached only when [`DifferentiationContext::bind`] wraps the produced duals back
+/// into [`DifferentiationTracer`]s for the user closure.
 ///
 /// Under a staging context both components are tracers in the *one* shared builder, so a tangent coefficient is
-/// produced by ordinary tracer arithmetic on the primal tracer
-/// (for example, `primal.cos()` stages a fresh `Cos` operation) rather than by capturing a residual factor. Both the
-/// primal SSA values and the tangent SSA values of a linearization live in that one [`TracingContext`],
-/// whose [`DispatchDomain::Operation`] is the ordinary primal operation family `O`, so a tangent tracer staged there is an
-/// ordinary primal operation (a `Mul`, `Add`, `Sin`, ...) rather than a linear operation with capture factors — which
-/// is precisely how the front end avoids symbolic capture entirely. Under an eager context (through a
-/// [`JvpContext`]) both components are concrete runtime values instead, and the same rules compute them directly.
-/// The tangent is a [`MaybeZero`]: structural zeros stay symbolic between rules and are materialized only at
-/// boundaries (see [`materialize`]).
-pub struct JvpTracer<C: Context> {
-    /// Primal value of this dual, staged in the staging context `C`.
-    primal: C::Value,
+/// produced by ordinary tracer arithmetic on the primal tracer (for example, `primal.cos()` stages a fresh `Cos`
+/// operation) rather than by capturing a residual factor. Both the primal SSA values and the tangent SSA values of a
+/// linearization live in that one [`TracingContext`], whose [`DispatchDomain::Operation`] is the ordinary primal
+/// operation family `O`, so a tangent tracer staged there is an ordinary primal operation (a `Mul`, `Add`, `Sin`, ...)
+/// rather than a linear operation with capture factors — which is precisely how the front end avoids symbolic capture
+/// entirely. Under an eager context (through a [`DifferentiationContext`]) both components are concrete runtime values instead,
+/// and the same rules compute them directly. The tangent is a [`MaybeZero`]: structural zeros stay symbolic between
+/// rules and are materialized only at boundaries (see [`materialize`]).
+pub struct DifferentiationDual<V: Typed> {
+    /// Primal value of this dual.
+    primal: V,
 
-    /// Tangent of this dual: a tangent value staged in the staging context `C`, or a structural
-    /// [`MaybeZero::Zero`] carrying only the tangent's [`Type`](crate::Type).
-    tangent: MaybeZero<C::Value>,
-
-    /// [`JvpContext`] this dual flows through, stamped by [`JvpContext::bind`] and [`JvpContext::lift`] so that the
-    /// value-capability sugar (`x + y`, `x.sin()`, …) can dispatch each operation through the forward-mode rule. It is
-    /// `None` only for duals a [`jvp`](DifferentiableOperation::jvp) rule constructs internally (via [`JvpTracer::new`])
-    /// before `bind` stamps the context onto the values it hands back to the user closure; rule bodies never call the
-    /// sugar on those intermediates, so the stamp is always present by the time a dual reaches the closure.
-    context: Option<JvpContext<C>>,
+    /// Tangent of this dual: a tangent value, or a structural [`MaybeZero::Zero`] carrying only the tangent's
+    /// [`Type`](crate::Type).
+    tangent: MaybeZero<V>,
 }
 
-impl<C: Context> JvpTracer<C> {
-    /// Creates a dual from its primal staged value and its symbolic tangent. The tangent may be passed either as a
-    /// staged tangent value directly or as a [`MaybeZero`].
+impl<V: Value> DifferentiationDual<V> {
+    /// Creates a dual from its primal value and its symbolic tangent. The tangent may be passed either as a value
+    /// directly or as a [`MaybeZero`].
     ///
     /// Public so backend crates can author [`DifferentiableOperation`] rules for their own operations, pairing
-    /// each staged primal output with its tangent output.
+    /// each primal output with its tangent output.
     #[inline]
-    pub fn new<Tangent: Into<MaybeZero<C::Value>>>(primal: C::Value, tangent: Tangent) -> Self {
-        Self { primal, tangent: tangent.into(), context: None }
+    pub fn new<Tangent: Into<MaybeZero<V>>>(primal: V, tangent: Tangent) -> Self {
+        Self { primal, tangent: tangent.into() }
     }
 
-    /// Creates a dual from its primal staged value and a structural zero tangent typed with the primal's own
-    /// [`Type`].
+    /// Creates a dual from its primal value and a structural zero tangent typed with the primal's own [`Type`].
     #[inline]
-    pub fn with_zero_tangent(primal: C::Value) -> Self {
+    pub fn with_zero_tangent(primal: V) -> Self {
         let tangent = MaybeZero::Zero(primal.r#type().into_owned());
-        Self { primal, tangent, context: None }
+        Self { primal, tangent }
     }
 
-    /// Returns the primal staged value of this dual.
+    /// Returns the primal value of this dual.
     #[inline]
-    pub fn primal(&self) -> &C::Value {
+    pub fn primal(&self) -> &V {
         &self.primal
     }
 
     /// Returns the symbolic tangent of this dual.
     #[inline]
-    pub fn tangent(&self) -> &MaybeZero<C::Value> {
+    pub fn tangent(&self) -> &MaybeZero<V> {
         &self.tangent
     }
 
-    /// Returns the [`JvpContext`] this dual flows through, stamped by [`JvpContext::bind`]/[`JvpContext::lift`]. The
-    /// value-capability sugar dispatches operations through it. This is only ever called on closure-facing duals, which
-    /// are always stamped (see the [`context`](Self::context) field documentation).
+    /// Consumes this dual and returns its primal value and symbolic tangent.
     #[inline]
-    pub(crate) fn context(&self) -> &JvpContext<C> {
-        self.context
-            .as_ref()
-            .expect("a `JvpTracer` reached value-capability sugar without a stamped `JvpContext`")
-    }
-
-    /// Returns this dual with `context` stamped as its flowing [`JvpContext`]. [`JvpContext::bind`] and
-    /// [`JvpContext::lift`] use this to stamp the values they hand back to the user closure.
-    #[inline]
-    pub(crate) fn with_context(mut self, context: JvpContext<C>) -> Self {
-        self.context = Some(context);
-        self
+    pub fn into_parts(self) -> (V, MaybeZero<V>) {
+        (self.primal, self.tangent)
     }
 }
 
-impl<C: Context> Clone for JvpTracer<C> {
+impl<V: Clone + Typed> Clone for DifferentiationDual<V> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { primal: self.primal.clone(), tangent: self.tangent.clone(), context: self.context.clone() }
+        Self { primal: self.primal.clone(), tangent: self.tangent.clone() }
     }
 }
 
-impl<C: Context> Debug for JvpTracer<C> {
+impl<V: Debug + Typed> Debug for DifferentiationDual<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("JvpTracer")
+            .debug_struct("DifferentiationDual")
             .field("primal", &self.primal)
             .field("tangent", &self.tangent)
             .finish()
     }
 }
 
-impl<C: Context> std::fmt::Display for JvpTracer<C> {
+/// A dual value flowing through a forward-mode [`DifferentiationContext`]: a [`DifferentiationDual`] paired with the context it
+/// flows through.
+///
+/// The function being differentiated operates on [`DifferentiationTracer`]s directly, so each operation the closure
+/// performs (`x + y`, `x.sin()`, …) dispatches its [`jvp`](DifferentiableOperation::jvp) rule through
+/// [`Context::bind`] on the stamped [`DifferentiationContext`]. This is forward mode's counterpart of
+/// [`BatchingTracer`](crate::batching::BatchingTracer): the context-free [`DifferentiationDual`] carries the data the
+/// rules operate on, exactly as [`ArrayBatch`](crate::batching::ArrayBatch) does for batching, while this wrapper adds
+/// the flowing context so the value-capability sugar can dispatch.
+pub struct DifferentiationTracer<C: Context> {
+    /// [`DifferentiationContext`] this dual flows through, so that the value-capability sugar (`x + y`, `x.sin()`, …) can
+    /// dispatch each operation through the forward-mode rule.
+    context: DifferentiationContext<C>,
+
+    /// Context-free dual number carrying the primal value and its symbolic tangent.
+    dual: DifferentiationDual<C::Value>,
+}
+
+impl<C: Context> DifferentiationTracer<C> {
+    /// Creates a new [`DifferentiationTracer`] from a context-free dual and the [`DifferentiationContext`] it flows through.
+    #[inline]
+    pub(crate) fn new(dual: DifferentiationDual<C::Value>, context: DifferentiationContext<C>) -> Self {
+        Self { context, dual }
+    }
+
+    /// Returns the [`DifferentiationContext`] this dual flows through. The value-capability sugar dispatches operations through it.
+    #[inline]
+    pub(crate) fn context(&self) -> &DifferentiationContext<C> {
+        &self.context
+    }
+
+    /// Returns the primal value of this dual.
+    #[inline]
+    pub fn primal(&self) -> &C::Value {
+        self.dual.primal()
+    }
+
+    /// Returns the symbolic tangent of this dual.
+    #[inline]
+    pub fn tangent(&self) -> &MaybeZero<C::Value> {
+        self.dual.tangent()
+    }
+
+    /// Returns the context-free [`DifferentiationDual`] this tracer carries.
+    #[inline]
+    pub fn dual(&self) -> &DifferentiationDual<C::Value> {
+        &self.dual
+    }
+
+    /// Consumes this tracer and returns the context-free [`DifferentiationDual`] it carries.
+    #[inline]
+    pub fn into_dual(self) -> DifferentiationDual<C::Value> {
+        self.dual
+    }
+}
+
+impl<C: Context> Clone for DifferentiationTracer<C> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { context: self.context.clone(), dual: self.dual.clone() }
+    }
+}
+
+impl<C: Context> Debug for DifferentiationTracer<C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DifferentiationTracer").field("dual", &self.dual).finish()
+    }
+}
+
+impl<C: Context> std::fmt::Display for DifferentiationTracer<C> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Dual-number notation: the primal plus the tangent-scaled infinitesimal.
-        match &self.tangent {
-            MaybeZero::Zero(_) => write!(formatter, "{} + 0ε", self.primal),
-            MaybeZero::Value(tangent) => write!(formatter, "{} + {}ε", self.primal, tangent),
+        match self.tangent() {
+            MaybeZero::Zero(_) => write!(formatter, "{} + 0ε", self.primal()),
+            MaybeZero::Value(tangent) => write!(formatter, "{} + {}ε", self.primal(), tangent),
         }
     }
 }
 
-impl<C: Context> Typed for JvpTracer<C> {
+impl<C: Context> Typed for DifferentiationTracer<C> {
     type Type = C::Type;
 
     #[inline]
     fn r#type(&self) -> std::borrow::Cow<'_, C::Type> {
-        self.primal.r#type()
+        self.primal().r#type()
     }
 }
 
-impl<C: Context> Parameter for JvpTracer<C> {}
+impl<C: Context> Parameter for DifferentiationTracer<C> {}
 
-/// A JVP dual flows through the [`JvpContext`] stamped on it.
-impl<C: Context> Value for JvpTracer<C> {
-    type DispatchDomain = JvpContext<C>;
-    type ExecutionDomain = JvpContext<C>;
+/// A JVP dual flows through the [`DifferentiationContext`] stamped on it.
+impl<C: Context> Value for DifferentiationTracer<C> {
+    type DispatchDomain = DifferentiationContext<C>;
+    type ExecutionDomain = DifferentiationContext<C>;
 
     #[inline]
-    fn dispatch_domain(&self) -> JvpContext<C> {
+    fn dispatch_domain(&self) -> DifferentiationContext<C> {
         self.context().clone()
     }
 
     #[inline]
-    fn execution_domain(&self) -> JvpContext<C> {
+    fn execution_domain(&self) -> DifferentiationContext<C> {
         self.context().clone()
     }
 }
 
-// The elementwise/arithmetic/trigonometric and other operation-specific capability implementations for `JvpTracer`
-// are hand-written in each operation's own module (bind-forwarding through the stamped `JvpContext`). The
-// capabilities whose signatures do not fit that shape are implemented by hand below.
+// The elementwise/arithmetic/trigonometric and other operation-specific capability implementations for
+// `DifferentiationTracer` are hand-written in each operation's own module (bind-forwarding through the stamped
+// `DifferentiationContext`). The capabilities whose signatures do not fit that shape are implemented by hand below.
 
 /// A forward-mode differentiation [`Context`] that interleaves [`DifferentiableOperation`] rules with an inner
-/// [`Context`], without building a program: its values are [`JvpTracer`] duals over the inner context's values, and
+/// [`Context`], without building a program: its values are [`DifferentiationTracer`] duals over the inner context's values, and
 /// binding an operation dispatches the operation's [`jvp`](DifferentiableOperation::jvp) rule against the inner
 /// context directly. Over an eager inner context this computes primal and tangent values operation by operation
 /// (the analogue of [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) interpreter), while over
 /// a staging inner context the rules stage the primal and tangent operations into the enclosing trace.
 ///
 /// This is forward mode's counterpart of [`BatchingContext`](crate::batching::BatchingContext): a transform context
-/// that wraps the receiver and runs the user's closure directly on transform tracers ([`JvpTracer`] duals here,
+/// that wraps the receiver and runs the user's closure directly on transform tracers ([`DifferentiationTracer`] duals here,
 /// [`BatchingTracer`](crate::batching::BatchingTracer)s there), with eager-versus-staged behavior absorbed entirely
-/// by the wrapped context. It is what makes [`DifferentiationContext::jvp`] the single forward-mode entry point.
+/// by the wrapped context. It is what makes [`Differentiate::jvp`] the single forward-mode entry point.
 ///
 /// Structural zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules: the
 /// [`bind`](Context::bind) fast path skips an operation's rule entirely when every input tangent is a structural
 /// zero, exactly like the program-level replay behind [`Program::linearize`], so no zero values are constructed and no
 /// zero work is performed until a boundary [`materialize`]s one through the inner context's [`Zero`] capability.
 #[derive(Clone)]
-pub struct JvpContext<C: Context> {
+pub struct DifferentiationContext<C: Context> {
     /// Inner context that carries the primal and tangent values and executes (or stages) the operations that the
     /// forward-mode rules bind.
     context: C,
 }
 
-impl<C: Context> JvpContext<C> {
-    /// Creates a new [`JvpContext`] over the provided inner [`Context`].
+impl<C: Context> DifferentiationContext<C> {
+    /// Creates a new [`DifferentiationContext`] over the provided inner [`Context`].
     #[inline]
     pub fn new(context: C) -> Self {
         Self { context }
@@ -783,16 +839,16 @@ impl<C: Context> JvpContext<C> {
     }
 }
 
-impl<C: Context> Domain for JvpContext<C> {
+impl<C: Context> Domain for DifferentiationContext<C> {
     type Type = C::Type;
-    type Value = JvpTracer<C>;
+    type Value = DifferentiationTracer<C>;
     type Constant = C::Constant;
     type Operation = C::Operation;
 }
 
-/// A [`JvpContext`] binds no named axes of its own: axis-name resolution passes through to the inner context, so
+/// A [`DifferentiationContext`] binds no named axes of its own: axis-name resolution passes through to the inner context, so
 /// collectives inside a differentiated closure resolve against the enclosing batching levels and mesh regions.
-impl<C> crate::axes::NamedAxes for JvpContext<C>
+impl<C> crate::axes::NamedAxes for DifferentiationContext<C>
 where
     C: Context + crate::axes::NamedAxes + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
@@ -803,40 +859,44 @@ where
     }
 }
 
-impl<C> Context for JvpContext<C>
+impl<C> Context for DifferentiationContext<C>
 where
     C: Context + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
-    fn lift(&self, constant: C::Constant) -> Result<JvpTracer<C>, ProgramError> {
+    fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
         // Constants are independent of every differentiation input, so their tangents are structural zeros.
-        Ok(JvpTracer::with_zero_tangent(self.context.lift(constant)?).with_context(self.clone()))
+        let dual = DifferentiationDual::with_zero_tangent(self.context.lift(constant)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 
     fn bind<O: Into<C::Operation>>(
         &self,
         operation: O,
-        inputs: &[JvpTracer<C>],
-    ) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        inputs: &[DifferentiationTracer<C>],
+    ) -> Result<Vec<DifferentiationTracer<C>>, ProgramError> {
         let operation = operation.into();
+        // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
+        // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
+        let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
         // All-zero fast path mirroring `build_jvp_program`: when an operation consumes at least one input and every
         // input tangent is a structural zero, the operation's tangent is zero by the chain rule, so the rule is
         // skipped and the primal operation binds directly. Zero-input operations are excluded so their dedicated
         // rules keep handling primal synthesis and tangent typing.
-        let outputs = if !inputs.is_empty() && inputs.iter().all(|dual| dual.tangent().is_zero()) {
-            let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
+            let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             self.context
                 .bind(operation, primal_inputs.as_slice())?
                 .into_iter()
-                .map(JvpTracer::with_zero_tangent)
+                .map(DifferentiationDual::with_zero_tangent)
                 .collect()
         } else {
-            operation.jvp(&self.context, inputs)?
+            operation.jvp(&self.context, input_duals.as_slice())?
         };
         // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
-        // forward-mode context (the `jvp` rules build their outputs context-free via `JvpTracer::new`).
-        Ok(outputs.into_iter().map(|dual| dual.with_context(self.clone())).collect())
+        // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
+        Ok(output_duals.into_iter().map(|dual| DifferentiationTracer::new(dual, self.clone())).collect())
     }
 
     /// A forward-mode context is eager exactly when the inner context carrying its duals' values is (never over a
@@ -849,72 +909,76 @@ where
 
 /// A zero synthesized inside a forward-mode context is independent of every differentiation input, so it is the
 /// inner context's zero paired with a structural zero tangent.
-impl<C> Zero<JvpTracer<C>> for JvpContext<C>
+impl<C> Zero<DifferentiationTracer<C>> for DifferentiationContext<C>
 where
     C: Context + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
-    fn zero(&self, r#type: &C::Type) -> Result<JvpTracer<C>, ProgramError> {
-        Ok(JvpTracer::with_zero_tangent(self.context().zero(r#type)?).with_context(self.clone()))
+    fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().zero(r#type)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 
 /// A one synthesized inside a forward-mode context is independent of every differentiation input, so it is the
 /// inner context's one paired with a structural zero tangent.
-impl<C> One<JvpTracer<C>> for JvpContext<C>
+impl<C> One<DifferentiationTracer<C>> for DifferentiationContext<C>
 where
     C: Context + Zero<C::Value> + One<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
-    fn one(&self, r#type: &C::Type) -> Result<JvpTracer<C>, ProgramError> {
-        Ok(JvpTracer::with_zero_tangent(self.context().one(r#type)?).with_context(self.clone()))
+    fn one(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().one(r#type)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 
 /// A fill synthesized inside a forward-mode context is independent of every differentiation input, so it is the
 /// inner context's fill paired with a structural zero tangent.
-impl<C, S> Fill<S, JvpTracer<C>> for JvpContext<C>
+impl<C, S> Fill<S, DifferentiationTracer<C>> for DifferentiationContext<C>
 where
     C: Context + Zero<C::Value> + Fill<S, C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
-    fn fill(&self, r#type: &C::Type, value: S) -> Result<JvpTracer<C>, ProgramError> {
-        Ok(JvpTracer::with_zero_tangent(self.context().fill(r#type, value)?).with_context(self.clone()))
+    fn fill(&self, r#type: &C::Type, value: S) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().fill(r#type, value)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 
 /// An iota synthesized inside a forward-mode context is independent of every differentiation input, so it is the
 /// inner context's iota paired with a structural zero tangent.
-impl<C> Iota<JvpTracer<C>> for JvpContext<C>
+impl<C> Iota<DifferentiationTracer<C>> for DifferentiationContext<C>
 where
     C: Context + Zero<C::Value> + Iota<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
-    fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<JvpTracer<C>, ProgramError> {
-        Ok(JvpTracer::with_zero_tangent(self.context().iota(r#type, dimension)?).with_context(self.clone()))
+    fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
+        let dual = DifferentiationDual::with_zero_tangent(self.context().iota(r#type, dimension)?);
+        Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
 
 /// A captured constant lifted inside a forward-mode context is independent of every differentiation input, so it is
 /// the inner context's lifted value paired with a structural zero tangent (via [`Context::lift`]).
-impl<C> Constant<JvpTracer<C>, C::Constant> for JvpContext<C>
+impl<C> Constant<DifferentiationTracer<C>, C::Constant> for DifferentiationContext<C>
 where
     C: Context + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
-    fn constant(&self, value: C::Constant) -> Result<JvpTracer<C>, ProgramError> {
+    fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
         self.lift(value)
     }
 }
 
 /// Runtime capture registration inside a forward-mode context delegates to the inner context, so values captured
 /// while differentiating flow into the same capture table as ordinary staging.
-impl<C, Capture> CapturingContext<Capture> for JvpContext<C>
+impl<C, Capture> CapturingContext<Capture> for DifferentiationContext<C>
 where
     C: CapturingContext<Capture> + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
@@ -930,7 +994,7 @@ where
 ///
 /// In a [`DifferentiableOperation`] each primitive operation owns its forward-mode rule, and the `ScalarOperation` /
 /// [`ArrayOperation`](crate::tracing_v2::ArrayOperation) enums forward to the active variant. The rule is keyed by the
-/// ordinary primal operation family `O` rather than by a differentiation context: it consumes [`JvpTracer`] inputs and
+/// ordinary primal operation family `O` rather than by a differentiation context: it consumes [`DifferentiationTracer`] inputs and
 /// stages both the primal result and the tangent operations into the one shared [`TracingContext`] as ordinary
 /// primal operations (a `Mul`, `Add`, `Sin`, ...), so no symbolic capture is ever introduced.
 ///
@@ -951,7 +1015,7 @@ where
 /// flowing through the rules (a staged [`Tracer`] under a staging context, a concrete runtime value under an eager
 /// one), and `C::Operation` the primal operation family. Rules bind the operations they synthesize through
 /// [`Context::bind`], which stages them under a staging context and executes them under an eager context, so one
-/// rule serves program-building replay (behind [`Program::linearize`]) and interleaved forward mode ([`JvpContext`])
+/// rule serves program-building replay (behind [`Program::linearize`]) and interleaved forward mode ([`DifferentiationContext`])
 /// uniformly.
 ///
 /// ## Deriving Differentiable Operation Enums
@@ -1000,7 +1064,11 @@ pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Ty
     ///
     ///   - `context`: Shared context into which both primal and tangent operations are staged.
     ///   - `inputs`: Input duals aligned with this operation's operands.
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError>;
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
 }
 
 /// Replays `operation` on the primal tracers of `inputs` and pairs each primal output with a structural zero
@@ -1019,8 +1087,8 @@ pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Ty
 pub(crate) fn replay_zero_tangent<C, P>(
     context: &C,
     operation: P,
-    inputs: &[JvpTracer<C>],
-) -> Result<Vec<JvpTracer<C>>, ProgramError>
+    inputs: &[DifferentiationDual<C::Value>],
+) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>
 where
     C: Context,
     P: Into<C::Operation>,
@@ -1029,7 +1097,7 @@ where
     Ok(context
         .bind(operation, primal_inputs.as_slice())?
         .into_iter()
-        .map(JvpTracer::with_zero_tangent)
+        .map(DifferentiationDual::with_zero_tangent)
         .collect())
 }
 
@@ -1144,7 +1212,7 @@ where
                     let primal =
                         primals[input_atom.index()].clone().ok_or(ProgramError::UnboundAtomId { id: input_atom })?;
                     let tangent = recorded_tangent(&primals, &tangents, input_atom)?;
-                    Ok(JvpTracer::<TracingContext<V, O>>::new(primal, tangent))
+                    Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
 
@@ -1158,7 +1226,7 @@ where
                 context
                     .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
                     .into_iter()
-                    .map(JvpTracer::<TracingContext<V, O>>::with_zero_tangent)
+                    .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::with_zero_tangent)
                     .collect()
             } else {
                 instruction.operation().jvp(&context, input_duals.as_slice())?
@@ -1166,8 +1234,9 @@ where
 
             check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
             for (output_atom, dual) in instruction.outputs().iter().copied().zip(output_duals) {
-                primals[output_atom.index()] = Some(dual.primal);
-                tangents[output_atom.index()] = Some(dual.tangent);
+                let (primal, tangent) = dual.into_parts();
+                primals[output_atom.index()] = Some(primal);
+                tangents[output_atom.index()] = Some(tangent);
             }
         }
 
@@ -1621,11 +1690,11 @@ where
     tangent_program.transpose_with_respect_to(with_respect_to.as_slice())
 }
 
-/// A reusable forward-mode linear map produced by [`DifferentiationContext::linearize`], the JAX `linearize` analogue:
+/// A reusable forward-mode linear map produced by [`Differentiate::linearize`], the JAX `linearize` analogue:
 /// it pairs the primal output with a callable that pushes any tangent at the linearization point through the function's
 /// Jacobian.
 ///
-/// Where [`jvp`](DifferentiationContext::jvp) interprets the fused JVP program once per `(primal, tangent)` pair,
+/// Where [`jvp`](Differentiate::jvp) interprets the fused JVP program once per `(primal, tangent)` pair,
 /// linearization partially evaluates that program against the *known* primals up front — folding the primal computation
 /// and every residual factor to concrete values — and keeps only the residual program over the still-*unknown*
 /// tangents. That residual program is the linear tangent map `f'(x)`: interpreting it at a flat tangent vector yields
@@ -1713,11 +1782,11 @@ where
     }
 }
 
-/// A reusable reverse-mode linear map produced by [`DifferentiationContext::vjp_fn`]: it wraps the pullback program and
-/// linearization-point residuals that [`DifferentiationContext::vjp`] returns behind a callable that maps output
+/// A reusable reverse-mode linear map produced by [`Differentiate::vjp_fn`]: it wraps the pullback program and
+/// linearization-point residuals that [`Differentiate::vjp`] returns behind a callable that maps output
 /// cotangents to input cotangents — the JAX `vjp` analogue.
 ///
-/// The raw [`vjp`](DifferentiationContext::vjp) returns a pullback program plus the residuals it consumes; reconstructing
+/// The raw [`vjp`](Differentiate::vjp) returns a pullback program plus the residuals it consumes; reconstructing
 /// the input cotangents means appending the residuals to the output cotangents, interpreting the pullback, and reshaping
 /// the flat result against the closure's input structure. [`apply`](Self::apply) performs exactly those steps, so callers
 /// hold one callable instead of threading the residuals by hand.
@@ -1791,7 +1860,7 @@ mod tests {
     use crate::scalars::Scalar;
     use crate::tracing_v2::test_util::assert_scalar_close;
 
-    use super::DifferentiationContext;
+    use super::Differentiate;
     use crate::contexts::EagerContext;
 
     #[test]
@@ -1844,8 +1913,8 @@ mod tests {
     #[test]
     fn test_jvp_over_nested_gradient_computes_a_hessian_vector_product() {
         // Forward-over-reverse: pushing a tangent through the gradient of f computes the Hessian-vector product
-        // f''(x)·v without materializing a dense Hessian. The `jvp` closure receives `JvpTracer` duals whose
-        // stamped `JvpContext` is itself a `DifferentiationContext`, so the inner reverse-mode transform nests on
+        // f''(x)·v without materializing a dense Hessian. The `jvp` closure receives `DifferentiationTracer` duals whose
+        // stamped `DifferentiationContext` is itself a `Differentiate`, so the inner reverse-mode transform nests on
         // it and differentiates through the duals. For f(x) = sin(x²) at x = 0.7 with v = 2, the primal is f'(0.7)
         // and the tangent is 2·f''(0.7).
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();

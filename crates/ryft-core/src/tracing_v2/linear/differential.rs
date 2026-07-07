@@ -5,8 +5,9 @@ use ryft_macros::Parameter;
 
 use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
@@ -19,10 +20,10 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, NestedTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, Linearization};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, Linearization, replay_via_bind};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
-use crate::tracing_v2::{DifferentiationContext, DifferentiationError, NestedTracer};
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::tracing_v2::{Differentiate, DifferentiationError, NestedTracer};
+use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
 ///
@@ -84,7 +85,7 @@ type CoordinateScalar<V> = <V as CoordinateValue>::Coordinate;
 
 /// Dense derivative materialization helpers for differentiable array domains.
 ///
-/// This extension trait keeps the core [`DifferentiationContext`] contract focused on primitive
+/// This extension trait keeps the core [`Differentiate`] contract focused on primitive
 /// linearization and AD transforms while providing structured Jacobian and Hessian materialization
 /// for domains whose values expose finite coordinate bases.
 pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
@@ -101,7 +102,6 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         primal: Input,
     ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>, ProgramError>
     where
-        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>>,
         DomainValue<Self>: CoordinateValue + BooleanLike + 'domain,
         Input: Parameterized<
                 DomainValue<Self>,
@@ -136,22 +136,16 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         >,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         <Self as Domain>::Operation: Clone
-            + InterpretableOperation<
-                DomainValue<Self>,
-                EagerContext<DomainValue<Self>, <Self as Domain>::Operation>,
-            >
-            + MaybeWhile<DomainValue<Self>, <Self as Domain>::Operation>
+            + InterpretableOperation<DomainValue<Self>, Self>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<ArrayType>>
             + DifferentiableOperation<
-                TracingContext<DomainValue<Self>, <Self as Domain>::Operation>,
+                TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>,
             >
             + PartiallyEvaluatableOperation<
-                TracingContext<DomainValue<Self>, <Self as Domain>::Operation>,
+                TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>,
             >
-            + BatchableOperation<
-                DomainValue<Self>,
-                EagerContext<DomainValue<Self>, <Self as Domain>::Operation>,
-            >,
+            + BatchableOperation<DomainValue<Self>, BatchingContext<Self>>,
     {
         let input_structure = primal.parameter_structure();
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
@@ -159,7 +153,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
 
         // Forward-mode Jacobian over the capture-free front end: trace the function into a primal program and
         // (for eager domains) unroll any concretizable `while` loop at the primal point before fusing, mirroring
-        // `DifferentiationContext::jvp`. `Program::linearize` then splits the JVP program into the primal sub-program
+        // `Differentiate::jvp`. `Program::linearize` then splits the JVP program into the primal sub-program
         // (primal outputs followed by residuals) and the linear tangent sub-program. `from_linearization` replays
         // every input-coordinate basis tangent through the tangent sub-program in one batched pass — broadcasting the
         // primal-derived residuals as replicated values — preserving the exact Jacobian layout.
@@ -170,9 +164,10 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
 
         // Recover the structured primal output by replaying the primal sub-program at the primals and dropping its
         // trailing residuals, leaving the leading primal outputs which `from_linearization` consumes for output
-        // shapes and structure.
-        let value_context = EagerContext::<DomainValue<Self>, <Self as Domain>::Operation>::new();
-        let mut primal_side = linearization.primal_program.interpret_in_context(&value_context, input_values)?;
+        // shapes and structure. The replay goes through this context itself — lifting the sub-program's staged
+        // constants into value space and binding each instruction — so an eager backend domain executes it with its
+        // own value semantics rather than through a fresh constant-only `EagerContext`.
+        let mut primal_side = replay_via_bind(self, &linearization.primal_program, input_values)?;
         let primal_output_count = primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "primal program produced {} outputs which is fewer than its {} residuals",
@@ -184,6 +179,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         let output = TracedOutput::To::<DomainValue<Self>>::from_parameters(output_structure, primal_side)?;
 
         Differential::from_linearization::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
+            self,
             input_structure,
             input_parameters,
             output,
@@ -202,7 +198,6 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         primals: Input,
     ) -> Result<Hessian<Input, DomainValue<Self>>, DifferentiationError>
     where
-        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>> + 'static,
         DomainValue<Self>: CoordinateValue + 'domain,
         Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<DomainTracingContext<Self>>>>
@@ -219,6 +214,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
                 Tracer<DomainTracingContext<Self>>,
                 To<Tracer<DomainTracingContext<Self>>> = Input::To<Tracer<DomainTracingContext<Self>>>,
                 To<DomainValue<Self>> = Input,
+                To<<Self as Domain>::Constant> = Input::To<<Self as Domain>::Constant>,
                 To<Tracer<NestedTracingContext<DomainTracingContext<Self>>>> = Input::To<
                     Tracer<NestedTracingContext<DomainTracingContext<Self>>>,
                 >,
@@ -228,19 +224,18 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             Input::To<Tracer<NestedTracingContext<DomainTracingContext<Self>>>>,
         ) -> Tracer<NestedTracingContext<DomainTracingContext<Self>>>,
         <Self as Domain>::Operation: Clone
-            + InterpretableOperation<DomainValue<Self>, EagerContext<DomainValue<Self>, <Self as Domain>::Operation>>
+            + InterpretableOperation<DomainValue<Self>, Self>
             + InterpretableOperation<Tracer<DomainTracingContext<Self>>, DomainTracingContext<Self>>
             + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
             + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
-            + BatchableOperation<DomainValue<Self>, EagerContext<DomainValue<Self>, <Self as Domain>::Operation>>
+            + BatchableOperation<DomainValue<Self>, BatchingContext<Self>>
             + From<FillOperation<ArrayType, f64>>
             + From<ZeroOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
             + From<ZeroLikeOperation>
-            + From<AddOperation>
-            + 'static,
+            + From<AddOperation>,
         <Self as Domain>::Constant: Value<Type = ArrayType>,
         Tracer<DomainTracingContext<Self>>: BooleanLike,
     {
@@ -264,12 +259,12 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error to flow it through the trace. A non-scalar gradient
                 // output cannot occur here for well-formed second-order use (the differentiated function is scalar).
-                crate::tracing_v2::DifferentiationContext::value_and_gradient(&context, function, input).map_err(
-                    |error| match error {
+                crate::tracing_v2::Differentiate::value_and_gradient(&context, function, input).map_err(|error| {
+                    match error {
                         DifferentiationError::Program(error) => error,
                         error => ProgramError::MalformedProgram(error.to_string()),
-                    },
-                )
+                    }
+                })
             },
             primals,
         )?;
@@ -278,6 +273,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // shapes and structure `from_linearization` needs; its primal replay recovers the residuals internally.
         let linearization = gradient_program.linearize().map_err(DifferentiationError::from)?;
         Differential::from_linearization::<Self, Input, Input, DomainValue<Self>>(
+            self,
             input_structure,
             input_parameters,
             gradient,
@@ -554,15 +550,18 @@ where
     /// `primal_program` taking the primal inputs and producing `[primal_outputs..., residuals...]`, and an unknown
     /// `tangent_program` taking `[tangents..., residuals...]` and producing the tangent outputs. This helper:
     ///
-    ///   1. Replays `primal_program` once at the concrete primal `input_parameters` through the value type's default
-    ///      interpretation context, and splits its outputs at
-    ///      [`residual_count`](Linearization::residual_count) into the primal outputs and the concrete residuals.
+    ///   1. Replays `primal_program` once at the concrete primal `input_parameters` through `context` itself —
+    ///      lifting the sub-program's staged constants with [`Context::lift`](crate::Context::lift) and binding each
+    ///      instruction — and splits its outputs at [`residual_count`](Linearization::residual_count) into the primal
+    ///      outputs and the concrete residuals.
     ///   2. Batch-replays `tangent_program` across the stacked input-coordinate basis tangents (all basis items on
     ///      axis 0, exactly as `from_pushforward` stacks them), appending the residuals as replicated
     ///      [`ArrayBatch::replicated`] operands after the batched basis tangents — the same replicated mechanism
-    ///      `from_pushforward` uses for closed constants and [`jacrev`] uses for its reverse-mode residuals. Because
-    ///      the tangent sub-program is expressed in the primal operation family, each instruction is lifted through its
-    ///      primal-family [`BatchableOperation`] rule by [`batch_linear_program_instruction`].
+    ///      `from_pushforward` uses for closed constants and [`jacrev`] uses for its reverse-mode residuals. Staged
+    ///      constants are lifted through `context` and broadcast as replicated operands the same way. Because the
+    ///      tangent sub-program is expressed in the primal operation family, each instruction is lifted through its
+    ///      primal-family [`BatchableOperation`] rule by [`batch_linear_program_instruction`], interpreting nullary
+    ///      instructions through `context`.
     ///   3. Assembles the per-(output-leaf, input-leaf) [`DifferentialBlock`]s from the resulting per-output coordinate
     ///      columns exactly as [`Self::from_pushforward`] does.
     ///
@@ -572,6 +571,8 @@ where
     ///
     /// # Parameters
     ///
+    ///   - `context`: Context whose [`lift`](crate::Context::lift) and [`bind`](crate::Context::bind) replay the
+    ///     primal sub-program and supply the value semantics for the batched tangent replay.
     ///   - `input_structure`: Placeholder shape of the function's `Input` argument.
     ///   - `input_parameters`: Concrete leaf values of `Input` at the point of linearization, used both to derive each
     ///     input leaf's static shape and to replay the primal sub-program.
@@ -579,10 +580,11 @@ where
     ///     shapes of its output leaves.
     ///   - `linearization`: Capture-free linearization whose primal and tangent sub-programs are replayed.
     pub(crate) fn from_linearization<C, Input, Output, V>(
+        context: &C,
         input_structure: Input::ParameterStructure,
         input_parameters: Vec<V>,
         output: Output,
-        linearization: Linearization<V, <C as Domain>::Operation>,
+        linearization: Linearization<<C as Domain>::Constant, <C as Domain>::Operation>,
     ) -> Result<Self, ProgramError>
     where
         S: Clone,
@@ -596,13 +598,10 @@ where
         Output::Family: ParameterizedFamily<DifferentialRow<Partials, S>>,
         Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-        <C as Domain>::Operation: Clone
-            + InterpretableOperation<V, EagerContext<V, <C as Domain>::Operation>>
-            + BatchableOperation<V, EagerContext<V, <C as Domain>::Operation>>,
+        <C as Domain>::Operation: Clone + InterpretableOperation<V, C> + BatchableOperation<V, BatchingContext<C>>,
     {
         let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
         let batch_size: usize = input_coordinate_counts.iter().sum();
-        let value_context = EagerContext::<V, <C as Domain>::Operation>::new();
         let batched_basis_parameters = batched_standard_basis::<V>(input_parameters.as_slice(), batch_size)?;
 
         let output_structure = output.parameter_structure();
@@ -611,8 +610,7 @@ where
         // Replay the primal sub-program once at the concrete primals to recover `[primal_outputs..., residuals...]`,
         // then split off the residual tail. The residuals depend only on the primal point and so are identical across
         // every basis item.
-        let mut primal_side =
-            linearization.primal_program.interpret_in_context(&value_context, input_parameters.clone())?;
+        let mut primal_side = replay_via_bind(context, &linearization.primal_program, input_parameters.clone())?;
         let residuals =
             primal_side.split_off(primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
@@ -627,13 +625,16 @@ where
         } else {
             // Feed the tangent sub-program `[batched_basis_tangents..., unbatched_residuals...]`: the basis tangents
             // carry one item per input coordinate on axis 0, and the residuals are broadcast as replicated values.
+            // Each instruction lifts through its batching dispatcher at an anonymous one-level `BatchingContext` over
+            // this context, so primitive work executes through the context itself.
+            let batching_context = BatchingContext::new(context.clone(), batch_size, None);
             let mut tangent_inputs = batched_basis_parameters;
             tangent_inputs.extend(residuals.into_iter().map(ArrayBatch::replicated));
             let batched_output = linearization.tangent_program.interpret_with(
                 tangent_inputs,
-                |_, constant: &V| Ok::<_, BatchingError>(ArrayBatch::replicated(constant.clone())),
+                |_, constant| Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?)),
                 |instruction, inputs: &[ArrayBatch<V>]| {
-                    batch_linear_program_instruction(instruction.operation(), inputs)
+                    batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
                 },
             )?;
             unstack_batched_coordinates::<V>(batched_output, output_parameters.as_slice(), batch_size)?
@@ -769,11 +770,11 @@ fn batched_standard_basis<V: CoordinateValue>(
                 standard_basis_leaf_item_values(parameter, offsets[leaf_index], counts[leaf_index], batch_size);
             let stacked = V::stack(item_values)?;
 
-            let mut batched_dimensions = Vec::with_capacity(leaf_type.shape().dimensions().len() + 1);
-            batched_dimensions.push(Size::Static(batch_size));
-            batched_dimensions.extend(leaf_type.shape().dimensions().iter().copied());
-            let batched_type = ArrayType::new(leaf_type.data_type(), Shape::new(batched_dimensions))
-                .with_layout(leaf_type.layout().cloned());
+            // Insert the batch axis through the type itself so the batched basis keeps the leaf's optional metadata:
+            // in particular, a sharded leaf yields a batched basis carrying the same per-dimension sharding with a
+            // replicated inserted batch axis, matching the sharded declared input types of the replayed tangent
+            // program. Rank-changing insertion clears any explicit layout, per `with_inserted_dimension`'s contract.
+            let batched_type = leaf_type.with_inserted_dimension(0, Size::Static(batch_size))?;
 
             ArrayBatch::new(batched_type, stacked, Some(0))
         })
@@ -789,28 +790,32 @@ fn batched_standard_basis<V: CoordinateValue>(
 /// region) are replicated by construction: every batch item receives the same value and there is no input batch
 /// axis to lift through. Their batching rules reject a direct [`BatchableOperation::batch`] call for exactly this
 /// reason and expect the surrounding staging path to handle them, so this helper interprets such operations once over
-/// the per-item value type and surfaces each result as a replicated [`ArrayBatch`] — mirroring how
-/// [`BatchingContext`](crate::batching::BatchingContext) stages a zero-input operation with an empty
-/// input list. Operations with at least one input dispatch through their batching rule as usual.
-fn batch_linear_program_instruction<O, V>(
-    operation: &O,
+/// the per-item value type through the parent context and surfaces each result as a replicated [`ArrayBatch`] —
+/// mirroring how [`BatchingContext`] stages a zero-input operation with an empty input list. Operations with at least
+/// one input dispatch through their batching rule at the [`BatchingContext`] — the one context every operation
+/// family's batching dispatcher is implemented at — so backend domains whose nullary constructions need runtime state
+/// (for example a PJRT client) participate in the dense-Jacobian replay through the batching context's parent instead
+/// of a fresh constant-only [`EagerContext`](crate::contexts::EagerContext).
+fn batch_linear_program_instruction<C, V>(
+    context: &BatchingContext<C>,
+    operation: &<C as Domain>::Operation,
     inputs: &[ArrayBatch<V>],
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
-    O: BatchableOperation<V, EagerContext<V, O>> + InterpretableOperation<V, EagerContext<V, O>>,
+    C: Context<Type = ArrayType, Value = V>,
     V: Value<Type = ArrayType>,
+    <C as Domain>::Operation: BatchableOperation<V, BatchingContext<C>> + InterpretableOperation<V, C>,
 {
     if inputs.is_empty() {
         // A zero-input operation has no operand batch axis to lift through and is replicated by construction, so
-        // interpret it once under the eager per-item context and surface the result as a replicated value.
+        // interpret it once over the per-item value type and surface the result as a replicated value.
         return operation
-            .interpret(&EagerContext::<V, O>::new(), &[])?
+            .interpret(context.parent(), &[])?
             .into_iter()
             .map(|value| Ok(ArrayBatch::replicated(value)))
             .collect();
     }
-    let context = EagerContext::<V, O>::new();
-    BatchableOperation::<V, EagerContext<V, O>>::batch(operation, &context, inputs)
+    BatchableOperation::<V, BatchingContext<C>>::batch(operation, context, inputs)
 }
 
 /// Extracts per-item flat output coordinates from a structured batched program output.
@@ -889,8 +894,8 @@ where
         >,
     F: FnOnce(Input::To<NestedTracer<C>>) -> Result<TracedOutput, ProgramError>,
     <C as Domain>::Operation: Clone
-        + InterpretableOperation<DomainValue<C>, EagerContext<DomainValue<C>, <C as Domain>::Operation>>
-        + BatchableOperation<DomainValue<C>, EagerContext<DomainValue<C>, <C as Domain>::Operation>>
+        + InterpretableOperation<DomainValue<C>, C>
+        + BatchableOperation<DomainValue<C>, BatchingContext<C>>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
         + From<ZeroOperation<ArrayType>>
@@ -899,7 +904,7 @@ where
         + PartiallyEvaluatableOperation<
             TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>,
         >,
-    EagerContext<<C as Domain>::Value, <C as Domain>::Operation>: Zero<<C as Domain>::Value>,
+    C: Zero<<C as Domain>::Value>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -909,10 +914,9 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let input_offsets = coordinate_offsets(&input_coordinate_counts);
-    let tangent_context = EagerContext::<<C as Domain>::Value, <C as Domain>::Operation>::new();
     let tangent_input_parameters = input_parameters
         .iter()
-        .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
+        .map(|parameter| context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
@@ -928,7 +932,7 @@ where
     let batch_size: usize = output_coordinate_counts.iter().sum();
     let cotangent_parameters = output_parameters
         .iter()
-        .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
+        .map(|parameter| context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut batched_basis_parameters =
         batched_standard_basis::<<C as Domain>::Value>(cotangent_parameters.as_slice(), batch_size)?;
@@ -940,11 +944,14 @@ where
     let rows = if batch_size == 0 {
         Vec::new()
     } else {
+        // Each pullback instruction lifts through its batching dispatcher at an anonymous one-level
+        // `BatchingContext` over the caller's context, so primitive work executes through that context itself.
+        let batching_context = BatchingContext::new(context.clone(), batch_size, None);
         let batched_input = pullback.interpret_with(
             batched_basis_parameters,
             |_, constant: &<C as Domain>::Value| Ok::<_, BatchingError>(ArrayBatch::replicated(constant.clone())),
             |instruction, inputs: &[ArrayBatch<<C as Domain>::Value>]| {
-                batch_linear_program_instruction(instruction.operation(), inputs)
+                batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
             },
         )?;
         unstack_batched_coordinates::<<C as Domain>::Value>(

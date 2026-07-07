@@ -8,7 +8,7 @@ use crate::scalars::Scalar;
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{DifferentiationContext, DifferentiationError};
+use crate::tracing_v2::{Differentiate, DifferentiationError};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
