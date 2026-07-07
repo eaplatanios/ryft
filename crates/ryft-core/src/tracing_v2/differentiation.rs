@@ -577,83 +577,51 @@ pub trait Differentiate: Context {
 
 impl<C: Context> Differentiate for C {}
 
-/// A context-free dual number: a primal value paired with its symbolic tangent.
-///
-/// This is the data the per-operation [`jvp`](DifferentiableOperation::jvp) rules consume and produce — the
-/// forward-mode analogue of [`ArrayBatch`](crate::batching::ArrayBatch) in batching. It carries no context, so a rule
-/// body constructs its outputs with [`DifferentiationDual::new`] / [`DifferentiationDual::with_zero_tangent`] without
-/// threading a [`DifferentiationContext`]; the context is attached only when [`DifferentiationContext::bind`] wraps the produced duals back
-/// into [`DifferentiationTracer`]s for the user closure.
-///
-/// Under a staging context both components are tracers in the *one* shared builder, so a tangent coefficient is
-/// produced by ordinary tracer arithmetic on the primal tracer (for example, `primal.cos()` stages a fresh `Cos`
-/// operation) rather than by capturing a residual factor. Both the primal SSA values and the tangent SSA values of a
-/// linearization live in that one [`TracingContext`], whose [`DispatchDomain::Operation`] is the ordinary primal
-/// operation family `O`, so a tangent tracer staged there is an ordinary primal operation (a `Mul`, `Add`, `Sin`, ...)
-/// rather than a linear operation with capture factors — which is precisely how the front end avoids symbolic capture
-/// entirely. Under an eager context (through a [`DifferentiationContext`]) both components are concrete runtime values instead,
-/// and the same rules compute them directly. The tangent is a [`MaybeZero`]: structural zeros stay symbolic between
-/// rules and are materialized only at boundaries (see [`materialize`]).
+/// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
+/// context of differentiating a function `f(x)`, the value `y = f(x)` is the primal value and its tangent `ẏ` is
+/// the directional derivative of `f` at `x` along an input tangent (i.e., perturbation direction) `ẋ` (i.e., the
+/// Jacobian-vector product `ẏ = (∂f/∂x)(x) · ẋ`). Forward-mode differentiation propagates a dual `(x, ẋ)` at the
+/// input to the dual `(y, ẏ) = (f(x), (∂f/∂x)(x) · ẋ)` at the output. This is the data that the per-operation
+/// [`jvp`](DifferentiableOperation::jvp) rules consume and produce.
+#[derive(Clone, Debug)]
 pub struct DifferentiationDual<V: Typed> {
     /// Primal value of this dual.
     primal: V,
 
-    /// Tangent of this dual: a tangent value, or a structural [`MaybeZero::Zero`] carrying only the tangent's
-    /// [`Type`](crate::Type).
+    /// Tangent value of this dual. Note that this can be a [`MaybeZero::Zero`] enabling structural zero propagation.
     tangent: MaybeZero<V>,
 }
 
 impl<V: Value> DifferentiationDual<V> {
-    /// Creates a dual from its primal value and its symbolic tangent. The tangent may be passed either as a value
-    /// directly or as a [`MaybeZero`].
-    ///
-    /// Public so backend crates can author [`DifferentiableOperation`] rules for their own operations, pairing
-    /// each primal output with its tangent output.
+    /// Creates a new [`DifferentiationDual`].
     #[inline]
     pub fn new<Tangent: Into<MaybeZero<V>>>(primal: V, tangent: Tangent) -> Self {
         Self { primal, tangent: tangent.into() }
     }
-
-    /// Creates a dual from its primal value and a structural zero tangent typed with the primal's own [`Type`].
+    
+    /// Creates a new [`DifferentiationDual`] with a [`MaybeZero::Zero`] tangent value.
     #[inline]
-    pub fn with_zero_tangent(primal: V) -> Self {
+    pub fn new_with_zero_tangent(primal: V) -> Self {
         let tangent = MaybeZero::Zero(primal.r#type().into_owned());
         Self { primal, tangent }
     }
 
-    /// Returns the primal value of this dual.
+    /// Returns the primal value of this [`DifferentiationDual`].
     #[inline]
     pub fn primal(&self) -> &V {
         &self.primal
     }
 
-    /// Returns the symbolic tangent of this dual.
+    /// Returns the tangent value of this [`DifferentiationDual`].
     #[inline]
     pub fn tangent(&self) -> &MaybeZero<V> {
         &self.tangent
     }
 
-    /// Consumes this dual and returns its primal value and symbolic tangent.
+    /// Consumes this [`DifferentiationDual`] and returns its primal and tangent values.
     #[inline]
     pub fn into_parts(self) -> (V, MaybeZero<V>) {
         (self.primal, self.tangent)
-    }
-}
-
-impl<V: Clone + Typed> Clone for DifferentiationDual<V> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self { primal: self.primal.clone(), tangent: self.tangent.clone() }
-    }
-}
-
-impl<V: Debug + Typed> Debug for DifferentiationDual<V> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DifferentiationDual")
-            .field("primal", &self.primal)
-            .field("tangent", &self.tangent)
-            .finish()
     }
 }
 
@@ -832,7 +800,7 @@ where
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
         // Constants are independent of every differentiation input, so their tangents are structural zeros.
-        let dual = DifferentiationDual::with_zero_tangent(self.context.lift(constant)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.context.lift(constant)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 
@@ -854,7 +822,7 @@ where
             self.context
                 .bind(operation, primal_inputs.as_slice())?
                 .into_iter()
-                .map(DifferentiationDual::with_zero_tangent)
+                .map(DifferentiationDual::new_with_zero_tangent)
                 .collect()
         } else {
             operation.jvp(&self.context, input_duals.as_slice())?
@@ -979,7 +947,7 @@ where
     Ok(context
         .bind(operation, primal_inputs.as_slice())?
         .into_iter()
-        .map(DifferentiationDual::with_zero_tangent)
+        .map(DifferentiationDual::new_with_zero_tangent)
         .collect())
 }
 
@@ -1108,7 +1076,7 @@ where
                 context
                     .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
                     .into_iter()
-                    .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::with_zero_tangent)
+                    .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new_with_zero_tangent)
                     .collect()
             } else {
                 instruction.operation().jvp(&context, input_duals.as_slice())?
