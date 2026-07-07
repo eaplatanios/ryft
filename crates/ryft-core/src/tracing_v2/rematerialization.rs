@@ -40,7 +40,6 @@ use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, JvpTracer, replay_via_bind, transpose_tangent_partitioned,
@@ -1216,7 +1215,7 @@ where
 
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
-    D: DifferentiationContext<Type: PartialEq>,
+    D: Context<Type: PartialEq>,
     B: Fn(IT) -> Result<OT, ProgramError>,
     P: ResidualHandling<D>,
     IT: Parameterized<
@@ -1461,9 +1460,9 @@ mod tests {
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::scalars::Scalar;
     use crate::tests::TestArray;
-    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
+    use crate::tracing_v2::{ArrayOperation, DifferentiationContext};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;

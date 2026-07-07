@@ -1,8 +1,7 @@
-use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
-use crate::contexts::{Context, Domain, EagerContext};
+use crate::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
+use crate::contexts::{Context, EagerContext};
 use crate::operations::Operation;
-use crate::programs::{Program, ProgramError, Value};
-use crate::tracing_v2::differentiation::DifferentiationContext;
+use crate::programs::{Program, Value};
 use crate::types::ArrayType;
 
 // TODO(eaplatanios): Review this module.
@@ -48,16 +47,4 @@ where
         |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
         |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
     )
-}
-
-impl<C> DifferentiationContext for BatchingContext<C>
-where
-    C: Context<Type = ArrayType> + DifferentiationContext,
-    C::Operation: BatchableOperation<<C as Domain>::Value, Self>,
-{
-    /// A batched primal is valid exactly when the parent context accepts the value it packs.
-    #[inline]
-    fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
-        self.parent().validate_primal(primal.batch().value())
-    }
 }

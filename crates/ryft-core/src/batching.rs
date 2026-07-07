@@ -11,7 +11,7 @@ use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
-use crate::macros::check_count;
+use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
@@ -939,6 +939,10 @@ where
             let mut output_atom_ids = Vec::with_capacity(output_batches.len());
             let mut output_axes = Vec::with_capacity(output_batches.len());
             for (output_batch, target) in output_batches.into_iter().zip(output_targets) {
+                // The batched outputs must belong to this batched trace: a foreign tracer's atom id would silently
+                // alias whichever atom shares its index in this builder, so the boundary rejects it with a
+                // builder-identity check.
+                check_builders!(&builder, output_batch.value().builder())?;
                 let natural_axis = output_batch.batch_axis();
                 // Untargeted (or already-aligned) output: keep the axis the batching rules produced.
                 let Some(target_axis) = target else {

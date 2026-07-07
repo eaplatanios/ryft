@@ -13,7 +13,6 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{Constant, Fill, Iota, One, OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::MaybeWhile;
-use crate::operations::scalars::ScalarOperation;
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
@@ -21,7 +20,6 @@ use crate::partial::{
     PartitionedProgram,
 };
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
-use crate::scalars::Scalar;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::types::{Type, Typed};
@@ -58,36 +56,26 @@ pub enum DifferentiationError {
     Program(#[from] ProgramError),
 }
 
-/// A [`Context`] that additionally supports automatic differentiation, and the single entry point for its
-/// forward- and reverse-mode transforms.
+/// Extension trait carrying the forward- and reverse-mode differentiation transforms on every [`Context`], mirroring
+/// how [`Batch`](crate::batching::Batch) carries batching.
 ///
-/// Implementors supply one differentiation hook: primal validation
-/// ([`validate_primal`](Self::validate_primal)). Tangents and cotangents are ordinary values of the same universe as
-/// the primals — [`Domain::Value`] — flowing through the same context (the descriptor-level tangent structure, such
-/// as cotangent types, lives on [`DifferentiableType`] instead). Predicate-capable operations such as `condition`,
-/// `while`, and `select` impose their own [`BooleanLike`] bounds through their operation-family implementations;
-/// tangent carriers themselves do not need to be Boolean-like just to participate in differentiation. Everything else
-/// an AD pass needs — the primal value/constant/operation types, applying an operation (`bind`), and lifting a
-/// constant (`lift`) — comes from the underlying [`Context`]/[`Domain`]. On top of those hooks the trait provides the
-/// user-facing transforms
-/// [`jvp`](Self::jvp), [`vjp`](Self::vjp), [`value_and_grad`](Self::value_and_grad), and
-/// [`value_and_gradient`](Self::value_and_gradient).
+/// This trait is blanket-implemented for all [`Context`]s and has no items of its own to implement: every entry
+/// point is a defaulted method whose `where` clause carries its actual requirements (the operation family's
+/// [`DifferentiableOperation`] rules, transposability for reverse mode, and so on), so whether a particular
+/// transform is available on a particular context is decided per method at the call site, exactly as with
+/// [`Batch::batch`](crate::batching::Batch::batch). Tangents and cotangents are ordinary values of the same universe
+/// as the primals — [`Domain::Value`] — flowing through the same context (the descriptor-level tangent structure,
+/// such as cotangent types, lives on [`DifferentiableType`] instead). Predicate-capable operations such as
+/// `condition`, `while`, and `select` impose their own [`BooleanLike`] bounds through their operation-family
+/// implementations; tangent carriers themselves do not need to be Boolean-like just to participate in
+/// differentiation.
 ///
-/// Both eager backends (e.g. an `ndarray` domain, whose value is concrete) and staging contexts ([`TracingContext`],
-/// batching contexts) implement it; whether a transform runs eagerly or stages a program is decided by the context's
-/// [`DispatchDomain::Value`] (concrete vs [`Tracer`]), not by a separate trait.
+/// Whether a transform runs eagerly or stages a program is decided by the context's
+/// [`DispatchDomain::Value`] (concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are
+/// detected lazily, like everything else about staging: a foreign tracer fails the builder-identity check either
+/// when an operation binds it ([`StagingContext::stage_operation`]) or when it escapes through a trace boundary
+/// (the boundary output checks), with [`ProgramError::MismatchedProgramBuilders`].
 pub trait DifferentiationContext: Context {
-    /// Validates that `primal` may be used as a primal input to an automatic-differentiation entry point in this
-    /// context. Eager contexts accept any concrete value and use the default no-op. Staging contexts override this
-    /// to verify that the input [`Tracer`] belongs to this context's
-    /// [`ProgramBuilder`](crate::programs::ProgramBuilder), rejecting tracers that escaped a different trace with
-    /// [`ProgramError::MismatchedProgramBuilders`].
-    #[inline]
-    fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
-        let _ = primal;
-        Ok(())
-    }
-
     /// Traces `function` into a flat primal [`Program`] over this context's types.
     ///
     /// This is the shared tracing prologue of the program-level entry points that consume a primal program:
@@ -102,8 +90,7 @@ pub trait DifferentiationContext: Context {
     /// # Parameters
     ///
     ///   - `function`: Closure traced into a primal program.
-    ///   - `primals`: Structured primal input values; their count must be non-zero and each must belong to this
-    ///     context (validated through [`validate_primal`](Self::validate_primal)).
+    ///   - `primals`: Structured primal input values; their count must be non-zero.
     fn trace_into_primal_program<F, Input, TracedOutput>(
         &self,
         function: F,
@@ -135,9 +122,6 @@ pub trait DifferentiationContext: Context {
         if primals.parameters().next().is_none() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
-        for primal in primals.parameters() {
-            self.validate_primal(primal)?;
-        }
         let input_structure = primals.parameter_structure();
         let input_values = primals.into_parameters().collect::<Vec<_>>();
 
@@ -156,6 +140,9 @@ pub trait DifferentiationContext: Context {
                 function(input).map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
             context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
             let output_structure = output.parameter_structure();
+            // The outputs must belong to this trace: a foreign tracer's atom id would silently alias whichever atom
+            // shares its index in this builder, so the boundary rejects it with a builder-identity check.
+            check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
             let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
             (output_structure, output_atoms)
         };
@@ -221,9 +208,6 @@ pub trait DifferentiationContext: Context {
     {
         if primals.parameters().next().is_none() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-        }
-        for primal in primals.parameters() {
-            self.validate_primal(primal)?;
         }
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
@@ -624,22 +608,7 @@ pub trait DifferentiationContext: Context {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, Capture> DifferentiationContext for TracingContext<V, O, Capture> {
-    #[inline]
-    fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
-        check_builders!(self.builder(), primal.context().builder()).map_err(|error| self.error(error))
-    }
-}
-
-impl<C: Context> DifferentiationContext for NestedTracingContext<C> {
-    #[inline]
-    fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
-        check_builders!(self.builder(), primal.context().builder()).map_err(|error| self.error(error))
-    }
-}
-
-/// The eager scalar domain differentiates eagerly with concrete [`Scalar`] tangents.
-impl DifferentiationContext for EagerContext<Scalar, ScalarOperation<Scalar>> {}
+impl<C: Context> DifferentiationContext for C {}
 
 /// A dual value: a primal value paired with its symbolic tangent, both flowing through the same [`Context`] `C`.
 ///
@@ -896,17 +865,6 @@ where
     fn is_eager(&self) -> bool {
         self.context.is_eager()
     }
-}
-
-/// Forward-mode contexts support nested differentiation: inside a [`jvp`](DifferentiationContext::jvp) closure, an
-/// inner transform invoked on the dual's [`JvpContext`] (recovered through the value-capability sugar's stamped
-/// context) differentiates through the duals themselves, so transforms compose — for example, reverse-over-forward
-/// through an inner [`value_and_grad`](DifferentiationContext::value_and_grad).
-impl<C> DifferentiationContext for JvpContext<C>
-where
-    C: Context + Zero<C::Value>,
-    C::Operation: Clone + DifferentiableOperation<C>,
-{
 }
 
 /// A zero synthesized inside a forward-mode context is independent of every differentiation input, so it is the
@@ -1739,7 +1697,7 @@ where
 
 impl<C, Input, TracedOutput> ForwardLinearization<C, Input, TracedOutput>
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Operation: Clone,
     Input: Parameterized<<C as Domain>::Value>,
     TracedOutput: Parameterized<<C as Domain>::Value>,
@@ -1813,7 +1771,7 @@ where
 
 impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<<C as Domain>::Value, EagerContext<<C as Domain>::Value, <C as Domain>::Operation>>,
     Input: Parameterized<<C as Domain>::Value>,

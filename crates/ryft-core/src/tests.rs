@@ -38,7 +38,7 @@ use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::TransferToMemory;
-use crate::tracing_v2::{ArrayOperation, CoordinateValue, DifferentiationContext};
+use crate::tracing_v2::{ArrayOperation, CoordinateValue};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
@@ -1055,10 +1055,6 @@ impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
     }
 }
 
-/// The test backend's interpreting eager domain, `EagerContext<TestArray, ArrayOperation<TestArray>>`,
-/// differentiates eagerly with concrete [`TestArray`] tangents.
-impl DifferentiationContext for EagerContext<TestArray, ArrayOperation<TestArray>> {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,10 +1089,8 @@ mod differentiation_tests {
     use crate::contexts::{Context, EagerContext};
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::NestedTracer;
     use crate::tracing_v2::differentiation::JvpTracer;
-
-    use super::DifferentiationContext;
+    use crate::tracing_v2::{DifferentiationContext, NestedTracer};
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
@@ -4577,10 +4571,10 @@ mod batching_tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::NestedTracer;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
+    use crate::tracing_v2::{DifferentiationContext, NestedTracer};
     use crate::types::{DataType, Shape};
 
     use super::*;

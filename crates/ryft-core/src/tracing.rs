@@ -9,6 +9,7 @@ use crate::axes::{NamedAxes, NamedAxis};
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
+use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -291,6 +292,9 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
             };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
+            // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
+            // whichever atom shares its index in this builder, and so we check for this here.
+            check_builders!(&builder, [output.parameters().map(|output| output.builder())])?;
             builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
             let output_structure = output.parameter_structure();
             let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;

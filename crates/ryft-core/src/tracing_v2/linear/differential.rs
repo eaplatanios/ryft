@@ -6,7 +6,7 @@ use ryft_macros::Parameter;
 use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
-use crate::contexts::{Domain, EagerContext};
+use crate::contexts::{Context, Domain, EagerContext};
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
@@ -87,7 +87,7 @@ type CoordinateScalar<V> = <V as CoordinateValue>::Coordinate;
 /// This extension trait keeps the core [`DifferentiationContext`] contract focused on primitive
 /// linearization and AD transforms while providing structured Jacobian and Hessian materialization
 /// for domains whose values expose finite coordinate bases.
-pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + DifferentiationContext {
+pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
     /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
     ///
     /// The returned [`Jacobian`] is a nested [`Parameterized`] value whose outer family mirrors
@@ -101,8 +101,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         primal: Input,
     ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>, ProgramError>
     where
-        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>>
-            + DifferentiationContext,
+        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>>,
         DomainValue<Self>: CoordinateValue + BooleanLike + 'domain,
         Input: Parameterized<
                 DomainValue<Self>,
@@ -203,7 +202,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         primals: Input,
     ) -> Result<Hessian<Input, DomainValue<Self>>, DifferentiationError>
     where
-        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>> + DifferentiationContext + 'static,
+        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>> + 'static,
         DomainValue<Self>: CoordinateValue + 'domain,
         Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<DomainTracingContext<Self>>>>
@@ -288,7 +287,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
     }
 }
 
-impl<D> DifferentiableDomainExtension for D where D: Domain<Type = ArrayType> + DifferentiationContext {}
+impl<D> DifferentiableDomainExtension for D where D: Context<Type = ArrayType> {}
 
 /// Partial derivatives of one output leaf with respect to one input leaf.
 ///
@@ -587,7 +586,7 @@ where
     ) -> Result<Self, ProgramError>
     where
         S: Clone,
-        C: Domain<Type = ArrayType, Value = V> + DifferentiationContext,
+        C: Context<Type = ArrayType, Value = V>,
         V: CoordinateValue<Coordinate = S>,
         Input:
             Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
@@ -854,7 +853,7 @@ pub fn jacrev<C, F, Input, TracedOutput>(
     primals: Input,
 ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<C>>, DomainValue<C>>, ProgramError>
 where
-    C: Domain<Type = ArrayType> + DifferentiationContext,
+    C: Context<Type = ArrayType>,
     DomainValue<C>: CoordinateValue + BooleanLike,
     <C as Domain>::Constant: Value<Type = ArrayType>,
     Input: Parameterized<DomainValue<C>, To<DomainValue<C>> = Input, ParameterStructure: Debug + PartialEq>,

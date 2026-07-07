@@ -2000,8 +2000,6 @@ mod tests {
         }
     }
 
-    impl DifferentiationContext for StagedDispatchTestArrayDomain {}
-
     /// Eager-domain context capabilities, delegating to the zero-state [`crate::EagerContext`] exactly like
     /// [`EagerContext<TestArray, ArrayOperation<TestArray>>`](crate::tests::EagerContext<TestArray, ArrayOperation<TestArray>>)'s.
     impl crate::operations::constants::Zero<TestArray> for StagedDispatchTestArrayDomain {

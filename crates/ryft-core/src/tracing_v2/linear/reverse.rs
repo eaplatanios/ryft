@@ -10,7 +10,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::tracing::TracingContext;
 use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::{DifferentiationContext, DifferentiationError, NestedTracer};
-use crate::{Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
+use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
 ///
@@ -25,7 +25,7 @@ pub fn value_and_grad<C, F, Input>(
     primals: Input,
 ) -> Result<(<C as Domain>::Value, Input::To<<C as Domain>::Value>), DifferentiationError>
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> NestedTracer<C>,
@@ -78,7 +78,7 @@ pub fn grad<C, F, Input>(
     primals: Input,
 ) -> Result<Input::To<<C as Domain>::Value>, DifferentiationError>
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> NestedTracer<C>,
@@ -117,7 +117,7 @@ pub fn value_and_grad_with_aux<C, F, Input, Aux>(
     primals: Input,
 ) -> Result<((<C as Domain>::Value, Aux), Input::To<<C as Domain>::Value>), DifferentiationError>
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> (NestedTracer<C>, Aux::To<NestedTracer<C>>),
@@ -186,7 +186,7 @@ pub fn grad_with_aux<C, F, Input, Aux>(
     primals: Input,
 ) -> Result<(Input::To<<C as Domain>::Value>, Aux), DifferentiationError>
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> (NestedTracer<C>, Aux::To<NestedTracer<C>>),
