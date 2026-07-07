@@ -29,7 +29,8 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Typed};
 
 /// Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output cotangent

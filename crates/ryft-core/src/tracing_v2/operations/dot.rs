@@ -15,7 +15,8 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, combine_terms};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::{DifferentiableOperation, combine_terms};
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.

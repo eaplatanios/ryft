@@ -7,6 +7,7 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
@@ -22,7 +23,7 @@ use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
 use crate::tracing_v2::differentiation::materialize;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_via_bind};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_via_bind};
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's

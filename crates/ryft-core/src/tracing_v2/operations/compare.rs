@@ -1,11 +1,12 @@
 use crate::contexts::Context;
+use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
 use crate::operations::Operation;
 use crate::operations::compare::CompareOperation;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_zero_tangent};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_zero_tangent};
 
 /// Forward-mode rule for [`CompareOperation`]: comparisons map into a discrete (Boolean) codomain, so the primal
 /// operation is replayed on the input primals and each Boolean output is paired with a canonical typed zero tangent.

@@ -22,10 +22,10 @@ use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
+use crate::differentiation::DifferentiationDual;
 use crate::operations::control_flow::MaybeWhile;
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, DifferentiationDual, Linearization, materialize,
-    replay_via_bind,
+    DifferentiableOperation, DifferentiableProgramOperation, Linearization, materialize, replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};

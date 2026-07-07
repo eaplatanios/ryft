@@ -3,6 +3,7 @@ use std::fmt::Display;
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::differentiation::DifferentiationDual;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::Zero;
@@ -10,9 +11,7 @@ use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
-};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
 use crate::types::{ArrayType, Type, TypeError};
 
 // TODO(eaplatanios): Review this module.
@@ -137,7 +136,7 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> 
 {
     #[inline]
     fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::with_zero_tangent(self.context().iota(r#type, dimension)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.context().iota(r#type, dimension)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

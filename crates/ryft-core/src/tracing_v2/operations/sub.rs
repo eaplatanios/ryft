@@ -9,7 +9,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::Typed;
 
 impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for SubOperation

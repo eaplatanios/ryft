@@ -1,3 +1,4 @@
+pub mod differentiation;
 pub mod transposition;
 pub mod types;
 
@@ -5,6 +6,7 @@ use thiserror::Error;
 
 use crate::programs::ProgramError;
 
+pub use differentiation::DifferentiationDual;
 pub use transposition::{TransposableOperation, TransposableProgramOperation};
 pub use types::DifferentiableType;
 

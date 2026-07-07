@@ -3,15 +3,14 @@ use std::fmt::Display;
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
+use crate::differentiation::DifferentiationDual;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationTracer,
-};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`ZeroOperation`].
@@ -134,7 +133,7 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::with_zero_tangent(self.context().zero(r#type)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.context().zero(r#type)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

@@ -24,6 +24,7 @@ use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::{BatchableOperation, BatchableProgramOperation};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::differentiation::DifferentiationDual;
 use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
@@ -41,9 +42,7 @@ use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
 use crate::tracing_v2::differentiation::materialize;
-use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiationDual, replay_via_bind, transpose_tangent_partitioned,
-};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_via_bind, transpose_tangent_partitioned};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
 };

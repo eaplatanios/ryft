@@ -7,7 +7,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].

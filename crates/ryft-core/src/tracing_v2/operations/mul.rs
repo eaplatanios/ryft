@@ -9,7 +9,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, combine_terms};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::{DifferentiableOperation, combine_terms};
 use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for MulOperation

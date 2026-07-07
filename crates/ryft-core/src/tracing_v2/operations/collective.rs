@@ -14,7 +14,8 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 

@@ -1,6 +1,7 @@
 use crate::batching::BatchAxis;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
+use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -9,7 +10,7 @@ use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Shape, Size, Typed};
 use crate::{ArrayBatch, BatchableOperation, BatchingError, Broadcast, Transpose};
 

@@ -15,7 +15,8 @@ use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationDual, replay_zero_tangent};
+use crate::differentiation::DifferentiationDual;
+use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_zero_tangent};
 use crate::types::{ArrayType, Type, Typed};
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
