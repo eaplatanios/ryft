@@ -1105,6 +1105,85 @@ pub trait Batch: Context<Type = ArrayType> {
 
 impl<C> Batch for C where C: Context<Type = ArrayType> {}
 
+// TODO(eaplatanios): Review this trait.
+/// [`Value`]s that can name and recover the active array [`Context`] that executes operations involving them. This
+/// is the context-recovery hook behind the free [`batch`] function.
+///
+/// Transform and staged values earn this through the blanket implementation: their [`Value::Domain`] *is* the active
+/// context (a staged [`Tracer`]'s trace, a [`BatchingTracer`]'s batching level, a JVP dual's differentiation
+/// context). Backend-concrete values opt in individually by naming their backend's rich eager context (e.g.,
+/// `TestArray` names `TestArrayDomain`), because their [`Value::Domain`] is the constant-only [`EagerContext`]
+/// (which cannot bind operations — the blanket tracer capability implementations are coherent with concrete values'
+/// own precisely because of this) and because constructing a backend context can involve backend state and defaults
+/// (e.g., a client handle or compilation options) that only the backend can choose. The `From<TransposeOperation>`
+/// bound on the blanket both keeps it coherent with (disjoint from) those concrete implementations and reflects a
+/// real obligation of the batching transform: batch-axis realignment stages transposes.
+pub trait BatchInput: Value<Type = ArrayType> {
+    /// Active [`Context`] that executes operations involving this value.
+    type Context: Context<Type = ArrayType, Value = Self>;
+
+    /// Returns the active [`Context`] that executes operations involving this value.
+    fn batch_context(&self) -> Self::Context;
+}
+
+// TODO(eaplatanios): Review this implementation.
+impl<V: Value<Type = ArrayType>> BatchInput for V
+where
+    V::Domain: Context,
+    <V::Domain as Domain>::Operation: From<TransposeOperation>,
+{
+    type Context = V::Domain;
+
+    #[inline]
+    fn batch_context(&self) -> V::Domain {
+        self.domain()
+    }
+}
+
+// TODO(eaplatanios): Review this function.
+/// Batches `function` over the mapped axes of `input`, recovering the active [`Context`] from the input's first leaf
+/// value via [`BatchInput::batch_context`] — the analogue of
+/// [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html), which likewise discovers the
+/// interpreter for its inputs (the innermost active trace, or the default eager backend for concrete arrays) instead
+/// of threading it explicitly. This is a thin delegator to [`Batch::batch`]; refer to its documentation for the
+/// `in_axes`/`out_axes`/`axis` conventions.
+///
+/// Staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their batching level (so `batch` nests inside
+/// `batch`), JVP duals recover their differentiation context, and backend-concrete values recover the eager backend
+/// context they name through their own [`BatchInput`] implementations. Inputs with *no leaf values* are the one case
+/// this form cannot serve: with nothing to recover a context from, it returns [`BatchingError::EmptyBatch`] even when
+/// `axis` supplies an explicit batch size — call [`Batch::batch`] on an explicit context instead.
+pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes>(
+    function: F,
+    input: I,
+    in_axes: InputBatchAxes,
+    out_axes: OutputBatchAxes,
+    axis: impl Into<BatchAxisSpecification>,
+) -> Result<O::To<V>, BatchingError>
+where
+    V: BatchInput + Transpose,
+    InputBatchAxes: Parameterized<BatchAxis>,
+    OutputBatchAxes: Parameterized<BatchAxis>,
+    I: Parameterized<
+            V,
+            ParameterStructure: Debug + PartialEq,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::Context>>,
+        >,
+    O: Parameterized<
+            BatchingTracer<V::Context>,
+            ParameterStructure: Debug + PartialEq,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
+        >,
+    I::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = I::ParameterStructure>,
+    O::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = O::ParameterStructure>,
+    F: FnOnce(I::To<BatchingTracer<V::Context>>) -> Result<O, ProgramError>,
+{
+    let Some(context) = input.parameters().next().map(BatchInput::batch_context) else {
+        return Err(BatchingError::EmptyBatch);
+    };
+    context.batch(function, input, in_axes, out_axes, axis)
+}
+
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -1411,8 +1490,8 @@ mod tests {
     // TODO(eaplatanios): Review this function.
     #[test]
     fn test_batch() {
-        // `batch` maps the closure over the mapped input axis: each item of the length-3 batch is squared, and the
-        // output carries its mapped axis back at the requested position.
+        // `Batch::batch` on an explicit context maps the closure over the mapped input axis: each item of the
+        // length-3 batch is squared, and the output carries its mapped axis back at the requested position.
         let output: TestArray = TestArrayDomain
             .batch(
                 |x| Ok(x.clone() * x),
@@ -1423,6 +1502,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, TestArray::vector(vec![1.0, 4.0, 9.0]));
+
+        // The free `batch` serves top-level concrete values through their `BatchInput` implementations: a plain
+        // `TestArray` input recovers the test backend's rich eager domain, mirroring how JAX's `vmap` falls back to
+        // the default eager interpreter for concrete arrays.
+        let output: TestArray = batch(
+            |x| Ok(x.clone() * x),
+            TestArray::vector(vec![1.0, 2.0, 3.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output, TestArray::vector(vec![1.0, 4.0, 9.0]));
+
+        // Under an active trace, the free `batch` recovers the staging context from its tracer input instead, so
+        // `vmap` composes inside traced code without threading a context. The traced function squares each row of
+        // its `[2, 3]` input by batching a per-item squaring closure over axis 0.
+        let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let (_, program) = TestArrayDomain::trace(
+            |inputs: Vec<_>| {
+                let mapped =
+                    batch(|x| Ok(x.clone() * x), inputs[0].clone(), BatchAxis::new(0), BatchAxis::new(0), None)?;
+                Ok(vec![mapped])
+            },
+            vec![matrix_type],
+        )
+        .unwrap();
+        let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let outputs = program.interpret(vec![input]).unwrap();
+        assert_eq!(outputs, vec![TestArray::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0])]);
+
+        // Nested inside an eager `batch`, the inner free `batch` recovers the outer `BatchingContext` from its
+        // `BatchingTracer` input, so `vmap` nests inside `vmap`: the outer level maps rows and the inner level maps
+        // items within each row.
+        let output: TestArray = TestArrayDomain
+            .batch(
+                |row| Ok(batch(|item| Ok(item.clone() * item), row, BatchAxis::new(0), BatchAxis::new(0), None)?),
+                TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output, TestArray::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0]));
 
         // A replicated input with an explicit batch size runs the closure on the shared value and returns a
         // replicated output.
@@ -1460,6 +1583,18 @@ mod tests {
                 None,
             )
             .unwrap_err();
+        assert_eq!(error, BatchingError::EmptyBatch);
+
+        // With no leaf value to recover a context from, the free `batch` reports an empty batch even when an
+        // explicit batch size is provided.
+        let error = batch(
+            |x: Vec<BatchingTracer<TestArrayDomain>>| Ok(x),
+            Vec::<TestArray>::new(),
+            BatchAxis::replicated(),
+            BatchAxis::replicated(),
+            2,
+        )
+        .unwrap_err();
         assert_eq!(error, BatchingError::EmptyBatch);
     }
 }

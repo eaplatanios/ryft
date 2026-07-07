@@ -1,14 +1,12 @@
 use std::fmt::Display;
 
 use crate::contexts::Context;
-use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
-use crate::macros::check_count;
+use crate::macros::{check_count, implement_tracer_operator};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`NegOperation`].
 pub const NEG_OPERATION_NAME: &'static str = "neg";
@@ -55,9 +53,9 @@ impl ElementwiseOperation for NegOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Neg, C> InterpretableOperation<T, V, C> for NegOperation
+impl<V: Clone + Value + Neg, C> InterpretableOperation<V, C> for NegOperation
 where
-    Self: Operation<T>,
+    Self: Operation<V::Type>,
 {
     #[inline]
     fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -77,21 +75,14 @@ pub trait Neg: Sized {
     fn neg(&self) -> Result<Self, ProgramError>;
 }
 
-impl<C: StagingContext<Operation: From<NegOperation>>> Neg for Tracer<C, C::Meta> {
+impl<V: Value<Domain: Context<Operation: From<NegOperation>>>> Neg for V {
     #[inline]
     fn neg(&self) -> Result<Self, ProgramError> {
-        Ok(self.unary(NegOperation))
+        Ok(self.domain().bind(NegOperation, &[self.clone()])?.remove(0))
     }
 }
 
-impl<C: StagingContext<Operation: From<NegOperation>>> std::ops::Neg for Tracer<C, C::Meta> {
-    type Output = Self;
-
-    #[inline]
-    fn neg(self) -> Self::Output {
-        self.unary(NegOperation)
-    }
-}
+implement_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -118,7 +109,7 @@ mod tests {
         assert_eq!(format!("{operation}"), NEG_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0)],
@@ -126,7 +117,7 @@ mod tests {
             Ok(vec![Scalar::from(-2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0)],
@@ -168,15 +159,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &[],
-            ),
+            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(&operation, &EagerContext::new(), &[],),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[],
@@ -185,7 +172,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, Scalar, NegOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, NegOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();

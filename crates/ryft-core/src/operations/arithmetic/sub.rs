@@ -2,14 +2,12 @@ use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
 use crate::contexts::Context;
-use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
-use crate::macros::check_count;
+use crate::macros::{check_count, implement_tracer_operator};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`SubOperation`].
 pub const SUB_OPERATION_NAME: &'static str = "sub";
@@ -58,9 +56,9 @@ impl ElementwiseOperation for SubOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Sub, C> InterpretableOperation<T, V, C> for SubOperation
+impl<V: Clone + Value + Sub, C> InterpretableOperation<V, C> for SubOperation
 where
-    Self: Operation<T>,
+    Self: Operation<V::Type>,
 {
     #[inline]
     fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -80,21 +78,14 @@ pub trait Sub: Sized {
     fn sub(&self, rhs: &Self) -> Result<Self, ProgramError>;
 }
 
-impl<C: StagingContext<Operation: From<SubOperation>>> Sub for Tracer<C, C::Meta> {
+impl<V: Value<Domain: Context<Operation: From<SubOperation>>>> Sub for V {
     #[inline]
     fn sub(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.binary(rhs, SubOperation))
+        Ok(self.domain().bind(SubOperation, &[self.clone(), rhs.clone()])?.remove(0))
     }
 }
 
-impl<C: StagingContext<Operation: From<SubOperation>>> std::ops::Sub for Tracer<C, C::Meta> {
-    type Output = Self;
-
-    #[inline]
-    fn sub(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, SubOperation)
-    }
-}
+implement_tracer_operator!(@binary std::ops::Sub, sub, SubOperation, "`sub` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -126,7 +117,7 @@ mod tests {
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0), Scalar::from(3.5)],
@@ -134,7 +125,7 @@ mod tests {
             Ok(vec![Scalar::from(-1.5)])
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
@@ -210,7 +201,7 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(2.0)],
@@ -218,7 +209,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(2.0)]
@@ -243,7 +234,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, Scalar, SubOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, SubOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
