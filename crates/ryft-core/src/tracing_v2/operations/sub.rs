@@ -1,87 +1,82 @@
-use std::ops::Sub;
+use std::ops::{Neg, Sub};
 
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{NegOperation, SubOperation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::Type;
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
 
-impl<T: Type, V: Value<T>, O: Operation<T> + From<NegOperation>> TransposableOperation<T, V, O> for SubOperation
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::types::Typed;
+
+impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for SubOperation
 where
-    SubOperation: Operation<T>,
+    SubOperation: Operation<V::Type>,
 {
     #[inline]
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
-        _input_types: &[&T],
-        output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
-        check_count!("output", output_cotangents, 1, ProgramError);
-        match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => {
-                Ok(vec![Cotangent::Staged(cotangent.clone()), Cotangent::Staged(-cotangent.clone())])
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Value(cotangent) => {
+                Ok(vec![MaybeZero::Value(cotangent.clone()), MaybeZero::Value(-cotangent.clone())])
             }
-            Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
+            MaybeZero::Zero(r#type) => Ok(vec![MaybeZero::Zero(r#type.clone()), MaybeZero::Zero(r#type.clone())]),
         }
     }
 }
 
-impl<C: DifferentiationContext> DifferentiableOperation<C> for SubOperation
+impl<C: Context> DifferentiableOperation<C> for SubOperation
 where
-    C::Value: Sub<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<SubOperation> + From<NegOperation>,
+    C::Operation: Clone,
+    C::Value: Sub<Output = C::Value> + Neg<Output = C::Value>,
     SubOperation: Operation<C::Type>,
 {
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![JvpTracer::new(
-            inputs[0].primal().clone() - inputs[1].primal().clone(),
-            inputs[0].tangent().clone() - inputs[1].tangent().clone(),
-        )])
+        let primal = inputs[0].primal().clone() - inputs[1].primal().clone();
+        // Structural zeros are dropped; a zero minuend collapses to the negated subtrahend so the tangent
+        // program never stages `Sub(zero, ..)` or `Sub(.., zero)`.
+        let left = inputs[0].tangent().as_value().cloned();
+        let right = inputs[1].tangent().as_value().cloned();
+        let tangent = match (left, right) {
+            (Some(left), Some(right)) => MaybeZero::Value(left - right),
+            (Some(term), None) => MaybeZero::Value(term),
+            (None, Some(term)) => MaybeZero::Value(-term),
+            (None, None) => MaybeZero::Zero(primal.r#type().into_owned()),
+        };
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::scalars::ScalarDomain;
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
+    use crate::scalars::Scalar;
     use crate::tracing_v2::DifferentiationContext;
 
     #[test]
     fn test_sub_jvp_matches_the_difference_rule() {
-        let domain = ScalarDomain::<f64>::new();
-        let (primal, tangent): (f64, f64) =
-            domain.jvp(|(left, right)| left - right, (5.0f64, 2.0f64), (3.0f64, 1.0f64)).unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent): (Scalar, Scalar) = domain
+            .jvp(
+                |(left, right)| left - right,
+                (Scalar::from(5.0), Scalar::from(2.0)),
+                (Scalar::from(3.0), Scalar::from(1.0)),
+            )
+            .unwrap();
 
         assert_eq!(primal, 3.0);
         assert_eq!(tangent, 2.0);
-
-        let (_, pushforward) = domain.linearize(|inputs| Ok(inputs.0 - inputs.1), (5.0f64, 2.0f64)).unwrap();
-        let pushforward = pushforward.instantiate_program().unwrap();
-
-        assert_eq!(
-            pushforward.to_string(),
-            indoc! {"
-                lambda %0:f64, %1:f64 .
-                let %2:f64 = sub %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
     }
 }

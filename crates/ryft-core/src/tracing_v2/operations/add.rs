@@ -1,68 +1,73 @@
 use std::ops::Add;
 
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::Type;
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
 
-impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for AddOperation
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, combine_terms};
+
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where
-    AddOperation: Operation<T>,
+    AddOperation: Operation<V::Type>,
 {
     #[inline]
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
-        _input_types: &[&T],
-        output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
-        check_count!("output", output_cotangents, 1, ProgramError);
-        Ok(vec![output_cotangents[0].clone(), output_cotangents[0].clone()])
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![outputs[0].clone(), outputs[0].clone()])
     }
 }
 
-impl<C: DifferentiationContext> DifferentiableOperation<C> for AddOperation
+impl<C: Context> DifferentiableOperation<C> for AddOperation
 where
+    C::Operation: Clone,
     C::Value: Add<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<AddOperation>,
     AddOperation: Operation<C::Type>,
 {
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![JvpTracer::new(
-            inputs[0].primal().clone() + inputs[1].primal().clone(),
-            inputs[0].tangent().clone() + inputs[1].tangent().clone(),
-        )])
+        let primal = inputs[0].primal().clone() + inputs[1].primal().clone();
+        // Structural zeros are dropped so the tangent program never stages `Add(zero, ..)`, which the
+        // straight-line tangent transposition would reject for having a known (non-linear) operand.
+        let left = inputs[0].tangent().as_value().cloned();
+        let right = inputs[1].tangent().as_value().cloned();
+        let tangent = combine_terms(left, right, &primal);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::scalars::ScalarDomain;
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
+    use crate::scalars::Scalar;
     use crate::tracing_v2::{DifferentiationContext, value_and_grad};
 
     #[test]
     fn test_add_jvp_and_gradient_are_linear() {
-        let domain = ScalarDomain::<f64>::new();
-        let (primal, tangent) = domain.jvp(|(left, right)| left + right, (2.0f64, 5.0f64), (3.0f64, -1.0f64)).unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent) = domain
+            .jvp(
+                |(left, right)| left + right,
+                (Scalar::from(2.0), Scalar::from(5.0)),
+                (Scalar::from(3.0), Scalar::from(-1.0)),
+            )
+            .unwrap();
         assert_eq!(primal, 7.0);
         assert_eq!(tangent, 2.0);
 
-        let (value, gradient) = value_and_grad(&domain, |(left, right)| left + right, (2.0f64, 5.0f64)).unwrap();
+        let (value, gradient) =
+            value_and_grad(&domain, |(left, right)| left + right, (Scalar::from(2.0), Scalar::from(5.0))).unwrap();
         assert_eq!(value, 7.0);
-        assert_eq!(gradient, (1.0, 1.0));
+        assert_eq!(gradient, (Scalar::from(1.0), Scalar::from(1.0)));
     }
 }

@@ -1,12 +1,14 @@
 use std::fmt::Display;
 
-use crate::contexts::StagingContext;
+use crate::contexts::Context;
+use crate::contexts::Domain;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{Sharding, ShardingDimension};
-use crate::tracing::Tracer;
-use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review this module.
 
@@ -63,15 +65,18 @@ impl Operation<ArrayType> for ReshapeOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Reshape> InterpretableOperation<ArrayType, V> for ReshapeOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + Reshape, C> InterpretableOperation<V, C> for ReshapeOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].reshape(self.shape.clone())?])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReshapeOperation where
+    C::Operation: From<ReshapeOperation>
+{
 }
 
 /// Represents the ability to reshape an array to a target [`Shape`] without changing its element count or its layout.
@@ -116,24 +121,24 @@ impl Reshape for ArrayType {
         let Some(input_elements) = self.element_count().map_err(|error| TypeError { message: error.to_string() })?
         else {
             return Err(
-                TypeError { message: "reshape requires statically known input element counts".to_string() }.into()
+                TypeError { message: "'reshape' requires statically known input element counts".to_string() }.into()
             );
         };
         let Some(output_elements) = shape.element_count().map_err(|error| TypeError { message: error.to_string() })?
         else {
             return Err(
-                TypeError { message: "reshape requires statically known output element counts".to_string() }.into()
+                TypeError { message: "'reshape' requires statically known output element counts".to_string() }.into()
             );
         };
         if input_elements != output_elements {
-            return Err(TypeError { message: "reshape changes the number of elements".to_string() }.into());
+            return Err(TypeError { message: "'reshape' changes the number of elements".to_string() }.into());
         }
 
         // Propagate the input sharding (when present) to the target shape using JAX-style singleton stripping and
         // contiguous split/merge grouping.
         let sharding = if let Some(sharding) = self.sharding() {
             let alignment_error =
-                || TypeError { message: "reshape could not align static reshape dimension groups".to_string() };
+                || TypeError { message: "'reshape' could not align static reshape dimension groups".to_string() };
 
             // Strip singleton and dynamic dimensions on both sides. Only the remaining static dimensions take part
             // in the split/merge analysis, so shardings move freely across inserted or removed size-1 axes.
@@ -224,7 +229,7 @@ impl Reshape for ArrayType {
                     .all(|(index, _)| matches!(sharding.dimensions()[*index], ShardingDimension::Replicated))
                 {
                     return Err(TypeError {
-                        message: "reshape cannot preserve sharding across the requested reshape".to_string(),
+                        message: "'reshape' cannot preserve sharding across the requested reshape".to_string(),
                     }
                     .into());
                 }
@@ -243,7 +248,7 @@ impl Reshape for ArrayType {
                     sharding.varying_manual_axes().clone(),
                 )
                 .map(|sharding| sharding.without_auto_axes())
-                .map_err(|_| TypeError { message: "reshape produced an invalid output sharding".to_string() })?,
+                .map_err(|_| TypeError { message: "'reshape' produced an invalid output sharding".to_string() })?,
             )
         } else {
             None
@@ -251,11 +256,19 @@ impl Reshape for ArrayType {
 
         ArrayType::new(self.data_type(), shape)
             .with_sharding(sharding)
-            .map_err(|_| TypeError { message: "reshape produced an invalid output type".to_string() }.into())
+            .map_err(|_| TypeError { message: "'reshape' produced an invalid output type".to_string() }.into())
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<ReshapeOperation>>> Reshape for Tracer<C> {
+/// Any context-carrying value reshapes by binding a [`ReshapeOperation`] through its own context. The
+/// `From<ReshapeOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Reshape for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReshapeOperation>,
+{
+    #[inline]
     fn reshape(&self, shape: Shape) -> Result<Self, ProgramError> {
         let input_type = self.r#type().into_owned();
         let output_type = input_type.reshape(shape)?;
@@ -263,8 +276,7 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<ReshapeOperation>>> Res
             return Ok(self.clone());
         }
         let mut outputs =
-            self.context().stage_operation(ReshapeOperation::new(output_type.shape().clone()), &[self])?;
-        check_count!("output", outputs, 1, ProgramError);
+            self.dispatch_domain().bind(ReshapeOperation::new(output_type.shape().clone()), &[self.clone()])?;
         Ok(outputs.remove(0))
     }
 }
@@ -278,7 +290,7 @@ mod tests {
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::tests::TestArray;
-    use crate::types::DataType;
+    use crate::types::{DataType, Typed};
 
     use super::*;
 
@@ -303,7 +315,8 @@ mod tests {
 
         // Interpretation reinterprets the row-major payload under the target shape.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation.interpret(&crate::EagerContext::new(), std::slice::from_ref(&input)).unwrap();
+        let output =
+            operation.interpret(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
@@ -314,15 +327,19 @@ mod tests {
         );
         assert_eq!(
             operation.infer_output_types(&[ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(5)]))]),
-            Err(TypeError { message: "reshape changes the number of elements".to_string() }),
+            Err(TypeError { message: "'reshape' changes the number of elements".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
+            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+                &operation,
+                &crate::EagerContext::<TestArray>::new(),
+                &[]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name and includes the captured output shape.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ReshapeOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, ReshapeOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();
@@ -348,23 +365,23 @@ mod tests {
         assert_eq!(
             dynamic_type.reshape(Shape::new(vec![Size::Static(6)])),
             Err(ProgramError::Type(TypeError {
-                message: "reshape requires statically known input element counts".to_string(),
+                message: "'reshape' requires statically known input element counts".to_string(),
             })),
         );
         assert_eq!(
             static_type.reshape(dynamic_shape.clone()),
             Err(ProgramError::Type(TypeError {
-                message: "reshape requires statically known output element counts".to_string(),
+                message: "'reshape' requires statically known output element counts".to_string(),
             })),
         );
         assert_eq!(
             ReshapeOperation::new(dynamic_shape.clone()).infer_output_types(std::slice::from_ref(&static_type)),
-            Err(TypeError { message: "reshape requires statically known output element counts".to_string() }),
+            Err(TypeError { message: "'reshape' requires statically known output element counts".to_string() }),
         );
         assert_eq!(
             TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).reshape(dynamic_shape),
             Err(ProgramError::Type(TypeError {
-                message: "reshape requires statically known output element counts".to_string(),
+                message: "'reshape' requires statically known output element counts".to_string(),
             })),
         );
 
@@ -503,7 +520,7 @@ mod tests {
         assert_eq!(
             input_type.reshape(Shape::new(vec![Size::Static(2), Size::Static(4)])),
             Err(ProgramError::Type(TypeError {
-                message: "reshape cannot preserve sharding across the requested reshape".to_string(),
+                message: "'reshape' cannot preserve sharding across the requested reshape".to_string(),
             })),
         );
     }
@@ -519,7 +536,7 @@ mod tests {
         assert_eq!(
             input_type.reshape(Shape::new(vec![Size::Static(8)])),
             Err(ProgramError::Type(TypeError {
-                message: "reshape cannot preserve sharding across the requested reshape".to_string(),
+                message: "'reshape' cannot preserve sharding across the requested reshape".to_string(),
             })),
         );
     }

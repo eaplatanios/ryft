@@ -31,12 +31,12 @@ use crate::types::DataType;
 /// through array-based backends, but they are not variants of this enum.
 #[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation)]
 #[ryft(bounds(interpretation(BooleanLike + WhilePredicate)))]
-pub enum ScalarOperation<V: Value<DataType>> {
+pub enum ScalarOperation<V: Value<Type = DataType>> {
     Zero(ZeroOperation<DataType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<DataType, V>),
+    Constant(ConstantOperation<V>),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
@@ -46,17 +46,17 @@ pub enum ScalarOperation<V: Value<DataType>> {
     Cos(CosOperation),
     Compare(CompareOperation),
     Select(SelectOperation),
-    While(Box<WhileOperation<DataType, V, Self>>),
+    While(Box<WhileOperation<V, Self>>),
     StopGradient(StopGradientOperation),
     Tag(TagOperation),
     Print(PrintOperation),
-    CustomJvp(Box<CustomJvpOperation<DataType, V, Self>>),
-    CustomVjp(Box<CustomVjpOperation<DataType, V, Self>>),
-    CustomVjpTangent(Box<CustomVjpTangentOperation<DataType, V, Self>>),
-    Rematerialize(Box<RematerializeOperation<DataType, V, Self>>),
+    CustomJvp(Box<CustomJvpOperation<V, Self>>),
+    CustomVjp(Box<CustomVjpOperation<V, Self>>),
+    CustomVjpTangent(Box<CustomVjpTangentOperation<V, Self>>),
+    Rematerialize(Box<RematerializeOperation<V, Self>>),
 }
 
-impl<V: Value<DataType>> MaybeTag for ScalarOperation<V> {
+impl<V: Value<Type = DataType>> MaybeTag for ScalarOperation<V> {
     #[inline]
     fn key(&self) -> Option<&str> {
         match self {
@@ -66,16 +66,16 @@ impl<V: Value<DataType>> MaybeTag for ScalarOperation<V> {
     }
 }
 
-impl<V: Value<DataType>> MaybeDot for ScalarOperation<V> {
+impl<V: Value<Type = DataType>> MaybeDot for ScalarOperation<V> {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
         None
     }
 }
 
-impl<V: Value<DataType>> MaybeWhile<DataType, V, ScalarOperation<V>> for ScalarOperation<V> {
+impl<V: Value<Type = DataType>> MaybeWhile<V, ScalarOperation<V>> for ScalarOperation<V> {
     #[inline]
-    fn as_while(&self) -> Option<WhileParts<'_, DataType, V, ScalarOperation<V>>> {
+    fn as_while(&self) -> Option<WhileParts<'_, V, ScalarOperation<V>>> {
         match self {
             Self::While(operation) => operation.as_while(),
             _ => None,
@@ -84,9 +84,9 @@ impl<V: Value<DataType>> MaybeWhile<DataType, V, ScalarOperation<V>> for ScalarO
 }
 
 /// [`ScalarOperation`] has no `scan` variant, so no residual ever needs scan-body provenance.
-impl<V: Value<DataType>> MaybeScan<DataType, V, ScalarOperation<V>> for ScalarOperation<V> {
+impl<V: Value<Type = DataType>> MaybeScan<V, ScalarOperation<V>> for ScalarOperation<V> {
     #[inline]
-    fn scan_body(&self) -> Option<&crate::programs::Program<DataType, V, ScalarOperation<V>, Vec<V>, Vec<V>>> {
+    fn scan_body(&self) -> Option<&crate::programs::Program<V, ScalarOperation<V>, Vec<V>, Vec<V>>> {
         None
     }
 }
@@ -103,24 +103,24 @@ mod tests {
     use crate::operations::control_flow::Select;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::tracing_v2::DifferentiationContext;
     use crate::types::TypeError;
 
     use super::*;
+    use crate::contexts::EagerContext;
 
     /// Builds a carry-only scalar body program that maps `[carry]` to `[carry + carry]`.
-    fn scalar_doubling_body() -> Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+    fn scalar_doubling_body() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
         let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
     /// Builds a scalar while condition that maps `[carry]` to `[carry < 8]`.
-    fn scalar_less_than_eight_condition() -> Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>
-    {
-        let mut builder = ProgramBuilder::<DataType, Scalar, ScalarOperation<Scalar>>::new();
+    fn scalar_less_than_eight_condition() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let carry = builder.add_input(DataType::F64);
         let eight = builder.add_constant(Scalar::from(8.0));
         let predicate = builder
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn test_scalar_compare_and_select_program() {
         // `f(x, y) = select(x > y, x + x, y)` staged through `ScalarOperation` tracers.
-        let (output_type, program) = ScalarDomain::trace(
+        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
             |(x, y)| {
                 let mask = x.clone().greater_than(&y)?;
                 Select::select(&mask, &(x.clone() + x), &y)
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn test_scalar_while() {
-        let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
+        let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
             scalar_less_than_eight_condition(),
             scalar_doubling_body(),
         )
@@ -171,14 +171,14 @@ mod tests {
         assert_eq!(operation.iteration_bound(), None);
         assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
         assert_eq!(
-            operation.interpret(&crate::EagerContext::<DataType, Scalar>::new(), &[Scalar::from(1.0)]),
+            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(1.0)]),
             Ok(vec![Scalar::from(8.0)])
         );
 
-        let domain = ScalarDomain::new();
-        let (output_type, program) = ScalarDomain::trace(
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
             |carry| {
-                let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
+                let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
                     scalar_less_than_eight_condition(),
                     scalar_doubling_body(),
                 )
@@ -216,7 +216,7 @@ mod tests {
         let (primal, tangent): (Scalar, Scalar) = domain
             .jvp(
                 |carry| {
-                    let operation = WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
+                    let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
                         scalar_less_than_eight_condition(),
                         scalar_doubling_body(),
                     )
@@ -234,11 +234,8 @@ mod tests {
     #[test]
     fn test_scalar_while_rejects_non_boolean_condition() {
         assert_eq!(
-            WhileOperation::<DataType, Scalar, ScalarOperation<Scalar>>::new(
-                scalar_doubling_body(),
-                scalar_doubling_body()
-            )
-            .map(|_| ()),
+            WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(scalar_doubling_body(), scalar_doubling_body())
+                .map(|_| ()),
             Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),
         );
     }

@@ -1,12 +1,14 @@
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::{ArrayType, Shape, Size, TypeError};
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].
 ///
@@ -16,28 +18,28 @@ use crate::types::{ArrayType, Shape, Size, TypeError};
 /// reduction, the surviving axes are reordered into input-axis order when `output_axes`
 /// is not monotonically increasing, and stretched unit axes are restored with a reshape so the
 /// cotangent matches the input type exactly. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for BroadcastOperation
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for BroadcastOperation
 where
     O: Operation<ArrayType>
         + From<crate::tracing_v2::operations::reduce::ReduceOperation>
         + From<TransposeOperation>
         + From<ReshapeOperation>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
+        _context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         use crate::operations::manipulation::{Reshape, Transpose};
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
-        check_count!("input", input_types, 1, ProgramError);
-        check_count!("output", output_cotangents, 1, ProgramError);
-        let Cotangent::Staged(cotangent) = &output_cotangents[0] else {
-            return Ok(vec![Cotangent::Zero]);
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        let MaybeZero::Value(cotangent) = &outputs[0] else {
+            return Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]);
         };
-        let input_type = input_types[0];
+        let input_type = inputs[0].r#type();
 
         // Mapped input axes whose extent matches the target are kept; mapped axes with a static
         // unit extent stretched to a larger target extent are summed like the added axes and
@@ -75,35 +77,34 @@ where
         if has_stretched_axes {
             contribution = contribution.reshape(input_type.shape().clone())?;
         }
-        Ok(vec![Cotangent::Staged(contribution)])
+        Ok(vec![MaybeZero::Value(contribution)])
     }
 }
 
-impl<C> DifferentiableOperation<C> for BroadcastOperation
+/// Forward-mode rule for [`BroadcastOperation`]: `broadcast` is structural-linear, so the tangent is the same
+/// broadcast applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
+/// rule is consulted, so the operand tangent reaching here is always live.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for BroadcastOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
+    C::Operation: Clone + From<BroadcastOperation>,
     C::Value: Broadcast,
-    C::Tangent: Broadcast,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<BroadcastOperation>,
 {
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().broadcast(self.output_type().clone(), self.output_axes())?;
-        let tangent = inputs[0].tangent().clone().broadcast(self.output_type().clone(), self.output_axes())?;
+        let primal = inputs[0].primal().broadcast(self.output_type().clone(), self.output_axes())?;
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Value(tangent) => {
+                MaybeZero::Value(tangent.broadcast(self.output_type().clone(), self.output_axes())?)
+            }
+        };
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
 /// Lifts a broadcast's `output_axes` and target shape through one batching level.
 ///
-/// When the input is batched at axis `k` (in the input's per-lane logical shape), the lifted
+/// When the input is batched at axis `k` (in the input's unbatched logical shape), the lifted
 /// broadcast inserts a batch dimension of size `axis_size` at position `k` in the target shape,
 /// places a corresponding batch axis at output position `k_out = k`, and shifts the existing
 /// `output_axes` so each previously-mapped output axis `>= k_out` is shifted by one.
@@ -129,31 +130,29 @@ pub fn lift_broadcast(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableOperation<V, C> for BroadcastOperation {
+impl<V: Value<Type = ArrayType> + Broadcast, C> crate::batching::BatchableOperation<V, C> for BroadcastOperation {
     fn batch(
         &self,
         _context: &C,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        inputs: &[crate::batching::ArrayBatch<V>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let (_, input_axes, axis_size) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
-        match input_axes[0] {
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        match batch_axes[0] {
             None => {
-                // Lane-uniform input: the broadcast itself does not change. Pass through.
+                // Replicated input: the broadcast itself does not change. Pass through.
                 let output_value =
                     inputs[0].value().clone().broadcast(self.output_type().clone(), self.output_axes())?;
-                Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(self.output_type().clone(), output_value, None)?])
+                Ok(vec![crate::batching::ArrayBatch::new(self.output_type().clone(), output_value, None)?])
             }
             Some(batch_axis) => {
+                let axis_size = crate::batching::ArrayBatch::common_batch_size(inputs)?
+                    .expect("a mapped input pins the batch size");
                 let (lifted_dimensions, lifted_target, target_batch_axis) =
                     lift_broadcast(self.output_axes(), self.output_type(), batch_axis, axis_size)?;
                 let output_value =
                     inputs[0].value().clone().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
-                Ok(vec![crate::tracing_v2::batching::ArrayBatch::new(
-                    lifted_target,
-                    output_value,
-                    Some(target_batch_axis),
-                )?])
+                Ok(vec![crate::batching::ArrayBatch::new(lifted_target, output_value, Some(target_batch_axis))?])
             }
         }
     }
@@ -161,22 +160,20 @@ impl<V: Value<ArrayType> + Broadcast, C> crate::tracing_v2::batching::BatchableO
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::rc::Rc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
-    use crate::differentiation::Cotangent;
-    use crate::domains::AbstractDomain;
     use crate::parameters::Placeholder;
-    use crate::programs::{Program, ProgramBuilder};
-    use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing::AbstractTracingContext;
+    use crate::programs::Program;
+    use crate::tests::TestArray;
+    use crate::tracing::TracingContext;
+    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{ArrayOperation, LinearArrayOperation};
     use crate::types::{DataType, Typed};
 
     use super::*;
@@ -186,29 +183,18 @@ mod tests {
     fn transposed_broadcast_program(
         operation: &BroadcastOperation,
         input_type: &ArrayType,
-    ) -> Program<
-        ArrayType,
-        TestArray,
-        LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        TestArray,
-        TestArray,
-    > {
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new()));
+    ) -> Program<TestArray, ArrayOperation<TestArray>, TestArray, TestArray> {
+        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let builder = context.builder().clone();
         let cotangent_atom = builder.borrow_mut().add_input(operation.output_type().clone());
-        let domain = AbstractDomain::new();
-        let mut context = AbstractTracingContext::new(&domain, builder.clone());
         let cotangent = context.tracer(cotangent_atom, None);
         let contribution = operation
-            .transpose(&mut context, &[input_type], &[Cotangent::Staged(cotangent)])
+            .transpose(&mut context, &[PartialValue::Unknown(input_type.clone())], &[MaybeZero::Value(cotangent)])
             .unwrap()
             .into_iter()
             .next()
             .expect("transpose should return one contribution");
-        let Cotangent::Staged(contribution) = contribution else {
+        let MaybeZero::Value(contribution) = contribution else {
             panic!("transpose should produce one staged cotangent contribution");
         };
         let contribution_atom = contribution.atom_id().unwrap();
@@ -285,16 +271,12 @@ mod tests {
     fn test_broadcast_transpose_propagates_symbolic_zero() {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let operation = BroadcastOperation::new(output_type, vec![1]);
+        let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
 
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>,
-        >::new()));
-        let domain = AbstractDomain::new();
-        let mut context = AbstractTracingContext::new(&domain, builder);
-        let contributions = operation.transpose(&mut context, &[&input_type], &[Cotangent::Zero]).unwrap();
+        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let contributions = operation
+            .transpose(&mut context, &[PartialValue::Unknown(input_type)], &[MaybeZero::Zero(output_type)])
+            .unwrap();
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
     }
@@ -305,7 +287,7 @@ mod tests {
         // twice, so the gradient is 2 at every coordinate.
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let (value, gradient) = crate::tracing_v2::value_and_grad(
-            &TestArrayDomain,
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| x.broadcast(output_type.clone(), &[1]).unwrap().reduce(&[0, 1], ReductionKind::Sum),
             TestArray::vector(vec![1.0, 2.0, 3.0]),
         )

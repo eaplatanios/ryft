@@ -1,8 +1,9 @@
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchableProgramOperation, ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{DifferentiableType, TransposableOperation, TransposableProgramOperation};
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::check_count;
@@ -12,7 +13,7 @@ use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
 use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
-    Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, TransposeOperation, move_axis_permutation,
+    Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Placeholder;
@@ -20,16 +21,15 @@ use crate::partial::PartialValue;
 use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::batching::{BatchingContext, align_batch_axis, broadcast_to_batched};
 
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, Linearization, materialize,
+    DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, Linearization, materialize, replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
-use crate::types::{ArrayType, DataType, Size, Type, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
-impl<V: Value<ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
+impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
     /// Returns an [`ArrayBatch`] that wraps the Boolean reinterpretation of the carried value (via the value's own
     /// [`BooleanLike::as_boolean`]) under the same batch axis.
     fn as_boolean(&self) -> Self {
@@ -90,16 +90,14 @@ impl<V: Value<ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
 ///     tangents; the [`Known`](PartialValue::Known) entries carry the predicate and residual tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the condition's outputs.
 pub fn transpose_primal_condition<V, O>(
-    operation: &ConditionOperation<ArrayType, V, O>,
-    context: &mut TracingContext<ArrayType, V, O>,
-    inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-    outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>>, ProgramError>
+    operation: &ConditionOperation<V, O>,
+    context: &mut TracingContext<V, O>,
+    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
-    V: Value<ArrayType>,
-    O: TransposableProgramOperation<ArrayType, V>
-        + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<ArrayType, V, O>>,
+    V: Value<Type = ArrayType>,
+    O: TransposableProgramOperation<V> + From<ZeroOperation<ArrayType>> + From<ConditionOperation<V, O>>,
 {
     // A condition with no live output cotangents is a zero linear map, so every operand cotangent is zero.
     if outputs.iter().all(MaybeZero::is_zero) {
@@ -121,7 +119,7 @@ where
 
     // The predicate is operand `0` and the residuals are the trailing operands; both are known values read from the
     // pullback. The dispatch guarantees a `Known` operand carries its pullback value, so each tracer is read directly.
-    let read_known = |index: usize| -> Result<Tracer<TracingContext<ArrayType, V, O>>, ProgramError> {
+    let read_known = |index: usize| -> Result<Tracer<TracingContext<V, O>>, ProgramError> {
         inputs[index]
             .as_known()
             .ok_or_else(|| {
@@ -171,8 +169,8 @@ where
 /// Appends one fresh variable atom to a built `program` by direct program-field extension (every appended atom is a
 /// fresh variable, so the [`Program`] invariants that [`ProgramBuilder`] would have established are preserved) and
 /// returns its id.
-fn append_program_variable<V: Value<ArrayType>, O>(
-    program: &mut Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+fn append_program_variable<V: Value<Type = ArrayType>, O>(
+    program: &mut Program<V, O, Vec<V>, Vec<V>>,
     r#type: ArrayType,
 ) -> AtomId {
     let id = AtomId::new(program.atoms.len());
@@ -183,8 +181,8 @@ fn append_program_variable<V: Value<ArrayType>, O>(
 /// Appends one instruction with a single fresh output atom to a built `program` by direct program-field extension
 /// (the appended instruction reads existing atoms and writes a fresh variable, so the [`Program`] invariants that
 /// [`ProgramBuilder`] would have established are preserved) and returns the output id.
-fn append_program_instruction<V: Value<ArrayType>, O>(
-    program: &mut Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+fn append_program_instruction<V: Value<Type = ArrayType>, O>(
+    program: &mut Program<V, O, Vec<V>, Vec<V>>,
     operation: O,
     inputs: Vec<AtomId>,
     output_type: ArrayType,
@@ -192,54 +190,6 @@ fn append_program_instruction<V: Value<ArrayType>, O>(
     let output = append_program_variable(program, output_type);
     program.instructions.push(Instruction::new(operation, inputs, vec![output]));
     output
-}
-
-/// Normalizes output `output_index` of a naturally batched program (see [`batch_program`](
-/// crate::tracing_v2::batching::batch_program)) to carry its mapped batch axis at `target_axis` by appending a
-/// staged axis-moving operation at the program tail: a transpose when the output is batched at a different axis, and
-/// a broadcast that inserts the batch axis when the output is replicated. The staged `condition` and `while`
-/// batching rules use this to make the batched programs they capture agree on one output-axis layout (matching
-/// branch signatures for `condition` and loop-invariant state types for `while`).
-fn normalize_batched_program_output_axis<V, O>(
-    program: &mut Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    output_index: usize,
-    current_axis: BatchAxis,
-    target_axis: usize,
-    axis_size: usize,
-) -> Result<(), ProgramError>
-where
-    V: Value<ArrayType>,
-    O: Operation<ArrayType> + From<TransposeOperation> + From<BroadcastOperation>,
-{
-    let output_id = program.output_ids[output_index];
-    let output_type = program.output_types()[output_index].clone();
-    match current_axis.axis() {
-        Some(axis) if axis == target_axis => {}
-        Some(axis) => {
-            let (logical_type, batch_dimension) = output_type.without_dimension(axis)?;
-            let permuted_type = logical_type.with_inserted_dimension(target_axis, batch_dimension)?;
-            let permutation = move_axis_permutation(output_type.rank(), axis, target_axis);
-            program.output_ids[output_index] = append_program_instruction(
-                program,
-                O::from(TransposeOperation::new(permutation)),
-                vec![output_id],
-                permuted_type,
-            );
-        }
-        None => {
-            let physical_type = output_type.with_inserted_dimension(target_axis, Size::Static(axis_size))?;
-            let output_axes = (0..output_type.rank())
-                .map(|axis| if axis < target_axis { axis } else { axis + 1 })
-                .collect::<Vec<_>>();
-            program.output_ids[output_index] = append_program_instruction(
-                program,
-                O::from(BroadcastOperation::new(physical_type.clone(), output_axes)),
-                vec![output_id],
-                physical_type,
-            );
-        }
-    }
-    Ok(())
 }
 
 /// Builds the augmented condition and body programs of the bounded staged while loop (see the [`WhileOperation`] JVP
@@ -259,16 +209,13 @@ where
 ///
 /// Returns the extended condition, the augmented body, and the `[bound, …]` residual stack types.
 fn build_bounded_while_programs<V, O>(
-    condition: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
-    primal_body: &Program<ArrayType, V, O, Vec<V>, Vec<V>>,
+    condition: &Program<V, O, Vec<V>, Vec<V>>,
+    primal_body: &Program<V, O, Vec<V>, Vec<V>>,
     residual_types: &[ArrayType],
     bound: usize,
-) -> Result<
-    (Program<ArrayType, V, O, Vec<V>, Vec<V>>, Program<ArrayType, V, O, Vec<V>, Vec<V>>, Vec<ArrayType>),
-    ProgramError,
->
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, Vec<ArrayType>), ProgramError>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
     O: Clone
         + Operation<ArrayType>
         + From<ZeroOperation<ArrayType>>
@@ -410,13 +357,13 @@ where
 ///
 /// The predicate is the first operand and carries no tangent (Boolean predicates have no tangent space); the fused
 /// conditional selects the same branch for both halves because they share the same primal predicate edge.
-impl<C: Context<Type = ArrayType> + Zero<ArrayType, C::Value>> DifferentiableOperation<C>
-    for ConditionOperation<ArrayType, C::Constant, C::Operation>
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C>
+    for ConditionOperation<C::Constant, C::Operation>
 where
     C::Operation: Clone
         + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<ArrayType, C::Constant, C::Operation>>
-        + DifferentiableProgramOperation<ArrayType, C::Constant, C::Operation>,
+        + From<ConditionOperation<C::Constant, C::Operation>>
+        + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
     fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, self.true_branch().input_types().len() + 1, ProgramError);
@@ -449,6 +396,24 @@ where
             .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
             .collect())
     }
+}
+
+/// Type-family forward-mode (JVP) semantics for [`WhileOperation`], with the differentiation context riding as a
+/// trait input and the type family as the implementing type (mirroring the partial-evaluation dispatch in the
+/// `while` module) so that the [`ArrayType`] and [`DataType`] rules stay coherent without the operation struct
+/// naming its type family as a parameter, and so that each family implementation carries exactly the capability
+/// bounds its rule needs.
+pub(crate) trait WhileJvp<C>: Type
+where
+    C: Context<Type = Self, Operation: Clone>,
+{
+    /// Applies the type family's `while` forward-mode rule; refer to the documentation of
+    /// [`DifferentiableOperation::jvp`] for the contract.
+    fn jvp_while(
+        operation: &WhileOperation<C::Constant, C::Operation>,
+        context: &C,
+        inputs: &[JvpTracer<C>],
+    ) -> Result<Vec<JvpTracer<C>>, ProgramError>;
 }
 
 /// Capture-free forward-mode (JVP) rule for the bounded [`WhileOperation`], staging an augmented primal `while`
@@ -491,8 +456,7 @@ where
 /// capture, and the single outer transpose flips the scan direction and transposes the body — the masked pushforward
 /// side receives a zero cotangent on inactive batch items while the carried side receives the full cotangent, so
 /// cotangents pass through inactive batch items unchanged exactly like the capture-based rule.
-impl<C: Context<Type = ArrayType> + Zero<ArrayType, C::Value>> DifferentiableOperation<C>
-    for WhileOperation<ArrayType, C::Constant, C::Operation>
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
     C::Operation: Clone
         + From<ZeroOperation<ArrayType>>
@@ -501,23 +465,51 @@ where
         + From<BroadcastOperation>
         + From<DynamicUpdateSliceOperation>
         + From<SelectOperation>
-        + From<WhileOperation<ArrayType, C::Constant, C::Operation>>
-        + From<ScanOperation<ArrayType, C::Constant, C::Operation>>
-        + DifferentiableProgramOperation<ArrayType, C::Constant, C::Operation>,
+        + From<ReduceOperation>
+        + From<AndOperation>
+        + From<WhileOperation<C::Constant, C::Operation>>
+        + From<ScanOperation<C::Constant, C::Operation>>
+        + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
-        let state_types = self.state_types();
+    fn jvp_while(
+        operation: &WhileOperation<C::Constant, C::Operation>,
+        context: &C,
+        inputs: &[JvpTracer<C>],
+    ) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        let state_types = operation.state_types();
         let state_count = state_types.len();
         check_count!("input", inputs, state_count, ProgramError);
 
+        // A batched (per-item) predicate cannot thread the bounded rule's augmented differentiation state through the
+        // predicate-prefix contract (the scalar iteration counter and the `[bound, ...]` residual stacks are not
+        // predicate-prefixed), so the loop is first rewritten into its scalar-predicate masked normal form over
+        // `[state..., active_mask]` (see `masked_while_programs`) and differentiated recursively — the masked loop's
+        // forward mode is this same rule. The initial mask is the condition replayed on the operand primals, carried
+        // with a zero tangent since a Boolean mask has no derivative.
+        let predicate_type = operation.condition().output_types()[0].clone();
+        if predicate_type.rank() > 0 {
+            let (masked_condition, masked_body) = masked_while_programs(operation.condition(), operation.body())?;
+            let masked_while = WhileOperation::<C::Constant, C::Operation>::new(masked_condition, masked_body)?
+                .with_iteration_bound(operation.iteration_bound())?;
+            let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let mut initial_mask = replay_via_bind(context, operation.condition(), primal_operands)?;
+            check_count!("output", initial_mask, 1, ProgramError);
+            let mut extended_inputs = inputs.to_vec();
+            extended_inputs.push(JvpTracer::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type)));
+            let mut outputs = masked_while.jvp(context, extended_inputs.as_slice())?;
+            check_count!("output", outputs, state_count + 1, ProgramError);
+            outputs.truncate(state_count);
+            return Ok(outputs);
+        }
+
         // An unbounded while loop has no statically shaped residual stack and no transposable form, so it has no
         // capture-free forward-mode rule.
-        let Some(bound) = self.iteration_bound() else {
+        let Some(bound) = operation.iteration_bound() else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "operation `{}` has no capture-free forward-mode linearization rule unless it carries an \
                      iteration bound; an unbounded while loop has no forward-mode rule",
-                    self.name(),
+                    operation.name(),
                 ),
             });
         };
@@ -526,7 +518,7 @@ where
         // tangent body consumes `[state_tangent..., residuals...]`; the residual count is the number of trailing
         // outputs of the primal body beyond the loop state.
         let Linearization { primal_program, tangent_program, residual_count, .. } =
-            C::Operation::linearize_program(self.body())?;
+            C::Operation::linearize_program(operation.body())?;
         let residual_types = primal_program.output_types().split_off(state_count);
 
         // Build and bind the augmented primal while over `[state..., counter, residual_stacks..., mask_stack]`, with
@@ -536,10 +528,9 @@ where
         let boolean_scalar_type = ArrayType::scalar(DataType::Boolean);
         let mask_stack_type = stacked_scan_type(&boolean_scalar_type, bound);
         let (extended_condition, augmented_body, stack_types) =
-            build_bounded_while_programs(self.condition(), &primal_program, residual_types.as_slice(), bound)?;
-        let augmented_while =
-            WhileOperation::<ArrayType, C::Constant, C::Operation>::new(extended_condition, augmented_body)?
-                .with_iteration_bound(bound)?;
+            build_bounded_while_programs(operation.condition(), &primal_program, residual_types.as_slice(), bound)?;
+        let augmented_while = WhileOperation::<C::Constant, C::Operation>::new(extended_condition, augmented_body)?
+            .with_iteration_bound(bound)?;
         let mut primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let zero_state_types =
             std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type));
@@ -627,7 +618,7 @@ where
         // Stage the length-`bound` tangent scan over the carry tangents followed by the stacked residuals and then the
         // per-differentiable-state-element mask stacks. Iteration `item` reads residual slice `item` and mask slice
         // `item`.
-        let tangent_scan = ScanOperation::<ArrayType, C::Constant, C::Operation>::new(scan_body, state_count, bound)?;
+        let tangent_scan = ScanOperation::<C::Constant, C::Operation>::new(scan_body, state_count, bound)?;
         // The tangent scan takes every carry tangent as a real program input, so materialize structural zeros.
         let mut tangent_operands = inputs
             .iter()
@@ -650,20 +641,36 @@ where
 /// expressible as primal-enum operand arithmetic (there is no scalar residual-stack representation backing the
 /// masked tangent scan the bounded array rule stages), so the rule reports an
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<C: Context<Type = DataType>> DifferentiableOperation<C> for WhileOperation<DataType, C::Constant, C::Operation>
+impl<C: Context<Type = DataType>> WhileJvp<C> for DataType
 where
     C::Operation: Clone,
 {
-    fn jvp(&self, _context: &C, _inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp_while(
+        operation: &WhileOperation<C::Constant, C::Operation>,
+        _context: &C,
+        _inputs: &[JvpTracer<C>],
+    ) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no capture-free forward-mode linearization rule", self.name()),
+            message: format!("operation `{}` has no capture-free forward-mode linearization rule", operation.name()),
         })
     }
 }
 
-impl<T: Type, V: Value<T>, O, Payload> TransposableOperation<T, V, O> for WhileOperation<T, V, O, Payload>
+/// Forward-mode (JVP) rule for [`WhileOperation`], dispatching to the loop's type family through [`WhileJvp`]: array
+/// loops stage the hybrid bounded rule documented on that trait's [`ArrayType`] implementation, and scalar loops
+/// report an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+impl<C: Context<Operation: Clone>> DifferentiableOperation<C> for WhileOperation<C::Constant, C::Operation>
 where
-    O: Operation<T>,
+    C::Type: WhileJvp<C>,
+{
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        <C::Type>::jvp_while(self, context, inputs)
+    }
+}
+
+impl<V: Value, O, Payload> TransposableOperation<V, O> for WhileOperation<V, O, Payload>
+where
+    O: Operation<V::Type>,
 {
     /// Rejects transposition. This rule is only reachable for *unbounded* staged while loops — the doubled-state
     /// linear loop staged by the [`WhileOperation`] JVP rule, which recomputes primal state *forward* through
@@ -675,10 +682,10 @@ where
     /// scan transpose without reaching this rule.
     fn transpose(
         &self,
-        _context: &mut TracingContext<T, V, O>,
-        _inputs: &[PartialValue<T, Tracer<TracingContext<T, V, O>>>],
-        _outputs: &[MaybeZero<T, Tracer<TracingContext<T, V, O>>>],
-    ) -> Result<Vec<MaybeZero<T, Tracer<TracingContext<T, V, O>>>>, ProgramError> {
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "while does not support transposition (reverse-mode differentiation through staged unbounded \
                       while loops is not supported; eager differentiation unrolls the loop instead, and loops built \
@@ -694,17 +701,17 @@ where
 /// remaining operand inputs. A batch-varying predicate interprets both branches over the operand inputs and merges
 /// their outputs per batch item via [`Select`](crate::operations::control_flow::Select).
 pub(crate) fn batch_condition_with_interpreter<VOperation, V, O, F>(
-    true_branch: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    false_branch: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    true_branch: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    false_branch: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
-    VOperation: Value<ArrayType>,
-    V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
+    VOperation: Value<Type = ArrayType>,
+    V: Value<Type = ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
     O: Operation<ArrayType>,
     F: FnMut(
-        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
 {
@@ -750,14 +757,14 @@ where
     }
 }
 
-impl<V, O> BatchableOperation<V, EagerContext<ArrayType, V, O>> for ConditionOperation<ArrayType, V, O>
+impl<V, O> BatchableOperation<V, EagerContext<V, O>> for ConditionOperation<V, O>
 where
-    V: Value<ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
-    O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
+    V: Value<Type = ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
+    O: BatchableOperation<V, EagerContext<V, O>>,
 {
     fn batch(
         &self,
-        context: &EagerContext<ArrayType, V, O>,
+        context: &EagerContext<V, O>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         batch_condition_with_interpreter(self.true_branch(), self.false_branch(), inputs, |program, program_inputs| {
@@ -777,7 +784,7 @@ where
 /// way the value-level rule above does. Instead of erroring, this rule *stages batched condition structure*:
 ///
 ///   - **Replicated predicate.** Both branch programs are batched at the operand batch axes via
-///     [`batch_program`](crate::tracing_v2::batching::batch_program) (the batching analog of symbolic program
+///     [`Program::batched`](crate::Program::batched) (the batching analog of symbolic program
 ///     linearization), their per-output batch axes are
 ///     normalized to a common layout by appending staged axis-moving operations at the branch tails when they
 ///     disagree (a transpose for a mismatched axis, a broadcast for a replicated output paired with a batched
@@ -787,22 +794,23 @@ where
 ///   - **Batch-varying predicate.** Both branches are interpreted over the operand inputs and merged per batch item
 ///     via [`Select`](crate::operations::control_flow::Select), exactly like the value-level rule: every per-item
 ///     primitive stages through the tracers, so the multi-operation rewrite composes under tracing already.
-impl<C, O> BatchableOperation<Tracer<C, C::Meta>, BatchingContext<C>> for ConditionOperation<ArrayType, C::Constant, O>
+impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for ConditionOperation<C::Constant, O>
 where
-    C: StagingContext<Type = ArrayType, Operation = O>,
-    C::Constant: Value<ArrayType>,
-    O: BatchableOperation<Tracer<C, C::Meta>, BatchingContext<C>>
+    C: Context<Type = ArrayType, Operation = O>,
+    C::Constant: Value<Type = ArrayType>,
+    <C as Domain>::Value: BooleanLike + Select<Condition = <C as Domain>::Value>,
+    O: BatchableOperation<<C as Domain>::Value, BatchingContext<C>>
         + BatchableProgramOperation<C::Constant>
         + From<TransposeOperation>
         + From<BroadcastOperation>
         + From<SelectOperation>
-        + From<ConditionOperation<ArrayType, C::Constant, O>>,
+        + From<ConditionOperation<C::Constant, O>>,
 {
     fn batch(
         &self,
         context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<Tracer<C, C::Meta>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C, C::Meta>>>, BatchingError> {
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: "cannot batch a condition operation with no predicate input".to_string(),
@@ -819,51 +827,50 @@ where
             );
         }
 
-        // Replicated (abstract) predicate: batch both branches at the operand batch axes and normalize their
-        // output axes to a common layout, preferring the true branch's natural axis when both are batched.
+        // Replicated (abstract) predicate: batch both branches at the operand batch axes with natural output axes to
+        // discover which outputs each branch batches (the discovery programs are discarded), join the two answers into
+        // one output layout — preferring the true branch's natural axis when both are batched — and re-batch each
+        // branch instantiated at the joined targets so the branch signatures agree. This is the two-pass shape of
+        // JAX's `_cond_batching_rule` (`batch_jaxpr` with `instantiate=out_bat`).
         let axis_size = context.axis_size();
         let operand_axes = operand_inputs.iter().map(|input| input.batch_axis()).collect::<Vec<_>>();
-        let (mut batched_true_branch, true_axes) =
-            self.true_branch()
-                .batched(axis_size, operand_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
-        let (mut batched_false_branch, false_axes) = self.false_branch().batched(
+        let (_, true_axes) = O::batch_program(
+            self.true_branch(),
+            axis_size,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
+        let (_, false_axes) = O::batch_program(
+            self.false_branch(),
             axis_size,
             operand_axes.as_slice(),
             ProgramBatchingOutputAxesPolicy::Natural,
         )?;
         check_count!("output", false_axes, true_axes.len(), ProgramError);
-        let mut output_axes = Vec::with_capacity(true_axes.len());
-        for (output_index, (true_axis, false_axis)) in true_axes.iter().zip(false_axes.iter()).enumerate() {
-            let target_axis = match (true_axis.axis(), false_axis.axis()) {
-                (None, None) => {
-                    output_axes.push(BatchAxis::replicated());
-                    continue;
-                }
-                (Some(axis), _) | (None, Some(axis)) => axis,
-            };
-            normalize_batched_program_output_axis(
-                &mut batched_true_branch,
-                output_index,
-                *true_axis,
-                target_axis,
-                axis_size,
-            )?;
-            normalize_batched_program_output_axis(
-                &mut batched_false_branch,
-                output_index,
-                *false_axis,
-                target_axis,
-                axis_size,
-            )?;
-            output_axes.push(BatchAxis::new(target_axis));
-        }
+        let output_axes: Vec<BatchAxis> = true_axes
+            .iter()
+            .zip(false_axes.iter())
+            .map(|(true_axis, false_axis)| if true_axis.is_replicated() { *false_axis } else { *true_axis })
+            .collect();
+        let (batched_true_branch, _) = O::batch_program(
+            self.true_branch(),
+            axis_size,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+        )?;
+        let (batched_false_branch, _) = O::batch_program(
+            self.false_branch(),
+            axis_size,
+            operand_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(output_axes.clone()),
+        )?;
 
         // Stage one condition over the batched branches with the unbatched predicate passed through.
         let batched_condition = ConditionOperation::new(batched_true_branch, batched_false_branch)?;
         let mut staged_inputs = Vec::with_capacity(inputs.len());
         staged_inputs.push(predicate_batch.value().clone());
         staged_inputs.extend(operand_inputs.iter().map(|input| input.value().clone()));
-        let outputs = context.parent_context().stage_operation(batched_condition, staged_inputs.as_slice())?;
+        let outputs = context.parent().bind(batched_condition, staged_inputs.as_slice())?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
         outputs
             .into_iter()
@@ -877,13 +884,13 @@ where
 }
 
 pub(crate) fn batch_while_with_interpreter<VOperation, V, O, Payload, F>(
-    while_operation: &WhileOperation<ArrayType, VOperation, O, Payload>,
+    while_operation: &WhileOperation<VOperation, O, Payload>,
     inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
-    VOperation: Value<ArrayType>,
-    V: Value<ArrayType>
+    VOperation: Value<Type = ArrayType>,
+    V: Value<Type = ArrayType>
         + BooleanLike
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
@@ -891,7 +898,7 @@ where
         + crate::operations::manipulation::Broadcast,
     O: Operation<ArrayType>,
     F: FnMut(
-        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
 {
@@ -930,19 +937,19 @@ where
     )
 }
 
-impl<V, O, Payload> BatchableOperation<V, EagerContext<ArrayType, V, O>> for WhileOperation<ArrayType, V, O, Payload>
+impl<V, O, Payload> BatchableOperation<V, EagerContext<V, O>> for WhileOperation<V, O, Payload>
 where
-    V: Value<ArrayType>
+    V: Value<Type = ArrayType>
         + BooleanLike
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast,
-    O: BatchableOperation<V, EagerContext<ArrayType, V, O>>,
+    O: BatchableOperation<V, EagerContext<V, O>>,
 {
     fn batch(
         &self,
-        context: &EagerContext<ArrayType, V, O>,
+        context: &EagerContext<V, O>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         batch_while_with_interpreter(self, inputs, |program, program_inputs| {
@@ -961,13 +968,14 @@ where
 /// structure*:
 ///
 ///   1. Every batched state input is realigned to batch axis `0` in the parent context, and the body is batched at
-///      the state batch axes via [`batch_program`](crate::tracing_v2::batching::batch_program),
+///      the state batch axes via [`Program::batched`](crate::Program::batched),
 ///      iterating the axes to a fixed point: a while loop's state types are loop-invariant, so a replicated state
 ///      element whose update depends on a batched element *becomes* batched, and the rule widens that element's
 ///      input axis and re-batches until the body is axis-invariant (the iteration count is bounded by the state
-///      count because every non-final pass widens at least one element). Body outputs that remain replicated or
-///      land on a different axis than their loop-invariant input are normalized by staged axis-moving operations at
-///      the batched body's tail, and widened parent inputs gain their batch axis through staged broadcasts.
+///      count because every non-final pass widens at least one element). Each pass instantiates the body outputs at
+///      the current state axes ([`ProgramBatchingOutputAxesPolicy::AlignEachTo`], mirroring JAX's
+///      `instantiate=carry_bat`), so the converged body is already aligned to the loop-invariant state layout, and
+///      widened parent inputs gain their batch axis through staged broadcasts.
 ///   2. The condition is batched at the stabilized axes. When its predicate output stays *replicated*, one
 ///      [`WhileOperation`] over the batched condition and body is staged directly, preserving any semantic
 ///      [`iteration_bound`](WhileOperation::with_iteration_bound) (so bounded loops stay reverse-capable under
@@ -981,10 +989,11 @@ where
 ///      mask. The initial mask is the batched condition staged once over the initial state in the parent context,
 ///      and the iteration bound is preserved (batch items share masked iterations, so capping the staged loop
 ///      matches per-item truncation exactly, like the operational rule).
-impl<C, O> BatchableOperation<Tracer<C, C::Meta>, BatchingContext<C>> for WhileOperation<ArrayType, C::Constant, O>
+impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for WhileOperation<C::Constant, O>
 where
-    C: StagingContext<Type = ArrayType, Operation = O>,
-    C::Constant: Value<ArrayType>,
+    C: Context<Type = ArrayType, Operation = O>,
+    C::Constant: Value<Type = ArrayType>,
+    <C as Domain>::Value: Broadcast + Transpose,
     O: Clone
         + BatchableProgramOperation<C::Constant>
         + From<TransposeOperation>
@@ -992,30 +1001,36 @@ where
         + From<ReduceOperation>
         + From<SelectOperation>
         + From<AndOperation>
-        + From<WhileOperation<ArrayType, C::Constant, O>>,
+        + From<WhileOperation<C::Constant, O>>,
 {
     fn batch(
         &self,
         context: &BatchingContext<C>,
-        inputs: &[ArrayBatch<Tracer<C, C::Meta>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<C, C::Meta>>>, BatchingError> {
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         let state_count = self.state_types().len();
         check_count!("input", inputs, state_count, ProgramError);
         let axis_size = context.axis_size();
 
         // Realign every batched state input to batch axis 0 in the parent context, so the loop-invariance fixed
         // point below only ever distinguishes replicated (`None`) from batched-at-0 (`Some(0)`) state elements.
-        let mut state = inputs.iter().map(|input| align_batch_axis(input, 0)).collect::<Result<Vec<_>, _>>()?;
+        let mut state = inputs.iter().map(|input| input.move_axis(0)).collect::<Result<Vec<_>, _>>()?;
         let mut state_axes = state.iter().map(|input| input.batch_axis()).collect::<Vec<_>>();
 
         // Iterate the body's batch axes to a fixed point: a replicated state element whose update is batched
         // becomes batched. Every non-final pass widens at least one of the `state_count` elements, so the loop
         // stabilizes within `state_count + 1` passes by construction; the trailing error guards the contract that
-        // separately implemented batching rules report widening monotonically.
+        // separately implemented batching rules report widening monotonically. Each pass instantiates the body's
+        // outputs at the current state axes (JAX's `instantiate=carry_bat`), so the body that stabilizes the fixed
+        // point is already aligned to the loop-invariant state layout and needs no further normalization.
         let mut batched_body = None;
         for _ in 0..=state_count {
-            let (candidate_body, body_axes) =
-                self.body().batched(axis_size, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
+            let (candidate_body, body_axes) = O::batch_program(
+                self.body(),
+                axis_size,
+                state_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
+            )?;
             check_count!("output", body_axes, state_count, ProgramError);
             let mut widened = false;
             for (state_axis, body_axis) in state_axes.iter_mut().zip(body_axes.iter()) {
@@ -1025,11 +1040,11 @@ where
                 }
             }
             if !widened {
-                batched_body = Some((candidate_body, body_axes));
+                batched_body = Some(candidate_body);
                 break;
             }
         }
-        let Some((mut batched_body, mut body_axes)) = batched_body else {
+        let Some(mut batched_body) = batched_body else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
                     "while loop batching failed to stabilize the loop state batch axes within {state_count} \
@@ -1042,38 +1057,38 @@ where
         // Batch the condition at the stabilized axes; a batched predicate output means per-item termination, in
         // which case every state element participates in per-item masking and is therefore widened to a batched
         // element before the masked loop structure is built.
-        let (mut batched_condition, mut condition_axes) =
-            self.condition()
-                .batched(axis_size, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
+        let (mut batched_condition, mut condition_axes) = O::batch_program(
+            self.condition(),
+            axis_size,
+            state_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::Natural,
+        )?;
         check_count!("output", condition_axes, 1, ProgramError);
         let batch_varying = !condition_axes[0].is_replicated();
         if batch_varying && state_axes.iter().any(|axis| axis.is_replicated()) {
             state_axes = vec![BatchAxis::new(0); state_count];
-            (batched_body, body_axes) =
-                self.body().batched(axis_size, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
+            let (widened_body, body_axes) = O::batch_program(
+                self.body(),
+                axis_size,
+                state_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(state_axes.clone()),
+            )?;
             check_count!("output", body_axes, state_count, ProgramError);
-            (batched_condition, condition_axes) =
-                self.condition()
-                    .batched(axis_size, state_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
+            batched_body = widened_body;
+            (batched_condition, condition_axes) = O::batch_program(
+                self.condition(),
+                axis_size,
+                state_axes.as_slice(),
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )?;
             check_count!("output", condition_axes, 1, ProgramError);
         }
 
-        // Normalize the batched body's output axes to the loop-invariant input axes and widen the parent state
-        // values whose elements became batched (their batch axis is materialized through a staged broadcast).
-        for (output_index, (state_axis, body_axis)) in state_axes.iter().zip(body_axes.iter()).enumerate() {
-            if let Some(target_axis) = state_axis.axis() {
-                normalize_batched_program_output_axis(
-                    &mut batched_body,
-                    output_index,
-                    *body_axis,
-                    target_axis,
-                    axis_size,
-                )?;
-            }
-        }
+        // Widen the parent state values whose elements became batched (their batch axis is materialized through a
+        // staged broadcast); the batched body's outputs are already aligned to the state axes by the fixed point.
         for (element, state_axis) in state.iter_mut().zip(state_axes.iter()) {
             if !state_axis.is_replicated() && element.batch_axis().is_replicated() {
-                *element = broadcast_to_batched(element, 0, axis_size)?;
+                *element = element.broadcast(0, axis_size)?;
             }
         }
         let state_values = state.iter().map(|element| element.value().clone()).collect::<Vec<_>>();
@@ -1082,7 +1097,7 @@ where
         if !batch_varying {
             let batched_while =
                 WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
-            let outputs = context.parent_context().stage_operation(batched_while, state_values.as_slice())?;
+            let outputs = context.parent().bind(batched_while, state_values.as_slice())?;
             check_count!("output", outputs, state_count, ProgramError);
             return outputs
                 .into_iter()
@@ -1094,68 +1109,25 @@ where
                 .collect();
         }
 
-        // Batch-varying predicate: build the masked loop as program data over `[state..., active_mask]`.
-        let Some(predicate_axis) = condition_axes[0].axis() else {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "while loop condition produced a replicated predicate after widening the loop state to \
-                          batched elements; this is not supported"
-                    .to_string(),
-            }
-            .into());
-        };
-        let batched_state_types = batched_body.input_types();
-        let mask_type = batched_condition.output_types()[0].clone();
-        let mut masked_state_types = batched_state_types.clone();
-        masked_state_types.push(mask_type.clone());
-
-        // Masked condition: `any(active_mask)` along the batch axis, ignoring the state inputs.
-        let (_, masked_condition) = TracingContext::<ArrayType, C::Constant, O>::trace(
-            |inputs| Ok(vec![inputs[state_count].reduce(&[predicate_axis], ReductionKind::Any)]),
-            masked_state_types.clone(),
+        // Batch-varying predicate (per-item termination): re-batch the condition with its predicate output
+        // instantiated at axis 0 and stage the while directly with that batched predicate, mirroring JAX's
+        // `_while_loop_batching_rule` (which re-batches the cond jaxpr with the predicate at dimension 0 and binds
+        // `while_p` directly). The predicate's `[axis_size]` shape is a prefix of every (widened) state shape, so the
+        // staged loop satisfies the relaxed predicate contract, and the loop's consumers own the masked semantics:
+        // eager interpretation continues while any per-item predicate is true and freezes finished items through
+        // [`WhilePredicate::mask_select`](crate::operations::control_flow::WhilePredicate), and the XLA lowering
+        // reduces the predicate with `or` and masks carry updates with a broadcast select.
+        let (batched_condition, condition_axes) = O::batch_program(
+            self.condition(),
+            axis_size,
+            state_axes.as_slice(),
+            ProgramBatchingOutputAxesPolicy::AlignEachTo(vec![BatchAxis::new(0)]),
         )?;
-
-        // Masked body: candidate updates from the spliced batched body, per-element masked selection between the
-        // candidate update and the carried state, the per-item predicate recomputed on the new state, and the mask
-        // narrowed via AND.
-        let (_, masked_body) = TracingContext::<ArrayType, C::Constant, O>::trace(
-            |inputs| {
-                let (mask, state) = inputs.split_last().unwrap();
-                let trace_context = mask.context().clone();
-                let candidates = trace_context.stage_program(&batched_body, state.to_vec())?;
-                check_count!("output", candidates, state_count, ProgramError);
-                let mut next_state = Vec::with_capacity(state_count);
-                for ((candidate, carried), state_type) in candidates.iter().zip(state).zip(batched_state_types.iter()) {
-                    // The mask broadcasts to each state element's shape so the selection is per batch item; a state
-                    // element already shaped like the mask reuses it directly.
-                    let element_mask_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
-                    let element_mask = if element_mask_type == mask_type {
-                        mask.clone()
-                    } else {
-                        mask.broadcast(element_mask_type, &[predicate_axis])?
-                    };
-                    next_state.push(Select::select(&element_mask, candidate, carried)?);
-                }
-                let next_predicate = trace_context.stage_program(&batched_condition, next_state.clone())?;
-                check_count!("output", next_predicate, 1, ProgramError);
-                let mut outputs = next_state;
-                outputs.push(mask.clone() & next_predicate.into_iter().next().unwrap());
-                Ok(outputs)
-            },
-            masked_state_types,
-        )?;
-
-        // The initial mask is the batched condition applied to the initial state, staged in the parent context.
-        let initial_mask_outputs = context.parent_context().stage_program(&batched_condition, state_values.clone())?;
-        check_count!("output", initial_mask_outputs, 1, ProgramError);
-        let mut staged_inputs = state_values;
-        staged_inputs.extend(initial_mask_outputs);
-
-        let masked_while =
-            WhileOperation::new(masked_condition, masked_body)?.with_iteration_bound(self.iteration_bound())?;
-        let mut outputs = context.parent_context().stage_operation(masked_while, staged_inputs.as_slice())?;
-        check_count!("output", outputs, state_count + 1, ProgramError);
-        // Drop the internal mask output; the rule's outputs are the original state elements, all batched at 0.
-        outputs.truncate(state_count);
+        check_count!("output", condition_axes, 1, ProgramError);
+        let batched_while =
+            WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
+        let outputs = context.parent().bind(batched_while, state_values.as_slice())?;
+        check_count!("output", outputs, state_count, ProgramError);
         outputs
             .into_iter()
             .map(|output| {
@@ -1166,23 +1138,88 @@ where
     }
 }
 
+/// Rewrites a while loop's condition and body into the scalar-predicate *masked form* over the augmented state
+/// `[state..., active_mask]`: the masked condition reduces the mask with a Boolean `any` over every predicate axis,
+/// and the masked body splices the original body for candidate updates, selects per state element between the
+/// candidate and the carried state under the (broadcast) mask, recomputes the per-item predicate on the new state,
+/// and ANDs it into the mask. The bounded while forward-mode rule uses this normal form for batched-predicate loops,
+/// whose counter- and stack-augmented differentiation state is not predicate-prefixed and therefore needs the loop's
+/// masking made explicit as program data hanging off a scalar predicate.
+fn masked_while_programs<V, O>(
+    condition: &Program<V, O, Vec<V>, Vec<V>>,
+    body: &Program<V, O, Vec<V>, Vec<V>>,
+) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>), ProgramError>
+where
+    V: Value<Type = ArrayType>,
+    O: Clone
+        + Operation<ArrayType>
+        + From<ReduceOperation>
+        + From<SelectOperation>
+        + From<AndOperation>
+        + From<BroadcastOperation>,
+{
+    let state_types = body.input_types();
+    let state_count = state_types.len();
+    let mask_type = condition.output_types()[0].clone();
+    let mask_axes: Vec<usize> = (0..mask_type.rank()).collect();
+    let mut masked_state_types = state_types.clone();
+    masked_state_types.push(mask_type.clone());
+
+    // Masked condition: `any(active_mask)` over every predicate axis, ignoring the state inputs.
+    let (_, masked_condition) = TracingContext::<V, O>::trace(
+        |inputs| Ok(vec![inputs[state_count].reduce(mask_axes.as_slice(), ReductionKind::Any)]),
+        masked_state_types.clone(),
+    )?;
+
+    // Masked body: candidate updates from the spliced body, per-element masked selection between the candidate
+    // update and the carried state, the per-item predicate recomputed on the new state, and the mask narrowed via
+    // AND.
+    let (_, masked_body) = TracingContext::<V, O>::trace(
+        |inputs| {
+            let (mask, state) = inputs.split_last().unwrap();
+            let trace_context = mask.context().clone();
+            let candidates = trace_context.stage_program(body, state.to_vec())?;
+            check_count!("output", candidates, state_count, ProgramError);
+            let mut next_state = Vec::with_capacity(state_count);
+            for ((candidate, carried), state_type) in candidates.iter().zip(state).zip(state_types.iter()) {
+                // The mask broadcasts to each state element's shape so the selection is per predicate item; a state
+                // element already shaped like the mask reuses it directly.
+                let element_mask_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
+                let element_mask = if element_mask_type == mask_type {
+                    mask.clone()
+                } else {
+                    mask.broadcast(element_mask_type, mask_axes.as_slice())?
+                };
+                next_state.push(Select::select(&element_mask, candidate, carried)?);
+            }
+            let next_predicate = trace_context.stage_program(condition, next_state.clone())?;
+            check_count!("output", next_predicate, 1, ProgramError);
+            let mut outputs = next_state;
+            outputs.push(mask.clone() & next_predicate.into_iter().next().unwrap());
+            Ok(outputs)
+        },
+        masked_state_types,
+    )?;
+    Ok((masked_condition, masked_body))
+}
+
 /// Eager loop that drives a [`WhileOperation`] whose condition program produces a replicated
 /// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
 /// when it becomes `false` or once the remaining iteration budget (the semantic iteration bound
 /// minus any body applications the caller already performed) is exhausted. This is the original
 /// simple loop preserved for the replicated case.
 fn run_replicated_while_loop<VOperation, V, O, F>(
-    condition: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    body: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    condition: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    body: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     mut state: Vec<ArrayBatch<V>>,
     mut remaining_iterations: Option<usize>,
     interpret_program: &mut F,
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
-    VOperation: Value<ArrayType>,
-    V: Value<ArrayType> + BooleanLike,
+    VOperation: Value<Type = ArrayType>,
+    V: Value<Type = ArrayType> + BooleanLike,
     F: FnMut(
-        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
 {
@@ -1225,23 +1262,23 @@ where
 /// [`Broadcast`](crate::operations::manipulation::Broadcast) — the same
 /// primitives every staged value type already needs for the rest of the operation enum.
 fn run_batch_varying_while_loop<VOperation, V, O, F>(
-    condition: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    body: &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    condition: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+    body: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     mut state: Vec<ArrayBatch<V>>,
     initial_predicate: ArrayBatch<V>,
     iteration_bound: Option<usize>,
     interpret_program: &mut F,
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
-    VOperation: Value<ArrayType>,
-    V: Value<ArrayType>
+    VOperation: Value<Type = ArrayType>,
+    V: Value<Type = ArrayType>
         + BooleanLike
         + crate::tracing_v2::operations::reduce::Reduce
         + std::ops::BitAnd<Output = V>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast,
     F: FnMut(
-        &Program<ArrayType, VOperation, O, Vec<VOperation>, Vec<VOperation>>,
+        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
 {
@@ -1282,7 +1319,9 @@ where
 
 /// Returns `true` when at least one batch item of `mask` is active by reducing along `predicate_axis`
 /// and extracting the resulting scalar Boolean.
-fn batch_varying_any_active<V: Value<ArrayType> + BooleanLike + crate::tracing_v2::operations::reduce::Reduce>(
+fn batch_varying_any_active<
+    V: Value<Type = ArrayType> + BooleanLike + crate::tracing_v2::operations::reduce::Reduce,
+>(
     mask: &ArrayBatch<V>,
     predicate_axis: usize,
 ) -> Result<bool, ProgramError> {
@@ -1295,7 +1334,7 @@ fn batch_varying_any_active<V: Value<ArrayType> + BooleanLike + crate::tracing_v
 
 /// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
 /// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<V: Value<ArrayType> + std::ops::BitAnd<Output = V>>(
+fn combine_active_mask<V: Value<Type = ArrayType> + std::ops::BitAnd<Output = V>>(
     active_mask: ArrayBatch<V>,
     next_predicate: ArrayBatch<V>,
 ) -> Result<ArrayBatch<V>, BatchingError> {
@@ -1315,7 +1354,7 @@ fn mask_state_element<V>(
     prior: ArrayBatch<V>,
 ) -> Result<ArrayBatch<V>, BatchingError>
 where
-    V: Value<ArrayType>
+    V: Value<Type = ArrayType>
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast,
 {
@@ -1347,11 +1386,11 @@ where
     ArrayBatch::new(selected_type, selected, Some(candidate_axis))
 }
 
-impl<V, F, O, C> InterpretableOperation<ArrayType, V, C> for ConditionOperation<ArrayType, V, O, F, Captured>
+impl<V, F, O, C> InterpretableOperation<V, C> for ConditionOperation<V, O, F, Captured>
 where
-    V: Value<ArrayType> + BooleanLike,
-    F: CustomVjpResidual<ArrayType, V>,
-    O: InterpretableProgramOperation<ArrayType, V, C, V>,
+    V: Value<Type = ArrayType> + BooleanLike,
+    F: CustomVjpResidual<V>,
+    O: InterpretableProgramOperation<V, C, V>,
 {
     fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -1366,21 +1405,21 @@ where
 /// than a linear operand, so it has no cotangent and is carried verbatim into a transposed condition over the
 /// transposed branch programs, selected by the same predicate. Branch transposition goes through
 /// [`TransposableProgramOperation`], keeping the branch fixed point owned by the operation family.
-impl<V, F, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<ArrayType, V, O, F, Captured>
+impl<V, F, O> TransposableOperation<V, O> for ConditionOperation<V, O, F, Captured>
 where
-    V: Value<ArrayType>,
-    F: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
+    F: Value<Type = ArrayType>,
     O: Operation<ArrayType>
-        + TransposableProgramOperation<ArrayType, V>
+        + TransposableProgramOperation<V>
         + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<ArrayType, V, O, F, Captured>>,
+        + From<ConditionOperation<V, O, F, Captured>>,
 {
     fn transpose(
         &self,
-        context: &mut TracingContext<ArrayType, V, O>,
-        _inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-        outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-    ) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>>, ProgramError> {
+        context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
         // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
         if outputs.iter().all(MaybeZero::is_zero) {
@@ -1393,11 +1432,11 @@ where
         }
         let transposed_condition = ConditionOperation::new_captured(
             self.predicate().clone(),
-            <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(
+            <O as TransposableProgramOperation<V>>::transpose_program(
                 self.true_branch(),
                 &vec![true; self.true_branch().input_ids().len()],
             )?,
-            <O as TransposableProgramOperation<ArrayType, V>>::transpose_program(
+            <O as TransposableProgramOperation<V>>::transpose_program(
                 self.false_branch(),
                 &vec![true; self.false_branch().input_ids().len()],
             )?,
@@ -1416,19 +1455,17 @@ where
 /// [`transpose_primal_condition`]. The predicate and the per-branch residuals ride as ordinary known operands, and the
 /// branch recursion happens through the [`TransposableProgramOperation`] fixed-point witness, so instantiating this
 /// implementation for a closed operation enum introduces no recursive [`TransposableOperation`] obligation on `O`.
-impl<V, O> TransposableOperation<ArrayType, V, O> for ConditionOperation<ArrayType, V, O, V, Input>
+impl<V, O> TransposableOperation<V, O> for ConditionOperation<V, O, V, Input>
 where
-    V: Value<ArrayType>,
-    O: TransposableProgramOperation<ArrayType, V>
-        + From<ZeroOperation<ArrayType>>
-        + From<ConditionOperation<ArrayType, V, O>>,
+    V: Value<Type = ArrayType>,
+    O: TransposableProgramOperation<V> + From<ZeroOperation<ArrayType>> + From<ConditionOperation<V, O>>,
 {
     fn transpose(
         &self,
-        context: &mut TracingContext<ArrayType, V, O>,
-        inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-        outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-    ) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>>, ProgramError> {
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         transpose_primal_condition(self, context, inputs, outputs)
     }
 }
@@ -1476,7 +1513,9 @@ mod tests {
         }
     }
 
-    impl Typed<ArrayType> for TestValue {
+    impl Typed for TestValue {
+        type Type = ArrayType;
+
         fn r#type(&self) -> Cow<'_, ArrayType> {
             match self {
                 Self::Bool(_) => Cow::Owned(ArrayType::scalar(DataType::Boolean)),
@@ -1485,7 +1524,18 @@ mod tests {
         }
     }
 
-    impl Value<ArrayType> for TestValue {}
+    impl Value for TestValue {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> EagerContext<Self> {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> EagerContext<Self> {
+            EagerContext::new()
+        }
+    }
 
     impl ZeroLike for TestValue {
         fn zero_like(&self) -> Self {
@@ -1505,7 +1555,7 @@ mod tests {
         }
     }
 
-    impl<O: Operation<ArrayType>> Zero<ArrayType, TestValue> for EagerContext<ArrayType, TestValue, O> {
+    impl<O: Operation<ArrayType>> Zero<TestValue> for EagerContext<TestValue, O> {
         fn zero(&self, value_type: &ArrayType) -> Result<TestValue, ProgramError> {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(false)),
@@ -1518,7 +1568,7 @@ mod tests {
         }
     }
 
-    impl<O: Operation<ArrayType>> One<ArrayType, TestValue> for EagerContext<ArrayType, TestValue, O> {
+    impl<O: Operation<ArrayType>> One<TestValue> for EagerContext<TestValue, O> {
         fn one(&self, value_type: &ArrayType) -> Result<TestValue, ProgramError> {
             match value_type.data_type() {
                 DataType::Boolean => Ok(TestValue::Bool(true)),
@@ -1552,13 +1602,16 @@ mod tests {
         }
     }
 
+    // `TestValue` predicates are scalar, so the scalar `WhilePredicate` defaults apply.
+    impl crate::operations::control_flow::WhilePredicate for TestValue {}
+
     #[derive(Clone, Debug)]
     enum TestOperation {
         Add,
         Sub,
         IsPositive,
-        Condition(Box<ConditionOperation<ArrayType, TestValue, TestOperation>>),
-        While(Box<WhileOperation<ArrayType, TestValue, TestOperation>>),
+        Condition(Box<ConditionOperation<TestValue, TestOperation>>),
+        While(Box<WhileOperation<TestValue, TestOperation>>),
     }
 
     impl Display for TestOperation {
@@ -1604,9 +1657,9 @@ mod tests {
         }
     }
 
-    impl<C> InterpretableOperation<ArrayType, TestValue, C> for TestOperation
+    impl<C> InterpretableOperation<TestValue, C> for TestOperation
     where
-        C: crate::operations::constants::Constant<ArrayType, TestValue, TestValue>,
+        C: crate::operations::constants::Constant<TestValue, TestValue>,
     {
         fn interpret(&self, context: &C, inputs: &[TestValue]) -> Result<Vec<TestValue>, ProgramError> {
             match self {
@@ -1628,14 +1681,14 @@ mod tests {
         }
     }
 
-    impl<C> InterpretableProgramOperation<ArrayType, TestValue, C> for TestOperation
+    impl<C> InterpretableProgramOperation<TestValue, C> for TestOperation
     where
-        C: crate::operations::constants::Constant<ArrayType, TestValue, TestValue>,
-        TestOperation: InterpretableOperation<ArrayType, TestValue, C>,
+        C: crate::operations::constants::Constant<TestValue, TestValue>,
+        TestOperation: InterpretableOperation<TestValue, C>,
     {
         fn interpret_program(
             context: &C,
-            program: &Program<ArrayType, TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
+            program: &Program<TestValue, Self, Vec<TestValue>, Vec<TestValue>>,
             input: Vec<TestValue>,
         ) -> Result<Vec<TestValue>, ProgramError> {
             program.interpret_with(
@@ -1646,25 +1699,24 @@ mod tests {
         }
     }
 
-    fn add_one_branch() -> Program<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+    fn add_one_branch() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
         let output = builder.add_instruction(TestOperation::Add, vec![input, one]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn subtract_one_branch() -> Program<ArrayType, TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+    fn subtract_one_branch() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let one = builder.add_constant(TestValue::Number(1.0));
         let output = builder.add_instruction(TestOperation::Sub, vec![input, one]).unwrap()[0];
         builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    fn identity_array_branch()
-    -> Program<ArrayType, TestValue, ArrayOperation<TestValue>, Vec<TestValue>, Vec<TestValue>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, ArrayOperation<TestValue>>::new();
+    fn identity_array_branch() -> Program<TestValue, ArrayOperation<TestValue>, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, ArrayOperation<TestValue>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
     }
@@ -1674,17 +1726,11 @@ mod tests {
         let condition = ConditionOperation::new(add_one_branch(), subtract_one_branch()).unwrap();
 
         assert_eq!(
-            condition.interpret(
-                &EagerContext::<ArrayType, TestValue>::new(),
-                &[TestValue::Bool(true), TestValue::Number(3.0)]
-            ),
+            condition.interpret(&EagerContext::<TestValue>::new(), &[TestValue::Bool(true), TestValue::Number(3.0)]),
             Ok(vec![TestValue::Number(4.0)]),
         );
         assert_eq!(
-            condition.interpret(
-                &EagerContext::<ArrayType, TestValue>::new(),
-                &[TestValue::Bool(false), TestValue::Number(3.0)]
-            ),
+            condition.interpret(&EagerContext::<TestValue>::new(), &[TestValue::Bool(false), TestValue::Number(3.0)]),
             Ok(vec![TestValue::Number(2.0)]),
         );
     }
@@ -1692,7 +1738,7 @@ mod tests {
     #[test]
     fn test_condition_program_rendering_includes_nested_branches() {
         let condition = ConditionOperation::new(add_one_branch(), subtract_one_branch()).unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder
@@ -1728,7 +1774,7 @@ mod tests {
 
     #[test]
     fn test_condition_rejects_branch_output_mismatch() {
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestOperation::IsPositive, vec![input]).unwrap()[0];
         let bool_branch = builder
@@ -1740,34 +1786,34 @@ mod tests {
 
     #[test]
     fn test_while_interprets_until_condition_is_false() {
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let condition_output =
             condition_builder.add_instruction(TestOperation::IsPositive, vec![condition_input]).unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let while_operation: WhileOperation<ArrayType, TestValue, TestOperation> =
+        let while_operation: WhileOperation<TestValue, TestOperation> =
             WhileOperation::new(condition, subtract_one_branch()).unwrap();
 
         assert_eq!(
-            while_operation.interpret(&EagerContext::<ArrayType, TestValue>::new(), &[TestValue::Number(3.0)]),
+            while_operation.interpret(&EagerContext::<TestValue>::new(), &[TestValue::Number(3.0)]),
             Ok(vec![TestValue::Number(0.0)]),
         );
     }
 
     #[test]
     fn test_while_program_rendering_includes_condition_and_body() {
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let condition_input = condition_builder.add_input(ArrayType::scalar(DataType::F64));
         let condition_output =
             condition_builder.add_instruction(TestOperation::IsPositive, vec![condition_input]).unwrap()[0];
         let condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![condition_output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let while_operation: WhileOperation<ArrayType, TestValue, TestOperation> =
+        let while_operation: WhileOperation<TestValue, TestOperation> =
             WhileOperation::new(condition, subtract_one_branch()).unwrap();
-        let mut builder = ProgramBuilder::<ArrayType, TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let output = builder.add_instruction(TestOperation::While(Box::new(while_operation)), vec![input]).unwrap()[0];
         let program = builder
@@ -1809,7 +1855,7 @@ mod tests {
     }
 
     use crate::operations::compare::ComparisonDirection;
-    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tests::TestArray;
 
     /// Test array operation enum used by the while tests below.
     type TestArrayOperation = ArrayOperation<TestArray>;
@@ -1839,7 +1885,7 @@ mod tests {
             inputs: &[Self::Value],
         ) -> Result<Vec<Self::Value>, ProgramError> {
             let operation = operation.into();
-            operation.interpret(&crate::EagerContext::<ArrayType, TestArray, Self::Operation>::new(), inputs)
+            operation.interpret(&crate::EagerContext::<TestArray, Self::Operation>::new(), inputs)
         }
 
         fn resolve(&self, value: &TestArray) -> crate::ValueResolution<TestArray> {
@@ -1856,38 +1902,32 @@ mod tests {
     }
 
     /// Eager-domain context capabilities, delegating to the zero-state [`crate::EagerContext`] exactly like
-    /// [`TestArrayDomain`](crate::tests::TestArrayDomain)'s.
-    impl crate::operations::constants::Zero<ArrayType, TestArray> for StagedDispatchTestArrayDomain {
+    /// [`EagerContext<TestArray, ArrayOperation<TestArray>>`](crate::tests::EagerContext<TestArray, ArrayOperation<TestArray>>)'s.
+    impl crate::operations::constants::Zero<TestArray> for StagedDispatchTestArrayDomain {
         fn zero(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Zero::zero(&crate::EagerContext::<ArrayType, TestArray>::new(), r#type)
+            crate::operations::constants::Zero::zero(&crate::EagerContext::<TestArray>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::One<ArrayType, TestArray> for StagedDispatchTestArrayDomain {
+    impl crate::operations::constants::One<TestArray> for StagedDispatchTestArrayDomain {
         fn one(&self, r#type: &ArrayType) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::One::one(&crate::EagerContext::<ArrayType, TestArray>::new(), r#type)
+            crate::operations::constants::One::one(&crate::EagerContext::<TestArray>::new(), r#type)
         }
     }
 
-    impl crate::operations::constants::Fill<ArrayType, f64, TestArray> for StagedDispatchTestArrayDomain {
+    impl crate::operations::constants::Fill<f64, TestArray> for StagedDispatchTestArrayDomain {
         fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Fill::fill(&crate::EagerContext::<ArrayType, TestArray>::new(), r#type, value)
+            crate::operations::constants::Fill::fill(&crate::EagerContext::<TestArray>::new(), r#type, value)
         }
     }
 
-    impl crate::operations::constants::Iota<ArrayType, TestArray> for StagedDispatchTestArrayDomain {
+    impl crate::operations::constants::Iota<TestArray> for StagedDispatchTestArrayDomain {
         fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<TestArray, ProgramError> {
-            crate::operations::constants::Iota::iota(
-                &crate::EagerContext::<ArrayType, TestArray>::new(),
-                r#type,
-                dimension,
-            )
+            crate::operations::constants::Iota::iota(&crate::EagerContext::<TestArray>::new(), r#type, dimension)
         }
     }
 
-    impl<Payload> crate::operations::constants::Constant<ArrayType, TestArray, TestArray, Payload>
-        for StagedDispatchTestArrayDomain
-    {
+    impl<Payload> crate::operations::constants::Constant<TestArray, TestArray, Payload> for StagedDispatchTestArrayDomain {
         fn constant(&self, value: TestArray) -> Result<TestArray, ProgramError> {
             Ok(value)
         }
@@ -1896,8 +1936,8 @@ mod tests {
     /// Builds the `state < threshold` while condition program over one scalar state element.
     fn scalar_threshold_condition(
         threshold: f64,
-    ) -> Program<ArrayType, TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+    ) -> Program<TestArray, TestArrayOperation, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let state = builder.add_input(ArrayType::scalar(DataType::F64));
         let threshold = builder.add_constant(TestArray::scalar(threshold));
         let predicate = builder
@@ -1907,12 +1947,9 @@ mod tests {
     }
 
     /// Builds the `while (x < threshold) { x = 2 * x }` loop with the provided semantic iteration bound.
-    fn bounded_doubling_while_operation(
-        threshold: f64,
-        bound: usize,
-    ) -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
+    fn bounded_doubling_while_operation(threshold: f64, bound: usize) -> WhileOperation<TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
         let two = builder.add_constant(TestArray::scalar(2.0));
         let doubled = builder.add_instruction(MulOperation, vec![state, two]).unwrap()[0];
@@ -1928,12 +1965,9 @@ mod tests {
     /// Builds the `while (x < threshold) { x = x * x }` loop with the provided semantic iteration bound. Squaring
     /// captures the loop state itself as a loop-varying residual, so differentiating this loop exercises the
     /// per-iteration residual stacks of the bounded staged path.
-    fn bounded_squaring_while_operation(
-        threshold: f64,
-        bound: usize,
-    ) -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
+    fn bounded_squaring_while_operation(threshold: f64, bound: usize) -> WhileOperation<TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let state = builder.add_input(scalar_f64);
         let squared = builder.add_instruction(MulOperation, vec![state, state]).unwrap()[0];
         let body = builder
@@ -2037,7 +2071,7 @@ mod tests {
 
         // The eager-domain reverse-mode entry point produces the same value and gradient numbers.
         let while_operation = bounded_squaring_while_operation(100.0, 4);
-        let (value, gradient) = TestArrayDomain
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_grad(
                 move |x| {
                     let mut outputs = x
@@ -2064,7 +2098,7 @@ mod tests {
         use crate::tracing_v2::operations::reduce::ReductionKind;
 
         let vector_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let condition_state = condition_builder.add_input(vector_f64.clone());
         let summed = condition_builder
             .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), vec![condition_state])
@@ -2076,7 +2110,7 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let body_state = body_builder.add_input(vector_f64.clone());
         let squared = body_builder.add_instruction(MulOperation, vec![body_state, body_state]).unwrap()[0];
         let body = body_builder
@@ -2110,7 +2144,7 @@ mod tests {
         // The eager-domain entry point differentiates the same bounded loop to identical numbers: the loop exits
         // through its condition after three iterations, well below the bound of five.
         let while_operation = bounded_doubling_while_operation(8.0, 5);
-        let (value, gradient) = TestArrayDomain
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_grad(
                 move |x| {
                     let mut outputs = x
@@ -2134,12 +2168,12 @@ mod tests {
         // item is true).
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
         let outputs = while_operation
-            .interpret(&crate::EagerContext::<ArrayType, TestArray>::new(), &[TestArray::scalar(2.0)])
+            .interpret(&crate::EagerContext::<TestArray>::new(), &[TestArray::scalar(2.0)])
             .unwrap();
         assert_eq!(outputs[0].values, vec![16.0]);
 
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
-        let (value, gradient) = TestArrayDomain
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_grad(
                 move |x| {
                     let mut outputs = x
@@ -2172,9 +2206,9 @@ mod tests {
     }
 
     /// Builds the per-item countdown loop `while (x > 0) { x = x - 1 }` over one scalar state element.
-    fn countdown_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
+    fn countdown_while_operation() -> WhileOperation<TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let condition_state = condition_builder.add_input(scalar_f64.clone());
         let zero = condition_builder.add_instruction(ZeroLikeOperation, vec![condition_state]).unwrap()[0];
         let predicate = condition_builder
@@ -2183,7 +2217,7 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let body_state = body_builder.add_input(scalar_f64);
         let one = body_builder.add_instruction(OneLikeOperation, vec![body_state]).unwrap()[0];
         let next = body_builder.add_instruction(SubOperation, vec![body_state, one]).unwrap()[0];
@@ -2196,20 +2230,20 @@ mod tests {
     /// Stages `while_operation` over one batched item (mapped at axis 0 with `batch_size` batch items) under tracing
     /// and returns the staged batched program for structural and numeric assertions.
     fn batch_while_under_tracing(
-        while_operation: WhileOperation<ArrayType, TestArray, TestArrayOperation>,
+        while_operation: WhileOperation<TestArray, TestArrayOperation>,
         batch_size: usize,
-    ) -> Program<ArrayType, TestArray, TestArrayOperation, TestArray, TestArray> {
-        use crate::tracing_v2::batching::BatchContext;
-        let parent_context = DomainTracingContext::<TestArrayDomain>::new();
-        let builder = parent_context.builder().clone();
+    ) -> Program<TestArray, TestArrayOperation, TestArray, TestArray> {
+        use crate::batching::Batch;
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(batch_size)]));
         let input_atom = builder.borrow_mut().add_input(input_type);
-        let input_tracer = parent_context.tracer(input_atom, None);
-        let output = BatchContext::batch(
-            &parent_context,
+        let input_tracer = parent.tracer(input_atom, None);
+        let output = Batch::batch(
+            &parent,
             |item| {
                 let mut outputs =
-                    item.context().stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&item])?;
+                    item.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[item.clone()])?;
                 Ok(outputs.remove(0))
             },
             input_tracer,
@@ -2227,23 +2261,26 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_stages_masked_while_for_batch_varying_predicates_under_tracing() {
+    fn test_batch_stages_batched_predicate_while_for_batch_varying_predicates_under_tracing() {
         // vmap-under-tracing of the per-item countdown loop: the predicate `x > 0` is per batch item, so the staged
-        // batching rule builds the masked loop as program data — exactly one staged `while` over the augmented
-        // state `[state, active_mask]` whose condition reduces the mask with a batch-axis `any` and whose body masks
-        // state updates per batch item — instead of unrolling (the body's single `sub` appears exactly once in the
-        // staged trace). Batch items [3, 1, 2] terminate after 3, 1, and 2 iterations, and inactive batch items carry
-        // their final state, matching the eager operational path batch item for batch item.
+        // batching rule stages exactly one `while` whose condition returns the batched `bool[3]` predicate directly
+        // (the relaxed predicate contract, mirroring JAX's `_while_loop_batching_rule`) instead of unrolling (the
+        // body's single `sub` appears exactly once in the staged trace) and without building any masking program data
+        // (no `reduce_any` in the staged form; interpretation and lowering own the masked semantics). Batch items
+        // [3, 1, 2] terminate after 3, 1, and 2 iterations, and inactive batch items carry their final state,
+        // matching the eager operational path batch item for batch item.
         let program = batch_while_under_tracing(countdown_while_operation(), 3);
         let rendered = program.to_string();
         assert_eq!(rendered.matches("= while").count(), 1, "{rendered}");
-        assert!(rendered.contains("reduce_any"), "{rendered}");
+        assert!(!rendered.contains("reduce_any"), "{rendered}");
+        assert!(rendered.contains("%2:bool[3] = compare"), "{rendered}");
         assert_eq!(rendered.matches("sub").count(), 1, "{rendered}");
         let output = program.interpret(TestArray::vector(vec![3.0, 1.0, 2.0])).unwrap();
         assert_eq!(output.values, vec![0.0, 0.0, 0.0]);
 
-        // The semantic iteration bound is preserved on the staged masked while: every batch item performs at most two
-        // body applications, so batch item 0 truncates at 1.0 — the numbers of the eager operational bounded path.
+        // The semantic iteration bound is preserved on the staged batched-predicate while: every batch item performs
+        // at most two body applications, so batch item 0 truncates at 1.0 — the numbers of the eager operational
+        // bounded path.
         let program = batch_while_under_tracing(countdown_while_operation().with_iteration_bound(2).unwrap(), 3);
         let rendered = program.to_string();
         assert!(rendered.contains("iteration_bound=2"), "{rendered}");
@@ -2253,9 +2290,9 @@ mod tests {
 
     /// Builds the `while (counter > 0) { (counter, value) = (counter - 1, value + value) }` loop whose predicate
     /// depends only on the counter state element.
-    fn counter_doubling_while_operation() -> WhileOperation<ArrayType, TestArray, TestArrayOperation> {
+    fn counter_doubling_while_operation() -> WhileOperation<TestArray, TestArrayOperation> {
         let scalar_f64 = ArrayType::scalar(DataType::F64);
-        let mut condition_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut condition_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let condition_counter = condition_builder.add_input(scalar_f64.clone());
         condition_builder.add_input(scalar_f64.clone());
         let zero = condition_builder.add_instruction(ZeroLikeOperation, vec![condition_counter]).unwrap()[0];
@@ -2265,7 +2302,7 @@ mod tests {
         let condition = condition_builder
             .build::<Vec<TestArray>, Vec<TestArray>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let mut body_builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
+        let mut body_builder = ProgramBuilder::<TestArray, TestArrayOperation>::new();
         let body_counter = body_builder.add_input(scalar_f64.clone());
         let body_value = body_builder.add_input(scalar_f64);
         let one = body_builder.add_instruction(OneLikeOperation, vec![body_counter]).unwrap()[0];
@@ -2283,26 +2320,26 @@ mod tests {
 
     #[test]
     fn test_batch_stages_plain_while_for_replicated_predicates_under_tracing() {
-        use crate::tracing_v2::batching::BatchContext;
+        use crate::batching::Batch;
 
         // vmap-under-tracing of a loop whose predicate depends only on a replicated counter: the staged batching
         // rule batches the condition and body at the state batch axes and stages one plain `while` — no mask
         // machinery (`reduce_any` / per-element `select`) appears in the staged program. Two iterations double the
         // batched value twice: [1, 2, 3] -> [4, 8, 12], with the replicated counter ending at 0.
-        let parent_context = DomainTracingContext::<TestArrayDomain>::new();
-        let builder = parent_context.builder().clone();
+        let parent = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = parent.builder().clone();
         let counter_atom = builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
         let value_atom =
             builder.borrow_mut().add_input(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])));
-        let counter_tracer = parent_context.tracer(counter_atom, None);
-        let value_tracer = parent_context.tracer(value_atom, None);
-        let (counter_output, value_output) = BatchContext::batch(
-            &parent_context,
+        let counter_tracer = parent.tracer(counter_atom, None);
+        let value_tracer = parent.tracer(value_atom, None);
+        let (counter_output, value_output) = Batch::batch(
+            &parent,
             |(counter, value)| {
                 let while_operation = counter_doubling_while_operation();
                 let mut outputs = counter
                     .context()
-                    .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&counter, &value])?;
+                    .bind(TestArrayOperation::While(Box::new(while_operation)), &[counter.clone(), value.clone()])?;
                 let value_output = outputs.remove(1);
                 Ok((outputs.remove(0), value_output))
             },
@@ -2333,55 +2370,25 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_batched_program_output_axis_appends_axis_moving_operations() {
-        // Transpose arm: a batched program output carrying its batch axis at position 1 is normalized to position 0
-        // by an appended staged transpose at the program tail.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let input = builder.add_input(input_type);
-        let mut program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        normalize_batched_program_output_axis(&mut program, 0, BatchAxis::new(1), 0, 3).unwrap();
-        assert_eq!(
-            program.output_types(),
-            vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]))],
-        );
-        let outputs = program.interpret(vec![TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]).unwrap();
-        assert_eq!(outputs[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
-
-        // Broadcast arm: a replicated output gains the batch axis at position 0 through an appended broadcast.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TestArrayOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let mut program = builder
-            .build::<Vec<TestArray>, Vec<TestArray>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        normalize_batched_program_output_axis(&mut program, 0, BatchAxis::replicated(), 0, 4).unwrap();
-        let outputs = program.interpret(vec![TestArray::scalar(7.0)]).unwrap();
-        assert_eq!(outputs[0].values, vec![7.0; 4]);
-    }
-
-    #[test]
     fn test_jvp_of_batched_bounded_while_under_tracing_composes_with_masked_scan() {
-        use crate::tracing_v2::batching::BatchContext;
+        use crate::batching::Batch;
 
         // F5 x F6 composition: jvp of a *vmapped bounded* while under the non-concretizing staged dispatch domain.
         // Batching stages one masked bounded while (the predicate `x < 8` is per batch item and the iteration bound 5
         // survives the staged rewrite), so the while JVP rule takes the bounded staged path: stored residual
         // stacks plus a masked linear scan on the tangent side. Batch items [1, 5, 9] double 3, 1, and 0 times, so the
         // primal is [8, 10, 9] and the per-item tangent scale is 2^iterations = [8, 2, 1].
-        fn batched_bounded_while<C>(x: crate::tracing::Tracer<C, C::Meta>) -> crate::tracing::Tracer<C, C::Meta>
+        fn batched_bounded_while<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
         where
             C: crate::contexts::StagingContext<Type = ArrayType, Constant = TestArray, Operation = TestArrayOperation>,
         {
             let context = x.context().clone();
-            let mapped: crate::tracing::Tracer<C, C::Meta> = BatchContext::batch(
+            let mapped: crate::tracing::Tracer<C> = Batch::batch(
                 &context,
                 |item| {
                     let while_operation = bounded_doubling_while_operation(8.0, 5);
-                    let mut outputs = item
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&item])?;
+                    let mut outputs =
+                        item.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[item.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 x,
@@ -2399,7 +2406,7 @@ mod tests {
         assert_eq!(tangent.values, vec![8.0, 2.0, 1.0]);
 
         // The plain eager domain produces the same numbers...
-        let (primal, tangent) = TestArrayDomain
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
             .unwrap();
         assert_eq!(primal.values, vec![8.0, 10.0, 9.0]);

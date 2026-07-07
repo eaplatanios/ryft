@@ -570,7 +570,7 @@ where
     ///      columns exactly as [`Self::from_pushforward`] does.
     ///
     /// The front end requires the differentiation context's [`Tangent`](DifferentiationContext::Tangent) to equal
-    /// its [`Value`](Domain::Value), so the concrete residuals recovered from the primal replay are tangent-typed and
+    /// its [`Value`](DispatchDomain::Value), so the concrete residuals recovered from the primal replay are tangent-typed and
     /// feed the tangent batch directly with no tangent-context bridging.
     ///
     /// # Parameters

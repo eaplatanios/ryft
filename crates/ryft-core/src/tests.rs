@@ -2112,76 +2112,23 @@ mod linearization_tests {
     }
 
     #[test]
-    fn test_jvp_interleaved_matches_jvp() {
-        // The interleaved forward mode (one walk over the primal program with `JvpTracer` duals under a
-        // `JvpContext`) must agree with the fused-program `jvp` path on values and derivatives, including through
-        // piecewise `select` derivatives, severed `stop_gradient` tangents, and zero input tangents.
+    fn test_jvp_direct_zero_tangent_flows_the_all_zero_fast_path() {
+        use crate::operations::arithmetic::Mul;
+        use crate::operations::trigonometric::Sin;
+        use crate::tracing_v2::differentiation::JvpTracer;
+
+        // A zero input tangent flows through the all-zero fast path of `JvpContext::bind` (the rule is skipped and
+        // the primal operation binds directly): the derivative is zero and the value matches the primal evaluation.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-
-        // f(x) = x * sin(x): derivative sin(x) + x * cos(x).
-        let (fused_value, fused_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
-            .jvp(
-                |inputs: Vec<_>| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-                vec![Scalar::from(0.7)],
-                vec![Scalar::from(1.0)],
+        let (value, tangent): (Scalar, Scalar) = domain
+            .jvp_direct(
+                |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.mul(&x.sin()?),
+                Scalar::from(0.7),
+                Scalar::from(0.0),
             )
             .unwrap();
-        let (interleaved_value, interleaved_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
-            .jvp_interleaved(
-                |inputs: Vec<_>| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-                vec![Scalar::from(0.7)],
-                vec![Scalar::from(1.0)],
-            )
-            .unwrap();
-        assert_close(&interleaved_value, &fused_value, "x * sin(x) value");
-        assert_close(&interleaved_tangent, &fused_tangent, "x * sin(x) tangent");
-
-        // f(x) = stop_gradient(x * x) + select(x > 1, x * x, x + x): a piecewise derivative plus a structural-zero
-        // contribution that must stay symbolic through the interleaved walk.
-        for primal in [3.0, 0.5] {
-            let (fused_value, fused_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
-                .jvp(
-                    |inputs: Vec<_>| {
-                        let one = inputs[0].context().constant(Scalar::from(1.0));
-                        let mask = inputs[0].clone().greater_than(&one).unwrap();
-                        let on_true = inputs[0].clone() * inputs[0].clone();
-                        let on_false = inputs[0].clone() + inputs[0].clone();
-                        let selected = Select::select(&mask, &on_true, &on_false).unwrap();
-                        vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + selected]
-                    },
-                    vec![Scalar::from(primal)],
-                    vec![Scalar::from(1.0)],
-                )
-                .unwrap();
-            let (interleaved_value, interleaved_tangent): (Vec<Scalar>, Vec<Scalar>) = domain
-                .jvp_interleaved(
-                    |inputs: Vec<_>| {
-                        let one = inputs[0].context().constant(Scalar::from(1.0));
-                        let mask = inputs[0].clone().greater_than(&one).unwrap();
-                        let on_true = inputs[0].clone() * inputs[0].clone();
-                        let on_false = inputs[0].clone() + inputs[0].clone();
-                        let selected = Select::select(&mask, &on_true, &on_false).unwrap();
-                        vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + selected]
-                    },
-                    vec![Scalar::from(primal)],
-                    vec![Scalar::from(1.0)],
-                )
-                .unwrap();
-            assert_close(&interleaved_value, &fused_value, "piecewise value");
-            assert_close(&interleaved_tangent, &fused_tangent, "piecewise tangent");
-        }
-
-        // A zero input tangent flows through the all-zero fast path of the interleaved context: the derivative is
-        // zero and the value matches the primal evaluation.
-        let (value, tangent): (Vec<Scalar>, Vec<Scalar>) = domain
-            .jvp_interleaved(
-                |inputs: Vec<_>| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-                vec![Scalar::from(0.7)],
-                vec![Scalar::from(0.0)],
-            )
-            .unwrap();
-        assert_close(&value, &[Scalar::from(0.7 * 0.7_f64.sin())], "zero-tangent value");
-        assert_close(&tangent, &[Scalar::from(0.0)], "zero-tangent tangent");
+        assert_close(&[value], &[Scalar::from(0.7 * 0.7_f64.sin())], "zero-tangent value");
+        assert_close(&[tangent], &[Scalar::from(0.0)], "zero-tangent tangent");
     }
 
     #[test]
@@ -2193,7 +2140,7 @@ mod linearization_tests {
         use crate::tracing_v2::differentiation::JvpTracer;
 
         // `jvp_direct` runs the closure directly on concrete duals, so ordinary Rust control flow can branch on the
-        // primal — impossible in `jvp`/`jvp_interleaved`, whose closures see tracers. `f(x) = if x != 0 { x * sin(x) }
+        // primal — impossible in `jvp`, whose closures see tracers. `f(x) = if x != 0 { x * sin(x) }
         // else { -x }`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let branching = |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| -> Result<JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>, ProgramError> {

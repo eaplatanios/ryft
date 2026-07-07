@@ -1,17 +1,21 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::contexts::Context;
+use crate::contexts::Domain;
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::{ProgramError, Value};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
-use crate::tracing::{AbstractTracingContext, Tracer};
-use crate::tracing_v2::operations::control_flow::stage_cotangent;
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::differentiation::materialize;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Shape, Size, TypeError};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 use super::scatter::{LinearScatterAddOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 use super::slicing::is_integer;
@@ -23,9 +27,9 @@ pub const GATHER_OPERATION_NAME: &'static str = "gather";
 
 /// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scatter::Scatter), mirroring JAX's
 /// [`GatherScatterMode`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.GatherScatterMode.html). The mode does
-/// not affect the output [`Type`] — only how a start index that would read or write outside the operand is treated at
-/// execution time. It is shared by both operations (gather and scatter both reference it; the scatter combiner kind
-/// lives in [`super::scatter`]).
+/// not affect the output [`Type`](crate::types::Type) — only how a start index that would read or write outside the
+/// operand is treated at execution time. It is shared by both operations (gather and scatter both reference it; the
+/// scatter combiner kind lives in [`super::scatter`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GatherScatterMode {
     /// The caller promises every index is in bounds; out-of-bounds behavior is undefined (and gradients are wrong if
@@ -372,21 +376,21 @@ impl Gather for ArrayType {
         if indices_rank == 0 {
             return Err(TypeError {
                 message: format!(
-                    "{GATHER_OPERATION_NAME} indices must have rank at least 1 (the trailing index vector)"
+                    "'{GATHER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
                 ),
             }
             .into());
         }
         if !is_integer(indices.data_type()) {
             return Err(TypeError {
-                message: format!("{GATHER_OPERATION_NAME} indices must be integer-typed but have type {indices}"),
+                message: format!("'{GATHER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"),
             }
             .into());
         }
         let index_vector_dimension = indices_rank - 1;
         let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension as isize) else {
             return Err(TypeError {
-                message: format!("{GATHER_OPERATION_NAME} indices index vector dimension must have a static extent"),
+                message: format!("'{GATHER_OPERATION_NAME}' indices index vector dimension must have a static extent"),
             }
             .into());
         };
@@ -415,7 +419,7 @@ impl Gather for ArrayType {
         if dimensions.start_index_map().len() != index_vector_extent {
             return Err(TypeError {
                 message: format!(
-                    "{GATHER_OPERATION_NAME} start_index_map has length {} but the index vector extent is \
+                    "'{GATHER_OPERATION_NAME}' start_index_map has length {} but the index vector extent is \
                      {index_vector_extent}",
                     dimensions.start_index_map().len(),
                 ),
@@ -427,7 +431,7 @@ impl Gather for ArrayType {
         if dimensions.start_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
             return Err(TypeError {
                 message: format!(
-                    "{GATHER_OPERATION_NAME} operand and start-indices batching dimensions must align 1:1, but got {} \
+                    "'{GATHER_OPERATION_NAME}' operand and start-indices batching dimensions must align 1:1, but got {} \
                      and {}",
                     dimensions.operand_batching_dimensions().len(),
                     dimensions.start_indices_batching_dimensions().len(),
@@ -439,7 +443,7 @@ impl Gather for ArrayType {
             if dimension >= indices_rank || dimension == index_vector_dimension {
                 return Err(TypeError {
                     message: format!(
-                        "{GATHER_OPERATION_NAME} start_indices_batching_dimensions entry {dimension} is out of range \
+                        "'{GATHER_OPERATION_NAME}' start_indices_batching_dimensions entry {dimension} is out of range \
                          or names the index vector dimension"
                     ),
                 }
@@ -453,7 +457,7 @@ impl Gather for ArrayType {
         if collapsed.intersection(&operand_batching).next().is_some() {
             return Err(TypeError {
                 message: format!(
-                    "{GATHER_OPERATION_NAME} collapsed_slice_dimensions and operand_batching_dimensions must be \
+                    "'{GATHER_OPERATION_NAME}' collapsed_slice_dimensions and operand_batching_dimensions must be \
                      disjoint"
                 ),
             }
@@ -465,7 +469,7 @@ impl Gather for ArrayType {
         if slice_sizes.len() != operand_rank {
             return Err(TypeError {
                 message: format!(
-                    "{GATHER_OPERATION_NAME} slice_sizes has length {} but the operand has rank {operand_rank}",
+                    "'{GATHER_OPERATION_NAME}' slice_sizes has length {} but the operand has rank {operand_rank}",
                     slice_sizes.len(),
                 ),
             }
@@ -476,7 +480,7 @@ impl Gather for ArrayType {
                 if size > extent {
                     return Err(TypeError {
                         message: format!(
-                            "{GATHER_OPERATION_NAME} slice size {size} at axis {axis} exceeds the operand extent \
+                            "'{GATHER_OPERATION_NAME}' slice size {size} at axis {axis} exceeds the operand extent \
                              {extent}"
                         ),
                     }
@@ -486,7 +490,7 @@ impl Gather for ArrayType {
             if collapsed.contains(&axis) && size != 1 {
                 return Err(TypeError {
                     message: format!(
-                        "{GATHER_OPERATION_NAME} collapsed slice dimension {axis} must have slice size 1 but has {size}"
+                        "'{GATHER_OPERATION_NAME}' collapsed slice dimension {axis} must have slice size 1 but has {size}"
                     ),
                 }
                 .into());
@@ -494,7 +498,7 @@ impl Gather for ArrayType {
             if operand_batching.contains(&axis) && size > 1 {
                 return Err(TypeError {
                     message: format!(
-                        "{GATHER_OPERATION_NAME} operand batching dimension {axis} must have slice size at most 1 but \
+                        "'{GATHER_OPERATION_NAME}' operand batching dimension {axis} must have slice size at most 1 but \
                          has {size}"
                     ),
                 }
@@ -506,7 +510,7 @@ impl Gather for ArrayType {
         if dimensions.offset_dimensions().len() != offset_count {
             return Err(TypeError {
                 message: format!(
-                    "{GATHER_OPERATION_NAME} offset_dimensions has length {} but the operand has {offset_count} \
+                    "'{GATHER_OPERATION_NAME}' offset_dimensions has length {} but the operand has {offset_count} \
                      non-collapsed, non-batching axes",
                     dimensions.offset_dimensions().len(),
                 ),
@@ -521,7 +525,7 @@ impl Gather for ArrayType {
             if operand.dimension(operand_axis as isize) != indices.dimension(indices_axis as isize) {
                 return Err(TypeError {
                     message: format!(
-                        "{GATHER_OPERATION_NAME} batching dimensions must have equal extents, but operand axis \
+                        "'{GATHER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
                          {operand_axis} and indices axis {indices_axis} differ"
                     ),
                 }
@@ -564,7 +568,7 @@ impl Gather for ArrayType {
             if requested.rank() != output_rank {
                 return Err(TypeError {
                     message: format!(
-                        "{GATHER_OPERATION_NAME} output sharding rank ({}) does not match the output rank \
+                        "'{GATHER_OPERATION_NAME}' output sharding rank ({}) does not match the output rank \
                          ({output_rank})",
                         requested.rank(),
                     ),
@@ -573,7 +577,7 @@ impl Gather for ArrayType {
             }
             if references_auto_axis(requested) {
                 return Err(TypeError {
-                    message: format!("{GATHER_OPERATION_NAME} output sharding cannot reference auto mesh axes"),
+                    message: format!("'{GATHER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"),
                 }
                 .into());
             }
@@ -593,7 +597,7 @@ impl Gather for ArrayType {
                     if dimension_has_explicit_axis(&mesh, &sharding.dimensions()[axis]) {
                         return Err(TypeError {
                             message: format!(
-                                "{GATHER_OPERATION_NAME} operand axis {axis} is indexed by the start indices and must \
+                                "'{GATHER_OPERATION_NAME}' operand axis {axis} is indexed by the start indices and must \
                                  be replicated over explicit mesh axes; request an explicit output sharding to resolve \
                                  placement"
                             ),
@@ -606,7 +610,7 @@ impl Gather for ArrayType {
                 if dimension_has_explicit_axis(&mesh, &sharding.dimensions()[index_vector_dimension]) {
                     return Err(TypeError {
                         message: format!(
-                            "{GATHER_OPERATION_NAME} indices index vector dimension must be replicated over explicit \
+                            "'{GATHER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
                              mesh axes"
                         ),
                     }
@@ -649,7 +653,7 @@ impl Gather for ArrayType {
             let sharding =
                 Sharding::with_manual_axes(mesh, placement, unreduced_axes, reduced_axes, varying_manual_axes)
                     .map_err(|error| TypeError {
-                        message: format!("{GATHER_OPERATION_NAME} output sharding construction failed: {error}"),
+                        message: format!("'{GATHER_OPERATION_NAME}' output sharding construction failed: {error}"),
                     })?;
             Some(sharding.without_auto_axes())
         } else {
@@ -662,28 +666,33 @@ impl Gather for ArrayType {
     }
 }
 
-impl<C> Gather for Tracer<C>
+/// Any context-carrying value gathers by binding a [`GatherOperation`] through its own context. The
+/// `From<GatherOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Gather for V
 where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: From<GatherOperation>,
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<GatherOperation>,
 {
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let inputs = [self, indices];
-        let mut outputs = self.context().stage_operation(operation.clone(), &inputs)?;
+        let mut outputs = self.dispatch_domain().bind(operation.clone(), &[self.clone(), indices.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Gather> InterpretableOperation<ArrayType, V> for GatherOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + Gather, C> InterpretableOperation<V, C> for GatherOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].gather(&inputs[1], self)?])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for GatherOperation where
+    C::Operation: From<GatherOperation>
+{
 }
 
 /// Returns whether `dimension` is sharded over at least one explicit mesh axis of `mesh` (the explicit-axis gate used
@@ -716,7 +725,7 @@ fn resolve_mesh(
         (Some(left), Some(right)) => {
             if left.mesh() != right.mesh() {
                 return Err(TypeError {
-                    message: format!("{GATHER_OPERATION_NAME} operand and indices shardings must use the same mesh"),
+                    message: format!("'{GATHER_OPERATION_NAME}' operand and indices shardings must use the same mesh"),
                 });
             }
             Ok(Some(left.mesh().clone()))
@@ -737,13 +746,13 @@ pub(crate) fn validate_sorted_unique_in_range(
     for window in axes.windows(2) {
         if window[0] >= window[1] {
             return Err(TypeError {
-                message: format!("{operation_name} {field} must be sorted and unique but got {axes:?}"),
+                message: format!("'{operation_name}' {field} must be sorted and unique but got {axes:?}"),
             });
         }
     }
     if let Some(&axis) = axes.iter().find(|&&axis| axis >= bound) {
         return Err(TypeError {
-            message: format!("{operation_name} {field} entry {axis} is out of range for bound {bound}"),
+            message: format!("'{operation_name}' {field} entry {axis} is out of range for bound {bound}"),
         });
     }
     Ok(())
@@ -761,11 +770,11 @@ pub(crate) fn validate_unique_in_range(
     for &axis in axes {
         if axis >= bound {
             return Err(TypeError {
-                message: format!("{operation_name} {field} entry {axis} is out of range for bound {bound}"),
+                message: format!("'{operation_name}' {field} entry {axis} is out of range for bound {bound}"),
             });
         }
         if !seen.insert(axis) {
-            return Err(TypeError { message: format!("{operation_name} {field} must be unique but got {axes:?}") });
+            return Err(TypeError { message: format!("'{operation_name}' {field} must be unique but got {axes:?}") });
         }
     }
     Ok(())
@@ -775,8 +784,7 @@ pub(crate) fn validate_unique_in_range(
 /// Captured-index gather linear operation: the linear map `t ↦ gather(t, indices; dimensions)` over the tangent (or
 /// cotangent) of the gathered operand.
 ///
-/// It is the counterpart of the `Gather` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) emitted by the JVP of [`GatherOperation`]: the
+/// It is the captured-index linear map emitted by the JVP of [`GatherOperation`]: the
 /// integer index operand is a primal value captured at linearization time as a residual factor (it has no tangent
 /// space, so the map is linear in the single tangent operand), and its transpose is the dual scatter-add. The single
 /// operation input is the gathered operand's tangent; the captured `indices` factor supplies the gather's index
@@ -810,13 +818,13 @@ impl<F> LinearGatherOperation<F> {
     }
 }
 
-impl<F: Value<ArrayType>> Display for LinearGatherOperation<F> {
+impl<F: Value<Type = ArrayType>> Display for LinearGatherOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<F: Value<ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
+impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
     #[inline]
     fn name(&self) -> &'static str {
         GATHER_OPERATION_NAME
@@ -833,42 +841,46 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearGatherOperation<F> {
     }
 }
 
-impl<V, F> InterpretableOperation<ArrayType, V> for LinearGatherOperation<F>
+impl<V, F, C> InterpretableOperation<V, C> for LinearGatherOperation<F>
 where
-    V: Value<ArrayType> + Gather,
-    F: CustomVjpResidual<ArrayType, V>,
+    V: Value<Type = ArrayType> + Gather,
+    F: CustomVjpResidual<V>,
 {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].gather(&self.indices().residual_value()?, self.operation())?])
     }
 }
 
-/// Transpose rule for the captured-index gather (the `Gather` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). The forward linear map
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearGatherOperation`].
+impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
+    for LinearGatherOperation<F>
+where
+    C::Operation: From<LinearGatherOperation<F>>,
+{
+}
+
+/// Transpose rule for the captured-index gather. The forward linear map
 /// `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the output cotangent back into a
 /// zero operand at the gathered windows: the scatter geometry mirrors the gather axis-for-axis and the captured
 /// indices carry over. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O> for LinearGatherOperation<F>
+impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOperation<V, O> for LinearGatherOperation<F>
 where
     O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<LinearScatterAddOperation<F>>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        check_count!("input", input_types, 1, ProgramError);
-        check_count!("output", output_cotangents, 1, ProgramError);
-        match &output_cotangents[0] {
-            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
-            Cotangent::Staged(cotangent) => {
-                let zeros = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
+            MaybeZero::Value(cotangent) => {
+                let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
                 let dimensions = self.operation().dimensions();
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     dimensions.offset_dimensions().to_vec(),
@@ -888,7 +900,64 @@ where
                     &[zeros, cotangent.clone()],
                 )?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![Cotangent::Staged(outputs.into_iter().next().unwrap())])
+                Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
+            }
+        }
+    }
+}
+
+/// Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index operand (operand 1) has no
+/// tangent space, so in a valid pushforward it is the known operand and the gathered operand (operand 0) is the
+/// linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the
+/// output cotangent back into a zero operand at the gathered windows: the scatter geometry mirrors the gather
+/// axis-for-axis. This reproduces the captured-index [`LinearGatherOperation`] transpose rule, reading the indices
+/// from the pullback through `operand_values` and staging a primal additive [`ScatterOperation`] instead of folding
+/// the indices into a captured factor. The indices receive a structural zero, and a zero output cotangent stays a
+/// structural zero.
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
+where
+    O: Operation<ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
+{
+    fn transpose(
+        &self,
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(vec![
+                MaybeZero::Zero(inputs[0].r#type().into_owned()),
+                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+            ]),
+            MaybeZero::Value(cotangent) => {
+                // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
+                // value, so read the tracer directly.
+                let indices = inputs[1]
+                    .as_known()
+                    .expect("dispatch guarantees a known operand carries its pullback value")
+                    .clone();
+                let zeros = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
+                let scatter_dimensions = ScatterDimensionNumbers::new(
+                    self.dimensions().offset_dimensions().to_vec(),
+                    self.dimensions().collapsed_slice_dimensions().to_vec(),
+                    self.dimensions().start_index_map().to_vec(),
+                )
+                .with_batching_dimensions(
+                    self.dimensions().operand_batching_dimensions().to_vec(),
+                    self.dimensions().start_indices_batching_dimensions().to_vec(),
+                );
+                let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
+                    .with_mode(self.mode())
+                    .with_indices_are_sorted(self.indices_are_sorted())
+                    .with_unique_indices(self.unique_indices());
+                let outputs = context.stage_operation(scatter_operation, &[zeros, indices, cotangent.clone()])?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![
+                    MaybeZero::Value(outputs.into_iter().next().unwrap()),
+                    MaybeZero::Zero(inputs[1].r#type().into_owned()),
+                ])
             }
         }
     }
@@ -1012,5 +1081,71 @@ mod tests {
         assert_eq!(run(GatherScatterMode::PromiseInBounds), vec![20.0, 40.0]);
         // Fill-or-drop fills the out-of-bounds query with zero.
         assert_eq!(run(GatherScatterMode::FillOrDrop), vec![20.0, 0.0]);
+    }
+
+    /// Minimal operation enum hosting the primal [`GatherOperation`] (the forward gather) and the primal
+    /// [`ScatterOperation`] (its staged scatter-add adjoint) plus the structural `zero` and `add` operations the
+    /// transpose pass needs. The `Constant` variant carries the value parameter `V` so the [`Operation`] derive can
+    /// infer the primary type. [`TransposableOperation`] is hand-written rather than derived because the primal
+    /// [`ScatterOperation`] adjoint target has no transpose rule (it only ever appears in the pullback, never as a
+    /// forward instruction being transposed); the derived all-variant dispatcher would require one.
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    enum TestGatherOperation<V: Value<Type = ArrayType>> {
+        Zero(ZeroOperation<ArrayType>),
+        Constant(crate::operations::constants::ConstantOperation<V>),
+        Add(crate::operations::arithmetic::AddOperation),
+        Gather(GatherOperation),
+        Scatter(ScatterOperation),
+    }
+
+    impl<V: Value<Type = ArrayType>> TransposableOperation<V, TestGatherOperation<V>> for TestGatherOperation<V> {
+        fn transpose(
+            &self,
+            context: &mut TracingContext<V, TestGatherOperation<V>>,
+            inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
+        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>>, ProgramError> {
+            match self {
+                Self::Gather(operation) => operation.transpose(context, inputs, outputs),
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: format!("{} is not transposed in this test enum", self.name()),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn test_gather_partitioned_transpose_computes_scatter_add_adjoint() {
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+        use crate::tests::TestArray;
+        use crate::types::Typed;
+
+        // Take rows 0 and 2 of a [3, 2] operand: the operand is linear and the [2, 1] index array is the known
+        // operand. The gathered output and its cotangent have shape [2, 2].
+        let dimensions = GatherDimensionNumbers::new(vec![1], vec![0], vec![0]);
+        let operation = GatherOperation::new(dimensions, vec![1, 2]);
+        let operand = TestArray::matrix(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let indices = TestArray::new(indices_type(vec![2, 1]), vec![0.0, 2.0]);
+        let cotangent = TestArray::matrix(2, 2, vec![10.0, 20.0, 30.0, 40.0]);
+        let operand_type = operand.r#type().into_owned();
+        let indices_type = indices.r#type().into_owned();
+
+        // Build `gather(operand, indices)` over the test enum, treat only the operand as linear, and interpret the
+        // pullback on `[cotangent, indices]`.
+        let mut builder = ProgramBuilder::<TestArray, TestGatherOperation<TestArray>>::new();
+        let operand_input = builder.add_input(operand_type.clone());
+        let indices_input = builder.add_input(indices_type.clone());
+        let output = builder.add_instruction(operation.clone(), vec![operand_input, indices_input]).unwrap()[0];
+        let program = builder
+            .build::<(TestArray, TestArray), TestArray>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        assert_eq!(pullback.output_ids().len(), 1, "the known index input must receive no cotangent output");
+        let operand_cotangents = pullback.interpret(vec![cotangent, indices]).unwrap();
+        assert_eq!(operand_cotangents.len(), 1);
+        assert_eq!(*operand_cotangents[0].r#type(), operand_type);
+        // The scatter-add adjoint writes the cotangent rows back into rows 0 and 2 of a zero operand.
+        assert_eq!(operand_cotangents[0].values, vec![10.0, 20.0, 0.0, 0.0, 30.0, 40.0]);
     }
 }

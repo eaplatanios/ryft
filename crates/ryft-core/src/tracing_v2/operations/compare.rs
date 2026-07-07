@@ -1,52 +1,41 @@
-use crate::macros::check_count;
-use crate::operations::compare::{Compare, CompareOperation};
-use crate::operations::constants::ZeroOperation;
-use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture, ZeroTangentOperation};
-use crate::types::ArrayType;
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
+use crate::operations::Operation;
+use crate::operations::compare::CompareOperation;
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
-    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for CompareOperation
+/// Forward-mode rule for [`CompareOperation`]: comparisons map into a discrete (Boolean) codomain, so the primal
+/// operation is replayed on the input primals and each Boolean output is paired with a canonical typed zero tangent.
+impl<C: Context> DifferentiableOperation<C> for CompareOperation
 where
-    CompareOperation: InterpretableOperation<ArrayType, V>,
+    C::Operation: Clone + From<CompareOperation>,
+    CompareOperation: Operation<C::Type>,
 {
-    fn batch(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        crate::tracing_v2::batching::apply_elementwise_batch(context, self, inputs)
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        replay_zero_tangent(context, self.clone(), inputs)
     }
 }
 
-/// Comparison outputs are Boolean, so [`CompareOperation`] uses the zero-tangent forward-mode rule. The rule is
-/// generic over the context's metadata type and applies to every context whose values can be compared and
-/// interpreted, covering both array ([`ArrayType`]) and scalar ([`DataType`](crate::types::DataType)) programs.
-impl<C: DifferentiationContext<Value: Compare<Output = C::Value>>> ZeroTangentOperation<C> for CompareOperation where
-    Self: InterpretableOperation<C::Type, C::Value>
-{
-}
-
-/// JVP rule for [`CompareOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// canonical staged zero tangent. Refer to the documentation of [`ZeroTangentOperation`] for why this is sound.
-impl<C: DifferentiationContext<Value: Compare<Output = C::Value>>> DifferentiableOperation<C> for CompareOperation
+/// Transpose rule for [`CompareOperation`]: comparisons map into a discrete (Boolean) codomain and are not linear
+/// maps, so a tangent program never contains a primal `compare` on a linear operand (its forward pairs the replayed
+/// primal with a zero tangent) and the rule reports an
+/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for CompareOperation
 where
-    Self: Operation<C::Type> + InterpretableOperation<C::Type, C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
+    CompareOperation: Operation<V::Type>,
 {
-    #[inline]
-    fn jvp<'jvp>(
+    fn transpose(
         &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        self.zero_tangent_jvp(context, inputs)
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+        })
     }
 }
 
@@ -54,10 +43,12 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
-    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::DifferentiationContext;
 
     /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged tracers of any context with [`TestArray`] semantics.
@@ -69,7 +60,7 @@ mod tests {
                 Operation = crate::tracing_v2::ArrayOperation<TestArray>,
             >,
     {
-        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);
+        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
         Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
     }
 
@@ -77,13 +68,15 @@ mod tests {
     fn test_compare_jvp_emits_zero_tangents_and_piecewise_select_derivatives() {
         // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
         // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
-        let (primal, tangent) =
-            TestArrayDomain.jvp(piecewise_select, TestArray::scalar(2.0), TestArray::scalar(1.0)).unwrap();
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(piecewise_select, TestArray::scalar(2.0), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(primal.values, vec![4.0]);
         assert_eq!(tangent.values, vec![2.0]);
 
-        let (primal, tangent) =
-            TestArrayDomain.jvp(piecewise_select, TestArray::scalar(-2.0), TestArray::scalar(1.0)).unwrap();
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(piecewise_select, TestArray::scalar(-2.0), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(primal.values, vec![-6.0]);
         assert_eq!(tangent.values, vec![3.0]);
     }

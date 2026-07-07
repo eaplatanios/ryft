@@ -1,11 +1,12 @@
 use std::fmt::Display;
 use std::ops::Not;
 
-use crate::contexts::StagingContext;
-use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::contexts::Context;
+use crate::interpretation::InterpretableOperation;
+use crate::macros::{check_count, implement_tracer_operator};
+use crate::operations::{ElementwiseOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, TypeError};
 
 /// Canonical operation name for [`NotOperation`].
@@ -43,26 +44,17 @@ impl ElementwiseOperation for NotOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Not<Output = V>> InterpretableOperation<ArrayType, V> for NotOperation {
+impl<V: Value<Type = ArrayType> + Not<Output = V>, C> InterpretableOperation<V, C> for NotOperation {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![!inputs[0].clone()])
     }
 }
 
-impl<C: StagingContext<Operation: From<NotOperation>>> Not for Tracer<C> {
-    type Output = Self;
+impl<C: Context<Type = ArrayType, Operation: From<NotOperation>>> PartiallyEvaluatableOperation<C> for NotOperation {}
 
-    #[inline]
-    fn not(self) -> Self::Output {
-        self.unary(NotOperation)
-    }
-}
+implement_tracer_operator!(@unary Not, not, NotOperation, "`not` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -86,7 +78,7 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "NotOperation");
         assert_eq!(format!("{operation}"), NOT_OPERATION_NAME);
         let input = TestArray::vector(vec![1.0, 0.0, 1.0]);
-        let outputs = operation.interpret(&EagerContext::new(), &[input]).unwrap();
+        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &[input]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 0.0]);
 
         // The `!` operator implementation matches the interpretation.
@@ -105,12 +97,16 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+                &operation,
+                &EagerContext::<TestArray>::new(),
+                &[]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, NotOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, NotOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();

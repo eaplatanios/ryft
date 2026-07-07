@@ -7,7 +7,7 @@ pub mod scatter;
 pub mod slicing;
 pub mod transpose;
 
-pub use broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastLeading, BroadcastOperation, BroadcastTo};
+pub use broadcasting::{BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation};
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation};
 pub use gather::{
     GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherOperation, GatherScatterMode, LinearGatherOperation,
@@ -23,4 +23,4 @@ pub use slicing::{
     DynamicUpdateSlice, DynamicUpdateSliceOperation, LinearDynamicSliceOperation, LinearDynamicUpdateSliceOperation,
     SLICE_OPERATION_NAME, Slice, SliceOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
-pub use transpose::{TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation, inverse_permutation};
+pub use transpose::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};

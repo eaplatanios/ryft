@@ -22,9 +22,9 @@ impl<T: Reshape> ReshapeOps for T {}
 ///
 /// This is the trait bound most reshape-aware transforms use when they need both the abstract leaf
 /// contract and the value-level reshape operation.
-pub trait ReshapeValue: Value<ArrayType> + ReshapeOps {}
+pub trait ReshapeValue: Value<Type = ArrayType> + ReshapeOps {}
 
-impl<T: Value<ArrayType> + ReshapeOps> ReshapeValue for T {}
+impl<T: Value<Type = ArrayType> + ReshapeOps> ReshapeValue for T {}
 
 /// Lifts a reshape's per-item `input_shape` / `output_shape` pair through one batching level by
 /// inserting a new dimension of size `axis_size` at the supplied input position and finding the
@@ -94,16 +94,16 @@ pub fn lift_reshape_shapes(
     Some((Shape::new(lifted_input_dimensions), Shape::new(lifted_output_dimensions), k_out))
 }
 
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ReshapeOperation
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReshapeOperation
 where
     O: Operation<ArrayType> + From<ReshapeOperation>,
 {
     fn transpose(
         &self,
-        _context: &mut TracingContext<ArrayType, V, O>,
-        inputs: &[PartialValue<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-        outputs: &[MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>],
-    ) -> Result<Vec<MaybeZero<ArrayType, Tracer<TracingContext<ArrayType, V, O>>>>, ProgramError> {
+        _context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -134,9 +134,9 @@ where
     }
 }
 
-impl<V: Value<ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for ReshapeOperation
+impl<V: Value<Type = ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for ReshapeOperation
 where
-    ReshapeOperation: InterpretableOperation<ArrayType, V, C>,
+    ReshapeOperation: InterpretableOperation<V, C>,
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);

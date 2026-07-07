@@ -31,12 +31,14 @@
 
 use std::fmt::Display;
 
-use crate::contexts::StagingContext;
+use crate::contexts::Context;
+use crate::contexts::Domain;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{MeshAxisType, Sharding, ShardingDimension};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, TypeError};
 
 /// Canonical operation name for [`ReshardOperation`].
@@ -167,29 +169,32 @@ pub trait Reshard: Clone {
     }
 }
 
-impl<C> Reshard for Tracer<C>
+/// Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
+/// `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Reshard for V
 where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: From<ReshardOperation>,
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
 {
-    #[inline]
     fn reshard(&self, sharding: &Sharding) -> Self {
-        self.unary(ReshardOperation::new(sharding.clone()))
+        self.dispatch_domain()
+            .bind(ReshardOperation::new(sharding.clone()), &[self.clone()])
+            .expect("`reshard` operation failed")
+            .remove(0)
     }
 }
 
-impl<V: Value<ArrayType> + Reshard> InterpretableOperation<ArrayType, V> for ReshardOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + Reshard, C> InterpretableOperation<V, C> for ReshardOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // The resharding flows through the capability so interpretation over staging values (program batching,
         // re-tracing) preserves it; concrete values pass through unchanged.
         Ok(vec![inputs[0].reshard(&self.sharding)])
     }
 }
+
+impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::Operation: From<ReshardOperation> {}
 
 /// Unary [`Operation`] that records a sharding-propagation hint, the analogue of JAX's
 /// [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
@@ -285,26 +290,35 @@ pub trait ConstrainSharding: Clone {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<ShardingConstraintOperation>>> ConstrainSharding
-    for Tracer<C>
+/// Any context-carrying value constrains its sharding by binding a [`ShardingConstraintOperation`] through its own
+/// context. The `From<ShardingConstraintOperation>` bound makes this disjoint from the eager value types (whose
+/// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+/// implementations.
+impl<V: Value<Type = ArrayType>> ConstrainSharding for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ShardingConstraintOperation>,
 {
-    #[inline]
     fn constrain_sharding(&self, sharding: &Sharding) -> Self {
-        self.unary(ShardingConstraintOperation::new(sharding.clone()))
+        self.dispatch_domain()
+            .bind(ShardingConstraintOperation::new(sharding.clone()), &[self.clone()])
+            .expect("`constrain_sharding` operation failed")
+            .remove(0)
     }
 }
 
-impl<V: Value<ArrayType> + ConstrainSharding> InterpretableOperation<ArrayType, V> for ShardingConstraintOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + ConstrainSharding, C> InterpretableOperation<V, C> for ShardingConstraintOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         // The hint flows through the capability so interpretation over staging values preserves it; concrete values
         // pass through unchanged.
         Ok(vec![inputs[0].constrain_sharding(&self.sharding)])
     }
+}
+
+impl<C: Context> PartiallyEvaluatableOperation<C> for ShardingConstraintOperation where
+    C::Operation: From<ShardingConstraintOperation>
+{
 }
 
 #[cfg(test)]

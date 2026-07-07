@@ -1,13 +1,13 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
 use crate::broadcasting::Broadcastable;
-use crate::contexts::StagingContext;
+use crate::contexts::Context;
+use crate::contexts::Domain;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{BooleanLike, InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{BooleanLike, ElementwiseOperation, Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`CompareOperation`].
@@ -85,25 +85,35 @@ impl<T: Type + Broadcastable + BooleanLike> Operation<T> for CompareOperation {
     }
 }
 
-impl<T: Type, V: Value<T> + Compare<Output = V>> InterpretableOperation<T, V> for CompareOperation
-where
-    Self: Operation<T>,
-{
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].compare(&inputs[1], self.direction)])
+impl ElementwiseOperation for CompareOperation {
+    #[inline]
+    fn input_count(&self) -> usize {
+        2
+    }
+
+    #[inline]
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        Operation::<ArrayType>::infer_output_types(self, input_types)
     }
 }
+
+impl<V: Value + Compare<Output = V>, C> InterpretableOperation<V, C> for CompareOperation
+where
+    Self: Operation<V::Type>,
+{
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![inputs[0].compare(&inputs[1], self.direction)?])
+    }
+}
+
+impl<C: Context<Operation: From<CompareOperation>>> PartiallyEvaluatableOperation<C> for CompareOperation {}
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
 /// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must be broadcast-compatible,
-/// in this case, and they must also have the same [`DataType`]. For this example, the output has [`DataType::Boolean`]
-/// and the broadcasted shape of the two input arrays.
+/// in this case, and they must also have the same [`DataType`](crate::DataType). For this example, the output
+/// has [`DataType::Boolean`](crate::DataType::Boolean) and the broadcasted shape of the two input arrays.
 ///
 /// The associated [`Output`](Compare::Output) type lets concrete backends choose how they represent Boolean results:
 ///
@@ -117,81 +127,54 @@ pub trait Compare<Rhs = Self>: Sized {
     type Output;
 
     /// Compares `self` and `rhs` using a predicate determined by the provided `direction`.
-    fn compare(&self, rhs: &Rhs, direction: ComparisonDirection) -> Self::Output;
+    fn compare(&self, rhs: &Rhs, direction: ComparisonDirection) -> Result<Self::Output, ProgramError>;
 
     /// Computes `self == rhs` using [`CompareOperation`].
     #[inline]
-    fn equal(&self, rhs: &Rhs) -> Self::Output {
+    fn equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::Equal)
     }
 
     /// Computes `self != rhs` using [`CompareOperation`].
     #[inline]
-    fn not_equal(&self, rhs: &Rhs) -> Self::Output {
+    fn not_equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::NotEqual)
     }
 
     /// Computes `self < rhs` using [`CompareOperation`].
     #[inline]
-    fn less_than(&self, rhs: &Rhs) -> Self::Output {
+    fn less_than(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::LessThan)
     }
 
     /// Computes `self <= rhs` using [`CompareOperation`].
     #[inline]
-    fn less_than_or_equal(&self, rhs: &Rhs) -> Self::Output {
+    fn less_than_or_equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::LessThanOrEqual)
     }
 
     /// Computes `self > rhs` using [`CompareOperation`].
     #[inline]
-    fn greater_than(&self, rhs: &Rhs) -> Self::Output {
+    fn greater_than(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::GreaterThan)
     }
 
     /// Computes `self >= rhs` using [`CompareOperation`].
     #[inline]
-    fn greater_than_or_equal(&self, rhs: &Rhs) -> Self::Output {
+    fn greater_than_or_equal(&self, rhs: &Rhs) -> Result<Self::Output, ProgramError> {
         self.compare(rhs, ComparisonDirection::GreaterThanOrEqual)
     }
 }
 
-macro_rules! impl_compare_for_scalar {
-    ($($type:ty => ($zero:expr, $one:expr)),* $(,)?) => {
-        $(
-            impl Compare for $type {
-                type Output = Self;
-
-                #[inline]
-                fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
-                    let result = match direction {
-                        ComparisonDirection::Equal => self == rhs,
-                        ComparisonDirection::NotEqual => self != rhs,
-                        ComparisonDirection::LessThan => self < rhs,
-                        ComparisonDirection::LessThanOrEqual => self <= rhs,
-                        ComparisonDirection::GreaterThan => self > rhs,
-                        ComparisonDirection::GreaterThanOrEqual => self >= rhs,
-                    };
-                    if result { $one } else { $zero }
-                }
-            }
-        )*
-    };
-}
-
-impl_compare_for_scalar!(
-    bf16 => (bf16::ZERO, bf16::ONE),
-    f16 => (f16::ZERO, f16::ONE),
-    f32 => (0.0, 1.0),
-    f64 => (0.0, 1.0),
-);
-
-impl<C: StagingContext<Operation: From<CompareOperation>>> Compare for Tracer<C> {
+impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compare for V {
     type Output = Self;
 
     #[inline]
-    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Self::Output {
-        self.binary(rhs, CompareOperation::new(direction))
+    fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(CompareOperation::new(direction), &[self.clone(), rhs.clone()])?
+            .remove(0))
     }
 }
 
@@ -201,6 +184,7 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::operations::Operation;
+    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -211,9 +195,25 @@ mod tests {
         // Test using `ArrayType`s.
         let lhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
         let rhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let outputs =
-            CompareOperation::infer_output_types(&CompareOperation::new(ComparisonDirection::LessThan), &[lhs, rhs])
-                .unwrap();
+        let outputs = Operation::<ArrayType>::infer_output_types(
+            &CompareOperation::new(ComparisonDirection::LessThan),
+            &[lhs, rhs],
+        )
+        .unwrap();
+        assert_eq!(
+            outputs,
+            vec![ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2), Size::Static(3)]))]
+        );
+
+        // Type inference broadcasts the two operand shapes together (a size-1 operand broadcasts up to the other) and
+        // always produces a Boolean-typed output at the broadcast shape.
+        let lhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(3)]));
+        let rhs = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
+        let outputs = Operation::<ArrayType>::infer_output_types(
+            &CompareOperation::new(ComparisonDirection::LessThan),
+            &[lhs, rhs],
+        )
+        .unwrap();
         assert_eq!(
             outputs,
             vec![ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2), Size::Static(3)]))]
@@ -222,10 +222,16 @@ mod tests {
         // Test using `DataType`s: broadcast-compatible (promotable) input data types infer a Boolean output and
         // non-promotable ones error.
         let operation = CompareOperation::new(ComparisonDirection::LessThan);
-        assert_eq!(operation.infer_output_types(&[DataType::F64, DataType::F64]), Ok(vec![DataType::Boolean]));
-        assert_eq!(operation.infer_output_types(&[DataType::F32, DataType::F64]), Ok(vec![DataType::Boolean]));
         assert_eq!(
-            operation.infer_output_types(&[DataType::F8E3M4, DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64, DataType::F64]),
+            Ok(vec![DataType::Boolean]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
+            Ok(vec![DataType::Boolean]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
             Err(TypeError { message: "comparison input types are not broadcast-compatible".to_string() }),
         );
 
@@ -237,34 +243,34 @@ mod tests {
         assert_eq!(array_type.as_boolean(), ArrayType::new(DataType::Boolean, Shape::new(vec![Size::Static(2)])));
         assert!(array_type.boolean().is_err());
 
-        // Test that scalar values use the in-band zero/one Boolean encoding.
-        assert_eq!(2.0f64.less_than(&3.0), 1.0);
-        assert_eq!(2.0f32.greater_than(&3.0), 0.0);
+        // Test that scalar values produce an honestly Boolean-typed `Scalar::Bool` result.
+        assert_eq!(Scalar::from(2.0).less_than(&Scalar::from(3.0)).unwrap(), Scalar::from(true));
+        assert_eq!(Scalar::from(2.0f32).greater_than(&Scalar::from(3.0f32)).unwrap(), Scalar::from(false));
         assert_eq!(
-            <CompareOperation as InterpretableOperation<DataType, f64>>::interpret(
+            <CompareOperation as InterpretableOperation<Scalar, EagerContext<Scalar>>>::interpret(
                 &operation,
-                &EagerContext::new(),
-                &[2.0f64, 3.0f64],
+                &EagerContext::<Scalar>::new(),
+                &[Scalar::from(2.0), Scalar::from(3.0)],
             ),
-            Ok(vec![1.0])
+            Ok(vec![Scalar::from(true)])
         );
 
         // Test using `TestArray`s.
         let lhs = TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]);
         let rhs = TestArray::vector(vec![2.0, 2.0, 2.0, 2.0]);
         let outputs = CompareOperation::new(ComparisonDirection::LessThan)
-            .interpret(&EagerContext::new(), &[lhs, rhs])
+            .interpret(&EagerContext::<TestArray>::new(), &[lhs, rhs])
             .unwrap();
         assert_eq!(outputs[0].values(), &[1.0, 0.0, 0.0, 0.0]);
 
         // Test the convenience functions provided by `Compare`.
         let left = || TestArray::vector(vec![1.0, 2.0, 3.0]);
         let right = || TestArray::vector(vec![2.0, 2.0, 2.0]);
-        assert_eq!(left().equal(&right()).values(), &[0.0, 1.0, 0.0]);
-        assert_eq!(left().not_equal(&right()).values(), &[1.0, 0.0, 1.0]);
-        assert_eq!(left().less_than(&right()).values(), &[1.0, 0.0, 0.0]);
-        assert_eq!(left().less_than_or_equal(&right()).values(), &[1.0, 1.0, 0.0]);
-        assert_eq!(left().greater_than(&right()).values(), &[0.0, 0.0, 1.0]);
-        assert_eq!(left().greater_than_or_equal(&right()).values(), &[0.0, 1.0, 1.0]);
+        assert_eq!(left().equal(&right()).unwrap().values(), &[0.0, 1.0, 0.0]);
+        assert_eq!(left().not_equal(&right()).unwrap().values(), &[1.0, 0.0, 1.0]);
+        assert_eq!(left().less_than(&right()).unwrap().values(), &[1.0, 0.0, 0.0]);
+        assert_eq!(left().less_than_or_equal(&right()).unwrap().values(), &[1.0, 1.0, 0.0]);
+        assert_eq!(left().greater_than(&right()).unwrap().values(), &[0.0, 0.0, 1.0]);
+        assert_eq!(left().greater_than_or_equal(&right()).unwrap().values(), &[0.0, 1.0, 1.0]);
     }
 }

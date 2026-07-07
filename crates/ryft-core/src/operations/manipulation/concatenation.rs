@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
-use crate::contexts::StagingContext;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::contexts::Context;
+use crate::contexts::Domain;
+use crate::interpretation::InterpretableOperation;
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::Sharding;
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 // TODO(eaplatanios): Review from here onwards.
@@ -61,14 +63,17 @@ impl Operation<ArrayType> for ConcatenateOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Concatenate> InterpretableOperation<ArrayType, V> for ConcatenateOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + Concatenate, C> InterpretableOperation<V, C> for ConcatenateOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         Ok(vec![Concatenate::concatenate(inputs, self.axis)?])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ConcatenateOperation where
+    C::Operation: From<ConcatenateOperation>
+{
 }
 
 /// Represents the ability to join two or more arrays end to end along one axis. This is the direct analogue of the
@@ -85,9 +90,9 @@ impl<V: Value<ArrayType> + Concatenate> InterpretableOperation<ArrayType, V> for
 ///
 /// The concatenated axis may be dynamic: if any operand's `axis` dimension is [`Size::Dynamic`], the output `axis`
 /// dimension is also [`Size::Dynamic`], with an upper bound equal to the sum of the operand upper bounds when every
-/// operand is bounded and an unbounded [`Size::Dynamic(None)`] otherwise. So concatenating a dynamic stack with a
+/// operand is bounded and an unbounded `Size::Dynamic(None)` otherwise. So concatenating a dynamic stack with a
 /// fixed slice along the dynamic axis grows the stack while keeping its type dynamic — `[?, d] ++ [1, d] = [?, d]`
-/// along axis `0`. This is the typing that lets a dynamically-sized residual stack accumulate one lane per loop
+/// along axis `0`. This is the typing that lets a dynamically-sized residual stack accumulate one iteration per loop
 /// iteration. The non-concatenated axes must still match per [`Size`] equality (a [`Size::Dynamic`] non-concatenated
 /// axis is allowed only when every operand carries the same [`Size`] there) and propagate unchanged.
 ///
@@ -133,13 +138,13 @@ impl Concatenate for ArrayType {
     fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(
-                TypeError { message: "concatenate expects at least one operand but got none".to_string() }.into()
+                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
         let rank = first.rank();
         if axis >= rank {
             return Err(TypeError {
-                message: format!("concatenate axis {axis} is out of bounds for operands of rank {rank}"),
+                message: format!("'concatenate' axis {axis} is out of bounds for operands of rank {rank}"),
             }
             .into());
         }
@@ -153,7 +158,7 @@ impl Concatenate for ArrayType {
             if operand.data_type() != first.data_type() {
                 return Err(TypeError {
                     message: format!(
-                        "concatenate operands must share one data type but operand {index} has data type {} and \
+                        "'concatenate' operands must share one data type but operand {index} has data type {} and \
                         operand 0 has data type {}",
                         operand.data_type(),
                         first.data_type(),
@@ -164,7 +169,7 @@ impl Concatenate for ArrayType {
             if operand.rank() != rank {
                 return Err(TypeError {
                     message: format!(
-                        "concatenate operands must share one rank but operand {index} has rank {} and operand 0 has \
+                        "'concatenate' operands must share one rank but operand {index} has rank {} and operand 0 has \
                         rank {rank}",
                         operand.rank(),
                     ),
@@ -180,7 +185,7 @@ impl Concatenate for ArrayType {
                 if dimension != first_dimension {
                     return Err(TypeError {
                         message: format!(
-                            "concatenate operands must agree on every axis other than {axis} but operand {index} has \
+                            "'concatenate' operands must agree on every axis other than {axis} but operand {index} has \
                             size {dimension} on axis {other_axis} and operand 0 has size {first_dimension}",
                         ),
                     }
@@ -226,13 +231,13 @@ impl Concatenate for ArrayType {
                 Some(reference) => {
                     if reference.mesh() != sharding.mesh() {
                         return Err(
-                            TypeError { message: "concatenate operands must use the same mesh".to_string() }.into()
+                            TypeError { message: "'concatenate' operands must use the same mesh".to_string() }.into()
                         );
                     }
                     if reference.conflicts_on_explicit_axes_with(sharding) {
                         return Err(TypeError {
                             message: format!(
-                                "concatenate operands must be sharded identically, but got {reference} and {sharding}"
+                                "'concatenate' operands must be sharded identically, but got {reference} and {sharding}"
                             ),
                         }
                         .into());
@@ -258,15 +263,22 @@ impl Concatenate for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<ConcatenateOperation>>> Concatenate for Tracer<C> {
+/// Any context-carrying value concatenates by binding a [`ConcatenateOperation`] through its own context. The
+/// `From<ConcatenateOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Concatenate for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ConcatenateOperation>,
+{
     fn concatenate(operands: &[Self], axis: usize) -> Result<Self, ProgramError> {
         let Some(first) = operands.first() else {
             return Err(
-                TypeError { message: "concatenate expects at least one operand but got none".to_string() }.into()
+                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
-        let inputs = operands.iter().collect::<Vec<_>>();
-        let mut outputs = first.context().stage_operation(ConcatenateOperation::new(axis), inputs.as_slice())?;
+        let mut outputs =
+            first.dispatch_domain().bind(ConcatenateOperation::new(axis), operands.to_vec().as_slice())?;
         crate::macros::check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -310,7 +322,7 @@ mod tests {
         // Interpretation joins the row-major payloads along axis 0.
         let first = TestArray::matrix(1, 2, vec![1.0, 2.0]);
         let second = TestArray::matrix(3, 2, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output = operation.interpret(&crate::EagerContext::new(), &[first, second]).unwrap();
+        let output = operation.interpret(&crate::EagerContext::<TestArray>::new(), &[first, second]).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
@@ -327,14 +339,14 @@ mod tests {
         // unbounded, the output upper bound is unknown; with all bounded, the output upper bound sums the operand
         // bounds. The non-concatenated axes still propagate their (possibly equal dynamic) sizes.
         let dynamic_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]));
-        let fixed_lane = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
+        let fixed_slice = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[dynamic_stack.clone(), fixed_lane.clone()]),
+            operation.infer_output_types(&[dynamic_stack.clone(), fixed_slice.clone()]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None), Size::Static(2)]))]),
         );
         let bounded_stack = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(4)), Size::Static(2)]));
         assert_eq!(
-            operation.infer_output_types(&[bounded_stack.clone(), fixed_lane.clone()]),
+            operation.infer_output_types(&[bounded_stack.clone(), fixed_slice.clone()]),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(Some(6)), Size::Static(2)]))]),
         );
         let dynamic_non_axis = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(None)]));
@@ -346,16 +358,16 @@ mod tests {
         // Invalid inputs report precise operation and capability errors.
         assert_eq!(
             operation.infer_output_types(&[]),
-            Err(TypeError { message: "concatenate expects at least one operand but got none".to_string() }),
+            Err(TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }),
         );
         assert_eq!(
             ConcatenateOperation::new(2).infer_output_types(&[first_type.clone(), second_type.clone()]),
-            Err(TypeError { message: "concatenate axis 2 is out of bounds for operands of rank 2".to_string() }),
+            Err(TypeError { message: "'concatenate' axis 2 is out of bounds for operands of rank 2".to_string() }),
         );
         assert_eq!(
             operation.infer_output_types(&[first_type.clone(), ArrayType::scalar(DataType::F64)]),
             Err(TypeError {
-                message: "concatenate operands must share one rank but operand 1 has rank 0 and operand 0 has rank 2"
+                message: "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has rank 2"
                     .to_string(),
             }),
         );
@@ -365,7 +377,7 @@ mod tests {
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3), Size::Static(2)])),
             ]),
             Err(TypeError {
-                message: "concatenate operands must share one data type but operand 1 has data type f32 and operand \
+                message: "'concatenate' operands must share one data type but operand 1 has data type f32 and operand \
                     0 has data type f64"
                     .to_string(),
             }),
@@ -376,7 +388,7 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(5)])),
             ]),
             Err(TypeError {
-                message: "concatenate operands must agree on every axis other than 0 but operand 1 has size 5 on \
+                message: "'concatenate' operands must agree on every axis other than 0 but operand 1 has size 5 on \
                     axis 1 and operand 0 has size 2"
                     .to_string(),
             }),
@@ -388,14 +400,14 @@ mod tests {
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(1), Size::Dynamic(Some(3))])),
             ]),
             Err(TypeError {
-                message: "concatenate operands must agree on every axis other than 0 but operand 1 has size <3 on \
+                message: "'concatenate' operands must agree on every axis other than 0 but operand 1 has size <3 on \
                     axis 1 and operand 0 has size *"
                     .to_string(),
             }),
         );
 
         // Program rendering uses the canonical operation name and includes the captured axis.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ConcatenateOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, ConcatenateOperation>::new();
         let program_first = builder.add_input(first_type);
         let program_second = builder.add_input(second_type);
         let program_output = builder.add_instruction(operation, vec![program_first, program_second]).unwrap()[0];
@@ -486,7 +498,7 @@ mod tests {
             *output.r#type(),
             ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3), Size::Static(2)])),
         );
-        // Each leading slice gets the first operand's lane followed by the second operand's two lanes.
+        // Each leading slice gets the first operand's slice followed by the second operand's two slices.
         assert_eq!(output.values, vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]);
 
         // Three operands joined along axis 0 stack in order.
@@ -501,7 +513,7 @@ mod tests {
         assert_eq!(
             Concatenate::concatenate(&[TestArray::vector(vec![1.0]), TestArray::scalar(2.0)], 0),
             Err(ProgramError::Type(TypeError {
-                message: "concatenate operands must share one rank but operand 1 has rank 0 and operand 0 has rank 1"
+                message: "'concatenate' operands must share one rank but operand 1 has rank 0 and operand 0 has rank 1"
                     .to_string(),
             })),
         );

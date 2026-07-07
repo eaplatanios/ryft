@@ -1,11 +1,12 @@
 use std::fmt::Display;
 use std::ops::BitXor;
 
-use crate::contexts::StagingContext;
-use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::contexts::Context;
+use crate::interpretation::InterpretableOperation;
+use crate::macros::{check_count, implement_tracer_operator};
+use crate::operations::{ElementwiseOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, TypeError};
 
 /// Canonical operation name for [`XorOperation`].
@@ -43,26 +44,17 @@ impl ElementwiseOperation for XorOperation {
     }
 }
 
-impl<V: Value<ArrayType> + BitXor<Output = V>> InterpretableOperation<ArrayType, V> for XorOperation {
+impl<V: Value<Type = ArrayType> + BitXor<Output = V>, C> InterpretableOperation<V, C> for XorOperation {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].clone() ^ inputs[1].clone()])
     }
 }
 
-impl<C: StagingContext<Operation: From<XorOperation>>> BitXor for Tracer<C> {
-    type Output = Self;
+impl<C: Context<Type = ArrayType, Operation: From<XorOperation>>> PartiallyEvaluatableOperation<C> for XorOperation {}
 
-    #[inline]
-    fn bitxor(self, rhs: Self) -> Self::Output {
-        self.binary(&rhs, XorOperation)
-    }
-}
+implement_tracer_operator!(@binary BitXor, bitxor, XorOperation, "`xor` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -87,7 +79,7 @@ mod tests {
         assert_eq!(format!("{operation}"), XOR_OPERATION_NAME);
         let lhs = TestArray::vector(vec![1.0, 1.0, 0.0, 0.0]);
         let rhs = TestArray::vector(vec![1.0, 0.0, 1.0, 0.0]);
-        let outputs = operation.interpret(&EagerContext::new(), &[lhs, rhs]).unwrap();
+        let outputs = operation.interpret(&EagerContext::<TestArray>::new(), &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].values(), &[0.0, 1.0, 1.0, 0.0]);
 
         // The `^` operator implementation matches the interpretation, including scalar broadcasting.
@@ -112,12 +104,16 @@ mod tests {
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &EagerContext::new(), &[]),
+            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+                &operation,
+                &EagerContext::<TestArray>::new(),
+                &[]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, XorOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, XorOperation>::new();
         let left = builder.add_input(input_type.clone());
         let right = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];

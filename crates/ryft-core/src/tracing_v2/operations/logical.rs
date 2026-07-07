@@ -1,133 +1,84 @@
-use std::ops::{BitAnd, BitOr, BitXor, Not};
-
-use crate::operations::constants::ZeroOperation;
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
+use crate::operations::Operation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
-use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture, ZeroTangentOperation};
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
 use crate::types::ArrayType;
 
-/// Logical inputs and outputs are Boolean, so [`NotOperation`] uses the zero-tangent forward-mode rule.
-impl<C> ZeroTangentOperation<C> for NotOperation
-where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: Not<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
-{
+/// Implements the erroring [`TransposableOperation`] rule for Boolean-codomain logical operations: they are not
+/// linear maps, so a tangent program never contains them on a linear operand (their forwards pair the replayed
+/// primal with a zero tangent) and each rule reports an
+/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+macro_rules! logical_unsupported_transpose {
+    ($operation:ty) => {
+        impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for $operation {
+            fn transpose(
+                &self,
+                _context: &mut TracingContext<V, O>,
+                _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+                _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+            ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+                })
+            }
+        }
+    };
 }
 
-/// JVP rule for [`NotOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// canonical staged zero tangent. Refer to the documentation of
-/// [`ZeroTangentOperation`] for why this is sound.
-impl<C> DifferentiableOperation<C> for NotOperation
+logical_unsupported_transpose!(NotOperation);
+logical_unsupported_transpose!(AndOperation);
+logical_unsupported_transpose!(OrOperation);
+logical_unsupported_transpose!(XorOperation);
+
+/// Forward-mode rule for [`NotOperation`]: a Boolean output has no tangent, so the primal operation is replayed
+/// on the input primals and paired with a canonical typed zero tangent.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for NotOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: Not<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
+    C::Operation: Clone + From<NotOperation>,
+    NotOperation: Operation<ArrayType>,
 {
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        self.zero_tangent_jvp(context, inputs)
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        replay_zero_tangent(context, self.clone(), inputs)
     }
 }
 
-/// Logical inputs and outputs are Boolean, so [`AndOperation`] uses the zero-tangent forward-mode rule.
-impl<C> ZeroTangentOperation<C> for AndOperation
+/// Forward-mode rule for [`AndOperation`]: a Boolean output has no tangent, so the primal operation is replayed
+/// on the input primals and paired with a canonical typed zero tangent.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for AndOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: BitAnd<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
+    C::Operation: Clone + From<AndOperation>,
+    AndOperation: Operation<ArrayType>,
 {
-}
-
-/// JVP rule for [`AndOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// canonical staged zero tangent. Refer to the documentation of
-/// [`ZeroTangentOperation`] for why this is sound.
-impl<C> DifferentiableOperation<C> for AndOperation
-where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: BitAnd<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
-{
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        self.zero_tangent_jvp(context, inputs)
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        replay_zero_tangent(context, self.clone(), inputs)
     }
 }
 
-/// Logical inputs and outputs are Boolean, so [`OrOperation`] uses the zero-tangent forward-mode rule.
-impl<C> ZeroTangentOperation<C> for OrOperation
+/// Forward-mode rule for [`OrOperation`]: a Boolean output has no tangent, so the primal operation is replayed on
+/// the input primals and paired with a canonical typed zero tangent.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for OrOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: BitOr<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
+    C::Operation: Clone + From<OrOperation>,
+    OrOperation: Operation<ArrayType>,
 {
-}
-
-/// JVP rule for [`OrOperation`]: the Boolean primal output is computed from the input primals and paired with a
-/// canonical staged zero tangent. Refer to the documentation of
-/// [`ZeroTangentOperation`] for why this is sound.
-impl<C> DifferentiableOperation<C> for OrOperation
-where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: BitOr<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
-{
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        self.zero_tangent_jvp(context, inputs)
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        replay_zero_tangent(context, self.clone(), inputs)
     }
 }
 
-/// Logical inputs and outputs are Boolean, so [`XorOperation`] uses the zero-tangent forward-mode rule.
-impl<C> ZeroTangentOperation<C> for XorOperation
+/// Forward-mode rule for [`XorOperation`]: a Boolean output has no tangent, so the primal operation is replayed
+/// on the input primals and paired with a canonical typed zero tangent.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for XorOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: BitXor<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
+    C::Operation: Clone + From<XorOperation>,
+    XorOperation: Operation<ArrayType>,
 {
-}
-
-/// JVP rule for [`XorOperation`]: the Boolean primal output is computed from the input primals and paired
-/// with a canonical staged zero tangent. Refer to the documentation of
-/// [`ZeroTangentOperation`] for why this is sound.
-impl<C> DifferentiableOperation<C> for XorOperation
-where
-    C: DifferentiationContext<Type = ArrayType>,
-    C::Value: BitXor<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
-{
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        self.zero_tangent_jvp(context, inputs)
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        replay_zero_tangent(context, self.clone(), inputs)
     }
 }
 
@@ -135,10 +86,12 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
-    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::DifferentiationContext;
 
     /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over staged tracers of any context with [`TestArray`]
@@ -151,8 +104,8 @@ mod tests {
                 Operation = crate::tracing_v2::ArrayOperation<TestArray>,
             >,
     {
-        let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);
-        let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan);
+        let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
+        let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan).unwrap();
         let mask = positive & above_one;
         Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
     }
@@ -161,13 +114,15 @@ mod tests {
     fn test_logical_jvp_emits_zero_tangents_and_piecewise_select_derivatives() {
         // The logical conjunction of two Boolean comparisons drives the select, so the derivative is 2 when both
         // predicates hold (x > 1) and 3 otherwise.
-        let (primal, tangent) =
-            TestArrayDomain.jvp(masked_select, TestArray::scalar(2.0), TestArray::scalar(1.0)).unwrap();
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(masked_select, TestArray::scalar(2.0), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(primal.values, vec![4.0]);
         assert_eq!(tangent.values, vec![2.0]);
 
-        let (primal, tangent) =
-            TestArrayDomain.jvp(masked_select, TestArray::scalar(0.5), TestArray::scalar(1.0)).unwrap();
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jvp(masked_select, TestArray::scalar(0.5), TestArray::scalar(1.0))
+            .unwrap();
         assert_eq!(primal.values, vec![1.5]);
         assert_eq!(tangent.values, vec![3.0]);
     }

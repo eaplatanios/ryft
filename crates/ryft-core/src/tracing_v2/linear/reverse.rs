@@ -228,17 +228,19 @@ mod tests {
 
     use crate::contexts::StagingContext;
     use crate::programs::ProgramError;
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext};
     use crate::tracing_v2::{DifferentiationContext, DifferentiationError};
     use crate::types::DataType;
 
     use super::*;
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
 
     #[test]
     fn test_traced_value_and_grad_requires_input_leaves() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
-        let empty_primals: Vec<DomainTracer<ScalarDomain>> = Vec::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let empty_primals: Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>> = Vec::new();
 
         let result = context
             .value_and_grad(|_inputs: Vec<_>| panic!("closure should not run without traced inputs"), empty_primals);
@@ -251,8 +253,8 @@ mod tests {
 
     #[test]
     fn test_traced_value_and_grad_rejects_mismatched_program_builders() {
-        let context_a = DomainTracingContext::<ScalarDomain>::new();
-        let context_b = DomainTracingContext::<ScalarDomain>::new();
+        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let primal_a = context_a.input(DataType::F64);
         let primal_b = context_b.input(DataType::F64);
 
@@ -263,11 +265,14 @@ mod tests {
 
     #[test]
     fn test_traced_value_and_grad_invokes_function_once() {
-        let context = DomainTracingContext::<ScalarDomain>::new();
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let primal = context.input(DataType::F64);
         let calls = Cell::new(0);
 
-        let (_value, gradient): (DomainTracer<ScalarDomain>, Vec<DomainTracer<ScalarDomain>>) = context
+        let (_value, gradient): (
+            DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
+        ) = context
             .value_and_grad(
                 |inputs| {
                     calls.set(calls.get() + 1);
@@ -283,7 +288,7 @@ mod tests {
 
     #[test]
     fn test_value_and_grad_with_aux_ignores_aux_cotangents() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) = value_and_grad_with_aux(
             &domain,
@@ -303,7 +308,7 @@ mod tests {
 
     #[test]
     fn test_grad_returns_only_the_gradient() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let gradient: (Scalar, Scalar) =
             grad(&domain, |(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
@@ -313,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_grad_with_aux_returns_gradient_and_aux() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let (gradient, aux): ((Scalar, Scalar), Scalar) =
             grad_with_aux(&domain, |(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))

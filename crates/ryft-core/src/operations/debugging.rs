@@ -1,15 +1,16 @@
 use std::fmt::Display;
 
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::TransposableOperation;
 use crate::effects::{Effect, Effects};
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::constants::ZeroOperation;
+use crate::operations::{ElementwiseOperation, Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::linearization::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
 use crate::types::{ArrayType, Type, TypeError};
 
 // TODO(eaplatanios): Review this module.
@@ -89,7 +90,7 @@ impl ElementwiseOperation for PrintOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T>, C> InterpretableOperation<T, V, C> for PrintOperation {
+impl<V: Clone + Value, C> InterpretableOperation<V, C> for PrintOperation {
     fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         eprintln!("{}: {}", self.label, inputs[0]);
@@ -101,7 +102,7 @@ impl<T: Type, V: Clone + Value<T>, C> InterpretableOperation<T, V, C> for PrintO
 /// [`Program::partially_evaluate`](crate::Program::partially_evaluate): the print folds into the known side when its
 /// input is known and residualizes otherwise, with dead-code elimination keeping residual prints alive because
 /// [`Operation::effects`] is not [`Effects::PURE`].
-impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation {}
+impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation where C::Operation: From<PrintOperation> {}
 
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
 /// effectively an identity function that prints its input to standard error when executed. Because the staged
@@ -112,37 +113,35 @@ pub trait Print: Sized {
     fn print(self, label: &str) -> Self;
 }
 
-impl<C: StagingContext<Operation: From<PrintOperation>>> Print for Tracer<C, C::Meta> {
+impl<C: StagingContext<Operation: From<PrintOperation>>> Print for Tracer<C> {
     #[inline]
     fn print(self, label: &str) -> Self {
         self.unary(PrintOperation::new(label))
     }
 }
 
-impl<
-    C: StagingContext<
-            Value: Print,
-            Operation: Clone + MaybeZeroOperation<C::Type> + From<ZeroOperation<C::Type>> + From<PrintOperation>,
-        >,
-> DifferentiableOperation<C> for PrintOperation
+impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<PrintOperation>>> DifferentiableOperation<C>
+    for PrintOperation
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         // We re-print the input primal so the effect survives differentiation, while letting the input tangent pass
         // through unchanged (printing tangents would change the observable output of the differentiated program).
+        // The print binds through the context so the rule works uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().print(self.label());
-        Ok(vec![JvpTracer::new(primal, inputs[0].tangent().clone())])
+        let mut primal = context.bind(PrintOperation::new(self.label()), std::slice::from_ref(inputs[0].primal()))?;
+        check_count!("output", primal, 1, ProgramError);
+        Ok(vec![JvpTracer::new(primal.remove(0), inputs[0].tangent().clone())])
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for PrintOperation {
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for PrintOperation {
     #[inline]
     fn transpose(
         &self,
-        _context: &mut TracingContext<T, V, O>,
-        _inputs: &[PartialValue<T, Tracer<TracingContext<T, V, O>>>],
-        outputs: &[Cotangent<T, V, O>],
-    ) -> Result<Vec<Cotangent<T, V, O>>, ProgramError> {
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         // `PrintOperation` acts as a linear identity function (i.e., `y = x`), and so its adjoint is the identity
         // function: the single output cotangent passes straight through to the single input without staging another
         // print. The `DifferentiableOperation` implementation keeps the effect on the primal side, so the reverse
@@ -156,14 +155,14 @@ impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for P
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::EagerContext;
-    use crate::domains::Domain;
-    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::contexts::{Domain, EagerContext};
+    use crate::tests::TestArray;
     use crate::tracing::DomainTracer;
-    use crate::tracing_v2::{ArrayOperation, value_and_grad};
+    use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType};
 
     use super::*;
+    use crate::tracing_v2::value_and_grad;
 
     /// Computes `f(x) = x * x` while printing `x` and discarding the printed value, so the staged `print` is dead
     /// code that only its effect keeps alive.
@@ -189,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_print_interprets_as_the_identity() {
-        let context = EagerContext::<ArrayType, TestArray>::new();
+        let context = EagerContext::<TestArray>::new();
         let input = TestArray::scalar(3.0);
         let outputs = PrintOperation::new("x").interpret(&context, &[input.clone()]).unwrap();
         assert_eq!(outputs, vec![input]);
@@ -200,7 +199,7 @@ mod tests {
         // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
         // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
         // the gradient) exercises the effect keep-alive of the partition projections.
-        let domain = TestArrayDomain;
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (value, gradient) = value_and_grad(&domain, print_square, TestArray::scalar(3.0)).unwrap();
         assert_eq!(value.values[0], 9.0);
         assert_eq!(gradient.values[0], 6.0);
@@ -208,8 +207,8 @@ mod tests {
 
     #[test]
     fn test_print_stages_through_the_tracer_capability() {
-        let (_, program) = TestArrayDomain::trace(
-            |x: DomainTracer<TestArrayDomain>| Ok(x.print("x")),
+        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.print("x")),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();
@@ -227,8 +226,8 @@ mod tests {
         // Linearizing `print_square` partitions its jvp program into primal and tangent stages: the dead print rides
         // the primal (known) stage through the partition projections' effect keep-alive, and the tangent stage stays
         // print-free because the JVP rule keeps the effect on the primal side.
-        let (_, program) = TestArrayDomain::trace(
-            |x: DomainTracer<TestArrayDomain>| Ok(print_square(x)),
+        let (_, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
+            |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(print_square(x)),
             ArrayType::scalar(DataType::F64),
         )
         .unwrap();

@@ -1,15 +1,19 @@
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
+use crate::contexts::Context;
+use crate::contexts::Domain;
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::{ProgramError, Value};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::sharding::{LogicalMesh, Sharding};
-use crate::tracing::{AbstractTracingContext, Tracer};
+use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
-use crate::types::{ArrayType, Size, TypeError};
+use crate::types::{ArrayType, Size, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
@@ -74,7 +78,7 @@ impl Display for ScatterReductionKind {
 /// Specification of how the index operand and the update windows map onto the operand axes of a [`scatter`](Scatter),
 /// mirroring StableHLO's [`scatter`](https://openxla.org/stablehlo/spec#scatter) dimension numbers and JAX's
 /// [`ScatterDimensionNumbers`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.ScatterDimensionNumbers.html). It
-/// is the structural dual of [`GatherDimensionNumbers`](super::gather::GatherDimensionNumbers):
+/// is the structural dual of [`GatherDimensionNumbers`]:
 /// [`update_window_dimensions`](Self::update_window_dimensions) mirrors `offset_dimensions`,
 /// [`inserted_window_dimensions`](Self::inserted_window_dimensions) mirrors `collapsed_slice_dimensions`, and
 /// [`scatter_dimensions_to_operand_dimensions`](Self::scatter_dimensions_to_operand_dimensions) mirrors
@@ -382,21 +386,21 @@ impl Scatter for ArrayType {
         if indices_rank == 0 {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} indices must have rank at least 1 (the trailing index vector)"
+                    "'{SCATTER_OPERATION_NAME}' indices must have rank at least 1 (the trailing index vector)"
                 ),
             }
             .into());
         }
         if !is_integer(indices.data_type()) {
             return Err(TypeError {
-                message: format!("{SCATTER_OPERATION_NAME} indices must be integer-typed but have type {indices}"),
+                message: format!("'{SCATTER_OPERATION_NAME}' indices must be integer-typed but have type {indices}"),
             }
             .into());
         }
         if updates.data_type() != operand.data_type() {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} updates data type {} does not match operand data type {}",
+                    "'{SCATTER_OPERATION_NAME}' updates data type {} does not match operand data type {}",
                     updates.data_type(),
                     operand.data_type(),
                 ),
@@ -406,7 +410,7 @@ impl Scatter for ArrayType {
         let index_vector_dimension = indices_rank - 1;
         let Size::Static(index_vector_extent) = indices.dimension(index_vector_dimension as isize) else {
             return Err(TypeError {
-                message: format!("{SCATTER_OPERATION_NAME} indices index vector dimension must have a static extent"),
+                message: format!("'{SCATTER_OPERATION_NAME}' indices index vector dimension must have a static extent"),
             }
             .into());
         };
@@ -432,7 +436,7 @@ impl Scatter for ArrayType {
         if dimensions.scatter_dimensions_to_operand_dimensions().len() != index_vector_extent {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} scatter_dimensions_to_operand_dimensions has length {} but the index \
+                    "'{SCATTER_OPERATION_NAME}' scatter_dimensions_to_operand_dimensions has length {} but the index \
                      vector extent is {index_vector_extent}",
                     dimensions.scatter_dimensions_to_operand_dimensions().len(),
                 ),
@@ -448,7 +452,7 @@ impl Scatter for ArrayType {
         if dimensions.scatter_indices_batching_dimensions().len() != dimensions.operand_batching_dimensions().len() {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} operand and scatter-indices batching dimensions must align 1:1, but got \
+                    "'{SCATTER_OPERATION_NAME}' operand and scatter-indices batching dimensions must align 1:1, but got \
                      {} and {}",
                     dimensions.operand_batching_dimensions().len(),
                     dimensions.scatter_indices_batching_dimensions().len(),
@@ -460,7 +464,7 @@ impl Scatter for ArrayType {
             if dimension >= indices_rank || dimension == index_vector_dimension {
                 return Err(TypeError {
                     message: format!(
-                        "{SCATTER_OPERATION_NAME} scatter_indices_batching_dimensions entry {dimension} is out of \
+                        "'{SCATTER_OPERATION_NAME}' scatter_indices_batching_dimensions entry {dimension} is out of \
                          range or names the index vector dimension"
                     ),
                 }
@@ -473,7 +477,7 @@ impl Scatter for ArrayType {
         if inserted.intersection(&operand_batching).next().is_some() {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} inserted_window_dimensions and operand_batching_dimensions must be \
+                    "'{SCATTER_OPERATION_NAME}' inserted_window_dimensions and operand_batching_dimensions must be \
                      disjoint"
                 ),
             }
@@ -486,7 +490,7 @@ impl Scatter for ArrayType {
         if operand_rank != dimensions.update_window_dimensions().len() + inserted.len() + operand_batching.len() {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} operand rank {operand_rank} must equal update_window + inserted_window + \
+                    "'{SCATTER_OPERATION_NAME}' operand rank {operand_rank} must equal update_window + inserted_window + \
                      operand_batching dimension counts"
                 ),
             }
@@ -495,7 +499,7 @@ impl Scatter for ArrayType {
         if updates_rank != (indices_rank - 1) + dimensions.update_window_dimensions().len() {
             return Err(TypeError {
                 message: format!(
-                    "{SCATTER_OPERATION_NAME} updates rank {updates_rank} must equal (indices rank - 1) + the update \
+                    "'{SCATTER_OPERATION_NAME}' updates rank {updates_rank} must equal (indices rank - 1) + the update \
                      window dimension count"
                 ),
             }
@@ -515,7 +519,7 @@ impl Scatter for ArrayType {
                 if update_extent > operand_extent {
                     return Err(TypeError {
                         message: format!(
-                            "{SCATTER_OPERATION_NAME} update window axis {update_axis} extent {update_extent} exceeds \
+                            "'{SCATTER_OPERATION_NAME}' update window axis {update_axis} extent {update_extent} exceeds \
                              the operand window axis {operand_axis} extent {operand_extent}"
                         ),
                     }
@@ -533,7 +537,7 @@ impl Scatter for ArrayType {
             if updates.dimension(update_axis as isize) != indices.dimension(indices_axis as isize) {
                 return Err(TypeError {
                     message: format!(
-                        "{SCATTER_OPERATION_NAME} updates scatter axis {update_axis} must match indices batch axis \
+                        "'{SCATTER_OPERATION_NAME}' updates scatter axis {update_axis} must match indices batch axis \
                          {indices_axis} in extent"
                     ),
                 }
@@ -550,7 +554,7 @@ impl Scatter for ArrayType {
             if operand.dimension(operand_axis as isize) != indices.dimension(indices_axis as isize) {
                 return Err(TypeError {
                     message: format!(
-                        "{SCATTER_OPERATION_NAME} batching dimensions must have equal extents, but operand axis \
+                        "'{SCATTER_OPERATION_NAME}' batching dimensions must have equal extents, but operand axis \
                          {operand_axis} and indices axis {indices_axis} differ"
                     ),
                 }
@@ -567,7 +571,7 @@ impl Scatter for ArrayType {
             if requested.rank() != operand.rank() {
                 return Err(TypeError {
                     message: format!(
-                        "{SCATTER_OPERATION_NAME} output sharding rank ({}) does not match the operand rank ({})",
+                        "'{SCATTER_OPERATION_NAME}' output sharding rank ({}) does not match the operand rank ({})",
                         requested.rank(),
                         operand.rank(),
                     ),
@@ -576,7 +580,7 @@ impl Scatter for ArrayType {
             }
             if references_auto_axis(requested) {
                 return Err(TypeError {
-                    message: format!("{SCATTER_OPERATION_NAME} output sharding cannot reference auto mesh axes"),
+                    message: format!("'{SCATTER_OPERATION_NAME}' output sharding cannot reference auto mesh axes"),
                 }
                 .into());
             }
@@ -595,7 +599,7 @@ impl Scatter for ArrayType {
                 if dimension_has_explicit_axis(&mesh, &operand_sharding.dimensions()[axis]) {
                     return Err(TypeError {
                         message: format!(
-                            "{SCATTER_OPERATION_NAME} operand axis {axis} is targeted by the start indices and must be \
+                            "'{SCATTER_OPERATION_NAME}' operand axis {axis} is targeted by the start indices and must be \
                              replicated over explicit mesh axes; request an explicit output sharding to resolve \
                              placement"
                         ),
@@ -607,7 +611,7 @@ impl Scatter for ArrayType {
                 if dimension_has_explicit_axis(&mesh, &indices_sharding.dimensions()[index_vector_dimension]) {
                     return Err(TypeError {
                         message: format!(
-                            "{SCATTER_OPERATION_NAME} indices index vector dimension must be replicated over explicit \
+                            "'{SCATTER_OPERATION_NAME}' indices index vector dimension must be replicated over explicit \
                              mesh axes"
                         ),
                     }
@@ -626,28 +630,34 @@ impl Scatter for ArrayType {
     }
 }
 
-impl<C> Scatter for Tracer<C>
+/// Any context-carrying value scatters by binding a [`ScatterOperation`] through its own context. The
+/// `From<ScatterOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Scatter for V
 where
-    C: StagingContext<Type = ArrayType>,
-    C::Operation: From<ScatterOperation>,
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ScatterOperation>,
 {
     fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
-        let inputs = [self, indices, updates];
-        let mut outputs = self.context().stage_operation(operation.clone(), &inputs)?;
+        let mut outputs =
+            self.dispatch_domain().bind(operation.clone(), &[self.clone(), indices.clone(), updates.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-impl<V: Value<ArrayType> + Scatter> InterpretableOperation<ArrayType, V> for ScatterOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + Scatter, C> InterpretableOperation<V, C> for ScatterOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         Ok(vec![inputs[0].scatter(&inputs[1], &inputs[2], self)?])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScatterOperation where
+    C::Operation: From<ScatterOperation>
+{
 }
 
 /// Errors when `other` is sharded over a different mesh than `mesh`.
@@ -655,7 +665,9 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
     if let Some(other) = other {
         if other.mesh() != mesh {
             return Err(TypeError {
-                message: format!("{SCATTER_OPERATION_NAME} operand, indices, and updates shardings must use one mesh"),
+                message: format!(
+                    "'{SCATTER_OPERATION_NAME}' operand, indices, and updates shardings must use one mesh"
+                ),
             });
         }
     }
@@ -667,8 +679,7 @@ fn check_same_mesh(mesh: &LogicalMesh, other: Option<&Sharding>) -> Result<(), T
 /// `(t, u) ↦ scatter_add(t, indices, u; dimensions)` over the tangents (or cotangents) of the scattered operand and
 /// the updates.
 ///
-/// It is the counterpart of the `ScatterAdd` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation) emitted by the JVP of [`ScatterOperation`] with
+/// It is the captured-index linear map emitted by the JVP of [`ScatterOperation`] with
 /// an [`Add`](ScatterReductionKind::Add) combiner: the integer index operand is a primal value captured at
 /// linearization time as a residual factor (it has no tangent space, so the map is jointly linear in the two tangent
 /// operands), and its transpose is the dual gather. The two operation inputs are the operand and update tangents; the
@@ -702,13 +713,13 @@ impl<F> LinearScatterAddOperation<F> {
     }
 }
 
-impl<F: Value<ArrayType>> Display for LinearScatterAddOperation<F> {
+impl<F: Value<Type = ArrayType>> Display for LinearScatterAddOperation<F> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<F: Value<ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> {
+impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> {
     #[inline]
     fn name(&self) -> &'static str {
         SCATTER_OPERATION_NAME
@@ -729,42 +740,46 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearScatterAddOperation<F> 
     }
 }
 
-impl<V, F> InterpretableOperation<ArrayType, V> for LinearScatterAddOperation<F>
+impl<V, F, C> InterpretableOperation<V, C> for LinearScatterAddOperation<F>
 where
-    V: Value<ArrayType> + Scatter,
-    F: CustomVjpResidual<ArrayType, V>,
+    V: Value<Type = ArrayType> + Scatter,
+    F: CustomVjpResidual<V>,
 {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].scatter(&self.indices().residual_value()?, &inputs[1], self.operation())?])
     }
 }
 
-/// Transpose rule for the captured-index scatter-add (the `ScatterAdd` variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation)). Because scatter-add accumulates into its operand
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearScatterAddOperation`].
+impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
+    for LinearScatterAddOperation<F>
+where
+    C::Operation: From<LinearScatterAddOperation<F>>,
+{
+}
+
+/// Transpose rule for the captured-index scatter-add. Because scatter-add accumulates into its operand
 /// (`output = operand + scattered(updates)`, so `∂output/∂operand = I`), the operand cotangent is the output cotangent
 /// unchanged; the update cotangent gathers the output cotangent at the scattered windows via the dual gather built by
 /// mirroring the scatter geometry. That gather needs the operand and update types, so the input count is checked
 /// before the dual gather is derived. Symbolic-zero cotangents propagate unchanged.
-impl<V: Value<ArrayType>, O, F: Value<ArrayType>> TransposableOperation<ArrayType, V, O>
+impl<V: Value<Type = ArrayType>, O, F: Value<Type = ArrayType>> TransposableOperation<V, O>
     for LinearScatterAddOperation<F>
 where
     O: Operation<ArrayType> + From<LinearGatherOperation<F>>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
         let dimensions = self.operation().dimensions();
-        let operand_type = input_types[0];
-        let updates_type = input_types[1];
+        let operand_type = inputs[0].r#type();
+        let updates_type = inputs[1].r#type();
         let operand_rank = operand_type.rank();
         let update_window_dimensions = dimensions.update_window_dimensions();
         let inserted_window_dimensions = dimensions.inserted_window_dimensions();
@@ -780,7 +795,7 @@ where
                 let extent = updates_type.dimension(update_axis as isize).value().ok_or_else(|| {
                     ProgramError::from(TypeError {
                         message: format!(
-                            "{SCATTER_OPERATION_NAME} transpose requires a static update shape but update axis \
+                            "'{SCATTER_OPERATION_NAME}' transpose requires a static update shape but update axis \
                              {update_axis} has a dynamic size",
                         ),
                     })
@@ -803,18 +818,21 @@ where
             .with_indices_are_sorted(self.operation().indices_are_sorted())
             .with_unique_indices(self.operation().unique_indices())
             .with_output_sharding(updates_type.sharding().cloned());
-        check_count!("output", output_cotangents, 1, ProgramError);
-        match &output_cotangents[0] {
-            Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-            Cotangent::Staged(cotangent) => {
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(vec![
+                MaybeZero::Zero(inputs[0].r#type().into_owned()),
+                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+            ]),
+            MaybeZero::Value(cotangent) => {
                 let update_cotangents = context.stage_operation(
                     LinearGatherOperation::new(gather_operation, self.indices().clone()),
                     std::slice::from_ref(cotangent),
                 )?;
                 check_count!("output", update_cotangents, 1, ProgramError);
                 Ok(vec![
-                    Cotangent::Staged(cotangent.clone()),
-                    Cotangent::Staged(update_cotangents.into_iter().next().unwrap()),
+                    MaybeZero::Value(cotangent.clone()),
+                    MaybeZero::Value(update_cotangents.into_iter().next().unwrap()),
                 ])
             }
         }

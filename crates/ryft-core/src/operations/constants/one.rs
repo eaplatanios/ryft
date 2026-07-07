@@ -1,13 +1,15 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
-use crate::contexts::{EagerContext, StagingContext};
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::contexts::Context;
+use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{DataType, Type, TypeError};
+use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`OneOperation`].
 pub const ONE_OPERATION_NAME: &'static str = "one";
@@ -60,28 +62,29 @@ impl<T: Type> Operation<T> for OneOperation<T> {
     }
 }
 
-impl<T: Type, V: Value<T, InterpretationContext: One<T, V>>> InterpretableOperation<T, V> for OneOperation<T> {
+impl<T: Type, V: Value<Type = T>, C: One<V>> InterpretableOperation<V, C> for OneOperation<T> {
     #[inline]
-    fn interpret(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![context.one(&self.r#type)?])
     }
+}
+
+impl<T: Type, C: Context<Type = T, Operation: From<OneOperation<T>>>> PartiallyEvaluatableOperation<C>
+    for OneOperation<T>
+{
 }
 
 /// Represents the ability to synthesize a _one_ value for a given [`Type`] in an interpretation context. [`One`]
 /// is the [`Type`]-driven counterpart to [`OneLike`](super::OneLike). It is what [`OneOperation`] needs for its
 /// [`InterpretableOperation`] implementation, and it lives on the context because producing an eager value can be
 /// backend- or context-dependent.
-pub trait One<T: Type, V: Value<T>> {
+pub trait One<V: Value> {
     /// Returns a _one_ value for the provided [`Type`].
-    fn one(&self, r#type: &T) -> Result<V, ProgramError>;
+    fn one(&self, r#type: &V::Type) -> Result<V, ProgramError>;
 }
 
-impl<C: StagingContext<Operation: From<OneOperation<C::Type>>>> One<C::Type, Tracer<C>> for C {
+impl<C: StagingContext<Operation: From<OneOperation<C::Type>>>> One<Tracer<C>> for C {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<Tracer<C>, ProgramError> {
         let mut outputs = self.stage_nullary_operation(OneOperation::new(r#type.clone()))?;
@@ -90,36 +93,15 @@ impl<C: StagingContext<Operation: From<OneOperation<C::Type>>>> One<C::Type, Tra
     }
 }
 
-macro_rules! impl_one_for_scalar {
-    ($ty:ty, $data_type:path, $one:expr) => {
-        impl<O: Operation<DataType>> One<DataType, $ty> for EagerContext<DataType, $ty, O> {
-            #[inline]
-            fn one(&self, r#type: &DataType) -> Result<$ty, ProgramError> {
-                if *r#type != $data_type {
-                    return Err(TypeError {
-                        message: format!("scalar value expected data type {} but got {}", $data_type, r#type),
-                    }
-                    .into());
-                }
-                Ok($one)
-            }
-        }
-    };
+impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C>> for BatchingContext<C>
+where
+    BatchingContext<C>: Context<Type = ArrayType, Value = BatchingTracer<C>>,
+{
+    fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {
+        let batch = ArrayBatch::new(r#type.clone(), self.parent().one(r#type)?, BatchAxis::replicated())?;
+        Ok(BatchingTracer::new(self.clone(), batch))
+    }
 }
-
-impl_one_for_scalar!(bool, DataType::Boolean, true);
-impl_one_for_scalar!(i8, DataType::I8, 1i8);
-impl_one_for_scalar!(i16, DataType::I16, 1i16);
-impl_one_for_scalar!(i32, DataType::I32, 1i32);
-impl_one_for_scalar!(i64, DataType::I64, 1i64);
-impl_one_for_scalar!(u8, DataType::U8, 1u8);
-impl_one_for_scalar!(u16, DataType::U16, 1u16);
-impl_one_for_scalar!(u32, DataType::U32, 1u32);
-impl_one_for_scalar!(u64, DataType::U64, 1u64);
-impl_one_for_scalar!(bf16, DataType::BF16, bf16::ONE);
-impl_one_for_scalar!(f16, DataType::F16, f16::ONE);
-impl_one_for_scalar!(f32, DataType::F32, 1.0f32);
-impl_one_for_scalar!(f64, DataType::F64, 1.0f64);
 
 #[cfg(test)]
 mod tests {
@@ -128,28 +110,31 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::types::{DataType, TypeError};
 
     use super::*;
 
     #[test]
     fn test_one() {
-        assert_eq!(EagerContext::<DataType, bool, OneOperation<DataType>>::new().one(&DataType::Boolean), Ok(true));
-        assert_eq!(EagerContext::<DataType, i8, OneOperation<DataType>>::new().one(&DataType::I8), Ok(1i8));
-        assert_eq!(EagerContext::<DataType, i16, OneOperation<DataType>>::new().one(&DataType::I16), Ok(1i16));
-        assert_eq!(EagerContext::<DataType, i32, OneOperation<DataType>>::new().one(&DataType::I32), Ok(1i32));
-        assert_eq!(EagerContext::<DataType, i64, OneOperation<DataType>>::new().one(&DataType::I64), Ok(1i64));
-        assert_eq!(EagerContext::<DataType, u8, OneOperation<DataType>>::new().one(&DataType::U8), Ok(1u8));
-        assert_eq!(EagerContext::<DataType, u16, OneOperation<DataType>>::new().one(&DataType::U16), Ok(1u16));
-        assert_eq!(EagerContext::<DataType, u32, OneOperation<DataType>>::new().one(&DataType::U32), Ok(1u32));
-        assert_eq!(EagerContext::<DataType, u64, OneOperation<DataType>>::new().one(&DataType::U64), Ok(1u64));
-        assert_eq!(EagerContext::<DataType, bf16, OneOperation<DataType>>::new().one(&DataType::BF16), Ok(bf16::ONE));
-        assert_eq!(EagerContext::<DataType, f16, OneOperation<DataType>>::new().one(&DataType::F16), Ok(f16::ONE));
-        assert_eq!(EagerContext::<DataType, f32, OneOperation<DataType>>::new().one(&DataType::F32), Ok(1.0f32));
-        assert_eq!(EagerContext::<DataType, f64, OneOperation<DataType>>::new().one(&DataType::F64), Ok(1.0f64));
+        let context = EagerContext::<Scalar, OneOperation<DataType>>::new();
+        assert_eq!(context.one(&DataType::Boolean), Ok(Scalar::from(true)));
+        assert_eq!(context.one(&DataType::I8), Ok(Scalar::from(1i8)));
+        assert_eq!(context.one(&DataType::I16), Ok(Scalar::from(1i16)));
+        assert_eq!(context.one(&DataType::I32), Ok(Scalar::from(1i32)));
+        assert_eq!(context.one(&DataType::I64), Ok(Scalar::from(1i64)));
+        assert_eq!(context.one(&DataType::U8), Ok(Scalar::from(1u8)));
+        assert_eq!(context.one(&DataType::U16), Ok(Scalar::from(1u16)));
+        assert_eq!(context.one(&DataType::U32), Ok(Scalar::from(1u32)));
+        assert_eq!(context.one(&DataType::U64), Ok(Scalar::from(1u64)));
+        assert_eq!(context.one(&DataType::BF16), Ok(Scalar::from(bf16::ONE)));
+        assert_eq!(context.one(&DataType::F16), Ok(Scalar::from(f16::ONE)));
+        assert_eq!(context.one(&DataType::F32), Ok(Scalar::from(1.0f32)));
+        assert_eq!(context.one(&DataType::F64), Ok(Scalar::from(1.0f64)));
 
         let operation = OneOperation::new(DataType::F64);
         assert_eq!(Operation::<DataType>::name(&operation), ONE_OPERATION_NAME);
@@ -157,31 +142,37 @@ mod tests {
         assert_eq!(format!("{operation}"), "one [type=f64]");
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
-            Ok(vec![1.0]),
+            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[]
+            ),
+            Ok(vec![Scalar::from(1.0)]),
         );
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[2.5]),
+            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[Scalar::from(2.5)],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(
+            InterpretableOperation::<Scalar, crate::EagerContext<Scalar>>::interpret(
                 &OneOperation::new(DataType::F32),
                 &EagerContext::new(),
                 &[],
             ),
-            Err(ProgramError::Type(TypeError {
-                message: "scalar value expected data type f64 but got f32".to_string()
-            })),
+            Ok(vec![Scalar::from(1.0f32)]),
         );
 
-        let mut builder = ProgramBuilder::<DataType, f64, OneOperation<DataType>>::new();
+        let mut builder = ProgramBuilder::<Scalar, OneOperation<DataType>>::new();
         let output = builder.add_instruction(operation, vec![]).unwrap()[0];
-        let program = builder.build::<(), f64>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), Scalar>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

@@ -1,18 +1,20 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::contexts::Context;
 use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
+use crate::operations::constants::{Zero, ZeroOperation};
 use crate::operations::control_flow::{SELECT_OPERATION_NAME, Select, SelectCondition, SelectOperation};
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::operations::control_flow::stage_cotangent;
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, materialize};
+use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.
 ///
@@ -34,9 +36,9 @@ pub struct LinearSelectOperation<F> {
     /// Captured Boolean condition that drives the selection.
     condition: F,
 
-    /// [`PhantomData`] marker tying the captured condition to the [`DataType`] it is interpreted against, mirroring the
-    /// marker carried by [`ScaleOperation`](crate::operations::arithmetic::ScaleOperation). The `fn() -> DataType` form
-    /// indexes by [`DataType`] without owning one, so this operation's `Send` and `Sync` depend only on `F`.
+    /// [`PhantomData`] marker tying the captured condition to the [`DataType`] it is interpreted against. The
+    /// `fn() -> DataType` form indexes by [`DataType`] without owning one, so this operation's `Send` and `Sync`
+    /// depend only on `F`.
     marker: PhantomData<fn() -> DataType>,
 }
 
@@ -55,6 +57,7 @@ impl<F> LinearSelectOperation<F> {
 }
 
 impl<F: Debug> Debug for LinearSelectOperation<F> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("LinearSelectOperation").field("condition", &self.condition).finish()
     }
@@ -80,7 +83,7 @@ impl<F: Display> Operation<DataType> for LinearSelectOperation<F> {
         if input_types[0] != input_types[1] {
             return Err(TypeError {
                 message: format!(
-                    "select on_true data type {} differs from on_false data type {}",
+                    "'select' on_true data type {} differs from on_false data type {}",
                     input_types[0], input_types[1],
                 ),
             });
@@ -94,7 +97,7 @@ impl<F: Display> Operation<DataType> for LinearSelectOperation<F> {
     }
 }
 
-impl<F: Value<ArrayType>> Operation<ArrayType> for LinearSelectOperation<F> {
+impl<F: Value<Type = ArrayType>> Operation<ArrayType> for LinearSelectOperation<F> {
     #[inline]
     fn name(&self) -> &'static str {
         SELECT_OPERATION_NAME
@@ -117,131 +120,158 @@ impl<F: Value<ArrayType>> Operation<ArrayType> for LinearSelectOperation<F> {
     }
 }
 
-impl<V, F> InterpretableOperation<DataType, V> for LinearSelectOperation<F>
+/// Interpretation materializes the captured condition factor into the interpreting value type through
+/// [`CustomVjpResidual`](crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual) (an identity for
+/// conditions captured as plain runtime values) and selects through the value-level [`Select`] capability, with the
+/// materialized condition's [`SelectCondition`] view providing the condition representation of the active value
+/// semantics (a decoded in-band [`bool`] for eager scalars, the value itself for arrays and staged tracers).
+impl<V, F, C> InterpretableOperation<V, C> for LinearSelectOperation<F>
 where
-    V: Value<DataType> + Select<Condition = <F as SelectCondition>::Condition>,
-    F: Display + SelectCondition,
+    V: Value + SelectCondition + Select<Condition = <V as SelectCondition>::Condition>,
+    F: crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual<V>,
+    Self: Operation<V::Type>,
 {
-    fn interpret(
-        &self,
-        _context: &<V as Value<DataType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![V::select(&self.condition().select_condition()?, &inputs[0], &inputs[1])?])
+        Ok(vec![V::select(&self.condition().residual_value()?.select_condition()?, &inputs[0], &inputs[1])?])
     }
 }
 
-impl<V, F> InterpretableOperation<ArrayType, V> for LinearSelectOperation<F>
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`LinearSelectOperation`].
+impl<F: Value<Type = ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
+    for LinearSelectOperation<F>
 where
-    V: Value<ArrayType> + Select<Condition = V>,
-    F: crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual<ArrayType, V>,
+    C::Operation: From<LinearSelectOperation<F>>,
 {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![V::select(&self.condition().residual_value()?, &inputs[0], &inputs[1])?])
-    }
 }
 
-/// Transpose rule for the captured-condition select, shared by the scalar
-/// [`LinearScalarOperation::Select`](crate::tracing_v2::LinearScalarOperation) and array
-/// [`LinearArrayOperation::Select`](crate::tracing_v2::LinearArrayOperation) variants. The forward linear map
+/// Transpose rule for the captured-condition select. The forward linear map
 /// `(t, f) ↦ select(condition, t, f)` routes the output cotangent into the branch the captured condition selected:
 /// the `on_true` cotangent is `select(condition, cotangent, 0)` and the `on_false` cotangent is
 /// `select(condition, 0, cotangent)`. The transposed select reuses the same captured condition, reconstructed from
-/// `self` and staged back into the transpose builder. The impl is generic over the primary type `T` and applies
-/// wherever `LinearSelectOperation<F>` implements [`Operation`] for `T` (i.e., [`DataType`] and [`ArrayType`]).
-impl<T: Type, V: Value<T>, O: Operation<T>, F: Clone> TransposableOperation<T, V, O> for LinearSelectOperation<F>
+/// `self` and staged back into the transpose builder. The impl is generic over the primary type `V::Type` and applies
+/// wherever `LinearSelectOperation<F>` implements [`Operation`] for it (i.e., [`DataType`] and [`ArrayType`]).
+impl<V: Value, O: Operation<V::Type>, F: Clone> TransposableOperation<V, O> for LinearSelectOperation<F>
 where
-    Self: Operation<T>,
-    O: From<ZeroOperation<T>> + From<LinearSelectOperation<F>>,
+    Self: Operation<V::Type>,
+    O: From<ZeroOperation<V::Type>> + From<LinearSelectOperation<F>>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        context: &mut AbstractTracingContext<'transpose, T, V, O>,
-        input_types: &[&T],
-        output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
-        check_count!("input", input_types, 2, ProgramError);
-        check_count!("output", output_cotangents, 1, ProgramError);
-        match &output_cotangents[0] {
-            Cotangent::Zero => Ok(vec![Cotangent::Zero, Cotangent::Zero]),
-            Cotangent::Staged(cotangent) => {
-                let zero = stage_cotangent(context, &Cotangent::Zero, input_types[0]);
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(vec![
+                MaybeZero::Zero(inputs[0].r#type().into_owned()),
+                MaybeZero::Zero(inputs[1].r#type().into_owned()),
+            ]),
+            MaybeZero::Value(cotangent) => {
+                let zero = materialize(context, MaybeZero::Zero(inputs[0].r#type().into_owned()))?;
                 let operation = || O::from(LinearSelectOperation::new(self.condition().clone()));
                 let on_true = context.stage_operation(operation(), &[cotangent.clone(), zero.clone()])?;
                 check_count!("output", on_true, 1, ProgramError);
                 let on_false = context.stage_operation(operation(), &[zero, cotangent.clone()])?;
                 check_count!("output", on_false, 1, ProgramError);
                 Ok(vec![
-                    Cotangent::Staged(on_true.into_iter().next().unwrap()),
-                    Cotangent::Staged(on_false.into_iter().next().unwrap()),
+                    MaybeZero::Value(on_true.into_iter().next().unwrap()),
+                    MaybeZero::Value(on_false.into_iter().next().unwrap()),
                 ])
             }
         }
     }
 }
 
-impl<V: Value<ArrayType> + crate::operations::manipulation::Broadcast + crate::operations::manipulation::Transpose>
-    crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext> for SelectOperation
+/// Partition-aware transpose rule for the primal [`SelectOperation`]. The Boolean condition (operand 0) has no
+/// tangent space, so in a valid pushforward it is the known operand and the two branches (operands 1 and 2) are the
+/// linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true, on_false)` routes the output
+/// cotangent into the branch the known condition selected: the `on_true` cotangent is `select(condition, cotangent, 0)`
+/// and the `on_false` cotangent is `select(condition, 0, cotangent)`. This reproduces the captured-condition
+/// [`LinearSelectOperation`] transpose rule, reading the condition from the pullback through `operand_values` and
+/// staging a primal `select` instead of folding the condition into a captured factor. The condition receives a
+/// structural zero, and a zero output cotangent stays a structural zero.
+///
+/// The rule is generic over the primary type `V::Type` because it only reaches the branch type (`input_types[1]`), the
+/// known condition operand value, and the primal `select`; it carries no rank- or shape-specific logic. It therefore
+/// applies to both the array [`ArrayOperation::Select`](crate::tracing_v2::ArrayOperation) and the scalar
+/// [`ScalarOperation::Select`](crate::operations::scalars::ScalarOperation) enum dispatch.
+impl<V: Value, O> TransposableOperation<V, O> for SelectOperation
 where
-    SelectOperation: InterpretableOperation<ArrayType, V>,
+    SelectOperation: Operation<V::Type>,
+    O: Operation<V::Type> + From<ZeroOperation<V::Type>> + From<SelectOperation>,
 {
-    fn batch(
+    fn transpose(
         &self,
-        context: &V::InterpretationContext,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
-        crate::tracing_v2::batching::apply_elementwise_batch(context, self, inputs)
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect()),
+            MaybeZero::Value(cotangent) => {
+                // The condition is the known operand; the dispatch guarantees a `Known` operand carries its pullback
+                // value, so read the tracer directly.
+                let condition = inputs[0]
+                    .as_known()
+                    .expect("dispatch guarantees a known operand carries its pullback value")
+                    .clone();
+                let zero = materialize(context, MaybeZero::Zero(inputs[1].r#type().into_owned()))?;
+                let on_true =
+                    context.stage_operation(SelectOperation, &[condition.clone(), cotangent.clone(), zero.clone()])?;
+                check_count!("output", on_true, 1, ProgramError);
+                let on_false = context.stage_operation(SelectOperation, &[condition, zero, cotangent.clone()])?;
+                check_count!("output", on_false, 1, ProgramError);
+                Ok(vec![
+                    MaybeZero::Zero(inputs[0].r#type().into_owned()),
+                    MaybeZero::Value(on_true.into_iter().next().unwrap()),
+                    MaybeZero::Value(on_false.into_iter().next().unwrap()),
+                ])
+            }
+        }
     }
 }
 
-/// JVP rule for [`SelectOperation`], mirroring JAX's rule for
-/// [`jnp.where`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.where.html): the primal output is
-/// `select(condition, on_true, on_false)` over the input primals, and the tangent is
-/// `select(condition, on_true_tangent, on_false_tangent)` with the same primal condition. The condition is Boolean,
-/// so its own tangent is identically zero and is ignored. When both branch tangents are canonical staged zeros, the
-/// output tangent is a canonical staged zero of the output type and no linear operation is staged;
-/// otherwise the rule captures the condition as a residual factor and stages the captured-condition select provided
-/// by [`LinearSelectOperation`].
-impl<C> DifferentiableOperation<C> for SelectOperation
+/// Forward-mode rule for [`SelectOperation`]: the primal output is `select(condition, on_true, on_false)` over
+/// the input primals, and the tangent selects the branch tangents under the *same* primal condition (a `select` is
+/// piecewise linear in its branches), with the condition carried as an ordinary primal operand edge. When both branch
+/// tangents are canonical staged zeros, the output tangent is a canonical staged zero of the output type.
+impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for SelectOperation
 where
-    C: DifferentiationContext,
+    C::Operation: Clone + From<SelectOperation>,
     SelectOperation: Operation<C::Type>,
-    C::Value: SelectCondition + Select<Condition = <C::Value as SelectCondition>::Condition>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
-        From<LinearSelectOperation<ValueOrCapture<C::Type, C::Value>>> + From<ZeroOperation<C::Type>>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
 {
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
         let on_true = &inputs[1];
         let on_false = &inputs[2];
-        let primal = C::Value::select(&condition.primal().select_condition()?, on_true.primal(), on_false.primal())?;
-        if context.is_zero(on_true.tangent())? && context.is_zero(on_false.tangent())? {
-            let tangent_type = primal.r#type().into_owned();
-            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
-            check_count!("output", tangent_outputs, 1, ProgramError);
-            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
-        }
-        let condition_factor = condition.factor(context);
-        let mut outputs = context
-            .stage_operation(LinearSelectOperation::new(condition_factor), &[on_true.tangent(), on_false.tangent()])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
+        // Bind the primal and tangent selects through the context rather than the value-level `Select` capability:
+        // binding works uniformly under staging and eager contexts, whereas eager value types select over their own
+        // condition representations (for example, `Scalar` selects over `bool`).
+        let mut primal = context.bind(
+            SelectOperation,
+            &[condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone()],
+        )?;
+        check_count!("output", primal, 1, ProgramError);
+        let primal = primal.remove(0);
+        let tangent = if on_true.tangent().is_zero() && on_false.tangent().is_zero() {
+            MaybeZero::Zero(primal.r#type().into_owned())
+        } else {
+            // A select needs both branch tangents as real values, so materialize the structurally zero side.
+            let on_true_tangent = materialize(context, on_true.tangent().clone())?;
+            let on_false_tangent = materialize(context, on_false.tangent().clone())?;
+            let mut tangents =
+                context.bind(SelectOperation, &[condition.primal().clone(), on_true_tangent, on_false_tangent])?;
+            check_count!("output", tangents, 1, ProgramError);
+            MaybeZero::Value(tangents.remove(0))
+        };
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
@@ -249,11 +279,13 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
-    use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing_v2::test_util::assert_close;
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
+    use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
     use crate::tracing_v2::{DifferentiableDomainExtension, jacrev};
 
     use super::LinearSelectOperation;
@@ -267,7 +299,7 @@ mod tests {
                 Operation = crate::tracing_v2::ArrayOperation<TestArray>,
             >,
     {
-        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan);
+        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
         Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
     }
 
@@ -276,10 +308,20 @@ mod tests {
         // Reverse mode through `f(x) = select(x > 0, 2x, 3x)` exercises the captured-condition select transpose:
         // the on_true cotangent is `select(condition, cotangent, 0)` and the on_false cotangent is
         // `select(condition, 0, cotangent)`.
-        let jacobian = jacrev(&TestArrayDomain, |x| Ok(piecewise_select(x)), TestArray::scalar(2.0)).unwrap();
+        let jacobian = jacrev(
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            |x| Ok(piecewise_select(x)),
+            TestArray::scalar(2.0),
+        )
+        .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 2.0);
 
-        let jacobian = jacrev(&TestArrayDomain, |x| Ok(piecewise_select(x)), TestArray::scalar(-2.0)).unwrap();
+        let jacobian = jacrev(
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            |x| Ok(piecewise_select(x)),
+            TestArray::scalar(-2.0),
+        )
+        .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 3.0);
     }
 
@@ -293,10 +335,14 @@ mod tests {
     fn test_select_jacfwd_computes_piecewise_derivative() {
         // Forward mode through the same function exercises the captured-condition select under batched basis
         // tangents (the direct batched JVP path).
-        let jacobian = TestArrayDomain.jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0)).unwrap();
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0))
+            .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 2.0);
 
-        let jacobian = TestArrayDomain.jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0)).unwrap();
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0))
+            .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 3.0);
     }
 
@@ -304,8 +350,12 @@ mod tests {
     fn test_select_jacrev_over_vector_masks_per_element() {
         // Per-element masking over a vector input: the Jacobian of `select(x > 0, 2x, 3x)` is diagonal with entries
         // 2 where x > 0 and 3 elsewhere.
-        let jacobian =
-            jacrev(&TestArrayDomain, |x| Ok(piecewise_select(x)), TestArray::vector(vec![1.0, -1.0])).unwrap();
+        let jacobian = jacrev(
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            |x| Ok(piecewise_select(x)),
+            TestArray::vector(vec![1.0, -1.0]),
+        )
+        .unwrap();
         let block = jacobian.rows().partials();
         assert_eq!(block.output_shape(), &[2]);
         assert_eq!(block.input_shape(), &[2]);
@@ -317,48 +367,128 @@ mod tests {
 
     #[test]
     fn test_scalar_select_jvp_and_gradient_flow_to_selected_branch() {
-        // Differentiating `f(x, y) = select(x > y, 2x, 3y)` over `ScalarDomain` exercises the scalar captured-condition
-        // select staged through `LinearScalarOperation::Select`: forward mode routes each branch tangent through the
-        // selected branch, and reverse mode routes the cotangent there, so the derivative reaches only the selected
-        // branch's input.
-        use crate::scalars::ScalarDomain;
+        // Differentiating `f(x, y) = select(x > y, 2x, 3y)` over `EagerContext<Scalar, ScalarOperation<Scalar>>` exercises the scalar select rule:
+        // forward mode routes each branch tangent through the selected branch, and reverse mode routes the cotangent
+        // there, so the derivative reaches only the selected branch's input.
+        use crate::operations::scalars::ScalarOperation;
+        use crate::scalars::Scalar;
         use crate::tracing_v2::{DifferentiationContext, value_and_grad};
 
         fn piecewise<C>(x: crate::tracing::Tracer<C>, y: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
         where
             C: crate::contexts::StagingContext<
                     Type = crate::types::DataType,
-                    Constant = f64,
-                    Operation = crate::operations::scalars::ScalarOperation<f64>,
+                    Constant = Scalar,
+                    Operation = crate::operations::scalars::ScalarOperation<Scalar>,
                 >,
         {
-            let mask = x.compare(&y, ComparisonDirection::GreaterThan);
+            let mask = x.compare(&y, ComparisonDirection::GreaterThan).unwrap();
             Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone())).unwrap()
         }
 
-        let domain = ScalarDomain::<f64>::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         // `x > y`: the output is `2x`, so forward mode passes the `x` tangent through (scaled by 2) and zeroes the `y`
         // tangent, while the gradient is `(2, 0)`.
-        let (primal, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (3.0, 2.0), (1.0, 0.0)).unwrap();
-        assert_close(primal, 6.0);
-        assert_close(tangent, 2.0);
-        let (_, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (3.0, 2.0), (0.0, 1.0)).unwrap();
-        assert_close(tangent, 0.0);
-        let (value, gradient) = value_and_grad(&domain, |(x, y)| piecewise(x, y), (3.0, 2.0)).unwrap();
-        assert_close(value, 6.0);
-        assert_close(gradient.0, 2.0);
-        assert_close(gradient.1, 0.0);
+        let (primal, tangent) = domain
+            .jvp(
+                |(x, y)| piecewise(x, y),
+                (Scalar::from(3.0), Scalar::from(2.0)),
+                (Scalar::from(1.0), Scalar::from(0.0)),
+            )
+            .unwrap();
+        assert_scalar_close(primal, 6.0);
+        assert_scalar_close(tangent, 2.0);
+        let (_, tangent) = domain
+            .jvp(
+                |(x, y)| piecewise(x, y),
+                (Scalar::from(3.0), Scalar::from(2.0)),
+                (Scalar::from(0.0), Scalar::from(1.0)),
+            )
+            .unwrap();
+        assert_scalar_close(tangent, 0.0);
+        let (value, gradient) =
+            value_and_grad(&domain, |(x, y)| piecewise(x, y), (Scalar::from(3.0), Scalar::from(2.0))).unwrap();
+        assert_scalar_close(value, 6.0);
+        assert_scalar_close(gradient.0, 2.0);
+        assert_scalar_close(gradient.1, 0.0);
 
         // `x <= y`: the output is `3y`, so the roles flip; the gradient is `(0, 3)`.
-        let (primal, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (1.0, 2.0), (1.0, 0.0)).unwrap();
-        assert_close(primal, 6.0);
-        assert_close(tangent, 0.0);
-        let (_, tangent) = domain.jvp(|(x, y)| piecewise(x, y), (1.0, 2.0), (0.0, 1.0)).unwrap();
-        assert_close(tangent, 3.0);
-        let (value, gradient) = value_and_grad(&domain, |(x, y)| piecewise(x, y), (1.0, 2.0)).unwrap();
-        assert_close(value, 6.0);
-        assert_close(gradient.0, 0.0);
-        assert_close(gradient.1, 3.0);
+        let (primal, tangent) = domain
+            .jvp(
+                |(x, y)| piecewise(x, y),
+                (Scalar::from(1.0), Scalar::from(2.0)),
+                (Scalar::from(1.0), Scalar::from(0.0)),
+            )
+            .unwrap();
+        assert_scalar_close(primal, 6.0);
+        assert_scalar_close(tangent, 0.0);
+        let (_, tangent) = domain
+            .jvp(
+                |(x, y)| piecewise(x, y),
+                (Scalar::from(1.0), Scalar::from(2.0)),
+                (Scalar::from(0.0), Scalar::from(1.0)),
+            )
+            .unwrap();
+        assert_scalar_close(tangent, 3.0);
+        let (value, gradient) =
+            value_and_grad(&domain, |(x, y)| piecewise(x, y), (Scalar::from(1.0), Scalar::from(2.0))).unwrap();
+        assert_scalar_close(value, 6.0);
+        assert_scalar_close(gradient.0, 0.0);
+        assert_scalar_close(gradient.1, 3.0);
+    }
+
+    /// Minimal operation enum hosting the primal [`SelectOperation`] (used for both the forward select and its staged
+    /// adjoint selects) plus the structural `zero` and `add` operations the transpose pass needs. The `Constant`
+    /// variant carries the value parameter `V` so the [`Operation`] derive can infer the primary type.
+    #[derive(Clone, Debug, ryft_macros::Operation, ryft_macros::TransposableOperation)]
+    enum TestSelectOperation<V: crate::programs::Value<Type = crate::types::ArrayType>> {
+        Zero(crate::operations::constants::ZeroOperation<crate::types::ArrayType>),
+        Constant(crate::operations::constants::ConstantOperation<V>),
+        Add(crate::operations::arithmetic::AddOperation),
+        Select(crate::operations::control_flow::SelectOperation),
+    }
+
+    #[test]
+    fn test_select_partitioned_transpose_matches_captured_condition_select_adjoint() {
+        use crate::operations::BooleanLike;
+        use crate::operations::control_flow::SelectOperation;
+        use crate::parameters::Placeholder;
+        use crate::programs::ProgramBuilder;
+
+        // Condition `[true, false]` (known), branches and cotangent are length-two f64 vectors (linear branches).
+        let condition = TestArray::vector(vec![1.0, 0.0]).as_boolean();
+        // The branches are linear operands, so only their type enters the transpose; their values are unused.
+        let on_true = TestArray::vector(vec![10.0, 20.0]);
+        let cotangent = TestArray::vector(vec![5.0, 7.0]);
+        let condition_type = <TestArray as crate::types::Typed>::r#type(&condition).into_owned();
+        let branch_type = <TestArray as crate::types::Typed>::r#type(&on_true).into_owned();
+
+        // Build `select(condition, on_true, on_false)` over the test enum, treat only the branches as linear, and
+        // interpret the pullback on `[cotangent, condition]`.
+        let mut builder = ProgramBuilder::<TestArray, TestSelectOperation<TestArray>>::new();
+        let condition_input = builder.add_input(condition_type.clone());
+        let on_true_input = builder.add_input(branch_type.clone());
+        let on_false_input = builder.add_input(branch_type.clone());
+        let output = builder
+            .add_instruction(SelectOperation, vec![condition_input, on_true_input, on_false_input])
+            .unwrap()[0];
+        let program = builder
+            .build::<(TestArray, TestArray, TestArray), TestArray>(
+                vec![output],
+                (Placeholder, Placeholder, Placeholder),
+                Placeholder,
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
+        assert_eq!(pullback.output_ids().len(), 2, "the known condition input must receive no cotangent output");
+        let branch_cotangents = pullback.interpret(vec![cotangent, condition]).unwrap();
+
+        // The select adjoint routes the cotangent into each selected branch: under condition `[true, false]` the
+        // `on_true` cotangent keeps the cotangent at the true batch items and zeroes the rest (`[5, 0]`), and the
+        // `on_false` cotangent does the opposite (`[0, 7]`).
+        assert_eq!(branch_cotangents.len(), 2);
+        assert_eq!(branch_cotangents[0].values, vec![5.0, 0.0]);
+        assert_eq!(branch_cotangents[1].values, vec![0.0, 7.0]);
     }
 }

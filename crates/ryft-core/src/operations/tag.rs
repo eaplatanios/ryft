@@ -1,14 +1,15 @@
 use std::fmt::Display;
 
-use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::constants::ZeroOperation;
+use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Value};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::linearization::{DifferentiableOperation, JvpTracer};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
 use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`TagOperation`].
@@ -68,21 +69,15 @@ impl ElementwiseOperation for TagOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T>> InterpretableOperation<T, V> for TagOperation {
+impl<V: Clone + Value, C> InterpretableOperation<V, C> for TagOperation {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<T: Type, V: Value<T>, O> PartiallyEvaluatableOperation<T, V, O> for TagOperation {}
+impl<C: Context<Operation: From<TagOperation>>> PartiallyEvaluatableOperation<C> for TagOperation {}
 
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
 /// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
@@ -100,37 +95,38 @@ pub trait MaybeTag {
     fn key(&self) -> Option<&str>;
 }
 
-impl<C: StagingContext<Operation: From<TagOperation>>> Tag for Tracer<C, C::Meta> {
+impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V {
     #[inline]
     fn tag(self, key: &str) -> Self {
-        self.unary(TagOperation::new(key))
+        self.dispatch_domain()
+            .bind(TagOperation::new(key), std::slice::from_ref(&self))
+            .expect("`tag` operation failed")
+            .remove(0)
     }
 }
 
-impl<
-    C: StagingContext<
-            Value: Tag,
-            Operation: Clone + MaybeZeroOperation<C::Type> + From<ZeroOperation<C::Type>> + From<TagOperation>,
-        >,
-> DifferentiableOperation<C> for TagOperation
+impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperation>>> DifferentiableOperation<C>
+    for TagOperation
 {
-    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         // We re-tag the input primal for downstream classification while letting the input tangent pass through
-        // unchanged, matching the identity tangent of the tag.
+        // unchanged, matching the identity tangent of the tag. The tag binds through the context so the rule works
+        // uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().tag(self.key());
-        Ok(vec![JvpTracer::new(primal, inputs[0].tangent().clone())])
+        let mut primal = context.bind(TagOperation::new(self.key()), std::slice::from_ref(inputs[0].primal()))?;
+        check_count!("output", primal, 1, ProgramError);
+        Ok(vec![JvpTracer::new(primal.remove(0), inputs[0].tangent().clone())])
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>> TransposableOperation<T, V, O> for TagOperation {
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for TagOperation {
     #[inline]
     fn transpose(
         &self,
-        _context: &mut TracingContext<T, V, O>,
-        _inputs: &[PartialValue<T, Tracer<TracingContext<T, V, O>>>],
-        outputs: &[Cotangent<T, V, O>],
-    ) -> Result<Vec<Cotangent<T, V, O>>, ProgramError> {
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
         // `TagOperation` acts as a linear identity function (i.e., `y = x`), and so its adjoint is the identity
         // function. The single output cotangent passes straight through to the single input, staging nothing and
         // leaving the cotangent untagged. That is because the tag is meant to mark forward residuals and not adjoints.

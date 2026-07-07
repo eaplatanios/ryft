@@ -1,17 +1,21 @@
-use crate::contexts::StagingContext;
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::batching::ArrayBatch;
+use crate::batching::BatchAxis;
+use crate::batching::BatchableOperation;
+use crate::batching::BatchingError;
+use crate::batching::InterpretableBatchableOperation;
+use crate::contexts::{Context, StagingContext};
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::constants::{MaybeZeroOperation, ZeroOperation};
+use crate::operations::Operation;
+use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Broadcast, Concatenate, ConcatenateOperation, SliceOperation, Transpose};
-use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation, batch_input_metadata};
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::{ArrayType, Size, TypeError, Typed};
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
 
-use super::slicing::materialize_lane_axis;
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, materialize};
+use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`ConcatenateOperation`].
 ///
@@ -21,36 +25,37 @@ use super::slicing::materialize_lane_axis;
 /// `start[axis]` and `limit[axis]` set to that operand's `[offset, offset + operand_axis_size)` window and the full
 /// extent on every other axis. The operands must have a static size along `axis` so the offsets are known.
 /// Symbolic-zero cotangents propagate unchanged to every operand.
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for ConcatenateOperation
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ConcatenateOperation
 where
     O: Operation<ArrayType> + From<SliceOperation>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        check_count!("output", output_cotangents, 1, ProgramError);
-        if input_types.is_empty() {
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("output", outputs, 1, ProgramError);
+        if inputs.is_empty() {
             return Err(TypeError {
-                message: "concatenate transpose expects at least one operand but got none".to_string(),
+                message: "'concatenate' transpose expects at least one operand but got none".to_string(),
             }
             .into());
         }
         let axis = self.axis();
-        match &output_cotangents[0] {
-            Cotangent::Zero => Ok(vec![Cotangent::Zero; input_types.len()]),
-            Cotangent::Staged(cotangent) => {
-                let rank = input_types[0].rank();
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect()),
+            MaybeZero::Value(cotangent) => {
+                let rank = inputs[0].r#type().rank();
                 let mut offset = 0usize;
-                let mut input_cotangents = Vec::with_capacity(input_types.len());
-                for (index, input_type) in input_types.iter().enumerate() {
+                let mut input_cotangents = Vec::with_capacity(inputs.len());
+                for (index, input) in inputs.iter().enumerate() {
+                    let input_type = input.r#type();
                     let dimension = input_type.dimension(axis as isize);
                     let Size::Static(operand_axis_size) = dimension else {
                         return Err(TypeError {
                             message: format!(
-                                "concatenate transpose requires a static size along the concatenated axis {axis} \
+                                "'concatenate' transpose requires a static size along the concatenated axis {axis} \
                                 but operand {index} has size {dimension}",
                             ),
                         }
@@ -66,7 +71,7 @@ where
                             size.value().ok_or_else(|| {
                                 TypeError {
                                     message: format!(
-                                        "concatenate transpose requires a static operand shape but operand {index} \
+                                        "'concatenate' transpose requires a static operand shape but operand {index} \
                                         has size {size} on axis {other_axis}",
                                     ),
                                 }
@@ -82,7 +87,7 @@ where
                         std::slice::from_ref(cotangent),
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
-                    input_cotangents.push(Cotangent::Staged(outputs.into_iter().next().unwrap()));
+                    input_cotangents.push(MaybeZero::Value(outputs.into_iter().next().unwrap()));
                     offset += operand_axis_size;
                 }
                 Ok(input_cotangents)
@@ -91,84 +96,56 @@ where
     }
 }
 
-/// JVP rule for [`ConcatenateOperation`]: concatenation is jointly linear in all of its operands, so the tangent is
-/// the concatenation of the operand tangents along the same axis. When every operand tangent is a canonical staged
-/// zero, the output tangent is a canonical staged zero of the output type and no linear operation is staged.
-impl<C> DifferentiableOperation<C> for ConcatenateOperation
+/// Forward-mode rule for [`ConcatenateOperation`]: `concatenate` is linear in every operand, so the tangent
+/// concatenates the operand tangents along the same axis.
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for ConcatenateOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
+    C::Operation: Clone + From<ConcatenateOperation>,
     C::Value: Concatenate,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
-        From<ConcatenateOperation> + From<ZeroOperation<ArrayType>>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<ArrayType>,
 {
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        if inputs.is_empty() {
-            return Err(
-                TypeError { message: "concatenate expects at least one operand but got none".to_string() }.into()
-            );
-        }
-        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal = Concatenate::concatenate(&primal_operands, self.axis())?;
-        if inputs
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        let primals = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        // The concatenation needs every operand tangent as a real value, so materialize the structurally zero ones
+        // (the shared all-zero fast path already handled the case where every operand tangent is zero).
+        let tangents = inputs
             .iter()
-            .try_fold(true, |all_zero, input| Ok::<_, ProgramError>(all_zero && context.is_zero(input.tangent())?))?
-        {
-            let tangent_type = primal.r#type().into_owned();
-            let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(tangent_type))?;
-            check_count!("output", tangent_outputs, 1, ProgramError);
-            return Ok(vec![JvpTracer::new(primal, tangent_outputs.remove(0))]);
-        }
-        let operand_tangent_references = inputs.iter().map(JvpTracer::tangent).collect::<Vec<_>>();
-        let mut outputs =
-            context.stage_operation(ConcatenateOperation::new(self.axis()), operand_tangent_references.as_slice())?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![JvpTracer::from_value(primal, outputs.remove(0))])
+            .map(|dual| materialize(context, dual.tangent().clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let primal = Concatenate::concatenate(&primals, self.axis())?;
+        let tangent = Concatenate::concatenate(&tangents, self.axis())?;
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
 /// Batching rule for [`ConcatenateOperation`].
 ///
-/// All operands are aligned on one physical lane axis (lane-uniform operands are broadcast to gain it via
-/// [`materialize_lane_axis`], so each lane concatenates its own per-lane operands), and the concatenated axis is
-/// shifted past the inserted lane axis when the lane axis sits at or before it. When no operand is batched, the
+/// All operands are aligned on one physical batch axis (replicated operands are broadcast to gain it via
+/// [`ArrayBatch::match_axis`](crate::batching::ArrayBatch::match_axis), so each batch item
+/// concatenates its own operands), and the concatenated axis is
+/// shifted past the inserted batch axis when the batch axis sits at or before it. When no operand is batched, the
 /// operation passes through unchanged.
-impl<V: Value<ArrayType> + Broadcast + Transpose> BatchableOperation<V, V::InterpretationContext>
-    for ConcatenateOperation
+impl<V: Value<Type = ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for ConcatenateOperation
 where
-    ConcatenateOperation: InterpretableOperation<ArrayType, V>,
+    ConcatenateOperation: InterpretableOperation<V, C>,
 {
-    fn batch(
-        &self,
-        context: &V::InterpretationContext,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         if inputs.is_empty() {
             return Err(
-                TypeError { message: "concatenate expects at least one operand but got none".to_string() }.into()
+                TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         }
-        let (_, input_axes, axis_size) = batch_input_metadata(inputs)?;
-        let Some(batch_axis) = input_axes.iter().copied().flatten().next() else {
-            return crate::tracing_v2::batching::apply_with_axes(context, self, inputs, &[None]);
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let Some(batch_axis) = batch_axes.iter().copied().flatten().next() else {
+            return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
-        let materialized = inputs
-            .iter()
-            .map(|input| materialize_lane_axis(input, batch_axis, axis_size))
-            .collect::<Result<Vec<_>, _>>()?;
+        let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
+        let materialized =
+            inputs.iter().map(|input| input.match_axis(batch_axis, axis_size)).collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        crate::tracing_v2::batching::apply_with_axes(
+        ConcatenateOperation::new(lifted_axis).interpret_with_batch_axes(
             context,
-            &ConcatenateOperation::new(lifted_axis),
             materialized.as_slice(),
-            &[Some(batch_axis)],
+            &[BatchAxis::new(batch_axis)],
         )
     }
 }
@@ -177,13 +154,17 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::operations::manipulation::Concatenate;
-    use crate::tests::{TestArray, TestArrayDomain};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, value_and_grad};
+    use crate::types::Typed;
 
     use super::*;
+    use crate::batching::BatchAxis;
 
     #[test]
     fn test_concatenate_value_and_grad_routes_cotangent_per_operand() {
@@ -191,7 +172,7 @@ mod tests {
         // y2], so f = x0 + 2*x1 + 3*y0 + 4*y1 + 5*y2. The pullback slices the weighted cotangent [1, 2, 3, 4, 5] into
         // the first two entries for x and the last three for y.
         let (value, (x_gradient, y_gradient)) = value_and_grad(
-            &TestArrayDomain,
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| {
                 let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
                 (Concatenate::concatenate(&[x, y], 0).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
@@ -209,7 +190,7 @@ mod tests {
     fn test_concatenate_jacfwd_stacks_operand_coordinates() {
         // Forward mode through `f(x, y) = concatenate([x, y], 0)` over `x = [a, b]` and `y = [c]` produces one
         // selection Jacobian block per operand: `x` maps to the first two output rows and `y` to the last.
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 |(x, y)| Concatenate::concatenate(&[x, y], 0),
                 (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0])),
@@ -227,29 +208,47 @@ mod tests {
     }
 
     #[test]
-    fn test_concatenate_batching_lifts_lane_axis() {
-        // Two batched operands keep their lane axis at 0 and concatenate along the shifted axis 1: lane 0 joins
-        // [0, 1] with [4, 5] and lane 1 joins [2, 3] with [6, 7].
-        let first = ArrayBatch::mapped(TestArray::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]), 0).unwrap();
-        let second = ArrayBatch::mapped(TestArray::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]), 0).unwrap();
-        let outputs = ConcatenateOperation::new(0).batch(&crate::EagerContext::new(), &[first, second]).unwrap();
+    fn test_concatenate_batching_lifts_batch_axis() {
+        // Two batched operands keep their batch axis at 0 and concatenate along the shifted axis 1: batch item 0 joins
+        // [0, 1] with [4, 5] and batch item 1 joins [2, 3] with [6, 7].
+        let first = {
+            let value = TestArray::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let second = {
+            let value = TestArray::matrix(2, 2, vec![4.0, 5.0, 6.0, 7.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let outputs = ConcatenateOperation::new(0)
+            .batch(&crate::EagerContext::<TestArray>::new(), &[first, second])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].r#type().shape().dimensions(), &[Size::Static(2), Size::Static(4)]);
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]);
 
-        // A lane-uniform operand is broadcast to gain the lane axis so each lane concatenates the same copy.
-        let batched = ArrayBatch::mapped(TestArray::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]), 0).unwrap();
-        let uniform = ArrayBatch::unbatched(TestArray::vector(vec![8.0, 9.0]));
-        let outputs = ConcatenateOperation::new(0).batch(&crate::EagerContext::new(), &[batched, uniform]).unwrap();
-        assert_eq!(outputs[0].batch_axis(), Some(0));
+        // A replicated operand is broadcast to gain the batch axis so each batch item concatenates the same copy.
+        let batched = {
+            let value = TestArray::matrix(2, 2, vec![0.0, 1.0, 2.0, 3.0]);
+            ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
+        }
+        .unwrap();
+        let uniform = ArrayBatch::replicated(TestArray::vector(vec![8.0, 9.0]));
+        let outputs = ConcatenateOperation::new(0)
+            .batch(&crate::EagerContext::<TestArray>::new(), &[batched, uniform])
+            .unwrap();
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]);
 
-        // Lane-uniform operands pass through the unlifted rule.
-        let left = ArrayBatch::unbatched(TestArray::vector(vec![1.0, 2.0]));
-        let right = ArrayBatch::unbatched(TestArray::vector(vec![3.0]));
-        let outputs = ConcatenateOperation::new(0).batch(&crate::EagerContext::new(), &[left, right]).unwrap();
-        assert_eq!(outputs[0].batch_axis(), None);
+        // Replicated operands pass through the unlifted rule.
+        let left = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
+        let right = ArrayBatch::replicated(TestArray::vector(vec![3.0]));
+        let outputs = ConcatenateOperation::new(0)
+            .batch(&crate::EagerContext::<TestArray>::new(), &[left, right])
+            .unwrap();
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
     }
 }

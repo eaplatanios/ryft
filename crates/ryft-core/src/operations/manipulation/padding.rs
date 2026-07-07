@@ -1,10 +1,12 @@
 use std::fmt::Display;
 
-use crate::contexts::StagingContext;
+use crate::contexts::Context;
+use crate::contexts::Domain;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, TypeError};
 
 use super::slicing::resized_output_sharding;
@@ -40,7 +42,7 @@ impl PadOperation {
         if edge_padding_low.len() != edge_padding_high.len() || edge_padding_low.len() != interior_padding.len() {
             return Err(TypeError {
                 message: format!(
-                    "pad expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
+                    "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length but \
                     got lengths {}, {}, and {}",
                     edge_padding_low.len(),
                     edge_padding_high.len(),
@@ -106,12 +108,8 @@ impl Operation<ArrayType> for PadOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Pad> InterpretableOperation<ArrayType, V> for PadOperation {
-    fn interpret(
-        &self,
-        _context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+impl<V: Value<Type = ArrayType> + Pad, C> InterpretableOperation<V, C> for PadOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].pad(
             &inputs[1],
@@ -120,6 +118,13 @@ impl<V: Value<ArrayType> + Pad> InterpretableOperation<ArrayType, V> for PadOper
             self.interior_padding.as_slice(),
         )?])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for PadOperation where
+    C::Operation: From<PadOperation>
+{
 }
 
 /// Represents the ability to expand an array by adding edge and interior padding filled with a scalar padding value.
@@ -193,7 +198,7 @@ impl Pad for ArrayType {
         if self.data_type() != padding_value.data_type() {
             return Err(TypeError {
                 message: format!(
-                    "pad input data type {} does not match padding value data type {}",
+                    "'pad' input data type {} does not match padding value data type {}",
                     self.data_type(),
                     padding_value.data_type(),
                 ),
@@ -202,7 +207,7 @@ impl Pad for ArrayType {
         }
         if padding_value.rank() != 0 {
             return Err(TypeError {
-                message: format!("pad padding value must be a scalar but has type {padding_value}"),
+                message: format!("'pad' padding value must be a scalar but has type {padding_value}"),
             }
             .into());
         }
@@ -214,7 +219,7 @@ impl Pad for ArrayType {
         ] {
             if padding.len() != rank {
                 return Err(TypeError {
-                    message: format!("pad {name} has length {} but input has rank {rank}", padding.len()),
+                    message: format!("'pad' {name} has length {} but input has rank {rank}", padding.len()),
                 }
                 .into());
             }
@@ -225,7 +230,7 @@ impl Pad for ArrayType {
             let Size::Static(size) = dimension else {
                 return Err(TypeError {
                     message: format!(
-                        "pad does not support dynamic input axis {axis} with size {dimension}; the padded extent \
+                        "'pad' does not support dynamic input axis {axis} with size {dimension}; the padded extent \
                         cannot be computed from an unknown extent",
                     ),
                 }
@@ -245,7 +250,14 @@ impl Pad for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<PadOperation>>> Pad for Tracer<C> {
+/// Any context-carrying value pads by binding a [`PadOperation`] through its own context. The `From<PadOperation>`
+/// bound makes this disjoint from the eager value types (whose context operation is `ConstantOperation`), so it covers
+/// the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Pad for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<PadOperation>,
+{
     fn pad(
         &self,
         padding_value: &Self,
@@ -253,9 +265,9 @@ impl<C: StagingContext<Type = ArrayType, Operation: From<PadOperation>>> Pad for
         edge_padding_high: &[usize],
         interior_padding: &[usize],
     ) -> Result<Self, ProgramError> {
-        let mut outputs = self.context().stage_operation(
+        let mut outputs = self.dispatch_domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
-            &[self, padding_value],
+            &[self.clone(), padding_value.clone()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -300,7 +312,9 @@ mod tests {
         // Interpretation writes the input elements at `low + i * (interior + 1)` (positions 1, 3, and 5) and fills
         // every other position with the padding value.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = operation.interpret(&crate::EagerContext::new(), &[input, TestArray::scalar(9.0)]).unwrap();
+        let output = operation
+            .interpret(&crate::EagerContext::<TestArray>::new(), &[input, TestArray::scalar(9.0)])
+            .unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![9.0, 1.0, 9.0, 2.0, 9.0, 3.0, 9.0, 9.0]);
 
@@ -320,7 +334,7 @@ mod tests {
         assert_eq!(
             PadOperation::new(vec![1], vec![2, 0], vec![1]),
             Err(ProgramError::Type(TypeError {
-                message: "pad expects edge_padding_low, edge_padding_high, and interior_padding to share one length \
+                message: "'pad' expects edge_padding_low, edge_padding_high, and interior_padding to share one length \
                     but got lengths 1, 2, and 1"
                     .to_string(),
             })),
@@ -332,18 +346,18 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[input_type.clone(), ArrayType::scalar(DataType::F32)]),
             Err(TypeError {
-                message: "pad input data type f64 does not match padding value data type f32".to_string(),
+                message: "'pad' input data type f64 does not match padding value data type f32".to_string(),
             }),
         );
         assert_eq!(
             operation.infer_output_types(&[input_type.clone(), input_type.clone()]),
-            Err(TypeError { message: "pad padding value must be a scalar but has type f64[3]".to_string() }),
+            Err(TypeError { message: "'pad' padding value must be a scalar but has type f64[3]".to_string() }),
         );
         assert_eq!(
             PadOperation::new(vec![1, 0], vec![2, 0], vec![1, 0])
                 .unwrap()
                 .infer_output_types(&[input_type.clone(), padding_value_type.clone()]),
-            Err(TypeError { message: "pad edge_padding_low has length 2 but input has rank 1".to_string() }),
+            Err(TypeError { message: "'pad' edge_padding_low has length 2 but input has rank 1".to_string() }),
         );
         assert_eq!(
             operation.infer_output_types(&[
@@ -351,18 +365,22 @@ mod tests {
                 padding_value_type.clone(),
             ]),
             Err(TypeError {
-                message: "pad does not support dynamic input axis 0 with size *; the padded extent cannot be \
+                message: "'pad' does not support dynamic input axis 0 with size *; the padded extent cannot be \
                     computed from an unknown extent"
                     .to_string(),
             }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray>::interpret(&operation, &crate::EagerContext::new(), &[]),
+            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+                &operation,
+                &crate::EagerContext::<TestArray>::new(),
+                &[]
+            ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name and includes all three padding vectors.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, PadOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, PadOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_padding_value = builder.add_input(padding_value_type);
         let program_output = builder.add_instruction(operation, vec![program_input, program_padding_value]).unwrap()[0];
@@ -393,7 +411,7 @@ mod tests {
         assert_eq!(
             TestArray::vector(vec![1.0, 2.0]).pad(&TestArray::vector(vec![0.0]), &[0], &[0], &[0]),
             Err(ProgramError::Type(TypeError {
-                message: "pad padding value must be a scalar but has type f64[1]".to_string(),
+                message: "'pad' padding value must be a scalar but has type f64[1]".to_string(),
             })),
         );
     }

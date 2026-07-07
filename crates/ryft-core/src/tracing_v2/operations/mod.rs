@@ -61,12 +61,6 @@ pub mod recompute;
 /// Reshaping primitive.
 pub mod reshape;
 
-/// Captured-factor payloads and materialization.
-pub mod captures;
-
-/// Scalar and tensor scaling.
-pub mod scale;
-
 /// Statically shaped scan loop differentiation and batching rules.
 pub mod scan;
 
@@ -95,22 +89,20 @@ pub mod sub;
 pub mod transpose;
 
 pub use broadcasting::lift_broadcast;
-pub use captures::{MaterializeCaptureOperation, ValueOrCapture};
 pub use collective::{Collective, CollectiveKind, CollectiveOperation, forward_collective_to_parent};
-pub use control_flow::{DefactorizableProgramOperation, DefactorizedOperation};
+pub use control_flow::transpose_primal_condition;
 pub use custom_derivatives::{
     CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpCallOperation, CustomVjpOperation, CustomVjpResidual,
-    custom_jvp, custom_vjp,
+    custom_jvp, custom_vjp, transpose_primal_custom_vjp,
 };
 pub use dot::{
-    Dot, DotDimensionNumbers, DotOperation, DotOps, LeftDot, LeftDotOperation, MaybeDot, RightDot, RightDotOperation,
-    adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot, dot_general_evaluate, lhs_result_axes,
-    lift_dot_dimensions, lift_left_dot_dimensions, lift_right_dot_dimensions, rhs_result_axes,
+    Dot, DotDimensionNumbers, DotOperation, DotOps, MaybeDot, adjoint_dimensions_for_left_dot,
+    adjoint_dimensions_for_right_dot, dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, rhs_result_axes,
 };
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
-pub use primitive::{ArrayOperation, LinearArrayOperation};
+pub use primitive::ArrayOperation;
 pub use recompute::RecomputeOperation;
 pub use reduce::{Reduce, ReduceOperation, ReductionKind, lift_reduce_axes, reduce_abstract, reduce_evaluate};
 pub use reshape::{ReshapeOps, ReshapeValue, lift_reshape_shapes};
-pub use select::LinearSelectOperation;
+pub use scan::transpose_primal_scan;
 pub use transpose::lift_permutation;

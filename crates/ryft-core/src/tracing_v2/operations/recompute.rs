@@ -1,19 +1,22 @@
 use std::fmt::Display;
 
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::batching::ArrayBatch;
+use crate::batching::BatchableOperation;
+use crate::batching::BatchingError;
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::constants::ZeroOperation;
-use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::batching::{ArrayBatch, BatchableOperation};
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture, ZeroTangentOperation};
-use crate::types::{ArrayType, TypeError};
+use crate::operations::Operation;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+
+use crate::types::{ArrayType, TypeError, Typed};
 
 /// Linear-program payload for recomputing a primal operation without differentiating through it.
 ///
-/// [`RecomputeOperation`] is used by fused linear control-flow programs when a value from the primal computation is
+/// [`RecomputeOperation`] is used by linear control-flow programs when a value from the primal computation is
 /// reconstructed inside the linear program instead of being carried as a saved residual. Interpreting and lowering
 /// the wrapper delegates to the wrapped operation, but automatic differentiation treats the recomputed value as a
 /// non-differentiated residual: its JVP has symbolic zero tangents and its transpose contributes zero cotangents to
@@ -74,134 +77,82 @@ impl<O: Operation<ArrayType>> Operation<ArrayType> for RecomputeOperation<O> {
     }
 }
 
-impl<V, O> InterpretableOperation<ArrayType, V> for RecomputeOperation<O>
+impl<V, O, C> InterpretableOperation<V, C> for RecomputeOperation<O>
 where
-    V: Value<ArrayType>,
-    O: InterpretableOperation<ArrayType, V>,
+    V: Value<Type = ArrayType>,
+    O: InterpretableOperation<V, C>,
 {
     #[inline]
-    fn interpret(
-        &self,
-        context: &<V as Value<ArrayType>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         self.operation.interpret(context, inputs)
     }
 }
 
-impl<C: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, C::Value>>
-    ZeroTangentOperation<C> for RecomputeOperation<O>
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate) for a [`RecomputeOperation`].
+impl<RecomputedOperation: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C>
+    for RecomputeOperation<RecomputedOperation>
+where
+    C::Operation: From<RecomputeOperation<RecomputedOperation>>,
 {
 }
 
-impl<C: DifferentiationContext<Type = ArrayType>, O: InterpretableOperation<ArrayType, C::Value>>
-    DifferentiableOperation<C> for RecomputeOperation<O>
+impl<V, O, Target> TransposableOperation<V, Target> for RecomputeOperation<O>
 where
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<ArrayType>>,
-{
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        self.zero_tangent_jvp(context, inputs)
-    }
-}
-
-impl<V, O, Target> TransposableOperation<ArrayType, V, Target> for RecomputeOperation<O>
-where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
     O: Operation<ArrayType>,
     Target: Operation<ArrayType>,
 {
     #[inline]
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, Target>,
-        input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, Target>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, Target>>, ProgramError> {
-        let input_types = input_types.iter().map(|input_type| (*input_type).clone()).collect::<Vec<_>>();
+        _context: &mut TracingContext<V, Target>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, ProgramError> {
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = self.infer_output_types(input_types.as_slice())?;
-        check_count!("output", output_cotangents, output_types.len(), ProgramError);
-        Ok(vec![Cotangent::Zero; input_types.len()])
+        check_count!("output", outputs, output_types.len(), ProgramError);
+        Ok(input_types.into_iter().map(MaybeZero::Zero).collect())
     }
 }
 
 impl<V, O, C> BatchableOperation<V, C> for RecomputeOperation<O>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
     O: BatchableOperation<V, C>,
 {
     #[inline]
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, ProgramError> {
+    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         self.operation.batch(context, inputs)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::Domain;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
-    use crate::contexts::StagingContext;
-    use crate::domains::AbstractDomain;
     use crate::operations::arithmetic::AddOperation;
-    use crate::programs::ProgramBuilder;
-    use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing_v2::operations::{ArrayOperation, LinearArrayOperation};
-    use crate::types::{DataType, Typed};
+    use crate::tests::TestArray;
+    use crate::tracing_v2::operations::ArrayOperation;
+    use crate::types::DataType;
 
     use super::*;
 
     #[test]
-    fn test_recompute_jvp_replays_primal_with_zero_tangent() {
-        type LinearOperation = <TestArrayDomain as DifferentiationContext>::LinearOperation<
-            <TestArrayDomain as DifferentiationContext>::Tangent,
-            ValueOrCapture<<TestArrayDomain as Domain>::Type, <TestArrayDomain as Domain>::Value>,
-        >;
-
+    fn test_recompute_transpose_returns_zero_input_cotangents() {
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, LinearOperation>::new()));
-        let mut context = TangentContext::new(&TestArrayDomain, builder.clone());
-        let tangent = context.input(scalar_type.clone());
+        let mut context = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
         let operation = RecomputeOperation::new(ArrayOperation::<TestArray>::Add(AddOperation));
 
-        let outputs = operation
-            .jvp(
+        let cotangents = operation
+            .transpose(
                 &mut context,
-                &[
-                    JvpTracer::from_value(TestArray::scalar(2.0), tangent.clone()),
-                    JvpTracer::from_value(TestArray::scalar(3.0), tangent),
-                ],
+                &[PartialValue::Unknown(scalar_type.clone()), PartialValue::Unknown(scalar_type.clone())],
+                &[MaybeZero::Zero(scalar_type.clone())],
             )
             .unwrap();
 
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &TestArray::scalar(5.0));
-        assert_eq!(outputs[0].tangent().r#type().into_owned(), scalar_type);
-        assert!(context.is_zero(outputs[0].tangent()).unwrap());
-        assert_eq!(builder.borrow().instructions().len(), 1);
-    }
-
-    #[test]
-    fn test_recompute_transpose_returns_zero_input_cotangents() {
-        type LinearOperation = LinearArrayOperation<TestArray, TestArray, TestArray, ArrayOperation<TestArray>>;
-
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, LinearOperation>::new()));
-        let domain = AbstractDomain::new();
-        let mut context = AbstractTracingContext::new(&domain, builder);
-        let operation = RecomputeOperation::new(ArrayOperation::<TestArray>::Add(AddOperation));
-
-        let cotangents = operation.transpose(&mut context, &[&scalar_type, &scalar_type], &[Cotangent::Zero]).unwrap();
-
         assert_eq!(cotangents.len(), 2);
-        assert!(cotangents.iter().all(Cotangent::is_zero));
+        assert!(cotangents.iter().all(MaybeZero::is_zero));
     }
 }

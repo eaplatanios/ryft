@@ -1,64 +1,73 @@
-use crate::contexts::StagingContext;
-use crate::macros::check_count;
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
 use crate::operations::Operation;
-use crate::operations::constants::ZeroOperation;
 use crate::operations::stop_gradient::StopGradientOperation;
-use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::Typed;
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, replay_zero_tangent};
 
-/// JVP rule for [`StopGradientOperation`]: the primal passes through unchanged and the tangent is
-/// replaced with a canonical staged zero, severing derivative flow in both forward and reverse
-/// mode.
-impl<C: DifferentiationContext> DifferentiableOperation<C> for StopGradientOperation
+/// Forward-mode rule for [`StopGradientOperation`]: the operation is the identity on the primal but severs the
+/// tangent, so the primal is replayed (re-tagging the stop-gradient boundary) and paired with a typed zero tangent.
+impl<C: Context> DifferentiableOperation<C> for StopGradientOperation
 where
+    C::Operation: Clone + From<StopGradientOperation>,
     StopGradientOperation: Operation<C::Type>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<ZeroOperation<C::Type>>,
 {
-    #[inline]
-    fn jvp<'jvp>(
+    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        replay_zero_tangent(context, self.clone(), inputs)
+    }
+}
+
+/// Transpose rule for [`StopGradientOperation`]: the operation severs the tangent, so a tangent program never
+/// contains a primal `stop_gradient` on a linear operand (its forward pairs the replayed primal with a zero tangent)
+/// and the rule reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for StopGradientOperation
+where
+    StopGradientOperation: Operation<V::Type>,
+{
+    fn transpose(
         &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
-        check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone();
-        let mut tangent_outputs = context.stage_nullary_operation(ZeroOperation::new(primal.r#type().into_owned()))?;
-        check_count!("output", tangent_outputs, 1, ProgramError);
-        let tangent = tangent_outputs.remove(0);
-        Ok(vec![JvpTracer::new(primal, tangent)])
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
     use crate::operations::stop_gradient::StopGradient;
-    use crate::scalars::ScalarDomain;
+    use crate::scalars::Scalar;
     use crate::tracing_v2::{DifferentiationContext, value_and_grad};
 
     #[test]
     fn test_stop_gradient_jvp_severs_the_tangent() {
-        let domain = ScalarDomain::<f64>::new();
-        let (primal, tangent) = domain.jvp(|x| x.stop_gradient(), 2.0f64, 3.0f64).unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent) = domain.jvp(|x| x.stop_gradient(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, 2.0);
         assert_eq!(tangent, 0.0);
     }
 
     #[test]
     fn test_stop_gradient_composes_with_batch() {
-        use crate::tests::{TestArray, TestArrayDomain};
-        use crate::tracing_v2::Batch;
+        use crate::batching::Batch;
+        use crate::batching::BatchAxis;
+        use crate::contexts::EagerContext;
+        use crate::tests::TestArray;
+        use crate::tracing_v2::ArrayOperation;
 
-        let output: TestArray = TestArrayDomain
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .batch(
                 |x| Ok(x.clone() * x.stop_gradient()),
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
-                Some(0),
-                Some(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
                 None,
             )
             .unwrap();
@@ -69,8 +78,8 @@ mod tests {
     fn test_stop_gradient_treats_the_marked_value_as_a_constant() {
         // The JAX documentation example: `f(x) = x * stop_gradient(x)` differentiates like
         // `x * c` with `c` frozen at the primal value, so `f'(x) = stop_gradient(x)`.
-        let domain = ScalarDomain::<f64>::new();
-        let (value, gradient) = value_and_grad(&domain, |x| x.clone() * x.stop_gradient(), 3.0f64).unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (value, gradient) = value_and_grad(&domain, |x| x.clone() * x.stop_gradient(), Scalar::from(3.0)).unwrap();
         assert_eq!(value, 9.0);
         assert_eq!(gradient, 3.0);
     }

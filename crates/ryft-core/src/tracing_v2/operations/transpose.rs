@@ -1,50 +1,52 @@
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::batching::InterpretableBatchableOperation;
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::manipulation::{Transpose, TransposeOperation, inverse_permutation};
-use crate::operations::{InterpretableOperation, Operation};
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::ArrayType;
+use crate::operations::Operation;
+use crate::operations::manipulation::{Transpose, TransposeOperation};
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
 
-impl<V: Value<ArrayType>, O> TransposableOperation<ArrayType, V, O> for TransposeOperation
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+use crate::types::{ArrayType, Typed};
+
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for TransposeOperation
 where
     O: Operation<ArrayType> + From<TransposeOperation>,
 {
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, ArrayType, V, O>,
-        _input_types: &[&ArrayType],
-        output_cotangents: &[Cotangent<'transpose, ArrayType, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, ArrayType, V, O>>, ProgramError> {
-        check_count!("output", output_cotangents, 1, ProgramError);
-        let inverse = inverse_permutation(self.permutation());
-        match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(cotangent.transpose(inverse)?)]),
-            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+        _context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        let inverse = self.permutation().inverse();
+        match &outputs[0] {
+            MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(cotangent.transpose(inverse)?)]),
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().into_owned())]),
         }
     }
 }
 
-impl<C> DifferentiableOperation<C> for TransposeOperation
+/// Forward-mode rule for [`TransposeOperation`]: `transpose` is structural-linear, so the tangent is the same
+/// transpose applied to the operand tangent. The shared all-zero fast path handles a zero operand tangent before this
+/// rule is consulted, so the operand tangent reaching here is always live.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for TransposeOperation
 where
-    C: DifferentiationContext<Type = ArrayType>,
+    C::Operation: Clone + From<TransposeOperation>,
     C::Value: Transpose,
-    C::Tangent: Transpose,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<TransposeOperation>,
 {
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().transpose(self.permutation().to_vec())?;
-        let tangent = inputs[0].tangent().clone().transpose(self.permutation().to_vec())?;
+        let primal = inputs[0].primal().transpose(self.permutation())?;
+        let tangent = match inputs[0].tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.transpose(self.permutation())?),
+        };
         Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
@@ -68,23 +70,23 @@ pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> 
     lifted
 }
 
-impl<V: Value<ArrayType>> crate::tracing_v2::batching::BatchableOperation<V, V::InterpretationContext>
-    for TransposeOperation
+impl<V: Value<Type = ArrayType>, C> crate::batching::BatchableOperation<V, C> for TransposeOperation
 where
-    TransposeOperation: InterpretableOperation<ArrayType, V>,
+    TransposeOperation: InterpretableOperation<V, C>,
 {
     fn batch(
         &self,
-        context: &V::InterpretationContext,
-        inputs: &[crate::tracing_v2::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::tracing_v2::batching::ArrayBatch<V>>, ProgramError> {
+        context: &C,
+        inputs: &[crate::batching::ArrayBatch<V>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let (_, input_axes, _) = crate::tracing_v2::batching::batch_input_metadata(inputs)?;
-        let (lifted_permutation, output_axis) = match input_axes[0] {
+        // Validates that a mapped batch axis has a static size before lifting.
+        crate::batching::ArrayBatch::common_batch_size(inputs)?;
+        let (lifted_permutation, output_axis) = match inputs[0].batch_axis().axis() {
             Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),
             None => (self.permutation().to_vec(), None),
         };
         let lifted_op = TransposeOperation::new(lifted_permutation);
-        crate::tracing_v2::batching::apply_with_axes(context, &lifted_op, inputs, &[output_axis])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[output_axis.into()])
     }
 }

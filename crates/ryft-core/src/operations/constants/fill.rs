@@ -1,13 +1,15 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
-use crate::contexts::{EagerContext, StagingContext};
+use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::contexts::Context;
+use crate::contexts::StagingContext;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{InterpretableOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::types::{DataType, Type, TypeError, Typed};
+use crate::types::{ArrayType, Type, TypeError};
 
 /// Canonical operation name for [`FillOperation`].
 pub const FILL_OPERATION_NAME: &'static str = "fill";
@@ -75,69 +77,46 @@ impl<T: Type, V: Display> Operation<T> for FillOperation<T, V> {
     }
 }
 
-impl<T: Type, V: Value<T, InterpretationContext: Fill<T, C, V>>, C: Clone + Display> InterpretableOperation<T, V>
-    for FillOperation<T, C>
+impl<T: Type, V: Value<Type = T>, S: Clone + Display, C: Fill<S, V>> InterpretableOperation<V, C>
+    for FillOperation<T, S>
 {
     #[inline]
-    fn interpret(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(vec![context.fill(&self.r#type, self.value.clone())?])
     }
+}
+
+impl<T: Type, Constant: Clone + Display, C: Context<Type = T, Operation: From<FillOperation<T, Constant>>>>
+    PartiallyEvaluatableOperation<C> for FillOperation<T, Constant>
+{
 }
 
 /// Represents the ability to synthesize a value for a given [`Type`] filled with a captured scalar in an interpretation
 /// context. [`Fill`] is the [`Type`]-driven counterpart needed by [`FillOperation`] for its [`InterpretableOperation`]
 /// implementation. It sits alongside [`Zero`](super::Zero) and [`One`](super::One) in the same type-driven family, but
 /// generalizes the fixed `zero` or `one` value to an arbitrary scalar `S` value supplied at the call site.
-pub trait Fill<T: Type, S, V: Value<T>> {
+pub trait Fill<S, V: Value> {
     /// Returns a value of `type` with every element set to `value`.
-    fn fill(&self, r#type: &T, value: S) -> Result<V, ProgramError>;
+    fn fill(&self, r#type: &V::Type, value: S) -> Result<V, ProgramError>;
 }
 
-macro_rules! impl_fill_for_scalar {
-    ($ty:ty) => {
-        impl<O: Operation<DataType>> Fill<DataType, $ty, $ty> for EagerContext<DataType, $ty, O> {
-            #[inline]
-            fn fill(&self, r#type: &DataType, value: $ty) -> Result<$ty, ProgramError> {
-                let value_type = <$ty as Typed<DataType>>::r#type(&value).into_owned();
-                if *r#type != value_type {
-                    return Err(TypeError {
-                        message: format!("scalar value expected data type {value_type} but got {}", r#type),
-                    }
-                    .into());
-                }
-                Ok(value)
-            }
-        }
-    };
-}
-
-impl_fill_for_scalar!(bool);
-impl_fill_for_scalar!(i8);
-impl_fill_for_scalar!(i16);
-impl_fill_for_scalar!(i32);
-impl_fill_for_scalar!(i64);
-impl_fill_for_scalar!(u8);
-impl_fill_for_scalar!(u16);
-impl_fill_for_scalar!(u32);
-impl_fill_for_scalar!(u64);
-impl_fill_for_scalar!(bf16);
-impl_fill_for_scalar!(f16);
-impl_fill_for_scalar!(f32);
-impl_fill_for_scalar!(f64);
-
-impl<C: StagingContext<Operation: From<FillOperation<C::Type, V>>>, V: Clone + Display> Fill<C::Type, V, Tracer<C>>
-    for C
-{
+impl<V: Clone + Display, C: StagingContext<Operation: From<FillOperation<C::Type, V>>>> Fill<V, Tracer<C>> for C {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: V) -> Result<Tracer<C>, ProgramError> {
         let mut outputs = self.stage_nullary_operation(FillOperation::new(r#type.clone(), value))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+impl<C: Context<Type = ArrayType> + Fill<S, C::Value>, S> Fill<S, BatchingTracer<C>> for BatchingContext<C>
+where
+    BatchingContext<C>: Context<Type = ArrayType, Value = BatchingTracer<C>>,
+{
+    fn fill(&self, r#type: &ArrayType, value: S) -> Result<BatchingTracer<C>, ProgramError> {
+        let batch = ArrayBatch::new(r#type.clone(), self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
+        Ok(BatchingTracer::new(self.clone(), batch))
     }
 }
 
@@ -147,63 +126,66 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
-    use crate::operations::{InterpretableOperation, Operation};
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::types::{DataType, TypeError};
+    use crate::tests::TestArray;
+    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
     use super::*;
 
     #[test]
     fn test_fill() {
-        let context = EagerContext::<DataType, f64, FillOperation<DataType, f64>>::new();
-        assert_eq!(context.fill(&DataType::F64, 3.5), Ok(3.5));
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
+        let context = EagerContext::<TestArray, FillOperation<ArrayType, f64>>::new();
+        assert_eq!(context.fill(&r#type, 3.5), Ok(TestArray::new(r#type.clone(), vec![3.5, 3.5])));
+
+        // Filling a dynamically sized type cannot materialize element data and surfaces an error.
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
-            context.fill(&DataType::F32, 3.5),
+            context.fill(&dynamic_type, 3.5),
             Err(ProgramError::Type(TypeError {
-                message: "scalar value expected data type f64 but got f32".to_string()
+                message: "cannot materialize a value of dynamically sized type f64[*]".to_string()
             })),
         );
 
-        let operation = FillOperation::new(DataType::F64, 3.5);
+        let operation = FillOperation::new(r#type.clone(), 3.5);
 
-        assert_eq!(Operation::<DataType>::name(&operation), FILL_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "FillOperation { type: F64, value: 3.5 }");
-        assert_eq!(format!("{operation}"), "fill [type=f64, value=3.5]");
-        assert_eq!(operation.r#type(), &DataType::F64);
+        assert_eq!(Operation::<ArrayType>::name(&operation), FILL_OPERATION_NAME);
+        assert_eq!(format!("{operation}"), "fill [type=f64[2], value=3.5]");
+        assert_eq!(operation.r#type(), &r#type);
         assert_eq!(operation.value(), &3.5);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[]), Ok(vec![DataType::F64]));
+        assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[]), Ok(vec![r#type.clone()]));
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[]),
-            Ok(vec![3.5]),
+            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[]
+            ),
+            Ok(vec![TestArray::new(r#type.clone(), vec![3.5, 3.5])]),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[r#type.clone()]),
             Err(TypeError { message: "expected 0 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(&operation, &EagerContext::new(), &[0.0]),
+            InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &[TestArray::new(r#type.clone(), vec![0.0, 0.0])],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
-        assert_eq!(
-            InterpretableOperation::<DataType, f64>::interpret(
-                &FillOperation::new(DataType::F32, 3.5),
-                &EagerContext::new(),
-                &[],
-            ),
-            Err(ProgramError::Type(TypeError {
-                message: "scalar value expected data type f64 but got f32".to_string()
-            })),
-        );
 
-        let mut builder = ProgramBuilder::<DataType, f64, FillOperation<DataType, f64>>::new();
+        let mut builder = ProgramBuilder::<TestArray, FillOperation<ArrayType, f64>>::new();
         let output = builder.add_instruction(operation, vec![]).unwrap()[0];
-        let program = builder.build::<(), f64>(vec![output], (), Placeholder).unwrap();
+        let program = builder.build::<(), TestArray>(vec![output], (), Placeholder).unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda  .
-                let %0:f64 = fill [type=f64, value=3.5]
+                let %0:f64[2] = fill [type=f64[2], value=3.5]
                 in (%0)
             "}
             .trim_end(),

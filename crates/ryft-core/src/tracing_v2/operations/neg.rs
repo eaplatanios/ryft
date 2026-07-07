@@ -1,67 +1,65 @@
 use std::ops::Neg;
 
-use crate::differentiation::{Cotangent, TransposableOperation};
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::NegOperation;
-use crate::programs::{ProgramError, Value};
-use crate::tracing::AbstractTracingContext;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
-use crate::types::Type;
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
 
-impl<T: Type, V: Value<T>, O: Operation<T> + From<NegOperation>> TransposableOperation<T, V, O> for NegOperation
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
+
+impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for NegOperation
 where
-    NegOperation: Operation<T>,
+    NegOperation: Operation<V::Type>,
 {
     #[inline]
-    fn transpose<'transpose>(
+    fn transpose(
         &self,
-        _context: &mut AbstractTracingContext<'transpose, T, V, O>,
-        _input_types: &[&T],
-        output_cotangents: &[Cotangent<'transpose, T, V, O>],
-    ) -> Result<Vec<Cotangent<'transpose, T, V, O>>, ProgramError> {
-        check_count!("output", output_cotangents, 1, ProgramError);
-        match &output_cotangents[0] {
-            Cotangent::Staged(cotangent) => Ok(vec![Cotangent::Staged(-cotangent.clone())]),
-            Cotangent::Zero => Ok(vec![Cotangent::Zero]),
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(-cotangent.clone())]),
+            MaybeZero::Zero(r#type) => Ok(vec![MaybeZero::Zero(r#type.clone())]),
         }
     }
 }
 
-impl<C: DifferentiationContext> DifferentiableOperation<C> for NegOperation
+impl<C: Context> DifferentiableOperation<C> for NegOperation
 where
+    C::Operation: Clone,
     C::Value: Neg<Output = C::Value>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: From<NegOperation>,
     NegOperation: Operation<C::Type>,
 {
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        _context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![JvpTracer::new(-inputs[0].primal().clone(), -inputs[0].tangent().clone())])
+        let primal = -inputs[0].primal().clone();
+        // A negated structural zero stays a structural zero, keeping `Neg(zero)` out of the tangent program.
+        let tangent = inputs[0].tangent().clone().map(|tangent| -tangent);
+        Ok(vec![JvpTracer::new(primal, tangent)])
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::scalars::ScalarDomain;
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
+    use crate::scalars::Scalar;
     use crate::tracing_v2::{DifferentiationContext, value_and_grad};
 
     #[test]
     fn test_neg_jvp_and_gradient_negate() {
-        let domain = ScalarDomain::<f64>::new();
-        let (primal, tangent) = domain.jvp(|x| -x, 2.0f64, 3.0f64).unwrap();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent) = domain.jvp(|x| -x, Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, -2.0);
         assert_eq!(tangent, -3.0);
 
-        let (value, gradient) = value_and_grad(&domain, |x| -x, 2.0f64).unwrap();
+        let (value, gradient) = value_and_grad(&domain, |x| -x, Scalar::from(2.0)).unwrap();
         assert_eq!(value, -2.0);
         assert_eq!(gradient, -1.0);
     }

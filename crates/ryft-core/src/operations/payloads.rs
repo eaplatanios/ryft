@@ -1,7 +1,7 @@
 /// Marker for [`Operation`](crate::Operation) payloads that are carried by the operation itself. Use [`Captured`]
 /// when the payload is embedded in the operation object and should be treated as a closed-over part of the staged
-/// instruction. Examples include ordinary [`ConstantOperation`](crate::ConstantOperation) payloads and captured scale
-/// factors in [`ScaleOperation`](crate::ScaleOperation)s.
+/// instruction. An example is an ordinary [`ConstantOperation`](crate::ConstantOperation) payload, whose value is a
+/// closed-over constant rather than a runtime input.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Captured;
 

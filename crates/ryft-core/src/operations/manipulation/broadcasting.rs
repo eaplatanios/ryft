@@ -1,13 +1,11 @@
 use std::fmt::Display;
 
 use crate::contexts::Context;
-use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Canonical operation name for [`BroadcastOperation`].
@@ -77,7 +75,7 @@ impl Operation<ArrayType> for BroadcastOperation {
     }
 }
 
-impl<V: Value<ArrayType> + Broadcast, C> InterpretableOperation<ArrayType, V, C> for BroadcastOperation {
+impl<V: Value<Type = ArrayType> + Broadcast, C> InterpretableOperation<V, C> for BroadcastOperation {
     #[inline]
     fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -189,7 +187,7 @@ pub trait Broadcast: Sized {
     /// ```
     fn broadcast_leading(&self, sizes: Vec<usize>) -> Result<Self, ProgramError>
     where
-        Self: Typed<ArrayType>,
+        Self: Typed<Type = ArrayType>,
     {
         let input_type = self.r#type().into_owned();
         let mut output_dimensions: Vec<Size> = sizes.iter().map(|size| Size::Static(*size)).collect();
@@ -238,7 +236,7 @@ pub trait Broadcast: Sized {
     /// ```
     fn broadcast_to(&self, shape: Shape) -> Result<Self, ProgramError>
     where
-        Self: Typed<ArrayType>,
+        Self: Typed<Type = ArrayType>,
     {
         let input_type = self.r#type().into_owned();
         let input_rank = input_type.rank();
@@ -351,14 +349,15 @@ impl Broadcast for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<BroadcastOperation>>> Broadcast for Tracer<C, C::Meta> {
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<BroadcastOperation>>>>
+    Broadcast for V
+{
     #[inline]
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
-        let mut outputs = self
-            .context()
-            .stage_operation(BroadcastOperation::new(output_type, output_axes.to_vec()), &[self])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
+        Ok(self
+            .dispatch_domain()
+            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), &[self.clone()])?
+            .remove(0))
     }
 }
 
@@ -396,9 +395,7 @@ mod tests {
 
         // Interpretation replicates the payload along the added axis.
         let input = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let output = operation
-            .interpret(&EagerContext::<ArrayType, TestArray>::new(), std::slice::from_ref(&input))
-            .unwrap();
+        let output = operation.interpret(&EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
 
@@ -443,9 +440,9 @@ mod tests {
             Err(TypeError { message: "broadcasting input axis 0 has size 2, which is neither 3 nor 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
-                &EagerContext::<ArrayType, TestArray>::new(),
+                &EagerContext::<TestArray>::new(),
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -458,7 +455,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name and includes the captured metadata.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, BroadcastOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, BroadcastOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();

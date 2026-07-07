@@ -2,14 +2,13 @@ use std::fmt::{Debug, Display};
 use std::ops::Deref;
 
 use crate::contexts::Context;
-use crate::contexts::StagingContext;
+use crate::contexts::Domain;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::sharding::{Sharding, ShardingError};
-use crate::tracing::Tracer;
 use crate::types::{ArrayType, Shape, TypeError, Typed};
 
 /// Canonical operation name for [`TransposeOperation`].
@@ -121,11 +120,11 @@ impl Operation<ArrayType> for TransposeOperation {
     #[inline]
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
-            .bracketed(|operation| operation.field("permutation", format_args!("{:?}", self.permutation)))
+            .bracketed(|operation| operation.field("permutation", format_args!("{:?}", self.permutation.as_slice())))
     }
 }
 
-impl<V: Value<ArrayType> + Transpose, C> InterpretableOperation<ArrayType, V, C> for TransposeOperation {
+impl<V: Value<Type = ArrayType> + Transpose, C> InterpretableOperation<V, C> for TransposeOperation {
     #[inline]
     fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
@@ -155,7 +154,7 @@ pub trait Transpose: Sized {
     #[inline]
     fn move_axis(&self, from: usize, to: usize) -> Result<Self, ProgramError>
     where
-        Self: Typed<ArrayType>,
+        Self: Typed<Type = ArrayType>,
     {
         let rank = self.r#type().rank();
         self.transpose(
@@ -174,7 +173,7 @@ pub trait Transpose: Sized {
     #[inline]
     fn swap_axes(&self, i: usize, j: usize) -> Result<Self, ProgramError>
     where
-        Self: Typed<ArrayType>,
+        Self: Typed<Type = ArrayType>,
     {
         let rank = self.r#type().rank();
         for axis in [i, j] {
@@ -269,14 +268,19 @@ impl Transpose for ArrayType {
     }
 }
 
-impl<C: StagingContext<Type = ArrayType, Operation: From<TransposeOperation>>> Transpose for Tracer<C, C::Meta> {
+impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operation: From<TransposeOperation>>>>
+    Transpose for V
+{
     #[inline]
     fn transpose<P: AsRef<[usize]>>(&self, permutation: P) -> Result<Self, ProgramError> {
         let permutation = permutation.as_ref();
         if permutation.iter().enumerate().all(|(index, axis)| index == *axis) {
             return Ok(self.clone());
         }
-        Ok(self.unary(TransposeOperation::new(permutation.to_vec())))
+        Ok(self
+            .dispatch_domain()
+            .bind(TransposeOperation::new(permutation.to_vec()), &[self.clone()])?
+            .remove(0))
     }
 }
 
@@ -319,7 +323,7 @@ mod tests {
 
         // Operation identity and accessors.
         assert_eq!(operation.name(), TRANSPOSE_OPERATION_NAME);
-        assert_eq!(format!("{operation:?}"), "TransposeOperation { permutation: [1, 0] }");
+        assert_eq!(format!("{operation:?}"), "TransposeOperation { permutation: Permutation([1, 0]) }");
         assert_eq!(format!("{operation}"), "transpose [permutation=[1, 0]]");
         assert_eq!(operation.permutation().as_slice(), &[1, 0]);
 
@@ -337,9 +341,7 @@ mod tests {
 
         // Interpretation reorders the row-major payload.
         let input = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let output = operation
-            .interpret(&EagerContext::<ArrayType, TestArray>::new(), std::slice::from_ref(&input))
-            .unwrap();
+        let output = operation.interpret(&EagerContext::<TestArray>::new(), std::slice::from_ref(&input)).unwrap();
         assert_eq!(*output[0].r#type(), output_type);
         assert_eq!(output[0].values, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
 
@@ -361,16 +363,16 @@ mod tests {
             Err(TypeError { message: "'transpose' permutation contains duplicate axis 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
-                &EagerContext::<ArrayType, TestArray>::new(),
+                &EagerContext::<TestArray>::new(),
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
 
         // Program rendering uses the canonical operation name and includes the captured permutation.
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, TransposeOperation>::new();
+        let mut builder = ProgramBuilder::<TestArray, TransposeOperation>::new();
         let program_input = builder.add_input(input_type);
         let program_output = builder.add_instruction(operation, vec![program_input]).unwrap()[0];
         let program = builder.build::<TestArray, TestArray>(vec![program_output], Placeholder, Placeholder).unwrap();

@@ -1,13 +1,22 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use crate::contexts::{Context, StagingContext};
+use crate::effects::Effects;
+use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::Zero;
 use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
-use crate::operations::{InterpretableOperation, InterpretableProgramOperation, Operation, OperationFormatter};
+use crate::operations::{Operation, OperationFormatter};
+use crate::parameters::Placeholder;
+use crate::partial::{
+    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialEvaluator,
+    PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
+};
 use crate::payloads::Captured;
-use crate::programs::{Program, ProgramError, Value};
-use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError};
+use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
+use crate::tracing::TracingContext;
+use crate::types::{ArrayType, DataType, Shape, Size, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -44,25 +53,21 @@ pub const SCAN_OPERATION_NAME: &'static str = "scan";
 ///
 /// The `Payload` type parameter is a zero-sized semantic tag for how the scan's capture environment is interpreted.
 /// The default [`Captured`] payload treats body constants as ordinary nested program constants. Direct linear scans use
-/// [`Input`](crate::payloads::Input) so scan-local capture references are instantiated from lane-indexed residual
+/// [`Input`](crate::payloads::Input) so scan-local capture references are instantiated from iteration-indexed residual
 /// stacks before each body iteration is interpreted.
 ///
 /// [`WhileOperation`]: crate::operations::control_flow::WhileOperation
 #[derive(Clone, Debug)]
-pub struct ScanOperation<T, V, O, C = V, Payload = Captured>
-where
-    T: Type,
-    V: Value<T>,
-{
+pub struct ScanOperation<V: Value, O, C = V, Payload = Captured> {
     /// Body [`Program`] of this [`ScanOperation`] that maps `[carry..., x_slice...]` to `[carry..., y_slice...]`.
-    pub(crate) body: Program<T, V, O, Vec<V>, Vec<V>>,
+    pub(crate) body: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Captured values used by the body operation payloads.
     ///
     /// Ordinary primal scans leave this empty. Linearized scans use it for values captured from the primal program,
-    /// such as per-lane residual stacks. Keeping the captures on the ordinary scan operation avoids a separate
+    /// such as per-iteration residual stacks. Keeping the captures on the ordinary scan operation avoids a separate
     /// linear scan operation while preserving the fact that captures can have a different value family from the
-    /// tangent operands carried by the scan body.
+    /// tangent inputs carried by the scan body.
     pub(crate) captures: Vec<C>,
 
     /// Number of loop-carried state leaves at the front of the body's inputs and outputs.
@@ -100,10 +105,9 @@ fn check_static_scan_type(role: &str, index: usize, r#type: &ArrayType) -> Resul
 }
 
 /// Validates a scan unroll factor against the scan's static trip count: the factor must be at least `1` and must
-/// evenly divide `length` (remainder handling is an explicit non-goal). This backs both
-/// [`ScanOperation::with_unroll`] and the enum-payload validation of the linear scan variant of
-/// [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation), whose fields are public and therefore cannot
-/// rely on builder-time validation alone.
+/// evenly divide `length` (remainder handling is an explicit non-goal). This backs [`ScanOperation::with_unroll`] and
+/// enum-payload validation of scan variants whose fields are public and therefore cannot rely on builder-time
+/// validation alone.
 pub(crate) fn validate_scan_unroll(unroll: usize, length: usize) -> Result<(), TypeError> {
     if unroll == 0 {
         return Err(TypeError { message: "scan unroll factor must be at least 1".to_string() });
@@ -125,8 +129,7 @@ pub(crate) fn stacked_scan_type(slice_type: &ArrayType, length: usize) -> ArrayT
 }
 
 /// Validates `[carry..., stacked_xs...]` input types against a scan body signature and returns the
-/// `[carry..., stacked_ys...]` output types. This backs type inference for both [`ScanOperation`] and the linear
-/// scan variant of [`LinearArrayOperation`](crate::tracing_v2::LinearArrayOperation).
+/// `[carry..., stacked_ys...]` output types. This backs type inference for [`ScanOperation`].
 pub(crate) fn scan_output_types(
     body_input_types: &[ArrayType],
     body_output_types: &[ArrayType],
@@ -181,9 +184,9 @@ pub(crate) fn scalar_scan_output_types(
 
 /// Type-family semantics for [`ScanOperation`].
 ///
-/// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-lane value type, while
-/// [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. This trait keeps
-/// those type rules local to the scan operation so the operation dispatcher itself can be generic over `T`.
+/// [`ArrayType`] can represent scanned values by prepending a static leading axis to each per-iteration value type,
+/// while [`DataType`] currently has no stack metadata and therefore supports only carry-only scalar scans. This trait
+/// keeps those type rules local to the scan operation so the operation dispatcher itself can be generic over `T`.
 pub trait ScanTypeSemantics: Type {
     /// Validates a scan body signature for this type family.
     fn validate_scan_body(
@@ -209,7 +212,7 @@ pub trait ScanTypeSemantics: Type {
     ) -> Result<Vec<Self>, TypeError>;
 
     /// Validates one capture value stored on this scan.
-    fn validate_scan_capture<C: Value<Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError>;
+    fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError>;
 }
 
 impl ScanTypeSemantics for ArrayType {
@@ -269,7 +272,7 @@ impl ScanTypeSemantics for ArrayType {
         scan_output_types(body_input_types, body_output_types, carry_count, length, input_types)
     }
 
-    fn validate_scan_capture<C: Value<Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
+    fn validate_scan_capture<C: Value<Type = Self>>(capture: &C, index: usize, length: usize) -> Result<(), TypeError> {
         let capture_type = capture.r#type();
         if capture_type.rank() == 0 || capture_type.dimension(0) != Size::Static(length) {
             return Err(TypeError {
@@ -312,7 +315,11 @@ impl ScanTypeSemantics for DataType {
         scalar_scan_output_types(body_input_types, body_output_types, carry_count, input_types)
     }
 
-    fn validate_scan_capture<C: Value<Self>>(_capture: &C, _index: usize, _length: usize) -> Result<(), TypeError> {
+    fn validate_scan_capture<C: Value<Type = Self>>(
+        _capture: &C,
+        _index: usize,
+        _length: usize,
+    ) -> Result<(), TypeError> {
         Err(TypeError { message: "scalar scan captures require a scalar stack representation".to_string() })
     }
 }
@@ -321,68 +328,68 @@ impl ScanTypeSemantics for DataType {
 ///
 /// Ordinary scans use [`Captured`] payloads: body constants are lifted from the nested program's constant table through
 /// the active context. Direct linear scans use a different payload implementation, defined next to the linear scan
-/// transform rules, because their capture list stores lane-indexed residual stacks that must be read and instantiated
-/// before each lane body is interpreted.
-pub(crate) trait ScanPayload<T, C, V, O, Capture>: Sized
+/// transform rules, because their capture list stores iteration-indexed residual stacks that must be read and
+/// instantiated before each iteration body is interpreted.
+pub(crate) trait ScanPayload<T, Constant, V, O, Capture, C>: Sized
 where
     T: ScanTypeSemantics,
-    C: Value<T>,
-    V: Value<T>,
+    Constant: Value<Type = T>,
+    V: Value<Type = T>,
     O: Operation<T>,
-    Capture: Value<T>,
+    Capture: Value<Type = T>,
 {
     /// Interprets `operation` in `context` using `inputs`.
     fn interpret_scan(
-        operation: &ScanOperation<T, C, O, Capture, Self>,
-        context: &V::InterpretationContext,
+        operation: &ScanOperation<Constant, O, Capture, Self>,
+        context: &C,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError>;
 }
 
-impl<C, V, O, Capture> ScanPayload<ArrayType, C, V, O, Capture> for Captured
+impl<Constant, V, O, Capture, C> ScanPayload<ArrayType, Constant, V, O, Capture, C> for Captured
 where
-    C: Value<ArrayType>,
-    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    O: InterpretableProgramOperation<ArrayType, V, C>,
-    Capture: Value<ArrayType>,
+    Constant: Value<Type = ArrayType>,
+    V: Value<Type = ArrayType> + Slice + UpdateSlice + Reshape,
+    C: Zero<V>,
+    O: InterpretableProgramOperation<V, C, Constant>,
+    Capture: Value<Type = ArrayType>,
 {
     fn interpret_scan(
-        operation: &ScanOperation<ArrayType, C, O, Capture, Self>,
-        context: &V::InterpretationContext,
+        operation: &ScanOperation<Constant, O, Capture, Self>,
+        context: &C,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let output_slice_types = operation.body.output_types().split_off(operation.carry_count);
-        interpret_scan_lanes(
+        interpret_scan_iterations(
             context,
             operation.carry_count,
             operation.length,
             operation.reverse,
             output_slice_types.as_slice(),
             inputs,
-            |_, lane_inputs| O::interpret_program(context, &operation.body, lane_inputs),
+            |_, iteration_inputs| O::interpret_program(context, &operation.body, iteration_inputs),
         )
     }
 }
 
-impl<C, V, O, Capture> ScanPayload<DataType, C, V, O, Capture> for Captured
+impl<Constant, V, O, Capture, C> ScanPayload<DataType, Constant, V, O, Capture, C> for Captured
 where
-    C: Value<DataType>,
-    V: Value<DataType>,
-    O: InterpretableProgramOperation<DataType, V, C>,
-    Capture: Value<DataType>,
+    Constant: Value<Type = DataType>,
+    V: Value<Type = DataType>,
+    O: InterpretableProgramOperation<V, C, Constant>,
+    Capture: Value<Type = DataType>,
 {
     fn interpret_scan(
-        operation: &ScanOperation<DataType, C, O, Capture, Self>,
-        context: &V::InterpretationContext,
+        operation: &ScanOperation<Constant, O, Capture, Self>,
+        context: &C,
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
         let mut state = inputs.to_vec();
-        let mut lanes = (0..operation.length).collect::<Vec<_>>();
+        let mut iterations = (0..operation.length).collect::<Vec<_>>();
         if operation.reverse {
-            lanes.reverse();
+            iterations.reverse();
         }
-        for _ in lanes {
+        for _ in iterations {
             state = O::interpret_program(context, &operation.body, state)?;
             check_count!("output", state, operation.carry_count, ProgramError);
         }
@@ -390,7 +397,10 @@ where
     }
 }
 
-impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> {
+impl<V: Value, O: Operation<V::Type>> ScanOperation<V, O>
+where
+    V::Type: ScanTypeSemantics,
+{
     /// Creates a new [`ScanOperation`] with the provided body program, carry count, and static trip count, visiting
     /// iterations in increasing order (use [`Self::with_reverse`] to flip the visit order).
     ///
@@ -402,41 +412,47 @@ impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>> ScanOperation<T, V, O> 
     ///     carry-only scans because it has no scalar-stack metadata.
     ///   - `carry_count`: Number of loop-carried state leaves at the front of the body's inputs and outputs.
     ///   - `length`: Static trip count.
-    pub fn new(body: Program<T, V, O, Vec<V>, Vec<V>>, carry_count: usize, length: usize) -> Result<Self, TypeError> {
+    pub fn new(body: Program<V, O, Vec<V>, Vec<V>>, carry_count: usize, length: usize) -> Result<Self, TypeError> {
         Self::new_with_payload(body, carry_count, length)
     }
 }
 
-impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C: Value<T>, Payload> ScanOperation<T, V, O, C, Payload> {
+impl<V: Value, O: Operation<V::Type>, C: Value<Type = V::Type>, Payload> ScanOperation<V, O, C, Payload>
+where
+    V::Type: ScanTypeSemantics,
+{
     /// Creates a new [`ScanOperation`] with an explicit capture and payload role.
     ///
     /// Use [`ScanOperation::new`] for ordinary scans. This constructor is for operation families that need a
-    /// non-default payload marker, such as direct linear scans whose captures are lane-indexed runtime inputs.
+    /// non-default payload marker, such as direct linear scans whose captures are iteration-indexed runtime inputs.
     pub fn new_with_payload(
-        body: Program<T, V, O, Vec<V>, Vec<V>>,
+        body: Program<V, O, Vec<V>, Vec<V>>,
         carry_count: usize,
         length: usize,
     ) -> Result<Self, TypeError> {
         let input_types = body.input_types();
         let output_types = body.output_types();
-        T::validate_scan_body(input_types.as_slice(), output_types.as_slice(), carry_count, length)?;
+        <V::Type>::validate_scan_body(input_types.as_slice(), output_types.as_slice(), carry_count, length)?;
         Ok(Self { body, captures: Vec::new(), carry_count, length, reverse: false, unroll: 1, marker: PhantomData })
     }
 }
 
-impl<T: ScanTypeSemantics, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C, Payload> {
+impl<V: Value, O: Operation<V::Type>, C, Payload> ScanOperation<V, O, C, Payload>
+where
+    V::Type: ScanTypeSemantics,
+{
     /// Returns the input types of this [`ScanOperation`].
-    pub fn input_types(&self) -> Vec<T> {
-        T::scan_input_types(self.body.input_types().as_slice(), self.carry_count, self.length)
+    pub fn input_types(&self) -> Vec<V::Type> {
+        <V::Type>::scan_input_types(self.body.input_types().as_slice(), self.carry_count, self.length)
     }
 
     /// Returns the output types of this [`ScanOperation`].
-    pub fn output_types(&self) -> Vec<T> {
-        T::scan_declared_output_types(self.body.output_types().as_slice(), self.carry_count, self.length)
+    pub fn output_types(&self) -> Vec<V::Type> {
+        <V::Type>::scan_declared_output_types(self.body.output_types().as_slice(), self.carry_count, self.length)
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C, Payload> {
+impl<V: Value, O: Operation<V::Type>, C, Payload> ScanOperation<V, O, C, Payload> {
     /// Returns this [`ScanOperation`] with the slice visit order set to `reverse`. For carry-only scalar scans this
     /// only preserves lowering metadata because all iterations consume and produce loop-carried state.
     #[inline]
@@ -460,12 +476,12 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C
     ///
     /// Captures are interpreted by operation payloads inside the body. The scan operation itself only stores and
     /// preserves them; linear interpretation, transposition, and batching rules decide how to instantiate each
-    /// captured value for a lane.
+    /// captured value for an iteration.
     #[inline]
     pub fn with_captures<MappedCapture>(
         self,
         captures: Vec<MappedCapture>,
-    ) -> ScanOperation<T, V, O, MappedCapture, Payload> {
+    ) -> ScanOperation<V, O, MappedCapture, Payload> {
         ScanOperation {
             body: self.body,
             captures,
@@ -479,7 +495,7 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C
 
     /// Returns the body [`Program`] of this [`ScanOperation`] that computes one iteration.
     #[inline]
-    pub fn body(&self) -> &Program<T, V, O, Vec<V>, Vec<V>> {
+    pub fn body(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.body
     }
 
@@ -515,9 +531,9 @@ impl<T: Type, V: Value<T>, O: Operation<T>, C, Payload> ScanOperation<T, V, O, C
     }
 }
 
-impl<T: Type, V: Value<T>, O, C, Payload> Display for ScanOperation<T, V, O, C, Payload>
+impl<V: Value, O, C, Payload> Display for ScanOperation<V, O, C, Payload>
 where
-    Self: Operation<T>,
+    Self: Operation<V::Type>,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
@@ -536,20 +552,20 @@ fn render_capture_list<C: Display>(captures: &[C]) -> String {
     rendered
 }
 
-impl<T, V, O, C, Payload> Operation<T> for ScanOperation<T, V, O, C, Payload>
+impl<V, O, C, Payload> Operation<V::Type> for ScanOperation<V, O, C, Payload>
 where
-    T: ScanTypeSemantics,
-    V: Value<T>,
-    O: Operation<T>,
-    C: Value<T>,
+    V: Value,
+    V::Type: ScanTypeSemantics,
+    O: Operation<V::Type>,
+    C: Value<Type = V::Type>,
 {
     #[inline]
     fn name(&self) -> &'static str {
         SCAN_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
-        let output_types = T::infer_scan_output_types(
+    fn infer_output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, TypeError> {
+        let output_types = <V::Type>::infer_scan_output_types(
             self.body.input_types().as_slice(),
             self.body.output_types().as_slice(),
             self.carry_count,
@@ -557,9 +573,14 @@ where
             input_types,
         )?;
         for (index, capture) in self.captures.iter().enumerate() {
-            T::validate_scan_capture(capture, index, self.length)?;
+            <V::Type>::validate_scan_capture(capture, index, self.length)?;
         }
         Ok(output_types)
+    }
+
+    #[inline]
+    fn effects(&self) -> Effects {
+        self.body.effects()
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -578,13 +599,24 @@ where
     }
 }
 
-/// Extracts slice `lane` of a stacked value along its leading axis and drops that axis.
+/// Trait that enables transforms to look through a `scan` boundary at the nested body value producing one scan
+/// output. Scan outputs and body outputs are index-aligned (`[final_carries..., stacked_outputs...]` versus
+/// `[next_carries..., output_slices...]`), so one index addresses both. Residual classification uses this to
+/// classify a stacked per-iteration residual by the body instruction that actually produces it — for example, a
+/// rematerialization policy such as `DotsSaveable` recognizing a dot inside a loop body — instead of by the `scan`
+/// boundary itself.
+pub trait MaybeScan<V: Value, O> {
+    /// Returns the nested body [`Program`] when this operation is a `scan`, and [`None`] otherwise.
+    fn scan_body(&self) -> Option<&Program<V, O, Vec<V>, Vec<V>>>;
+}
+
+/// Extracts slice `iteration` of a stacked value along its leading axis and drops that axis.
 ///
 /// The slice bounds and the squeezed shape are derived from the stacked value's own type, which must be fully static
-/// with a leading axis of extent greater than `lane` (guaranteed for stacked scan values by construction).
-pub fn read_scan_lane<V>(stack: &V, lane: usize) -> Result<V, ProgramError>
+/// with a leading axis of extent greater than `iteration` (guaranteed for stacked scan values by construction).
+pub fn read_scan_iteration<V>(stack: &V, iteration: usize) -> Result<V, ProgramError>
 where
-    V: Value<ArrayType> + Slice + Reshape,
+    V: Value<Type = ArrayType> + Slice + Reshape,
 {
     let stack_type = stack.r#type().into_owned();
     let dimensions = stack_type
@@ -594,25 +626,26 @@ where
         .map(|dimension| {
             dimension.value().ok_or_else(|| {
                 TypeError {
-                    message: format!("scan lane extraction requires a static stacked type but got {stack_type}"),
+                    message: format!("scan iteration extraction requires a static stacked type but got {stack_type}"),
                 }
                 .into()
             })
         })
         .collect::<Result<Vec<usize>, ProgramError>>()?;
     let mut start_indices = vec![0; dimensions.len()];
-    start_indices[0] = lane;
+    start_indices[0] = iteration;
     let mut limit_indices = dimensions.clone();
-    limit_indices[0] = lane + 1;
+    limit_indices[0] = iteration + 1;
     let unit_strides = vec![1; dimensions.len()];
-    let lane_value = stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
-    lane_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Size::Static(dimension)).collect()))
+    let iteration_value = stack.slice(start_indices.as_slice(), limit_indices.as_slice(), unit_strides.as_slice())?;
+    iteration_value.reshape(Shape::new(dimensions[1..].iter().map(|&dimension| Size::Static(dimension)).collect()))
 }
 
-/// Writes `value` as slice `lane` of `accumulator` along its leading axis, prepending a unit axis to `value` first.
-pub(super) fn write_scan_lane<V>(accumulator: V, lane: usize, value: V) -> Result<V, ProgramError>
+/// Writes `value` as slice `iteration` of `accumulator` along its leading axis, prepending a unit axis to `value`
+/// first.
+pub(super) fn write_scan_iteration<V>(accumulator: V, iteration: usize, value: V) -> Result<V, ProgramError>
 where
-    V: Value<ArrayType> + UpdateSlice + Reshape,
+    V: Value<Type = ArrayType> + UpdateSlice + Reshape,
 {
     let value_type = value.r#type().into_owned();
     let mut dimensions = Vec::with_capacity(value_type.rank() + 1);
@@ -620,43 +653,43 @@ where
     dimensions.extend(value_type.shape().dimensions().iter().cloned());
     let expanded = value.reshape(Shape::new(dimensions))?;
     let mut start_indices = vec![0; value_type.rank() + 1];
-    start_indices[0] = lane;
+    start_indices[0] = iteration;
     accumulator.update_slice(&expanded, start_indices.as_slice())
 }
 
 /// Drives one array scan loop over `[carry..., stacked_xs...]` inputs, delegating each iteration's body evaluation to
-/// `interpret_lane`.
+/// `interpret_iteration`.
 ///
-/// This is the single source of truth for scan lane arithmetic: iteration `lane` consumes slice `lane` of every
-/// stacked input and writes slice `lane` of every stacked output, visiting lanes from `length - 1` down to `0` when
-/// `reverse` is `true` (the visit order reverses while the slice pairing does not). [`ScanOperation`]'s
-/// interpretation evaluates the body program directly, while the linear scan interpretation arms instantiate the
-/// body's scan-local residual references against each lane's residual values before evaluating it; both share this
-/// loop.
+/// This is the single source of truth for scan iteration arithmetic: iteration `iteration` consumes slice `iteration`
+/// of every stacked input and writes slice `iteration` of every stacked output, visiting iterations from `length - 1`
+/// down to `0` when `reverse` is `true` (the visit order reverses while the slice pairing does not).
+/// [`ScanOperation`]'s interpretation evaluates the body program directly, while the linear scan interpretation arms
+/// instantiate the body's scan-local residual references against each iteration's residual values before evaluating
+/// it; both share this loop.
 ///
 /// # Parameters
 ///
 ///   - `context`: Interpretation context used to allocate output stacks.
 ///   - `carry_count`: Number of loop-carried state leaves at the front of `inputs`.
 ///   - `length`: Static trip count.
-///   - `reverse`: Whether lanes are visited in reverse order.
+///   - `reverse`: Whether iterations are visited in reverse order.
 ///   - `y_slice_types`: Per-iteration output slice types used to allocate the output stacks.
 ///   - `inputs`: Flat `[carry..., stacked_xs...]` input values.
-///   - `interpret_lane`: Evaluates one iteration, mapping `(lane, [carry..., x_slice...])` to `[carry...,
+///   - `interpret_iteration`: Evaluates one iteration, mapping `(iteration, [carry..., x_slice...])` to `[carry...,
 ///     y_slice...]`.
-pub fn interpret_scan_lanes<V, InterpretLaneFn>(
-    context: &V::InterpretationContext,
+pub fn interpret_scan_iterations<V, C, InterpretIterationFn>(
+    context: &C,
     carry_count: usize,
     length: usize,
     reverse: bool,
     y_slice_types: &[ArrayType],
     inputs: &[V],
-    mut interpret_lane: InterpretLaneFn,
+    mut interpret_iteration: InterpretIterationFn,
 ) -> Result<Vec<V>, ProgramError>
 where
-    V: Value<ArrayType> + Slice + UpdateSlice + Reshape,
-    V::InterpretationContext: Zero<ArrayType, V>,
-    InterpretLaneFn: FnMut(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
+    V: Value<Type = ArrayType> + Slice + UpdateSlice + Reshape,
+    C: Zero<V>,
+    InterpretIterationFn: FnMut(usize, Vec<V>) -> Result<Vec<V>, ProgramError>,
 {
     let (carries, stacks) = inputs.split_at(carry_count);
     let mut carries = carries.to_vec();
@@ -667,74 +700,582 @@ where
             context.zero(&stack_type)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut lanes: Vec<usize> = (0..length).collect();
+    let mut iterations: Vec<usize> = (0..length).collect();
     if reverse {
-        lanes.reverse();
+        iterations.reverse();
     }
-    for lane in lanes {
-        let mut lane_inputs = carries.clone();
+    for iteration in iterations {
+        let mut iteration_inputs = carries.clone();
         for stack in stacks {
-            lane_inputs.push(read_scan_lane(stack, lane)?);
+            iteration_inputs.push(read_scan_iteration(stack, iteration)?);
         }
-        let mut lane_outputs = interpret_lane(lane, lane_inputs)?;
-        check_count!("output", lane_outputs, carry_count + y_slice_types.len(), ProgramError);
-        let lane_ys = lane_outputs.split_off(carry_count);
-        carries = lane_outputs;
-        for (accumulator, lane_y) in accumulators.iter_mut().zip(lane_ys.into_iter()) {
-            *accumulator = write_scan_lane(accumulator.clone(), lane, lane_y)?;
+        let mut iteration_outputs = interpret_iteration(iteration, iteration_inputs)?;
+        check_count!("output", iteration_outputs, carry_count + y_slice_types.len(), ProgramError);
+        let iteration_ys = iteration_outputs.split_off(carry_count);
+        carries = iteration_outputs;
+        for (accumulator, iteration_y) in accumulators.iter_mut().zip(iteration_ys.into_iter()) {
+            *accumulator = write_scan_iteration(accumulator.clone(), iteration, iteration_y)?;
         }
     }
     carries.extend(accumulators);
     Ok(carries)
 }
 
-impl<T, C, V, O, Capture, Payload> InterpretableOperation<T, V> for ScanOperation<T, C, O, Capture, Payload>
+impl<Constant, V, O, Capture, Payload, C> InterpretableOperation<V, C> for ScanOperation<Constant, O, Capture, Payload>
 where
-    T: ScanTypeSemantics,
-    C: Value<T>,
-    V: Value<T>,
-    O: Operation<T>,
-    Capture: Value<T>,
-    Payload: ScanPayload<T, C, V, O, Capture>,
+    Constant: Value,
+    Constant::Type: ScanTypeSemantics,
+    V: Value<Type = Constant::Type>,
+    O: Operation<Constant::Type>,
+    Capture: Value<Type = Constant::Type>,
+    Payload: ScanPayload<Constant::Type, Constant, V, O, Capture, C>,
 {
-    fn interpret(
-        &self,
-        context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         self.infer_output_types(input_types.as_slice())?;
         Payload::interpret_scan(self, context, inputs)
     }
 }
 
+/// Partial-evaluation override for a [`Captured`]-payload [`ScanOperation`] over [`ArrayType`].
+///
+/// A scan's inputs are `[carry_init..., stacked_xs...]` and its body maps `[carry..., x_slice...]` to
+/// `[next_carry..., y_slice...]`. Partial evaluation folds the known value of every *loop-invariant-known* carry into
+/// the body: a carry is loop-invariant-known iff its init input is [`Known`](PartialValue::Known) and, with the
+/// loop-invariant-known carries bound to their init values and everything else [`Unknown`](PartialValue::Unknown), its
+/// body next-carry output is itself a known value equal to that init. Such a carry holds its init value on every
+/// iteration, so binding it to that constant inside the body is sound and collapses every subcomputation that depended
+/// only on it.
+///
+/// The invariant carries are found by a monotonic fixed point (a carry can only be demoted from invariant to
+/// non-invariant as more carries are admitted, so it converges): on each round every currently-invariant carry is
+/// bound to `Known(init)`, every other carry and every scanned element is `Unknown`, the body is partially evaluated
+/// through the [`PartiallyEvaluatableProgramOperation`] witness (not [`Program::partially_evaluate`] directly, to avoid
+/// re-entering the operation-enum trait-solver cycle), and a carry survives the round only if its next-carry output is
+/// known and equal to its init. A carry init that is known but does not [`resolve`](Context::resolve) to a
+/// [`Concrete`](crate::ValueResolution::Concrete) constant in the known-side context is never an invariance
+/// candidate: its value could not be embedded into the rebuilt body as a
+/// constant, and skipping it also keeps the fixed point's probe rounds from folding symbolic known work into a live
+/// staging context. Under a staging known-side context, the surviving equality check is [`Tracer`](crate::Tracer)
+/// identity, which degrades invariance detection to syntactic pass-through.
+///
+/// The residual scan keeps the *same* carry set and therefore the same output arity as the original operation. A
+/// reduced carry set would change the scan's output count (`carry_count + scanned_outputs`). Instead, each
+/// loop-invariant-known carry's body input is left dead and its body next-carry output is rebuilt as the constant init
+/// value, so the carry slot survives while every use of its value folds away. The residual body is rebuilt from the
+/// final round's residual body program: the carries and scanned elements feed it as inputs in scan body order, the
+/// intensive residuals it consumes (the folded invariant carry values and any other value the body closed over) are
+/// rebuilt inline as residual-body constants (so the residual scan needs no captures), and folded next-carry and
+/// scanned outputs are rebuilt inline as constants exactly as the residual program reports them. The rewrite is
+/// emitted over the original scan inputs unchanged.
+///
+/// Beyond the invariants, *time-varying* known work — known non-invariant carry chains and known stacked inputs —
+/// is split off by `split_scan_by_knownness` into a *known scan* bound in the enclosing known-side context and an
+/// *unknown scan* left in the residual program, connected by per-iteration residual edges the known scan stacks over
+/// the scan length; see that function's documentation for the full recipe. If no carry is loop-invariant-known, no
+/// time-varying known work exists, and the body has no other foldable subcomputation, the rule defers to the default
+/// residualize-unchanged behavior.
+impl<V, O, C> PartiallyEvaluatableOperation<C> for ScanOperation<V, O, V, Captured>
+where
+    V: Value<Type = ArrayType>,
+    C: Context<Type = ArrayType, Constant = V, Operation = O>,
+    C::Value: PartialEq,
+    O: Clone
+        + Operation<ArrayType>
+        + PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableProgramOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + From<ScanOperation<V, O>>,
+{
+    fn partially_evaluate(
+        &self,
+        evaluator: &mut PartialEvaluator<C>,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // When every input is known the whole scan folds by binding it in the known-side evaluator; defer to that
+        // default behavior.
+        if inputs.iter().all(PartialEvaluationValue::is_known) {
+            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+        }
+
+        let carry_count = self.carry_count;
+        let body_input_types = self.body.input_types();
+
+        // The invariance fixed point below probes by folding the body through the *live* known-side evaluator. For an
+        // effectful body each probe round would execute (eager) or stage (staging) the body's effects once more, so
+        // effectful bodies skip invariance probing entirely: the known-ness split's probes run through fresh,
+        // discarded contexts and remain safe (see the effect placement contract on
+        // `PartialEvaluator::fold_or_residualize`).
+        if !self.body.effects().is_pure() {
+            let time_varying_known = inputs.iter().any(PartialEvaluationValue::is_known);
+            if time_varying_known {
+                return split_scan_by_knownness(evaluator, self, inputs);
+            }
+            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+        }
+
+        // A carry can only fold if its init input is known *and* concretizable in the known-side evaluator: the folded
+        // value must be embeddable as a rebuilt-body constant, and skipping symbolic knowns also keeps the fixed
+        // point's probe rounds from folding symbolic known work into a live staging evaluator.
+        let carry_inits = (0..carry_count)
+            .map(|index| {
+                inputs[index].as_known().filter(|value| evaluator.context().resolve(value).is_concrete()).cloned()
+            })
+            .collect::<Vec<Option<C::Value>>>();
+
+        // Monotonically narrow the set of loop-invariant-known carries to a fixed point. A round binds each invariant
+        // carry to its init, leaves everything else unknown, and keeps a carry only if the body reproduces its init.
+        // With no invariance candidates at all there is nothing the rebuild below could embed, so skip the
+        // live-evaluator probe entirely and go straight to the known-ness split (or the default).
+        let mut invariant = carry_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
+        if invariant.iter().all(|candidate| !candidate) {
+            if inputs.iter().any(PartialEvaluationValue::is_known) {
+                return split_scan_by_knownness(evaluator, self, inputs);
+            }
+            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+        }
+        let body_knowledge = |invariant: &[bool]| -> Vec<PartialValue<C::Value>> {
+            let mut knowledge = Vec::with_capacity(body_input_types.len());
+            for index in 0..carry_count {
+                match (invariant[index], &carry_inits[index]) {
+                    (true, Some(value)) => knowledge.push(PartialValue::Known(value.clone())),
+                    _ => knowledge.push(PartialValue::Unknown(body_input_types[index].clone())),
+                }
+            }
+            for slice_type in body_input_types[carry_count..].iter() {
+                knowledge.push(PartialValue::Unknown(slice_type.clone()));
+            }
+            knowledge
+        };
+
+        let mut body_evaluation =
+            O::partially_evaluate_program(evaluator.context(), &self.body, &body_knowledge(&invariant))?;
+        loop {
+            let refined = (0..carry_count)
+                .map(|index| {
+                    invariant[index]
+                        && matches!(
+                            &body_evaluation.outputs[index],
+                            PartialEvaluationOutput::Known(value) if Some(value) == carry_inits[index].as_ref()
+                        )
+                })
+                .collect::<Vec<bool>>();
+            if refined == invariant {
+                break;
+            }
+            invariant = refined;
+            body_evaluation =
+                O::partially_evaluate_program(evaluator.context(), &self.body, &body_knowledge(&invariant))?;
+        }
+
+        // Beyond the invariants, the remaining knowledge may still contain *time-varying* known work: known
+        // non-invariant carry inits or known stacked inputs. Those cannot fold once, but they can ride a *known
+        // scan* that runs per iteration, so after the invariant rewrite below the known-ness split takes over.
+        let time_varying_known = (0..carry_count).any(|index| inputs[index].is_known() && !invariant[index])
+            || inputs[carry_count..].iter().any(PartialEvaluationValue::is_known);
+
+        // Nothing folded into the body: defer to the known-ness split when time-varying known work remains, and to
+        // the default residualize-unchanged behavior otherwise. A loop-invariant-known carry always shrinks the body
+        // (its uses fold to constants), so the only way nothing folds is an empty invariant set whose residual body
+        // did not shrink either. The rebuild below embeds the probe's known values as inline body constants, which
+        // is only possible when they are all concrete — under a staging known-side evaluator the probe can fold a
+        // constant-only chain into a live-trace tracer — so a non-concrete probe takes the same fallback.
+        if (invariant.iter().all(|folded| !folded)
+            && body_evaluation.program.instructions().len() >= self.body.instructions().len())
+            || !evaluator.all_knowns_are_concrete(&body_evaluation)
+        {
+            if time_varying_known {
+                return split_scan_by_knownness(evaluator, self, inputs);
+            }
+            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+        }
+
+        // The residual scan keeps the same carry set, so its output arity matches the original scan. A
+        // loop-invariant-known carry is not dropped; instead its body next-carry output is rebuilt as the constant
+        // init value and its body input is left dead, while its known value is folded into the body wherever it was
+        // used. The body's per-iteration inputs are `[carry..., scanned_elem...]`.
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let body_input_atoms =
+            body_input_types.iter().map(|input_type| builder.add_input(input_type.clone())).collect::<Vec<_>>();
+
+        // Feed the residual body program's inputs in its own input order. A surviving unknown body input is a
+        // non-invariant carry or a scanned element and maps to the matching body input atom; a known residual (a
+        // folded invariant carry value or another value the body closed over) is rebuilt as an inline constant by
+        // recovering its staged payload through the known-side evaluator.
+        let mut residual_body_inputs = Vec::with_capacity(body_evaluation.inputs.len());
+        for residual_input in body_evaluation.inputs.iter() {
+            match residual_input {
+                PartialEvaluationInput::Unknown(body_input) => residual_body_inputs.push(body_input_atoms[*body_input]),
+                PartialEvaluationInput::Known(value) => {
+                    residual_body_inputs.push(builder.add_constant(evaluator.known_constant(value)?))
+                }
+            }
+        }
+        let spliced_outputs = builder.add_program(&body_evaluation.program, &residual_body_inputs)?;
+
+        // Assemble the residual body outputs as `[next_carry..., scanned_out...]`: a folded output (an invariant
+        // carry's next value, or any output the body closed over) becomes an inline constant, and an unknown output
+        // reads the spliced residual program's corresponding output.
+        let body_output_atoms = (0..self.body.output_types().len())
+            .map(|output_index| match &body_evaluation.outputs[output_index] {
+                PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(evaluator.known_constant(value)?)),
+                PartialEvaluationOutput::Unknown(index) => Ok(spliced_outputs[*index]),
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+
+        let body_output_count = body_output_atoms.len();
+        let residual_body = builder.build::<Vec<V>, Vec<V>>(
+            body_output_atoms,
+            vec![Placeholder; body_input_atoms.len()],
+            vec![Placeholder; body_output_count],
+        )?;
+
+        let scan = ScanOperation::<V, O>::new(residual_body, carry_count, self.length)?
+            .with_reverse(self.reverse)
+            .with_unroll(self.unroll)?;
+
+        // With time-varying known work remaining, the known-ness split of the invariant-folded scan finishes the
+        // job; otherwise the residual scan's inputs are exactly the original scan's inputs: each carry init (now a
+        // known residual for the folded carries) followed by each stacked input.
+        if time_varying_known {
+            return split_scan_by_knownness(evaluator, &scan, inputs);
+        }
+        evaluator.fold_or_residualize(O::from(scan), inputs)
+    }
+}
+
+/// Splits `scan` into a *known scan* bound in the enclosing known-side context and an *unknown scan* emitted into the
+/// residual program, by a fixed point over carry known-ness — ryft's analogue of JAX's `_scan_partial_eval`, which
+/// keeps time-varying known chains known instead of demoting them.
+///
+/// A carry stays known iff the body computes its next value from known values alone (its init must be known); known
+/// stacked inputs are known throughout. Unlike the loop-*invariance* fixed point (which folds a carry once and
+/// therefore requires a concretizable, value-equal init), known-ness needs neither concretizability nor value
+/// equality, so symbolic known inits (tracers into a live outer trace) participate fully. Each fixed-point round
+/// splits the body through a **fresh** staging context whose inputs stand in for the known body inputs, so no probe
+/// or split work can leak into the caller's context.
+///
+/// From the converged split, the *known scan*'s body maps the known carries and known stacked slices to the known
+/// next-carries, the known per-iteration outputs, and the **residual edges** — every known per-iteration value the
+/// unknown side consumes — which the known scan *stacks* over the scan length as extra scanned outputs. The known
+/// scan is bound whole into the enclosing known-side context over the original known inputs (interpreting it under an
+/// eager context and staging it into the outer program under a staging one). The *unknown scan*'s body consumes the
+/// unknown carries, the unknown stacked slices, and one slice of each stacked edge per iteration; a known body
+/// next-carry belonging to an *unknown* carry (one whose value the unknown side threads) is instantiated as one more
+/// residual edge that the unknown body passes through, mirroring JAX's `instantiate` flag. If the split turns out to
+/// have an empty known side, the scan residualizes unchanged through the default rule instead.
+fn split_scan_by_knownness<V, O, C>(
+    evaluator: &mut PartialEvaluator<C>,
+    scan: &ScanOperation<V, O, V, Captured>,
+    inputs: &[PartialEvaluationValue<C::Value>],
+) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+where
+    V: Value<Type = ArrayType>,
+    C: Context<Type = ArrayType, Constant = V, Operation = O>,
+    O: Clone
+        + Operation<ArrayType>
+        + PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + From<ScanOperation<V, O>>,
+{
+    let carry_count = scan.carry_count;
+    let body_input_types = scan.body.input_types();
+    let body_output_count = scan.body.output_types().len();
+    let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
+
+    // Fixed point over carry known-ness, each round splitting the body through a fresh staging evaluator.
+    let split_body = |carry_known: &[bool]| -> Result<
+        (TracingContext<V, O>, PartialEvaluation<TracingContext<V, O>>),
+        ProgramError,
+    > {
+        let fresh = TracingContext::<V, O>::new();
+        let knowledge = body_input_types
+            .iter()
+            .enumerate()
+            .map(|(index, input_type)| {
+                let known = if index < carry_count { carry_known[index] } else { input_known[index] };
+                if known {
+                    PartialValue::Known(fresh.input(input_type.clone()))
+                } else {
+                    PartialValue::Unknown(input_type.clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        let evaluation = scan.body.partially_evaluate_in_context(&fresh, knowledge.as_slice())?;
+        Ok((fresh, evaluation))
+    };
+
+    let mut carry_known = input_known[..carry_count].to_vec();
+    let (fresh, evaluation) = loop {
+        let (fresh, evaluation) = split_body(&carry_known)?;
+        let refined = (0..carry_count)
+            .map(|index| carry_known[index] && matches!(&evaluation.outputs[index], PartialEvaluationOutput::Known(_)))
+            .collect::<Vec<bool>>();
+        if refined == carry_known {
+            break (fresh, evaluation);
+        }
+        carry_known = refined;
+    };
+
+    // Assemble the known body's outputs: the known next-carries, then the known per-iteration outputs, then the
+    // residual edges (the known feeders the unknown side consumes, plus the instantiated known next-carries of
+    // unknown carries). Absolute positions into this list equal positions into the known scan's outputs, because the
+    // known scan's outputs are its final carries followed by its stacked per-iteration outputs in the same order.
+    let mut known_output_atoms = Vec::new();
+    let mut known_carry_output_positions = vec![None; carry_count];
+    for index in 0..carry_count {
+        if carry_known[index] {
+            match &evaluation.outputs[index] {
+                PartialEvaluationOutput::Known(value) => {
+                    known_carry_output_positions[index] = Some(known_output_atoms.len());
+                    known_output_atoms.push(value.atom_id()?);
+                }
+                PartialEvaluationOutput::Unknown(_) => {
+                    return Err(ProgramError::MalformedProgram(
+                        "scan known-ness fixed point converged with an unknown next value for a known carry"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut known_y_output_positions = vec![None; body_output_count - carry_count];
+    for (position, output) in evaluation.outputs[carry_count..].iter().enumerate() {
+        if let PartialEvaluationOutput::Known(value) = output {
+            known_y_output_positions[position] = Some(known_output_atoms.len());
+            known_output_atoms.push(value.atom_id()?);
+        }
+    }
+    let mut edge_types = Vec::new();
+    let mut feeder_edge_positions = Vec::with_capacity(evaluation.inputs.len());
+    for input in evaluation.inputs.iter() {
+        match input {
+            PartialEvaluationInput::Known(value) => {
+                feeder_edge_positions.push(Some((edge_types.len(), known_output_atoms.len())));
+                edge_types.push(value.r#type().into_owned());
+                known_output_atoms.push(value.atom_id()?);
+            }
+            PartialEvaluationInput::Unknown(_) => feeder_edge_positions.push(None),
+        }
+    }
+    let mut instantiated_edge_positions = vec![None; carry_count];
+    for index in 0..carry_count {
+        if !carry_known[index] {
+            if let PartialEvaluationOutput::Known(value) = &evaluation.outputs[index] {
+                instantiated_edge_positions[index] = Some((edge_types.len(), known_output_atoms.len()));
+                edge_types.push(value.r#type().into_owned());
+                known_output_atoms.push(value.atom_id()?);
+            }
+        }
+    }
+
+    // An empty known side means the split folds nothing; residualize unchanged through the default rule.
+    if known_output_atoms.is_empty() {
+        return evaluator.fold_or_residualize(O::from(scan.clone()), inputs);
+    }
+
+    // Bind the known scan into the enclosing known-side evaluator over the original known inputs.
+    let known_carry_count = carry_known.iter().filter(|&&known| known).count();
+    let known_scan_inputs = inputs
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| if *index < carry_count { carry_known[*index] } else { input_known[*index] })
+        .map(|(_, input)| input.clone())
+        .collect::<Vec<_>>();
+    let known_output_count = known_output_atoms.len();
+    let known_body = fresh
+        .builder()
+        .borrow()
+        .clone()
+        .build::<Vec<V>, Vec<V>>(
+            known_output_atoms,
+            vec![Placeholder; known_scan_inputs.len()],
+            vec![Placeholder; known_output_count],
+        )?
+        .into_simplified()?;
+    let known_scan = ScanOperation::<V, O>::new(known_body, known_carry_count, scan.length)?
+        .with_reverse(scan.reverse)
+        .with_unroll(scan.unroll)?;
+    let known_outputs = evaluator.fold_or_residualize(O::from(known_scan), known_scan_inputs.as_slice())?;
+
+    // Assemble the unknown body over `[unknown carries..., unknown stacked slices..., edge slices...]`, splicing the
+    // residual body program over its unknown inputs and edge inputs, with instantiated known next-carries passed
+    // through from their edge slices.
+    let mut unknown_output_ordinals = vec![None; body_output_count];
+    let mut residual_outputs = Vec::new();
+    let has_unknown_outputs =
+        evaluation.outputs.iter().any(|output| matches!(output, PartialEvaluationOutput::Unknown(_)))
+            || (0..carry_count).any(|index| !carry_known[index]);
+    if has_unknown_outputs {
+        let mut builder = ProgramBuilder::<V, O>::new();
+        let mut unknown_body_input_atoms = vec![None; body_input_types.len()];
+        for (index, input_type) in body_input_types.iter().enumerate() {
+            let known = if index < carry_count { carry_known[index] } else { input_known[index] };
+            if !known {
+                unknown_body_input_atoms[index] = Some(builder.add_input(input_type.clone()));
+            }
+        }
+        let edge_input_atoms =
+            edge_types.iter().map(|edge_type| builder.add_input(edge_type.clone())).collect::<Vec<_>>();
+
+        let mut spliced_inputs = Vec::with_capacity(evaluation.inputs.len());
+        for (input, edge_position) in evaluation.inputs.iter().zip(feeder_edge_positions.iter()) {
+            match (input, edge_position) {
+                (PartialEvaluationInput::Unknown(slot), _) => {
+                    spliced_inputs.push(unknown_body_input_atoms[*slot].ok_or_else(|| {
+                        ProgramError::MalformedProgram(
+                            "scan known-ness split saw a residual feeder for a known body input".to_string(),
+                        )
+                    })?);
+                }
+                (PartialEvaluationInput::Known(_), Some((edge, _))) => spliced_inputs.push(edge_input_atoms[*edge]),
+                (PartialEvaluationInput::Known(_), None) => {
+                    return Err(ProgramError::MalformedProgram(
+                        "scan known-ness split lost a residual edge".to_string(),
+                    ));
+                }
+            }
+        }
+        let spliced_outputs = builder.add_program(&evaluation.program, &spliced_inputs)?;
+
+        let mut unknown_output_atoms = Vec::new();
+        for index in 0..body_output_count {
+            let owned_by_unknown_side = if index < carry_count {
+                !carry_known[index]
+            } else {
+                matches!(&evaluation.outputs[index], PartialEvaluationOutput::Unknown(_))
+            };
+            if !owned_by_unknown_side {
+                continue;
+            }
+            unknown_output_ordinals[index] = Some(unknown_output_atoms.len());
+            match &evaluation.outputs[index] {
+                PartialEvaluationOutput::Unknown(spliced) => unknown_output_atoms.push(spliced_outputs[*spliced]),
+                PartialEvaluationOutput::Known(_) => {
+                    let (edge, _) = instantiated_edge_positions[index].ok_or_else(|| {
+                        ProgramError::MalformedProgram(
+                            "scan known-ness split lost an instantiated carry edge".to_string(),
+                        )
+                    })?;
+                    unknown_output_atoms.push(edge_input_atoms[edge]);
+                }
+            }
+        }
+
+        let unknown_body_input_count =
+            unknown_body_input_atoms.iter().filter(|atom| atom.is_some()).count() + edge_input_atoms.len();
+        let unknown_output_count = unknown_output_atoms.len();
+        let unknown_body = builder.build::<Vec<V>, Vec<V>>(
+            unknown_output_atoms,
+            vec![Placeholder; unknown_body_input_count],
+            vec![Placeholder; unknown_output_count],
+        )?;
+        let unknown_carry_count = carry_known.iter().filter(|&&known| !known).count();
+        let unknown_scan = ScanOperation::<V, O>::new(unknown_body, unknown_carry_count, scan.length)?
+            .with_reverse(scan.reverse)
+            .with_unroll(scan.unroll)?;
+
+        // The unknown scan consumes the unknown original inputs followed by one stacked edge per residual edge, each
+        // edge fed by the known scan's matching stacked output.
+        let mut unknown_scan_inputs = Vec::new();
+        for (index, input) in inputs.iter().enumerate() {
+            let known = if index < carry_count { carry_known[index] } else { input_known[index] };
+            if !known {
+                unknown_scan_inputs.push(input.clone());
+            }
+        }
+        let mut edge_known_output_positions = feeder_edge_positions
+            .iter()
+            .flatten()
+            .chain(instantiated_edge_positions.iter().flatten())
+            .collect::<Vec<_>>();
+        edge_known_output_positions.sort_by_key(|(edge, _)| *edge);
+        for (_, known_output_position) in edge_known_output_positions {
+            unknown_scan_inputs.push(known_outputs.get(*known_output_position).cloned().ok_or_else(|| {
+                ProgramError::MalformedProgram(
+                    "scan known-ness split known scan produced no output for a residual edge".to_string(),
+                )
+            })?);
+        }
+        residual_outputs = evaluator.residualize(O::from(unknown_scan), unknown_scan_inputs.as_slice())?;
+    }
+
+    // Reassemble the original scan's outputs from the two sides.
+    (0..body_output_count)
+        .map(|index| {
+            let known_position = if index < carry_count {
+                known_carry_output_positions[index]
+            } else {
+                known_y_output_positions[index - carry_count]
+            };
+            if let Some(position) = known_position {
+                return known_outputs.get(position).cloned().ok_or_else(|| {
+                    ProgramError::MalformedProgram(
+                        "scan known-ness split known scan produced no output for a known result".to_string(),
+                    )
+                });
+            }
+            let ordinal = unknown_output_ordinals[index].ok_or_else(|| {
+                ProgramError::MalformedProgram(
+                    "scan known-ness split produced a result owned by neither side".to_string(),
+                )
+            })?;
+            residual_outputs.get(ordinal).cloned().ok_or_else(|| {
+                ProgramError::MalformedProgram(
+                    "scan known-ness split unknown scan produced no output for a residual result".to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for an
+/// [`Input`]-payload [`ScanOperation`] — the linear scans whose captures store iteration-indexed residual stacks. The
+/// carry-folding rule above applies only to the ordinary [`Captured`]-payload array scan whose capture family matches
+/// its value family; keying this default on the [`Input`] payload keeps the two implementations disjoint.
+///
+/// The residual-program operation family `O` is independent of the scan body's operation family `BodyOperation`,
+/// because such a scan never inlines a nested program during partial evaluation and so never constructs a residual
+/// program itself.
+///
+/// [`Input`]: crate::payloads::Input
+impl<V, BodyOperation, Capture, C> PartiallyEvaluatableOperation<C>
+    for ScanOperation<V, BodyOperation, Capture, crate::payloads::Input>
+where
+    V: Value,
+    V::Type: ScanTypeSemantics,
+    BodyOperation: Clone + Operation<V::Type>,
+    Capture: Value<Type = V::Type>,
+    C: Context<Type = V::Type>,
+    C::Operation: From<ScanOperation<V, BodyOperation, Capture, crate::payloads::Input>>,
+{
+}
+
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tests::{TestArray, TestArrayDomain};
-    use crate::tracing::TracingContext;
+    use crate::tests::TestArray;
+    use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
     use super::*;
 
-    type TestScanOperation = ScanOperation<ArrayType, TestArray, ArrayOperation<TestArray>>;
+    type TestScanOperation = ScanOperation<TestArray, ArrayOperation<TestArray>>;
 
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`: the new carry is
     /// the running product and each iteration also emits that product as a stacked output slice.
-    fn product_body() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+    fn product_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let x = builder.add_input(ArrayType::scalar(DataType::F64));
         let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
@@ -744,8 +1285,8 @@ mod tests {
     }
 
     /// Builds a carry-only body program that maps `[carry]` to `[carry + carry]` with no stacked inputs or outputs.
-    fn doubling_body() -> Program<ArrayType, TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+    fn doubling_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(ArrayType::scalar(DataType::F64));
         let doubled = builder.add_instruction(AddOperation, vec![carry, carry]).unwrap()[0];
         builder.build(vec![doubled], vec![Placeholder], vec![Placeholder]).unwrap()
@@ -834,7 +1375,10 @@ mod tests {
             .trim_end(),
         );
         let outputs = unrolled
-            .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
+            )
             .unwrap();
         assert_eq!(outputs[0].values, vec![24.0]);
         assert_eq!(outputs[1].values, vec![2.0, 6.0, 24.0]);
@@ -845,7 +1389,7 @@ mod tests {
             TestScanOperation::new(product_body(), 3, 3).map(|_| ()),
             Err(TypeError { message: "scan carry count 3 exceeds the body input count 2".to_string() }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let carry = builder.add_input(scalar_f64.clone());
         let x = builder.add_input(scalar_f64.clone());
         let product = builder.add_instruction(MulOperation, vec![carry, x]).unwrap()[0];
@@ -856,7 +1400,7 @@ mod tests {
             TestScanOperation::new(no_output_body, 2, 3).map(|_| ()),
             Err(TypeError { message: "scan carry count 2 exceeds the body output count 1".to_string() }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let mismatched_carry = builder.add_input(scalar_f64.clone());
         let mismatched_output = builder.add_instruction(ZeroLikeOperation, vec![mismatched_carry]).unwrap()[0];
         let mismatched_output = builder
@@ -874,7 +1418,7 @@ mod tests {
                 message: "scan body carry type signature mismatch: expected [f64[]] but got [bool[]]".to_string(),
             }),
         );
-        let mut builder = ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         let dynamic_carry = builder.add_input(dynamic_type);
         let dynamic_body = builder
@@ -890,23 +1434,30 @@ mod tests {
         // Interpretation threads the carry while stacking the per-iteration outputs: a cumulative product over
         // `xs = [2, 3, 4]` starting at `1` produces the final carry `24` and the running products `[2, 6, 24]`.
         let outputs = operation
-            .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
+            )
             .unwrap();
         assert_eq!(outputs[0].values, vec![24.0]);
         assert_eq!(outputs[1].values, vec![2.0, 6.0, 24.0]);
 
         // A reversed scan visits the slices from the back while keeping output slice `i` aligned with input slice
-        // `i`: the running products visit `4, 3, 2` and land in lanes `2, 1, 0`.
+        // `i`: the running products visit `4, 3, 2` and land in iterations `2, 1, 0`.
         let reversed = TestScanOperation::new(product_body(), 1, 3).unwrap().with_reverse(true);
         let outputs = reversed
-            .interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])])
+            .interpret(
+                &crate::EagerContext::<TestArray>::new(),
+                &[TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
+            )
             .unwrap();
         assert_eq!(outputs[0].values, vec![24.0]);
         assert_eq!(outputs[1].values, vec![24.0, 12.0, 4.0]);
 
         // A carry-only scan with no stacked inputs or outputs applies the body `length` times.
         let carry_only = TestScanOperation::new(doubling_body(), 1, 3).unwrap();
-        let outputs = carry_only.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]).unwrap();
+        let outputs =
+            carry_only.interpret(&crate::EagerContext::<TestArray>::new(), &[TestArray::scalar(1.0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].values, vec![8.0]);
 
@@ -915,7 +1466,7 @@ mod tests {
         let empty_stacked_f64 = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
         let outputs = empty
             .interpret(
-                &crate::EagerContext::new(),
+                &crate::EagerContext::<TestArray>::new(),
                 &[TestArray::scalar(1.0), TestArray::new(empty_stacked_f64, vec![])],
             )
             .unwrap();
@@ -924,15 +1475,14 @@ mod tests {
 
         // Invalid inputs report precise interpreter errors.
         assert_eq!(
-            operation.interpret(&crate::EagerContext::new(), &[TestArray::scalar(1.0)]),
+            operation.interpret(&crate::EagerContext::<TestArray>::new(), &[TestArray::scalar(1.0)]),
             Err(ProgramError::Type(TypeError { message: "expected 2 inputs but got 1".to_string() })),
         );
 
-        // Staging records the scan payload into the active program instead of running scan lanes eagerly over staged
-        // values.
-        let domain = TestArrayDomain;
-        let builder = Rc::new(RefCell::new(ProgramBuilder::<ArrayType, TestArray, ArrayOperation<TestArray>>::new()));
-        let context = TracingContext::new(&domain, builder.clone());
+        // Staging records the scan payload into the active program instead of running scan iterations eagerly over
+        // staged values.
+        let context = DomainTracingContext::<EagerContext<TestArray, ArrayOperation<TestArray>>>::new();
+        let builder = context.builder().clone();
         let staged_carry = context.input(scalar_f64.clone());
         let staged_xs = context.input(stacked_f64.clone());
         let outputs = context.stage_operation(operation.clone(), &[staged_carry.clone(), staged_xs.clone()]).unwrap();
@@ -948,11 +1498,7 @@ mod tests {
         assert_eq!(outputs[1].atom_id(), Ok(builder.instructions()[0].outputs()[1]));
 
         // Program rendering uses the canonical operation name and includes the nested body program.
-        let mut builder = ProgramBuilder::<
-            ArrayType,
-            TestArray,
-            ScanOperation<ArrayType, TestArray, ArrayOperation<TestArray>>,
-        >::new();
+        let mut builder = ProgramBuilder::<TestArray, ScanOperation<TestArray, ArrayOperation<TestArray>>>::new();
         let program_carry = builder.add_input(scalar_f64);
         let program_xs = builder.add_input(stacked_f64);
         let program_outputs = builder.add_instruction(operation, vec![program_carry, program_xs]).unwrap().to_vec();
@@ -981,5 +1527,332 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    /// A scan whose body prints inside its known chain keeps the effect in the *known scan* of the known-ness
+    /// split: effectful bodies skip the live-context invariance probes and go straight to the split, whose fresh
+    /// probe contexts fold the all-known print into the known side. The known scan staged into the live outer trace
+    /// owns the print (running it once per iteration, all before the residual side, per the effect placement
+    /// contract), and the residual scan stays pure.
+    #[test]
+    fn test_partially_evaluate_scan_keeps_effectful_known_work_in_the_known_scan() {
+        use crate::operations::debugging::PrintOperation;
+        use crate::tracing::TracingContext;
+
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+
+        // Body `[acc, k, x] -> [acc + (print(k) * k) * x, k, acc + (print(k) * k) * x]`: the print sits inside the
+        // otherwise-known `k * k` chain.
+        let body = {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let acc = builder.add_input(scalar());
+            let k = builder.add_input(scalar());
+            let x = builder.add_input(scalar());
+            let printed = builder.add_instruction(PrintOperation::new("k"), vec![k]).unwrap()[0];
+            let ksq = builder.add_instruction(MulOperation, vec![printed, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation, vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, vec![acc, kx]).unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(
+                    vec![next_acc, k, next_acc],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        };
+
+        let scan = TestScanOperation::new(body, 2, 3).unwrap();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let acc_init = builder.add_input(scalar());
+        let k_init = builder.add_input(scalar());
+        let xs = builder.add_input(stacked.clone());
+        let outputs = builder.add_instruction(scan, vec![acc_init, k_init, xs]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+
+        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let known_carry = outer.input(scalar());
+        let knowledge =
+            vec![PartialValue::Unknown(scalar()), PartialValue::Known(known_carry), PartialValue::Unknown(stacked)];
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
+
+        // The known scan owns the print (visible through the nested-program effects union) and the residual scan
+        // is pure, consuming the stacked known-chain edge instead.
+        {
+            let outer_builder = outer.builder().borrow();
+            assert_eq!(outer_builder.instructions().len(), 1);
+            let ArrayOperation::Scan(known_scan) = outer_builder.instructions()[0].operation() else {
+                panic!("expected the outer program to contain the known scan");
+            };
+            assert!(known_scan.body().effects().is_ordered());
+        }
+        assert!(evaluation.program.effects().is_pure());
+        let residual_scans = evaluation
+            .program
+            .instructions()
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Scan(_)))
+            .count();
+        assert_eq!(residual_scans, 1);
+    }
+
+    /// Under a *staging* known-side context, a *symbolic* known carry (a genuine outer tracer) participates in the
+    /// known-ness split: the known chain (`k` and `k * k`) rides a known scan staged into the live outer trace,
+    /// stacking the per-iteration `k * k` values the unknown side consumes as a residual edge, while the unknown
+    /// accumulator chain stays behind a residual scan — JAX's `_scan_partial_eval` behavior. The fixed-point probes
+    /// run through fresh contexts, so the only instruction the outer trace gains is the known scan itself.
+    #[test]
+    fn test_partially_evaluate_scan_splits_symbolic_known_carries_under_staging() {
+        use crate::tracing::TracingContext;
+
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+
+        // Body `[acc, k, x] -> [acc + (k * k) * x, k, acc + (k * k) * x]`, as in the loop-invariant test below.
+        let body = || {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let acc = builder.add_input(scalar());
+            let k = builder.add_input(scalar());
+            let x = builder.add_input(scalar());
+            let ksq = builder.add_instruction(MulOperation, vec![k, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation, vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, vec![acc, kx]).unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(
+                    vec![next_acc, k, next_acc],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        };
+
+        let scan = TestScanOperation::new(body(), 2, 3).unwrap();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let acc_init = builder.add_input(scalar());
+        let k_init = builder.add_input(scalar());
+        let xs = builder.add_input(stacked.clone());
+        let outputs = builder.add_instruction(scan, vec![acc_init, k_init, xs]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+
+        let outer = TracingContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let known_carry = outer.input(scalar());
+        let knowledge = vec![
+            PartialValue::Unknown(scalar()),
+            PartialValue::Known(known_carry),
+            PartialValue::Unknown(stacked.clone()),
+        ];
+        let evaluation = program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
+
+        // The known chain landed in the outer program as one known scan whose body carries `k` and stacks `k * k`
+        // per iteration as the residual edge — the fixed-point probes leaked nothing else.
+        {
+            let outer_builder = outer.builder().borrow();
+            assert_eq!(outer_builder.instructions().len(), 1);
+            let ArrayOperation::Scan(known_scan) = outer_builder.instructions()[0].operation() else {
+                panic!("expected the outer program to contain the known scan");
+            };
+            assert_eq!(known_scan.carry_count(), 1);
+            assert_eq!(known_scan.body().input_types().len(), 1);
+            assert_eq!(known_scan.body().output_types().len(), 2);
+            assert_eq!(known_scan.body().instructions().len(), 1);
+        }
+
+        // The unknown accumulator chain stays behind one residual scan over `[acc, x_slice, stacked k * k slice]`.
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let ArrayOperation::Scan(residual_scan) = evaluation.program.instructions()[0].operation() else {
+            panic!("expected the residual program to contain the unknown scan");
+        };
+        assert_eq!(residual_scan.carry_count(), 1);
+        assert_eq!(residual_scan.body().input_types().len(), 3);
+        assert_eq!(residual_scan.body().output_types().len(), 2);
+        assert_eq!(residual_scan.body().instructions().len(), 2);
+        assert_eq!(evaluation.inputs.len(), 3);
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
+        assert!(matches!(&evaluation.inputs[1], PartialEvaluationInput::Unknown(2)));
+        assert!(matches!(&evaluation.inputs[2], PartialEvaluationInput::Known(value) if value.atom_id().is_ok()));
+
+        // The final `k` is a *known* output (the known scan's final carry), and the accumulator outputs stay residual.
+        assert_eq!(evaluation.outputs.len(), 3);
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
+        assert!(matches!(&evaluation.outputs[2], PartialEvaluationOutput::Unknown(1)));
+    }
+
+    /// The known-ness split keeps *time-varying* known work known under an eager context too: a known stacked input
+    /// whose per-iteration squares feed the unknown accumulator executes during partial evaluation inside a known
+    /// scan, the folded stacked output surfaces as a concrete known value, and the unknown scan consumes the concrete
+    /// stacked squares as a residual edge.
+    #[test]
+    fn test_partially_evaluate_scan_splits_time_varying_known_work() {
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+
+        // Body `[c, x] -> [c + x * x, x * x]` over an unknown accumulator `c` and known stacked `xs`.
+        let body = {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let c = builder.add_input(scalar());
+            let x = builder.add_input(scalar());
+            let xsq = builder.add_instruction(MulOperation, vec![x, x]).unwrap()[0];
+            let next = builder.add_instruction(AddOperation, vec![c, xsq]).unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(vec![next, xsq], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let scan = TestScanOperation::new(body, 1, 3).unwrap();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let c_init = builder.add_input(scalar());
+        let xs = builder.add_input(stacked.clone());
+        let outputs = builder.add_instruction(scan, vec![c_init, xs]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let knowledge =
+            vec![PartialValue::Unknown(scalar()), PartialValue::Known(TestArray::vector(vec![1.0, 2.0, 3.0]))];
+        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+
+        // The stacked squares were computed *during* partial evaluation by the known scan: they surface both as the
+        // folded stacked output and as the residual edge feeding the unknown scan.
+        assert_eq!(evaluation.outputs.len(), 2);
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert!(matches!(
+            &evaluation.outputs[1],
+            PartialEvaluationOutput::Known(value) if value.values == vec![1.0, 4.0, 9.0]
+        ));
+        assert_eq!(evaluation.inputs.len(), 2);
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(0)));
+        assert!(matches!(
+            &evaluation.inputs[1],
+            PartialEvaluationInput::Known(value) if value.values == vec![1.0, 4.0, 9.0]
+        ));
+
+        // The residual (unknown) scan accumulates the stacked squares: interpreting it at `c = 10` reproduces the
+        // full interpretation of the original program.
+        let residual_outputs = evaluation
+            .program
+            .interpret(vec![TestArray::scalar(10.0), TestArray::vector(vec![1.0, 4.0, 9.0])])
+            .unwrap();
+        let expected =
+            program.interpret(vec![TestArray::scalar(10.0), TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(residual_outputs[0].values, expected[0].values);
+        assert_eq!(residual_outputs[0].values, vec![24.0]);
+    }
+
+    /// With a *loop-invariant known* carry, a scan partially evaluates by folding that carry's value into the body: the
+    /// residual scan keeps the same carry set (so its output arity is preserved) but its body shrinks because every
+    /// subcomputation that depended only on the known carry collapses to a constant.
+    ///
+    /// The body over `[acc, k, x]` computes `ksq = k * k`, `kx = ksq * x`, `next_acc = acc + kx`, and returns
+    /// `[next_acc, k, next_acc]`: `acc` is a running accumulator, `k` is forwarded unchanged (loop-invariant), and the
+    /// stacked output is the running accumulator. With `k` known (`2`) and `acc` and `xs` unknown, the `k` carry is
+    /// loop-invariant-known (its next-carry equals its init), so `ksq` folds to the constant `4` and the body shrinks
+    /// from three instructions to two, with `final_k` folded to the constant `2` inside the residual scan body.
+    /// Interpreting the residual program reproduces the original scan over the same inputs.
+    #[test]
+    fn test_partially_evaluate_folds_loop_invariant_known_carry() {
+        let scalar = || ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+
+        // Body `[acc, k, x] -> [acc + (k * k) * x, k, acc + (k * k) * x]`.
+        let body = || {
+            let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+            let acc = builder.add_input(scalar());
+            let k = builder.add_input(scalar());
+            let x = builder.add_input(scalar());
+            let ksq = builder.add_instruction(MulOperation, vec![k, k]).unwrap()[0];
+            let kx = builder.add_instruction(MulOperation, vec![ksq, x]).unwrap()[0];
+            let next_acc = builder.add_instruction(AddOperation, vec![acc, kx]).unwrap()[0];
+            builder
+                .build::<Vec<TestArray>, Vec<TestArray>>(
+                    vec![next_acc, k, next_acc],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 3],
+                )
+                .unwrap()
+        };
+
+        // Flat program over `[acc_init, k_init, xs]` staging the scan (two carries, one scanned input, length 3); its
+        // outputs are `[final_acc, final_k, stacked_acc]`.
+        let scan = TestScanOperation::new(body(), 2, 3).unwrap();
+        let mut builder = ProgramBuilder::<TestArray, ArrayOperation<TestArray>>::new();
+        let acc_init = builder.add_input(scalar());
+        let k_init = builder.add_input(scalar());
+        let xs = builder.add_input(stacked.clone());
+        let outputs = builder.add_instruction(scan, vec![acc_init, k_init, xs]).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<TestArray>, Vec<TestArray>>(outputs, vec![Placeholder; 3], vec![Placeholder; 3])
+            .unwrap();
+
+        let knowledge = vec![
+            PartialValue::Unknown(scalar()),
+            PartialValue::Known(TestArray::scalar(2.0)),
+            PartialValue::Unknown(stacked.clone()),
+        ];
+        let evaluation = program.partially_evaluate(knowledge.as_slice()).unwrap();
+
+        // All three scan outputs are produced by the residual program: the scan instruction itself residualizes
+        // (its inputs are not all known), so even the loop-invariant `final_k` is computed by the residual scan
+        // (whose body folds it to the constant `2`) rather than folded at the top level.
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(_)));
+        assert!(matches!(&evaluation.outputs[1], PartialEvaluationOutput::Unknown(_)));
+        assert!(matches!(&evaluation.outputs[2], PartialEvaluationOutput::Unknown(_)));
+
+        // The residual program's only instruction is the rewritten scan.
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let ArrayOperation::Scan(residual_scan) = evaluation.program.instructions()[0].operation() else {
+            panic!("expected the residual program to contain a rewritten scan");
+        };
+
+        // The carry set is preserved (so output arity matches), but the body shrank: `k * k` folded to a constant, so
+        // the body drops from three instructions to two.
+        assert_eq!(residual_scan.carry_count(), 2);
+        assert_eq!(residual_scan.length(), 3);
+        assert!(residual_scan.body().instructions().len() < body().instructions().len());
+        assert_eq!(residual_scan.body().instructions().len(), 2);
+
+        // Correctness: interpreting the residual program reproduces the original program on the same concrete inputs.
+        let runtime = |acc: f64, xs: Vec<f64>| -> Vec<TestArray> {
+            let arguments = evaluation
+                .inputs
+                .iter()
+                .map(|residual_input| match residual_input {
+                    PartialEvaluationInput::Known(value) => value.clone(),
+                    PartialEvaluationInput::Unknown(index) => match index {
+                        0 => TestArray::scalar(acc),
+                        _ => TestArray::vector(xs.clone()),
+                    },
+                })
+                .collect::<Vec<_>>();
+            let residual_outputs = evaluation.program.interpret(arguments).unwrap();
+            evaluation
+                .outputs
+                .iter()
+                .map(|output| match output {
+                    PartialEvaluationOutput::Known(value) => value.clone(),
+                    PartialEvaluationOutput::Unknown(index) => residual_outputs[*index].clone(),
+                })
+                .collect()
+        };
+        let original = |acc: f64, k: f64, xs: Vec<f64>| {
+            program
+                .interpret(vec![TestArray::scalar(acc), TestArray::scalar(k), TestArray::vector(xs)])
+                .unwrap()
+        };
+
+        let reassembled = runtime(1.0, vec![5.0, 6.0, 7.0]);
+        let expected = original(1.0, 2.0, vec![5.0, 6.0, 7.0]);
+        assert_eq!(
+            reassembled.iter().map(|value| value.values.clone()).collect::<Vec<_>>(),
+            expected.iter().map(|value| value.values.clone()).collect::<Vec<_>>()
+        );
+        // `acc` threads `1 -> 1 + 4*5 -> 21 + 4*6 -> 45 + 4*7 = 73`; the stacked output records `[21, 45, 73]`; the
+        // loop-invariant `k` final carry stays `2`.
+        assert_eq!(reassembled[0].values, vec![73.0]);
+        assert_eq!(reassembled[1].values, vec![2.0]);
+        assert_eq!(reassembled[2].values, vec![21.0, 45.0, 73.0]);
     }
 }

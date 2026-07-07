@@ -18,7 +18,7 @@ use crate::operations::differentiation::StopGradientOperation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation,
+    GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
@@ -51,15 +51,16 @@ use crate::types::ArrayType;
     partial_evaluation(PartialEq + BooleanLike),
     differentiation(PartialEq + BooleanLike),
     batching(
-        BooleanLike + BitAnd<Output = V> + Select<Condition = V> + Broadcast + Reduce + Slice + UpdateSlice + Reshape
+        BooleanLike + BitAnd<Output = V> + Select<Condition = V> + Broadcast + Transpose + Reduce + Slice + UpdateSlice
+            + Reshape
     ),
 ))]
-pub enum ArrayOperation<V: Value<ArrayType>> {
+pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     ZeroLike(ZeroLikeOperation),
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
-    Constant(ConstantOperation<ArrayType, V>),
+    Constant(ConstantOperation<V>),
     // TODO(eaplatanios): Why is this limited to `f64`?
     Fill(FillOperation<ArrayType, f64>),
     Iota(IotaOperation<ArrayType>),
@@ -99,19 +100,19 @@ pub enum ArrayOperation<V: Value<ArrayType>> {
     #[ryft(batching(active))]
     AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
-    Condition(Box<ConditionOperation<ArrayType, V, Self>>),
-    While(Box<WhileOperation<ArrayType, V, Self>>),
-    Scan(Box<ScanOperation<ArrayType, V, Self>>),
-    CustomJvp(Box<CustomJvpOperation<ArrayType, V, Self>>),
-    CustomVjp(Box<CustomVjpOperation<ArrayType, V, Self>>),
-    CustomVjpTangent(Box<CustomVjpTangentOperation<ArrayType, V, Self>>),
-    Rematerialize(Box<RematerializeOperation<ArrayType, V, Self>>),
+    Condition(Box<ConditionOperation<V, Self>>),
+    While(Box<WhileOperation<V, Self>>),
+    Scan(Box<ScanOperation<V, Self>>),
+    CustomJvp(Box<CustomJvpOperation<V, Self>>),
+    CustomVjp(Box<CustomVjpOperation<V, Self>>),
+    CustomVjpTangent(Box<CustomVjpTangentOperation<V, Self>>),
+    Rematerialize(Box<RematerializeOperation<V, Self>>),
 }
 
 // TODO(eaplatanios): Should this be derived as part of one of our macros?
 impl<V> MaybeTag for ArrayOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
     fn key(&self) -> Option<&str> {
@@ -125,7 +126,7 @@ where
 // TODO(eaplatanios): Should this be derived as part of one of our macros?
 impl<V> MaybeDot for ArrayOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
@@ -137,12 +138,12 @@ where
 }
 
 // TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeWhile<ArrayType, V, ArrayOperation<V>> for ArrayOperation<V>
+impl<V> MaybeWhile<V, ArrayOperation<V>> for ArrayOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
-    fn as_while(&self) -> Option<WhileParts<'_, ArrayType, V, ArrayOperation<V>>> {
+    fn as_while(&self) -> Option<WhileParts<'_, V, ArrayOperation<V>>> {
         match self {
             Self::While(operation) => operation.as_while(),
             _ => None,
@@ -151,12 +152,12 @@ where
 }
 
 // TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeScan<ArrayType, V, ArrayOperation<V>> for ArrayOperation<V>
+impl<V> MaybeScan<V, ArrayOperation<V>> for ArrayOperation<V>
 where
-    V: Value<ArrayType>,
+    V: Value<Type = ArrayType>,
 {
     #[inline]
-    fn scan_body(&self) -> Option<&crate::programs::Program<ArrayType, V, ArrayOperation<V>, Vec<V>, Vec<V>>> {
+    fn scan_body(&self) -> Option<&crate::programs::Program<V, ArrayOperation<V>, Vec<V>, Vec<V>>> {
         match self {
             Self::Scan(operation) => Some(operation.body()),
             _ => None,

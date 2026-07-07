@@ -1,18 +1,18 @@
 use std::fmt::Display;
 
-use half::{bf16, f16};
-
-use crate::contexts::StagingContext;
+use crate::contexts::Context;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, InterpretableOperation, Operation};
+use crate::operations::{ElementwiseOperation, Operation};
+use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`StopGradientOperation`].
 pub const STOP_GRADIENT_OPERATION_NAME: &'static str = "stop_gradient";
 
-// TODO(eaplatanios): Link to [`Pushforward`].
+// TODO(eaplatanios): Review this module.
+
 /// [`Operation`] that returns its input unchanged while severing gradient flow/propagation. Interpretation,
 /// batching, and backend lowering all treat this operation as the identity function, but differentiation does not.
 /// The Jacobian-Vector Product (JVP) rule of this operation passes the primal through unchanged and replaces the
@@ -61,19 +61,22 @@ impl ElementwiseOperation for StopGradientOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T>> InterpretableOperation<T, V> for StopGradientOperation
+impl<V: Clone + Value, C> InterpretableOperation<V, C> for StopGradientOperation
 where
-    Self: Operation<T>,
+    Self: Operation<V::Type>,
 {
     #[inline]
-    fn interpret(
-        &self,
-        _context: &<V as Value<T>>::InterpretationContext,
-        inputs: &[V],
-    ) -> Result<Vec<V>, ProgramError> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context> PartiallyEvaluatableOperation<C> for StopGradientOperation where
+    C::Operation: From<StopGradientOperation>
+{
 }
 
 /// Value-level gradient stopping capability. [`StopGradient`] fills the same role for [`StopGradientOperation`]
@@ -83,25 +86,22 @@ pub trait StopGradient: Sized {
     fn stop_gradient(&self) -> Self;
 }
 
-macro_rules! impl_stop_gradient_for_scalar {
-    ($($ty:ty),* $(,)?) => {
-        $(
-            impl StopGradient for $ty {
-                #[inline]
-                fn stop_gradient(&self) -> Self {
-                    *self
-                }
-            }
-        )*
-    };
-}
-
-impl_stop_gradient_for_scalar!(bf16, f16, f32, f64);
-
-impl<C: StagingContext<Operation: From<StopGradientOperation>>> StopGradient for Tracer<C> {
+/// Any context-carrying value stops gradients by binding a [`StopGradientOperation`] through its own context: a
+/// staged tracer records the operation, while batching / JVP tracers apply their transform rules. The
+/// `From<StopGradientOperation>` bound makes this blanket disjoint from the concrete eager value types (whose context
+/// operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), which implement
+/// [`StopGradient`] directly.
+impl<V: Value> StopGradient for V
+where
+    V::DispatchDomain: Context,
+    <V::DispatchDomain as crate::Domain>::Operation: From<StopGradientOperation>,
+{
     #[inline]
     fn stop_gradient(&self) -> Self {
-        self.unary(StopGradientOperation)
+        self.dispatch_domain()
+            .bind(StopGradientOperation, &[self.clone()])
+            .expect("`stop_gradient` operation failed")
+            .remove(0)
     }
 }
 

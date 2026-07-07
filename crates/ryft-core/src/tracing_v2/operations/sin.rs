@@ -1,64 +1,72 @@
-use crate::contexts::StagingContext;
+use std::ops::Mul;
+
+use crate::contexts::Context;
+use crate::differentiation::TransposableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{Scalable, ScaleOperation};
-use crate::operations::constants::MaybeZeroOperation;
 use crate::operations::trigonometric::{Cos, Sin, SinOperation};
-use crate::payloads::Input;
-use crate::programs::ProgramError;
-use crate::tracing_v2::differentiation::{JvpTracer, TangentContext};
-use crate::tracing_v2::{DifferentiableOperation, DifferentiationContext, ValueOrCapture};
+use crate::partial::PartialValue;
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer};
 
-impl<C> DifferentiableOperation<C> for SinOperation
+impl<C: Context> DifferentiableOperation<C> for SinOperation
 where
-    C: DifferentiationContext,
+    C::Operation: Clone,
+    C::Value: Sin + Cos + Mul<Output = C::Value>,
     SinOperation: Operation<C::Type>,
-    C::Value: Sin + Cos,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>:
-        From<ScaleOperation<C::Type, ValueOrCapture<C::Type, C::Value>, Input>>,
-    C::LinearOperation<C::Tangent, ValueOrCapture<C::Type, C::Value>>: MaybeZeroOperation<C::Type>,
 {
-    #[inline]
-    fn jvp<'jvp>(
-        &self,
-        context: &mut TangentContext<'jvp, C>,
-        inputs: &[JvpTracer<'jvp, C>],
-    ) -> Result<Vec<JvpTracer<'jvp, C>>, ProgramError>
-    where
-        C: 'jvp,
-    {
+    fn jvp(&self, _context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
-        let tangent = if context.is_zero(input.tangent())? {
-            input.tangent().clone()
-        } else {
-            let factor = context.factor(input.primal().clone().cos());
-            input.tangent().scale(factor)?
+        let primal = input.primal().sin()?;
+        // d(sin x) = cos(x) * dx, staging a fresh `Cos` primal operation as the coefficient. A structural zero
+        // tangent stays symbolic.
+        let tangent = match input.tangent() {
+            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+            MaybeZero::Value(tangent) => MaybeZero::Value(input.primal().cos()? * tangent.clone()),
         };
-        Ok(vec![JvpTracer::new(input.primal().clone().sin(), tangent)])
+        Ok(vec![JvpTracer::new(primal, tangent)])
+    }
+}
+
+/// Transpose rule for [`SinOperation`]: the sine is nonlinear in its operand, so a tangent program never contains a
+/// primal `sin` on a linear operand (the chain-rule forward stages a bilinear `mul` by a fresh `cos` coefficient
+/// instead) and the rule reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for SinOperation
+where
+    SinOperation: Operation<V::Type>,
+{
+    fn transpose(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::contexts::EagerContext;
+    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
-    use crate::scalars::ScalarDomain;
+    use crate::scalars::Scalar;
+    use crate::tracing_v2::test_util::assert_scalar_close;
     use crate::tracing_v2::{DifferentiationContext, value_and_grad};
-
-    fn approx_eq(left: f64, right: f64) {
-        let delta = (left - right).abs();
-        assert!(delta <= 1e-9, "expected {left} ~= {right}; absolute error {delta} exceeded tolerance");
-    }
 
     #[test]
     fn test_sin_jvp_and_gradient_scale_by_cosine() {
-        let domain = ScalarDomain::<f64>::new();
-        let (primal, tangent) = domain.jvp(|x| x.sin(), 2.0f64, 3.0f64).unwrap();
-        approx_eq(primal, 2.0f64.sin());
-        approx_eq(tangent, 3.0 * 2.0f64.cos());
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (primal, tangent) = domain.jvp(|x| x.sin().unwrap(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
+        assert_scalar_close(primal, 2.0f64.sin());
+        assert_scalar_close(tangent, 3.0 * 2.0f64.cos());
 
-        let (value, gradient) = value_and_grad(&domain, |x| x.sin(), 2.0f64).unwrap();
-        approx_eq(value, 2.0f64.sin());
-        approx_eq(gradient, 2.0f64.cos());
+        let (value, gradient) = value_and_grad(&domain, |x| x.sin().unwrap(), Scalar::from(2.0)).unwrap();
+        assert_scalar_close(value, 2.0f64.sin());
+        assert_scalar_close(gradient, 2.0f64.cos());
     }
 }
