@@ -45,22 +45,22 @@ use crate::types::{Type, Typed};
 ///
 /// The generated implementation is:
 ///
-///   - `impl TransposableOperation<T, V, Enum> for Enum`, where `T` is selected using the same rules that are used
-///     for inferring `T` in the `#[derive(Operation)]` macro.
-///   - For enums with one `Value<T>` parameter and no recursive payloads (i.e., payloads that mention `Self`), that
-///     parameter is treated as the operation family's stored constant type and the generated implementation is
-///     generic over a separate transposition value type `V`. For enums with two or more `Value<T>` parameters, the
-///     first value parameter is treated as the tangent/cotangent value type and later value parameters are constants
-///     or captured factors. Enums with recursive payloads likewise pin the transposition value to the program constant
-///     type (i.e., no separate `V` is introduced). Recursive higher-order payload rules name the operation-family
-///     fixed point through [`TransposableProgramOperation`] and pin their transposition value to the program constant
-///     type, so the generated witness's [`Program::transpose_with_respect_to`] call is only provable at that
-///     instantiation.
+///   - `impl TransposableOperation<V, Enum> for Enum`, where the transposition value type `V` carries the primary
+///     type `T` selected using the same rules that are used for inferring `T` in the `#[derive(Operation)]` macro.
+///   - For enums with one `Value<Type = T>` parameter and no recursive payloads (i.e., payloads that mention `Self`),
+///     that parameter is treated as the operation family's stored constant type and the generated implementation is
+///     generic over a separate transposition value type `V`. For enums with two or more `Value<Type = T>` parameters,
+///     the first value parameter is treated as the tangent/cotangent value type and later value parameters are
+///     constants or captured factors. Enums with recursive payloads likewise pin the transposition value to the
+///     program constant type (i.e., no separate `V` is introduced). Recursive higher-order payload rules name the
+///     operation-family fixed point through [`TransposableProgramOperation`] and pin their transposition value to the
+///     program constant type, so the generated witness's [`Program::transpose_with_respect_to`] call is only provable
+///     at that instantiation.
 ///   - Concrete payload variants forward directly to their payload implementations and receive a generated
-///     `Payload: TransposableOperation<T, V, Enum>` `where` predicate. Payload-specific capability requirements should
+///     `Payload: TransposableOperation<V, Enum>` `where` predicate. Payload-specific capability requirements should
 ///     live on the payload's own [`TransposableOperation`] implementation; the enum derivation carries them through
 ///     this generated payload bound.
-///   - `impl TransposableProgramOperation<T, V> for Enum`, using the same value-type inference and all non-recursive
+///   - `impl TransposableProgramOperation<V> for Enum`, using the same value-type inference and all non-recursive
 ///     payload transposition bounds as the dispatcher implementation. The generated implementation is the standard
 ///     operation-family witness for nested linear programs: it calls [`Program::transpose_with_respect_to`] on the
 ///     provided program for [`transpose_program`](TransposableProgramOperation::transpose_program) (fully linear
@@ -71,11 +71,11 @@ use crate::types::{Type, Typed};
 ///     The implementation is additionally constrained by the [`Zero`](crate::Zero)/[`Add`](std::ops::Add) capabilities
 ///     that [`Program::transpose`] requires.
 ///   - Bare generic payload variants such as `Extension(Extension)` receive the same generated
-///     `Extension: TransposableOperation<T, V, Enum>` bound, because the macro cannot know which concrete extension
+///     `Extension: TransposableOperation<V, Enum>` bound, because the macro cannot know which concrete extension
 ///     type will be substituted by the caller.
 ///
 /// Recursive higher-order payloads that need to transpose captured linear programs should depend on
-/// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<T, V, Enum>` bound.
+/// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<V, Enum>` bound.
 /// When those recursive payload rules need value capabilities, express those requirements on the enum's generic
 /// parameters or on the payload implementations themselves, so the generated dispatcher and program-transposition
 /// witness inherit them through normal Rust bounds
@@ -92,12 +92,12 @@ use crate::types::{Type, Typed};
 /// # use ryft_macros::{Operation, TransposableOperation};
 ///
 /// #[derive(Clone, Debug, Operation, TransposableOperation)]
-/// enum LinearOperation<V: Value<ArrayType>> {
+/// enum LinearOperation<V: Value<Type = ArrayType>> {
 ///     Zero(ZeroOperation<ArrayType>),
-///     Constant(ConstantOperation<ArrayType, V>),
+///     Constant(ConstantOperation<V>),
 /// }
 /// ```
-pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operation<T> {
+pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type> {
     /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
     /// contain one entry per operation input. Each [`MaybeZero::Value`] entry is a staged cotangent contribution in
     /// the active [`TracingContext`], and each [`MaybeZero::Zero`] means that the corresponding input receives
@@ -118,10 +118,10 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
     ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation-output order.
     fn transpose(
         &self,
-        context: &mut TracingContext<T, V, O>,
-        inputs: &[PartialValue<T, Tracer<TracingContext<T, V, O>>>],
-        outputs: &[MaybeZero<T, Tracer<TracingContext<T, V, O>>>],
-    ) -> Result<Vec<MaybeZero<T, Tracer<TracingContext<T, V, O>>>>, ProgramError>;
+        context: &mut TracingContext<V, O>,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>;
 }
 
 // TODO(eaplatanios): Review from here onwards.
@@ -129,7 +129,7 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 /// Represents closed [`Operation`] families whose flat linear [`Program`]s can be transposed as nested programs.
 /// Higher-order transpose rules, such as the rules for linear condition branches and linear scan bodies, need to
 /// transpose captured programs whose operation family is the same closed enum that is currently being proven
-/// transposable. Writing that need directly as `O: TransposableOperation<T, V, O>` at every recursive payload boundary
+/// transposable. Writing that need directly as `O: TransposableOperation<V, O>` at every recursive payload boundary
 /// can send Rust's trait solver through the enum's higher-order variants indefinitely. [`TransposableProgramOperation`]
 /// names the recursive fixed point once: the closed operation enum implements this trait by calling
 /// [`Program::transpose_with_respect_to`], while higher-order payloads depend on this semantic witness instead of
@@ -139,7 +139,10 @@ pub trait TransposableOperation<T: Type, V: Value<T>, O: Operation<T>>: Operatio
 /// that delegate to [`Program::transpose_with_respect_to`] add that method's [`Zero`](crate::Zero)/
 /// [`Add`](std::ops::Add) bounds locally because those are requirements of the standard implementation strategy,
 /// not of this semantic witness itself.
-pub trait TransposableProgramOperation<T: DifferentiableType, V: Value<T>>: Operation<T> + Sized {
+pub trait TransposableProgramOperation<V: Value>: Operation<V::Type> + Sized
+where
+    V::Type: DifferentiableType,
+{
     /// Transposes the provided flat [`Program`] in this operation family with respect to the inputs flagged in
     /// `input_linearity`; refer to the documentation of [`Program::transpose_with_respect_to`] for the pullback's
     /// input and output layout. The operand-form higher-order transpose rules (condition branches and scan bodies
@@ -154,18 +157,18 @@ pub trait TransposableProgramOperation<T: DifferentiableType, V: Value<T>>: Oper
     ///   - `program`: Flat [`Program`] whose inputs and outputs are flattened vectors of values.
     ///   - `input_linearity`: Per-input linearity flags, in program-input order.
     fn transpose_program(
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
+        program: &Program<V, Self, Vec<V>, Vec<V>>,
         input_linearity: &[bool],
-    ) -> Result<Program<T, V, Self, Vec<V>, Vec<V>>, ProgramError>;
+    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
 }
 
 impl<
     T: DifferentiableType,
-    V: Value<T>,
-    O: TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    V: Value<Type = T>,
+    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-> Program<T, V, O, Input, Output>
+> Program<V, O, Input, Output>
 {
     /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback. This is the main entrypoint for
     /// transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on
@@ -187,8 +190,8 @@ impl<
     /// rule receives an all-`true` operand-linearity slice, and the pullback's inputs and outputs preserve this
     /// program's output and input structures respectively.
     #[inline]
-    pub fn transpose(&self) -> Result<Program<T, V, O, Output, Input>, ProgramError> {
-        let flat = TracingContext::<T, V, O>::new().transpose(self, &vec![true; self.input_ids().len()])?;
+    pub fn transpose(&self) -> Result<Program<V, O, Output, Input>, ProgramError> {
+        let flat = TracingContext::<V, O>::new().transpose(self, &vec![true; self.input_ids().len()])?;
         // Every input is linear, so the pullback has one cotangent input per primal output and one cotangent output per
         // primal input. Recover the structured form by reattaching this program's output and input structures to the
         // flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
@@ -236,7 +239,7 @@ impl<
     pub fn transpose_with_respect_to(
         &self,
         input_indices: &[usize],
-    ) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, ProgramError> {
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
         // Scatter the selected indices into the per-input linearity mask that seeds the forward propagation,
         // rejecting out-of-range and duplicate indices up front.
         let input_count = self.input_ids().len();
@@ -256,7 +259,7 @@ impl<
             }
             input_linearity[index] = true;
         }
-        let mut pullback = TracingContext::<T, V, O>::new().transpose(self, input_linearity.as_slice())?;
+        let mut pullback = TracingContext::<V, O>::new().transpose(self, input_linearity.as_slice())?;
 
         // The reverse walk emits one cotangent output per selected input in program-input order; permute them so the
         // pullback's outputs follow the order of `input_indices` instead. The walk position of index `i` is the
@@ -271,7 +274,7 @@ impl<
     }
 }
 
-impl<T: Type + DifferentiableType, V: Value<T>, O: Operation<T>, Capture> TracingContext<T, V, O, Capture> {
+impl<T: Type + DifferentiableType, V: Value<Type = T>, O: Operation<T>, Capture> TracingContext<V, O, Capture> {
     /// Transposes the provided traced linear [`Program`] whose values are [`Tracer`]s belonging to this outer
     /// [`TracingContext`]. This uses the same reverse-walk implementation as [`Program::transpose`] in a fresh
     /// [`TracingContext`].
@@ -294,12 +297,12 @@ impl<T: Type + DifferentiableType, V: Value<T>, O: Operation<T>, Capture> Tracin
     pub fn transpose_traced<
         Input: Parameterized<Tracer<Self>>,
         Output: Parameterized<Tracer<Self>>,
-        LinearOperation: TransposableOperation<T, Tracer<Self>, LinearOperation> + From<ZeroOperation<T>> + From<AddOperation>,
+        LinearOperation: TransposableOperation<Tracer<Self>, LinearOperation> + From<ZeroOperation<T>> + From<AddOperation>,
     >(
         &self,
-        program: &Program<T, Tracer<Self>, LinearOperation, Input, Output>,
-    ) -> Result<Program<T, Tracer<Self>, LinearOperation, Output, Input>, ProgramError> {
-        let flat = TracingContext::<T, Tracer<Self>, LinearOperation>::new()
+        program: &Program<Tracer<Self>, LinearOperation, Input, Output>,
+    ) -> Result<Program<Tracer<Self>, LinearOperation, Output, Input>, ProgramError> {
+        let flat = TracingContext::<Tracer<Self>, LinearOperation>::new()
             .transpose(program, &vec![true; program.input_ids().len()])?;
         // Every input is linear, so the flat pullback has one cotangent input per primal output and one cotangent
         // output per primal input. Recover the structured form by reattaching this program's output and input
@@ -318,9 +321,9 @@ impl<T: Type + DifferentiableType, V: Value<T>, O: Operation<T>, Capture> Tracin
 
 impl<
     T: Type + DifferentiableType,
-    V: Value<T>,
-    O: TransposableOperation<T, V, O> + From<ZeroOperation<T>> + From<AddOperation>,
-> TracingContext<T, V, O>
+    V: Value<Type = T>,
+    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+> TracingContext<V, O>
 {
     /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
     /// builder-level implementation behind [`Program::transpose`]. Refer to the documentation of [`Program::transpose`]
@@ -362,9 +365,9 @@ impl<
     #[inline]
     pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
         mut self,
-        program: &Program<T, V, O, Input, Output>,
+        program: &Program<V, O, Input, Output>,
         input_linearity: &[bool],
-    ) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, ProgramError> {
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
         /// Accumulates one staged cotangent contribution for `atom` into the reverse-pass adjoint table. The first
         /// contribution is stored directly, while later contributions are summed by staging an add instruction in the
         /// transpose builder.
@@ -375,8 +378,8 @@ impl<
         ///   - `adjoints`: Per-primal-atom table storing the currently accumulated cotangent atom, if any.
         ///   - `atom`: Primal atom whose cotangent is being accumulated.
         ///   - `contribution`: Staged cotangent atom to add into `atom`'s adjoint slot.
-        fn accumulate<T: Type, V: Value<T>, O: Operation<T> + From<AddOperation>>(
-            builder: &Rc<RefCell<ProgramBuilder<T, V, O>>>,
+        fn accumulate<V: Value, O: Operation<V::Type> + From<AddOperation>>(
+            builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             adjoints: &mut [Option<AtomId>],
             atom: AtomId,
             contribution: AtomId,
@@ -460,7 +463,7 @@ impl<
             let output_type = output_atom.r#type();
             let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.into_owned());
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
-            accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
+            accumulate::<V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
         }
 
         // Add a pullback input carrying the runtime value of each known program input, after the cotangent inputs so
@@ -578,7 +581,7 @@ impl<
                 if let Some(contribution) = contribution.as_value() {
                     // Staged contributions must belong to this builder before their atom IDs can be accumulated.
                     check_builders!(&builder, contribution.builder())?;
-                    accumulate::<T, V, O>(&builder, adjoints.as_mut_slice(), input, contribution.atom_id()?)?;
+                    accumulate::<V, O>(&builder, adjoints.as_mut_slice(), input, contribution.atom_id()?)?;
                 }
             }
         }
@@ -756,14 +759,13 @@ mod tests {
         }
     }
 
-    impl<V: Value<DataType>> TransposableOperation<DataType, V, TestLinearOperation> for TestLinearOperation {
+    impl<V: Value<Type = DataType>> TransposableOperation<V, TestLinearOperation> for TestLinearOperation {
         fn transpose(
             &self,
-            context: &mut TracingContext<DataType, V, TestLinearOperation>,
-            _inputs: &[PartialValue<DataType, Tracer<TracingContext<DataType, V, TestLinearOperation>>>],
-            outputs: &[MaybeZero<DataType, Tracer<TracingContext<DataType, V, TestLinearOperation>>>],
-        ) -> Result<Vec<MaybeZero<DataType, Tracer<TracingContext<DataType, V, TestLinearOperation>>>>, ProgramError>
-        {
+            context: &mut TracingContext<V, TestLinearOperation>,
+            _inputs: &[PartialValue<Tracer<TracingContext<V, TestLinearOperation>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>],
+        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>>, ProgramError> {
             match self {
                 Self::Identity => {
                     check_count!("output", outputs, 1, ProgramError);
@@ -795,7 +797,7 @@ mod tests {
                 }
                 Self::ForeignContribution => {
                     check_count!("output", outputs, 1, ProgramError);
-                    let foreign_context = TracingContext::<DataType, V, TestLinearOperation>::new();
+                    let foreign_context = TracingContext::<V, TestLinearOperation>::new();
                     Ok(vec![MaybeZero::Value(foreign_context.input(DataType::F64))])
                 }
                 Self::Zero(_) => {
@@ -808,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_identity() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::Identity, vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
@@ -828,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_accumulates_contributions_to_repeated_input() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::Add, vec![input, input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
@@ -852,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_passes_zero_for_unused_instruction_output() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let outputs = builder.add_instruction(TestLinearOperation::TwoOutputs, vec![input]).unwrap().to_vec();
         let program = builder.build::<Scalar, Scalar>(vec![outputs[0]], Placeholder, Placeholder).unwrap();
@@ -873,7 +875,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_rejects_invalid_rule_input_cotangent_count() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::BadArity, vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
@@ -882,7 +884,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_rejects_foreign_builder_contribution() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::ForeignContribution, vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
@@ -891,7 +893,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_rejects_invalid_input_indices() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::Add, vec![left, right]).unwrap()[0];
@@ -912,7 +914,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_orders_outputs_by_the_requested_indices() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::Add, vec![left, right]).unwrap()[0];
@@ -936,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_materializes_disconnected_input_zero() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         builder.add_input(DataType::F64);
         let program = builder.build::<Scalar, ()>(Vec::new(), Placeholder, ()).unwrap();
         let transposed = program.transpose().unwrap();
@@ -962,7 +964,7 @@ mod tests {
 
     #[test]
     fn test_program_transpose_skips_dead_instruction() {
-        let mut builder = ProgramBuilder::<DataType, Scalar, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let dead_input = builder.add_input(DataType::F64);
         let live_input = builder.add_input(DataType::F64);
         let dead_output = builder.add_instruction(TestLinearOperation::BadArity, vec![dead_input]).unwrap()[0];
@@ -995,7 +997,7 @@ mod tests {
     #[test]
     fn test_program_transpose_reports_unbound_input_atom() {
         let input = AtomId::new(0);
-        let program = Program::<DataType, Scalar, TestLinearOperation, Scalar, ()> {
+        let program = Program::<Scalar, TestLinearOperation, Scalar, ()> {
             atoms: Vec::new(),
             input_ids: vec![input],
             output_ids: Vec::new(),
@@ -1011,7 +1013,7 @@ mod tests {
     fn test_program_transpose_reports_unbound_instruction_output_atom() {
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
-        let program = Program::<DataType, Scalar, TestLinearOperation, Scalar, Scalar> {
+        let program = Program::<Scalar, TestLinearOperation, Scalar, Scalar> {
             atoms: vec![Atom::Variable(DataType::F64)],
             input_ids: vec![input],
             output_ids: vec![input],
@@ -1030,7 +1032,7 @@ mod tests {
     fn test_tracing_context_transpose_materializes_disconnected_input_zero_as_zero_instruction() {
         let tracing_context = DomainTracingContext::<ScalarDomain>::new();
         let outer_builder = tracing_context.builder().clone();
-        let mut builder = ProgramBuilder::<DataType, TestTracingValue, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
         let connected_input = builder.add_input(DataType::F64);
         let disconnected_input = builder.add_input(DataType::F64);
         let program = builder
@@ -1074,7 +1076,7 @@ mod tests {
     fn test_tracing_context_transpose_materializes_staged_zero_contribution_as_zero_instruction() {
         let tracing_context = DomainTracingContext::<ScalarDomain>::new();
         let outer_builder = tracing_context.builder().clone();
-        let mut builder = ProgramBuilder::<DataType, TestTracingValue, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
         let program =

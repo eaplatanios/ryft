@@ -31,6 +31,7 @@ pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
 pub use batching::{
     ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableProgramOperation,
     BatchingContext, BatchingError, BatchingTracer, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
+    batch,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;

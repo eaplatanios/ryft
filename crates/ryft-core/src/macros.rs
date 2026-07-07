@@ -111,8 +111,6 @@ macro_rules! check_builders {
     }};
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Implements a foreign `std::ops` operator trait as panicking sugar for the three core transform tracer types
 /// (i.e., [`Tracer`](crate::Tracer), [`BatchingTracer`](crate::BatchingTracer), and [`JvpTracer`](crate::JvpTracer))
 /// by binding the operation through each tracer's own context. The operator traits (i.e., `std::ops::Add`,
@@ -126,16 +124,19 @@ macro_rules! check_builders {
 /// fails. Binding directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal
 /// (e.g., no `Type = ArrayType` pin is needed on the batching arm).
 ///
-/// The `unary` arm produces `fn(self) -> Self` operators and the `binary` arm produces `fn(self, Self) -> Self`
-/// operators. The `$operation` path is a unit-struct operation used both as the `From` bound target and as the bound
-/// value, and `$message` is the panic message used when an eager tracer's bind fails.
+/// # Parameters
+///
+///   - `@unary` / `@binary`: Selects the operator shape to stamp out. `@unary` produces `fn(self) -> Self` operators
+///     and `@binary` produces `fn(self, Self) -> Self` operators.
+///   - `$trait`: Path to the foreign `std::ops` operator trait to implement (e.g., `std::ops::Add`).
+///   - `$method`: Identifier of the operator trait method to define (e.g., `add`).
+///   - `$operation`: Path to the unit-struct operation, used both as the `From` bound target and as the value bound
+///     through each tracer's context (e.g., `AddOperation`).
+///   - `$message`: Panic message used when an eager tracer's bind fails.
 #[macro_export]
 macro_rules! implement_tracer_operator {
-    (unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
-        impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
-        where
-            C::Operation: ::std::convert::From<$operation>,
-        {
+    (@unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+        impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
 
             #[inline]
@@ -146,8 +147,8 @@ macro_rules! implement_tracer_operator {
 
         impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
         where
-            $crate::BatchingContext<C>: $crate::Context<Value = $crate::BatchingTracer<C>>,
-            <$crate::BatchingContext<C> as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            $crate::BatchingContext<C>:
+                $crate::Context<Value = $crate::BatchingTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -157,11 +158,11 @@ macro_rules! implement_tracer_operator {
             }
         }
 
+        // TODO(eaplatanios): Clean this up once we clean up the differentiation module.
         impl<C: $crate::Context> $trait for $crate::JvpTracer<C>
         where
-            $crate::tracing_v2::differentiation::JvpContext<C>: $crate::Context<Value = $crate::JvpTracer<C>>,
-            <$crate::tracing_v2::differentiation::JvpContext<C> as $crate::Domain>::Operation:
-                ::std::convert::From<$operation>,
+            $crate::tracing_v2::differentiation::JvpContext<C>:
+                $crate::Context<Value = $crate::JvpTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -171,11 +172,8 @@ macro_rules! implement_tracer_operator {
             }
         }
     };
-    (binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
-        impl<C: $crate::StagingContext> $trait for $crate::Tracer<C>
-        where
-            C::Operation: ::std::convert::From<$operation>,
-        {
+    (@binary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
+        impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
 
             #[inline]
@@ -186,8 +184,8 @@ macro_rules! implement_tracer_operator {
 
         impl<C: $crate::Context<Type = $crate::ArrayType>> $trait for $crate::BatchingTracer<C>
         where
-            $crate::BatchingContext<C>: $crate::Context<Value = $crate::BatchingTracer<C>>,
-            <$crate::BatchingContext<C> as $crate::Domain>::Operation: ::std::convert::From<$operation>,
+            $crate::BatchingContext<C>:
+                $crate::Context<Value = $crate::BatchingTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -197,11 +195,11 @@ macro_rules! implement_tracer_operator {
             }
         }
 
+        // TODO(eaplatanios): Clean this up once we clean up the differentiation module.
         impl<C: $crate::Context> $trait for $crate::JvpTracer<C>
         where
-            $crate::tracing_v2::differentiation::JvpContext<C>: $crate::Context<Value = $crate::JvpTracer<C>>,
-            <$crate::tracing_v2::differentiation::JvpContext<C> as $crate::Domain>::Operation:
-                ::std::convert::From<$operation>,
+            $crate::tracing_v2::differentiation::JvpContext<C>:
+                $crate::Context<Value = $crate::JvpTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 

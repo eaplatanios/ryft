@@ -431,12 +431,12 @@ pub(crate) fn normalize_op_name(name: &str) -> String {
 ///   - `nested_regions_for_op`: Callback that returns the immediate nested regions carried by one
 ///     staged op.
 pub fn summarize_program<T, V, Input, Output, O, F>(
-    program: &Program<T, V, O, Input, Output>,
+    program: &Program<V, O, Input, Output>,
     nested_regions_for_op: F,
 ) -> Result<IrBenchmarkSummary, BenchmarkError>
 where
     T: Type,
-    V: Value<T>,
+    V: Value<Type = T>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
     O: Operation<T>,
@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
         let domain = ScalarDomain::new();
-        let (_, compiled): (Scalar, Program<DataType, Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) = domain
+        let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) = domain
             .interpret_and_trace(
                 |x| {
                     let with_constant = x.clone() + x.context().constant(Scalar::from(1.0));

@@ -28,12 +28,12 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
 ///   - `program`: Program to summarize.
 fn summarize_tracing_program<
     T: Type,
-    V: Value<T>,
+    V: Value<Type = T>,
     Input: crate::parameters::Parameterized<V>,
     Output: crate::parameters::Parameterized<V>,
     O: Clone + crate::operations::Operation<T>,
 >(
-    program: &Program<T, V, O, Input, Output>,
+    program: &Program<V, O, Input, Output>,
 ) -> Result<IrBenchmarkSummary, BenchmarkError> {
     summarize_program(program, |_| Ok(Vec::new()))
 }
@@ -47,7 +47,7 @@ fn summarize_tracing_program<
 ///   - `program`: Program to render and summarize.
 fn tracing_record<
     T: Type,
-    V: Value<T>
+    V: Value<Type = T>
         + Sin
         + Cos
         + Add<Output = V>
@@ -61,7 +61,7 @@ fn tracing_record<
 >(
     case_id: &'static str,
     surface: &'static str,
-    program: &Program<T, V, O, Input, Output>,
+    program: &Program<V, O, Input, Output>,
 ) -> Result<IrBenchmarkRecord, BenchmarkError> {
     Ok(record(case_id, tracing_category(case_id), surface, program.to_string(), summarize_tracing_program(program)?))
 }
@@ -86,7 +86,7 @@ fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T> + Neg<Out
 
 /// Emits the plain JIT scalar bilinear benchmark.
 fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Scalar, Program<DataType, Scalar, ScalarOperation<Scalar>, (Scalar, Scalar), Scalar>) =
+    let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, (Scalar, Scalar), Scalar>) =
         ScalarDomain::new().interpret_and_trace(
             |inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?),
             (Scalar::from(2.0), Scalar::from(3.0)),
@@ -96,7 +96,7 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pullback): (Scalar, Program<DataType, Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>) =
+    let (_, pullback): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>) =
         ScalarDomain::new()
             .vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?), (Scalar::from(2.0), Scalar::from(3.0)))?;
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
@@ -104,8 +104,8 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, Ben
 
 /// Emits the staged scalar reverse-mode gradient benchmark.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (Scalar, Program<DataType, Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) =
-        ScalarDomain::new().interpret_and_trace(
+    let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) = ScalarDomain::new()
+        .interpret_and_trace(
             |x| {
                 let context = x.context().clone();
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
@@ -124,22 +124,20 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
 
 /// Emits the staged scalar value-and-gradient benchmark.
 fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, compiled): (
-        (Scalar, Scalar),
-        Program<DataType, Scalar, ScalarOperation<Scalar>, Scalar, (Scalar, Scalar)>,
-    ) = ScalarDomain::new().interpret_and_trace(
-        |x| {
-            let context = x.context().clone();
-            // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
-            // differentiation error into a program error. A non-scalar gradient output cannot occur for this
-            // scalar benchmark function.
-            let value_and_gradient = context.value_and_grad(quartic_plus_sin, x).map_err(|error| match error {
-                DifferentiationError::Program(error) => error,
-                error => ProgramError::MalformedProgram(error.to_string()),
-            })?;
-            Ok(value_and_gradient)
-        },
-        Scalar::from(2.0),
-    )?;
+    let (_, compiled): ((Scalar, Scalar), Program<Scalar, ScalarOperation<Scalar>, Scalar, (Scalar, Scalar)>) =
+        ScalarDomain::new().interpret_and_trace(
+            |x| {
+                let context = x.context().clone();
+                // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
+                // differentiation error into a program error. A non-scalar gradient output cannot occur for this
+                // scalar benchmark function.
+                let value_and_gradient = context.value_and_grad(quartic_plus_sin, x).map_err(|error| match error {
+                    DifferentiationError::Program(error) => error,
+                    error => ProgramError::MalformedProgram(error.to_string()),
+                })?;
+                Ok(value_and_gradient)
+            },
+            Scalar::from(2.0),
+        )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_grad", &compiled)?])
 }

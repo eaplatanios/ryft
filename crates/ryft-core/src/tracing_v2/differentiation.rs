@@ -74,7 +74,7 @@ pub enum DifferentiationError {
 /// [`Domain::Value`] (concrete vs [`Tracer`]), not by a separate trait.
 pub trait DifferentiationContext: Context {
     /// Tangent value type staged in the active linear program.
-    type Tangent: Value<Self::Type>;
+    type Tangent: Value<Type = Self::Type>;
 
     /// Validates that `primal` may be used as a primal input to an automatic-differentiation entry point in this
     /// context. Eager contexts accept any concrete value and use the default no-op. Staging contexts override this
@@ -123,7 +123,6 @@ pub trait DifferentiationContext: Context {
     ) -> Result<
         (
             Program<
-                <Self as Domain>::Type,
                 <Self as Domain>::Constant,
                 <Self as Domain>::Operation,
                 Vec<<Self as Domain>::Constant>,
@@ -210,11 +209,9 @@ pub trait DifferentiationContext: Context {
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Constant: Clone,
         <Self as Domain>::Operation: Clone
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
-            + DifferentiableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            >,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> TracedOutput,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -296,12 +293,11 @@ pub trait DifferentiationContext: Context {
         tangents: Input::To<Self::Tangent>,
     ) -> Result<(TracedOutput::To<<Self as Domain>::Value>, TracedOutput::To<Self::Tangent>), ProgramError>
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>
-            + Zero<<Self as Domain>::Type, <Self as Domain>::Value>,
+        Self: DifferentiationContext<Tangent = <Self as Domain>::Value> + Zero<<Self as Domain>::Value>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Constant: Clone,
         <Self as Domain>::Operation: Clone
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + DifferentiableOperation<Self>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> TracedOutput,
@@ -348,7 +344,7 @@ pub trait DifferentiationContext: Context {
         let mut primal_outputs = Vec::with_capacity(output_duals.len());
         let mut tangent_outputs = Vec::with_capacity(output_duals.len());
         for dual in output_duals {
-            let JvpTracer { primal, tangent } = dual;
+            let JvpTracer { primal, tangent, .. } = dual;
             tangent_outputs.push(materialize(self, tangent)?);
             primal_outputs.push(primal);
         }
@@ -357,6 +353,82 @@ pub trait DifferentiationContext: Context {
         let tangent_output = TracedOutput::To::<Self::Tangent>::from_parameters(output_structure, tangent_outputs)?;
 
         Ok((output, tangent_output))
+    }
+
+    /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the
+    /// closure **directly on [`JvpTracer`] duals**, without tracing a primal [`Program`] first.
+    ///
+    /// This is the concrete-in-closure sibling of [`jvp_interleaved`](Self::jvp_interleaved): rather than trace the
+    /// closure into a primal program and then walk it with duals, it wraps each input as a dual over a [`JvpContext`]
+    /// and calls `function` on those duals. Each operation the closure performs (`x.sin()`, `x * y`, …) dispatches
+    /// through the dual's stamped context via [`Context::bind`], applying the operation's
+    /// [`jvp`](DifferentiableOperation::jvp) rule. Over an **eager** inner context both components are concrete, so the
+    /// closure sees real primal values — it can branch on them (`if x.boolean()? { … }`), print them, or otherwise use
+    /// Rust control flow driven by the primal, exactly like
+    /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) over its eager interpreter. Over a
+    /// staging inner context the same closure stages the primal and tangent operations into the enclosing trace, and
+    /// branching on a primal errors because it is a [`Tracer`] with no concrete payload.
+    ///
+    /// Structural zero tangents stay symbolic between operations and are materialized through this context's [`Zero`]
+    /// capability only at the output boundary.
+    fn jvp_direct<F, Input, Output>(
+        &self,
+        function: F,
+        primals: Input,
+        tangents: Input::To<Self::Tangent>,
+    ) -> Result<(Output::To<<Self as Domain>::Value>, Output::To<Self::Tangent>), ProgramError>
+    where
+        Self: DifferentiationContext<Tangent = <Self as Domain>::Value> + Zero<<Self as Domain>::Value>,
+        JvpContext<Self>: Context<Value = JvpTracer<Self>>,
+        <Self as Domain>::Operation: Clone + DifferentiableOperation<Self>,
+        F: FnOnce(Input::To<JvpTracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<
+                <Self as Domain>::Value,
+                Family: ParameterizedFamily<JvpTracer<Self>> + ParameterizedFamily<Self::Tangent>,
+                ParameterStructure: Debug + PartialEq,
+            >,
+        Output: Parameterized<
+                JvpTracer<Self>,
+                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
+            >,
+    {
+        let primal_structure = primals.parameter_structure();
+        let tangent_structure = tangents.parameter_structure();
+        // `Tangent` equals `Value`, so each dual pairs an ordinary domain value on both sides.
+        if tangent_structure != primal_structure {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!("{primal_structure:?}"),
+                right_structure: format!("{tangent_structure:?}"),
+            }
+            .into());
+        }
+
+        // Wrap each (primal, tangent) as a dual stamped with the forward-mode context so the closure's value sugar
+        // dispatches through it, then run the closure directly on those duals.
+        let context = JvpContext::new(self.clone());
+        let input_duals = primals
+            .into_parameters()
+            .zip(tangents.into_parameters())
+            .map(|(primal, tangent)| JvpTracer::new(primal, tangent).with_context(context.clone()))
+            .collect::<Vec<_>>();
+        let input = Input::To::<JvpTracer<Self>>::from_parameters(primal_structure, input_duals)?;
+        let output = function(input)?;
+
+        // Split each output dual into its primal value and its materialized tangent.
+        let output_structure = output.parameter_structure();
+        let output_duals = output.into_parameters().collect::<Vec<_>>();
+        let mut primal_outputs = Vec::with_capacity(output_duals.len());
+        let mut tangent_outputs = Vec::with_capacity(output_duals.len());
+        for dual in output_duals {
+            let JvpTracer { primal, tangent, .. } = dual;
+            tangent_outputs.push(materialize(self, tangent)?);
+            primal_outputs.push(primal);
+        }
+        let primal_output =
+            Output::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
+        let tangent_output = Output::To::<Self::Tangent>::from_parameters(output_structure, tangent_outputs)?;
+
+        Ok((primal_output, tangent_output))
     }
 
     /// Linearizes `function` at `primals`, returning the primal output and a reusable
@@ -388,11 +460,9 @@ pub trait DifferentiationContext: Context {
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Operation: Clone
             + PartiallyEvaluatableOperation<Self>
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
-            + DifferentiableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            >,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> TracedOutput,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -488,7 +558,6 @@ pub trait DifferentiationContext: Context {
         (
             TracedOutput::To<<Self as Domain>::Value>,
             Program<
-                <Self as Domain>::Type,
                 <Self as Domain>::Value,
                 <Self as Domain>::Operation,
                 Vec<<Self as Domain>::Value>,
@@ -501,18 +570,15 @@ pub trait DifferentiationContext: Context {
     where
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Type: DifferentiableType,
-        <Self as Domain>::Constant: Value<<Self as Domain>::Type>,
+        <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Operation: Clone
-            + TransposableOperation<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>
-            + DifferentiableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            > + PartiallyEvaluatableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            >,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
+            + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -614,18 +680,15 @@ pub trait DifferentiationContext: Context {
     where
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Type: DifferentiableType,
-        <Self as Domain>::Constant: Value<<Self as Domain>::Type>,
+        <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Operation: Clone
-            + TransposableOperation<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<AddOperation>
-            + DifferentiableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            > + PartiallyEvaluatableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            >,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
+            + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -654,20 +717,17 @@ pub trait DifferentiationContext: Context {
     where
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Value: BooleanLike,
-        <Self as Domain>::Constant: Value<<Self as Domain>::Type>,
+        <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Type: DifferentiableType,
         <Self as Domain>::Operation: Clone
-            + InterpretableOperation<<Self as Domain>::Type, <Self as Domain>::Value, Self>
-            + TransposableOperation<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + InterpretableOperation<<Self as Domain>::Value, Self>
+            + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<OneOperation<<Self as Domain>::Type>>
             + From<AddOperation>
-            + DifferentiableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            > + PartiallyEvaluatableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            >,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
+            + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> Tracer<NestedTracingContext<Self>>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -713,20 +773,17 @@ pub trait DifferentiationContext: Context {
     where
         Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Value: BooleanLike,
-        <Self as Domain>::Constant: Value<<Self as Domain>::Type>,
+        <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Type: DifferentiableType,
         <Self as Domain>::Operation: Clone
-            + InterpretableOperation<<Self as Domain>::Type, <Self as Domain>::Value, Self>
-            + TransposableOperation<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
-            + MaybeWhile<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>
+            + InterpretableOperation<<Self as Domain>::Value, Self>
+            + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
+            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + From<OneOperation<<Self as Domain>::Type>>
             + From<AddOperation>
-            + DifferentiableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            > + PartiallyEvaluatableOperation<
-                TracingContext<<Self as Domain>::Type, <Self as Domain>::Constant, <Self as Domain>::Operation>,
-            >,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
+            + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> Tracer<NestedTracingContext<Self>>,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -739,8 +796,8 @@ pub trait DifferentiationContext: Context {
     }
 }
 
-impl<T: Type, V: Value<T>, O: Operation<T>, Capture> DifferentiationContext for TracingContext<T, V, O, Capture> {
-    type Tangent = Tracer<TracingContext<T, V, O, Capture>>;
+impl<V: Value, O: Operation<V::Type>, Capture> DifferentiationContext for TracingContext<V, O, Capture> {
+    type Tangent = Tracer<TracingContext<V, O, Capture>>;
 
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
@@ -776,7 +833,14 @@ pub struct JvpTracer<C: Context> {
 
     /// Tangent of this dual: a tangent value staged in the staging context `C`, or a structural
     /// [`MaybeZero::Zero`] carrying only the tangent's [`Type`](crate::Type).
-    tangent: MaybeZero<C::Type, C::Value>,
+    tangent: MaybeZero<C::Value>,
+
+    /// [`JvpContext`] this dual flows through, stamped by [`JvpContext::bind`] and [`JvpContext::lift`] so that the
+    /// value-capability sugar (`x + y`, `x.sin()`, …) can dispatch each operation through the forward-mode rule. It is
+    /// `None` only for duals a [`jvp`](DifferentiableOperation::jvp) rule constructs internally (via [`JvpTracer::new`])
+    /// before `bind` stamps the context onto the values it hands back to the user closure; rule bodies never call the
+    /// sugar on those intermediates, so the stamp is always present by the time a dual reaches the closure.
+    context: Option<JvpContext<C>>,
 }
 
 impl<C: Context> JvpTracer<C> {
@@ -786,8 +850,8 @@ impl<C: Context> JvpTracer<C> {
     /// Public so backend crates can author [`DifferentiableOperation`] rules for their own operations, pairing
     /// each staged primal output with its tangent output.
     #[inline]
-    pub fn new<Tangent: Into<MaybeZero<C::Type, C::Value>>>(primal: C::Value, tangent: Tangent) -> Self {
-        Self { primal, tangent: tangent.into() }
+    pub fn new<Tangent: Into<MaybeZero<C::Value>>>(primal: C::Value, tangent: Tangent) -> Self {
+        Self { primal, tangent: tangent.into(), context: None }
     }
 
     /// Creates a dual from its primal staged value and a structural zero tangent typed with the primal's own
@@ -795,7 +859,7 @@ impl<C: Context> JvpTracer<C> {
     #[inline]
     pub fn with_zero_tangent(primal: C::Value) -> Self {
         let tangent = MaybeZero::Zero(primal.r#type().into_owned());
-        Self { primal, tangent }
+        Self { primal, tangent, context: None }
     }
 
     /// Returns the primal staged value of this dual.
@@ -806,15 +870,33 @@ impl<C: Context> JvpTracer<C> {
 
     /// Returns the symbolic tangent of this dual.
     #[inline]
-    pub fn tangent(&self) -> &MaybeZero<C::Type, C::Value> {
+    pub fn tangent(&self) -> &MaybeZero<C::Value> {
         &self.tangent
+    }
+
+    /// Returns the [`JvpContext`] this dual flows through, stamped by [`JvpContext::bind`]/[`JvpContext::lift`]. The
+    /// value-capability sugar dispatches operations through it. This is only ever called on closure-facing duals, which
+    /// are always stamped (see the [`context`](Self::context) field documentation).
+    #[inline]
+    pub(crate) fn context(&self) -> &JvpContext<C> {
+        self.context
+            .as_ref()
+            .expect("a `JvpTracer` reached value-capability sugar without a stamped `JvpContext`")
+    }
+
+    /// Returns this dual with `context` stamped as its flowing [`JvpContext`]. [`JvpContext::bind`] and
+    /// [`JvpContext::lift`] use this to stamp the values they hand back to the user closure.
+    #[inline]
+    fn with_context(mut self, context: JvpContext<C>) -> Self {
+        self.context = Some(context);
+        self
     }
 }
 
 impl<C: Context> Clone for JvpTracer<C> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { primal: self.primal.clone(), tangent: self.tangent.clone() }
+        Self { primal: self.primal.clone(), tangent: self.tangent.clone(), context: self.context.clone() }
     }
 }
 
@@ -838,7 +920,9 @@ impl<C: Context> std::fmt::Display for JvpTracer<C> {
     }
 }
 
-impl<C: Context> Typed<C::Type> for JvpTracer<C> {
+impl<C: Context> Typed for JvpTracer<C> {
+    type Type = C::Type;
+
     #[inline]
     fn r#type(&self) -> std::borrow::Cow<'_, C::Type> {
         self.primal.r#type()
@@ -847,8 +931,43 @@ impl<C: Context> Typed<C::Type> for JvpTracer<C> {
 
 impl<C: Context> Parameter for JvpTracer<C> {}
 
-impl<C: Context> Value<C::Type> for JvpTracer<C> {}
+/// A JVP dual flows through the [`JvpContext`] stamped on it.
+impl<C: Context> Value for JvpTracer<C> {
+    type Domain = JvpContext<C>;
 
+    #[inline]
+    fn domain(&self) -> JvpContext<C> {
+        self.context().clone()
+    }
+}
+
+// The elementwise/arithmetic/trigonometric and other operation-specific capability implementations for `JvpTracer`
+// are hand-written in each operation's own module (bind-forwarding through the stamped `JvpContext`). The
+// capabilities whose signatures do not fit that shape are implemented by hand below.
+
+/// A dual's Boolean view uses its primal's: [`as_boolean`](BooleanLike::as_boolean) reinterprets the primal with a
+/// structural zero tangent, and [`boolean`](BooleanLike::boolean) decodes the primal — so branching on a dual in a
+/// closure succeeds exactly when the primal is a concrete (eager) value and errors when it is a staged tracer.
+impl<C: Context> BooleanLike for JvpTracer<C>
+where
+    C::Value: BooleanLike,
+{
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        let primal = self.primal.as_boolean();
+        let tangent = MaybeZero::Zero(primal.r#type().into_owned());
+        Self { primal, tangent, context: self.context.clone() }
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        self.primal.boolean()
+    }
+}
+
+// TODO(eaplatanios): Consider renaming `JvpContext` to `LinearizationContext` and `JvpTracer` to `LinearizationTracer`.
+//  Although, why do we need `JvpContext` in the first place? It doesn't look like it's doing anything other than carry
+//  an underlying context which we might as well be using directly?
 /// A forward-mode differentiation [`Context`] that interleaves [`DifferentiableOperation`] rules with an inner
 /// [`Context`], without building a program: its values are [`JvpTracer`] duals over the inner context's values, and
 /// binding an operation dispatches the operation's [`jvp`](DifferentiableOperation::jvp) rule against the inner
@@ -888,15 +1007,28 @@ impl<C: Context> Domain for JvpContext<C> {
     type Operation = C::Operation;
 }
 
+/// A [`JvpContext`] binds no named axes of its own: axis-name resolution passes through to the inner context, so
+/// collectives inside a differentiated closure resolve against the enclosing batching levels and mesh regions.
+impl<C> crate::axes::NamedAxes for JvpContext<C>
+where
+    C: Context + crate::axes::NamedAxes + Zero<C::Value>,
+    C::Operation: Clone + DifferentiableOperation<C>,
+{
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<crate::axes::NamedAxis> {
+        self.context().named_axis(name)
+    }
+}
+
 impl<C> Context for JvpContext<C>
 where
-    C: Context + Zero<C::Type, C::Value>,
+    C: Context + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<JvpTracer<C>, ProgramError> {
         // Constants are independent of every differentiation input, so their tangents are structural zeros.
-        Ok(JvpTracer::with_zero_tangent(self.context.lift(constant)?))
+        Ok(JvpTracer::with_zero_tangent(self.context.lift(constant)?).with_context(self.clone()))
     }
 
     fn bind<O: Into<C::Operation>>(
@@ -909,16 +1041,19 @@ where
         // input tangent is a structural zero, the operation's tangent is zero by the chain rule, so the rule is
         // skipped and the primal operation binds directly. Zero-input operations are excluded so their dedicated
         // rules keep handling primal synthesis and tangent typing.
-        if !inputs.is_empty() && inputs.iter().all(|dual| dual.tangent().is_zero()) {
+        let outputs = if !inputs.is_empty() && inputs.iter().all(|dual| dual.tangent().is_zero()) {
             let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-            return Ok(self
-                .context
+            self.context
                 .bind(operation, primal_inputs.as_slice())?
                 .into_iter()
                 .map(JvpTracer::with_zero_tangent)
-                .collect());
-        }
-        operation.jvp(&self.context, inputs)
+                .collect()
+        } else {
+            operation.jvp(&self.context, inputs)?
+        };
+        // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
+        // forward-mode context (the `jvp` rules build their outputs context-free via `JvpTracer::new`).
+        Ok(outputs.into_iter().map(|dual| dual.with_context(self.clone())).collect())
     }
 }
 
@@ -973,7 +1108,7 @@ where
 ///     the use site, so the enum does not spell them — plus a `Self: From<Payload>` conversion for every concrete
 ///     payload (the rules stage ordinary primal-enum operations for both the primal and the tangent side) and the
 ///     `Self: MaybeZeroOperation<T> + From<ZeroOperation<T>> +
-///     DifferentiableProgramOperation<T, C, Self>` fixed-point witnesses that higher-order payload rules
+///     DifferentiableProgramOperation<C::Constant, Self>` fixed-point witnesses that higher-order payload rules
 ///     (condition/while/scan) use to linearize their nested programs. *Recursive* payloads (those mentioning
 ///     `Self`) are skipped — such a predicate would re-enter the enum's own obligation and overflow the trait
 ///     solver — and their rules are discharged as definition-time body obligations against the witnesses instead.
@@ -1040,10 +1175,10 @@ where
 ///   - `left_term`: Live left tangent term, or [`None`] if it was dropped as a structural zero.
 ///   - `right_term`: Live right tangent term, or [`None`] if it was dropped as a structural zero.
 ///   - `primal`: Primal tracer whose type the zero fallback adopts.
-pub(crate) fn combine_terms<T, V>(left_term: Option<V>, right_term: Option<V>, primal: &V) -> MaybeZero<T, V>
+pub(crate) fn combine_terms<T, V>(left_term: Option<V>, right_term: Option<V>, primal: &V) -> MaybeZero<V>
 where
     T: Type,
-    V: Typed<T> + std::ops::Add<Output = V>,
+    V: Typed<Type = T> + std::ops::Add<Output = V>,
 {
     match (left_term, right_term) {
         (Some(left_term), Some(right_term)) => MaybeZero::Value(left_term + right_term),
@@ -1076,13 +1211,13 @@ where
 ///     the [`DifferentiableOperation`] default's
 ///     [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
 pub(crate) fn build_jvp_program<T, V, O, Input, Output>(
-    program: &Program<T, V, O, Input, Output>,
-) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, ProgramError>
+    program: &Program<V, O, Input, Output>,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     T: Type,
-    V: Value<T>,
+    V: Value<Type = T>,
     O: Clone + Operation<T> + From<ZeroOperation<T>>,
-    O: DifferentiableOperation<TracingContext<T, V, O>>,
+    O: DifferentiableOperation<TracingContext<V, O>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1091,16 +1226,15 @@ where
     // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so that
     // scoping every tracer (and the context) inside that block makes the `Rc::try_unwrap` at the end a real ownership
     // check rather than depending on manual drops. Only raw output atom ids escape the block.
-    let context = TracingContext::<T, V, O>::new();
+    let context = TracingContext::<V, O>::new();
     let builder = context.builder().clone();
     let output_atoms = {
         let context = context;
 
         // Track the primal tracer and symbolic tangent for each source atom. Tangents of atoms not connected to an
         // input tangent (constants and dead inputs) are derived lazily as structural zeros by `recorded_tangent`.
-        let mut primals: Vec<Option<Tracer<TracingContext<T, V, O>>>> = vec![None; program.atoms().len()];
-        let mut tangents: Vec<Option<MaybeZero<T, Tracer<TracingContext<T, V, O>>>>> =
-            vec![None; program.atoms().len()];
+        let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; program.atoms().len()];
+        let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; program.atoms().len()];
 
         // Primal inputs become the leading inputs; one fresh tangent input is added per primal input afterwards
         // so the input order is `(primals ++ tangents)`.
@@ -1140,7 +1274,7 @@ where
                     let primal =
                         primals[input_atom.index()].clone().ok_or(ProgramError::UnboundAtomId { id: input_atom })?;
                     let tangent = recorded_tangent(&primals, &tangents, input_atom)?;
-                    Ok(JvpTracer::<TracingContext<T, V, O>>::new(primal, tangent))
+                    Ok(JvpTracer::<TracingContext<V, O>>::new(primal, tangent))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
 
@@ -1154,7 +1288,7 @@ where
                 context
                     .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
                     .into_iter()
-                    .map(JvpTracer::<TracingContext<T, V, O>>::with_zero_tangent)
+                    .map(JvpTracer::<TracingContext<V, O>>::with_zero_tangent)
                     .collect()
             } else {
                 instruction.operation().jvp(&context, input_duals.as_slice())?
@@ -1205,11 +1339,11 @@ where
 
 /// Returns the symbolic tangent recorded for `atom`, deriving a structural zero typed with the atom's primal type
 /// for atoms (constants and dead inputs) not connected to any input tangent.
-fn recorded_tangent<T: Type, V: Typed<T> + Clone>(
+fn recorded_tangent<V: Typed + Clone>(
     primals: &[Option<V>],
-    tangents: &[Option<MaybeZero<T, V>>],
+    tangents: &[Option<MaybeZero<V>>],
     atom: AtomId,
-) -> Result<MaybeZero<T, V>, ProgramError> {
+) -> Result<MaybeZero<V>, ProgramError> {
     if let Some(tangent) = &tangents[atom.index()] {
         return Ok(tangent.clone());
     }
@@ -1225,9 +1359,9 @@ fn recorded_tangent<T: Type, V: Typed<T> + Clone>(
 /// match on the [`MaybeZero`] everywhere else so zeros stay symbolic. Public so backend crates can materialize zeros
 /// in their own higher-order [`DifferentiableOperation`] and [`TransposableOperation`]
 /// rules.
-pub fn materialize<C>(context: &C, value: MaybeZero<C::Type, C::Value>) -> Result<C::Value, ProgramError>
+pub fn materialize<C>(context: &C, value: MaybeZero<C::Value>) -> Result<C::Value, ProgramError>
 where
-    C: Context + Zero<C::Type, C::Value>,
+    C: Context + Zero<C::Value>,
 {
     match value {
         MaybeZero::Value(value) => Ok(value),
@@ -1248,16 +1382,16 @@ where
 /// [`Program::transpose_with_respect_to`](crate::Program::transpose_with_respect_to) without re-keying it into a linear
 /// operation family.
 ///
-/// The type-descriptor parameter `T`, value type `V`, and operation family `O` match the primal program that was
-/// linearized.
-pub struct Linearization<T: Type, V: Value<T>, O: Clone + Operation<T>> {
+/// The value type `V` and operation family `O` match the primal program that was
+/// program being linearized.
+pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
     /// Known sub-program. It takes the primal inputs and produces the primal outputs followed by the residuals; its
     /// trailing [`residual_count`](Self::residual_count) outputs are the residual environment consumed by the tangent
     /// sub-program.
-    pub primal_program: Program<T, V, O, Vec<V>, Vec<V>>,
+    pub primal_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Unknown sub-program. It takes the tangent inputs followed by the residuals and produces the tangent outputs.
-    pub tangent_program: Program<T, V, O, Vec<V>, Vec<V>>,
+    pub tangent_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// For each original function output, `true` if it is produced by the tangent sub-program and `false` if by the
     /// primal sub-program. Used to reassemble the combined program's outputs from the two sides.
@@ -1269,13 +1403,13 @@ pub struct Linearization<T: Type, V: Value<T>, O: Clone + Operation<T>> {
     pub residual_count: usize,
 }
 
-impl<T, V, O, Input, Output> Program<T, V, O, Input, Output>
+impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: Type,
-    V: Value<T>,
+    V: Value<Type = T>,
     O: Clone + Operation<T> + From<ZeroOperation<T>>,
-    O: DifferentiableOperation<TracingContext<T, V, O>>,
-    O: PartiallyEvaluatableOperation<TracingContext<T, V, O>>,
+    O: DifferentiableOperation<TracingContext<V, O>>,
+    O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
@@ -1283,7 +1417,7 @@ where
     /// producing `[primal_outputs..., tangent_outputs...]`, without splitting it into primal and tangent halves;
     /// this is the un-split front half of [`Self::linearize`], exposed for fused higher-order JVP rules and
     /// direct forward-mode interpretation.
-    pub fn jvp_program(&self) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, ProgramError> {
+    pub fn jvp_program(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
         build_jvp_program(self)
     }
 
@@ -1316,7 +1450,7 @@ where
     ///
     /// Operations outside the supported slice fail with the [`DifferentiableOperation`] default's
     /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-    pub fn linearize(&self) -> Result<Linearization<T, V, O>, ProgramError> {
+    pub fn linearize(&self) -> Result<Linearization<V, O>, ProgramError> {
         let primal_input_count = self.input_ids().len();
         let primal_output_count = self.output_ids().len();
 
@@ -1459,13 +1593,13 @@ where
 /// residual-program input sources — unreachable under the current walk, which seeds every unknown input up front and
 /// never prunes residual-program inputs, but kept so the rebuild stays correct for any source layout.
 fn restored_input_atom<T, V, O>(
-    atoms: &mut Vec<Atom<T, V>>,
-    jvp_program: &Program<T, V, O, Vec<V>, Vec<V>>,
+    atoms: &mut Vec<Atom<V>>,
+    jvp_program: &Program<V, O, Vec<V>, Vec<V>>,
     jvp_input_index: usize,
 ) -> Result<AtomId, ProgramError>
 where
     T: Type,
-    V: Value<T>,
+    V: Value<Type = T>,
     O: Operation<T>,
 {
     let Atom::Variable(tangent_type) = &jvp_program.atoms[jvp_program.input_ids[jvp_input_index].index()] else {
@@ -1480,15 +1614,15 @@ where
 ///
 /// Higher-order forward-mode rules, such as the control-flow rules, must linearize the captured branch or
 /// body programs whose operation family is the same closed enum currently being proven
-/// [`DifferentiableOperation`]. Writing that need directly as `O: DifferentiableOperation<T, V, O>` at every
+/// [`DifferentiableOperation`]. Writing that need directly as a recursive `DifferentiableOperation` bound at every
 /// recursive payload boundary makes Rust's trait solver re-enter the same enum and overflow.
-/// [`DifferentiableProgramOperation`] names that recursive fixed point once: the type-descriptor `T`, value `V`,
+/// [`DifferentiableProgramOperation`] names that recursive fixed point once: the value `V`
 /// and operation family `O` stay fixed across the recursion, so a closed operation enum implements this trait directly
 /// — calling [`Program::linearize`](crate::Program::linearize) in the body while spelling only the *leaf* closure of
 /// capabilities that body needs in the impl's `where` clause, rather than the recursive
-/// `Self: DifferentiableOperation<T, V, Self>` bound
+/// `Self: DifferentiableOperation<…>` bound
 /// itself. That recursive obligation is then discharged once, as a definition-time body check, which is what lets a
-/// higher-order rule require `Self: DifferentiableProgramOperation<T, V, Self>` without sending the trait
+/// higher-order rule require `Self: DifferentiableProgramOperation<V, Self>` without sending the trait
 /// solver into an unbounded recursion. Higher-order payloads depend on this semantic witness instead of reproducing the
 /// full linearization obligation.
 ///
@@ -1498,11 +1632,11 @@ where
 /// `impl DifferentiableProgramOperation for O where O: DifferentiableOperation` would reintroduce exactly the
 /// recursion this trait exists to break).
 ///
-/// The type-descriptor parameter `T`, value type `V`, and operation family `O` match the primal program being
-/// linearized.
-pub trait DifferentiableProgramOperation<T: Type, V: Value<T>, O>: Clone + Operation<T> + Sized
+/// The value type `V` (whose carried type descriptor types the programs) and operation family `O` match the primal
+/// program being linearized.
+pub trait DifferentiableProgramOperation<V: Value, O>: Clone + Operation<V::Type> + Sized
 where
-    O: Clone + Operation<T> + From<ZeroOperation<T>>,
+    O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>,
 {
     /// Linearizes `program` capture-free; refer to the documentation of
     /// [`Program::linearize`](crate::Program::linearize) for the returned packaging.
@@ -1511,9 +1645,7 @@ where
     ///
     ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs and
     ///     outputs.
-    fn linearize_program(
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Linearization<T, V, Self>, ProgramError>;
+    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 
     /// Builds the *fused* jvp program of `program` over `[primals..., tangents...]`, producing
     /// `[primal_outputs..., tangent_outputs...]`, without splitting it into primal and tangent halves.
@@ -1528,8 +1660,8 @@ where
     ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs
     ///     and outputs.
     fn jvp_program(
-        program: &Program<T, V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<T, V, Self, Vec<V>, Vec<V>>, ProgramError>;
+        program: &Program<V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
 }
 
 /// Replays a flat sub-program of a [`Linearization`] through a context's [`bind`](Context::bind) by interpreting
@@ -1556,7 +1688,7 @@ where
 ///   - `inputs`: Flat input values aligned with the sub-program's input atoms.
 pub(crate) fn replay_via_bind<C, Input, Output>(
     context: &C,
-    program: &Program<<C as Domain>::Type, <C as Domain>::Constant, <C as Domain>::Operation, Input, Output>,
+    program: &Program<<C as Domain>::Constant, <C as Domain>::Operation, Input, Output>,
     inputs: Vec<<C as Domain>::Value>,
 ) -> Result<Vec<<C as Domain>::Value>, ProgramError>
 where
@@ -1588,19 +1720,19 @@ where
 /// therefore over the primal operation family `O` and maps `(output_cotangents ++ residuals)` to the cotangents of the
 /// linear tangent inputs only.
 ///
-/// The type-descriptor parameter `T`, value type `V`, and operation family `O` match the primal program that was
-/// linearized.
+/// The value type `V` and operation family `O` match the primal program that was
+/// program being linearized.
 ///
 /// # Parameters
 ///
 ///   - `linearization`: Linearization whose tangent sub-program is transposed.
 pub fn transpose_tangent_partitioned<T, V, O>(
-    linearization: &Linearization<T, V, O>,
-) -> Result<Program<T, V, O, Vec<V>, Vec<V>>, ProgramError>
+    linearization: &Linearization<V, O>,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     T: DifferentiableType,
-    V: Value<T>,
-    O: Clone + Operation<T> + TransposableOperation<T, V, O>,
+    V: Value<Type = T>,
+    O: Clone + Operation<T> + TransposableOperation<V, O>,
     O: From<ZeroOperation<T>> + From<AddOperation>,
 {
     let tangent_program = &linearization.tangent_program;
@@ -1730,13 +1862,8 @@ where
 {
     /// Pullback program over the primal operation family, mapping `[output_cotangents ++ residuals]` to flat input
     /// cotangents.
-    pub(crate) program: Program<
-        <C as Domain>::Type,
-        <C as Domain>::Value,
-        <C as Domain>::Operation,
-        Vec<<C as Domain>::Value>,
-        Vec<<C as Domain>::Value>,
-    >,
+    pub(crate) program:
+        Program<<C as Domain>::Value, <C as Domain>::Operation, Vec<<C as Domain>::Value>, Vec<<C as Domain>::Value>>,
 
     /// Linearization-point residuals consumed by [`program`](Self::program), appended after the output cotangents when
     /// interpreting it.
@@ -1754,11 +1881,7 @@ impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>
 where
     C: DifferentiationContext<Tangent = <C as Domain>::Value>,
     <C as Domain>::Operation: Clone
-        + InterpretableOperation<
-            <C as Domain>::Type,
-            <C as Domain>::Value,
-            EagerContext<<C as Domain>::Type, <C as Domain>::Value, <C as Domain>::Operation>,
-        >,
+        + InterpretableOperation<<C as Domain>::Value, EagerContext<<C as Domain>::Value, <C as Domain>::Operation>>,
     Input: Parameterized<<C as Domain>::Value>,
     Input::Family: ParameterizedFamily<C::Tangent>,
     TracedOutput: Parameterized<C::Tangent>,
@@ -1775,7 +1898,7 @@ where
     pub fn apply(&self, cotangents: TracedOutput::To<C::Tangent>) -> Result<Input::To<C::Tangent>, ProgramError> {
         let mut inputs = cotangents.into_parameters().collect::<Vec<_>>();
         inputs.extend(self.residuals.iter().cloned());
-        let context = EagerContext::<<C as Domain>::Type, <C as Domain>::Value, <C as Domain>::Operation>::new();
+        let context = EagerContext::<<C as Domain>::Value, <C as Domain>::Operation>::new();
         let input_cotangents = self.program.interpret_in_context(&context, inputs)?;
         Ok(Input::To::<C::Tangent>::from_parameters(self.input_structure.clone(), input_cotangents)?)
     }
