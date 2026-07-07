@@ -1605,10 +1605,11 @@ mod linearization_tests {
         assert_close(reassembled_tangents, &reference_tangents, "forward tangent");
     }
 
-    /// Runs the raw fused-JVP pipeline — trace, eager `while` unroll, fused JVP program build, simplification, and
-    /// direct interpretation at `(primals ++ tangents)` — so the packaged [`DifferentiationContext::jvp`] surface can
-    /// be compared against the pipeline it wraps. Returns the flat primal and tangent outputs.
-    fn jvp_direct<Function>(
+    /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
+    /// simplification, and direct interpretation at `(primals ++ tangents)` — as an independent oracle for
+    /// [`DifferentiationContext::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
+    /// agree with the program-level pipeline. Returns the flat primal and tangent outputs.
+    fn fused_pipeline_jvp<Function>(
         domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
         function: Function,
         primals: Vec<Scalar>,
@@ -1730,7 +1731,7 @@ mod linearization_tests {
             )
             .unwrap();
 
-        let (primal_outputs, tangent_outputs) = jvp_direct(
+        let (primal_outputs, tangent_outputs) = fused_pipeline_jvp(
             &domain,
             |inputs| vec![inputs[0].clone().unary(scalar_squaring_while())],
             vec![Scalar::from(1.5)],
@@ -3124,10 +3125,11 @@ mod array_linearization_tests {
         assert_arrays_close(&input_cotangents, &reference_cotangents, "reverse cotangent");
     }
 
-    /// Runs the raw fused-JVP pipeline — trace, eager `while` unroll, fused JVP program build, simplification, and
-    /// direct interpretation at `(primals ++ tangents)` — so the packaged [`DifferentiationContext::jvp`] surface can
-    /// be compared against the pipeline it wraps. Returns the flat primal and tangent outputs.
-    fn jvp_direct<Function>(
+    /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
+    /// simplification, and direct interpretation at `(primals ++ tangents)` — as an independent oracle for
+    /// [`DifferentiationContext::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
+    /// agree with the program-level pipeline. Returns the flat primal and tangent outputs.
+    fn fused_pipeline_jvp<Function>(
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
         function: Function,
         primals: Vec<TestArray>,
@@ -3304,7 +3306,7 @@ mod array_linearization_tests {
             )
             .unwrap();
 
-        let (primal_outputs, tangent_outputs) = jvp_direct(
+        let (primal_outputs, tangent_outputs) = fused_pipeline_jvp(
             &domain,
             |inputs| vec![inputs[0].clone().unary(array_squaring_while())],
             vec![TestArray::scalar(1.5)],

@@ -269,6 +269,13 @@ impl<'c> Context for XlaDomain<'c> {
         let value = self.constant(&array_type, kind).map_err(|error| TypeError { message: error.to_string() })?;
         Ok(vec![value])
     }
+
+    /// XLA has no host interpreter for arbitrary operations ([`bind`](Context::bind) materializes only the nullary
+    /// identities above), so strategies that fold work through `bind` — the eager data-dependent `while` rules —
+    /// must not be chosen for this context even though its values are concrete arrays.
+    fn is_eager(&self) -> bool {
+        false
+    }
 }
 
 impl<'c> DifferentiationContext for XlaDomain<'c> {
