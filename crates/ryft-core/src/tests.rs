@@ -1089,7 +1089,7 @@ mod differentiation_tests {
     use crate::contexts::{Context, EagerContext};
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::differentiation::JvpTracer;
+    use crate::tracing_v2::differentiation::DifferentiationTracer;
     use crate::tracing_v2::{DifferentiationContext, NestedTracer};
 
     #[test]
@@ -1123,7 +1123,7 @@ mod differentiation_tests {
         // collective operation.
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
-                |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                     let severed = x.stop_gradient();
                     let mut outputs = severed.context().bind(
                         CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
@@ -1150,7 +1150,7 @@ mod differentiation_tests {
         // the headline `linearize` capability.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let function = |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap();
-        let jvp_function = |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
+        let jvp_function = |x: DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = domain.linearize(function, Scalar::from(0.7)).unwrap();
 
         let (reference_primal, _) = domain.jvp(jvp_function, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
@@ -1176,8 +1176,8 @@ mod differentiation_tests {
             NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
         )| a.clone() * b + a.sin().unwrap();
         let jvp_function = |(a, b): (
-            JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
-            JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
         )| Ok(a.clone() * b + a.sin()?);
         let (output, forward) = domain.linearize(function, (Scalar::from(0.5), Scalar::from(1.3))).unwrap();
 
@@ -1206,7 +1206,7 @@ mod differentiation_tests {
         // distinct tangents are applied through the one linearization and each matches `jvp`.
         let function =
             |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| x.clone() * x.sin().unwrap();
-        let jvp_function = |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
+        let jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .linearize(function, TestArray::scalar(0.7))
             .unwrap();
@@ -1249,7 +1249,7 @@ mod differentiation_tests {
                 .unwrap();
             outputs.remove(0)
         };
-        let condition_jvp_function = |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let condition_jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
             let predicate = x.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
             let mut outputs =
@@ -1295,7 +1295,7 @@ mod differentiation_tests {
                 x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
             outputs.remove(0)
         };
-        let while_jvp_function = |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+        let while_jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let while_operation = doubling_while_for_linearize();
             let mut outputs = x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
             Ok(outputs.remove(0))
@@ -1343,8 +1343,8 @@ mod differentiation_tests {
             outputs.remove(0)
         };
         let scan_jvp_function = |(init, xs): (
-            JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
-            JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
         )| {
             let scan = product_scan_for_linearize();
             let mut outputs = init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs])?;
@@ -1528,7 +1528,7 @@ mod linearization_tests {
     type ScalarTracer = Tracer<NestedTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>;
 
     /// Forward-mode dual leaf seen by the scalar `jvp` closures.
-    type ScalarJvpTracer = JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
+    type ScalarJvpTracer = DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
     const TOLERANCE: f64 = 1e-12;
@@ -2362,7 +2362,7 @@ mod linearization_tests {
 
         let (primal_outputs, tangent_outputs) = outer_context
             .jvp(
-                |inputs: Vec<JvpTracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>| {
+                |inputs: Vec<DifferentiationTracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>| {
                     Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?])
                 },
                 vec![primal_a, primal_b],
@@ -3010,7 +3010,7 @@ mod array_linearization_tests {
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::differentiation::{
-        DifferentiationContext, JvpTracer, Linearization, build_jvp_program, replay_via_bind,
+        DifferentiationContext, DifferentiationTracer, Linearization, build_jvp_program, replay_via_bind,
         transpose_tangent_partitioned,
     };
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -3023,7 +3023,7 @@ mod array_linearization_tests {
     type ArrayTracer = Tracer<NestedTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>;
 
     /// Forward-mode dual leaf seen by the array `jvp` closures.
-    type ArrayJvpTracer = JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>;
+    type ArrayJvpTracer = DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
     const TOLERANCE: f64 = 1e-12;

@@ -111,18 +111,19 @@ macro_rules! check_builders {
     }};
 }
 
-/// Implements a foreign `std::ops` operator trait as panicking sugar for the three core transform tracer types
-/// (i.e., [`Tracer`](crate::Tracer), [`BatchingTracer`](crate::BatchingTracer), and [`JvpTracer`](crate::JvpTracer))
-/// by binding the operation through each tracer's own context. The operator traits (i.e., `std::ops::Add`,
-/// `std::ops::Neg`, `std::ops::BitAnd`, etc.) are foreign and so a single `impl<V: Value>` blanket implementation
-/// (i.e., the shape used for the fallible in-crate capability traits) is not allowed due to the orphan rule. This macro
-/// stamps out the implementations that a blanket would otherwise cover. Note also that because an operator must return
-/// `Self`, the two error modes differ by tracer and cannot be collapsed: a staged [`Tracer`](crate::Tracer) records
-/// through its [`unary`](crate::Tracer::unary) / [`binary`](crate::Tracer::binary) helpers, which *poison* on a failed
-/// bind so that the error surfaces later at tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer) and
-/// [`JvpTracer`](crate::JvpTracer) have no deferral point and bind directly, panicking with `$message` if the bind
-/// fails. Binding directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal
-/// (e.g., no `Type = ArrayType` pin is needed on the batching arm).
+/// Implements a foreign `std::ops` operator trait as panicking sugar for the three core transform
+/// tracer types (i.e., [`Tracer`](crate::Tracer), [`BatchingTracer`](crate::BatchingTracer), and
+/// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
+/// The operator traits (i.e., `std::ops::Add`, `std::ops::Neg`, `std::ops::BitAnd`, etc.) are foreign and so a single
+/// `impl<V: Value>` blanket implementation (i.e., the shape used for the fallible in-crate capability traits) is not
+/// allowed due to the orphan rule. This macro stamps out the implementations that a blanket would otherwise cover. Note
+/// also that because an operator must return `Self`, the two error modes differ by tracer and cannot be collapsed: a
+/// staged [`Tracer`](crate::Tracer) records through its [`unary`](crate::Tracer::unary) and
+/// [`binary`](crate::Tracer::binary) helpers, which *poison* on a failed bind so that the error surfaces later at
+/// tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer) and
+/// [`DifferentiationTracer`](crate::DifferentiationTracer) have no deferral point and bind directly, panicking with
+/// `$message` if the bind fails. Binding directly rather than delegating to the fallible capability trait keeps the
+/// eager arms' bounds minimal (e.g., no `Type = ArrayType` pin is needed on the batching arm).
 ///
 /// # Parameters
 ///
@@ -159,10 +160,10 @@ macro_rules! implement_tracer_operator {
         }
 
         // TODO(eaplatanios): Clean this up once we clean up the differentiation module.
-        impl<C: $crate::Context> $trait for $crate::JvpTracer<C>
+        impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
         where
             $crate::tracing_v2::differentiation::JvpContext<C>:
-                $crate::Context<Value = $crate::JvpTracer<C>, Operation: ::std::convert::From<$operation>>,
+                $crate::Context<Value = $crate::DifferentiationTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 
@@ -196,10 +197,10 @@ macro_rules! implement_tracer_operator {
         }
 
         // TODO(eaplatanios): Clean this up once we clean up the differentiation module.
-        impl<C: $crate::Context> $trait for $crate::JvpTracer<C>
+        impl<C: $crate::Context> $trait for $crate::DifferentiationTracer<C>
         where
             $crate::tracing_v2::differentiation::JvpContext<C>:
-                $crate::Context<Value = $crate::JvpTracer<C>, Operation: ::std::convert::From<$operation>>,
+                $crate::Context<Value = $crate::DifferentiationTracer<C>, Operation: ::std::convert::From<$operation>>,
         {
             type Output = Self;
 

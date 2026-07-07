@@ -125,16 +125,16 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
 }
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`]. [`MaybeZero`] is the
-/// symbolic-zero representation shared by transforms like forward-mode and reverse-mode differentiation where it is the
-/// tangent type carried by [`JvpTracer`](crate::JvpTracer)s and the cotangent type that transposition rules consume and
-/// produce. A [`MaybeZero::Zero`] means that no value exists and nothing has been staged or computed for it. In the
-/// context of differentiation, it means that the corresponding derivative is zero *by construction* (e.g., a
-/// disconnected input, a severed tangent, an unused output, etc.), and is not a runtime value that happens to contain
-/// zeros. Differentiation rules branch on the variant to skip work entirely. A rule that sees a zero tangent or
-/// cotangent emits no operations for it, and "zero-ness" propagates transitively through rules without ever inspecting
-/// a program or materializing a buffer. A zero is _materialized_ into a real value only at the boundaries where one is
-/// structurally required (e.g., a nested sub-program operand, a program output, or an eagerly returned tangent),
-/// which is also where its carried [`Type`] is consumed.
+/// symbolic-zero representation shared by transforms like forward-mode and reverse-mode differentiation where it is
+/// the tangent type carried by [`DifferentiationTracer`](crate::DifferentiationTracer)s and the cotangent type that
+/// transposition rules consume and produce. A [`MaybeZero::Zero`] means that no value exists and nothing has been
+/// staged or computed for it. In the context of differentiation, it means that the corresponding derivative is zero
+/// *by construction* (e.g., a disconnected input, a severed tangent, an unused output, etc.), and is not a runtime
+/// value that happens to contain zeros. Differentiation rules branch on the variant to skip work entirely. A rule that
+/// sees a zero tangent or cotangent emits no operations for it, and "zero-ness" propagates transitively through rules
+/// without ever inspecting a program or materializing a buffer. A zero is _materialized_ into a real value only at the
+/// boundaries where one is structurally required (e.g., a nested sub-program operand, a program output, or an eagerly
+/// returned tangent), which is also where its carried [`Type`] is consumed.
 #[derive(Clone, Debug)]
 pub enum MaybeZero<V: Typed> {
     /// Structural zero of the carried [`Type`] (i.e., no value exists and nothing has been staged or computed for it).
