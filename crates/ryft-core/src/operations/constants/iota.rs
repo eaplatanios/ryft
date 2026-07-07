@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
@@ -109,10 +109,7 @@ pub trait Iota<V: Value> {
     fn iota(&self, r#type: &V::Type, dimension: usize) -> Result<V, ProgramError>;
 }
 
-impl<C> Iota<Tracer<C>> for C
-where
-    C: StagingContext<Operation: From<IotaOperation<C::Type>>>,
-{
+impl<C: StagingContext<Operation: From<IotaOperation<C::Type>>>> Iota<Tracer<C>> for C {
     #[inline]
     fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<Tracer<C>, ProgramError> {
         let mut outputs = self.stage_nullary_operation(IotaOperation::new(r#type.clone(), dimension))?;
@@ -121,13 +118,10 @@ where
     }
 }
 
-/// A [`BatchingContext`] synthesizes a batched iota by delegating to its parent and replicating the result across the
-/// batch, so every batch item observes the same per-element index sequence.
-impl<C> Iota<BatchingTracer<C>> for BatchingContext<C>
-where
-    C: Context<Type = ArrayType> + Iota<C::Value>,
-    BatchingContext<C>: Context<Type = ArrayType, Value = BatchingTracer<C>>,
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Iota<C::Value>>
+    Iota<BatchingTracer<C>> for BatchingContext<C>
 {
+    #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))

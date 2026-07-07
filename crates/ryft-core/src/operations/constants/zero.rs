@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
@@ -116,10 +116,10 @@ impl<C: StagingContext<Operation: From<ZeroOperation<C::Type>>>> Zero<Tracer<C>>
     }
 }
 
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C>> for BatchingContext<C>
-where
-    BatchingContext<C>: Context<Type = ArrayType, Value = BatchingTracer<C>>,
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Zero<C::Value>>
+    Zero<BatchingTracer<C>> for BatchingContext<C>
 {
+    #[inline]
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {
         let batch = ArrayBatch::new(r#type.clone(), self.parent().zero(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))

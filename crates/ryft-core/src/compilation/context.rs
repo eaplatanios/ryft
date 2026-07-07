@@ -4,13 +4,13 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use lru::LruCache;
-
+use crate::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::contexts::Context;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::NestedTracingContext;
 use crate::types::ArrayType;
+use lru::LruCache;
 
 use super::disk_cache::{CacheDigest, DiskCache};
 use super::domain::CompilationDomain;
@@ -186,11 +186,8 @@ pub trait CapturingContext<C: Value<Type = Self::Type>>: Context {
     fn capture(&self, value: C) -> Result<Self::Constant, ProgramError>;
 }
 
-impl<C, Capture> CapturingContext<Capture> for BatchingContext<C>
-where
-    C: CapturingContext<Capture, Type = ArrayType>,
-    BatchingContext<C>: Context<Type = ArrayType, Constant = C::Constant>,
-    Capture: Value<Type = ArrayType>,
+impl<Capture: Value<Type = C::Type>, C: CapturingContext<Capture>> CapturingContext<Capture>
+    for NestedTracingContext<C>
 {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
@@ -198,8 +195,12 @@ where
     }
 }
 
-impl<C: CapturingContext<Capture>, Capture: Value<Type = C::Type>> CapturingContext<Capture>
-    for NestedTracingContext<C>
+impl<
+    Capture: Value<Type = ArrayType>,
+    C: CapturingContext<Capture, Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>,
+> CapturingContext<Capture> for BatchingContext<C>
+where
+    BatchingContext<C>: Context<Type = ArrayType, Constant = C::Constant>,
 {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {

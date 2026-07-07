@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use crate::batching::{ArrayBatch, BatchAxis, BatchingContext, BatchingTracer};
+use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
@@ -144,10 +144,12 @@ impl<C: StagingContext> Constant<Tracer<C>, Tracer<C>, Input> for C {
     }
 }
 
-impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored, Payload>, Stored, Payload>
-    Constant<BatchingTracer<C>, Stored, Payload> for BatchingContext<C>
-where
-    BatchingContext<C>: Context<Type = ArrayType, Value = BatchingTracer<C>>,
+impl<
+    C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>
+        + Constant<C::Value, Stored, Payload>,
+    Stored,
+    Payload,
+> Constant<BatchingTracer<C>, Stored, Payload> for BatchingContext<C>
 {
     fn constant(&self, value: Stored) -> Result<BatchingTracer<C>, ProgramError> {
         let parent_value = self.parent().constant(value)?;
