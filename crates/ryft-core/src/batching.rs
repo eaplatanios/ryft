@@ -166,9 +166,9 @@ impl From<usize> for BatchAxis {
 /// For example:
 ///
 /// ```ignore
-/// domain.batch(f, input, in_axes, out_axes, None)?;                                     // Inferred size, anonymous.
-/// domain.batch(f, input, in_axes, out_axes, 8)?;                                        // Explicit size, anonymous.
-/// domain.batch(f, input, in_axes, out_axes, BatchAxisSpecification::named("devices"))?; // Inferred size, named.
+/// domain.batch(f, input, input_axes, output_axes, None)?;                                     // Inferred, anonymous.
+/// domain.batch(f, input, input_axes, output_axes, 8)?;                                        // Explicit, anonymous.
+/// domain.batch(f, input, input_axes, output_axes, BatchAxisSpecification::named("devices"))?; // Inferred, named.
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BatchAxisSpecification {
@@ -981,102 +981,74 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review this trait.
-/// Extension trait that exposes batching (`vmap`) as a method on any array [`Context`] — the single `batch` entry
-/// point, mirroring how `jvp` sits on [`Differentiate`](crate::tracing_v2::differentiation::Differentiate).
-///
-/// `context.batch(function, input, in_axes, out_axes, axis)` wraps the receiver in a [`BatchingContext`] and runs
-/// `function` on concrete [`BatchingTracer`] values, so every primitive bind inside the closure flows through the
-/// receiver's own context. This composes uniformly across the whole stack: an eager backend [`Context`] interprets
-/// each batched bind immediately (concrete-value `vmap`), an active [`StagingContext`](crate::StagingContext) stages it into the enclosing
-/// trace, and a [`BatchingContext`] receiver nests `vmap` inside `vmap` — each level's [`BatchingTracer`] carries its
-/// own batch axis, so nested maps thread through with no side table.
-pub trait Batch: Context<Type = ArrayType> {
-    /// Maps `function` over array axes selected per leaf by `in_axes` and places each output's mapped axis at the
-    /// position requested by `out_axes`.
-    ///
-    /// `in_axes` is any [`Parameterized`] value over [`BatchAxis`] leaves; it is broadcast into the input's parameter
-    /// structure via [`Parameterized::broadcast_to_parameter_structure`], so a single [`BatchAxis`] maps every leaf
-    /// the same way (the typed counterpart of JAX's `in_axes=0`), a value whose structure matches the input gives a
-    /// per-leaf axis, and a smaller compatible structure prefix-broadcasts to fill the input. Each leaf is either
-    /// [`BatchAxis::new(k)`](BatchAxis::new) (the input is mapped on axis `k` of its physical type) or
-    /// [`BatchAxis::replicated`] (the input is replicated / broadcast across the batch). When at least one input is
-    /// mapped, the batch size is inferred from those inputs; the `axis` parameter accepts anything convertible to a
-    /// [`BatchAxisSpecification`] and can supply an explicit batch size to either pin the inferred size or drive a
-    /// fully-broadcast `batch` whose batch size would otherwise be unobservable, as well as an axis name that
-    /// collectives (`psum`, `pmean`, `pmax`) inside the batched function can address. The `out_axes` value (broadcast
-    /// the same way over the output structure) selects where the mapped axis lands in each output:
-    /// [`BatchAxis::new(k)`](BatchAxis::new) requests position `k` (an explicit transpose is staged when the natural
-    /// output axis differs), and [`BatchAxis::replicated`] declares the corresponding output to be replicated (e.g., a
-    /// value produced from broadcast inputs without staging any per-item work).
-    fn batch<F, I, O, InputBatchAxes, OutputBatchAxes, S: Into<BatchAxisSpecification>>(
+/// Extension trait that exposes the batching transform as a method on any [`Context`] over [`ArrayType`]. Refer to the
+/// documentation of the [`batch`] function for information on what the batching transform does and how to use it. This
+/// trait serves the call sites that must name the [`Context`] explicitly (most notably inputs with no values to recover
+/// a context from).
+pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
+    /// Batches `function` over the mapped axes of `input`, with this [`Context`] executing (or staging) the batched
+    /// operations. Refer to the documentation of the [`batch`] function for information on the batching transform and
+    /// its arguments. Unlike that function, this method also serves inputs with no leaf values (i.e., that are empty),
+    /// provided that `batch_axis` supplies an explicit batch size.
+    fn batch<
+        F: FnOnce(I::To<BatchingTracer<Self>>) -> Result<O, ProgramError>,
+        I: Parameterized<Self::Value, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<Self>>>,
+        O: Parameterized<BatchingTracer<Self>, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<Self::Value>>,
+        InputBatchAxes: Parameterized<BatchAxis>,
+        OutputBatchAxes: Parameterized<BatchAxis>,
+        Specification: Into<BatchAxisSpecification>,
+    >(
         &self,
         function: F,
         input: I,
-        in_axes: InputBatchAxes,
-        out_axes: OutputBatchAxes,
-        axis: S,
-    ) -> Result<O::To<Self::Value>, BatchingError>
-    where
-        InputBatchAxes: Parameterized<BatchAxis>,
-        OutputBatchAxes: Parameterized<BatchAxis>,
-        Self::Value: Transpose,
-        I: Parameterized<
-                Self::Value,
-                ParameterStructure: Debug + PartialEq,
-                Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<Self>>,
-            >,
-        O: Parameterized<
-                BatchingTracer<Self>,
-                ParameterStructure: Debug + PartialEq,
-                Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<Self::Value>,
-            >,
-        I::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = I::ParameterStructure>,
-        O::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = O::ParameterStructure>,
-        F: FnOnce(I::To<BatchingTracer<Self>>) -> Result<O, ProgramError>,
-    {
-        let axis = axis.into();
+        input_batch_axes: InputBatchAxes,
+        output_batch_axes: OutputBatchAxes,
+        batch_axis: Specification,
+    ) -> Result<O::To<Self::Value>, BatchingError> {
+        let batch_axis = batch_axis.into();
         let input_structure = input.parameter_structure();
-        let input_tracers = input.into_parameters().collect::<Vec<_>>();
-        // Broadcast the caller's `in_axes` into the input parameter structure: a single `BatchAxis` leaf fills every
-        // input leaf (JAX's `in_axes=0`), a matching structure gives one axis per leaf, and a smaller compatible
-        // structure prefix-broadcasts. A structure that cannot fill the input surfaces as a `ParameterError`.
-        let in_axes_values = in_axes
-            .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
-            .into_parameters()
-            .collect::<Vec<_>>();
-        if input_tracers.is_empty() && axis.size().is_none() {
+        let inputs = input.into_parameters().collect::<Vec<_>>();
+        if inputs.is_empty() && batch_axis.size().is_none() {
             return Err(BatchingError::EmptyBatch.into());
         }
 
-        let mut resolved_axis_size = axis.size();
-        let mut inputs_with_axes = Vec::with_capacity(input_tracers.len());
-        for (tracer, axis) in input_tracers.into_iter().zip(in_axes_values.iter().copied()) {
-            let physical_type = tracer.r#type().into_owned();
-            match axis.axis() {
-                Some(batch_axis) => {
-                    let Some(size) = physical_type.dimension(batch_axis as isize).value() else {
-                        return Err(BatchingError::DynamicBatchAxis { r#type: physical_type, axis: batch_axis }.into());
+        // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills
+        // every input leaf, a matching structure gives one axis per leaf, and a smaller compatible structure broadcasts
+        // based on its prefixes. A structure that cannot fill the input surfaces as a `ParameterError`.
+        let input_batch_axes = input_batch_axes
+            .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
+            .into_parameters()
+            .collect::<Vec<_>>();
+
+        // TODO(eaplatanios): Review from here onwards.
+
+        let mut batch_size = batch_axis.size();
+        let mut inputs_with_axes = Vec::with_capacity(inputs.len());
+        for (input, input_batch_axis) in inputs.into_iter().zip(input_batch_axes.iter().copied()) {
+            let input_type = input.r#type().into_owned();
+            match input_batch_axis.axis() {
+                Some(position) => {
+                    let Some(size) = input_type.dimension(position as isize).value() else {
+                        return Err(BatchingError::DynamicBatchAxis { r#type: input_type, axis: position }.into());
                     };
-                    match resolved_axis_size {
-                        Some(existing_size) if existing_size != size => {
-                            return Err(
-                                BatchingError::MismatchedBatchSizes { expected: existing_size, actual: size }.into()
-                            );
+                    match batch_size {
+                        Some(expected) if expected != size => {
+                            return Err(BatchingError::MismatchedBatchSizes { expected, actual: size }.into());
                         }
                         Some(_) => {}
-                        None => resolved_axis_size = Some(size),
+                        None => batch_size = Some(size),
                     }
-                    inputs_with_axes.push((tracer, physical_type, BatchAxis::new(batch_axis)));
+                    inputs_with_axes.push((input, input_type, BatchAxis::new(position)));
                 }
                 None => {
-                    inputs_with_axes.push((tracer, physical_type, BatchAxis::replicated()));
+                    inputs_with_axes.push((input, input_type, BatchAxis::replicated()));
                 }
             }
         }
-        let resolved_axis_size = resolved_axis_size.ok_or(BatchingError::EmptyBatch)?;
+        let resolved_axis_size = batch_size.ok_or(BatchingError::EmptyBatch)?;
 
-        let batching_context = BatchingContext::new(self.clone(), resolved_axis_size, axis.name().map(String::from));
+        let batching_context =
+            BatchingContext::new(self.clone(), resolved_axis_size, batch_axis.name().map(String::from));
 
         // Pack each input parent value with its mapped batch axis at its physical type. A value already produced by an
         // enclosing `batch` keeps that level's axis (its own [`BatchingTracer`] carries it), so nested maps thread
@@ -1092,27 +1064,28 @@ pub trait Batch: Context<Type = ArrayType> {
         let batched_output = function(batched_input)?;
 
         let output_structure = batched_output.parameter_structure();
-        // Broadcast the caller's `out_axes` into the output parameter structure, mirroring the `in_axes` handling
-        // above: a single `BatchAxis` leaf applies to every output, a matching structure gives one axis per leaf.
-        let out_axes_values = out_axes
+        // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
+        // `input_batch_axes` handling above: a single `BatchAxis` leaf applies to every output, and a matching
+        // structure gives one axis per leaf.
+        let output_batch_axis_values = output_batch_axes
             .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
             .into_parameters()
             .collect::<Vec<_>>();
 
-        // Realign each output's packed batch axis to the caller's `out_axes` and unwrap the parent tracer, which
-        // already carries any enclosing level's metadata, so nested `vmap` threads through with no side table.
+        // Realign each output's packed batch axis to the caller's `output_batch_axes` and unwrap the parent tracer,
+        // which already carries any enclosing level's metadata, so nested `vmap` threads through with no side table.
         let parent_outputs = batched_output
             .into_parameters()
-            .zip(out_axes_values.iter().map(|axis| axis.axis()))
+            .zip(output_batch_axis_values.iter().map(|axis| axis.axis()))
             .map(|(output, expected_axis)| -> Result<Self::Value, ProgramError> {
                 let batch = output.into_batch();
                 let natural_axis = batch.batch_axis().axis();
                 match (natural_axis, expected_axis) {
                     (None, None) => Ok(batch.into_value()),
-                    // The output's mapped-axis presence disagrees with the caller's `out_axes` declaration. Collapsing
-                    // a mapped output requires an explicit reduction inside the batched function, and materializing a
-                    // missing axis requires an explicit broadcast; position-only disagreements are repaired with the
-                    // staged transpose in the final arm.
+                    // The output's mapped-axis presence disagrees with the caller's `output_batch_axes` declaration.
+                    // Collapsing a mapped output requires an explicit reduction inside the batched function, and
+                    // materializing a missing axis requires an explicit broadcast; position-only disagreements are
+                    // repaired with the staged transpose in the final arm.
                     (None, Some(_)) | (Some(_), None) => Err(BatchingError::MismatchedOutputAxes {
                         expected: BatchAxis::from(expected_axis),
                         actual: BatchAxis::from(natural_axis),
@@ -1128,50 +1101,76 @@ pub trait Batch: Context<Type = ArrayType> {
     }
 }
 
-impl<C> Batch for C where C: Context<Type = ArrayType> {}
+impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
 
-// TODO(eaplatanios): Review this trait.
-// TODO(eaplatanios): This should have the main documentation and the docstring of `Batch::batch` should refer to this
-//  and not the other way around.
-/// Batches `function` over the mapped axes of `input`. This is a thin delegator to [`Batch::batch`] and is the analogue
-/// of [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html). Refer to the documentation of
-/// [`Batch::batch`] for more information on what it does and on its arguments.
+/// Batches `function` over the mapped axes of `input`, running it once over whole batches instead of once per batch
+/// item. This is the batching (i.e., vectorization) transform — the analogue of
+/// [JAX's `vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.vmap.html).
 ///
-/// Staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their batching level (so `batch` nests inside
-/// `batch`), JVP duals recover their differentiation context, and backend-concrete values recover the eager backend
-/// context they name through their own [`Value::ExecutionDomain`] declarations. Inputs with *no leaf values* are the
-/// one case this form cannot serve: with nothing to recover a context from, it returns [`BatchingError::EmptyBatch`]
-/// even when `axis` supplies an explicit batch size — call [`Batch::batch`] on an explicit context instead.
+/// The transform recovers a [`Context`] from the input's leaf values (through [`Value::ExecutionDomain`]), wraps it
+/// in a [`BatchingContext`], and runs `function` on [`BatchingTracer`] values, so every operation inside the closure
+/// is lifted through its [`BatchableOperation`] rule against the recovered context. This composes uniformly across
+/// the whole stack: an eager backend context interprets each batched operation immediately (concrete-value `vmap`),
+/// an active [`StagingContext`](crate::StagingContext) stages it into the enclosing trace, and a [`BatchingContext`]
+/// nests `vmap` inside `vmap` — each level's [`BatchingTracer`] carries its own batch axis, so nested maps thread
+/// through with no side table. Concretely, staged [`Tracer`]s recover their trace, [`BatchingTracer`]s recover their
+/// batching level, [differentiation duals](crate::tracing_v2::differentiation::DifferentiationTracer) recover their
+/// differentiation context, and backend-concrete values recover the eager backend domain they name. Inputs with *no
+/// leaf values* are the one case this form cannot serve: with nothing to recover a context from, it returns
+/// [`BatchingError::EmptyBatch`] even when `batch_axis` supplies an explicit batch size — use [`Batch::batch`] on an
+/// explicit context instead.
+///
+/// `input_batch_axes` selects the mapped axis of each input leaf and `output_batch_axes` the position of the mapped
+/// axis in each output leaf. Both are [`Parameterized`] values over [`BatchAxis`] leaves that are broadcast into the
+/// corresponding parameter structure via [`Parameterized::broadcast_to_parameter_structure`]: a single [`BatchAxis`]
+/// applies to every leaf (the typed counterpart of JAX's `in_axes=0`), a value whose structure matches gives one
+/// axis per leaf, and a smaller compatible structure prefix-broadcasts. On the input side,
+/// [`BatchAxis::new(k)`](BatchAxis::new) maps the leaf on axis `k` of its physical type, while
+/// [`BatchAxis::replicated`] shares the leaf unchanged across the batch. On the output side,
+/// [`BatchAxis::new(k)`](BatchAxis::new) requests the mapped axis at position `k` (an explicit transpose is staged
+/// when the natural output axis differs), while [`BatchAxis::replicated`] declares the output replicated (e.g., a
+/// value produced from replicated inputs without any per-item work) — collapsing a genuinely mapped output instead
+/// requires an explicit reduction inside `function`.
+///
+/// When at least one input is mapped, the batch size is inferred from those inputs. The `batch_axis` argument
+/// accepts anything convertible to a [`BatchAxisSpecification`] and can supply an explicit batch size — either to
+/// pin the inferred size or to drive a fully-replicated `batch` whose batch size would otherwise be unobservable —
+/// as well as an axis name that collective operations (e.g., `psum`, `pmean`, and `pmax`) inside `function` can
+/// address.
+///
+/// # Parameters
+///
+///   - `function`: Closure mapped over the batch, running on [`BatchingTracer`] values.
+///   - `input`: [`Parameterized`] input whose leaf values the closure is mapped over.
+///   - `input_batch_axes`: [`BatchAxis`] selection for the input leaves, broadcast into the input's structure.
+///   - `output_batch_axes`: [`BatchAxis`] selection for the output leaves, broadcast into the output's structure.
+///   - `batch_axis`: [`BatchAxisSpecification`] carrying an optional explicit batch size and an optional axis name.
 pub fn batch<V, F, I, O, InputBatchAxes, OutputBatchAxes, S: Into<BatchAxisSpecification>>(
     function: F,
     input: I,
-    in_axes: InputBatchAxes,
-    out_axes: OutputBatchAxes,
-    axis: S,
+    input_batch_axes: InputBatchAxes,
+    output_batch_axes: OutputBatchAxes,
+    batch_axis: S,
 ) -> Result<O::To<V>, BatchingError>
 where
     V: Value<Type = ArrayType> + Transpose,
-    V::ExecutionDomain: Context<Type = ArrayType>,
+    V::ExecutionDomain: Context,
     InputBatchAxes: Parameterized<BatchAxis>,
     OutputBatchAxes: Parameterized<BatchAxis>,
     I: Parameterized<
             V,
-            ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::ExecutionDomain>>,
         >,
     O: Parameterized<
             BatchingTracer<V::ExecutionDomain>,
-            ParameterStructure: Debug + PartialEq,
             Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
         >,
-    I::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = I::ParameterStructure>,
-    O::To<BatchAxis>: Parameterized<BatchAxis, ParameterStructure = O::ParameterStructure>,
     F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
 {
     let Some(context) = input.parameters().next().map(Value::execution_domain) else {
         return Err(BatchingError::EmptyBatch);
     };
-    context.batch(function, input, in_axes, out_axes, axis)
+    context.batch(function, input, input_batch_axes, output_batch_axes, batch_axis)
 }
 
 #[cfg(test)]
