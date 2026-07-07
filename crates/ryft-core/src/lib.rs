@@ -54,7 +54,7 @@ pub use partial::{
 pub use programs::{
     Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value,
 };
-pub use scalars::{Scalar, ScalarDomain};
+pub use scalars::Scalar;
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
 pub use tracing_v2::differentiation::{

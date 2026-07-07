@@ -2,7 +2,7 @@ use crate::operations::arithmetic::MulOperation;
 use crate::parameters::Placeholder;
 use crate::programs::ProgramBuilder;
 use crate::scalars::Scalar;
-use crate::tests::{TestArray, TestArrayDomain};
+use crate::tests::TestArray;
 use crate::tracing_v2::ArrayOperation;
 use crate::types::{ArrayType, DataType, Typed};
 
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn test_jacfwd_batches_basis_tangents() {
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn test_jacrev_batches_basis_cotangents() {
         let jacobian = jacrev(
-            &TestArrayDomain,
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
             (TestArray::scalar(2.0), TestArray::scalar(3.0)),
         )
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_jacfwd_iter_blocks_yields_each_output_input_pair() {
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_hessian_accepts_original_scalar_function() {
-        let hessian = TestArrayDomain
+        let hessian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .hessian(|(x, y)| x.clone() * y + x.sin().unwrap(), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
             .unwrap();
 
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_jacfwd_handles_function_with_independent_outputs() {
         // f(x, y) = (x*y + sin(x), y, x + y) — output[1] is independent of x.
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 |(x, y)| Ok((x.clone() * y.clone() + x.sin()?, y.clone(), x + y)),
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
@@ -409,7 +409,7 @@ mod tests {
         // replicated pullback inputs) through BatchableOperation::batch — exercise that path explicitly via a
         // dot-based scalar function. f(x, y) = x · y (inner product) so ∂f/∂x = y and ∂f/∂y = x.
         let jacobian = jacrev(
-            &TestArrayDomain,
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
             (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
         )
@@ -428,7 +428,7 @@ mod tests {
         // jacfwd linearizes the function once, then replays all input-coordinate basis tangents through the
         // pushforward in one batched pass. A dot-product scalar output exercises captured-factor (product-rule)
         // linear maps instead of only elementwise tangent arithmetic.
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 |(x, y)| Ok(x.dot(&y, &DotDimensionNumbers::inner_product())),
                 (TestArray::vector(vec![2.0, 3.0, 5.0]), TestArray::vector(vec![7.0, 11.0, 13.0])),
@@ -588,7 +588,12 @@ mod tests {
         // `f(x) = x + zero_like(x)` is functionally the identity, but exercises the
         // `ZeroLikeOperation` rule through `jacrev`'s internal Jacobian batching path. Verifies
         // that the constant-op rule composes cleanly with reverse-mode autodiff.
-        let jacobian = jacrev(&TestArrayDomain, |x| Ok(x.clone() + x.zero_like()), TestArray::scalar(2.0)).unwrap();
+        let jacobian = jacrev(
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            |x| Ok(x.clone() + x.zero_like()),
+            TestArray::scalar(2.0),
+        )
+        .unwrap();
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 0) / dx = 1 at the scalar point.
@@ -599,7 +604,9 @@ mod tests {
     fn test_jacfwd_through_function_using_one_like() {
         // `f(x) = x + one_like(x)` shifts x by a constant; the Jacobian is still 1. Exercises
         // `OneLikeOperation` through jacfwd's internal batching.
-        let jacobian = TestArrayDomain.jacfwd(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0)).unwrap();
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .jacfwd(|x| Ok(x.clone() + x.one_like()), TestArray::scalar(2.0))
+            .unwrap();
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 1) / dx = 1.
@@ -629,11 +636,15 @@ mod tests {
     fn test_condition_composes_with_jacrev_and_jacfwd() {
         // The constant `true` predicate selects the scale-by-2 branch, so both autodiff transforms must report a
         // derivative of 2 by linearizing the selected branch through the `ArrayOperation::Condition` JVP dispatch.
-        let jacobian =
-            jacrev(&TestArrayDomain, |x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0)).unwrap();
+        let jacobian = jacrev(
+            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            |x| Ok(stage_constant_predicate_condition(x)),
+            TestArray::scalar(4.0),
+        )
+        .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 2.0);
 
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0))
             .unwrap();
         assert_close(jacobian.rows().partials().values()[0], 2.0);
@@ -672,7 +683,7 @@ mod tests {
         // forward-mode derivative is 2^3 = 8. Exercises the `ArrayOperation::While` JVP dispatch in an eager domain:
         // the rule stages the doubled-state linear loop, which direct JVP execution interprets immediately.
         let while_operation = doubling_while_operation();
-        let (primal, tangent) = TestArrayDomain
+        let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |x| {
                     let mut outputs =
@@ -694,7 +705,7 @@ mod tests {
         // interpreted over the value-level batching rules, so the linear while runs once over the stacked
         // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
         let while_operation = doubling_while_operation();
-        let jacobian = TestArrayDomain
+        let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 move |x| {
                     let mut outputs =
@@ -714,7 +725,7 @@ mod tests {
         // only truncates once it is reached). The straight-line pushforward transposes, and locally `f(x) = 8 x`, so
         // the value is 8 and the gradient is 8.
         let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
-        let (value, gradient) = TestArrayDomain
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_grad(
                 move |x| {
                     let mut outputs =
@@ -735,7 +746,7 @@ mod tests {
         // `f(x) = 8 x`, so the value is 8 and the gradient is 8. JAX cannot do this even under eager execution,
         // because it always traces `while_loop`.
         let while_operation = doubling_while_operation();
-        let (value, gradient) = TestArrayDomain
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_grad(
                 move |x| {
                     let mut outputs =
@@ -756,7 +767,7 @@ mod tests {
         // straight-line pushforward into a reusable pullback (no `while` remains). The loop is locally `f(x) = 8 x`,
         // so every output cotangent is scaled by 8.
         let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
-        let (output, pullback, residuals) = TestArrayDomain
+        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -792,7 +803,7 @@ mod tests {
         // Eager `vjp` transposes the unrolled straight-line pushforward of an *unbounded* loop into a reusable
         // pullback: the doubling loop at `x = 1` is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
         let while_operation = doubling_while_operation();
-        let (output, pullback, residuals) = TestArrayDomain
+        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -852,7 +863,7 @@ mod tests {
         // (same residual stacks, `reverse` flipped) — the static trip count is what makes this total, where the
         // staged linear `while` rejects transposition.
         let scan = product_scan_operation(false);
-        let (value, (init_gradient, xs_gradient)) = TestArrayDomain
+        let (value, (init_gradient, xs_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_grad(
                 move |(init, xs)| {
                     let mut outputs =
@@ -873,7 +884,7 @@ mod tests {
         // scan: the same residual stacks with `reverse` flipped to `true`. Each cotangent seed scales the
         // hand-computed gradients `(24, [12, 8, 6])`.
         let scan = product_scan_operation(false);
-        let (output, pullback, residuals) = TestArrayDomain
+        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -908,7 +919,7 @@ mod tests {
         // product has `ys = [x0 x1 x2, x1 x2, x2] = [24, 12, 4]`, so a unit tangent on `x1` gives
         // `dys = [x0 x2, x2, 0] = [8, 4, 0]`.
         let scan = product_scan_operation(true);
-        let ((carry, ys), (carry_tangent, ys_tangent)) = TestArrayDomain
+        let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -928,7 +939,7 @@ mod tests {
         // Reverse mode through the reversed scan flips `reverse` back to `false` in the pullback and produces the
         // same product-rule gradients (multiplication commutes across the visit order).
         let scan = product_scan_operation(true);
-        let (output, pullback, residuals) = TestArrayDomain
+        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -968,7 +979,7 @@ mod tests {
         // transpose rule: the pullback runs the transposed branch program selected by the captured predicate, so
         // the operand cotangent is 2 * output cotangent at a TRUE-predicate primal point and 3 * output cotangent
         // at a FALSE one. The Boolean predicate has no tangent space, so its cotangent slot is always zero.
-        let (output, pullback, residuals) = TestArrayDomain
+        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 |(predicate, operand)| {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
@@ -987,7 +998,7 @@ mod tests {
         assert_eq!(cotangents[1].values, vec![10.0]);
         assert_eq!(cotangents[0].values, vec![0.0]);
 
-        let (output, pullback, residuals) = TestArrayDomain
+        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 |(predicate, operand)| {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;

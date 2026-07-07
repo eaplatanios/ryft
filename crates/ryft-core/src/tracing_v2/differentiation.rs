@@ -12,13 +12,13 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::MaybeWhile;
+use crate::operations::scalars::ScalarOperation;
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialValue, PartiallyEvaluatableOperation,
     PartitionedProgram,
 };
-use crate::operations::scalars::ScalarOperation;
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
 use crate::scalars::Scalar;
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
@@ -276,94 +276,11 @@ pub trait DifferentiationContext: Context {
         Ok((output, tangent_output))
     }
 
-    /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by interpreting
-    /// the primal program **operation by operation** under a [`JvpContext`] wrapping this context, without ever
-    /// building a fused JVP program.
-    ///
-    /// This is the interleaved sibling of [`jvp`](Self::jvp): where `jvp` replays every instruction's
-    /// [`DifferentiableOperation`] rule into a combined program and then interprets that program at
-    /// `(primals ++ tangents)`, this entry point walks the primal program once with [`JvpTracer`] duals as the
-    /// flowing values, dispatching each instruction's rule against this context directly. In an eager context the
-    /// primal and tangent values are therefore computed concretely as the walk proceeds (the analogue of
-    /// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) interpreter), and in a staging
-    /// context the rules stage both computations into the enclosing trace. Structural zero tangents stay symbolic
-    /// between rules and are materialized through this context's [`Zero`] capability only at the output boundary.
-    /// As in [`jvp`](Self::jvp), concretizable `while` loops are unrolled at the concrete primals first in eager
-    /// contexts.
-    fn jvp_interleaved<F, Input, TracedOutput>(
-        &self,
-        function: F,
-        primals: Input,
-        tangents: Input::To<Self::Tangent>,
-    ) -> Result<(TracedOutput::To<<Self as Domain>::Value>, TracedOutput::To<Self::Tangent>), ProgramError>
-    where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value> + Zero<<Self as Domain>::Value>,
-        <Self as Domain>::Value: BooleanLike,
-        <Self as Domain>::Constant: Clone,
-        <Self as Domain>::Operation: Clone
-            + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
-            + From<ZeroOperation<<Self as Domain>::Type>>
-            + DifferentiableOperation<Self>,
-        F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> TracedOutput,
-        Input: Parameterized<
-                <Self as Domain>::Value,
-                To<<Self as Domain>::Value> = Input,
-                Family: ParameterizedFamily<Tracer<NestedTracingContext<Self>>> + ParameterizedFamily<Self::Tangent>,
-                ParameterStructure: Debug + PartialEq,
-            >,
-        TracedOutput: Parameterized<
-                Tracer<NestedTracingContext<Self>>,
-                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
-            >,
-    {
-        let tangent_structure = tangents.parameter_structure();
-        let primal_structure = primals.parameter_structure();
-        let (program, _input_structure, output_structure, input_values) =
-            self.trace_into_primal_program::<_, Input, TracedOutput>(|input| Ok(function(input)), primals)?;
-
-        // Eager domains unroll any concretizable `while` loop at the concrete primals first, exactly as in `jvp`, so
-        // unbounded / data-dependent loops differentiate through the capture-free rules.
-        let program = unroll_concretizable_whiles(self, program, input_values.clone())?;
-
-        // Structure-check the tangents against the primals before pairing them into duals. `Tangent` equals `Value`,
-        // so each dual carries an ordinary domain value on both sides.
-        if tangent_structure != primal_structure {
-            return Err(ParameterError::MismatchedParameterStructures {
-                left_structure: format!("{primal_structure:?}"),
-                right_structure: format!("{tangent_structure:?}"),
-            }
-            .into());
-        }
-        let duals = input_values
-            .into_iter()
-            .zip(tangents.into_parameters())
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
-            .collect::<Vec<_>>();
-
-        // Walk the primal program once under the interleaving context: each instruction dispatches its rule against
-        // this context, and constants lift with structural zero tangents. The walk emits one output dual per primal
-        // output, whose tangent halves are materialized through this context's `Zero` capability.
-        let jvp_context = JvpContext::new(self.clone());
-        let output_duals = replay_via_bind(&jvp_context, &program, duals)?;
-        let mut primal_outputs = Vec::with_capacity(output_duals.len());
-        let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-        for dual in output_duals {
-            let JvpTracer { primal, tangent, .. } = dual;
-            tangent_outputs.push(materialize(self, tangent)?);
-            primal_outputs.push(primal);
-        }
-        let output =
-            TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
-        let tangent_output = TracedOutput::To::<Self::Tangent>::from_parameters(output_structure, tangent_outputs)?;
-
-        Ok((output, tangent_output))
-    }
-
     /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the
     /// closure **directly on [`JvpTracer`] duals**, without tracing a primal [`Program`] first.
     ///
-    /// This is the concrete-in-closure sibling of [`jvp_interleaved`](Self::jvp_interleaved): rather than trace the
-    /// closure into a primal program and then walk it with duals, it wraps each input as a dual over a [`JvpContext`]
+    /// This is the concrete-in-closure sibling of [`jvp`](Self::jvp): rather than trace the closure into a primal
+    /// program and replay differentiation rules over it, it wraps each input as a dual over a [`JvpContext`]
     /// and calls `function` on those duals. Each operation the closure performs (`x.sin()`, `x * y`, …) dispatches
     /// through the dual's stamped context via [`Context::bind`], applying the operation's
     /// [`jvp`](DifferentiableOperation::jvp) rule. Over an **eager** inner context both components are concrete, so the
@@ -1932,11 +1849,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
-    use crate::scalars::{Scalar, ScalarOperation};
+    use crate::scalars::Scalar;
     use crate::tracing_v2::test_util::assert_scalar_close;
 
     use super::DifferentiationContext;
+    use crate::contexts::EagerContext;
 
     #[test]
     fn test_nested_value_and_grad_computes_the_analytic_second_derivative() {

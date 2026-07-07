@@ -5,11 +5,12 @@ use std::fmt::Display;
 use half::{bf16, f16};
 use ryft_macros::Parameter;
 
-use crate::contexts::{Context, Domain, EagerContext, ValueResolution};
-use crate::interpretation::InterpretableOperation;
+#[cfg(test)]
+use crate::contexts::Context;
+use crate::contexts::EagerContext;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
-use crate::operations::constants::{Constant, One, OneLike, Zero, ZeroLike};
+use crate::operations::constants::{One, OneLike, Zero, ZeroLike};
 use crate::operations::control_flow::{Select, SelectCondition, WhilePredicate};
 use crate::operations::differentiation::StopGradient;
 use crate::operations::scalars::ScalarOperation;

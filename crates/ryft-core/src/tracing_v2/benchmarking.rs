@@ -523,7 +523,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
-    use crate::scalars::{Scalar, ScalarDomain};
+    use crate::scalars::Scalar;
     use crate::types::DataType;
 
     use super::*;
@@ -531,7 +531,7 @@ mod tests {
     /// Summarizes a small scalar program and verifies the structural metrics.
     #[test]
     fn test_summarize_program_counts_constants_and_depth() {
-        let domain = ScalarDomain::new();
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (_, compiled): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Scalar, Scalar>) = domain
             .interpret_and_trace(
                 |x| {

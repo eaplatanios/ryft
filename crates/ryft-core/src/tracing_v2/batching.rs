@@ -15,7 +15,7 @@ impl<C: Context<Type = ArrayType>> BatchingContext<C> {
     /// eager parent, staging under a live trace).
     ///
     /// This only requires the program's own operation family `O` to be batchable; it deliberately does not require the
-    /// enclosing context's [`Operation`](Domain::Operation) to be batchable, so higher-order batching rules can replay
+    /// enclosing context's [`Operation`](DispatchDomain::Operation) to be batchable, so higher-order batching rules can replay
     /// a captured sub-program through a [`BatchingContext`] whose [`Context`] impl is not yet in scope.
     pub(crate) fn interpret_program<O>(
         &self,

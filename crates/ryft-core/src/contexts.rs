@@ -450,7 +450,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::{Scalar};
+    use crate::scalars::Scalar;
     use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
 
