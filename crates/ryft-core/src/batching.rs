@@ -1020,61 +1020,50 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
             .into_parameters()
             .collect::<Vec<_>>();
 
-        // TODO(eaplatanios): Review from here onwards.
+        // Pack each input parent value with its mapped batch axis at its physical type ([`ArrayBatch::new`] validates
+        // that each mapped axis is in bounds). A value already produced by an enclosing `batch` keeps that level's
+        // axis (its own [`BatchingTracer`] carries it), and so nested maps thread through with no side table. Fresh
+        // inputs simply flow the receiver's own value representation.
+        let inputs = inputs
+            .into_iter()
+            .zip(input_batch_axes)
+            .map(|(input, input_batch_axis)| ArrayBatch::new(input.r#type().into_owned(), input, input_batch_axis))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let mut batch_size = batch_axis.size();
-        let mut inputs_with_axes = Vec::with_capacity(inputs.len());
-        for (input, input_batch_axis) in inputs.into_iter().zip(input_batch_axes.iter().copied()) {
-            let input_type = input.r#type().into_owned();
-            match input_batch_axis.axis() {
-                Some(position) => {
-                    let Some(size) = input_type.dimension(position as isize).value() else {
-                        return Err(BatchingError::DynamicBatchAxis { r#type: input_type, axis: position }.into());
-                    };
-                    match batch_size {
-                        Some(expected) if expected != size => {
-                            return Err(BatchingError::MismatchedBatchSizes { expected, actual: size }.into());
-                        }
-                        Some(_) => {}
-                        None => batch_size = Some(size),
-                    }
-                    inputs_with_axes.push((input, input_type, BatchAxis::new(position)));
-                }
-                None => {
-                    inputs_with_axes.push((input, input_type, BatchAxis::replicated()));
-                }
+        // The batch size is the explicit `batch_axis` size when one is provided and the common size of the mapped
+        // inputs otherwise. The two must agree when both are present, and at least one of them must pin the size.
+        let batch_size = match (batch_axis.size(), ArrayBatch::common_batch_size(&inputs)?) {
+            (Some(explicit_size), Some(common_size)) if explicit_size != common_size => {
+                return Err(BatchingError::MismatchedBatchSizes { expected: explicit_size, actual: common_size });
             }
-        }
-        let resolved_axis_size = batch_size.ok_or(BatchingError::EmptyBatch)?;
+            (explicit_size, common_size) => explicit_size.or(common_size).ok_or(BatchingError::EmptyBatch)?,
+        };
 
-        let batching_context =
-            BatchingContext::new(self.clone(), resolved_axis_size, batch_axis.name().map(String::from));
-
-        // Pack each input parent value with its mapped batch axis at its physical type. A value already produced by an
-        // enclosing `batch` keeps that level's axis (its own [`BatchingTracer`] carries it), so nested maps thread
-        // through with no side table; a fresh input simply flows the receiver's own value representation.
-        let mut batched_input_values = Vec::with_capacity(inputs_with_axes.len());
-        for (parent_value, physical_type, batch_axis) in inputs_with_axes {
-            let batch = ArrayBatch::new(physical_type, parent_value, batch_axis)?;
-            batched_input_values.push(BatchingTracer::new(batching_context.clone(), batch));
-        }
-        let batched_input = I::To::<BatchingTracer<Self>>::from_parameters(input_structure, batched_input_values)?;
-        // Binds inside the closure fold through the receiver directly: an eager context interprets each immediately,
+        // Create a `BatchingContext`, construct the batched function input, and invoke the function with it. Binds
+        // inside the closure fold through the receiver directly and so, an eager context interprets each immediately,
         // while a staging context stages it into the enclosing trace, whose own drain surfaces any deferred error.
-        let batched_output = function(batched_input)?;
+        let context = BatchingContext::new(self.clone(), batch_size, batch_axis.name().map(String::from));
+        let inputs = inputs
+            .into_iter()
+            .map(|batch| BatchingTracer::new(context.clone(), batch))
+            .collect::<Vec<_>>();
+        let input = I::To::<BatchingTracer<Self>>::from_parameters(input_structure, inputs)?;
+        let output = function(input)?;
 
-        let output_structure = batched_output.parameter_structure();
         // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
-        // `input_batch_axes` handling above: a single `BatchAxis` leaf applies to every output, and a matching
+        // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
         // structure gives one axis per leaf.
+        let output_structure = output.parameter_structure();
         let output_batch_axis_values = output_batch_axes
             .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
             .into_parameters()
             .collect::<Vec<_>>();
 
+        // TODO(eaplatanios): Review from here onwards.
+        
         // Realign each output's packed batch axis to the caller's `output_batch_axes` and unwrap the parent tracer,
         // which already carries any enclosing level's metadata, so nested `vmap` threads through with no side table.
-        let parent_outputs = batched_output
+        let parent_outputs = output
             .into_parameters()
             .zip(output_batch_axis_values.iter().map(|axis| axis.axis()))
             .map(|(output, expected_axis)| -> Result<Self::Value, ProgramError> {
@@ -1102,6 +1091,8 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
 }
 
 impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Batches `function` over the mapped axes of `input`, running it once over whole batches instead of once per batch
 /// item. This is the batching (i.e., vectorization) transform — the analogue of
