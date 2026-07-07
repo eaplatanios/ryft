@@ -23,9 +23,9 @@ pub fn value_and_grad<C, F, Input>(
     context: &C,
     function: F,
     primals: Input,
-) -> Result<(<C as Domain>::Value, Input::To<C::Tangent>), DifferentiationError>
+) -> Result<(<C as Domain>::Value, Input::To<<C as Domain>::Value>), DifferentiationError>
 where
-    C: DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: DifferentiationContext,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> NestedTracer<C>,
@@ -35,7 +35,7 @@ where
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-    C: One<C::Tangent>,
+    C: One<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<<C as Domain>::Value, C>
@@ -60,8 +60,8 @@ where
     let mut pullback_inputs = vec![context.one(output.r#type().as_ref())?];
     pullback_inputs.extend(residuals);
     let input_cotangents = pullback.interpret_in_context(context, pullback_inputs)?;
-    let gradient =
-        Input::To::<C::Tangent>::from_parameters(input_structure, input_cotangents).map_err(ProgramError::from)?;
+    let gradient = Input::To::<<C as Domain>::Value>::from_parameters(input_structure, input_cotangents)
+        .map_err(ProgramError::from)?;
     Ok((output, gradient))
 }
 
@@ -76,9 +76,9 @@ pub fn grad<C, F, Input>(
     context: &C,
     function: F,
     primals: Input,
-) -> Result<Input::To<C::Tangent>, DifferentiationError>
+) -> Result<Input::To<<C as Domain>::Value>, DifferentiationError>
 where
-    C: DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: DifferentiationContext,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> NestedTracer<C>,
@@ -88,7 +88,7 @@ where
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-    C: One<C::Tangent>,
+    C: One<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<<C as Domain>::Value, C>
@@ -115,9 +115,9 @@ pub fn value_and_grad_with_aux<C, F, Input, Aux>(
     context: &C,
     function: F,
     primals: Input,
-) -> Result<((<C as Domain>::Value, Aux), Input::To<C::Tangent>), DifferentiationError>
+) -> Result<((<C as Domain>::Value, Aux), Input::To<<C as Domain>::Value>), DifferentiationError>
 where
-    C: DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: DifferentiationContext,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> (NestedTracer<C>, Aux::To<NestedTracer<C>>),
@@ -137,7 +137,7 @@ where
             To<<C as Domain>::Value> = (<C as Domain>::Value, Aux),
             Family: ParameterizedFamily<<C as Domain>::Value>,
         >,
-    C: One<C::Tangent> + Zero<C::Tangent>,
+    C: One<<C as Domain>::Value> + Zero<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<<C as Domain>::Value, C>
@@ -147,7 +147,7 @@ where
         + From<AddOperation>
         + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
-    Input::Family: ParameterizedFamily<C::Tangent>,
+    Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     Aux: Parameterized<<C as Domain>::Value, To<<C as Domain>::Value> = Aux>,
 {
     let input_structure = primals.parameter_structure();
@@ -169,8 +169,8 @@ where
     }
     pullback_inputs.extend(residuals);
     let input_cotangents = pullback.interpret_in_context(context, pullback_inputs)?;
-    let gradient =
-        Input::To::<C::Tangent>::from_parameters(input_structure, input_cotangents).map_err(ProgramError::from)?;
+    let gradient = Input::To::<<C as Domain>::Value>::from_parameters(input_structure, input_cotangents)
+        .map_err(ProgramError::from)?;
     Ok(((output, aux), gradient))
 }
 
@@ -184,9 +184,9 @@ pub fn grad_with_aux<C, F, Input, Aux>(
     context: &C,
     function: F,
     primals: Input,
-) -> Result<(Input::To<C::Tangent>, Aux), DifferentiationError>
+) -> Result<(Input::To<<C as Domain>::Value>, Aux), DifferentiationError>
 where
-    C: DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: DifferentiationContext,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
     <C as Domain>::Value: BooleanLike,
     F: FnOnce(Input::To<NestedTracer<C>>) -> (NestedTracer<C>, Aux::To<NestedTracer<C>>),
@@ -206,7 +206,7 @@ where
             To<<C as Domain>::Value> = (<C as Domain>::Value, Aux),
             Family: ParameterizedFamily<<C as Domain>::Value>,
         >,
-    C: One<C::Tangent> + Zero<C::Tangent>,
+    C: One<<C as Domain>::Value> + Zero<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<<C as Domain>::Value, C>
@@ -216,7 +216,7 @@ where
         + From<AddOperation>
         + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
-    Input::Family: ParameterizedFamily<C::Tangent>,
+    Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     Aux: Parameterized<<C as Domain>::Value, To<<C as Domain>::Value> = Aux>,
 {
     value_and_grad_with_aux(context, function, primals).map(|((_, aux), gradient)| (gradient, aux))

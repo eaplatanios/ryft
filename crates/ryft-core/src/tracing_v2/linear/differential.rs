@@ -47,7 +47,7 @@ pub trait CoordinateValue: Value<Type = ArrayType> + ZeroLike + OneLike {
     /// [`ArrayType`]; the resulting value carries that type prefixed with `Size::Static(values.len())`
     /// on axis `0`. Used by `Differential::from_linearization` and [`jacrev`] to pack `N`
     /// per-basis-tangent values into one batched input that flows through the value-level
-    /// [`BatchableOperation::batch`] rule for `Tangent` values.
+    /// [`BatchableOperation::batch`] rule for tangent values.
     fn stack(values: Vec<Self>) -> Result<Self, ProgramError>;
 }
 
@@ -102,7 +102,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
     ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>, ProgramError>
     where
         Self: Domain<Type = ArrayType, Constant = DomainValue<Self>>
-            + DifferentiationContext<Tangent = DomainValue<Self>>,
+            + DifferentiationContext,
         DomainValue<Self>: CoordinateValue + BooleanLike + 'domain,
         Input: Parameterized<
                 DomainValue<Self>,
@@ -203,9 +203,7 @@ pub trait DifferentiableDomainExtension: Domain<Type = ArrayType> + Differentiat
         primals: Input,
     ) -> Result<Hessian<Input, DomainValue<Self>>, DifferentiationError>
     where
-        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>>
-            + DifferentiationContext<Tangent = DomainValue<Self>>
-            + 'static,
+        Self: Domain<Type = ArrayType, Constant = DomainValue<Self>> + DifferentiationContext + 'static,
         DomainValue<Self>: CoordinateValue + 'domain,
         Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<Tracer<NestedTracingContext<DomainTracingContext<Self>>>>
@@ -569,9 +567,9 @@ where
     ///   3. Assembles the per-(output-leaf, input-leaf) [`DifferentialBlock`]s from the resulting per-output coordinate
     ///      columns exactly as [`Self::from_pushforward`] does.
     ///
-    /// The front end requires the differentiation context's [`Tangent`](DifferentiationContext::Tangent) to equal
-    /// its [`Value`](DispatchDomain::Value), so the concrete residuals recovered from the primal replay are tangent-typed and
-    /// feed the tangent batch directly with no tangent-context bridging.
+    /// Tangents are ordinary [`Value`](DispatchDomain::Value)s of the same universe as the primals, so the concrete
+    /// residuals recovered from the primal replay are tangent-typed and feed the tangent batch directly with no
+    /// tangent-context bridging.
     ///
     /// # Parameters
     ///
@@ -589,7 +587,7 @@ where
     ) -> Result<Self, ProgramError>
     where
         S: Clone,
-        C: Domain<Type = ArrayType, Value = V> + DifferentiationContext<Tangent = V>,
+        C: Domain<Type = ArrayType, Value = V> + DifferentiationContext,
         V: CoordinateValue<Coordinate = S>,
         Input:
             Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
@@ -856,16 +854,16 @@ pub fn jacrev<C, F, Input, TracedOutput>(
     primals: Input,
 ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<C>>, DomainValue<C>>, ProgramError>
 where
-    C: Domain<Type = ArrayType> + DifferentiationContext<Tangent = DomainValue<C>>,
+    C: Domain<Type = ArrayType> + DifferentiationContext,
     DomainValue<C>: CoordinateValue + BooleanLike,
     <C as Domain>::Constant: Value<Type = ArrayType>,
     Input: Parameterized<DomainValue<C>, To<DomainValue<C>> = Input, ParameterStructure: Debug + PartialEq>,
     TracedOutput: Parameterized<NestedTracer<C>, ParameterStructure: Debug + PartialEq>,
-    Input::Family: ParameterizedFamily<C::Tangent>
+    Input::Family: ParameterizedFamily<<C as Domain>::Value>
         + ParameterizedFamily<NestedTracer<C>>
         + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
     TracedOutput::Family: ParameterizedFamily<DomainValue<C>>
-        + ParameterizedFamily<C::Tangent>
+        + ParameterizedFamily<<C as Domain>::Value>
         + ParameterizedFamily<NestedTracer<C>>
         + ParameterizedFamily<
             DifferentialRow<
@@ -876,7 +874,7 @@ where
     TracedOutput::To<DomainValue<C>>: Parameterized<
             DomainValue<C>,
             To<DomainValue<C>> = TracedOutput::To<DomainValue<C>>,
-            To<C::Tangent> = TracedOutput::To<C::Tangent>,
+            To<<C as Domain>::Value> = TracedOutput::To<<C as Domain>::Value>,
             To<
                 DifferentialRow<
                     Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
@@ -902,7 +900,7 @@ where
         + PartiallyEvaluatableOperation<
             TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>,
         >,
-    EagerContext<C::Tangent, <C as Domain>::Operation>: Zero<C::Tangent>,
+    EagerContext<<C as Domain>::Value, <C as Domain>::Operation>: Zero<<C as Domain>::Value>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
@@ -912,7 +910,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
     let input_offsets = coordinate_offsets(&input_coordinate_counts);
-    let tangent_context = EagerContext::<C::Tangent, <C as Domain>::Operation>::new();
+    let tangent_context = EagerContext::<<C as Domain>::Value, <C as Domain>::Operation>::new();
     let tangent_input_parameters = input_parameters
         .iter()
         .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
@@ -934,7 +932,7 @@ where
         .map(|parameter| tangent_context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
     let mut batched_basis_parameters =
-        batched_standard_basis::<C::Tangent>(cotangent_parameters.as_slice(), batch_size)?;
+        batched_standard_basis::<<C as Domain>::Value>(cotangent_parameters.as_slice(), batch_size)?;
     // The direct-transpose pullback consumes `[output_cotangents ++ residuals]`. The residuals depend only on the
     // primal, so they are identical across all cotangent rows; feed them as replicated operands
     // appended after the per-item cotangent basis.
@@ -945,12 +943,16 @@ where
     } else {
         let batched_input = pullback.interpret_with(
             batched_basis_parameters,
-            |_, constant: &C::Tangent| Ok::<_, BatchingError>(ArrayBatch::replicated(constant.clone())),
-            |instruction, inputs: &[ArrayBatch<C::Tangent>]| {
+            |_, constant: &<C as Domain>::Value| Ok::<_, BatchingError>(ArrayBatch::replicated(constant.clone())),
+            |instruction, inputs: &[ArrayBatch<<C as Domain>::Value>]| {
                 batch_linear_program_instruction(instruction.operation(), inputs)
             },
         )?;
-        unstack_batched_coordinates::<C::Tangent>(batched_input, tangent_input_parameters.as_slice(), batch_size)?
+        unstack_batched_coordinates::<<C as Domain>::Value>(
+            batched_input,
+            tangent_input_parameters.as_slice(),
+            batch_size,
+        )?
     };
 
     let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());

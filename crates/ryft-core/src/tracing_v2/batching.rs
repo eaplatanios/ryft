@@ -52,11 +52,9 @@ where
 
 impl<C> DifferentiationContext for BatchingContext<C>
 where
-    C: Context<Type = ArrayType> + DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: Context<Type = ArrayType> + DifferentiationContext,
     C::Operation: BatchableOperation<<C as Domain>::Value, Self>,
 {
-    type Tangent = BatchingTracer<C>;
-
     /// A batched primal is valid exactly when the parent context accepts the value it packs.
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {

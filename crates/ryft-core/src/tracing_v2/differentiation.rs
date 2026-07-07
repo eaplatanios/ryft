@@ -61,8 +61,10 @@ pub enum DifferentiationError {
 /// A [`Context`] that additionally supports automatic differentiation, and the single entry point for its
 /// forward- and reverse-mode transforms.
 ///
-/// Implementors supply the differentiation hooks: a tangent value type ([`Tangent`](Self::Tangent)) and primal
-/// validation ([`validate_primal`](Self::validate_primal)). Predicate-capable operations such as `condition`,
+/// Implementors supply one differentiation hook: primal validation
+/// ([`validate_primal`](Self::validate_primal)). Tangents and cotangents are ordinary values of the same universe as
+/// the primals — [`Domain::Value`] — flowing through the same context (the descriptor-level tangent structure, such
+/// as cotangent types, lives on [`DifferentiableType`] instead). Predicate-capable operations such as `condition`,
 /// `while`, and `select` impose their own [`BooleanLike`] bounds through their operation-family implementations;
 /// tangent carriers themselves do not need to be Boolean-like just to participate in differentiation. Everything else
 /// an AD pass needs — the primal value/constant/operation types, applying an operation (`bind`), and lifting a
@@ -75,9 +77,6 @@ pub enum DifferentiationError {
 /// batching contexts) implement it; whether a transform runs eagerly or stages a program is decided by the context's
 /// [`DispatchDomain::Value`] (concrete vs [`Tracer`]), not by a separate trait.
 pub trait DifferentiationContext: Context {
-    /// Tangent value type staged in the active linear program.
-    type Tangent: Value<Type = Self::Type>;
-
     /// Validates that `primal` may be used as a primal input to an automatic-differentiation entry point in this
     /// context. Eager contexts accept any concrete value and use the default no-op. Staging contexts override this
     /// to verify that the input [`Tracer`] belongs to this context's
@@ -203,21 +202,21 @@ pub trait DifferentiationContext: Context {
         &self,
         function: F,
         primals: Input,
-        tangents: Input::To<Self::Tangent>,
-    ) -> Result<(Output::To<<Self as Domain>::Value>, Output::To<Self::Tangent>), ProgramError>
+        tangents: Input::To<<Self as Domain>::Value>,
+    ) -> Result<(Output::To<<Self as Domain>::Value>, Output::To<<Self as Domain>::Value>), ProgramError>
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value> + Zero<<Self as Domain>::Value>,
+        Self: Zero<<Self as Domain>::Value>,
         JvpContext<Self>: Context<Value = JvpTracer<Self>>,
         <Self as Domain>::Operation: Clone + DifferentiableOperation<Self>,
         F: FnOnce(Input::To<JvpTracer<Self>>) -> Result<Output, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
-                Family: ParameterizedFamily<JvpTracer<Self>> + ParameterizedFamily<Self::Tangent>,
+                Family: ParameterizedFamily<JvpTracer<Self>> + ParameterizedFamily<<Self as Domain>::Value>,
                 ParameterStructure: Debug + PartialEq,
             >,
         Output: Parameterized<
                 JvpTracer<Self>,
-                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<Self::Tangent>,
+                Family: ParameterizedFamily<<Self as Domain>::Value> + ParameterizedFamily<<Self as Domain>::Value>,
             >,
     {
         if primals.parameters().next().is_none() {
@@ -228,7 +227,7 @@ pub trait DifferentiationContext: Context {
         }
         let primal_structure = primals.parameter_structure();
         let tangent_structure = tangents.parameter_structure();
-        // `Tangent` equals `Value`, so each dual pairs an ordinary domain value on both sides.
+        // Tangents are ordinary domain values, so each dual pairs values of the same type on both sides.
         if tangent_structure != primal_structure {
             return Err(ParameterError::MismatchedParameterStructures {
                 left_structure: format!("{primal_structure:?}"),
@@ -260,7 +259,7 @@ pub trait DifferentiationContext: Context {
         }
         let primal_output =
             Output::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
-        let tangent_output = Output::To::<Self::Tangent>::from_parameters(output_structure, tangent_outputs)?;
+        let tangent_output = Output::To::<<Self as Domain>::Value>::from_parameters(output_structure, tangent_outputs)?;
 
         Ok((primal_output, tangent_output))
     }
@@ -290,7 +289,6 @@ pub trait DifferentiationContext: Context {
         ProgramError,
     >
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Operation: Clone
             + PartiallyEvaluatableOperation<Self>
@@ -402,7 +400,6 @@ pub trait DifferentiationContext: Context {
         ProgramError,
     >
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Type: DifferentiableType,
         <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Value: BooleanLike,
@@ -512,7 +509,6 @@ pub trait DifferentiationContext: Context {
         ProgramError,
     >
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Type: DifferentiableType,
         <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Value: BooleanLike,
@@ -547,9 +543,8 @@ pub trait DifferentiationContext: Context {
         &self,
         function: F,
         primals: Input,
-    ) -> Result<(<Self as Domain>::Value, Input::To<Self::Tangent>), DifferentiationError>
+    ) -> Result<(<Self as Domain>::Value, Input::To<<Self as Domain>::Value>), DifferentiationError>
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Type: DifferentiableType,
@@ -592,7 +587,7 @@ pub trait DifferentiationContext: Context {
         let mut pullback_inputs = vec![seeds.pop().unwrap()];
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret_in_context(self, pullback_inputs)?;
-        let gradient = Input::To::<Self::Tangent>::from_parameters(input_structure, input_cotangents)
+        let gradient = Input::To::<<Self as Domain>::Value>::from_parameters(input_structure, input_cotangents)
             .map_err(ProgramError::from)?;
         Ok((output, gradient))
     }
@@ -603,9 +598,8 @@ pub trait DifferentiationContext: Context {
         &self,
         function: F,
         primals: Input,
-    ) -> Result<Input::To<Self::Tangent>, DifferentiationError>
+    ) -> Result<Input::To<<Self as Domain>::Value>, DifferentiationError>
     where
-        Self: DifferentiationContext<Tangent = <Self as Domain>::Value>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Type: DifferentiableType,
@@ -631,8 +625,6 @@ pub trait DifferentiationContext: Context {
 }
 
 impl<V: Value, O: Operation<V::Type>, Capture> DifferentiationContext for TracingContext<V, O, Capture> {
-    type Tangent = Tracer<TracingContext<V, O, Capture>>;
-
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
         check_builders!(self.builder(), primal.context().builder()).map_err(|error| self.error(error))
@@ -640,8 +632,6 @@ impl<V: Value, O: Operation<V::Type>, Capture> DifferentiationContext for Tracin
 }
 
 impl<C: Context> DifferentiationContext for NestedTracingContext<C> {
-    type Tangent = Tracer<NestedTracingContext<C>>;
-
     #[inline]
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
         check_builders!(self.builder(), primal.context().builder()).map_err(|error| self.error(error))
@@ -649,9 +639,7 @@ impl<C: Context> DifferentiationContext for NestedTracingContext<C> {
 }
 
 /// The eager scalar domain differentiates eagerly with concrete [`Scalar`] tangents.
-impl DifferentiationContext for EagerContext<Scalar, ScalarOperation<Scalar>> {
-    type Tangent = Scalar;
-}
+impl DifferentiationContext for EagerContext<Scalar, ScalarOperation<Scalar>> {}
 
 /// A dual value: a primal value paired with its symbolic tangent, both flowing through the same [`Context`] `C`.
 ///
@@ -919,7 +907,6 @@ where
     C: Context + Zero<C::Value>,
     C::Operation: Clone + DifferentiableOperation<C>,
 {
-    type Tangent = JvpTracer<C>;
 }
 
 /// A zero synthesized inside a forward-mode context is independent of every differentiation input, so it is the
@@ -1616,10 +1603,9 @@ where
 /// in the primal operation family `<C as Domain>::Operation` over constants `<C as Domain>::Constant`, so a sub-program
 /// can be replayed exactly like the primal program: its constants are lifted with [`Context::lift`] and each
 /// instruction is bound with [`Context::bind`]. This gives the eager/staging duality for free — an eager `bind`
-/// computes the operation immediately, while a staging `bind` splices it into the active trace. Because every
-/// value-level differentiation context has [`Tangent`](DifferentiationContext::Tangent) equal to its
-/// [`Value`](DispatchDomain::Value), the tangent sub-program (whose leaves are tangents) is replayed through the same `bind`
-/// with no tangent-context bridging.
+/// computes the operation immediately, while a staging `bind` splices it into the active trace. Because tangents are
+/// ordinary [`Value`](DispatchDomain::Value)s of the same universe as the primals, the tangent sub-program (whose
+/// leaves are tangents) is replayed through the same `bind` with no tangent-context bridging.
 ///
 /// This is the plain-program sibling of [`PartialEvaluation::interpret`], which replays a partial-evaluation
 /// residual program by additionally wiring its residual-input feeders; both share the same
@@ -1719,7 +1705,7 @@ where
 /// The differentiation context `C` supplies the value semantics and operation family; `Input` is the closure's
 /// structured input type and `TracedOutput` its structured output type, whose
 /// [`ParameterStructure`](crate::parameters::Parameterized::ParameterStructure) is retained so the flat tangent outputs
-/// reshape back into `TracedOutput::To<C::Tangent>`. `Input` is carried as a type parameter so
+/// reshape back into `TracedOutput::To<<C as Domain>::Value>`. `Input` is carried as a type parameter so
 /// [`apply`](Self::apply) infers the tangent family from the linearization itself rather than requiring a turbofish.
 pub struct ForwardLinearization<C, Input, TracedOutput>
 where
@@ -1753,11 +1739,11 @@ where
 
 impl<C, Input, TracedOutput> ForwardLinearization<C, Input, TracedOutput>
 where
-    C: DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: DifferentiationContext,
     <C as Domain>::Operation: Clone,
-    Input: Parameterized<C::Tangent>,
+    Input: Parameterized<<C as Domain>::Value>,
     TracedOutput: Parameterized<<C as Domain>::Value>,
-    TracedOutput::Family: ParameterizedFamily<C::Tangent>,
+    TracedOutput::Family: ParameterizedFamily<<C as Domain>::Value>,
 {
     /// Pushes the structured tangents `tangents` through the linearized Jacobian, returning the tangent outputs.
     ///
@@ -1771,7 +1757,10 @@ where
     /// # Parameters
     ///
     ///   - `tangents`: Structured tangents at the linearization point, matching the closure's input structure.
-    pub fn apply(&self, tangents: Input::To<C::Tangent>) -> Result<TracedOutput::To<C::Tangent>, ProgramError> {
+    pub fn apply(
+        &self,
+        tangents: Input::To<<C as Domain>::Value>,
+    ) -> Result<TracedOutput::To<<C as Domain>::Value>, ProgramError> {
         let tangents = tangents.into_parameters().collect::<Vec<_>>();
         if tangents.len() != self.primal_input_count {
             return Err(ProgramError::InvalidInputCount { expected: self.primal_input_count, actual: tangents.len() });
@@ -1782,7 +1771,7 @@ where
         // program's outputs — the folded primal half followed by the tangent half — and `apply` returns the latter.
         let mut outputs = self.evaluation.interpret(&self.domain, tangents.as_slice())?;
         let tangent_values = outputs.split_off(self.primal_output_count);
-        Ok(TracedOutput::To::<C::Tangent>::from_parameters(self.output_structure.clone(), tangent_values)?)
+        Ok(TracedOutput::To::<<C as Domain>::Value>::from_parameters(self.output_structure.clone(), tangent_values)?)
     }
 }
 
@@ -1797,7 +1786,7 @@ where
 ///
 /// The differentiation context `C` supplies the value semantics and operation family; `Input` is the closure's
 /// structured input type, whose [`ParameterStructure`](crate::parameters::Parameterized::ParameterStructure) is retained
-/// so the flat input cotangents reshape back into `Input::To<C::Tangent>`. `TracedOutput` is the closure's structured
+/// so the flat input cotangents reshape back into `Input::To<<C as Domain>::Value>`. `TracedOutput` is the closure's structured
 /// output type, carried as a type parameter so [`apply`](Self::apply) infers the cotangent family from the pullback
 /// itself rather than requiring a turbofish.
 pub struct Pullback<C, Input, TracedOutput>
@@ -1824,12 +1813,12 @@ where
 
 impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>
 where
-    C: DifferentiationContext<Tangent = <C as Domain>::Value>,
+    C: DifferentiationContext,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<<C as Domain>::Value, EagerContext<<C as Domain>::Value, <C as Domain>::Operation>>,
     Input: Parameterized<<C as Domain>::Value>,
-    Input::Family: ParameterizedFamily<C::Tangent>,
-    TracedOutput: Parameterized<C::Tangent>,
+    Input::Family: ParameterizedFamily<<C as Domain>::Value>,
+    TracedOutput: Parameterized<<C as Domain>::Value>,
 {
     /// Pulls the structured output cotangents `cotangents` back to the closure's input cotangents.
     ///
@@ -1840,12 +1829,15 @@ where
     /// # Parameters
     ///
     ///   - `cotangents`: Structured output cotangents, matching the closure's output structure.
-    pub fn apply(&self, cotangents: TracedOutput::To<C::Tangent>) -> Result<Input::To<C::Tangent>, ProgramError> {
+    pub fn apply(
+        &self,
+        cotangents: TracedOutput::To<<C as Domain>::Value>,
+    ) -> Result<Input::To<<C as Domain>::Value>, ProgramError> {
         let mut inputs = cotangents.into_parameters().collect::<Vec<_>>();
         inputs.extend(self.residuals.iter().cloned());
         let context = EagerContext::<<C as Domain>::Value, <C as Domain>::Operation>::new();
         let input_cotangents = self.program.interpret_in_context(&context, inputs)?;
-        Ok(Input::To::<C::Tangent>::from_parameters(self.input_structure.clone(), input_cotangents)?)
+        Ok(Input::To::<<C as Domain>::Value>::from_parameters(self.input_structure.clone(), input_cotangents)?)
     }
 }
 

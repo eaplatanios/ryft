@@ -1057,9 +1057,7 @@ impl crate::tracing_v2::operations::reduce::Reduce for TestArray {
 
 /// The test backend's interpreting eager domain, `EagerContext<TestArray, ArrayOperation<TestArray>>`,
 /// differentiates eagerly with concrete [`TestArray`] tangents.
-impl DifferentiationContext for EagerContext<TestArray, ArrayOperation<TestArray>> {
-    type Tangent = TestArray;
-}
+impl DifferentiationContext for EagerContext<TestArray, ArrayOperation<TestArray>> {}
 
 #[cfg(test)]
 mod tests {
