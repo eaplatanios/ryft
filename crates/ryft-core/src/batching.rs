@@ -393,6 +393,28 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         if self.batch_axis().is_replicated() { self.broadcast(axis, axis_size) } else { self.move_axis(axis) }
     }
 
+    /// Returns a copy of this [`ArrayBatch`] with its batch axis aligned to the provided `batch_axis`, staging a
+    /// transpose via [`Self::move_axis`] when only the mapped position differs. This is the *strict* counterpart of
+    /// [`match_axis`](Self::match_axis): the declared axis must agree with the packed axis on presence, because
+    /// changing presence has no implicit meaning at a declaration boundary (collapsing a mapped value requires an
+    /// explicit reduction and materializing a missing axis requires an explicit broadcast) so a presence disagreement
+    /// surfaces as a [`BatchingError::MismatchedOutputAxes`]. [`Batch::batch`] uses this function to realign each
+    /// output to the caller's declared `output_batch_axes`.
+    #[inline]
+    pub fn align_axis(&self, batch_axis: BatchAxis) -> Result<Self, BatchingError>
+    where
+        V: Transpose,
+    {
+        match (self.batch_axis().axis(), batch_axis.axis()) {
+            (None, None) => Ok(self.clone()),
+            (Some(_), Some(expected)) => self.move_axis(expected),
+            (actual, expected) => Err(BatchingError::MismatchedOutputAxes {
+                expected: BatchAxis::from(expected),
+                actual: BatchAxis::from(actual),
+            }),
+        }
+    }
+
     /// Returns the [`ShardingDimension`] to place on the batch axis that batching introduces in each output, derived
     /// from how the provided batched inputs shard their own batch axis. Every input that is actually mapped on a batch
     /// axis and carries a [`Sharding`](crate::Sharding) contributes the [`ShardingDimension`] of that axis. Replicated
@@ -1020,9 +1042,9 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
             .into_parameters()
             .collect::<Vec<_>>();
 
-        // Pack each input parent value with its mapped batch axis at its physical type ([`ArrayBatch::new`] validates
+        // Pack each input parent value with its mapped batch axis at its physical type (`ArrayBatch::new` validates
         // that each mapped axis is in bounds). A value already produced by an enclosing `batch` keeps that level's
-        // axis (its own [`BatchingTracer`] carries it), and so nested maps thread through with no side table. Fresh
+        // axis (its own `BatchingTracer` carries it), and so nested maps thread through with no side table. Fresh
         // inputs simply flow the receiver's own value representation.
         let inputs = inputs
             .into_iter()
@@ -1043,10 +1065,7 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
         // inside the closure fold through the receiver directly and so, an eager context interprets each immediately,
         // while a staging context stages it into the enclosing trace, whose own drain surfaces any deferred error.
         let context = BatchingContext::new(self.clone(), batch_size, batch_axis.name().map(String::from));
-        let inputs = inputs
-            .into_iter()
-            .map(|batch| BatchingTracer::new(context.clone(), batch))
-            .collect::<Vec<_>>();
+        let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
         let input = I::To::<BatchingTracer<Self>>::from_parameters(input_structure, inputs)?;
         let output = function(input)?;
 
@@ -1059,32 +1078,15 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
             .into_parameters()
             .collect::<Vec<_>>();
 
-        // TODO(eaplatanios): Review from here onwards.
-        
         // Realign each output's packed batch axis to the caller's `output_batch_axes` and unwrap the parent tracer,
-        // which already carries any enclosing level's metadata, so nested `vmap` threads through with no side table.
+        // which already carries any enclosing level's metadata, so nested `batch` calls thread through with no side
+        // table. `ArrayBatch::align_axis` owns the boundary contract: position-only disagreements are repaired with a
+        // staged transpose, while presence disagreements surface as `MismatchedOutputAxes`.
         let parent_outputs = output
             .into_parameters()
-            .zip(output_batch_axis_values.iter().map(|axis| axis.axis()))
-            .map(|(output, expected_axis)| -> Result<Self::Value, ProgramError> {
-                let batch = output.into_batch();
-                let natural_axis = batch.batch_axis().axis();
-                match (natural_axis, expected_axis) {
-                    (None, None) => Ok(batch.into_value()),
-                    // The output's mapped-axis presence disagrees with the caller's `output_batch_axes` declaration.
-                    // Collapsing a mapped output requires an explicit reduction inside the batched function, and
-                    // materializing a missing axis requires an explicit broadcast; position-only disagreements are
-                    // repaired with the staged transpose in the final arm.
-                    (None, Some(_)) | (Some(_), None) => Err(BatchingError::MismatchedOutputAxes {
-                        expected: BatchAxis::from(expected_axis),
-                        actual: BatchAxis::from(natural_axis),
-                    }
-                    .into()),
-                    (Some(current), Some(expected)) if current == expected => Ok(batch.into_value()),
-                    (Some(_), Some(expected)) => Ok(batch.move_axis(expected)?.into_value()),
-                }
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
+            .zip(output_batch_axis_values)
+            .map(|(output, output_batch_axis)| Ok(output.into_batch().align_axis(output_batch_axis)?.into_value()))
+            .collect::<Result<Vec<_>, BatchingError>>()?;
 
         Ok(O::To::<Self::Value>::from_parameters(output_structure, parent_outputs)?)
     }
