@@ -3,11 +3,9 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use thiserror::Error;
-
 use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableType, TransposableOperation};
+use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::arithmetic::AddOperation;
@@ -23,38 +21,6 @@ use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramErro
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::types::{Type, Typed};
-
-/// Errors emitted by the differentiation helpers in [`crate::tracing_v2`].
-#[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
-pub enum DifferentiationError {
-    /// Reverse-mode differentiation (`grad`/`value_and_grad`) was requested for a function whose output is not a
-    /// single scalar. Reverse mode seeds the output cotangent with the multiplicative identity ("one") and pulls it
-    /// back to the inputs, which yields a gradient only when the output is a rank-0 scalar. A non-scalar output
-    /// describes a vector-valued function whose full derivative is a Jacobian; because program interpretation binds
-    /// inputs positionally without checking their types, seeding such an output with a ones cotangent would not
-    /// fail but would instead silently compute the gradient of the sum of the outputs, so the gradient entry points
-    /// reject it up front. Use a Jacobian transform such as `jacrev`/`jacfwd` for non-scalar outputs.
-    #[error("gradient output must be a rank-0 scalar but got {output_type}")]
-    NonScalarGradientOutput {
-        /// Rendered [`Type`] of the offending non-scalar output.
-        output_type: String,
-    },
-
-    /// Reverse-mode differentiation (`grad`/`value_and_grad`) was requested for a function whose output type carries no
-    /// cotangent space (a non-differentiable type such as a Boolean or integer scalar, the
-    /// [`float0`](https://docs.jax.dev/en/latest/_autosummary/jax.numpy.float0.html) analogue). Reverse mode seeds the
-    /// output cotangent with the multiplicative identity ("one"), but a non-differentiable output has no "one" to seed,
-    /// so the gradient is degenerate and the gradient entry points reject it up front rather than fabricating a seed.
-    #[error("gradient output type {output_type} is non-differentiable and carries no cotangent space")]
-    NonDifferentiableGradientOutput {
-        /// Rendered [`Type`] of the offending non-differentiable output.
-        output_type: String,
-    },
-
-    /// A program-level error surfaced while differentiating.
-    #[error(transparent)]
-    Program(#[from] ProgramError),
-}
 
 /// Extension trait carrying the forward- and reverse-mode differentiation transforms on every [`Context`], mirroring
 /// how [`Batch`](crate::batching::Batch) carries batching.

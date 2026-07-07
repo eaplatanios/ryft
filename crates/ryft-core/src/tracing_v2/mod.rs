@@ -36,7 +36,7 @@ pub(crate) mod test_util;
 pub use crate::operations::tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use crate::tracing::NestedTracer;
-pub use differentiation::{Differentiate, DifferentiationError};
+pub use differentiation::Differentiate;
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,

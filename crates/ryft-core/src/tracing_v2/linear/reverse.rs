@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 
-use crate::differentiation::{DifferentiableType, TransposableOperation};
+use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::AddOperation;
@@ -9,7 +9,7 @@ use crate::operations::control_flow::MaybeWhile;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::tracing::TracingContext;
 use crate::tracing_v2::differentiation::DifferentiableOperation;
-use crate::tracing_v2::{Differentiate, DifferentiationError, NestedTracer};
+use crate::tracing_v2::{Differentiate, NestedTracer};
 use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
@@ -227,10 +227,11 @@ mod tests {
     use std::cell::Cell;
 
     use crate::contexts::StagingContext;
+    use crate::differentiation::DifferentiationError;
     use crate::programs::ProgramError;
     use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext};
-    use crate::tracing_v2::{Differentiate, DifferentiationError};
+    use crate::tracing_v2::Differentiate;
     use crate::types::DataType;
 
     use super::*;

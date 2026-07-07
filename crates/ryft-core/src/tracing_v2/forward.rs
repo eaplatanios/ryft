@@ -2,13 +2,14 @@
 mod tests {
     use crate::contexts::StagingContext;
     use crate::contexts::{Domain, EagerContext};
+    use crate::differentiation::DifferentiationError;
     use crate::operations::arithmetic::Add;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized};
     use crate::programs::ProgramError;
     use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext, NestedTracingContext};
-    use crate::tracing_v2::{Differentiate, DifferentiationError};
+    use crate::tracing_v2::Differentiate;
     use crate::types::DataType;
 
     #[test]

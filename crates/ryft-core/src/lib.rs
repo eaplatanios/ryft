@@ -36,7 +36,9 @@ pub use batching::{
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
-pub use differentiation::*;
+pub use differentiation::{
+    DifferentiableType, DifferentiationError, TransposableOperation, TransposableProgramOperation,
+};
 pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error};
 pub use interpretation::{InterpretableOperation, InterpretableProgramOperation};

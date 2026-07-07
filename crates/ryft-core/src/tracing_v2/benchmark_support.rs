@@ -1,14 +1,15 @@
 use std::ops::{Add, Mul, Neg};
 
 use crate::contexts::Context;
+use crate::differentiation::DifferentiationError;
 use crate::operations::scalars::ScalarOperation;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::{Program, ProgramError, Value};
 use crate::scalars::Scalar;
+use crate::tracing_v2::Differentiate;
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{Differentiate, DifferentiationError};
 use crate::types::{DataType, Type};
 
 /// Returns the tracing-only IR benchmark cases.
