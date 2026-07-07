@@ -49,7 +49,7 @@ mod tests {
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::stop_gradient::StopGradient;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::{Differentiate, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_gradient};
 
     #[test]
     fn test_stop_gradient_jvp_severs_the_tangent() {
@@ -84,7 +84,8 @@ mod tests {
         // The JAX documentation example: `f(x) = x * stop_gradient(x)` differentiates like
         // `x * c` with `c` frozen at the primal value, so `f'(x) = stop_gradient(x)`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (value, gradient) = value_and_grad(&domain, |x| x.clone() * x.stop_gradient(), Scalar::from(3.0)).unwrap();
+        let (value, gradient) =
+            value_and_gradient(&domain, |x| x.clone() * x.stop_gradient(), Scalar::from(3.0)).unwrap();
         assert_eq!(value, 9.0);
         assert_eq!(gradient, 3.0);
     }

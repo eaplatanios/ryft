@@ -18,7 +18,7 @@ use super::fingerprint::FunctionFingerprint;
 /// # Composition with transforms
 ///
 /// Because a [`CompilationDomain`] *is a* [`Domain`], the existing `ryft-core` transforms
-/// (`grad`, `value_and_grad`, `jvp`, `vjp`, `linearize`, `jacrev`, `jacfwd`, `hessian`, `batch`)
+/// (`grad`, `value_and_gradient`, `jvp`, `vjp`, `linearize`, `jacrev`, `jacfwd`, `hessian`, `batch`)
 /// compose naturally inside the closure passed to
 /// [`compile_with_options`](super::compile_with_options). The transform is traced as part of the
 /// staged program, so the resulting executable computes the transformed function directly.

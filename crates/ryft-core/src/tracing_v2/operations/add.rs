@@ -55,7 +55,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::{Differentiate, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_gradient};
 
     #[test]
     fn test_add_jvp_and_gradient_are_linear() {
@@ -71,7 +71,7 @@ mod tests {
         assert_eq!(tangent, 2.0);
 
         let (value, gradient) =
-            value_and_grad(&domain, |(left, right)| left + right, (Scalar::from(2.0), Scalar::from(5.0))).unwrap();
+            value_and_gradient(&domain, |(left, right)| left + right, (Scalar::from(2.0), Scalar::from(5.0))).unwrap();
         assert_eq!(value, 7.0);
         assert_eq!(gradient, (Scalar::from(1.0), Scalar::from(1.0)));
     }

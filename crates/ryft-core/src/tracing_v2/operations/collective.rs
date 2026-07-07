@@ -701,13 +701,13 @@ mod tests {
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::{NestedTracer, value_and_grad};
+        use crate::tracing_v2::{NestedTracer, value_and_gradient};
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `psum`, which re-broadcasts the cotangent across the batch items, giving `∂g/∂x_i = 1`
         // for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                 let context = x.context().clone();
@@ -736,14 +736,14 @@ mod tests {
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::{NestedTracer, value_and_grad};
+        use crate::tracing_v2::{NestedTracer, value_and_gradient};
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
         // self-adjoint `pmean`, which carries the `1/N` factor, so `∂g/∂x_i = 1/N` for every input. With `x =
         // [1, 2, 3]` (so `N = 3`) the value is `2` and the gradient is `[1/3, 1/3, 1/3]`, witnessing the `1/N`
         // scaling that distinguishes `pmean` from `psum`.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                 let context = x.context().clone();

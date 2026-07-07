@@ -263,7 +263,7 @@ pub trait Differentiate: Context {
         // Eager domains unroll any concretizable `while` loop at the concrete primals before fusing; staging domains
         // keep the bounded `while` rule.
         let program = unroll_concretizable_whiles(self, program, input_values.clone())?;
-        let jvp_program = build_jvp_program(&program)?.into_simplified()?;
+        let jvp_program = program.jvp()?.into_simplified()?;
 
         // The fused program takes `[primals(n) ++ tangents(n)]` and produces `[primal(n) ++ tangent(n)]`. Mark the
         // primals known and the tangents unknown: the tangent of input `i` has the same type as primal input `i`.
@@ -487,10 +487,10 @@ pub trait Differentiate: Context {
 
     /// Returns the traced scalar output and reverse-mode gradient for `function`.
     ///
-    /// This is the active-context counterpart of [`crate::tracing_v2::value_and_grad`]. It uses
+    /// This is the active-context counterpart of [`crate::tracing_v2::value_and_gradient`]. It uses
     /// [`Differentiate::vjp`] directly, so nested reverse mode composes with any enclosing context that
     /// implements this trait instead of going through a separate tracer dispatch path.
-    fn value_and_grad<F, Input>(
+    fn value_and_gradient<F, Input>(
         &self,
         function: F,
         primals: Input,
@@ -543,9 +543,10 @@ pub trait Differentiate: Context {
         Ok((output, gradient))
     }
 
-    /// Returns the reverse-mode gradient of a traced scalar-output function.
+    /// Returns the reverse-mode gradient of a traced scalar-output function. This is the gradient-only counterpart of
+    /// [`value_and_gradient`](Self::value_and_gradient), discarding the primal output.
     #[inline]
-    fn value_and_gradient<F, Input>(
+    fn gradient<F, Input>(
         &self,
         function: F,
         primals: Input,
@@ -571,7 +572,7 @@ pub trait Differentiate: Context {
                 ParameterStructure: Debug + PartialEq,
             >,
     {
-        self.value_and_grad(function, primals).map(|(_, gradient)| gradient)
+        self.value_and_gradient(function, primals).map(|(_, gradient)| gradient)
     }
 }
 
@@ -765,7 +766,7 @@ where
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
         let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
-        // All-zero fast path mirroring `build_jvp_program`: when an operation consumes at least one input and every
+        // All-zero fast path mirroring `Program::jvp`: when an operation consumes at least one input and every
         // input tangent is a structural zero, the operation's tangent is zero by the chain rule, so the rule is
         // skipped and the primal operation binds directly. Zero-input operations are excluded so their dedicated
         // rules keep handling primal synthesis and tangent typing.
@@ -843,14 +844,16 @@ where
 ///     the use site, so the enum does not spell them — plus a `Self: From<Payload>` conversion for every concrete
 ///     payload (the rules stage ordinary primal-enum operations for both the primal and the tangent side) and the
 ///     `Self: MaybeZeroOperation<T> + From<ZeroOperation<T>> +
-///     DifferentiableProgramOperation<C::Constant, Self>` fixed-point witnesses that higher-order payload rules
-///     (condition/while/scan) use to linearize their nested programs. *Recursive* payloads (those mentioning
-///     `Self`) are skipped — such a predicate would re-enter the enum's own obligation and overflow the trait
-///     solver — and their rules are discharged as definition-time body obligations against the witnesses instead.
-///     The enum must therefore supply its own
-///     [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation)
-///     implementation, spelling only the leaf capabilities that
-///     [`Program::linearize`](crate::Program::linearize) needs.
+///     DifferentiableProgramOperation<C::Constant, Self> + LinearizableProgramOperation<C::Constant, Self>`
+///     fixed-point witnesses that higher-order payload rules (condition/while/scan) use to forward-differentiate and
+///     linearize their nested programs. *Recursive* payloads (those mentioning `Self`) are skipped — such a predicate
+///     would re-enter the enum's own obligation and overflow the trait solver — and their rules are discharged as
+///     definition-time body obligations against the witnesses instead. The enum must therefore supply its own
+///     [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation) and
+///     [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation)
+///     implementations, spelling only the leaf capabilities that
+///     [`Program::jvp_program`](crate::Program::jvp_program) and [`Program::linearize`](crate::Program::linearize)
+///     need.
 ///
 /// The derive supports no `#[ryft(bounds(...))]` kind of its own: the per-variant predicates always forward each
 /// payload rule's capability requirements, so there is nothing for the enum to add. It tolerates (parses and
@@ -926,32 +929,7 @@ where
     }
 }
 
-/// Builds the JVP program from an already-traced primal [`Program`].
-///
-/// The returned program stages both the primal computation and its pushforward into one program over the primal
-/// operation family: its inputs are the primal inputs followed by one fresh tangent input per primal input (same
-/// types), and its outputs are the original primal outputs followed by the tangent outputs. Each primal instruction is
-/// replayed once through its [`DifferentiableOperation`] rule, which returns the dual (primal result plus tangent)
-/// for the instruction's outputs; both are staged into the shared builder as ordinary primal operations, so the result
-/// contains no symbolic capture.
-///
-/// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
-/// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path below short-circuits the all-zero case (an
-/// operation consuming at least one input whose every input tangent is a structural zero) by staging the primal
-/// operation directly and pairing each primal output with a typed structural zero tangent, so zero-ness propagates
-/// transitively without staging or scanning instructions. Structural zero tangents are materialized as typed
-/// [`ZeroOperation`] instructions only at the output boundary, preserving the `(primal_outputs ++ tangent_outputs)`
-/// program contract.
-///
-/// # Parameters
-///
-///   - `program`: Already-traced primal program over the primal operation family `O`. Its constants are lifted into
-///     the builder and its instructions are replayed in order. Operations outside the supported slice fail with
-///     the [`DifferentiableOperation`] default's
-///     [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-pub(crate) fn build_jvp_program<T, V, O, Input, Output>(
-    program: &Program<V, O, Input, Output>,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: Type,
     V: Value<Type = T>,
@@ -960,136 +938,178 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    let primal_input_count = program.input_ids().len();
+    /// Builds the *fused* jvp program of this already-traced primal [`Program`].
+    ///
+    /// Read the input program as a function `f` from its flat inputs to its flat outputs, `x ↦ y = f(x)`. This returns
+    /// the program that computes `f` together with its *pushforward* (the forward-mode Jacobian-vector product): given
+    /// an input tangent (i.e., perturbation direction) `ẋ`, the pushforward produces the output tangent
+    /// `ẏ = (∂f/∂x)(x) · ẋ`, the directional derivative of `f` at `x` along `ẋ`. As a single map, the returned program
+    /// computes `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`.
+    ///
+    /// In terms of the flat program boundaries: if the input program has inputs `[x_1, …, x_n]` and outputs
+    /// `[y_1, …, y_m]` (so `y = f(x)`), the returned program has
+    ///
+    ///   - inputs `[x_1, …, x_n, ẋ_1, …, ẋ_n]` — the `n` primal inputs followed by one fresh tangent input `ẋ_i` per
+    ///     primal input `x_i`, of the same type; and
+    ///   - outputs `[y_1, …, y_m, ẏ_1, …, ẏ_m]` — the `m` primal outputs `y_j = f_j(x)` followed by the `m` tangent
+    ///     outputs `ẏ = (∂f/∂x)(x) · ẋ`.
+    ///
+    /// Both halves stay over the same primal operation family; the program is *not* split into separate primal and
+    /// tangent sub-programs (that is [`Self::linearize`], whose partial-evaluation known-ness split consumes this fused
+    /// program as its front half). This un-split form is exposed for fused higher-order JVP rules and direct
+    /// forward-mode interpretation.
+    ///
+    /// Each primal instruction is replayed once through its [`DifferentiableOperation`] rule, which returns the dual
+    /// (primal result plus tangent) for the instruction's outputs; both are staged into the shared builder as ordinary
+    /// primal operations, so the result contains no symbolic capture.
+    ///
+    /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
+    /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path below short-circuits the all-zero case (an
+    /// operation consuming at least one input whose every input tangent is a structural zero) by staging the primal
+    /// operation directly and pairing each primal output with a typed structural zero tangent, so zero-ness propagates
+    /// transitively without staging or scanning instructions. Structural zero tangents are materialized as typed
+    /// [`ZeroOperation`] instructions only at the output boundary, preserving the `(primal_outputs ++ tangent_outputs)`
+    /// program contract.
+    ///
+    /// Operations outside the supported slice fail with the [`DifferentiableOperation`] default's
+    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+    pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        let program = self;
+        let primal_input_count = program.input_ids().len();
 
-    // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so that
-    // scoping every tracer (and the context) inside that block makes the `Rc::try_unwrap` at the end a real ownership
-    // check rather than depending on manual drops. Only raw output atom ids escape the block.
-    let context = TracingContext::<V, O>::new();
-    let builder = context.builder().clone();
-    let output_atoms = {
-        let context = context;
+        // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so that
+        // scoping every tracer (and the context) inside that block makes the `Rc::try_unwrap` at the end a real ownership
+        // check rather than depending on manual drops. Only raw output atom ids escape the block.
+        let context = TracingContext::<V, O>::new();
+        let builder = context.builder().clone();
+        let output_atoms = {
+            let context = context;
 
-        // Track the primal tracer and symbolic tangent for each source atom. Tangents of atoms not connected to an
-        // input tangent (constants and dead inputs) are derived lazily as structural zeros by `recorded_tangent`.
-        let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; program.atoms().len()];
-        let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; program.atoms().len()];
+            // Track the primal tracer and symbolic tangent for each source atom. Tangents of atoms not connected to an
+            // input tangent (constants and dead inputs) are derived lazily as structural zeros typed with the atom's
+            // primal type.
+            let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; program.atoms().len()];
+            let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; program.atoms().len()];
 
-        // Primal inputs become the leading inputs; one fresh tangent input is added per primal input afterwards
-        // so the input order is `(primals ++ tangents)`.
-        for input_id in program.input_ids().iter().copied() {
-            let r#type = program.atoms()[input_id.index()].r#type().into_owned();
-            primals[input_id.index()] = Some(context.input(r#type));
-        }
-        let tangent_inputs = program
-            .input_ids()
-            .iter()
-            .copied()
-            .map(|input_id| {
+            // Primal inputs become the leading inputs; one fresh tangent input is added per primal input afterwards
+            // so the input order is `(primals ++ tangents)`.
+            for input_id in program.input_ids().iter().copied() {
                 let r#type = program.atoms()[input_id.index()].r#type().into_owned();
-                context.input(r#type)
-            })
-            .collect::<Vec<_>>();
-        for (input_id, tangent) in program.input_ids().iter().copied().zip(tangent_inputs) {
-            tangents[input_id.index()] = Some(MaybeZero::Value(tangent));
-        }
-
-        // Constants are lifted into the builder as primal constants; their tangents are derived lazily as structural
-        // zeros by `recorded_tangent`. The call is disambiguated to the staging method because the `Constant`
-        // capability trait also provides a `constant` method.
-        for (atom_index, atom) in program.atoms().iter().enumerate() {
-            if let Atom::Constant(value) = atom {
-                primals[atom_index] = Some(StagingContext::constant(&context, value.clone()));
+                primals[input_id.index()] = Some(context.input(r#type));
             }
-        }
-
-        // Replay each primal instruction in JVP form, staging both the primal result and the tangent operations
-        // into the shared builder.
-        for instruction in program.instructions() {
-            let input_duals = instruction
-                .inputs()
+            let tangent_inputs = program
+                .input_ids()
                 .iter()
                 .copied()
-                .map(|input_atom| {
-                    let primal =
-                        primals[input_atom.index()].clone().ok_or(ProgramError::UnboundAtomId { id: input_atom })?;
-                    let tangent = recorded_tangent(&primals, &tangents, input_atom)?;
-                    Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent))
+                .map(|input_id| {
+                    let r#type = program.atoms()[input_id.index()].r#type().into_owned();
+                    context.input(r#type)
                 })
-                .collect::<Result<Vec<_>, ProgramError>>()?;
-
-            // All-zero fast path: when an operation consumes at least one input and every input tangent is a
-            // structural zero, the operation's tangent is zero by the chain rule, so the rule is skipped. The primal
-            // outputs are staged directly and each output tangent is a typed structural zero. Zero-input operations
-            // are excluded so their dedicated rules keep handling primal synthesis and tangent typing.
-            let all_input_tangents_are_zero = input_duals.iter().all(|dual| dual.tangent().is_zero());
-            let output_duals = if !input_duals.is_empty() && all_input_tangents_are_zero {
-                let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-                context
-                    .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
-                    .into_iter()
-                    .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new_with_zero_tangent)
-                    .collect()
-            } else {
-                instruction.operation().jvp(&context, input_duals.as_slice())?
-            };
-
-            check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
-            for (output_atom, dual) in instruction.outputs().iter().copied().zip(output_duals) {
-                let (primal, tangent) = dual.into_parts();
-                primals[output_atom.index()] = Some(primal);
-                tangents[output_atom.index()] = Some(tangent);
+                .collect::<Vec<_>>();
+            for (input_id, tangent) in program.input_ids().iter().copied().zip(tangent_inputs) {
+                tangents[input_id.index()] = Some(MaybeZero::Value(tangent));
             }
-        }
 
-        // Collect the outputs: the primal outputs followed by the tangent outputs, in the original output order.
-        // Structural zero tangents are materialized as typed `ZeroOperation` instructions here — the output boundary
-        // is the only place the fused program requires a real atom for them.
-        let primal_output_atoms = program
-            .output_ids()
-            .iter()
-            .copied()
-            .map(|output_atom| {
-                primals[output_atom.index()]
-                    .as_ref()
-                    .map(|primal| primal.atom_id())
-                    .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let tangent_output_atoms = program
-            .output_ids()
-            .iter()
-            .copied()
-            .map(|output_atom| {
-                let tangent = recorded_tangent(&primals, &tangents, output_atom)?;
-                tangent.materialize(&context)?.atom_id()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            // Constants are lifted into the builder as primal constants; their tangents are derived lazily as structural
+            // zeros typed with the atom's primal type. The call is disambiguated to the staging method because the
+            // `Constant` capability trait also provides a `constant` method.
+            for (atom_index, atom) in program.atoms().iter().enumerate() {
+                if let Atom::Constant(value) = atom {
+                    primals[atom_index] = Some(StagingContext::constant(&context, value.clone()));
+                }
+            }
 
-        let mut output_atoms = primal_output_atoms;
-        output_atoms.extend(tangent_output_atoms);
-        output_atoms
-    };
+            // Replay each primal instruction in JVP form, staging both the primal result and the tangent operations
+            // into the shared builder.
+            for instruction in program.instructions() {
+                let input_duals = instruction
+                    .inputs()
+                    .iter()
+                    .copied()
+                    .map(|input_atom| {
+                        let primal = primals[input_atom.index()]
+                            .clone()
+                            .ok_or(ProgramError::UnboundAtomId { id: input_atom })?;
+                        // Atoms not connected to an input tangent (constants and dead inputs) take a structural zero typed
+                        // with the atom's primal type.
+                        let tangent = match &tangents[input_atom.index()] {
+                            Some(tangent) => tangent.clone(),
+                            None => MaybeZero::Zero(primal.r#type().into_owned()),
+                        };
+                        Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent))
+                    })
+                    .collect::<Result<Vec<_>, ProgramError>>()?;
 
-    // All tracing handles are dropped here, so the builder can be recovered and finalized.
-    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-    let input_count = 2 * primal_input_count;
-    let output_count = output_atoms.len();
-    builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
-}
+                // All-zero fast path: when an operation consumes at least one input and every input tangent is a
+                // structural zero, the operation's tangent is zero by the chain rule, so the rule is skipped. The primal
+                // outputs are staged directly and each output tangent is a typed structural zero. Zero-input operations
+                // are excluded so their dedicated rules keep handling primal synthesis and tangent typing.
+                let all_input_tangents_are_zero = input_duals.iter().all(|dual| dual.tangent().is_zero());
+                let output_duals = if !input_duals.is_empty() && all_input_tangents_are_zero {
+                    let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+                    context
+                        .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
+                        .into_iter()
+                        .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new_with_zero_tangent)
+                        .collect()
+                } else {
+                    instruction.operation().jvp(&context, input_duals.as_slice())?
+                };
 
-/// Returns the symbolic tangent recorded for `atom`, deriving a structural zero typed with the atom's primal type
-/// for atoms (constants and dead inputs) not connected to any input tangent.
-fn recorded_tangent<V: Typed + Clone>(
-    primals: &[Option<V>],
-    tangents: &[Option<MaybeZero<V>>],
-    atom: AtomId,
-) -> Result<MaybeZero<V>, ProgramError> {
-    if let Some(tangent) = &tangents[atom.index()] {
-        return Ok(tangent.clone());
+                check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
+                for (output_atom, dual) in instruction.outputs().iter().copied().zip(output_duals) {
+                    let (primal, tangent) = dual.into_parts();
+                    primals[output_atom.index()] = Some(primal);
+                    tangents[output_atom.index()] = Some(tangent);
+                }
+            }
+
+            // Collect the outputs: the primal outputs followed by the tangent outputs, in the original output order.
+            // Structural zero tangents are materialized as typed `ZeroOperation` instructions here — the output boundary
+            // is the only place the fused program requires a real atom for them.
+            let primal_output_atoms = program
+                .output_ids()
+                .iter()
+                .copied()
+                .map(|output_atom| {
+                    primals[output_atom.index()]
+                        .as_ref()
+                        .map(|primal| primal.atom_id())
+                        .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let tangent_output_atoms = program
+                .output_ids()
+                .iter()
+                .copied()
+                .map(|output_atom| {
+                    // Atoms not connected to an input tangent (constants and dead inputs) take a structural zero typed
+                    // with the atom's primal type.
+                    let tangent = match &tangents[output_atom.index()] {
+                        Some(tangent) => tangent.clone(),
+                        None => MaybeZero::Zero(
+                            primals[output_atom.index()]
+                                .as_ref()
+                                .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
+                                .r#type()
+                                .into_owned(),
+                        ),
+                    };
+                    tangent.materialize(&context)?.atom_id()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let mut output_atoms = primal_output_atoms;
+            output_atoms.extend(tangent_output_atoms);
+            output_atoms
+        };
+
+        // All tracing handles are dropped here, so the builder can be recovered and finalized.
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let input_count = 2 * primal_input_count;
+        let output_count = output_atoms.len();
+        builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
     }
-    let primal = primals[atom.index()].as_ref().ok_or(ProgramError::UnboundAtomId { id: atom })?;
-    Ok(MaybeZero::Zero(primal.r#type().into_owned()))
 }
 
 /// Result of [`Program::linearize`](crate::Program::linearize): the partially evaluated known (primal) and unknown
@@ -1136,14 +1156,6 @@ where
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 {
-    /// Builds the fused jvp program of this already-traced primal [`Program`] over `[primals..., tangents...]`,
-    /// producing `[primal_outputs..., tangent_outputs...]`, without splitting it into primal and tangent halves;
-    /// this is the un-split front half of [`Self::linearize`], exposed for fused higher-order JVP rules and
-    /// direct forward-mode interpretation.
-    pub fn jvp_program(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
-        build_jvp_program(self)
-    }
-
     /// Builds the linearization core from this already-traced primal [`Program`] by fusing the forward-mode rules into
     /// one jvp program and splitting it into the primal (known) and tangent (unknown) halves through the
     /// partial-evaluation known-ness split.
@@ -1178,7 +1190,7 @@ where
         let primal_output_count = self.output_ids().len();
 
         // Build the fused jvp program over `[primals..., tangents...] -> [primal_outputs..., tangent_outputs...]`.
-        let fused = build_jvp_program(self)?;
+        let fused = self.jvp()?;
 
         // Split the fused program with the leading `primal_input_count` primal inputs known and the trailing tangent
         // inputs unknown. The split walks the fused program through the per-operation partial-evaluation rules
@@ -1259,7 +1271,21 @@ where
         for (position, atom) in tangent_inputs.into_iter().enumerate() {
             let restored = match atom {
                 Some(atom) => atom,
-                None => restored_input_atom(&mut tangent_program.atoms, &fused, primal_input_count + position)?,
+                // The split recorded no source for this tangent position, so restore it as a fresh dead program input
+                // (referenced by no instruction) typed from the corresponding fused-program tangent input. The fused
+                // program's inputs are laid out as `[primals..., tangents...]`, so the tangent for `position` lives at
+                // index `primal_input_count + position`.
+                None => {
+                    let fused_input_index = primal_input_count + position;
+                    let Atom::Variable(tangent_type) = &fused.atoms[fused.input_ids[fused_input_index].index()] else {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "tangent input {fused_input_index} is not a variable",
+                        )));
+                    };
+                    let restored = AtomId::new(tangent_program.atoms.len());
+                    tangent_program.atoms.push(Atom::Variable(tangent_type.clone()));
+                    restored
+                }
             };
             tangent_program.input_ids.push(restored);
         }
@@ -1311,43 +1337,26 @@ where
     }
 }
 
-/// Returns a fresh tangent input atom of the type of the `jvp_input_index`-th input of `jvp_program`, pushing it onto
-/// `atoms`. Used by the linearization input rebuild to restore a tangent position missing from the split's recorded
-/// residual-program input sources — unreachable under the current walk, which seeds every unknown input up front and
-/// never prunes residual-program inputs, but kept so the rebuild stays correct for any source layout.
-fn restored_input_atom<T, V, O>(
-    atoms: &mut Vec<Atom<V>>,
-    jvp_program: &Program<V, O, Vec<V>, Vec<V>>,
-    jvp_input_index: usize,
-) -> Result<AtomId, ProgramError>
-where
-    T: Type,
-    V: Value<Type = T>,
-    O: Operation<T>,
-{
-    let Atom::Variable(tangent_type) = &jvp_program.atoms[jvp_program.input_ids[jvp_input_index].index()] else {
-        return Err(ProgramError::MalformedProgram(format!("tangent input {jvp_input_index} is not a variable")));
-    };
-    let restored = AtomId::new(atoms.len());
-    atoms.push(Atom::Variable(tangent_type.clone()));
-    Ok(restored)
-}
-
-/// Operation families whose captured flat programs can be linearized capture-free on behalf of an enclosing JVP rule.
+/// Operation families whose captured flat programs can be built into a *fused* jvp program on behalf of an enclosing
+/// forward-mode rule.
 ///
-/// Higher-order forward-mode rules, such as the control-flow rules, must linearize the captured branch or
+/// Higher-order forward-mode rules, such as the control-flow rules, must forward-differentiate the captured branch or
 /// body programs whose operation family is the same closed enum currently being proven
 /// [`DifferentiableOperation`]. Writing that need directly as a recursive `DifferentiableOperation` bound at every
 /// recursive payload boundary makes Rust's trait solver re-enter the same enum and overflow.
 /// [`DifferentiableProgramOperation`] names that recursive fixed point once: the value `V`
 /// and operation family `O` stay fixed across the recursion, so a closed operation enum implements this trait directly
-/// — calling [`Program::linearize`](crate::Program::linearize) in the body while spelling only the *leaf* closure of
-/// capabilities that body needs in the impl's `where` clause, rather than the recursive
+/// — calling [`Program::jvp_program`](crate::Program::jvp_program) in the body while spelling only the *leaf* closure
+/// of capabilities that body needs in the impl's `where` clause, rather than the recursive
 /// `Self: DifferentiableOperation<…>` bound
 /// itself. That recursive obligation is then discharged once, as a definition-time body check, which is what lets a
 /// higher-order rule require `Self: DifferentiableProgramOperation<V, Self>` without sending the trait
 /// solver into an unbounded recursion. Higher-order payloads depend on this semantic witness instead of reproducing the
-/// full linearization obligation.
+/// full forward-mode obligation.
+///
+/// [`LinearizableProgramOperation`] is the sibling witness for the *split* linearization form. The two are separated so
+/// a rule requires only the shape it actually stages: the fused forward-mode `scan`/`condition` rules need only this
+/// trait, while the bounded `while` rule (which must stack per-iteration residuals) needs the split one.
 ///
 /// This trait is intentionally about complete operation families rather than individual primitive payloads, and is
 /// implemented explicitly per
@@ -1356,20 +1365,11 @@ where
 /// recursion this trait exists to break).
 ///
 /// The value type `V` (whose carried type descriptor types the programs) and operation family `O` match the primal
-/// program being linearized.
+/// program being differentiated.
 pub trait DifferentiableProgramOperation<V: Value, O>: Clone + Operation<V::Type> + Sized
 where
     O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>,
 {
-    /// Linearizes `program` capture-free; refer to the documentation of
-    /// [`Program::linearize`](crate::Program::linearize) for the returned packaging.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs and
-    ///     outputs.
-    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
-
     /// Builds the *fused* jvp program of `program` over `[primals..., tangents...]`, producing
     /// `[primal_outputs..., tangent_outputs...]`, without splitting it into primal and tangent halves.
     ///
@@ -1385,6 +1385,35 @@ where
     fn jvp_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
     ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
+}
+
+/// Operation families whose captured flat programs can be linearized capture-free on behalf of an enclosing rule.
+///
+/// This is the split-form sibling of [`DifferentiableProgramOperation`]: where that witness builds the fused jvp
+/// program, this one additionally splits it into the primal (known) and tangent (unknown, linear) halves through the
+/// partial-evaluation known-ness split, producing a [`Linearization`]. It breaks the same recursive fixed point the
+/// same way — a closed operation enum implements it directly, calling
+/// [`Program::linearize`](crate::Program::linearize) in the body while spelling only the *leaf* closure of capabilities
+/// that body needs, so a higher-order rule can require `Self: LinearizableProgramOperation<V, Self>` without the trait
+/// solver re-entering the enum's own [`DifferentiableOperation`] obligation. The bounded `while` rule uses it because a
+/// loop must stack per-iteration residuals for its tangent map to replay; the fused forward-mode rules that keep their
+/// bodies un-split depend on [`DifferentiableProgramOperation`] instead.
+///
+/// Like [`DifferentiableProgramOperation`], it is implemented explicitly per operation enum rather than through a
+/// blanket impl, which would reintroduce the recursion it exists to break. The value type `V` (whose carried type
+/// descriptor types the programs) and operation family `O` match the primal program being linearized.
+pub trait LinearizableProgramOperation<V: Value, O>: Clone + Operation<V::Type> + Sized
+where
+    O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>,
+{
+    /// Linearizes `program` capture-free; refer to the documentation of
+    /// [`Program::linearize`](crate::Program::linearize) for the returned packaging.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs and
+    ///     outputs.
+    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 }
 
 /// Replays a flat sub-program of a [`Linearization`] through a context's [`bind`](Context::bind) by interpreting
@@ -1654,10 +1683,10 @@ mod tests {
         // the outer value is f'(x) = 2x cos(x²) and the outer gradient is f''(x) = 2 cos(x²) - 4x² sin(x²).
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (value, gradient) = domain
-            .value_and_grad(
+            .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    context.value_and_gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
+                    context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
                 },
                 Scalar::from(0.7),
             )
@@ -1673,14 +1702,14 @@ mod tests {
         // types through the trait solver. For f(x) = sin(x²), f'''(x) = -12x sin(x²) - 8x³ cos(x²).
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (value, gradient) = domain
-            .value_and_grad(
+            .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
                     context
-                        .value_and_gradient(
+                        .gradient(
                             |y| {
                                 let context = y.context().clone();
-                                context.value_and_gradient(|z| (z.clone() * z).sin().unwrap(), y).unwrap()
+                                context.gradient(|z| (z.clone() * z).sin().unwrap(), y).unwrap()
                             },
                             x,
                         )
@@ -1706,7 +1735,7 @@ mod tests {
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    Ok(context.value_and_gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap())
+                    Ok(context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap())
                 },
                 Scalar::from(0.7),
                 Scalar::from(2.0),

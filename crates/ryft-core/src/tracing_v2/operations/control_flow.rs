@@ -25,7 +25,8 @@ use crate::tracing::{Tracer, TracingContext};
 use crate::differentiation::DifferentiationDual;
 use crate::operations::control_flow::MaybeWhile;
 use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, Linearization, replay_via_bind,
+    DifferentiableOperation, DifferentiableProgramOperation, LinearizableProgramOperation, Linearization,
+    replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
@@ -440,7 +441,7 @@ where
 /// preserved (the capture-based rule's unbounded regime stages a non-transposable doubled-state loop, which has
 /// no capture-free counterpart here).
 ///
-/// For a bound `B`, the rule linearizes the body capture-free through [`DifferentiableProgramOperation`],
+/// For a bound `B`, the rule linearizes the body capture-free through [`LinearizableProgramOperation`],
 /// giving a primal body `[state] -> [next_state, residuals...]` and a tangent body
 /// `[state_tangent, residuals...] -> [next_state_tangent]` together with the residual count. It then:
 ///
@@ -481,7 +482,11 @@ where
         + From<WhileOperation<C::Constant, C::Operation>>
         + From<ScanOperation<C::Constant, C::Operation>>
         + MaybeWhile<C::Constant, C::Operation>
-        + DifferentiableProgramOperation<C::Constant, C::Operation>,
+        // The body is linearized through `LinearizableProgramOperation`, while the augmented bounded `while` staged
+        // below is itself forward-differentiated via a recursive `WhileOperation::jvp`, which needs the fused
+        // `DifferentiableProgramOperation` witness.
+        + DifferentiableProgramOperation<C::Constant, C::Operation>
+        + LinearizableProgramOperation<C::Constant, C::Operation>,
 {
     fn jvp_while(
         operation: &WhileOperation<C::Constant, C::Operation>,
@@ -2131,10 +2136,10 @@ mod tests {
             Ok(vec![16.0]),
         );
 
-        // `value_and_grad` composes the same machinery end to end.
+        // `value_and_gradient` composes the same machinery end to end.
         let while_operation = bounded_doubling_while_operation(8.0, 5);
         let (value, gradient) = StagedDispatchTestArrayDomain
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
@@ -2180,7 +2185,7 @@ mod tests {
         // The eager-domain reverse-mode entry point produces the same value and gradient numbers.
         let while_operation = bounded_squaring_while_operation(100.0, 4);
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
@@ -2227,7 +2232,7 @@ mod tests {
         let while_operation = WhileOperation::new(condition, body).unwrap().with_iteration_bound(4).unwrap();
 
         let (value, gradient) = StagedDispatchTestArrayDomain
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
@@ -2253,7 +2258,7 @@ mod tests {
         // through its condition after three iterations, well below the bound of five.
         let while_operation = bounded_doubling_while_operation(8.0, 5);
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
@@ -2282,7 +2287,7 @@ mod tests {
 
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()
@@ -2298,7 +2303,7 @@ mod tests {
 
         let while_operation = bounded_doubling_while_operation(f64::INFINITY, 3);
         let (value, gradient) = StagedDispatchTestArrayDomain
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs = x
                         .context()

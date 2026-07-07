@@ -208,7 +208,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_grad};
+    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -220,7 +220,7 @@ mod tests {
         // strided slice of the weighted cotangent at the pad geometry (positions 1, 3, and 5 of w) and the
         // padding-value gradient is the sum over the padding positions, computed as sum(w) - sum(sliced w) =
         // 36 - 12 = 24.
-        let (value, (input_gradient, padding_value_gradient)) = value_and_grad(
+        let (value, (input_gradient, padding_value_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, padding_value)| {
                 let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));

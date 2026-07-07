@@ -200,7 +200,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_grad};
+    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the differentiation trace that `exemplar` belongs to.
@@ -218,7 +218,7 @@ mod tests {
         // Scatter-add is the identity in its operand (`∂output/∂operand = I`), so the operand gradient is the all-ones
         // cotangent unchanged, while the update gradient gathers that cotangent at the captured indices — the
         // scatter-add/gather transpose duality.
-        let (value, (operand_gradient, update_gradient)) = value_and_grad(
+        let (value, (operand_gradient, update_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, updates)| {
                 let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);

@@ -165,7 +165,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_grad};
+    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
     use crate::types::Typed;
 
     use super::*;
@@ -176,7 +176,7 @@ mod tests {
         // f(x, y) = sum(concatenate([x, y], 0) * w) with w = [1, 2, 3, 4, 5]: the joined output is [x0, x1, y0, y1,
         // y2], so f = x0 + 2*x1 + 3*y0 + 4*y1 + 5*y2. The pullback slices the weighted cotangent [1, 2, 3, 4, 5] into
         // the first two entries for x and the last three for y.
-        let (value, (x_gradient, y_gradient)) = value_and_grad(
+        let (value, (x_gradient, y_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| {
                 let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]));

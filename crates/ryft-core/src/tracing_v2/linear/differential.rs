@@ -259,11 +259,9 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error to flow it through the trace. A non-scalar gradient
                 // output cannot occur here for well-formed second-order use (the differentiated function is scalar).
-                crate::tracing_v2::Differentiate::value_and_gradient(&context, function, input).map_err(|error| {
-                    match error {
-                        DifferentiationError::Program(error) => error,
-                        error => ProgramError::MalformedProgram(error.to_string()),
-                    }
+                crate::tracing_v2::Differentiate::gradient(&context, function, input).map_err(|error| match error {
+                    DifferentiationError::Program(error) => error,
+                    error => ProgramError::MalformedProgram(error.to_string()),
                 })
             },
             primals,

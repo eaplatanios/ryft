@@ -726,7 +726,7 @@ mod tests {
         // the value is 8 and the gradient is 8.
         let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs =
                         x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
@@ -747,7 +747,7 @@ mod tests {
         // because it always traces `while_loop`.
         let while_operation = doubling_while_operation();
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_grad(
+            .value_and_gradient(
                 move |x| {
                     let mut outputs =
                         x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
@@ -864,7 +864,7 @@ mod tests {
         // staged linear `while` rejects transposition.
         let scan = product_scan_operation(false);
         let (value, (init_gradient, xs_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .value_and_grad(
+            .value_and_gradient(
                 move |(init, xs)| {
                     let mut outputs =
                         init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();

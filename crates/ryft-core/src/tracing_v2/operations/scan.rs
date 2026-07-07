@@ -747,7 +747,7 @@ mod tests {
         .unwrap();
         let program = program.to_flat_program();
 
-        let jvp = program.jvp_program().unwrap().into_simplified().unwrap();
+        let jvp = program.jvp().unwrap().into_simplified().unwrap();
         let scans = jvp
             .instructions()
             .iter()

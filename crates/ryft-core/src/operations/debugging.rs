@@ -167,7 +167,7 @@ mod tests {
     use crate::types::{ArrayType, DataType};
 
     use super::*;
-    use crate::tracing_v2::value_and_grad;
+    use crate::tracing_v2::value_and_gradient;
 
     /// Computes `f(x) = x * x` while printing `x` and discarding the printed value, so the staged `print` is dead
     /// code that only its effect keeps alive.
@@ -205,7 +205,7 @@ mod tests {
         // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
         // the gradient) exercises the effect keep-alive of the partition projections.
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let (value, gradient) = value_and_grad(&domain, print_square, TestArray::scalar(3.0)).unwrap();
+        let (value, gradient) = value_and_gradient(&domain, print_square, TestArray::scalar(3.0)).unwrap();
         assert_eq!(value.values[0], 9.0);
         assert_eq!(gradient.values[0], 6.0);
     }

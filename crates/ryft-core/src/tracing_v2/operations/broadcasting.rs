@@ -291,7 +291,7 @@ mod tests {
         // f(x) = sum(broadcast(x, [2, 3], [1])): every input coordinate is replicated
         // twice, so the gradient is 2 at every coordinate.
         let output_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let (value, gradient) = crate::tracing_v2::value_and_grad(
+        let (value, gradient) = crate::tracing_v2::value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| x.broadcast(output_type.clone(), &[1]).unwrap().reduce(&[0, 1], ReductionKind::Sum),
             TestArray::vector(vec![1.0, 2.0, 3.0]),

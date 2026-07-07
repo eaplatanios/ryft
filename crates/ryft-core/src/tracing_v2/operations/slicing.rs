@@ -579,7 +579,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, NestedTracer, value_and_grad};
+    use crate::tracing_v2::{DifferentiableDomainExtension, NestedTracer, value_and_gradient};
     use crate::types::DataType;
 
     use super::*;
@@ -602,7 +602,7 @@ mod tests {
     fn test_slice_value_and_grad_zero_pads_cotangent() {
         // f(x) = sum(slice(x, [1], [3])): the pullback writes the all-ones cotangent into a zero array at the slice
         // offsets, so the gradient is the indicator of the sliced window.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| x.slice(&[1], &[3], &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
             TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
@@ -617,7 +617,7 @@ mod tests {
         // f(x) = sum(slice(x, [1], [6], strides=[2]) * w) with w = [1, 2, 3]: the forward slice reads positions 1,
         // 3, and 5, so the pullback pads the weighted cotangent [1, 2, 3] with `low = 1`, `interior = 1`, and
         // `high = 0`, scattering it back to exactly those positions.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0]));
@@ -647,7 +647,7 @@ mod tests {
     fn test_update_slice_value_and_grad_splits_cotangent() {
         // f(x, u) = sum(update_slice(x, u, [1])): the input gradient is the cotangent with the update window zeroed
         // and the update gradient is the slice of the cotangent at the update window.
-        let (value, (input_gradient, update_gradient)) = value_and_grad(
+        let (value, (input_gradient, update_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, update)| x.update_slice(&update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
             (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
@@ -663,7 +663,7 @@ mod tests {
         // f(x) = sum(dynamic_slice(x, [1], [2])): the integer start index is a constant of the trace (its tangent is
         // a structural zero that the JVP rule ignores), and the pullback scatters the all-ones cotangent into a zero
         // array at the captured index.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let start = index_constant(&x, 1.0);
@@ -699,7 +699,7 @@ mod tests {
     fn test_dynamic_update_slice_value_and_grad_splits_cotangent() {
         // f(x, u) = sum(dynamic_update_slice(x, u, [1])): the input gradient is the cotangent with the update window
         // zeroed and the update gradient is the dynamic slice of the cotangent at the captured index.
-        let (value, (input_gradient, update_gradient)) = value_and_grad(
+        let (value, (input_gradient, update_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, update)| {
                 let start = index_constant(&x, 1.0);
@@ -945,7 +945,7 @@ mod tests {
         // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();

@@ -93,7 +93,7 @@ mod tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let foreign_context = NestedTracingContext::new(domain.clone());
         let foreign = foreign_context.input(DataType::F64);
-        let result = domain.value_and_gradient(move |_input| foreign, Scalar::from(1.0));
+        let result = domain.gradient(move |_input| foreign, Scalar::from(1.0));
         assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
     }
 }

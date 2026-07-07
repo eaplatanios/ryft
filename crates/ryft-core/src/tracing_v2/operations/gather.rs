@@ -78,7 +78,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_grad};
+    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the differentiation trace that `exemplar` belongs to.
@@ -95,7 +95,7 @@ mod tests {
         // f(x) = sum(gather(x, [[0], [2]])) takes rows 0 and 2 of a 3x2 matrix; the integer indices are constants of
         // the trace, so the gather/scatter-add transpose duality pulls the all-ones cotangent back into a zero operand
         // at exactly those rows.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);

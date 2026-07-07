@@ -145,6 +145,7 @@ where
 /// is straight-line primal-enum operations referencing those tracers directly, it introduces no symbolic capture and
 /// the enclosing partial-evaluation split discovers the residual operand edges structurally — so
 /// the rule is a leaf needing no [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation)
+/// or [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation)
 /// witness, and reverse mode transposes the spliced bilinear operations exactly as it does for any other straight-line
 /// tangent program.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Constant, C::Operation>
@@ -655,7 +656,7 @@ where
         if !operation.transposed {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                    value_and_grad, or jacrev) instead"
+                    value_and_gradient, or jacrev) instead"
                     .to_string(),
             }
             .into());
@@ -767,7 +768,7 @@ where
         if !self.transposed {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                    value_and_grad, or jacrev) instead"
+                    value_and_gradient, or jacrev) instead"
                     .to_string(),
             }
             .into());
@@ -800,7 +801,8 @@ where
 /// fails with the canonical reverse-only error, while [`transpose_primal_custom_vjp`] replays the user's `backward`
 /// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
 /// primal-enum operation, the rule introduces no symbolic capture and needs no
-/// [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation) witness.
+/// [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation) or
+/// [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation) witness.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Constant, C::Operation>
 where
     C::Constant: Clone,
@@ -995,7 +997,7 @@ where
     fn interpret(&self, _context: &C, _inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         Err(TypeError {
             message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
-                value_and_grad, or jacrev) instead"
+                value_and_gradient, or jacrev) instead"
                 .to_string(),
         }
         .into())
@@ -1443,7 +1445,7 @@ mod tests {
     use super::*;
     use crate::batching::BatchAxis;
     use crate::tracing_v2::differentiation::Differentiate;
-    use crate::tracing_v2::value_and_grad;
+    use crate::tracing_v2::value_and_gradient;
 
     /// Returns the canonical test array type with the provided dimensions.
     fn test_type(dimensions: &[usize]) -> ArrayType {
@@ -1614,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_custom_jvp_governs_reverse_mode() {
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let operation = custom_jvp_sin(&test_type(&[]));
@@ -1630,7 +1632,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let operation = custom_vjp_sin(&test_type(&[]));
@@ -1749,7 +1751,7 @@ mod tests {
 
     #[test]
     fn test_scalar_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
             |x| {
                 let operation = ScalarOperation::CustomVjp(Box::new(
@@ -1788,7 +1790,7 @@ mod tests {
         assert_close(primal.values[0], 2.0f64.sin());
         assert_close(tangent.values[0], 2.0 * 2.0f64.cos());
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| function.call(x).unwrap(),
             TestArray::scalar(3.0),
@@ -1810,7 +1812,7 @@ mod tests {
                 Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| function.call(x).unwrap(),
             TestArray::scalar(2.0),
@@ -1846,7 +1848,7 @@ mod tests {
                 Ok((scaled_x, scaled_y))
             },
         );
-        let (value, (gradient_x, gradient_y)) = value_and_grad(
+        let (value, (gradient_x, gradient_y)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| function.call((x, y)).unwrap(),
             (TestArray::scalar(2.0), TestArray::scalar(5.0)),
@@ -1869,7 +1871,7 @@ mod tests {
                 Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) = value_and_grad(&domain, |x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
+        let (value, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
         assert_scalar_close(value, 2.0f64.sin());
         assert_scalar_close(gradient, 3.0 * 2.0f64.cos());
     }
@@ -1914,12 +1916,12 @@ mod tests {
     fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
         use crate::batching::Batch;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::{NestedTracer, value_and_grad};
+        use crate::tracing_v2::{NestedTracer, value_and_gradient};
 
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
         // rule: traced batching re-wraps the call around batched programs instead of inlining the primal, so the
         // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
@@ -1949,11 +1951,11 @@ mod tests {
     fn test_custom_vjp_survives_batching_and_governs_the_batched_gradient() {
         use crate::batching::Batch;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::{NestedTracer, value_and_grad};
+        use crate::tracing_v2::{NestedTracer, value_and_gradient};
 
         // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
         // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();

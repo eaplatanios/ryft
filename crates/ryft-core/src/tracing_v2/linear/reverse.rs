@@ -19,7 +19,7 @@ use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramErr
 /// leaf. Use [`Differentiate::vjp`] directly for vector-valued functions that need an explicit output
 /// cotangent.
 #[allow(private_bounds)]
-pub fn value_and_grad<C, F, Input>(
+pub fn value_and_gradient<C, F, Input>(
     context: &C,
     function: F,
     primals: Input,
@@ -67,12 +67,12 @@ where
 
 /// Computes the reverse-mode gradient of a scalar-output function.
 ///
-/// This is [`value_and_grad`] with the primal value discarded — the analogue of JAX's
+/// This is [`value_and_gradient`] with the primal value discarded — the analogue of JAX's
 /// [`grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html). The function must return
-/// exactly one rank-0 scalar array leaf. Use [`value_and_grad`] when the function value is also
-/// needed, and [`grad_with_aux`] when the function carries auxiliary outputs.
+/// exactly one rank-0 scalar array leaf. Use [`value_and_gradient`] when the function value is also
+/// needed, and [`gradient_with_aux`] when the function carries auxiliary outputs.
 #[allow(private_bounds)]
-pub fn grad<C, F, Input>(
+pub fn gradient<C, F, Input>(
     context: &C,
     function: F,
     primals: Input,
@@ -99,7 +99,7 @@ where
         + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
 {
-    value_and_grad(context, function, primals).map(|(_, gradient)| gradient)
+    value_and_gradient(context, function, primals).map(|(_, gradient)| gradient)
 }
 
 /// Computes a scalar-output value, auxiliary outputs, and the reverse-mode gradient.
@@ -111,7 +111,7 @@ where
 /// This mirrors the semantics of a `has_aux` transform while keeping the Rust API explicit: the
 /// primal value and auxiliary data are returned as `((value, aux), gradient)`.
 #[allow(private_bounds)]
-pub fn value_and_grad_with_aux<C, F, Input, Aux>(
+pub fn value_and_gradient_with_aux<C, F, Input, Aux>(
     context: &C,
     function: F,
     primals: Input,
@@ -176,11 +176,11 @@ where
 
 /// Computes the reverse-mode gradient and auxiliary outputs of a scalar-output function.
 ///
-/// This is [`value_and_grad_with_aux`] with the primal scalar value discarded. The return order is
+/// This is [`value_and_gradient_with_aux`] with the primal scalar value discarded. The return order is
 /// `(gradient, aux)`, matching the common use case where auxiliary outputs are diagnostics or
 /// cached intermediates and the gradient remains the primary result.
 #[allow(private_bounds)]
-pub fn grad_with_aux<C, F, Input, Aux>(
+pub fn gradient_with_aux<C, F, Input, Aux>(
     context: &C,
     function: F,
     primals: Input,
@@ -219,7 +219,7 @@ where
     Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     Aux: Parameterized<<C as Domain>::Value, To<<C as Domain>::Value> = Aux>,
 {
-    value_and_grad_with_aux(context, function, primals).map(|((_, aux), gradient)| (gradient, aux))
+    value_and_gradient_with_aux(context, function, primals).map(|((_, aux), gradient)| (gradient, aux))
 }
 
 #[cfg(test)]
@@ -243,8 +243,10 @@ mod tests {
         let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let empty_primals: Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>> = Vec::new();
 
-        let result = context
-            .value_and_grad(|_inputs: Vec<_>| panic!("closure should not run without traced inputs"), empty_primals);
+        let result = context.value_and_gradient(
+            |_inputs: Vec<_>| panic!("closure should not run without traced inputs"),
+            empty_primals,
+        );
 
         assert!(matches!(
             result,
@@ -259,7 +261,8 @@ mod tests {
         let primal_a = context_a.input(DataType::F64);
         let primal_b = context_b.input(DataType::F64);
 
-        let result = context_a.value_and_grad(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal_a, primal_b]);
+        let result =
+            context_a.value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal_a, primal_b]);
 
         assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
     }
@@ -274,7 +277,7 @@ mod tests {
             DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
             Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
         ) = context
-            .value_and_grad(
+            .value_and_gradient(
                 |inputs| {
                     calls.set(calls.get() + 1);
                     inputs[0].clone() * inputs[0].clone()
@@ -291,7 +294,7 @@ mod tests {
     fn test_value_and_grad_with_aux_ignores_aux_cotangents() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
-        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) = value_and_grad_with_aux(
+        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) = value_and_gradient_with_aux(
             &domain,
             |(x, y)| {
                 let value = x.clone() * y.clone();
@@ -312,7 +315,7 @@ mod tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let gradient: (Scalar, Scalar) =
-            grad(&domain, |(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
+            gradient(&domain, |(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
 
         assert_eq!(gradient, (Scalar::from(4.0), Scalar::from(2.0)));
     }
@@ -322,7 +325,7 @@ mod tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let (gradient, aux): ((Scalar, Scalar), Scalar) =
-            grad_with_aux(&domain, |(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
+            gradient_with_aux(&domain, |(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
                 .unwrap();
 
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));

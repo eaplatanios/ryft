@@ -112,7 +112,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error. A non-scalar gradient output cannot occur for this
                 // scalar benchmark function.
-                let gradient = context.value_and_gradient(quartic_plus_sin, x).map_err(|error| match error {
+                let gradient = context.gradient(quartic_plus_sin, x).map_err(|error| match error {
                     DifferentiationError::Program(error) => error,
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })?;
@@ -132,13 +132,14 @@ fn emit_scalar_quartic_plus_sin_value_and_grad() -> Result<Vec<IrBenchmarkRecord
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error. A non-scalar gradient output cannot occur for this
                 // scalar benchmark function.
-                let value_and_gradient = context.value_and_grad(quartic_plus_sin, x).map_err(|error| match error {
-                    DifferentiationError::Program(error) => error,
-                    error => ProgramError::MalformedProgram(error.to_string()),
-                })?;
+                let value_and_gradient =
+                    context.value_and_gradient(quartic_plus_sin, x).map_err(|error| match error {
+                        DifferentiationError::Program(error) => error,
+                        error => ProgramError::MalformedProgram(error.to_string()),
+                    })?;
                 Ok(value_and_gradient)
             },
             Scalar::from(2.0),
         )?;
-    Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_grad", &compiled)?])
+    Ok(vec![tracing_record("scalar_quartic_plus_sin_value_and_grad", "value_and_gradient", &compiled)?])
 }

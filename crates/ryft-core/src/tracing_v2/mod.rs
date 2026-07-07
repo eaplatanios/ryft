@@ -14,7 +14,7 @@ pub mod benchmarking;
 /// evaluated into a known primal sub-program and an unknown linear tangent sub-program
 /// ([`Program::linearize`](crate::Program::linearize)), whose tangent half transposes directly in the primal
 /// operation family for reverse mode. The value-level entry points on [`Differentiate`] — `jvp`,
-/// `linearize`, `vjp`, `value_and_grad`, `value_and_gradient` — are sugar that traces the closure into a primal
+/// `linearize`, `vjp`, `value_and_gradient`, `value_and_gradient` — are sugar that traces the closure into a primal
 /// program and then differentiates it on that path, so whether a transform runs eagerly or stages a program is
 /// decided by the context's value type rather than by a mode flag.
 pub mod differentiation;
@@ -39,7 +39,7 @@ pub use crate::tracing::NestedTracer;
 pub use differentiation::Differentiate;
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
-    Jacobian, grad, grad_with_aux, jacrev, value_and_grad, value_and_grad_with_aux,
+    Jacobian, gradient, gradient_with_aux, jacrev, value_and_gradient, value_and_gradient_with_aux,
 };
 pub use operations::collective::{
     AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,

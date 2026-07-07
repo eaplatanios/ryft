@@ -61,7 +61,7 @@ mod tests {
     use crate::operations::trigonometric::Cos;
     use crate::scalars::Scalar;
     use crate::tracing_v2::test_util::assert_scalar_close;
-    use crate::tracing_v2::{Differentiate, value_and_grad};
+    use crate::tracing_v2::{Differentiate, value_and_gradient};
 
     #[test]
     fn test_cos_jvp_and_gradient_scale_by_negated_sine() {
@@ -70,7 +70,7 @@ mod tests {
         assert_scalar_close(primal, 2.0f64.cos());
         assert_scalar_close(tangent, -3.0 * 2.0f64.sin());
 
-        let (value, gradient) = value_and_grad(&domain, |x| x.cos().unwrap(), Scalar::from(2.0)).unwrap();
+        let (value, gradient) = value_and_gradient(&domain, |x| x.cos().unwrap(), Scalar::from(2.0)).unwrap();
         assert_scalar_close(value, 2.0f64.cos());
         assert_scalar_close(gradient, -2.0f64.sin());
     }

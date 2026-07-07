@@ -223,7 +223,7 @@ mod tests {
 
     use super::*;
     use crate::tracing_v2::differentiation::Differentiate;
-    use crate::tracing_v2::value_and_grad;
+    use crate::tracing_v2::value_and_gradient;
 
     const PINNED_HOST: Memory = Memory::Host { pinned: true };
 
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = value_and_grad(
+        let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
