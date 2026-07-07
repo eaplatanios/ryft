@@ -721,24 +721,23 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>
 }
 
 impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>> Context for BatchingContext<C> {
-    /// Lifts a constant by lifting it in the parent context and replicating it across the batch.
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {
+        // Lifts a constant by lifting it in the parent context and replicating it across the batch.
         Ok(BatchingTracer::new(self.clone(), ArrayBatch::replicated(self.parent().lift(constant)?)))
     }
 
-    /// Binding routes the operation through its [`BatchableOperation`] implementation against the batch-carrying
-    /// inputs. The implementation dispatches primitive work through the parent context, executing eagerly under an
-    /// eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
-    /// collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
-    /// [`Instruction`](crate::Instruction) becoming two branches plus a per-item select instruction) emerges
-    /// automatically.
     #[inline]
     fn bind<P: Into<Self::Operation>>(
         &self,
         operation: P,
         inputs: &[BatchingTracer<C>],
     ) -> Result<Vec<BatchingTracer<C>>, ProgramError> {
+        // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
+        // inputs. The implementation dispatches primitive work through the parent context, executing eagerly under an
+        // eager parent or staging into an enclosing trace under a staging parent, and axis-referencing work (e.g.,
+        // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
+        // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
         let operation = operation.into();
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
         let output_batches = operation.batch(self, input_batches.as_slice())?;
@@ -746,8 +745,12 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>
     }
 
     #[inline]
+    fn is_eager(&self) -> bool {
+        self.parent().is_eager()
+    }
+
+    #[inline]
     fn resolve(&self, value: &BatchingTracer<C>) -> ValueResolution<C::Constant> {
-        // A batching value resolves exactly as the parent context resolves the value it packs.
         self.parent().resolve(value.batch().value())
     }
 }

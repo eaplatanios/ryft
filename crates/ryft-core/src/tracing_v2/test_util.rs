@@ -46,7 +46,7 @@ mod tests {
     use crate::batching::ArrayBatch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
-    use crate::contexts::{EagerContext, StagingContext};
+    use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
     use crate::operations::compare::CompareOperation;
@@ -687,8 +687,8 @@ mod tests {
             .jvp(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
-                    outputs.remove(0)
+                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
+                    Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
                 TestArray::scalar(1.0),
@@ -923,9 +923,9 @@ mod tests {
             .jvp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
+                        init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     let ys = outputs.remove(1);
-                    (outputs.remove(0), ys)
+                    Ok((outputs.remove(0), ys))
                 },
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
                 (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 1.0, 0.0])),

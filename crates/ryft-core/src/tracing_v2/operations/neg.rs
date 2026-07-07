@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn test_neg_jvp_and_gradient_negate() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = domain.jvp(|x| -x, Scalar::from(2.0), Scalar::from(3.0)).unwrap();
+        let (primal, tangent) = domain.jvp(|x| Ok(-x), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, -2.0);
         assert_eq!(tangent, -3.0);
 

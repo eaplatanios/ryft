@@ -10,9 +10,8 @@ use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::{Tracer, TracerState, TracingContext};
+use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
-use crate::{DomainTracer, DomainTracingContext};
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
 /// batching and automatic differentiation. A [`Domain`] is purely the type, value, constant, and operation universe
@@ -123,6 +122,15 @@ pub trait Context: Domain + Clone {
         operation: O,
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
+
+    /// Returns `true` if this [`Context`] is *eager* meaning that its [`bind`](Self::bind) computes concrete values
+    /// immediately so that concretizing extractions such as [`BooleanLike::boolean`](crate::BooleanLike::boolean) on
+    /// values it produces can succeed and, for example, the trip count of a data-dependent loop is decidable while
+    /// differentiating. Transform contexts that wrap other contexts (e.g., batching and forward-mode differentiation)
+    /// delegate to the wrapped context, so that the answer reflects the innermost context that actually executes the
+    /// bound operations.
+    #[inline]
+    fn is_eager(&self) -> bool;
 
     /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible
     /// [`ValueResolution`]s and their semantics.
@@ -262,6 +270,11 @@ impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O
     #[inline]
     fn bind<P: Into<O>>(&self, operation: P, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
         operation.into().interpret(self, inputs)
+    }
+
+    #[inline]
+    fn is_eager(&self) -> bool {
+        true
     }
 
     #[inline]

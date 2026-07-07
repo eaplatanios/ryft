@@ -356,6 +356,12 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     }
 
     #[inline]
+    fn is_eager(&self) -> bool {
+        // `TracingContext`s stage values as `Tracer`s rather than computing them and so they are never eager.
+        false
+    }
+
+    #[inline]
     fn resolve(&self, value: &Tracer<Self>) -> ValueResolution<V> {
         if !Rc::ptr_eq(self.builder(), value.context().builder()) {
             return ValueResolution::Opaque;
@@ -466,6 +472,12 @@ impl<C: Context> Context for NestedTracingContext<C> {
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
         self.stage_operation(operation.into(), inputs)
+    }
+
+    #[inline]
+    fn is_eager(&self) -> bool {
+        // `NestedTracingContext`s stage values as `Tracer`s rather than computing them and so they are never eager.
+        false
     }
 
     #[inline]

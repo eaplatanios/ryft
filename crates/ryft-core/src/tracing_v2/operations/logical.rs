@@ -90,24 +90,20 @@ mod tests {
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
+    use crate::programs::ProgramError;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::DifferentiationContext;
+    use crate::tracing_v2::differentiation::JvpTracer;
 
-    /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over staged tracers of any context with [`TestArray`]
-    /// semantics.
-    fn masked_select<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
-    where
-        C: crate::contexts::StagingContext<
-                Type = crate::types::ArrayType,
-                Constant = TestArray,
-                Operation = crate::tracing_v2::ArrayOperation<TestArray>,
-            >,
-    {
-        let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
-        let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan).unwrap();
+    /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
+    fn masked_select(
+        x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+    ) -> Result<JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        let positive = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
+        let above_one = x.compare(&x.one_like(), ComparisonDirection::GreaterThan)?;
         let mask = positive & above_one;
-        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
+        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
     }
 
     #[test]

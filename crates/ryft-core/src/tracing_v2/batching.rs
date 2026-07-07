@@ -62,11 +62,4 @@ where
     fn validate_primal(&self, primal: &Self::Value) -> Result<(), ProgramError> {
         self.parent().validate_primal(primal.batch().value())
     }
-
-    /// Concretizing a batched primal is possible exactly when the parent context supports concretizing the value it
-    /// packs (never under a staging parent, always under an eager one).
-    #[inline]
-    fn supports_primal_concretization(&self) -> bool {
-        self.parent().supports_primal_concretization()
-    }
 }

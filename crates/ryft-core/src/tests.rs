@@ -1092,12 +1092,13 @@ mod differentiation_tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::{Context, EagerContext};
+    use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
     use crate::tracing_v2::NestedTracer;
+    use crate::tracing_v2::differentiation::JvpTracer;
 
     use super::DifferentiationContext;
-    use crate::contexts::EagerContext;
-    use crate::operations::scalars::ScalarOperation;
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
@@ -1105,11 +1106,11 @@ mod differentiation_tests {
         // the former `bf16`- and `f16`-specific domains are now two variants exercised over the one domain.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         assert_eq!(
-            domain.jvp(|x| x.clone() + x, Scalar::BF16(bf16::from_f32(3.0)), Scalar::BF16(bf16::ONE)),
+            domain.jvp(|x| Ok(x.clone() + x), Scalar::BF16(bf16::from_f32(3.0)), Scalar::BF16(bf16::ONE)),
             Ok((Scalar::BF16(bf16::from_f32(6.0)), Scalar::BF16(bf16::from_f32(2.0))))
         );
         assert_eq!(
-            domain.jvp(|x| x.clone() + x, Scalar::F16(f16::from_f32(3.0)), Scalar::F16(f16::ONE)),
+            domain.jvp(|x| Ok(x.clone() + x), Scalar::F16(f16::from_f32(3.0)), Scalar::F16(f16::ONE)),
             Ok((Scalar::F16(f16::from_f32(6.0)), Scalar::F16(f16::from_f32(2.0))))
         );
     }
@@ -1117,30 +1118,26 @@ mod differentiation_tests {
     #[test]
     fn test_jvp_takes_the_symbolic_zero_fast_path_for_rule_less_operations() {
         use crate::contexts::EagerContext;
-        use crate::contexts::StagingContext;
         use crate::operations::differentiation::StopGradient;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::NestedTracer;
         use crate::tracing_v2::operations::collective::{CollectiveKind, CollectiveOperation};
 
         // `stop_gradient` severs the incoming tangent, making every downstream collective input tangent a symbolic
-        // zero, so the JVP replay's all-zero fast path computes the primal by binding the operation and emits a zero
-        // output tangent without consulting the per-operation rule. The function is `f(x) = x + psum(stop_gradient(x))`,
-        // which differentiates like `x + c`, so the tangent equals the input tangent. `jvp` traces the closure into a
-        // primal program first, so the fast path fires during the replay rather than during value-level interpretation.
+        // zero, so `JvpContext::bind`'s all-zero fast path computes the primal by binding the operation and emits a
+        // zero output tangent without consulting the per-operation rule. The function is
+        // `f(x) = x + psum(stop_gradient(x))`, which differentiates like `x + c`, so the tangent equals the input
+        // tangent. `jvp` runs the closure directly on duals, so the fast path fires as the closure binds the
+        // collective operation.
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
-                |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                     let severed = x.stop_gradient();
-                    let mut outputs = severed
-                        .context()
-                        .stage_operation(
-                            CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
-                            &[&severed],
-                        )
-                        .unwrap();
-                    x + outputs.remove(0)
+                    let mut outputs = severed.context().bind(
+                        CollectiveOperation::new("batch".to_string(), CollectiveKind::PSum),
+                        &[severed.clone()],
+                    )?;
+                    Ok(x + outputs.remove(0))
                 },
                 TestArray::scalar(2.0),
                 TestArray::scalar(1.0),
@@ -1161,13 +1158,14 @@ mod differentiation_tests {
         // the headline `linearize` capability.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let function = |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap();
+        let jvp_function = |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = domain.linearize(function, Scalar::from(0.7)).unwrap();
 
-        let (reference_primal, _) = domain.jvp(function, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
+        let (reference_primal, _) = domain.jvp(jvp_function, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
         assert_eq!(output, reference_primal);
 
         for tangent in [1.0, -2.5] {
-            let (_, reference_tangent) = domain.jvp(function, Scalar::from(0.7), Scalar::from(tangent)).unwrap();
+            let (_, reference_tangent) = domain.jvp(jvp_function, Scalar::from(0.7), Scalar::from(tangent)).unwrap();
             assert_eq!(forward.apply(Scalar::from(tangent)).unwrap(), reference_tangent);
         }
     }
@@ -1185,16 +1183,20 @@ mod differentiation_tests {
             NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
             NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
         )| a.clone() * b + a.sin().unwrap();
+        let jvp_function = |(a, b): (
+            JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+        )| Ok(a.clone() * b + a.sin()?);
         let (output, forward) = domain.linearize(function, (Scalar::from(0.5), Scalar::from(1.3))).unwrap();
 
         let (reference_primal, _) = domain
-            .jvp(function, (Scalar::from(0.5), Scalar::from(1.3)), (Scalar::from(1.0), Scalar::from(1.0)))
+            .jvp(jvp_function, (Scalar::from(0.5), Scalar::from(1.3)), (Scalar::from(1.0), Scalar::from(1.0)))
             .unwrap();
         assert_eq!(output, reference_primal);
 
         for (da, db) in [(1.0, 0.0), (0.0, 1.0), (2.0, -1.0)] {
             let (_, reference_tangent) = domain
-                .jvp(function, (Scalar::from(0.5), Scalar::from(1.3)), (Scalar::from(da), Scalar::from(db)))
+                .jvp(jvp_function, (Scalar::from(0.5), Scalar::from(1.3)), (Scalar::from(da), Scalar::from(db)))
                 .unwrap();
             let tangent = forward.apply((Scalar::from(da), Scalar::from(db))).unwrap();
             assert_eq!(tangent, reference_tangent);
@@ -1212,18 +1214,19 @@ mod differentiation_tests {
         // distinct tangents are applied through the one linearization and each matches `jvp`.
         let function =
             |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| x.clone() * x.sin().unwrap();
+        let jvp_function = |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .linearize(function, TestArray::scalar(0.7))
             .unwrap();
 
         let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(function, TestArray::scalar(0.7), TestArray::scalar(1.0))
+            .jvp(jvp_function, TestArray::scalar(0.7), TestArray::scalar(1.0))
             .unwrap();
         assert_eq!(output.values, reference_primal.values);
 
         for tangent in [1.0, -2.5] {
             let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .jvp(function, TestArray::scalar(0.7), TestArray::scalar(tangent))
+                .jvp(jvp_function, TestArray::scalar(0.7), TestArray::scalar(tangent))
                 .unwrap();
             let result = forward.apply(TestArray::scalar(tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
@@ -1254,19 +1257,26 @@ mod differentiation_tests {
                 .unwrap();
             outputs.remove(0)
         };
+        let condition_jvp_function = |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+            let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
+            let predicate = x.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
+            let mut outputs =
+                x.context().bind(ArrayOperation::Condition(Box::new(condition)), &[predicate, x.clone()])?;
+            Ok(outputs.remove(0))
+        };
 
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .linearize(condition_function, TestArray::scalar(4.0))
             .unwrap();
         let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(condition_function, TestArray::scalar(4.0), TestArray::scalar(1.0))
+            .jvp(condition_jvp_function, TestArray::scalar(4.0), TestArray::scalar(1.0))
             .unwrap();
         assert_eq!(output.values, reference_primal.values);
         assert_eq!(output.values, vec![8.0]);
 
         for tangent in [1.0, 3.0] {
             let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .jvp(condition_function, TestArray::scalar(4.0), TestArray::scalar(tangent))
+                .jvp(condition_jvp_function, TestArray::scalar(4.0), TestArray::scalar(tangent))
                 .unwrap();
             let result = forward.apply(TestArray::scalar(tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
@@ -1280,7 +1290,8 @@ mod differentiation_tests {
         // Eager forward linearization through an unbounded `while x < 8 { x = x + x }`: the eager unroll-then-fuse
         // pre-pass unrolls the loop at the concrete primal, so the fused JVP program is straight-line and partially
         // evaluates cleanly. From `x = 1` the loop doubles three times, so `f(x) = 8 x` locally; the primal is 8 and
-        // every directional derivative is `8 * tangent`. This matches `jvp`, which unrolls the same loop.
+        // every directional derivative is `8 * tangent`. This matches `jvp`, whose eager `while` rule differentiates
+        // the same loop directly at the concrete primal.
         use crate::contexts::EagerContext;
         use crate::contexts::StagingContext;
         use crate::tests::TestArray;
@@ -1292,6 +1303,11 @@ mod differentiation_tests {
                 x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
             outputs.remove(0)
         };
+        let while_jvp_function = |x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+            let while_operation = doubling_while_for_linearize();
+            let mut outputs = x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
+            Ok(outputs.remove(0))
+        };
 
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .linearize(while_function, TestArray::scalar(1.0))
@@ -1299,13 +1315,13 @@ mod differentiation_tests {
         assert_eq!(output.values, vec![8.0]);
 
         let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(while_function, TestArray::scalar(1.0), TestArray::scalar(1.0))
+            .jvp(while_jvp_function, TestArray::scalar(1.0), TestArray::scalar(1.0))
             .unwrap();
         assert_eq!(output.values, reference_primal.values);
 
         for tangent in [1.0, 2.0] {
             let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .jvp(while_function, TestArray::scalar(1.0), TestArray::scalar(tangent))
+                .jvp(while_jvp_function, TestArray::scalar(1.0), TestArray::scalar(tangent))
                 .unwrap();
             let result = forward.apply(TestArray::scalar(tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
@@ -1334,6 +1350,14 @@ mod differentiation_tests {
                 init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
             outputs.remove(0)
         };
+        let scan_jvp_function = |(init, xs): (
+            JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+            JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+        )| {
+            let scan = product_scan_for_linearize();
+            let mut outputs = init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs])?;
+            Ok(outputs.remove(0))
+        };
 
         let primals = (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0]));
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
@@ -1342,7 +1366,7 @@ mod differentiation_tests {
         assert_eq!(output.values, vec![24.0]);
 
         let (reference_primal, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(scan_function, primals.clone(), (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 0.0, 0.0])))
+            .jvp(scan_jvp_function, primals.clone(), (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 0.0, 0.0])))
             .unwrap();
         assert_eq!(output.values, reference_primal.values);
 
@@ -1353,7 +1377,7 @@ mod differentiation_tests {
         ];
         for (init_tangent, xs_tangent) in tangents {
             let (_, reference_tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .jvp(scan_function, primals.clone(), (init_tangent.clone(), xs_tangent.clone()))
+                .jvp(scan_jvp_function, primals.clone(), (init_tangent.clone(), xs_tangent.clone()))
                 .unwrap();
             let result = forward.apply((init_tangent, xs_tangent)).unwrap();
             assert_eq!(result.values, reference_tangent.values);
@@ -1511,6 +1535,9 @@ mod linearization_tests {
     /// Tracer leaf seen by the scalar test closures.
     type ScalarTracer = Tracer<NestedTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>;
 
+    /// Forward-mode dual leaf seen by the scalar `jvp` closures.
+    type ScalarJvpTracer = JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
+
     /// Absolute tolerance for comparing the path against the established transforms.
     const TOLERANCE: f64 = 1e-12;
 
@@ -1539,7 +1566,7 @@ mod linearization_tests {
         primals: Vec<Scalar>,
         tangents: Vec<Scalar>,
     ) where
-        JvpFunction: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
+        JvpFunction: FnOnce(Vec<ScalarJvpTracer>) -> Result<Vec<ScalarJvpTracer>, ProgramError>,
         LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
     {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
@@ -1692,11 +1719,12 @@ mod linearization_tests {
     fn test_jvp_pipeline_unrolls_eager_unbounded_while() {
         // The eager unroll-then-fuse pre-pass unrolls the unbounded `while x < 100 { x = x * x }` at the concrete
         // primal, so forward mode through it now succeeds on the capture-free path and must reproduce the
-        // established eager `jvp`, which unrolls the same loop. From `x = 1.5` the loop runs four squarings.
+        // established eager `jvp`, whose eager `while` rule differentiates the same loop directly at the concrete
+        // primal. From `x = 1.5` the loop runs four squarings.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (reference_primals, reference_tangents) = domain
             .jvp(
-                |inputs| vec![inputs[0].clone().unary(scalar_squaring_while())],
+                |inputs: Vec<ScalarJvpTracer>| inputs[0].context().bind(scalar_squaring_while(), &[inputs[0].clone()]),
                 vec![Scalar::from(1.5)],
                 vec![Scalar::from(1.0)],
             )
@@ -1791,6 +1819,39 @@ mod linearization_tests {
     }
 
     #[test]
+    fn test_jvp_runs_eager_nested_unbounded_while() {
+        // Forward mode through *nested* data-dependent loops under an eager receiver: the `while` JVP rule runs the
+        // outer loop at the concrete duals and unrolls the inner loop at each iteration's concrete carries, so
+        // neither loop needs an iteration bound. The primal must match the traced program's own eager
+        // interpretation, and because every operation on the branch taken at `x = 1.5` (adds and doublings) is
+        // linear in the carry, the pushforward of a unit tangent is exactly `f(1.5) / 1.5`.
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (program, _, _, input_values) = domain
+            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
+                |inputs| Ok(vec![inputs[0].clone().unary(scalar_nested_while())]),
+                vec![Scalar::from(1.5)],
+            )
+            .unwrap();
+        let expected = program.interpret(input_values).unwrap();
+
+        let (primal, tangent): (Vec<Scalar>, Vec<Scalar>) = domain
+            .jvp(
+                |inputs: Vec<_>| {
+                    let mut outputs = inputs[0].context().bind(scalar_nested_while(), &[inputs[0].clone()])?;
+                    Ok(vec![outputs.remove(0)])
+                },
+                vec![Scalar::from(1.5)],
+                vec![Scalar::from(1.0)],
+            )
+            .unwrap();
+        assert_close(&primal, &expected, "eager nested unbounded while jvp primal");
+        let Scalar::F64(value) = expected[0] else {
+            panic!("nested while primal should be an f64 scalar");
+        };
+        assert_close(&tangent, &[Scalar::from(value / 1.5)], "eager nested unbounded while jvp tangent");
+    }
+
+    #[test]
     fn test_vjp_pipeline_unrolls_eager_unbounded_while() {
         // The unrolled straight-line primal program produces a control-flow-free tangent program that transposes via
         // the existing partitioned transposition, so reverse mode through the unbounded `while x < 100 { x = x * x }`
@@ -1822,7 +1883,7 @@ mod linearization_tests {
     fn test_forward_equivalent_to_jvp() {
         // f(x) = x * sin(x): exercises mul (operand-factor terms) feeding sin (fresh-coefficient chain rule).
         assert_forward_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
+            |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
             |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
             vec![Scalar::from(0.7)],
             vec![Scalar::from(1.0)],
@@ -1831,8 +1892,8 @@ mod linearization_tests {
         // f(x) = x * x + 3 * x: exercises mul against a constant tangent and add.
         assert_forward_equivalent(
             |inputs| {
-                let three = inputs[0].context().constant(Scalar::from(3.0));
-                vec![inputs[0].clone() * inputs[0].clone() + three * inputs[0].clone()]
+                let three = inputs[0].context().lift(Scalar::from(3.0))?;
+                Ok(vec![inputs[0].clone() * inputs[0].clone() + three * inputs[0].clone()])
             },
             |inputs| {
                 let three = inputs[0].context().constant(Scalar::from(3.0));
@@ -1844,7 +1905,7 @@ mod linearization_tests {
 
         // f(x) = sin(x) * cos(x): exercises both fresh-coefficient chain rules feeding a product.
         assert_forward_equivalent(
-            |inputs| vec![inputs[0].sin().unwrap() * inputs[0].cos().unwrap()],
+            |inputs| Ok(vec![inputs[0].sin()? * inputs[0].cos()?]),
             |inputs| Ok(vec![inputs[0].sin()? * inputs[0].cos()?]),
             vec![Scalar::from(1.2)],
             vec![Scalar::from(1.0)],
@@ -1852,7 +1913,7 @@ mod linearization_tests {
 
         // f(a, b) = a * b + sin(a): two inputs, mixing a bilinear product with a unary chain rule.
         assert_forward_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
+            |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
             |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
             vec![Scalar::from(0.5), Scalar::from(1.3)],
             vec![Scalar::from(1.0), Scalar::from(1.0)],
@@ -1860,7 +1921,7 @@ mod linearization_tests {
 
         // f(a, b) = a * b + sin(a), tangent only along b, to exercise the partial all-zero tangent path.
         assert_forward_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
+            |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
             |inputs| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
             vec![Scalar::from(0.5), Scalar::from(1.3)],
             vec![Scalar::from(0.0), Scalar::from(2.0)],
@@ -1869,7 +1930,7 @@ mod linearization_tests {
         // f(a, b) = a / b: exercises the quotient rule (fresh reciprocal and `-(a/b²)` coefficients) with both terms
         // live.
         assert_forward_equivalent(
-            |inputs| vec![inputs[0].clone() / inputs[1].clone()],
+            |inputs| Ok(vec![inputs[0].clone() / inputs[1].clone()]),
             |inputs| Ok(vec![inputs[0].clone() / inputs[1].clone()]),
             vec![Scalar::from(3.0), Scalar::from(2.0)],
             vec![Scalar::from(1.0), Scalar::from(1.0)],
@@ -1877,7 +1938,7 @@ mod linearization_tests {
 
         // f(a, b) = sin(a) / b, tangent only along a, to exercise the quotient rule's dropped right term.
         assert_forward_equivalent(
-            |inputs| vec![inputs[0].sin().unwrap() / inputs[1].clone()],
+            |inputs| Ok(vec![inputs[0].sin()? / inputs[1].clone()]),
             |inputs| Ok(vec![inputs[0].sin()? / inputs[1].clone()]),
             vec![Scalar::from(0.9), Scalar::from(1.4)],
             vec![Scalar::from(1.0), Scalar::from(0.0)],
@@ -2112,51 +2173,38 @@ mod linearization_tests {
     }
 
     #[test]
-    fn test_jvp_direct_zero_tangent_flows_the_all_zero_fast_path() {
+    fn test_jvp_zero_tangent_flows_the_all_zero_fast_path() {
         use crate::operations::arithmetic::Mul;
         use crate::operations::trigonometric::Sin;
-        use crate::tracing_v2::differentiation::JvpTracer;
 
         // A zero input tangent flows through the all-zero fast path of `JvpContext::bind` (the rule is skipped and
         // the primal operation binds directly): the derivative is zero and the value matches the primal evaluation.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (value, tangent): (Scalar, Scalar) = domain
-            .jvp_direct(
-                |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.mul(&x.sin()?),
-                Scalar::from(0.7),
-                Scalar::from(0.0),
-            )
-            .unwrap();
+        let (value, tangent): (Scalar, Scalar) =
+            domain.jvp(|x: ScalarJvpTracer| x.mul(&x.sin()?), Scalar::from(0.7), Scalar::from(0.0)).unwrap();
         assert_close(&[value], &[Scalar::from(0.7 * 0.7_f64.sin())], "zero-tangent value");
         assert_close(&[tangent], &[Scalar::from(0.0)], "zero-tangent tangent");
     }
 
     #[test]
-    fn test_jvp_direct_branches_on_concrete_primal() {
-        use crate::NestedTracer;
+    fn test_jvp_branches_on_concrete_primal() {
         use crate::operations::BooleanLike;
         use crate::operations::arithmetic::{Mul, Neg};
         use crate::operations::trigonometric::Sin;
-        use crate::tracing_v2::differentiation::JvpTracer;
 
-        // `jvp_direct` runs the closure directly on concrete duals, so ordinary Rust control flow can branch on the
-        // primal — impossible in `jvp`, whose closures see tracers. `f(x) = if x != 0 { x * sin(x) }
-        // else { -x }`.
+        // Over an eager receiver `jvp` runs the closure directly on concrete duals, so ordinary Rust control flow can
+        // branch on the primal — impossible under a staging receiver, whose duals carry tracers.
+        // `f(x) = if x != 0 { x * sin(x) } else { -x }`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let branching = |x: JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| -> Result<JvpTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>, ProgramError> {
+        let branching = |x: ScalarJvpTracer| -> Result<ScalarJvpTracer, ProgramError> {
             if x.primal().boolean()? { x.mul(&x.sin()?) } else { x.neg() }
         };
-        let (primal, tangent): (Scalar, Scalar) =
-            domain.jvp_direct(branching, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
+        let (primal, tangent): (Scalar, Scalar) = domain.jvp(branching, Scalar::from(0.7), Scalar::from(1.0)).unwrap();
 
         // `0.7` decodes as `true`, so the `x * sin(x)` branch runs; its primal and tangent match `jvp` of that
         // straight-line function.
         let (reference_primal, reference_tangent): (Scalar, Scalar) = domain
-            .jvp(
-                |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap(),
-                Scalar::from(0.7),
-                Scalar::from(1.0),
-            )
+            .jvp(|x: ScalarJvpTracer| Ok(x.clone() * x.sin()?), Scalar::from(0.7), Scalar::from(1.0))
             .unwrap();
         assert_eq!(primal, reference_primal);
         assert_eq!(tangent, reference_tangent);
@@ -2244,66 +2292,60 @@ mod linearization_tests {
         assert_close(&outputs, &[Scalar::from(10.0), Scalar::from(2.0)], "constant scaling and nullary constants");
     }
 
-    /// Asserts that [`jvp_direct`] reproduces both the primal and the tangent outputs of
-    /// [`DifferentiationContext::jvp`] for `function` at `primals` with the given `tangents`, replaying the JVP program
-    /// sub-programs through the eager scalar domain's [`bind`](Context::bind).
-    fn assert_jvp_direct_equivalent<JvpFunction, LinearizeFunction>(
-        jvp_function: JvpFunction,
-        linearize_function: LinearizeFunction,
-        primals: Vec<Scalar>,
-        tangents: Vec<Scalar>,
-    ) where
-        JvpFunction: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
-        LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
-    {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (reference_primals, reference_tangents) =
-            domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
-
-        let (primal_outputs, tangent_outputs) = jvp_direct(&domain, linearize_function, primals, tangents).unwrap();
-        assert_close(&primal_outputs, &reference_primals, "jvp pipeline primal");
-        assert_close(&tangent_outputs, &reference_tangents, "jvp pipeline tangent");
-    }
-
     #[test]
-    fn test_jvp_direct_equivalent_to_jvp() {
-        // f(x) = x * sin(x): mul feeding sin, replayed forward through the eager domain's `bind`.
-        assert_jvp_direct_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-            |inputs| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-            vec![Scalar::from(0.7)],
-            vec![Scalar::from(1.0)],
-        );
+    fn test_jvp_computes_analytic_forward_derivatives() {
+        // The single `jvp` entry point runs the closure directly on duals; each block below asserts the hand-computed
+        // primal and directional derivative for one of the function shapes the pipeline-equivalence harness used to
+        // exercise.
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
-        // f(x) = x * x + 3 * x.
-        assert_jvp_direct_equivalent(
-            |inputs| {
-                let three = inputs[0].context().constant(Scalar::from(3.0));
-                vec![inputs[0].clone() * inputs[0].clone() + three * inputs[0].clone()]
-            },
-            |inputs| {
-                let three = inputs[0].context().constant(Scalar::from(3.0));
-                vec![inputs[0].clone() * inputs[0].clone() + three * inputs[0].clone()]
-            },
-            vec![Scalar::from(2.0)],
-            vec![Scalar::from(1.0)],
-        );
+        // f(x) = x * sin(x): mul feeding sin; d/dx = sin(x) + x * cos(x).
+        let (primals, tangents) = domain
+            .jvp(
+                |inputs: Vec<ScalarJvpTracer>| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
+                vec![Scalar::from(0.7)],
+                vec![Scalar::from(1.0)],
+            )
+            .unwrap();
+        assert_close(&primals, &[Scalar::from(0.7 * 0.7_f64.sin())], "x sin(x) primal");
+        assert_close(&tangents, &[Scalar::from(0.7_f64.sin() + 0.7 * 0.7_f64.cos())], "x sin(x) tangent");
 
-        // f(a, b) = a * b + sin(a): two inputs, mixing a bilinear product with a unary chain rule.
-        assert_jvp_direct_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
-            |inputs| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
-            vec![Scalar::from(0.5), Scalar::from(1.3)],
-            vec![Scalar::from(1.0), Scalar::from(1.0)],
-        );
+        // f(x) = x * x + 3 * x at x = 2: primal 10 and derivative 2x + 3 = 7.
+        let (primals, tangents) = domain
+            .jvp(
+                |inputs: Vec<ScalarJvpTracer>| {
+                    let three = inputs[0].context().lift(Scalar::from(3.0))?;
+                    Ok(vec![inputs[0].clone() * inputs[0].clone() + three * inputs[0].clone()])
+                },
+                vec![Scalar::from(2.0)],
+                vec![Scalar::from(1.0)],
+            )
+            .unwrap();
+        assert_close(&primals, &[Scalar::from(10.0)], "x^2 + 3x primal");
+        assert_close(&tangents, &[Scalar::from(7.0)], "x^2 + 3x tangent");
 
-        // f(a, b) = a * b + sin(a), tangent only along b, exercising the partial all-zero tangent path.
-        assert_jvp_direct_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
-            |inputs| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
-            vec![Scalar::from(0.5), Scalar::from(1.3)],
-            vec![Scalar::from(0.0), Scalar::from(2.0)],
-        );
+        // f(a, b) = a * b + sin(a) at (0.5, 1.3) with tangents (1, 1): the directional derivative is
+        // b * da + a * db + cos(a) * da = 1.3 + 0.5 + cos(0.5).
+        let (primals, tangents) = domain
+            .jvp(
+                |inputs: Vec<ScalarJvpTracer>| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
+                vec![Scalar::from(0.5), Scalar::from(1.3)],
+                vec![Scalar::from(1.0), Scalar::from(1.0)],
+            )
+            .unwrap();
+        assert_close(&primals, &[Scalar::from(0.5 * 1.3 + 0.5_f64.sin())], "a b + sin(a) primal");
+        assert_close(&tangents, &[Scalar::from(1.3 + 0.5 + 0.5_f64.cos())], "a b + sin(a) tangent");
+
+        // Same function with the tangent only along `b`, exercising the partial all-zero tangent path: the `sin`
+        // term drops out and the derivative is a * db = 0.5 * 2 = 1.
+        let (_, tangents) = domain
+            .jvp(
+                |inputs: Vec<ScalarJvpTracer>| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
+                vec![Scalar::from(0.5), Scalar::from(1.3)],
+                vec![Scalar::from(0.0), Scalar::from(2.0)],
+            )
+            .unwrap();
+        assert_close(&tangents, &[Scalar::from(1.0)], "a b + sin(a) partial-zero tangent");
     }
 
     #[test]
@@ -2327,9 +2369,9 @@ mod linearization_tests {
 
         let (primal_outputs, tangent_outputs) = outer_context
             .jvp(
-                |inputs: Vec<
-                    Tracer<NestedTracingContext<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>,
-                >| { vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()] },
+                |inputs: Vec<JvpTracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>>| {
+                    Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?])
+                },
                 vec![primal_a, primal_b],
                 vec![tangent_a, tangent_b],
             )
@@ -2356,7 +2398,7 @@ mod linearization_tests {
 
         let (reference_primal, reference_tangent) = domain
             .jvp(
-                |inputs: Vec<ScalarTracer>| vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin().unwrap()],
+                |inputs: Vec<ScalarJvpTracer>| Ok(vec![inputs[0].clone() * inputs[1].clone() + inputs[0].sin()?]),
                 vec![Scalar::from(0.5), Scalar::from(1.3)],
                 vec![Scalar::from(1.0), Scalar::from(1.0)],
             )
@@ -2476,10 +2518,16 @@ mod linearization_tests {
 
     #[test]
     fn test_forward_equivalent_to_jvp_for_custom_jvp() {
+        use crate::tracing_v2::operations::custom_derivatives::CustomJvpOperation;
+
         // f(x) = custom_jvp(sin, doubled_rule)(x). The spliced JVP program maps `(x, dx) -> (sin(x), 2*cos(x)*dx)`, so
         // the tangent is the deliberately doubled `2*cos(x)*dx` rather than the primal body's `cos(x)*dx`.
         assert_forward_equivalent(
-            |inputs| scalar_custom_jvp_function(inputs).unwrap(),
+            |inputs: Vec<ScalarJvpTracer>| {
+                let operation =
+                    CustomJvpOperation::new(scalar_custom_jvp_sin_primal(), scalar_custom_jvp_sin_doubled_rule())?;
+                inputs[0].context().bind(ScalarOperation::CustomJvp(Box::new(operation)), &[inputs[0].clone()])
+            },
             scalar_custom_jvp_function,
             vec![Scalar::from(0.7)],
             vec![Scalar::from(1.5)],
@@ -2527,7 +2575,7 @@ mod linearization_tests {
         // recomputes the interior residuals from it), so the forward reproduces `jvp` of the un-rematerialized
         // body. At x = 2 the directional derivative is `cos(4) * 4 * dx`.
         assert_forward_equivalent(
-            |inputs| vec![(inputs[0].clone() * inputs[0].clone()).sin().unwrap()],
+            |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).sin()?]),
             scalar_rematerialize_function,
             vec![Scalar::from(2.0)],
             vec![Scalar::from(1.0)],
@@ -2546,13 +2594,15 @@ mod linearization_tests {
         );
     }
 
-    /// Stages `custom_vjp(sin, forward, tripled_backward)(x)` over the single closure input `[x]`. The forward program
-    /// is `x -> (sin(x), cos(x))` and the deliberately wrong backward program is
+    /// Builds the scalar `custom_vjp(sin, forward, tripled_backward)` operation. The forward program is
+    /// `x -> (sin(x), cos(x))` and the deliberately wrong backward program is
     /// `(residual, cotangent) -> 3 * residual * cotangent`, detectably different from the true `cos(x) * cotangent`, so
     /// a passing equivalence proves the opaque carrier actually replays `backward` rather than folding to zero or to
     /// the primal derivative. Shares its oracle shape with the `custom_derivatives` tests.
-    fn scalar_custom_vjp_function(inputs: Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError> {
-        use crate::contexts::StagingContext;
+    fn scalar_custom_vjp_operation() -> Result<
+        crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation<Scalar, ScalarOperation<Scalar>>,
+        ProgramError,
+    > {
         use crate::operations::arithmetic::MulOperation;
         use crate::operations::trigonometric::{CosOperation, SinOperation};
         use crate::parameters::Placeholder;
@@ -2580,7 +2630,15 @@ mod linearization_tests {
         let backward =
             backward_builder.build(vec![gradient], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap();
 
-        let operation = CustomVjpOperation::new(primal, forward, backward)?;
+        Ok(CustomVjpOperation::new(primal, forward, backward)?)
+    }
+
+    /// Stages the [`scalar_custom_vjp_operation`] call `custom_vjp(sin, forward, tripled_backward)(x)` over the
+    /// single closure input `[x]`, the shared body of the scalar custom-VJP equivalence closures.
+    fn scalar_custom_vjp_function(inputs: Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError> {
+        use crate::contexts::StagingContext;
+
+        let operation = scalar_custom_vjp_operation()?;
         inputs[0].context().stage_operation(ScalarOperation::CustomVjp(Box::new(operation)), &[&inputs[0]])
     }
 
@@ -2685,7 +2743,10 @@ mod linearization_tests {
 
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         match domain.jvp(
-            |inputs: Vec<ScalarTracer>| scalar_custom_vjp_function(inputs).unwrap(),
+            |inputs: Vec<ScalarJvpTracer>| {
+                let operation = scalar_custom_vjp_operation()?;
+                inputs[0].context().bind(ScalarOperation::CustomVjp(Box::new(operation)), &[inputs[0].clone()])
+            },
             vec![Scalar::from(0.7)],
             vec![Scalar::from(1.5)],
         ) {
@@ -2956,7 +3017,8 @@ mod array_linearization_tests {
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::differentiation::{
-        DifferentiationContext, Linearization, build_jvp_program, replay_via_bind, transpose_tangent_partitioned,
+        DifferentiationContext, JvpTracer, Linearization, build_jvp_program, replay_via_bind,
+        transpose_tangent_partitioned,
     };
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -2966,6 +3028,9 @@ mod array_linearization_tests {
 
     /// Tracer leaf seen by the array test closures.
     type ArrayTracer = Tracer<NestedTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>;
+
+    /// Forward-mode dual leaf seen by the array `jvp` closures.
+    type ArrayJvpTracer = JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
     const TOLERANCE: f64 = 1e-12;
@@ -2996,7 +3061,7 @@ mod array_linearization_tests {
         primals: Vec<TestArray>,
         tangents: Vec<TestArray>,
     ) where
-        JvpFunction: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
+        JvpFunction: FnOnce(Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError>,
         LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
@@ -3228,13 +3293,26 @@ mod array_linearization_tests {
     fn test_array_jvp_pipeline_unrolls_eager_unbounded_while() {
         // The eager unroll-then-fuse pre-pass unrolls the unbounded `while x < 100 { x = x * x }` at the concrete
         // primal, so forward mode through it now succeeds on the capture-free path and must reproduce the
-        // established eager `jvp`, which unrolls the same loop. From `x = 1.5` the loop runs four squarings.
-        assert_array_jvp_direct_equivalent(
-            |inputs| vec![inputs[0].clone().unary(array_squaring_while())],
+        // established eager `jvp`, whose eager `while` rule differentiates the same loop directly at the concrete
+        // primal. From `x = 1.5` the loop runs four squarings.
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let (reference_primals, reference_tangents) = domain
+            .jvp(
+                |inputs: Vec<ArrayJvpTracer>| inputs[0].context().bind(array_squaring_while(), &[inputs[0].clone()]),
+                vec![TestArray::scalar(1.5)],
+                vec![TestArray::scalar(1.0)],
+            )
+            .unwrap();
+
+        let (primal_outputs, tangent_outputs) = jvp_direct(
+            &domain,
             |inputs| vec![inputs[0].clone().unary(array_squaring_while())],
             vec![TestArray::scalar(1.5)],
             vec![TestArray::scalar(1.0)],
-        );
+        )
+        .unwrap();
+        assert_arrays_close(&primal_outputs, &reference_primals, "eager unbounded while jvp pipeline primal");
+        assert_arrays_close(&tangent_outputs, &reference_tangents, "eager unbounded while jvp pipeline tangent");
     }
 
     #[test]
@@ -3269,7 +3347,7 @@ mod array_linearization_tests {
     fn test_array_forward_equivalent_to_jvp() {
         // Elementwise: f(x) = x * sin(x) over a vector (Mul + Sin), with a non-trivial tangent.
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
+            |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
             |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
             vec![TestArray::vector(vec![0.7, -1.2, 2.0])],
             vec![TestArray::vector(vec![1.0, 0.5, -2.0])],
@@ -3278,7 +3356,7 @@ mod array_linearization_tests {
         // Inner product: f(x) = x . x (Dot with both operands the differentiated input, so the product rule stages a
         // left and a right Dot).
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())],
+            |inputs| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
             |inputs| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
             vec![TestArray::vector(vec![1.0, 2.0, 3.0])],
             vec![TestArray::vector(vec![0.5, -1.0, 2.0])],
@@ -3287,8 +3365,8 @@ mod array_linearization_tests {
         // Matrix multiply against a constant: f(x) = x @ c (Dot with the right operand held constant).
         assert_array_forward_equivalent(
             |inputs| {
-                let constant = inputs[0].context().constant(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]));
-                vec![inputs[0].dot(&constant, &DotDimensionNumbers::matmul())]
+                let constant = inputs[0].context().lift(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]))?;
+                Ok(vec![inputs[0].dot(&constant, &DotDimensionNumbers::matmul())])
             },
             |inputs| {
                 let constant = inputs[0].context().constant(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]));
@@ -3301,7 +3379,7 @@ mod array_linearization_tests {
         // Structural reduce: f(x) = reduce_sum(x * x, axis 0), reducing a vector to a scalar. This exercises the
         // elementwise product feeding a structural (linear) sum reduction.
         assert_array_forward_equivalent(
-            |inputs| vec![(inputs[0].clone() * inputs[0].clone()).reduce(&[0], ReductionKind::Sum)],
+            |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).reduce(&[0], ReductionKind::Sum)]),
             |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).reduce(&[0], ReductionKind::Sum)]),
             vec![TestArray::vector(vec![1.0, -2.0, 3.0])],
             vec![TestArray::vector(vec![0.5, 1.0, -1.0])],
@@ -3311,10 +3389,10 @@ mod array_linearization_tests {
         // non-differentiated Boolean operand edge that becomes the primal select condition.
         assert_array_forward_equivalent(
             |inputs| {
-                let mask = inputs[0].compare(&inputs[0].zero_like(), ComparisonDirection::GreaterThan).unwrap();
+                let mask = inputs[0].compare(&inputs[0].zero_like(), ComparisonDirection::GreaterThan)?;
                 let on_true = inputs[0].clone() + inputs[0].clone();
                 let on_false = inputs[0].clone() + inputs[0].clone() + inputs[0].clone();
-                vec![Select::select(&mask, &on_true, &on_false).unwrap()]
+                Ok(vec![Select::select(&mask, &on_true, &on_false)?])
             },
             |inputs| {
                 let mask = inputs[0].compare(&inputs[0].zero_like(), ComparisonDirection::GreaterThan)?;
@@ -3329,7 +3407,7 @@ mod array_linearization_tests {
         // Structural broadcast + reshape: f(x) = reshape(x, [4]) + broadcast(reduce_sum(x)) over a 2x2 matrix.
         // Exercises a reshape and a broadcast of a reduced scalar feeding an elementwise add.
         assert_array_forward_equivalent(
-            |inputs| vec![reshape_broadcast(&inputs[0])],
+            |inputs| Ok(vec![reshape_broadcast_jvp(&inputs[0])?]),
             |inputs| Ok(vec![reshape_broadcast(&inputs[0])]),
             vec![TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])],
             vec![TestArray::matrix(2, 2, vec![0.5, -1.0, 2.0, 1.0])],
@@ -3414,12 +3492,22 @@ mod array_linearization_tests {
         Ok(vec![inputs[0].clone() + filled])
     }
 
+    /// Binds `f(x) = x + fill([3], 2.0)` through the forward-mode dual context, the `jvp` twin of [`fill_function`].
+    fn fill_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
+        use crate::operations::constants::FillOperation;
+        use crate::types::{DataType, Shape, Size};
+
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
+        let mut filled = inputs[0].context().bind(FillOperation::new(vector_type, 2.0), &[])?;
+        Ok(vec![inputs[0].clone() + filled.remove(0)])
+    }
+
     #[test]
     fn test_array_forward_and_reverse_equivalent_for_fill() {
         // f(x) = x + fill([3], 2.0): the fill constant carries a zero tangent, so the forward tangent is `dx` and
         // the pullback passes the cotangent straight through, matching `jvp` / `vjp`.
         assert_array_forward_equivalent(
-            |inputs| fill_function(inputs).unwrap(),
+            fill_jvp_function,
             fill_function,
             vec![TestArray::vector(vec![1.0, -2.0, 3.0])],
             vec![TestArray::vector(vec![0.5, 1.0, -1.0])],
@@ -3439,7 +3527,7 @@ mod array_linearization_tests {
         // f(x) = slice(x, [1], [4], strides=[1]): slicing is linear, so the tangent is the same slice of the
         // operand tangent and the pullback writes the cotangent back into the read window, matching `jvp` / `vjp`.
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].slice(&[1], &[4], &[1]).unwrap()],
+            |inputs| Ok(vec![inputs[0].slice(&[1], &[4], &[1])?]),
             |inputs| Ok(vec![inputs[0].slice(&[1], &[4], &[1]).unwrap()]),
             vec![TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])],
             vec![TestArray::vector(vec![0.5, -1.0, 2.0, 1.0, -0.5])],
@@ -3468,7 +3556,7 @@ mod array_linearization_tests {
         // tangent updates the operand tangent with the update tangent and the pullback splits the cotangent into
         // the zeroed-window operand cotangent and the windowed update cotangent, matching `jvp` / `vjp`.
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].update_slice(&inputs[1], &[1]).unwrap()],
+            |inputs| Ok(vec![inputs[0].update_slice(&inputs[1], &[1])?]),
             |inputs| Ok(vec![inputs[0].update_slice(&inputs[1], &[1]).unwrap()]),
             vec![TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])],
             vec![TestArray::vector(vec![0.5, -1.0, 2.0, 1.0]), TestArray::vector(vec![1.0, -0.5])],
@@ -3497,6 +3585,21 @@ mod array_linearization_tests {
         Ok(vec![inputs[0].scatter(&indices, &inputs[1], &operation)?])
     }
 
+    /// Binds `f(x, u) = scatter_add(x, [[1], [3]], u)` through the forward-mode dual context, the `jvp` twin of
+    /// [`scatter_add_function`].
+    fn scatter_add_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
+        use crate::operations::manipulation::{
+            Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind,
+        };
+        use crate::types::{DataType, Shape, Size};
+
+        let indices_type = ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2), Size::Static(1)]));
+        let indices = inputs[0].context().lift(TestArray::new(indices_type, vec![1.0, 3.0]))?;
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), ScatterReductionKind::Add);
+        Ok(vec![inputs[0].scatter(&indices, &inputs[1], &operation)?])
+    }
+
     #[test]
     fn test_array_forward_and_reverse_equivalent_for_scatter_add() {
         // f(x, u) = scatter_add(x, [[1], [3]], u): scatter-add is the identity in its operand and accumulates the
@@ -3504,7 +3607,7 @@ mod array_linearization_tests {
         // operand cotangent through while gathering the update cotangent at the captured indices, matching `jvp` /
         // `vjp`.
         assert_array_forward_equivalent(
-            |inputs| scatter_add_function(inputs).unwrap(),
+            scatter_add_jvp_function,
             scatter_add_function,
             vec![TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![10.0, 20.0])],
             vec![TestArray::vector(vec![0.5, -1.0, 2.0, 1.0]), TestArray::vector(vec![1.0, -0.5])],
@@ -3523,13 +3626,13 @@ mod array_linearization_tests {
         // selects the extremal coordinate, so the directional derivative equals `dx` at the argmax. The argmax mask is
         // staged capture-free as a `compare`/`mul`, and the result matches the established `jvp`.
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].reduce(&[0], ReductionKind::Max)],
+            |inputs| Ok(vec![inputs[0].reduce(&[0], ReductionKind::Max)]),
             |inputs| Ok(vec![inputs[0].reduce(&[0], ReductionKind::Max)]),
             vec![TestArray::vector(vec![1.0, 4.0, 2.0, 3.0])],
             vec![TestArray::vector(vec![0.5, -1.0, 2.0, 1.0])],
         );
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].reduce(&[0], ReductionKind::Min)],
+            |inputs| Ok(vec![inputs[0].reduce(&[0], ReductionKind::Min)]),
             |inputs| Ok(vec![inputs[0].reduce(&[0], ReductionKind::Min)]),
             vec![TestArray::vector(vec![4.0, 1.0, 2.0, 3.0])],
             vec![TestArray::vector(vec![0.5, -1.0, 2.0, 1.0])],
@@ -3538,7 +3641,7 @@ mod array_linearization_tests {
         // Matrix reduction along axis 1 keeps the broadcast-back-and-mask geometry honest across a non-trivial output
         // shape; the per-row argmaxes pick distinct columns.
         assert_array_forward_equivalent(
-            |inputs| vec![inputs[0].reduce(&[1], ReductionKind::Max)],
+            |inputs| Ok(vec![inputs[0].reduce(&[1], ReductionKind::Max)]),
             |inputs| Ok(vec![inputs[0].reduce(&[1], ReductionKind::Max)]),
             vec![TestArray::matrix(2, 3, vec![1.0, 3.0, 2.0, 5.0, 4.0, 6.0])],
             vec![TestArray::matrix(2, 3, vec![0.5, -1.0, 2.0, 1.0, -0.5, 0.25])],
@@ -3600,62 +3703,58 @@ mod array_linearization_tests {
         assert_close(&outputs[1].values, &[12.0], "array jvp tangent");
     }
 
-    /// Asserts that the generic [`jvp_direct`] reproduces both the primal and the tangent outputs of
-    /// [`DifferentiationContext::jvp`] for an array `function` at `primals` with the given `tangents`, replaying the
-    /// sub-programs through the eager [`EagerContext<TestArray, ArrayOperation<TestArray>>`]'s [`bind`](crate::contexts::Context::bind).
-    fn assert_array_jvp_direct_equivalent<JvpFunction, LinearizeFunction>(
-        jvp_function: JvpFunction,
-        linearize_function: LinearizeFunction,
-        primals: Vec<TestArray>,
-        tangents: Vec<TestArray>,
-    ) where
-        JvpFunction: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
-        LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
-    {
-        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let (reference_primals, reference_tangents) =
-            domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
-
-        let (primal_outputs, tangent_outputs) = jvp_direct(&domain, linearize_function, primals, tangents).unwrap();
-        assert_arrays_close(&primal_outputs, &reference_primals, "array jvp pipeline primal");
-        assert_arrays_close(&tangent_outputs, &reference_tangents, "array jvp pipeline tangent");
-    }
-
     #[test]
-    fn test_array_jvp_direct_equivalent_to_jvp() {
-        // Elementwise: f(x) = x * sin(x) over a vector (Mul + Sin), replayed forward through the eager domain's `bind`.
-        assert_array_jvp_direct_equivalent(
-            |inputs| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-            |inputs| vec![inputs[0].clone() * inputs[0].sin().unwrap()],
-            vec![TestArray::vector(vec![0.7, -1.2, 2.0])],
-            vec![TestArray::vector(vec![1.0, 0.5, -2.0])],
-        );
+    fn test_array_jvp_computes_analytic_forward_derivatives() {
+        // The single `jvp` entry point runs the closure directly on duals; each block below asserts the hand-computed
+        // primal and directional derivative for one of the array function shapes the pipeline-equivalence harness
+        // used to exercise.
+        let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
-        // Inner product: f(x) = x . x (Dot product rule staging a left and a right Dot).
-        assert_array_jvp_direct_equivalent(
-            |inputs| vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())],
-            |inputs| vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())],
-            vec![TestArray::vector(vec![1.0, 2.0, 3.0])],
-            vec![TestArray::vector(vec![0.5, -1.0, 2.0])],
-        );
+        // Elementwise: f(x) = x * sin(x) over a vector (Mul + Sin); tangent_i = (sin(x_i) + x_i cos(x_i)) * t_i.
+        let x = [0.7, -1.2, 2.0];
+        let t = [1.0, 0.5, -2.0];
+        let (primals, tangents) = domain
+            .jvp(
+                |inputs: Vec<ArrayJvpTracer>| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
+                vec![TestArray::vector(x.to_vec())],
+                vec![TestArray::vector(t.to_vec())],
+            )
+            .unwrap();
+        let expected_primals = x.iter().map(|x| x * x.sin()).collect::<Vec<_>>();
+        let expected_tangents = x.iter().zip(t).map(|(x, t)| (x.sin() + x * x.cos()) * t).collect::<Vec<_>>();
+        assert_close(&primals[0].values, &expected_primals, "elementwise x sin(x) primal");
+        assert_close(&tangents[0].values, &expected_tangents, "elementwise x sin(x) tangent");
 
-        // Select: f(x) = select(x > 0, 2x, 3x) over a vector, masking per element.
-        assert_array_jvp_direct_equivalent(
-            |inputs| {
-                let mask = inputs[0].compare(&inputs[0].zero_like(), ComparisonDirection::GreaterThan).unwrap();
-                let on_true = inputs[0].clone() + inputs[0].clone();
-                let on_false = inputs[0].clone() + inputs[0].clone() + inputs[0].clone();
-                vec![Select::select(&mask, &on_true, &on_false).unwrap()]
-            },
-            |inputs| {
-                let mask = inputs[0].compare(&inputs[0].zero_like(), ComparisonDirection::GreaterThan).unwrap();
-                let on_true = inputs[0].clone() + inputs[0].clone();
-                let on_false = inputs[0].clone() + inputs[0].clone() + inputs[0].clone();
-                vec![Select::select(&mask, &on_true, &on_false).unwrap()]
-            },
-            vec![TestArray::vector(vec![1.0, -1.0, 2.0])],
-            vec![TestArray::vector(vec![1.0, 1.0, 1.0])],
-        );
+        // Inner product: f(x) = x . x (Dot product rule staging a left and a right Dot); the tangent is
+        // 2 * (x . t) = 2 * (0.5 - 2 + 6) = 9.
+        let (primals, tangents) = domain
+            .jvp(
+                |inputs: Vec<ArrayJvpTracer>| {
+                    Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())])
+                },
+                vec![TestArray::vector(vec![1.0, 2.0, 3.0])],
+                vec![TestArray::vector(vec![0.5, -1.0, 2.0])],
+            )
+            .unwrap();
+        assert_close(&primals[0].values, &[14.0], "inner-product primal");
+        assert_close(&tangents[0].values, &[9.0], "inner-product tangent");
+
+        // Select: f(x) = select(x > 0, 2x, 3x) over a vector, masking per element: the primal is [2, -3, 4] and the
+        // tangent routes each element through the selected branch's slope, [2, 3, 2].
+        let (primals, tangents) = domain
+            .jvp(
+                |inputs: Vec<ArrayJvpTracer>| {
+                    let mask = inputs[0].compare(&inputs[0].zero_like(), ComparisonDirection::GreaterThan)?;
+                    let on_true = inputs[0].clone() + inputs[0].clone();
+                    let on_false = inputs[0].clone() + inputs[0].clone() + inputs[0].clone();
+                    Ok(vec![Select::select(&mask, &on_true, &on_false)?])
+                },
+                vec![TestArray::vector(vec![1.0, -1.0, 2.0])],
+                vec![TestArray::vector(vec![1.0, 1.0, 1.0])],
+            )
+            .unwrap();
+        assert_close(&primals[0].values, &[2.0, -3.0, 4.0], "select primal");
+        assert_close(&tangents[0].values, &[2.0, 3.0, 2.0], "select tangent");
     }
 
     /// Builds the flat scalar branch `x -> x * 2 + 1`, which linearizes with no residuals (its tangent `2 * dx`
@@ -3701,6 +3800,15 @@ mod array_linearization_tests {
         Ok(outputs)
     }
 
+    /// Binds the same `condition(predicate, x*2+1, sin(x))` through the forward-mode dual context, the `jvp` twin of
+    /// [`condition_function`].
+    fn condition_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
+        let condition = crate::operations::control_flow::ConditionOperation::new(affine_branch(), sine_branch())?;
+        inputs[0]
+            .context()
+            .bind(ArrayOperation::Condition(Box::new(condition)), &[inputs[0].clone(), inputs[1].clone()])
+    }
+
     /// Asserts that the full JVP program for `condition_function` at `(predicate, x)` with tangent `(0, dx)`,
     /// interpreted directly, reproduces both the primal and the tangent outputs of [`DifferentiationContext::jvp`].
     ///
@@ -3717,7 +3825,7 @@ mod array_linearization_tests {
         let predicate_tangent = TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]);
         let (reference_primals, reference_tangents) = domain
             .jvp(
-                |inputs| condition_function(inputs).unwrap(),
+                condition_jvp_function,
                 vec![predicate_value.clone(), TestArray::scalar(x)],
                 vec![predicate_tangent.clone(), TestArray::scalar(dx)],
             )
@@ -3783,6 +3891,15 @@ mod array_linearization_tests {
         Ok(outputs)
     }
 
+    /// Binds the same length-3 cumulative-product `scan(init, xs)` through the forward-mode dual context, the `jvp`
+    /// twin of [`scan_function`].
+    fn scan_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
+        let scan = crate::operations::control_flow::ScanOperation::new(scan_product_body(), 1, 3)?;
+        inputs[0]
+            .context()
+            .bind(ArrayOperation::Scan(Box::new(scan)), &[inputs[0].clone(), inputs[1].clone()])
+    }
+
     #[test]
     fn test_array_forward_equivalent_to_jvp_for_scan() {
         use crate::types::{DataType, Shape, Size};
@@ -3796,7 +3913,7 @@ mod array_linearization_tests {
         // A unit tangent on `init` propagates the cumulative product's derivative; over `xs = [2, 3, 4]` from
         // `init = 1` the running products are `[2, 6, 24]` and `d/d(init)` matches them.
         assert_array_forward_equivalent(
-            |inputs| scan_function(inputs).unwrap(),
+            scan_jvp_function,
             scan_function,
             vec![TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
             vec![TestArray::scalar(1.0), TestArray::new(stacked_f64.clone(), vec![0.0, 0.0, 0.0])],
@@ -3805,7 +3922,7 @@ mod array_linearization_tests {
         // A unit tangent on `xs[1]` exercises the per-iteration residual stacking: only iterations at or past
         // iteration 1 depend on `x1`, so the stacked-output tangent is `[0, 2, 8]`.
         assert_array_forward_equivalent(
-            |inputs| scan_function(inputs).unwrap(),
+            scan_jvp_function,
             scan_function,
             vec![TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])],
             vec![TestArray::scalar(0.0), TestArray::new(stacked_f64, vec![0.0, 1.0, 0.0])],
@@ -3837,6 +3954,17 @@ mod array_linearization_tests {
         let broadcast_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
         let broadcast_total = total.broadcast(broadcast_type, &[]).unwrap();
         flat + broadcast_total
+    }
+
+    /// Computes the [`reshape_broadcast`] body over forward-mode duals, the `jvp` twin of that helper.
+    fn reshape_broadcast_jvp(input: &ArrayJvpTracer) -> Result<ArrayJvpTracer, ProgramError> {
+        use crate::types::{ArrayType, DataType, Shape, Size};
+
+        let flat = input.reshape(Shape::new(vec![Size::Static(4)]))?;
+        let total = input.reduce(&[0, 1], ReductionKind::Sum);
+        let broadcast_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(4)]));
+        let broadcast_total = total.broadcast(broadcast_type, &[])?;
+        Ok(flat + broadcast_total)
     }
 
     /// Control-flow de-risking: the linearization witness must resolve for the *self-containing*
@@ -3908,6 +4036,13 @@ mod array_linearization_tests {
         Ok(outputs)
     }
 
+    /// Binds the same bounded squaring `while` through the forward-mode dual context, the `jvp` twin of
+    /// [`bounded_while_function`].
+    fn bounded_while_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
+        let while_operation = bounded_squaring_while_operation(100.0, 5);
+        inputs[0].context().bind(ArrayOperation::While(Box::new(while_operation)), &[inputs[0].clone()])
+    }
+
     #[test]
     fn test_array_forward_equivalent_to_jvp_for_bounded_while() {
         // f(x) = (((x^2)^2)^2) = x^8 via the bounded squaring loop. The rule stages an augmented primal while
@@ -3915,7 +4050,7 @@ mod array_linearization_tests {
         // length-5 masked tangent scan whose iterations beyond the actual trip count (3) pass the carried tangent
         // through unchanged. At x = 2 the loop value is 256 and the directional derivative is `8 * x^7 = 1024`.
         assert_array_forward_equivalent(
-            |inputs| bounded_while_function(inputs).unwrap(),
+            bounded_while_jvp_function,
             bounded_while_function,
             vec![TestArray::scalar(2.0)],
             vec![TestArray::scalar(1.0)],
@@ -4028,13 +4163,23 @@ mod array_linearization_tests {
         inputs[0].context().stage_operation(ArrayOperation::CustomJvp(Box::new(operation)), &[&inputs[0]])
     }
 
+    /// Binds the same `custom_jvp(sin, doubled_rule)` call through the forward-mode dual context, the `jvp` twin of
+    /// [`custom_jvp_function`].
+    fn custom_jvp_jvp_function(inputs: Vec<ArrayJvpTracer>) -> Result<Vec<ArrayJvpTracer>, ProgramError> {
+        let operation = crate::tracing_v2::operations::custom_derivatives::CustomJvpOperation::new(
+            custom_jvp_sin_primal(),
+            custom_jvp_sin_doubled_rule(),
+        )?;
+        inputs[0].context().bind(ArrayOperation::CustomJvp(Box::new(operation)), &[inputs[0].clone()])
+    }
+
     #[test]
     fn test_array_forward_equivalent_to_jvp_for_custom_jvp() {
         // f(x) = custom_jvp(sin, doubled_rule)(x). The spliced JVP program maps `(x, dx) -> (sin(x), 2*cos(x)*dx)`, so
         // the tangent is the deliberately doubled `2*cos(x)*dx` rather than the primal body's `cos(x)*dx`. The
         // single operand tangent is live, so the reassembling forward harness applies directly.
         assert_array_forward_equivalent(
-            |inputs| custom_jvp_function(inputs).unwrap(),
+            custom_jvp_jvp_function,
             custom_jvp_function,
             vec![TestArray::scalar(0.7)],
             vec![TestArray::scalar(1.5)],
@@ -4098,7 +4243,7 @@ mod array_linearization_tests {
         // tangent program (which recomputes the interior residuals from that tail), so the forward reproduces
         // `jvp` of the un-rematerialized body. The single operand tangent is live, so the reassembling harness applies.
         assert_array_forward_equivalent(
-            |inputs| vec![remat_dot_sine_body(inputs[0].clone())],
+            |inputs| Ok(vec![remat_dot_sine_body(inputs[0].clone())]),
             rematerialize_function,
             vec![TestArray::vector(vec![0.5, 1.5])],
             vec![TestArray::vector(vec![1.0, 0.0])],
@@ -4222,7 +4367,14 @@ mod array_linearization_tests {
 
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         match domain.jvp(
-            |inputs: Vec<ArrayTracer>| custom_vjp_function(inputs).unwrap(),
+            |inputs: Vec<ArrayJvpTracer>| {
+                let operation = crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation::new(
+                    custom_vjp_sin_primal(),
+                    custom_vjp_sin_forward(),
+                    custom_vjp_sin_tripled_backward(),
+                )?;
+                inputs[0].context().bind(ArrayOperation::CustomVjp(Box::new(operation)), &[inputs[0].clone()])
+            },
             vec![TestArray::scalar(0.7)],
             vec![TestArray::scalar(1.5)],
         ) {
@@ -4663,7 +4815,7 @@ mod batching_tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    DifferentiationContext::jvp(&context, |y| y.clone() * y, x.clone(), x.one_like())
+                    DifferentiationContext::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 BatchAxis::new(0),
@@ -4701,17 +4853,14 @@ mod batching_tests {
             .jvp(
                 |x| {
                     let context = x.context().clone();
-                    let output: crate::tracing_v2::NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
-                        Batch::batch(
-                            &context,
-                            |item| Ok(item.clone() * item),
-                            x,
-                            BatchAxis::new(0),
-                            BatchAxis::new(0),
-                            None,
-                        )
-                        .unwrap();
-                    output
+                    Ok(Batch::batch(
+                        &context,
+                        |item| Ok(item.clone() * item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )?)
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 TestArray::vector(vec![1.0, 1.0]),

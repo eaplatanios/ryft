@@ -57,7 +57,7 @@ mod tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal, tangent) = domain
             .jvp(
-                |(left, right)| left + right,
+                |(left, right)| Ok(left + right),
                 (Scalar::from(2.0), Scalar::from(5.0)),
                 (Scalar::from(3.0), Scalar::from(-1.0)),
             )

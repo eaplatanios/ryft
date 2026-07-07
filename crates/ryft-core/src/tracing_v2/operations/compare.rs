@@ -47,21 +47,18 @@ mod tests {
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
+    use crate::programs::ProgramError;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::DifferentiationContext;
+    use crate::tracing_v2::differentiation::JvpTracer;
 
-    /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged tracers of any context with [`TestArray`] semantics.
-    fn piecewise_select<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
-    where
-        C: crate::contexts::StagingContext<
-                Type = crate::types::ArrayType,
-                Constant = TestArray,
-                Operation = crate::tracing_v2::ArrayOperation<TestArray>,
-            >,
-    {
-        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
-        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
+    /// `f(x) = select(x > 0, 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
+    fn piecewise_select(
+        x: JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
+    ) -> Result<JvpTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>, ProgramError> {
+        let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan)?;
+        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x))
     }
 
     #[test]

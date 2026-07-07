@@ -271,7 +271,7 @@ mod tests {
         // Eagerly the transfer is the identity on both the primal and the tangent.
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
-                |x| x.transfer_to_memory(PINNED_HOST),
+                |x| Ok(x.transfer_to_memory(PINNED_HOST)),
                 TestArray::vector(vec![2.0, 3.0]),
                 TestArray::vector(vec![1.0, 0.5]),
             )

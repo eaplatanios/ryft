@@ -22,11 +22,13 @@ use crate::payloads::{Captured, Input};
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
+use crate::operations::control_flow::MaybeWhile;
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, JvpTracer, Linearization, materialize, replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
+use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
@@ -424,7 +426,9 @@ where
 /// stacked scanned inputs, so no symbolic capture is ever introduced. The enclosing partial-evaluation split then
 /// discovers the residual operand edges structurally, exactly as it does for the scan and condition rules.
 ///
-/// **The unbounded case is rejected.** Without a semantic
+/// **The unbounded case is rejected.** This staged rule is only reached when the context is not
+/// [eager](Context::is_eager) (eager contexts run the loop directly through
+/// [`jvp_while_eagerly`], with no bound needed), and without a semantic
 /// [`iteration_bound`](crate::operations::control_flow::WhileOperation::with_iteration_bound) there is no statically
 /// shaped residual stack and no transposable form, so the rule reports
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) and the non-transposable unbounded-while boundary is
@@ -458,6 +462,8 @@ where
 /// cotangents pass through inactive batch items unchanged exactly like the capture-based rule.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
+    C::Value: BooleanLike,
+    C::Constant: Value<Type = ArrayType>,
     C::Operation: Clone
         + From<ZeroOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
@@ -469,6 +475,7 @@ where
         + From<AndOperation>
         + From<WhileOperation<C::Constant, C::Operation>>
         + From<ScanOperation<C::Constant, C::Operation>>
+        + MaybeWhile<C::Constant, C::Operation>
         + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
     fn jvp_while(
@@ -656,14 +663,110 @@ where
     }
 }
 
-/// Forward-mode (JVP) rule for [`WhileOperation`], dispatching to the loop's type family through [`WhileJvp`]: array
-/// loops stage the hybrid bounded rule documented on that trait's [`ArrayType`] implementation, and scalar loops
-/// report an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<C: Context<Operation: Clone>> DifferentiableOperation<C> for WhileOperation<C::Constant, C::Operation>
+/// Runs a `while` loop's forward-mode rule directly at concrete duals for an
+/// [eager](Context::is_eager) context, returning `None` when the loop's predicate does
+/// not concretize to one scalar Boolean (e.g., a batched per-item predicate) and the caller must therefore fall back
+/// to the type family's staged strategy.
+///
+/// Each iteration evaluates the condition on the concrete primal carries, unrolls any nested data-dependent `while`
+/// in the body at those carries (through the same value-level rewrite the reverse-mode pre-pass uses), fuses the
+/// unrolled body into its JVP program through the [`DifferentiableProgramOperation`] fixed point, and replays that
+/// fused program once over `[primal_carries ++ tangent_carries]` to advance both halves. Data-dependent trip counts
+/// therefore need no iteration bound — this is the analogue of
+/// [JAX's `jvp` through an eagerly executed loop](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) — while a
+/// semantic [`iteration_bound`](WhileOperation::with_iteration_bound) truncates the loop once it is reached, matching
+/// the bounded-`while` truncation semantics. Body effects fire while the loop runs (the correct all-known placement),
+/// once during the nested-`while` unroll interpretation and once during the fused replay, exactly as they did on the
+/// reverse-mode pre-pass path.
+fn jvp_while_eagerly<C>(
+    operation: &WhileOperation<C::Constant, C::Operation>,
+    context: &C,
+    inputs: &[JvpTracer<C>],
+) -> Result<Option<Vec<JvpTracer<C>>>, ProgramError>
 where
+    C: Context + Zero<C::Value>,
+    C::Value: BooleanLike,
+    C::Constant: Value<Type = C::Type>,
+    C::Operation: Clone
+        + MaybeWhile<C::Constant, C::Operation>
+        + From<ZeroOperation<C::Type>>
+        + DifferentiableProgramOperation<C::Constant, C::Operation>,
+{
+    let state_count = inputs.len();
+    let mut primal_carries = Vec::with_capacity(state_count);
+    let mut tangent_carries = Vec::with_capacity(state_count);
+    for input in inputs {
+        primal_carries.push(input.primal().clone());
+        tangent_carries.push(materialize(context, input.tangent().clone())?);
+    }
+
+    let mut completed_iterations = 0;
+    loop {
+        if operation.iteration_bound().is_some_and(|bound| completed_iterations >= bound) {
+            break;
+        }
+
+        // Concretize the condition on the current concrete primal carries to decide whether another iteration runs.
+        let mut condition_outputs = replay_via_bind(context, operation.condition(), primal_carries.clone())?;
+        check_count!("output", condition_outputs, 1, ProgramError);
+        let predicate = match condition_outputs.remove(0).boolean() {
+            Ok(predicate) => predicate,
+            // The predicate does not concretize to one scalar Boolean — e.g., a batched per-item predicate, whose
+            // items stop on different iterations, has no single trip decision. Report the loop as non-concretizable
+            // so the caller falls back to the type family's staged strategy; nothing has been advanced yet on the
+            // first iteration. The predicate type is loop-invariant, so a later-iteration failure cannot occur once
+            // the first concretization succeeds, and any such error is surfaced.
+            Err(_) if completed_iterations == 0 => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if !predicate {
+            break;
+        }
+
+        // Advance one iteration: unroll nested data-dependent loops at the current concrete carries, fuse the
+        // straight-line body into its JVP program, and replay it over both carry halves.
+        let body = unroll_concretizable_whiles(context, operation.body().clone(), primal_carries.clone())?;
+        let fused_body = C::Operation::jvp_program(&body)?;
+        let mut combined_carries = primal_carries;
+        combined_carries.extend(tangent_carries);
+        let mut outputs = replay_via_bind(context, &fused_body, combined_carries)?;
+        check_count!("output", outputs, 2 * state_count, ProgramError);
+        tangent_carries = outputs.split_off(state_count);
+        primal_carries = outputs;
+        completed_iterations += 1;
+    }
+
+    Ok(Some(
+        primal_carries
+            .into_iter()
+            .zip(tangent_carries)
+            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .collect(),
+    ))
+}
+
+/// Forward-mode (JVP) rule for [`WhileOperation`]. An [eager](Context::is_eager) context
+/// runs the loop directly at the concrete duals (see [`jvp_while_eagerly`]), so eager forward mode is total over
+/// data-dependent `while` loops with no iteration bound. Staging contexts — and eager contexts whose loop
+/// predicate is batched and therefore has no single trip decision — dispatch to the loop's type family through
+/// [`WhileJvp`]: array loops stage the hybrid bounded rule documented on that trait's [`ArrayType`] implementation,
+/// and scalar loops report an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+impl<C> DifferentiableOperation<C> for WhileOperation<C::Constant, C::Operation>
+where
+    C: Context<Operation: Clone> + Zero<C::Value>,
     C::Type: WhileJvp<C>,
+    C::Value: BooleanLike,
+    C::Constant: Value<Type = C::Type>,
+    C::Operation: MaybeWhile<C::Constant, C::Operation>
+        + From<ZeroOperation<C::Type>>
+        + DifferentiableProgramOperation<C::Constant, C::Operation>,
 {
     fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+        if context.is_eager()
+            && let Some(outputs) = jvp_while_eagerly(self, context, inputs)?
+        {
+            return Ok(outputs);
+        }
         <C::Type>::jvp_while(self, context, inputs)
     }
 }
@@ -1891,14 +1994,14 @@ mod tests {
         fn resolve(&self, value: &TestArray) -> crate::ValueResolution<TestArray> {
             crate::ValueResolution::Concrete(value.clone())
         }
+
+        fn is_eager(&self) -> bool {
+            false
+        }
     }
 
     impl DifferentiationContext for StagedDispatchTestArrayDomain {
         type Tangent = TestArray;
-
-        fn supports_primal_concretization(&self) -> bool {
-            false
-        }
     }
 
     /// Eager-domain context capabilities, delegating to the zero-state [`crate::EagerContext`] exactly like
@@ -2371,33 +2474,33 @@ mod tests {
 
     #[test]
     fn test_jvp_of_batched_bounded_while_under_tracing_composes_with_masked_scan() {
-        use crate::batching::Batch;
+        use crate::batching::{Batch, BatchableOperation, BatchingContext, BatchingTracer};
 
         // F5 x F6 composition: jvp of a *vmapped bounded* while under the non-concretizing staged dispatch domain.
         // Batching stages one masked bounded while (the predicate `x < 8` is per batch item and the iteration bound 5
         // survives the staged rewrite), so the while JVP rule takes the bounded staged path: stored residual
         // stacks plus a masked linear scan on the tangent side. Batch items [1, 5, 9] double 3, 1, and 0 times, so the
         // primal is [8, 10, 9] and the per-item tangent scale is 2^iterations = [8, 2, 1].
-        fn batched_bounded_while<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+        fn batched_bounded_while<V>(x: V) -> Result<V, ProgramError>
         where
-            C: crate::contexts::StagingContext<Type = ArrayType, Constant = TestArray, Operation = TestArrayOperation>,
+            V: Value<Type = ArrayType> + crate::operations::manipulation::Transpose,
+            V::DispatchDomain: Context<Type = ArrayType, Value = V, Operation = TestArrayOperation>,
+            TestArrayOperation: BatchableOperation<V, BatchingContext<V::DispatchDomain>>,
         {
-            let context = x.context().clone();
-            let mapped: crate::tracing::Tracer<C> = Batch::batch(
+            let context = x.dispatch_domain();
+            let mapped = Batch::batch(
                 &context,
-                |item| {
-                    let while_operation = bounded_doubling_while_operation(8.0, 5);
-                    let mut outputs =
-                        item.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[item.clone()])?;
+                |item: BatchingTracer<V::DispatchDomain>| {
+                    let batching_context = item.context().clone();
+                    let mut outputs = batching_context.bind(bounded_doubling_while_operation(8.0, 5), &[item])?;
                     Ok(outputs.remove(0))
                 },
                 x,
                 BatchAxis::new(0),
                 BatchAxis::new(0),
                 None,
-            )
-            .unwrap();
-            mapped
+            )?;
+            Ok(mapped)
         }
         let (primal, tangent) = StagedDispatchTestArrayDomain
             .jvp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]), TestArray::vector(vec![1.0, 1.0, 1.0]))
@@ -2415,7 +2518,7 @@ mod tests {
         // ... and reverse mode composes through the masked linear scan: the pullback contains the reversed scan
         // and no while loop, and the per-item gradients match the tangent scales.
         let (output, pullback, residuals) = StagedDispatchTestArrayDomain
-            .vjp(|x| Ok(batched_bounded_while(x)), TestArray::vector(vec![1.0, 5.0, 9.0]))
+            .vjp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]))
             .unwrap();
         assert_eq!(output.values, vec![8.0, 10.0, 9.0]);
         let rendered_pullback = pullback.to_string();

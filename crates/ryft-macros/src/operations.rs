@@ -849,6 +849,13 @@ impl CodeGenerator {
         where_clause.predicates.push(syn::parse_quote! {
             __DifferentiationContext: #ryft::Zero<<__DifferentiationContext as #ryft::Domain>::Value>
         });
+        // The `while` rule concretizes data-dependent loop predicates on the carried values when the context is
+        // eager, so the dispatcher also transports the `BooleanLike` value requirement. Staged values
+        // satisfy it through the tracer `BooleanLike` implementation (whose `boolean` defers with an error) and
+        // eager values implement it directly.
+        where_clause.predicates.push(syn::parse_quote! {
+            <__DifferentiationContext as #ryft::Domain>::Value: #ryft::BooleanLike
+        });
         where_clause
             .predicates
             .push(syn::parse_quote!(#differentiation_self_type: #ryft::Operation<#primary_type>));

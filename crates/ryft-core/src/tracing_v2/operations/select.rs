@@ -374,16 +374,12 @@ mod tests {
         use crate::scalars::Scalar;
         use crate::tracing_v2::{DifferentiationContext, value_and_grad};
 
-        fn piecewise<C>(x: crate::tracing::Tracer<C>, y: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+        fn piecewise<V>(x: V, y: V) -> Result<V, crate::programs::ProgramError>
         where
-            C: crate::contexts::StagingContext<
-                    Type = crate::types::DataType,
-                    Constant = Scalar,
-                    Operation = crate::operations::scalars::ScalarOperation<Scalar>,
-                >,
+            V: Clone + Compare<Output = V> + Select<Condition = V> + std::ops::Add<Output = V>,
         {
-            let mask = x.compare(&y, ComparisonDirection::GreaterThan).unwrap();
-            Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone())).unwrap()
+            let mask = x.compare(&y, ComparisonDirection::GreaterThan)?;
+            Select::select(&mask, &(x.clone() + x.clone()), &(y.clone() + y.clone() + y.clone()))
         }
 
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
@@ -408,7 +404,7 @@ mod tests {
             .unwrap();
         assert_scalar_close(tangent, 0.0);
         let (value, gradient) =
-            value_and_grad(&domain, |(x, y)| piecewise(x, y), (Scalar::from(3.0), Scalar::from(2.0))).unwrap();
+            value_and_grad(&domain, |(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0))).unwrap();
         assert_scalar_close(value, 6.0);
         assert_scalar_close(gradient.0, 2.0);
         assert_scalar_close(gradient.1, 0.0);
@@ -432,7 +428,7 @@ mod tests {
             .unwrap();
         assert_scalar_close(tangent, 3.0);
         let (value, gradient) =
-            value_and_grad(&domain, |(x, y)| piecewise(x, y), (Scalar::from(1.0), Scalar::from(2.0))).unwrap();
+            value_and_grad(&domain, |(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0))).unwrap();
         assert_scalar_close(value, 6.0);
         assert_scalar_close(gradient.0, 0.0);
         assert_scalar_close(gradient.1, 3.0);

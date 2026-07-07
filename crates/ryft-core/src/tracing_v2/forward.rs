@@ -14,7 +14,7 @@ mod tests {
     fn jvp_rejects_mismatched_parameter_structures() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let result: Result<(Scalar, Scalar), ProgramError> =
-            domain.jvp(|xs| xs[0].clone(), vec![Scalar::from(2.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]);
+            domain.jvp(|xs| Ok(xs[0].clone()), vec![Scalar::from(2.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]);
         assert!(matches!(
             result,
             Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
@@ -38,7 +38,7 @@ mod tests {
                 Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
             ),
             ProgramError,
-        > = DifferentiationContext::jvp(&context, |inputs| inputs, empty_primals, empty_tangents);
+        > = DifferentiationContext::jvp(&context, |inputs| Ok(inputs), empty_primals, empty_tangents);
 
         assert!(matches!(result, Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 })));
     }
@@ -60,7 +60,7 @@ mod tests {
             ProgramError,
         > = DifferentiationContext::jvp(
             &context_a,
-            |inputs| inputs[0].clone() + inputs[1].clone(),
+            |inputs| Ok(inputs[0].clone() + inputs[1].clone()),
             vec![primal_a, primal_b],
             vec![tangent_a, tangent_b],
         );

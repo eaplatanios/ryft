@@ -49,7 +49,7 @@ mod tests {
     #[test]
     fn test_stop_gradient_jvp_severs_the_tangent() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = domain.jvp(|x| x.stop_gradient(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
+        let (primal, tangent) = domain.jvp(|x| Ok(x.stop_gradient()), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_eq!(primal, 2.0);
         assert_eq!(tangent, 0.0);
     }

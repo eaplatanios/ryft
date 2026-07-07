@@ -137,28 +137,27 @@ impl<
     /// Stages a call to this function into an active trace as a `jit_call` operation.
     ///
     /// This does not execute anything. It records a trace boundary carrying this function's retained source program
-    /// so enclosing transforms can rewrite the boundary through the ordinary XLA operation rules.
+    /// so enclosing transforms can rewrite the boundary through the ordinary XLA operation rules. The call is
+    /// value-generic: `V` is a plain [`Tracer`] under an ordinary trace, and a transform tracer (e.g. a
+    /// forward-mode dual) when an enclosing transform differentiates or otherwise rewrites the boundary through the
+    /// `jit_call` operation's own rules.
     #[inline]
-    pub fn call<
-        C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Array<'c>>,
-    >(
-        &self,
-        inputs: In::To<Tracer<C>>,
-    ) -> Out::To<Tracer<C>>
+    pub fn call<V>(&self, inputs: In::To<V>) -> Out::To<V>
     where
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
-        In::To<Tracer<C>>: Parameterized<Tracer<C>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
-        Out::To<Tracer<C>>:
-            Parameterized<Tracer<C>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        V: Value<Type = ArrayType>,
+        V::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+            + CapturingContext<Array<'c>>
+            + Constant<V, XlaConstant>,
+        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
+        In::To<V>: Parameterized<V>,
+        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
+        Out::To<V>: Parameterized<V, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         let inputs = inputs.into_parameters().collect::<Vec<_>>();
         let context = inputs
             .first()
             .expect("staging a well-formed jitted call requires at least one input")
-            .context()
-            .clone();
+            .dispatch_domain();
         let capture_references = self
             .source_program
             .captures()
@@ -170,7 +169,7 @@ impl<
         let outputs = self
             .call_with_flat_capture_references(capture_references.as_slice(), inputs)
             .expect("staging a well-formed jitted call into a compatible outer trace should not fail");
-        Out::To::<Tracer<C>>::from_parameters(self.output_structure.clone(), outputs)
+        Out::To::<V>::from_parameters(self.output_structure.clone(), outputs)
             .expect("jitted call output structure should match the staged function")
     }
 
@@ -395,19 +394,16 @@ impl<
     ///
     /// Refer to the documentation of [`StagedXlaFunction::call`] for more information.
     #[inline]
-    pub fn call<
-        C: StagingContext<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Array<'c>>,
-    >(
-        &self,
-        inputs: In::To<Tracer<C>>,
-    ) -> Out::To<Tracer<C>>
+    pub fn call<V>(&self, inputs: In::To<V>) -> Out::To<V>
     where
-        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
-        In::To<Tracer<C>>: Parameterized<Tracer<C>>,
-        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Tracer<C>>>,
-        Out::To<Tracer<C>>:
-            Parameterized<Tracer<C>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+        V: Value<Type = ArrayType>,
+        V::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
+            + CapturingContext<Array<'c>>
+            + Constant<V, XlaConstant>,
+        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
+        In::To<V>: Parameterized<V>,
+        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
+        Out::To<V>: Parameterized<V, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.staged.call(inputs)
     }
@@ -534,10 +530,7 @@ impl<
                 let (primal_outputs, tangent_outputs): (Vec<XlaCompileTracer<'c>>, Vec<XlaCompileTracer<'c>>) = context
                     .jvp(
                         move |inputs| {
-                            function
-                                .staged
-                                .call_with_flat_capture_references(capture_references.as_slice(), inputs)
-                                .expect("compiled-function jvp call staging should succeed")
+                            function.staged.call_with_flat_capture_references(capture_references.as_slice(), inputs)
                         },
                         primals,
                         tangents,
@@ -1628,7 +1621,9 @@ mod tests {
         let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal, tangent)| {
                 let context = primal.context().clone();
-                context.jvp(move |x| inner.call(x), primal, tangent).expect("nested captured jvp(jit) should stage")
+                context
+                    .jvp(move |x| Ok(inner.call(x)), primal, tangent)
+                    .expect("nested captured jvp(jit) should stage")
             },
             (input_type.clone(), input_type.clone()),
             &engine,

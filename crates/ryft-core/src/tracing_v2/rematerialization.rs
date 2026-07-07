@@ -1633,7 +1633,7 @@ mod tests {
     fn test_tag_is_transparent_to_differentiation() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (primal, tangent) =
-            domain.jvp(|x| (x.clone() * x).tag("square"), Scalar::from(2.0), Scalar::from(1.0)).unwrap();
+            domain.jvp(|x| Ok((x.clone() * x).tag("square")), Scalar::from(2.0), Scalar::from(1.0)).unwrap();
         assert_eq!(primal, 4.0);
         assert_eq!(tangent, 4.0);
         let (value, gradient) = value_and_grad(&domain, |x| (x.clone() * x).tag("square"), Scalar::from(3.0)).unwrap();
@@ -1707,7 +1707,7 @@ mod tests {
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body);
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
-                |x| function.call(x).unwrap(),
+                |x| function.call(x),
                 TestArray::new(vector_type(2), vec![0.5, 1.5]),
                 TestArray::new(vector_type(2), vec![1.0, 0.0]),
             )
@@ -1924,7 +1924,7 @@ mod tests {
         );
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
-                |x| outer.call(x).unwrap(),
+                |x| outer.call(x),
                 TestArray::new(vector_type(2), vec![0.5, 1.5]),
                 TestArray::new(vector_type(2), vec![1.0, 0.0]),
             )

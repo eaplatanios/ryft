@@ -1,14 +1,14 @@
 //! Eager unroll-then-fuse pre-pass.
 //!
 //! Eager differentiation domains (whose
-//! [`supports_primal_concretization`](DifferentiationContext::supports_primal_concretization) returns `true`) can
+//! [`is_eager`](Context::is_eager) returns `true`) can
 //! differentiate unbounded, data-dependent `while` loops by unrolling them at the concrete primal
-//! state — a capability the JVP / linearization front ends lack, because the `while` rule only handles
-//! bounded loops with a static residual-stack length. This module bridges the two: given a traced primal [`Program`]
-//! and the concrete input values at which it is being differentiated, [`unroll_concretizable_whiles`] rewrites it into
-//! an equivalent straight-line [`Program`] with every concretizable `while` unrolled, which the capture-free path
-//! then consumes unchanged. Reverse mode composes for free, because an unrolled straight-line primal program produces a
-//! control-flow-free tangent program that the existing partitioned transposition handles.
+//! state. Reverse mode needs that unrolling at the *program* level: transposition consumes a primal [`Program`], so
+//! given a traced primal [`Program`] and the concrete input values at which it is being differentiated,
+//! [`unroll_concretizable_whiles`] rewrites it into an equivalent straight-line [`Program`] with every concretizable
+//! `while` unrolled, which the capture-free path then consumes unchanged: an unrolled straight-line primal program
+//! produces a control-flow-free tangent program that the existing partitioned transposition handles. (Forward mode
+//! needs no pre-pass: the `while` forward-mode rule runs data-dependent loops directly at the concrete duals.)
 //!
 //! The rewrite is a dual-table pass over the source program's atoms. Each source atom is threaded with both (a) its
 //! concrete value, used to evaluate `while` conditions and drive trip counts, and (b) the [`AtomId`] of the
@@ -34,7 +34,6 @@ use crate::macros::check_count;
 use crate::operations::BooleanLike;
 use crate::operations::control_flow::{MaybeWhile, WhileParts};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError};
-use crate::tracing_v2::differentiation::DifferentiationContext;
 
 /// Rewrites `program` into an equivalent straight-line [`Program`] with every concretizable `while` loop unrolled at
 /// the concrete `input_values`, leaving all other instructions unchanged.
@@ -45,14 +44,14 @@ use crate::tracing_v2::differentiation::DifferentiationContext;
 /// so it slots in transparently before the JVP / linearization build.
 ///
 /// The rewrite runs only when the context
-/// [supports primal concretization](DifferentiationContext::supports_primal_concretization): only eager domains,
+/// [is eager](Context::is_eager): only eager domains,
 /// whose primal values are concrete, can evaluate a `while` condition with [`BooleanLike::boolean`] and decide a
 /// data-dependent trip count. For symbolic and staging domains the program is returned unchanged, keeping their
 /// staged (masked-scan / linear-loop) strategies.
 ///
 /// # Parameters
 ///
-///   - `context`: Differentiation context whose [`lift`](Context::lift) and [`bind`](Context::bind) supply the
+///   - `context`: Context whose [`lift`](Context::lift) and [`bind`](Context::bind) supply the
 ///     concrete value semantics used to evaluate `while` conditions and drive trip counts.
 ///   - `program`: Traced primal program to rewrite, with flat [`Vec`]-parameterized inputs and outputs.
 ///   - `input_values`: Concrete input values aligned with `program`'s input atoms, at which the loops are unrolled.
@@ -75,12 +74,12 @@ pub(crate) fn unroll_concretizable_whiles<C>(
     ProgramError,
 >
 where
-    C: DifferentiationContext,
+    C: Context,
     <C as Domain>::Value: BooleanLike,
     <C as Domain>::Constant: Clone,
     <C as Domain>::Operation: Clone + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>,
 {
-    if !context.supports_primal_concretization() {
+    if !context.is_eager() {
         return Ok(program);
     }
     let program = &program;

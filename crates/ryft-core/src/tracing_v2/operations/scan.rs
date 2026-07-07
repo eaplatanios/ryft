@@ -775,9 +775,9 @@ mod tests {
             .jvp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(TestOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
+                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     let ys = outputs.remove(1);
-                    (outputs.remove(0), ys)
+                    Ok((outputs.remove(0), ys))
                 },
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
                 (TestArray::scalar(1.0), TestArray::vector(vec![0.0, 0.0, 0.0])),
@@ -795,9 +795,9 @@ mod tests {
             .jvp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(TestOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
+                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     let ys = outputs.remove(1);
-                    (outputs.remove(0), ys)
+                    Ok((outputs.remove(0), ys))
                 },
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
                 (TestArray::scalar(0.0), TestArray::vector(vec![0.0, 1.0, 0.0])),
@@ -818,9 +818,9 @@ mod tests {
             .jvp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(TestOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
+                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     let ys = outputs.remove(1);
-                    (outputs.remove(0), ys)
+                    Ok((outputs.remove(0), ys))
                 },
                 (TestArray::scalar(1.0), TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0])),
                 (TestArray::scalar(1.0), TestArray::matrix(2, 3, vec![0.0; 6])),
@@ -842,9 +842,9 @@ mod tests {
             .jvp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(TestOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
+                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     let ys = outputs.remove(1);
-                    (outputs.remove(0), ys)
+                    Ok((outputs.remove(0), ys))
                 },
                 (TestArray::scalar(1.0), TestArray::new(xs_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])),
                 (TestArray::scalar(1.0), TestArray::new(xs_type, vec![0.0; 8])),

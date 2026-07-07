@@ -96,7 +96,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::{Domain, StagingContext};
+    use crate::contexts::{Context, Domain, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
     use crate::operations::compare::{Compare, ComparisonDirection};
@@ -221,7 +221,7 @@ mod tests {
                         scalar_doubling_body(),
                     )
                     .unwrap();
-                    carry.unary(operation)
+                    Ok(carry.context().bind(operation, &[carry.clone()])?.remove(0))
                 },
                 Scalar::from(1.0),
                 Scalar::from(1.0),

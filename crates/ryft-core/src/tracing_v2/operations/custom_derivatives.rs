@@ -1584,7 +1584,7 @@ mod tests {
             .jvp(
                 |x| {
                     let operation = custom_jvp_sin(&test_type(&[]));
-                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    Ok(x.context().bind(operation, &[x.clone()])?.into_iter().next().unwrap())
                 },
                 TestArray::scalar(2.0),
                 TestArray::scalar(1.0),
@@ -1720,7 +1720,7 @@ mod tests {
                     let operation = ScalarOperation::CustomJvp(Box::new(
                         CustomJvpOperation::new(scalar_sin_program(), scalar_doubled_sin_jvp_program()).unwrap(),
                     ));
-                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    Ok(x.context().bind(operation, &[x.clone()])?.into_iter().next().unwrap())
                 },
                 Scalar::from(2.0),
                 Scalar::from(1.0),
@@ -1767,7 +1767,7 @@ mod tests {
             },
         );
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .jvp(|x| function.call(x).unwrap(), TestArray::scalar(2.0), TestArray::scalar(1.0))
+            .jvp(|x| function.call(x), TestArray::scalar(2.0), TestArray::scalar(1.0))
             .unwrap();
         assert_close(primal.values[0], 2.0f64.sin());
         assert_close(tangent.values[0], 2.0 * 2.0f64.cos());

@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn test_sin_jvp_and_gradient_scale_by_cosine() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = domain.jvp(|x| x.sin().unwrap(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
+        let (primal, tangent) = domain.jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_scalar_close(primal, 2.0f64.sin());
         assert_scalar_close(tangent, 3.0 * 2.0f64.cos());
 
