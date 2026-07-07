@@ -1615,7 +1615,7 @@ mod linearization_tests {
         let (program, _input_structure, _output_structure, input_values) =
             domain.trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(|inputs| Ok(function(inputs)), primals)?;
         let program = unroll_concretizable_whiles(domain, program, input_values.clone())?;
-        let jvp_program = build_jvp_program(&program)?.into_simplified()?;
+        let jvp_program = program.jvp()?.into_simplified()?;
         let mut combined_inputs = input_values;
         combined_inputs.extend(tangents);
         let mut outputs = replay_via_bind(domain, &jvp_program, combined_inputs)?;
@@ -2045,7 +2045,7 @@ mod linearization_tests {
                 vec![Scalar::from(0.7)],
             )
             .unwrap();
-        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        let jvp_program = primal_program.jvp().unwrap();
         assert_eq!(jvp_program.input_ids().len(), 2);
         assert_eq!(jvp_program.output_ids().len(), 2);
 
@@ -2108,7 +2108,7 @@ mod linearization_tests {
             )
             .unwrap();
 
-        let error = build_jvp_program(&primal_program).unwrap_err();
+        let error = primal_program.jvp().unwrap_err();
         assert!(
             matches!(error, ProgramError::UnsupportedOperation { .. }),
             "expected the front end to reject a `while` loop, but got {error:?}",
@@ -2141,7 +2141,7 @@ mod linearization_tests {
                 vec![Scalar::from(3.0)],
             )
             .unwrap();
-        let select_jvp = build_jvp_program(&select_program).unwrap().simplified().unwrap();
+        let select_jvp = select_program.jvp().unwrap().simplified().unwrap();
 
         // Selected branch (x = 3 > 1): primal x*x = 9, tangent 2x*dx = 6.
         let outputs = select_jvp.interpret_in_context(&context, vec![Scalar::from(3.0), Scalar::from(1.0)]).unwrap();
@@ -2159,7 +2159,7 @@ mod linearization_tests {
                 vec![Scalar::from(1.5)],
             )
             .unwrap();
-        let stop_gradient_jvp = build_jvp_program(&stop_gradient_program).unwrap().simplified().unwrap();
+        let stop_gradient_jvp = stop_gradient_program.jvp().unwrap().simplified().unwrap();
         // primal = stop_gradient(2.25) + 1.5 = 3.75; tangent = 0 + dx = 1.
         let outputs = stop_gradient_jvp
             .interpret_in_context(&context, vec![Scalar::from(1.5), Scalar::from(1.0)])
@@ -2217,7 +2217,7 @@ mod linearization_tests {
                 vec![Scalar::from(1.5)],
             )
             .unwrap();
-        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        let jvp_program = primal_program.jvp().unwrap();
         use crate::operations::Operation;
         assert!(
             !jvp_program.instructions().iter().any(|instruction| instruction.operation().name() == "zero"),
@@ -2237,7 +2237,7 @@ mod linearization_tests {
                 vec![Scalar::from(1.5)],
             )
             .unwrap();
-        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        let jvp_program = primal_program.jvp().unwrap();
         use crate::operations::Operation;
         let zero_count = jvp_program
             .instructions()
@@ -2280,7 +2280,7 @@ mod linearization_tests {
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![total], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        let jvp_program = primal_program.jvp().unwrap();
         let context = EagerContext::<Scalar>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(4.0), Scalar::from(1.0)]).unwrap();
         // primal = 2*4 + 2 = 10; tangent = 2*1 = 2.
@@ -2894,7 +2894,7 @@ mod linearization_tests {
 
         // Generic trace: partially evaluate the same fused JVP program with `C` = a fresh staging context, primals
         // seeded `Known(C.input(..))` and tangents `Unknown(type)`.
-        let jvp_program = build_jvp_program(&primal_program).unwrap().into_simplified().unwrap();
+        let jvp_program = primal_program.jvp().unwrap().into_simplified().unwrap();
         let outer = TracingContext::<Scalar, ScalarOperation<Scalar>>::new();
         let primal_count = primals.len();
         let mut knowledge = Vec::with_capacity(2 * primal_count);
@@ -3012,8 +3012,7 @@ mod array_linearization_tests {
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::differentiation::{
-        Differentiate, DifferentiationTracer, Linearization, build_jvp_program, replay_via_bind,
-        transpose_tangent_partitioned,
+        Differentiate, DifferentiationTracer, Linearization, replay_via_bind, transpose_tangent_partitioned,
     };
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -3135,7 +3134,7 @@ mod array_linearization_tests {
         let (program, _input_structure, _output_structure, input_values) =
             domain.trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(|inputs| Ok(function(inputs)), primals)?;
         let program = unroll_concretizable_whiles(domain, program, input_values.clone())?;
-        let jvp_program = build_jvp_program(&program)?.into_simplified()?;
+        let jvp_program = program.jvp()?.into_simplified()?;
         let mut combined_inputs = input_values;
         combined_inputs.extend(tangents);
         let mut outputs = replay_via_bind(domain, &jvp_program, combined_inputs)?;
@@ -3676,7 +3675,7 @@ mod array_linearization_tests {
                 vec![TestArray::vector(vec![1.0, 2.0, 3.0])],
             )
             .unwrap();
-        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        let jvp_program = primal_program.jvp().unwrap();
         assert_eq!(jvp_program.input_ids().len(), 2);
         assert_eq!(jvp_program.output_ids().len(), 2);
 
@@ -3833,7 +3832,7 @@ mod array_linearization_tests {
                 vec![predicate_value.clone(), TestArray::scalar(x)],
             )
             .unwrap();
-        let jvp_program = build_jvp_program(&primal_program).unwrap();
+        let jvp_program = primal_program.jvp().unwrap();
 
         // The program takes `(primals ++ tangents)` and produces `(primal_outputs ++ tangent_outputs)`.
         let context = EagerContext::<TestArray>::new();
@@ -3963,25 +3962,30 @@ mod array_linearization_tests {
         Ok(flat + broadcast_total)
     }
 
-    /// Control-flow de-risking: the linearization witness must resolve for the *self-containing*
+    /// Control-flow de-risking: the program-level witnesses must resolve for the *self-containing*
     /// [`ArrayOperation`] enum. The enum holds `Condition`/`While`/`Scan` variants whose branch and body programs are
-    /// themselves `Program<…, ArrayOperation, …>`, so satisfying the bound below is exactly the recursive case feared
-    /// to overflow the trait solver when higher-order rules linearize their nested programs. Because the
-    /// witness's `T`/`V`/`O` are fixed across the recursion and the blanket impl grounds it in
-    /// [`Program::linearize`](crate::Program::linearize), this reduces to the enum's existing forward-mode proof — so
-    /// it compiles, with no recursive obligation and no overflow.
+    /// themselves `Program<…, ArrayOperation, …>`, so satisfying the bounds below is exactly the recursive case feared
+    /// to overflow the trait solver when higher-order rules forward-differentiate and linearize their nested programs.
+    /// Because each witness's `T`/`V`/`O` are fixed across the recursion and the fixed bodies ground them in
+    /// [`Program::jvp_program`](crate::Program::jvp_program) and [`Program::linearize`](crate::Program::linearize),
+    /// this reduces to the enum's existing forward-mode proof — so it compiles, with no recursive obligation and no
+    /// overflow.
     #[test]
-    fn array_operation_satisfies_the_linearization_witness() {
+    fn array_operation_satisfies_the_program_witnesses() {
         use crate::operations::constants::ZeroOperation;
         use crate::programs::Value;
-        use crate::tracing_v2::differentiation::DifferentiableProgramOperation;
+        use crate::tracing_v2::differentiation::{DifferentiableProgramOperation, LinearizableProgramOperation};
 
-        fn assert_linearizable<V: Value, O>()
+        fn assert_program_witnesses<V: Value, O>()
         where
-            O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>> + DifferentiableProgramOperation<V, O>,
+            O: Clone
+                + Operation<V::Type>
+                + From<ZeroOperation<V::Type>>
+                + DifferentiableProgramOperation<V, O>
+                + LinearizableProgramOperation<V, O>,
         {
         }
-        assert_linearizable::<TestArray, ArrayOperation<TestArray>>();
+        assert_program_witnesses::<TestArray, ArrayOperation<TestArray>>();
     }
 
     /// Builds the `while (x < threshold) { x = x * x }` loop with the provided semantic iteration bound. Squaring
@@ -4782,7 +4786,7 @@ mod batching_tests {
         // The scalar input is replicated inside the batch, so the elementwise batching rule
         // stages a `Broadcast` on the differentiated value; the gradient must flow back
         // through the broadcast's transpose rule (a sum-reduction over the batch axis).
-        let (value, gradient) = crate::tracing_v2::value_and_grad(
+        let (value, gradient) = crate::tracing_v2::value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
@@ -4830,7 +4834,9 @@ mod batching_tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    Ok(context.value_and_grad(|y| y.clone() * y, x).expect("scalar value_and_grad should succeed"))
+                    Ok(context
+                        .value_and_gradient(|y| y.clone() * y, x)
+                        .expect("scalar value_and_gradient should succeed"))
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 BatchAxis::new(0),
@@ -4871,7 +4877,7 @@ mod batching_tests {
     fn test_context_batch_composes_inside_value_and_grad() {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
-        let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_grad(
+        let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();

@@ -61,7 +61,7 @@ pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
 pub use tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiationContext, DifferentiationTracer,
-    Linearization,
+    LinearizableProgramOperation, Linearization,
 };
 pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use types::*;
