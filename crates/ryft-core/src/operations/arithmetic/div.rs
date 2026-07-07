@@ -78,10 +78,10 @@ pub trait Div: Sized {
     fn div(&self, rhs: &Self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Domain: Context<Operation: From<DivOperation>>>> Div for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<DivOperation>>>> Div for V {
     #[inline]
     fn div(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.domain().bind(DivOperation, &[self.clone(), rhs.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(DivOperation, &[self.clone(), rhs.clone()])?.remove(0))
     }
 }
 

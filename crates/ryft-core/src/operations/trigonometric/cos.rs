@@ -1,14 +1,12 @@
 use std::fmt::Display;
 
 use crate::contexts::Context;
-use crate::contexts::StagingContext;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
-use crate::tracing::Tracer;
-use crate::types::{ArrayType, DataType, Type, TypeError};
+use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`CosOperation`].
 pub const COS_OPERATION_NAME: &'static str = "cos";
@@ -55,9 +53,9 @@ impl ElementwiseOperation for CosOperation {
     }
 }
 
-impl<T: Type, V: Clone + Value<T> + Cos, C> InterpretableOperation<T, V, C> for CosOperation
+impl<V: Clone + Value + Cos, C> InterpretableOperation<V, C> for CosOperation
 where
-    Self: Operation<T>,
+    Self: Operation<V::Type>,
 {
     #[inline]
     fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
@@ -75,10 +73,10 @@ pub trait Cos: Sized {
     fn cos(&self) -> Result<Self, ProgramError>;
 }
 
-impl<C: StagingContext<Operation: From<CosOperation>>> Cos for Tracer<C, C::Meta> {
+impl<V: Value<DispatchDomain: Context<Operation: From<CosOperation>>>> Cos for V {
     #[inline]
     fn cos(&self) -> Result<Self, ProgramError> {
-        Ok(self.unary(CosOperation))
+        Ok(self.dispatch_domain().bind(CosOperation, &[self.clone()])?.remove(0))
     }
 }
 
@@ -113,7 +111,7 @@ mod tests {
         assert_eq!(format!("{operation}"), COS_OPERATION_NAME);
         assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
+            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[Scalar::from(0.5)],
@@ -121,7 +119,7 @@ mod tests {
             Ok(vec![Scalar::from(0.5f64.cos())]),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[TestArray::scalar(0.5)],
@@ -163,15 +161,11 @@ mod tests {
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<DataType, Scalar, EagerContext<DataType, Scalar>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &[],
-            ),
+            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(&operation, &EagerContext::new(), &[],),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<ArrayType, TestArray, EagerContext<ArrayType, TestArray>>::interpret(
+            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
                 &[],
@@ -180,7 +174,7 @@ mod tests {
         );
 
         // Program rendering uses the canonical operation name.
-        let mut builder = ProgramBuilder::<DataType, Scalar, CosOperation>::new();
+        let mut builder = ProgramBuilder::<Scalar, CosOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();

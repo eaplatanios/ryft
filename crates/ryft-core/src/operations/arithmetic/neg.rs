@@ -75,10 +75,10 @@ pub trait Neg: Sized {
     fn neg(&self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Domain: Context<Operation: From<NegOperation>>>> Neg for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<NegOperation>>>> Neg for V {
     #[inline]
     fn neg(&self) -> Result<Self, ProgramError> {
-        Ok(self.domain().bind(NegOperation, &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(NegOperation, &[self.clone()])?.remove(0))
     }
 }
 

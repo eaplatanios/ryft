@@ -78,10 +78,10 @@ pub trait Add: Sized {
     fn add(&self, rhs: &Self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Domain: Context<Operation: From<AddOperation>>>> Add for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<AddOperation>>>> Add for V {
     #[inline]
     fn add(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.domain().bind(AddOperation, &[self.clone(), rhs.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(AddOperation, &[self.clone(), rhs.clone()])?.remove(0))
     }
 }
 

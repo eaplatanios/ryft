@@ -78,10 +78,10 @@ pub trait Sub: Sized {
     fn sub(&self, rhs: &Self) -> Result<Self, ProgramError>;
 }
 
-impl<V: Value<Domain: Context<Operation: From<SubOperation>>>> Sub for V {
+impl<V: Value<DispatchDomain: Context<Operation: From<SubOperation>>>> Sub for V {
     #[inline]
     fn sub(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.domain().bind(SubOperation, &[self.clone(), rhs.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(SubOperation, &[self.clone(), rhs.clone()])?.remove(0))
     }
 }
 
