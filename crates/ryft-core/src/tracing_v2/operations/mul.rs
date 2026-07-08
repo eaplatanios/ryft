@@ -10,7 +10,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, combine_terms};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for MulOperation
@@ -33,7 +33,12 @@ where
         // as the capture-based pushforward.
         let left_term = left.tangent().as_value().map(|tangent| right.primal().clone() * tangent.clone());
         let right_term = right.tangent().as_value().map(|tangent| left.primal().clone() * tangent.clone());
-        let tangent = combine_terms(left_term, right_term, &primal);
+        // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
+        let tangent = left_term
+            .into_iter()
+            .chain(right_term)
+            .reduce(|left_term, right_term| left_term + right_term)
+            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }

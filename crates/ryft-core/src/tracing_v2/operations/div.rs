@@ -10,7 +10,8 @@ use crate::operations::constants::OneLike;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, combine_terms};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
+use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for DivOperation
 where
@@ -41,7 +42,12 @@ where
             let denominator = right.primal().clone() * right.primal().clone();
             -(left.primal().clone() / denominator) * tangent.clone()
         });
-        let tangent = combine_terms(left_term, right_term, &primal);
+        // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
+        let tangent = left_term
+            .into_iter()
+            .chain(right_term)
+            .reduce(|left_term, right_term| left_term + right_term)
+            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }

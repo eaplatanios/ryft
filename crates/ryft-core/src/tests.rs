@@ -1645,7 +1645,7 @@ mod linearization_tests {
         let primal_output_count = primal_side.len() - linearization.residual_count;
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
-        let pullback = transpose_tangent_partitioned(&linearization)?;
+        let pullback = linearization.pullback_program()?;
         Ok((primal_outputs, pullback, residuals))
     }
 
@@ -3021,9 +3021,7 @@ mod array_linearization_tests {
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
-    use crate::tracing_v2::differentiation::{
-        Differentiate, DifferentiationTracer, Linearization, transpose_tangent_partitioned,
-    };
+    use crate::tracing_v2::differentiation::{Differentiate, DifferentiationTracer, Linearization};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
@@ -3175,7 +3173,7 @@ mod array_linearization_tests {
         let primal_output_count = primal_side.len() - linearization.residual_count;
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
-        let pullback = transpose_tangent_partitioned(&linearization)?;
+        let pullback = linearization.pullback_program()?;
         Ok((primal_outputs, pullback, residuals))
     }
 

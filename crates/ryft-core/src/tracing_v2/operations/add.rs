@@ -10,7 +10,8 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, combine_terms};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
+use crate::types::Typed;
 
 impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AddOperation
 where
@@ -45,7 +46,12 @@ where
         // straight-line tangent transposition would reject for having a known (non-linear) operand.
         let left = inputs[0].tangent().as_value().cloned();
         let right = inputs[1].tangent().as_value().cloned();
-        let tangent = combine_terms(left, right, &primal);
+        // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
+        let tangent = left
+            .into_iter()
+            .chain(right)
+            .reduce(|left_term, right_term| left_term + right_term)
+            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }

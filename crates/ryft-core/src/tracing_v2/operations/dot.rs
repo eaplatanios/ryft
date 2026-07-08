@@ -16,7 +16,7 @@ use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, combine_terms};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.
@@ -686,7 +686,12 @@ where
         let primal = stage_dot(left.primal(), right.primal());
         let left_term = left.tangent().as_value().map(|tangent| stage_dot(tangent, right.primal()));
         let right_term = right.tangent().as_value().map(|tangent| stage_dot(left.primal(), tangent));
-        let tangent = combine_terms(left_term, right_term, &primal);
+        // Combine the surviving terms, falling back to a structural zero of the primal's type when both were dropped.
+        let tangent = left_term
+            .into_iter()
+            .chain(right_term)
+            .reduce(|left_term, right_term| left_term + right_term)
+            .map_or_else(|| MaybeZero::Zero(primal.r#type().into_owned()), MaybeZero::Value);
         Ok(vec![DifferentiationDual::new(primal, tangent)])
     }
 }

@@ -529,7 +529,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        crate::tracing_v2::differentiation::replay_zero_tangent(context, self.clone(), inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(self.clone(), &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 

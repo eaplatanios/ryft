@@ -41,7 +41,7 @@ use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, transpose_tangent_partitioned};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
 };
@@ -1397,7 +1397,7 @@ where
         // its pullback consumes `[output_cotangents..., residuals...]` and produces one cotangent per region input.
         let backward_input_types =
             input_types.iter().chain(saved_types.iter()).chain(output_types.iter()).cloned().collect::<Vec<_>>();
-        let pullback = transpose_tangent_partitioned(&linearization)?;
+        let pullback = linearization.pullback_program()?;
         let (_, backward) = D::trace(
             |flat: Vec<DomainTracer<D>>| {
                 let context = flat.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context();

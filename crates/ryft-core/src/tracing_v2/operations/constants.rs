@@ -16,7 +16,7 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_zero_tangent};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Type, Typed};
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
@@ -198,7 +198,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, self.clone(), inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(self.clone(), &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
@@ -214,7 +221,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, self.clone(), inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(self.clone(), &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
@@ -230,7 +244,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, self.clone(), inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(self.clone(), &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
@@ -246,7 +267,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, *self, inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(*self, &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
@@ -262,7 +290,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, *self, inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(*self, &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
@@ -278,7 +313,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, self.clone(), inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(self.clone(), &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
@@ -294,7 +336,14 @@ where
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        replay_zero_tangent(context, self.clone(), inputs)
+        // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
+        // with a structural zero tangent, which stays symbolic and stages nothing.
+        let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
+        Ok(context
+            .bind(self.clone(), &primal_inputs)?
+            .into_iter()
+            .map(DifferentiationDual::new_with_zero_tangent)
+            .collect())
     }
 }
 
