@@ -5,6 +5,8 @@ use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing_v2::differentiation::Linearization;
 use crate::types::Typed;
 
+// TODO(eaplatanios): Should we rename this module to `forward.rs`?
+
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
 /// context of differentiating a function `f(x)`, the value `y = f(x)` is the primal value and its tangent `ẏ` is
 /// the directional derivative of `f` at `x` along an input tangent (i.e., perturbation direction) `ẋ` (i.e., the
@@ -132,25 +134,19 @@ pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Ty
 pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>>:
     Operation<V::Type> + Sized
 {
-    // TODO(eaplatanios): Review from here onwards.
-    /// Builds the *fused* jvp program of `program`: reading the program as a function `x ↦ y = f(x)` over its flat
-    /// inputs and outputs, the returned program computes `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)` over the flat
-    /// boundary `[x₁, …, xₙ, ẋ₁, …, ẋₙ] ↦ [y₁, …, yₘ, ẏ₁, …, ẏₘ]`, without splitting it into primal and tangent
-    /// halves. Refer to [`Program::jvp`] for the full contract.
-    ///
-    /// This is what the fused higher-order JVP rules (`scan`/`condition`) stage as their nested jvp bodies: keeping
-    /// the body fused defers the primal/tangent separation to the partial-evaluation known-ness split that
-    /// [`Program::linearize`] performs, so pure forward mode stages no residual stacks
-    /// and pays a single loop pass.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs
-    ///     and outputs.
+    /// Builds the *fused* JVP [`Program`] of `program`. Interpreting the provided program as a function `x ↦ y = f(x)`
+    /// over its flattened inputs and outputs, the returned program computes `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`
+    /// over the flat boundary `[x₁, …, xₙ, ẋ₁, …, ẋₙ] ↦ [y₁, …, yₘ, ẏ₁, …, ẏₘ]`, without splitting it into primal and
+    /// tangent halves. Refer to [`Program::jvp`] for the full contract. This is what the fused higher-order JVP rules
+    /// (e.g., `scan`, `condition`, etc.) stage as their nested JVP bodies. Keeping the body fused defers the
+    /// primal/tangent separation to the partial-evaluation known-ness split that [`Program::linearize`] performs,
+    /// and so pure forward mode stages no residual stacks and pays the cost of only a single pass.
     fn jvp_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
     ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Represents closed [`Operation`] families whose captured flat programs can be linearized capture-free on behalf of
 /// an enclosing rule.
