@@ -499,9 +499,9 @@ impl<C: Context> NestedTracingContext<C> {
 
         let (output_structure, output_atoms) = {
             let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
-            let mut builder = context.builder().borrow_mut();
-            let output = function(input_tracers).map_err(|error| builder.error.take().unwrap_or(error))?;
-            builder.error.take().map_or(Ok(()), Err)?;
+            let output = function(input_tracers)
+                .map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
+            context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
             let output_structure = output.parameter_structure();
 
             // The outputs must belong to this trace. A foreign tracer's atom ID would silently alias whichever atom

@@ -1388,7 +1388,7 @@ mod differentiation_tests {
         // `[cotangent ++ residuals]` and applying `Pullback::apply` to the same cotangent must agree, for two distinct
         // cotangents. `f(x) = x * sin(x)`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = crate::contexts::EagerContext::<Scalar>::new();
+        let context = crate::contexts::EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let function = |x: NestedTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
 
         let (output, pullback) = domain.vjp_fn(function, Scalar::from(0.7)).unwrap();
@@ -1414,7 +1414,7 @@ mod differentiation_tests {
         // The array-domain, multi-input `vjp_fn`: `f(a, b) = a * b` returns one scalar output whose pullback maps the
         // output cotangent to `(b * cotangent, a * cotangent)`. The callable's reshaped input cotangents must match the
         // raw pullback interpreted manually.
-        let context = crate::contexts::EagerContext::<TestArray>::new();
+        let context = crate::contexts::EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let function = |(a, b): (
             NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
             NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
@@ -1570,7 +1570,7 @@ mod linearization_tests {
         let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let (_, primal_program) = NestedTracingContext::trace(domain.clone(), linearize_function, input_types).unwrap();
         let linearization = primal_program.into_simplified().unwrap().linearize().unwrap();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
         // primal outputs that the linearization core no longer caches.
@@ -1617,7 +1617,7 @@ mod linearization_tests {
         let jvp_program = program.jvp()?.into_simplified()?;
         let mut combined_inputs = primals;
         combined_inputs.extend(tangents);
-        let mut outputs = replay_via_bind(domain, &jvp_program, combined_inputs)?;
+        let mut outputs = jvp_program.interpret_in_context(domain, combined_inputs)?;
         let tangent_outputs = outputs.split_off(outputs.len() / 2);
         Ok((outputs, tangent_outputs))
     }
@@ -1641,7 +1641,7 @@ mod linearization_tests {
         let (_, program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
         let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let linearization = program.linearize()?;
-        let primal_side = replay_via_bind(domain, &linearization.primal_program, primals)?;
+        let primal_side = linearization.primal_program.interpret_in_context(domain, primals)?;
         let primal_output_count = primal_side.len() - linearization.residual_count;
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
@@ -1666,7 +1666,7 @@ mod linearization_tests {
         LinearizeFunction: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
     {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
         let mut reference_inputs = output_cotangents.clone();
@@ -1855,7 +1855,7 @@ mod linearization_tests {
         // now succeeds and must reproduce the established eager `vjp`. The direct-transpose pullback consumes the
         // residuals as ordinary inputs, so it is interpreted at `output_cotangents ++ residuals`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let (_, reference_pullback, reference_residuals) = domain
             .vjp(|inputs| Ok(vec![inputs[0].clone().unary(scalar_squaring_while())]), vec![Scalar::from(1.5)])
@@ -2024,7 +2024,7 @@ mod linearization_tests {
         // Recover the residuals by interpreting the primal sub-program at the primals, then feed `(dx, dy, residuals)`
         // through the tangent sub-program. The restored `dy` slot must be reinserted for the tangent program to accept
         // both tangent inputs even though `stop_gradient` blocks `y`'s tangent and `dy` feeds nothing.
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let primal_outputs = linearization
             .primal_program
             .interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.3)])
@@ -2062,7 +2062,7 @@ mod linearization_tests {
 
         // Interpreting the program at (primal, tangent) = (0.7, 1.0) reproduces the function value and its
         // derivative `sin(x) + x*cos(x)`.
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.0)]).unwrap();
         let expected_primal = 0.7 * 0.7_f64.sin();
         let expected_tangent = 0.7_f64.sin() + 0.7 * 0.7_f64.cos();
@@ -2130,7 +2130,7 @@ mod linearization_tests {
         // prune the structurally dead zero tangents the replay synthesizes for the Boolean codomain and the
         // severed branch — including a `zero` of Boolean type that the `f64` interpreter cannot evaluate.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         // f(x) = select(x > 1, x * x, x + x): the comparison contributes a zero tangent and `select` routes the chosen
         // branch's tangent. For x > 1 the derivative is `2x`; otherwise it is `2`.
@@ -2256,7 +2256,7 @@ mod linearization_tests {
         assert_eq!(zero_count, 1, "expected exactly one boundary zero, but got:\n{jvp_program}");
 
         // The fused program still evaluates correctly: primal passes through and the tangent output is zero.
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(1.5), Scalar::from(1.0)]).unwrap();
         assert_close(&outputs, &[Scalar::from(1.5), Scalar::from(0.0)], "boundary-zero jvp");
     }
@@ -2290,7 +2290,7 @@ mod linearization_tests {
             .unwrap();
 
         let jvp_program = primal_program.jvp().unwrap();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(4.0), Scalar::from(1.0)]).unwrap();
         // primal = 2*4 + 2 = 10; tangent = 2*1 = 2.
         assert_close(&outputs, &[Scalar::from(10.0), Scalar::from(2.0)], "constant scaling and nullary constants");
@@ -2392,7 +2392,7 @@ mod linearization_tests {
             .build::<Vec<Scalar>, Vec<Scalar>>(output_atoms, vec![Placeholder; 4], vec![Placeholder; 2])
             .unwrap();
 
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let staged_outputs = staged
             .interpret_in_context(
                 &context,
@@ -2458,7 +2458,7 @@ mod linearization_tests {
             .build::<Vec<Scalar>, Vec<Scalar>>(output_atoms, vec![Placeholder; 2], vec![Placeholder; 1])
             .unwrap();
 
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let staged_cotangents =
             staged.interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.0)]).unwrap();
 
@@ -2655,7 +2655,7 @@ mod linearization_tests {
         // wrong zero gradient). The re-key path is intentionally not exercised: the primal-enum carrier has no linear
         // operation family variant to re-key into.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let (_, reference_pullback, reference_residuals) =
             domain.vjp(scalar_custom_vjp_function, vec![Scalar::from(0.7)]).unwrap();
@@ -2722,7 +2722,7 @@ mod linearization_tests {
         }
 
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (_, pullback, residuals) = vjp_direct(&domain, function, vec![Scalar::from(0.7)]).unwrap();
         let mut pullback_inputs = vec![Scalar::from(2.5)];
         pullback_inputs.extend(residuals);
@@ -2881,7 +2881,7 @@ mod linearization_tests {
         use crate::tracing::TracingContext;
 
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let context = EagerContext::<Scalar>::new();
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let primals = vec![Scalar::from(0.7), Scalar::from(1.3)];
         let tangents = vec![Scalar::from(1.0), Scalar::from(0.5)];
 
@@ -3022,7 +3022,7 @@ mod array_linearization_tests {
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::differentiation::{
-        Differentiate, DifferentiationTracer, Linearization, replay_via_bind, transpose_tangent_partitioned,
+        Differentiate, DifferentiationTracer, Linearization, transpose_tangent_partitioned,
     };
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
@@ -3073,7 +3073,7 @@ mod array_linearization_tests {
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
         let linearization = array_linearize(&domain, linearize_function, primals.clone()).unwrap();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
         // primal outputs that the linearization core no longer caches.
@@ -3114,7 +3114,7 @@ mod array_linearization_tests {
         LinearizeFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
         let mut reference_inputs = output_cotangents.clone();
@@ -3147,7 +3147,7 @@ mod array_linearization_tests {
         let jvp_program = program.jvp()?.into_simplified()?;
         let mut combined_inputs = primals;
         combined_inputs.extend(tangents);
-        let mut outputs = replay_via_bind(domain, &jvp_program, combined_inputs)?;
+        let mut outputs = jvp_program.interpret_in_context(domain, combined_inputs)?;
         let tangent_outputs = outputs.split_off(outputs.len() / 2);
         Ok((outputs, tangent_outputs))
     }
@@ -3171,7 +3171,7 @@ mod array_linearization_tests {
         let (_, program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
         let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let linearization = program.linearize()?;
-        let primal_side = replay_via_bind(domain, &linearization.primal_program, primals)?;
+        let primal_side = linearization.primal_program.interpret_in_context(domain, primals)?;
         let primal_output_count = primal_side.len() - linearization.residual_count;
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
@@ -3202,7 +3202,7 @@ mod array_linearization_tests {
         DirectFunction: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         // Reference: the established `vjp` pullback emits one input cotangent per primal input and consumes
         // `output_cotangents ++ residuals`.
@@ -3327,7 +3327,7 @@ mod array_linearization_tests {
         // now succeeds and must reproduce the established eager `vjp`. The direct-transpose pullback consumes the
         // residuals as ordinary inputs, so it is interpreted at `output_cotangents ++ residuals`.
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         let (_, reference_pullback, reference_residuals) = domain
             .vjp(|inputs| Ok(vec![inputs[0].clone().unary(array_squaring_while())]), vec![TestArray::scalar(1.5)])
@@ -3661,7 +3661,7 @@ mod array_linearization_tests {
         // forward tangent reproduced in reverse rather than the capture-based `vjp` (whose reduce-max transpose is not
         // implemented).
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         let primals = vec![TestArray::vector(vec![1.0, 4.0, 2.0, 3.0])];
         let output_cotangents = vec![TestArray::scalar(2.5)];
@@ -3701,7 +3701,7 @@ mod array_linearization_tests {
 
         // Interpreting the program at primal x = [1, 2, 3] and tangent t = [1, 1, 1] reproduces the value
         // x . x = 14 and its directional derivative 2 * (x . t) = 2 * 6 = 12.
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let inputs = vec![TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::vector(vec![1.0, 1.0, 1.0])];
         let outputs = jvp_program.interpret_in_context(&context, inputs).unwrap();
         assert_eq!(outputs.len(), 2);
@@ -3847,7 +3847,7 @@ mod array_linearization_tests {
         let jvp_program = primal_program.jvp().unwrap();
 
         // The program takes `(primals ++ tangents)` and produces `(primal_outputs ++ tangent_outputs)`.
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let inputs = vec![predicate_value, TestArray::scalar(x), predicate_tangent, TestArray::scalar(dx)];
         let outputs = jvp_program.interpret_in_context(&context, inputs).unwrap();
         let (primal_outputs, tangent_outputs) = outputs.split_at(reference_primals.len());
@@ -4349,7 +4349,7 @@ mod array_linearization_tests {
         // primal-enum `CustomVjpTangent` carrier into the linear operation family, which has no such variant. The
         // carrier exists precisely so the direct-transpose path can keep the tangent program in the primal enum.
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let primals = vec![TestArray::scalar(0.7)];
         let output_cotangents = vec![TestArray::scalar(2.5)];
 
@@ -4472,7 +4472,7 @@ mod array_linearization_tests {
         let tangents = vec![TestArray::vector(vec![1.0, 1.0, 1.0])];
 
         let linearization = array_linearize(&domain, batched_bounded_while_function, primals.clone()).unwrap();
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         // The known side computes the primal outputs followed by the residuals; its primal half is [8, 10, 9].
         let mut known_outputs = linearization.primal_program.interpret_in_context(&context, primals).unwrap();
@@ -4553,7 +4553,7 @@ mod array_linearization_tests {
             .build::<Vec<TestArray>, Vec<TestArray>>(output_atoms, vec![Placeholder; 2], vec![Placeholder; 1])
             .unwrap();
 
-        let context = EagerContext::<TestArray>::new();
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let sample_x = TestArray::vector(vec![0.7, -1.2, 2.0]);
         let sample_cotangent = TestArray::vector(vec![2.5, 1.0, -0.5]);
         let staged_cotangents =

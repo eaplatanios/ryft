@@ -20,7 +20,7 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, NestedTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, Linearization, replay_via_bind};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, Linearization};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::tracing_v2::{Differentiate, NestedTracer};
 use crate::types::{ArrayType, Size, TypeError, Typed};
@@ -167,7 +167,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // shapes and structure. The replay goes through this context itself — lifting the sub-program's staged
         // constants into value space and binding each instruction — so an eager backend domain executes it with its
         // own value semantics rather than through a fresh constant-only `EagerContext`.
-        let mut primal_side = replay_via_bind(self, &linearization.primal_program, input_values)?;
+        let mut primal_side = linearization.primal_program.interpret_in_context(self, input_values)?;
         let primal_output_count = primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "primal program produced {} outputs which is fewer than its {} residuals",
@@ -608,7 +608,7 @@ where
         // Replay the primal sub-program once at the concrete primals to recover `[primal_outputs..., residuals...]`,
         // then split off the residual tail. The residuals depend only on the primal point and so are identical across
         // every basis item.
-        let mut primal_side = replay_via_bind(context, &linearization.primal_program, input_parameters.clone())?;
+        let mut primal_side = linearization.primal_program.interpret_in_context(context, input_parameters.clone())?;
         let residuals =
             primal_side.split_off(primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
@@ -947,7 +947,11 @@ where
         let batching_context = BatchingContext::new(context.clone(), batch_size, None);
         let batched_input = pullback.interpret_with(
             batched_basis_parameters,
-            |_, constant: &<C as Domain>::Value| Ok::<_, BatchingError>(ArrayBatch::replicated(constant.clone())),
+            // The pullback stays in the context's staged constant space, so each live constant is lifted into the
+            // value space first and then replicated across the batch (residuals get the same treatment above).
+            |_, constant: &<C as Domain>::Constant| {
+                Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?))
+            },
             |instruction, inputs: &[ArrayBatch<<C as Domain>::Value>]| {
                 batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
             },

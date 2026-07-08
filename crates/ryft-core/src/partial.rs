@@ -331,11 +331,7 @@ impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
                 PartialEvaluationInput::Unknown(_) => Ok(remaining_inputs.next().cloned().unwrap()),
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        let residual_outputs = self.program.interpret_with(
-            residual_inputs,
-            |_, constant| context.lift(constant.clone()),
-            |instruction, inputs| context.bind(instruction.operation().clone(), inputs),
-        )?;
+        let residual_outputs = self.program.interpret_in_context(context, residual_inputs)?;
         self.outputs
             .iter()
             .map(|output| match output {

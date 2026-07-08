@@ -193,11 +193,7 @@ where
 
         // Concretize the condition on the current concrete carry to decide whether another iteration runs.
         let condition_values = carry.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
-        let condition_outputs = parts.condition.interpret_with(
-            condition_values,
-            |_, constant| context.lift(constant.clone()),
-            |instruction, inputs| context.bind(instruction.operation().clone(), inputs),
-        )?;
+        let condition_outputs = parts.condition.interpret_in_context(context, condition_values)?;
         check_count!("output", condition_outputs, 1, ProgramError);
         let predicate = match condition_outputs[0].boolean() {
             Ok(predicate) => predicate,

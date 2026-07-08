@@ -41,7 +41,7 @@ use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_via_bind, transpose_tangent_partitioned};
+use crate::tracing_v2::differentiation::{DifferentiableOperation, transpose_tangent_partitioned};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
 };
@@ -220,7 +220,8 @@ where
 /// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: splices the derived forward and tangent
 /// programs directly into the shared builder.
 ///
-/// Both derived programs are ordinary primal-enum programs, so the rule replays them through `replay_via_bind`:
+/// Both derived programs are ordinary primal-enum programs, so the rule replays them through
+/// [`Program::interpret_in_context`](crate::Program::interpret_in_context):
 ///
 ///   1. The forward program maps `inputs -> (outputs..., forward_tail...)`, where the tail is the region inputs
 ///      followed by the policy-saved residuals. Replaying it on the dual primals yields the primal outputs and the
@@ -255,7 +256,7 @@ where
         // Splice the forward program on the dual primals, recovering the primal outputs followed by the forward tail
         // (region inputs plus policy-saved residuals) that the tangent program consumes.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = replay_via_bind(context, self.forward(), primal_operands)?;
+        let mut forward_outputs = self.forward().interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "rematerialize forward program produced {} outputs which is fewer than its {output_count} \
@@ -273,7 +274,7 @@ where
         for input in inputs {
             tangent_operands.push(input.tangent().clone().materialize(context)?);
         }
-        let tangent_outputs = replay_via_bind(context, self.tangent(), tangent_operands)?;
+        let tangent_outputs = self.tangent().interpret_in_context(context, tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -1359,7 +1360,7 @@ where
             |xs: Vec<DomainTracer<D>>| {
                 let context = xs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context();
                 let context = context.clone();
-                let mut primal_side = replay_via_bind(&context, &linearization.primal_program, xs.clone())?;
+                let mut primal_side = linearization.primal_program.interpret_in_context(&context, xs.clone())?;
                 let residuals = primal_side.split_off(output_count);
                 let mut outputs = primal_side;
                 outputs.extend(xs.iter().cloned());
@@ -1404,14 +1405,14 @@ where
                 let primal_tracers = flat[..input_count].to_vec();
                 let saved_tracers = &flat[input_count..input_count + saved_count];
                 let cotangent_tracers = flat[input_count + saved_count..].to_vec();
-                let mut primal_side = replay_via_bind(&context, &linearization.primal_program, primal_tracers)?;
+                let mut primal_side = linearization.primal_program.interpret_in_context(&context, primal_tracers)?;
                 let mut residuals = primal_side.split_off(output_count);
                 for (slot, &index) in saved_indices.iter().enumerate() {
                     residuals[index] = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[index])?;
                 }
                 let mut pullback_inputs = cotangent_tracers;
                 pullback_inputs.extend(residuals);
-                replay_via_bind(&context, &pullback, pullback_inputs)
+                pullback.interpret_in_context(&context, pullback_inputs)
             },
             backward_input_types,
         )?;
@@ -1430,14 +1431,14 @@ where
                 let primal_tracers = flat[..input_count].to_vec();
                 let saved_tracers = &flat[input_count..input_count + saved_count];
                 let tangent_tracers = flat[input_count + saved_count..].to_vec();
-                let mut primal_side = replay_via_bind(&context, &linearization.primal_program, primal_tracers)?;
+                let mut primal_side = linearization.primal_program.interpret_in_context(&context, primal_tracers)?;
                 let mut residuals = primal_side.split_off(output_count);
                 for (slot, &index) in saved_indices.iter().enumerate() {
                     residuals[index] = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[index])?;
                 }
                 let mut tangent_inputs = tangent_tracers;
                 tangent_inputs.extend(residuals);
-                replay_via_bind(&context, &linearization.tangent_program, tangent_inputs)
+                linearization.tangent_program.interpret_in_context(&context, tangent_inputs)
             },
             tangent_input_types,
         )?;

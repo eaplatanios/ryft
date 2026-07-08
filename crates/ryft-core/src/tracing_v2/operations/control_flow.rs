@@ -26,7 +26,6 @@ use crate::differentiation::DifferentiationDual;
 use crate::operations::control_flow::MaybeWhile;
 use crate::tracing_v2::differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, LinearizableProgramOperation, Linearization,
-    replay_via_bind,
 };
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
@@ -509,7 +508,7 @@ where
             let masked_while = WhileOperation::<C::Constant, C::Operation>::new(masked_condition, masked_body)?
                 .with_iteration_bound(operation.iteration_bound())?;
             let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let mut initial_mask = replay_via_bind(context, operation.condition(), primal_operands)?;
+            let mut initial_mask = operation.condition().interpret_in_context(context, primal_operands)?;
             check_count!("output", initial_mask, 1, ProgramError);
             let mut extended_inputs = inputs.to_vec();
             extended_inputs.push(DifferentiationDual::new(initial_mask.remove(0), MaybeZero::Zero(predicate_type)));
@@ -717,7 +716,7 @@ where
         }
 
         // Concretize the condition on the current concrete primal carries to decide whether another iteration runs.
-        let mut condition_outputs = replay_via_bind(context, operation.condition(), primal_carries.clone())?;
+        let mut condition_outputs = operation.condition().interpret_in_context(context, primal_carries.clone())?;
         check_count!("output", condition_outputs, 1, ProgramError);
         let predicate = match condition_outputs.remove(0).boolean() {
             Ok(predicate) => predicate,
@@ -739,7 +738,7 @@ where
         let fused_body = C::Operation::jvp_program(&body)?;
         let mut combined_carries = primal_carries;
         combined_carries.extend(tangent_carries);
-        let mut outputs = replay_via_bind(context, &fused_body, combined_carries)?;
+        let mut outputs = fused_body.interpret_in_context(context, combined_carries)?;
         check_count!("output", outputs, 2 * state_count, ProgramError);
         tangent_carries = outputs.split_off(state_count);
         primal_carries = outputs;

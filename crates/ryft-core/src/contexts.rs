@@ -188,11 +188,7 @@ pub trait Context: Domain + Clone {
         )?;
         let output_structure = output_structure.unwrap();
         let flat_program = flat_program.into_simplified()?;
-        let output_values = flat_program.interpret_with(
-            input_values,
-            |_, constant| self.lift(constant.clone()),
-            |instruction, inputs| self.bind(instruction.operation().clone(), inputs),
-        )?;
+        let output_values = flat_program.interpret_in_context(self, input_values)?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
         let program = Program {
             atoms: flat_program.atoms,

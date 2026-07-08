@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use crate::contexts::{Context, EagerContext};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::parameters::{ParameterError, Parameterized};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramError, Value};
 use crate::types::{Type, TypeError, Typed};
 
@@ -54,31 +54,51 @@ impl<
     T: Type,
     V: Value<Type = T>,
     O: Operation<T>,
-    Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<V>,
+    Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<V, To<V> = Output>,
 > Program<V, O, Input, Output>
 {
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
     /// [`Program`]s. It checks that the provided input value matches the program's expected input structure and type,
-    /// evaluates the [`Instruction`]s in order, and finally builds a structured output value from
-    /// the computed output values.
+    /// evaluates the [`Instruction`]s in order, and finally builds a structured output value from the computed output
+    /// values. This is the eager instantiation of [`Self::interpret_in_context`] using this program's own
+    /// [`EagerContext`], whose [`bind`](Context::bind) interprets each operation immediately through its
+    /// [`InterpretableOperation`] rule and whose [`lift`](Context::lift) is the identity.
     #[inline]
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
-        O: InterpretableOperation<V, EagerContext<V, O>>,
+        O: Clone + InterpretableOperation<V, EagerContext<V, O>>,
     {
         self.interpret_in_context(&EagerContext::<V, O>::new(), input)
     }
 
-    /// Interprets/executes this [`Program`] with the provided input, within the supplied interpretation context.
-    /// This is the context-taking core behind [`Self::interpret`], which instantiates it at this program's own
-    /// [`EagerContext`]. Callers that interpret using [`Tracer`](crate::Tracer)s must supply the surrounding
-    /// [`StagingContext`](crate::StagingContext) instead, so that nullary operations can stage themselves into it.
-    /// Nested program interpretation (e.g., control flow branches, custom derivative programs, etc.) routes through
-    /// here so that a single replay path handles both eager and traced values.
-    pub fn interpret_in_context<C: Context<Type = T>>(&self, context: &C, input: Input) -> Result<Output, ProgramError>
+    /// Interprets/executes this [`Program`] with the provided input by replaying it through the supplied [`Context`].
+    /// Constants are lifted with [`Context::lift`] and each [`Instruction`] is bound with [`Context::bind`]. The
+    /// program stays over the context's staged [`Constant`](crate::Domain::Constant) representation `V` while values
+    /// of the context's [`Value`](crate::Domain::Value) type flow through the replay, so the input and output are the
+    /// program's `Input` and `Output` reparameterized at `C::Value`. Because the context owns the semantics of each
+    /// bind, this gives the eager/staging duality for free. An eager context (for which `C::Value = V` and this
+    /// function is [`Self::interpret`]) computes each operation immediately through its [`InterpretableOperation`]
+    /// implementation, a staging context splices the program into the active trace, and a transform context runs its
+    /// per-operation rules. It checks that the provided input matches the program's expected input structure and types
+    /// before replaying.
+    ///
+    /// This is the plain-program sibling of [`PartialEvaluation::interpret`](crate::PartialEvaluation::interpret),
+    /// which additionally wires residual-input feeders, and the transform-aware counterpart of
+    /// [`StagingContext::stage_program`](crate::StagingContext::stage_program), which records instructions directly
+    /// into a builder without routing through `bind`'s transform interception. Nested program interpretation (e.g.,
+    /// control flow branches, custom derivative programs, etc.) does *not* route through here. Instead, it goes
+    /// through the [`InterpretableProgramOperation`] witness, whose interpretation context is deliberately not
+    /// [`Context`]-bounded.
+    pub fn interpret_in_context<C: Context<Type = T, Constant = V, Operation = O>>(
+        &self,
+        context: &C,
+        input: Input::To<C::Value>,
+    ) -> Result<Output::To<C::Value>, ProgramError>
     where
-        O: InterpretableOperation<V, C>,
+        O: Clone,
+        Input::Family: ParameterizedFamily<C::Value>,
+        Output::Family: ParameterizedFamily<C::Value>,
     {
         // Validate that the caller supplied an input with the expected parameter structure.
         let input_structure = input.parameter_structure();
@@ -109,15 +129,15 @@ impl<
             }
         }
 
-        // Replay using ordinary interpretation and reshape the flat outputs back into the expected
-        // structured `Output` form expected by this program.
+        // Replay through the context's lift/bind protocol and reshape the flat outputs back into the expected
+        // structured output form of this program, reparameterized at the context's value type.
         let outputs = self.interpret_with(
             inputs,
-            |_, constant| Ok(constant.clone()),
-            |instruction, inputs| instruction.operation().interpret(context, inputs),
+            |_, constant| context.lift(constant.clone()),
+            |instruction, inputs| context.bind(instruction.operation().clone(), inputs),
         )?;
 
-        Ok(Output::from_parameters(self.output_structure.clone(), outputs)?)
+        Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)
     }
 }
 

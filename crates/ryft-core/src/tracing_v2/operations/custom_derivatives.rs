@@ -22,7 +22,7 @@ use crate::payloads::Captured;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, replay_via_bind};
+use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
@@ -140,7 +140,8 @@ where
 ///
 /// The JVP program is already JVP-shaped over the primal operation family — it maps
 /// `(inputs..., input_tangents...)` to `(outputs..., output_tangents...)` — so the rule simply replays it
-/// through `replay_via_bind` over the dual inputs: the primal tracers followed by the tangent tracers feed the JVP
+/// through [`Program::interpret_in_context`](crate::Program::interpret_in_context) over the dual inputs: the primal tracers followed by the
+/// tangent tracers feed the JVP
 /// program, and its outputs split into the primal outputs and the staged output tangents. Because the spliced program
 /// is straight-line primal-enum operations referencing those tracers directly, it introduces no symbolic capture and
 /// the enclosing partial-evaluation split discovers the residual operand edges structurally — so
@@ -168,7 +169,7 @@ where
         for input in inputs {
             jvp_inputs.push(input.tangent().clone().materialize(context)?);
         }
-        let mut outputs = replay_via_bind(context, self.jvp_program(), jvp_inputs)?;
+        let mut outputs = self.jvp_program().interpret_in_context(context, jvp_inputs)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
         Ok(outputs
@@ -794,7 +795,8 @@ where
 /// Unlike [`CustomJvpOperation`], a `custom_vjp` function has no forward tangent program, so the forward cannot
 /// compute the output tangents straight-line. Instead it reproduces — under the capture-free direct-transpose path —
 /// the same structure the capture-based reverse rule builds: the forward program (already an ordinary primal-enum
-/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through `replay_via_bind` over the dual
+/// program mapping `inputs -> (outputs..., residuals...)`) is replayed through
+/// [`Program::interpret_in_context`](crate::Program::interpret_in_context) over the dual
 /// primals, recovering the primal outputs and the residuals; then one [`CustomVjpTangentOperation`] is staged over
 /// `[input_tangents..., residuals...]` with the residuals as ordinary *operands* (not capture factors). That carrier
 /// is opaque: it stands for the unknown tangent map and rejects interpretation, so a forward-mode use through it
@@ -817,7 +819,7 @@ where
         check_count!("input", inputs, self.input_types().len(), ProgramError);
         // Replay the forward program on the dual primals, recovering the primal outputs followed by the residuals.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = replay_via_bind(context, self.forward(), primal_operands)?;
+        let mut forward_outputs = self.forward().interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "custom_vjp forward program produced {} outputs which is fewer than its {output_count} primal \
@@ -1062,7 +1064,8 @@ where
 ///   2. Stages the output cotangents (materializing structural zeros so the backward program receives every
 ///      cotangent input).
 ///   3. Replays the user's `backward` program over `[residuals..., output_cotangents...]` through
-///      `replay_via_bind`, producing the input cotangents. The backward program is *not* transposed — it already
+///      [`Program::interpret_in_context`](crate::Program::interpret_in_context), producing the input cotangents. The backward program is
+///      *not* transposed — it already
 ///      is the pullback — so it is replayed forward into the active pullback builder.
 ///
 /// The returned cotangents place those input cotangents at the linear (tangent) operand positions and a structural
@@ -1125,7 +1128,7 @@ where
     for cotangent in outputs {
         backward_inputs.push(cotangent.clone().materialize(context)?);
     }
-    let input_cotangents = replay_via_bind(context, operation.backward(), backward_inputs)?;
+    let input_cotangents = operation.backward().interpret_in_context(context, backward_inputs)?;
     check_count!("output", input_cotangents, tangent_count, ProgramError);
 
     // The user's backward program is an opaque splice: its outputs come back as plain replayed values, so any

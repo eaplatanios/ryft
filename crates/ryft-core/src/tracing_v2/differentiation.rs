@@ -4,7 +4,6 @@ use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError, TransposableOperation};
-use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
@@ -302,10 +301,12 @@ pub trait Differentiate: Context {
     /// and its pushforward are staged into a single JVP program over the ordinary primal operation family, that
     /// program is partially evaluated into a known primal sub-program and an unknown linear tangent sub-program, the
     /// primal side is replayed to recover the primal outputs and the concrete residual values at the linearization
-    /// point, and the tangent side is transposed in the primal operation family. The resulting pullback is then lifted
-    /// into this context's value space so it can serve reverse mode *under tracing*: in an eager context the lift is
-    /// the identity, while in a staging context (whose values are [`Tracer`]s) it records the pullback's literal
-    /// constants as constants in the enclosing trace, so the backward pass splices into that trace.
+    /// point, and the tangent side is transposed in the primal operation family. The resulting pullback stays in this
+    /// context's staged [`Constant`](Domain::Constant) space; interpreting it through
+    /// [`Program::interpret_in_context`] lifts its literal constants through this context's [`lift`](Context::lift)
+    /// at replay time, which is what serves reverse mode *under tracing*: in an eager context the lift is the
+    /// identity, while in a staging context (whose values are [`Tracer`]s) it records the pullback's constants in the
+    /// enclosing trace, so the backward pass splices into that trace.
     ///
     /// The returned pullback is a flat program over the primal operation family that maps
     /// `(output_cotangents ++ residuals)` to flat input cotangents. Because the direct-transpose pullback consumes the
@@ -323,10 +324,10 @@ pub trait Differentiate: Context {
         (
             TracedOutput::To<<Self as Domain>::Value>,
             Program<
-                <Self as Domain>::Value,
+                <Self as Domain>::Constant,
                 <Self as Domain>::Operation,
-                Vec<<Self as Domain>::Value>,
-                Vec<<Self as Domain>::Value>,
+                Vec<<Self as Domain>::Constant>,
+                Vec<<Self as Domain>::Constant>,
             >,
             Vec<<Self as Domain>::Value>,
         ),
@@ -365,7 +366,7 @@ pub trait Differentiate: Context {
         // Replay the primal side to recover the primal outputs followed by the residuals at the linearization point.
         // Under tracing these are enclosing-trace values, so they are returned for the caller to append to the output
         // cotangents.
-        let primal_side = replay_via_bind(self, &linearization.primal_program, input_values)?;
+        let primal_side = linearization.primal_program.interpret_in_context(self, input_values)?;
         let primal_output_count = primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "primal program produced {} outputs which is fewer than its {} residuals",
@@ -376,31 +377,11 @@ pub trait Differentiate: Context {
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
 
-        // Transpose the tangent sub-program in `Constant` space, then lift the resulting pullback into the active
-        // value space so reverse-mode-under-tracing consumers can interpret it into the enclosing trace. The only
-        // place a value flows into a transposed pullback is its constant atoms, so lifting those constants is the
-        // complete conversion; under an enclosing `TracingContext` the lift records each constant in the enclosing
-        // trace, while for an eager context it is the identity.
-        let constant_pullback = transpose_tangent_partitioned(&linearization)?;
-        let Program { atoms, input_ids, output_ids, instructions, .. } = constant_pullback;
-        let atoms = atoms
-            .into_iter()
-            .map(|atom| match atom {
-                Atom::Constant(constant) => Ok(Atom::Constant(self.lift(constant)?)),
-                Atom::Variable(r#type) => Ok(Atom::Variable(r#type)),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        let input_count = input_ids.len();
-        let output_count = output_ids.len();
-        let pullback = Program {
-            atoms,
-            input_ids,
-            output_ids,
-            instructions,
-            input_structure: vec![Placeholder; input_count],
-            output_structure: vec![Placeholder; output_count],
-            marker: PhantomData,
-        };
+        // Transpose the tangent sub-program in `Constant` space. The pullback stays in that space: interpreting it
+        // through `Program::interpret_in_context` lifts its literal constants through the consuming context's `lift`
+        // at replay time, so reverse-mode-under-tracing consumers splice it into the enclosing trace without any
+        // eager per-atom conversion here.
+        let pullback = transpose_tangent_partitioned(&linearization)?;
         let output = TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure, primal_outputs)?;
         Ok((output, pullback, residuals))
     }
@@ -462,7 +443,6 @@ pub trait Differentiate: Context {
         <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Type: DifferentiableType,
         <Self as Domain>::Operation: Clone
-            + InterpretableOperation<<Self as Domain>::Value, Self>
             + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
@@ -518,7 +498,6 @@ pub trait Differentiate: Context {
         <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Type: DifferentiableType,
         <Self as Domain>::Operation: Clone
-            + InterpretableOperation<<Self as Domain>::Value, Self>
             + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
@@ -1378,46 +1357,6 @@ where
     fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 }
 
-/// Replays a flat sub-program of a [`Linearization`] through a context's [`bind`](Context::bind) by interpreting
-/// each instruction with [`Program::interpret_with`].
-///
-/// This is the value-level driver shared by the forward and reverse paths. Both sub-programs are expressed
-/// in the primal operation family `<C as Domain>::Operation` over constants `<C as Domain>::Constant`, so a sub-program
-/// can be replayed exactly like the primal program: its constants are lifted with [`Context::lift`] and each
-/// instruction is bound with [`Context::bind`]. This gives the eager/staging duality for free — an eager `bind`
-/// computes the operation immediately, while a staging `bind` splices it into the active trace. Because tangents are
-/// ordinary [`Value`](DispatchDomain::Value)s of the same universe as the primals, the tangent sub-program (whose
-/// leaves are tangents) is replayed through the same `bind` with no tangent-context bridging.
-///
-/// This is the plain-program sibling of [`PartialEvaluation::interpret`], which replays a partial-evaluation
-/// residual program by additionally wiring its residual-input feeders; both share the same
-/// [`interpret_with`](Program::interpret_with) + [`lift`](Context::lift)/[`bind`](Context::bind) shape.
-///
-/// # Parameters
-///
-///   - `context`: Context whose [`lift`](Context::lift) and [`bind`](Context::bind) interpret the sub-program.
-///   - `program`: Flat sub-program over the primal operation family, taking and producing flat
-///     [`Vec`]s of constants.
-///   - `inputs`: Flat input values aligned with the sub-program's input atoms.
-pub(crate) fn replay_via_bind<C, Input, Output>(
-    context: &C,
-    program: &Program<<C as Domain>::Constant, <C as Domain>::Operation, Input, Output>,
-    inputs: Vec<<C as Domain>::Value>,
-) -> Result<Vec<<C as Domain>::Value>, ProgramError>
-where
-    C: Context,
-    <C as Domain>::Constant: Clone,
-    <C as Domain>::Operation: Clone,
-    Input: Parameterized<<C as Domain>::Constant>,
-    Output: Parameterized<<C as Domain>::Constant>,
-{
-    program.interpret_with(
-        inputs,
-        |_, constant| context.lift(constant.clone()),
-        |instruction, inputs| context.bind(instruction.operation().clone(), inputs),
-    )
-}
-
 /// Transposes a [`Linearization`]'s tangent sub-program into the reverse-mode pullback directly, without re-keying
 /// it into a linear operation enum.
 ///
@@ -1580,10 +1519,15 @@ where
     /// mirroring how [`ForwardLinearization`] replays its tangent map.
     pub(crate) context: C,
 
-    /// Pullback program over the primal operation family, mapping `[output_cotangents ++ residuals]` to flat input
-    /// cotangents.
-    pub(crate) program:
-        Program<<C as Domain>::Value, <C as Domain>::Operation, Vec<<C as Domain>::Value>, Vec<<C as Domain>::Value>>,
+    /// Pullback program over the primal operation family in the context's staged [`Constant`](Domain::Constant)
+    /// space, mapping `[output_cotangents ++ residuals]` to flat input cotangents. Its literal constants are lifted
+    /// through the context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
+    pub(crate) program: Program<
+        <C as Domain>::Constant,
+        <C as Domain>::Operation,
+        Vec<<C as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
+    >,
 
     /// Linearization-point residuals consumed by [`program`](Self::program), appended after the output cotangents when
     /// interpreting it.
@@ -1600,7 +1544,7 @@ where
 impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>
 where
     C: Context,
-    <C as Domain>::Operation: Clone + InterpretableOperation<<C as Domain>::Value, C>,
+    <C as Domain>::Operation: Clone,
     Input: Parameterized<<C as Domain>::Value>,
     Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     TracedOutput: Parameterized<<C as Domain>::Value>,
