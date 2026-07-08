@@ -54,8 +54,8 @@ impl<
     T: Type,
     V: Value<Type = T>,
     O: Operation<T>,
-    Input: Parameterized<V, To<V> = Input, ParameterStructure: Debug + PartialEq>,
-    Output: Parameterized<V, To<V> = Output>,
+    Input: Parameterized<V, ParameterStructure: Debug + PartialEq>,
+    Output: Parameterized<V>,
 > Program<V, O, Input, Output>
 {
     /// Interprets/executes this [`Program`] with the provided input. This is the main replay entry point for staged
@@ -68,6 +68,8 @@ impl<
     pub fn interpret(&self, input: Input) -> Result<Output, ProgramError>
     where
         O: Clone + InterpretableOperation<V, EagerContext<V, O>>,
+        Input: Parameterized<V, To<V> = Input>,
+        Output: Parameterized<V, To<V> = Output>,
     {
         self.interpret_in_context(&EagerContext::<V, O>::new(), input)
     }
