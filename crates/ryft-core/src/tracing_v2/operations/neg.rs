@@ -1,7 +1,7 @@
 use std::ops::Neg;
 
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::NegOperation;
@@ -10,7 +10,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 
 impl<V: Value, O: Operation<V::Type> + From<NegOperation>> TransposableOperation<V, O> for NegOperation
 where

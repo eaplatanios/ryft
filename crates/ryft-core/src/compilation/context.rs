@@ -7,10 +7,11 @@ use std::sync::Mutex;
 use crate::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::contexts::Context;
+use crate::differentiation::DifferentiableOperation;
 use crate::operations::constants::Zero;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::NestedTracingContext;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext};
+use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::types::ArrayType;
 use lru::LruCache;
 

@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDual, DifferentiationError, TransposableOperation,
+};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
@@ -34,7 +36,7 @@ use crate::types::{Type, Typed};
 /// differentiation.
 ///
 /// Whether a transform runs eagerly or stages a program is decided by the context's
-/// [`DispatchDomain::Value`] (concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are
+/// [`Value`](Domain::Value) (concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are
 /// detected lazily, like everything else about staging: a foreign tracer fails the builder-identity check either
 /// when an operation binds it ([`StagingContext::stage_operation`]) or when it escapes through a trace boundary
 /// (the boundary output checks), with [`ProgramError::MismatchedProgramBuilders`].
@@ -644,7 +646,8 @@ impl<C: Context> Value for DifferentiationTracer<C> {
 /// Structural zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules: the
 /// [`bind`](Context::bind) fast path skips an operation's rule entirely when every input tangent is a structural
 /// zero, exactly like the program-level replay behind [`Program::linearize`], so no zero values are constructed and no
-/// zero work is performed until a boundary [`materialize`]s one through the inner context's [`Zero`] capability.
+/// zero work is performed until a boundary [`materialize`](MaybeZero::materialize)s one through the inner
+/// context's [`Zero`] capability.
 #[derive(Clone)]
 pub struct DifferentiationContext<C: Context> {
     /// Inner context that carries the primal and tangent values and executes (or stages) the operations that the
@@ -732,89 +735,6 @@ where
     fn is_eager(&self) -> bool {
         self.context.is_eager()
     }
-}
-
-/// Operation-level contract for capture-free forward-mode (JVP) staging.
-///
-/// In a [`DifferentiableOperation`] each primitive operation owns its forward-mode rule, and the `ScalarOperation` /
-/// [`ArrayOperation`](crate::tracing_v2::ArrayOperation) enums forward to the active variant. The rule is keyed by the
-/// ordinary primal operation family `O` rather than by a differentiation context: it consumes [`DifferentiationTracer`] inputs and
-/// stages both the primal result and the tangent operations into the one shared [`TracingContext`] as ordinary
-/// primal operations (a `Mul`, `Add`, `Sin`, ...), so no symbolic capture is ever introduced.
-///
-/// Implementing this trait is what gives an operation its forward-mode behavior: [`jvp`](Self::jvp) is a required
-/// method, and an operation that has no capture-free forward-mode form — such as the scalar `while` loop or the
-/// reverse-mode-only custom-VJP tangent carrier — implements it with a rule that reports an
-/// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error. Operation enums such as `ScalarOperation` and
-/// [`ArrayOperation`](crate::tracing_v2::ArrayOperation) implement the trait through
-/// `#[derive(DifferentiableOperation)]` (see the derive contract on [`Operation`]), whose generated dispatcher
-/// forwards every variant to its payload's rule uniformly, so the unsupported payloads' own erroring rules report
-/// those failures. Each per-operation rule supplies the operation's own primal-enum operand arithmetic; the
-/// [`ConditionOperation`](crate::operations::control_flow::ConditionOperation) rule is the higher-order case,
-/// linearizing both branches capture-free through [`DifferentiableProgramOperation`] and staging an ordinary
-/// primal-enum `condition` for each of the primal and the tangent side.
-///
-/// The context `C` carries the type, constant, value, and operation universe of the primal program being
-/// linearized: `C::Type` is the type descriptor, `C::Constant` the program's constant payload, `C::Value` the value
-/// flowing through the rules (a staged [`Tracer`] under a staging context, a concrete runtime value under an eager
-/// one), and `C::Operation` the primal operation family. Rules bind the operations they synthesize through
-/// [`Context::bind`], which stages them under a staging context and executes them under an eager context, so one
-/// rule serves program-building replay (behind [`Program::linearize`]) and interleaved forward mode ([`DifferentiationContext`])
-/// uniformly.
-///
-/// ## Deriving Differentiable Operation Enums
-///
-/// Ryft also provides a `#[derive(DifferentiableOperation)]` procedural macro for operation enums whose variants own
-/// forward-mode (JVP) rules through
-/// [`DifferentiableOperation`](crate::tracing_v2::differentiation::DifferentiableOperation). This derive enables
-/// forward-mode differentiation only; enums that also need reverse-mode differentiation additionally derive
-/// `TransposableOperation` (see the derive contract on
-/// [`TransposableOperation`](crate::differentiation::TransposableOperation)), whose transposition dispatchers
-/// reverse mode is built on. It follows the same enum-shape and operation-type-inference rules as
-/// `#[derive(Operation)]` and generates:
-///
-///   - An `impl DifferentiableOperation<C> for Enum` that is generic over a
-///     [`StagingContext`](crate::StagingContext) `C` pinned to the enum's primary type, program constant type, and
-///     the enum itself as its operation family. Every variant forwards
-///     [`jvp`](crate::tracing_v2::differentiation::DifferentiableOperation::jvp) to its payload's own rule, so payloads
-///     without a capture-free forward-mode form must still implement the trait with a rule that reports an
-///     [`UnsupportedOperation`](crate::ProgramError::UnsupportedOperation) error (e.g., the scalar `while` rule).
-///   - A `where` clause following the same shape as the generated interpretation and partial-evaluation impls: a
-///     per-variant `Payload: DifferentiableOperation<C>` predicate for every *non-recursive* payload — the
-///     predicate transports each rule's own capability requirements (e.g., `C::Value: Sin` for the sine rule) to
-///     the use site, so the enum does not spell them — plus a `Self: From<Payload>` conversion for every concrete
-///     payload (the rules stage ordinary primal-enum operations for both the primal and the tangent side) and the
-///     `Self: MaybeZeroOperation<T> + From<ZeroOperation<T>> +
-///     DifferentiableProgramOperation<C::Constant, Self> + LinearizableProgramOperation<C::Constant, Self>`
-///     fixed-point witnesses that higher-order payload rules (condition/while/scan) use to forward-differentiate and
-///     linearize their nested programs. *Recursive* payloads (those mentioning `Self`) are skipped — such a predicate
-///     would re-enter the enum's own obligation and overflow the trait solver — and their rules are discharged as
-///     definition-time body obligations against the witnesses instead. The enum must therefore supply its own
-///     [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation) and
-///     [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation)
-///     implementations, spelling only the leaf capabilities that
-///     [`Program::jvp_program`](crate::Program::jvp_program) and [`Program::linearize`](crate::Program::linearize)
-///     need.
-///
-/// The derive supports no `#[ryft(bounds(...))]` kind of its own: the per-variant predicates always forward each
-/// payload rule's capability requirements, so there is nothing for the enum to add. It tolerates (parses and
-/// discards) the `interpretation(...)` and `partial_evaluation(...)` kinds owned by a sibling `#[derive(Operation)]`
-/// sharing the `#[ryft(...)]` attribute namespace.
-pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Type> {
-    /// Applies this operation's capture-free forward-mode (JVP) rule.
-    ///
-    /// The returned vector must be aligned with this operation's outputs, each carrying the primal output value and
-    /// the staged tangent value for that output, both staged in the shared builder.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Shared context into which both primal and tangent operations are staged.
-    ///   - `inputs`: Input duals aligned with this operation's operands.
-    fn jvp(
-        &self,
-        context: &C,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
 }
 
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
@@ -1222,85 +1142,6 @@ where
             residual_count,
         })
     }
-}
-
-/// Operation families whose captured flat programs can be built into a *fused* jvp program on behalf of an enclosing
-/// forward-mode rule.
-///
-/// Higher-order forward-mode rules, such as the control-flow rules, must forward-differentiate the captured branch or
-/// body programs whose operation family is the same closed enum currently being proven
-/// [`DifferentiableOperation`]. Writing that need directly as a recursive `DifferentiableOperation` bound at every
-/// recursive payload boundary makes Rust's trait solver re-enter the same enum and overflow.
-/// [`DifferentiableProgramOperation`] names that recursive fixed point once: the value `V`
-/// and operation family `O` stay fixed across the recursion, so a closed operation enum implements this trait directly
-/// — calling [`Program::jvp_program`](crate::Program::jvp_program) in the body while spelling only the *leaf* closure
-/// of capabilities that body needs in the impl's `where` clause, rather than the recursive
-/// `Self: DifferentiableOperation<…>` bound
-/// itself. That recursive obligation is then discharged once, as a definition-time body check, which is what lets a
-/// higher-order rule require `Self: DifferentiableProgramOperation<V, Self>` without sending the trait
-/// solver into an unbounded recursion. Higher-order payloads depend on this semantic witness instead of reproducing the
-/// full forward-mode obligation.
-///
-/// [`LinearizableProgramOperation`] is the sibling witness for the *split* linearization form. The two are separated so
-/// a rule requires only the shape it actually stages: the fused forward-mode `scan`/`condition` rules need only this
-/// trait, while the bounded `while` rule (which must stack per-iteration residuals) needs the split one.
-///
-/// This trait is intentionally about complete operation families rather than individual primitive payloads, and is
-/// implemented explicitly per
-/// operation enum rather than through a blanket impl (a blanket
-/// `impl DifferentiableProgramOperation for O where O: DifferentiableOperation` would reintroduce exactly the
-/// recursion this trait exists to break).
-///
-/// The value type `V` (whose carried type descriptor types the programs) and operation family `O` match the primal
-/// program being differentiated.
-pub trait DifferentiableProgramOperation<V: Value, O>: Clone + Operation<V::Type> + Sized
-where
-    O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>,
-{
-    /// Builds the *fused* jvp program of `program` over `[primals..., tangents...]`, producing
-    /// `[primal_outputs..., tangent_outputs...]`, without splitting it into primal and tangent halves.
-    ///
-    /// This is what the fused higher-order JVP rules (`scan`/`condition`) stage as their nested jvp bodies: keeping
-    /// the body fused defers the primal/tangent separation to the partial-evaluation known-ness split that
-    /// [`Program::linearize`](crate::Program::linearize) performs, so pure forward mode stages no residual stacks
-    /// and pays a single loop pass.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs
-    ///     and outputs.
-    fn jvp_program(
-        program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
-}
-
-/// Operation families whose captured flat programs can be linearized capture-free on behalf of an enclosing rule.
-///
-/// This is the split-form sibling of [`DifferentiableProgramOperation`]: where that witness builds the fused jvp
-/// program, this one additionally splits it into the primal (known) and tangent (unknown, linear) halves through the
-/// partial-evaluation known-ness split, producing a [`Linearization`]. It breaks the same recursive fixed point the
-/// same way — a closed operation enum implements it directly, calling
-/// [`Program::linearize`](crate::Program::linearize) in the body while spelling only the *leaf* closure of capabilities
-/// that body needs, so a higher-order rule can require `Self: LinearizableProgramOperation<V, Self>` without the trait
-/// solver re-entering the enum's own [`DifferentiableOperation`] obligation. The bounded `while` rule uses it because a
-/// loop must stack per-iteration residuals for its tangent map to replay; the fused forward-mode rules that keep their
-/// bodies un-split depend on [`DifferentiableProgramOperation`] instead.
-///
-/// Like [`DifferentiableProgramOperation`], it is implemented explicitly per operation enum rather than through a
-/// blanket impl, which would reintroduce the recursion it exists to break. The value type `V` (whose carried type
-/// descriptor types the programs) and operation family `O` match the primal program being linearized.
-pub trait LinearizableProgramOperation<V: Value, O>: Clone + Operation<V::Type> + Sized
-where
-    O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>,
-{
-    /// Linearizes `program` capture-free; refer to the documentation of
-    /// [`Program::linearize`](crate::Program::linearize) for the returned packaging.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs and
-    ///     outputs.
-    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 }
 
 impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {

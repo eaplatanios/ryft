@@ -26,6 +26,7 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 #[cfg(test)]
 use crate::contexts::{Context, Domain};
+use crate::differentiation::DifferentiableProgramOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
@@ -3982,9 +3983,9 @@ mod array_linearization_tests {
     /// overflow.
     #[test]
     fn array_operation_satisfies_the_program_witnesses() {
+        use crate::differentiation::LinearizableProgramOperation;
         use crate::operations::constants::ZeroOperation;
         use crate::programs::Value;
-        use crate::tracing_v2::differentiation::{DifferentiableProgramOperation, LinearizableProgramOperation};
 
         fn assert_program_witnesses<V: Value, O>()
         where

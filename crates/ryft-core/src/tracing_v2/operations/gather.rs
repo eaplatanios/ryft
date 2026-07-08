@@ -17,8 +17,7 @@ use crate::operations::manipulation::{
 };
 use crate::programs::{MaybeZero, ProgramError, Value};
 
-use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, Typed};
 

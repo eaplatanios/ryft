@@ -7,7 +7,7 @@ use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::MulOperation;
@@ -21,7 +21,6 @@ use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].

@@ -6,7 +6,9 @@ use thiserror::Error;
 
 use crate::programs::ProgramError;
 
-pub use differentiation::{DifferentiableOperation, DifferentiableProgramOperation, DifferentiationDual};
+pub use differentiation::{
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiationDual, LinearizableProgramOperation,
+};
 pub use transposition::{TransposableOperation, TransposableProgramOperation};
 pub use types::DifferentiableType;
 

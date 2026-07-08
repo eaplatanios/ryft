@@ -1,8 +1,8 @@
 use std::ops::{Add, Div, Mul, Neg};
 
 use crate::contexts::Context;
-use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::DivOperation;
@@ -10,7 +10,6 @@ use crate::operations::constants::OneLike;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::Typed;
 
 impl<C: Context> DifferentiableOperation<C> for DivOperation

@@ -25,7 +25,7 @@ use crate::batching::BatchingError;
 use crate::batching::{BatchableOperation, BatchableProgramOperation};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::DifferentiationDual;
-use crate::differentiation::{DifferentiableType, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiableType, TransposableOperation};
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
@@ -41,7 +41,6 @@ use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
 };
@@ -235,8 +234,8 @@ where
 /// Because both spliced programs are straight-line primal-enum operations referencing the staged tracers directly,
 /// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
 /// operand edges structurally — so
-/// this is a leaf rule needing no [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation)
-/// or [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation)
+/// this is a leaf rule needing no [`DifferentiableProgramOperation`](crate::differentiation::DifferentiableProgramOperation)
+/// or [`LinearizableProgramOperation`](crate::differentiation::LinearizableProgramOperation)
 /// witness, and reverse mode transposes the spliced recompute-and-pushforward operations like any other straight-line
 /// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
 /// dropped in the forward (it is a backend lowering hint with no value-level semantics).

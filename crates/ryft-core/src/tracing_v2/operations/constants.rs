@@ -4,7 +4,7 @@ use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -16,7 +16,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Type, Typed};
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same

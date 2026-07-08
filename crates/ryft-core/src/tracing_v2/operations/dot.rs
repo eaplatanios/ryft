@@ -5,7 +5,7 @@ use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Domain;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::manipulation::Transpose;
@@ -16,7 +16,6 @@ use crate::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Shape, Size, StaticShape, TypeError, Typed};
 
 /// Specification of contracting and batching dimensions for a generalized dot product.

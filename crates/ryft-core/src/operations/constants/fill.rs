@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
-use crate::differentiation::DifferentiationDual;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::Zero;
@@ -11,7 +11,7 @@ use crate::operations::{Operation, OperationFormatter};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiationContext, DifferentiationTracer};
+use crate::tracing_v2::differentiation::{DifferentiationContext, DifferentiationTracer};
 use crate::types::{ArrayType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.

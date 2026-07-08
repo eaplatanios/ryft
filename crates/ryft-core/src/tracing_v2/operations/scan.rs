@@ -6,7 +6,10 @@ use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::DifferentiationDual;
-use crate::differentiation::{DifferentiableType, TransposableOperation, TransposableProgramOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, TransposableOperation,
+    TransposableProgramOperation,
+};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -19,7 +22,6 @@ use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, DifferentiableProgramOperation};
 use crate::types::{ArrayType, DataType, Shape, Size, Type, Typed};
 
 /// Renders a compact comma-separated list of capture-like payloads.

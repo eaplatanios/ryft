@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -14,7 +14,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 
 /// Captured-condition select operation used in linear tangent and cotangent programs.

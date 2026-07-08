@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::contexts::Context;
-use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
@@ -10,7 +10,6 @@ use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{Type, TypeError};
 
 /// Canonical operation name for [`TagOperation`].

@@ -1,12 +1,11 @@
 use crate::contexts::Context;
-use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::operations::Operation;
 use crate::operations::stop_gradient::StopGradientOperation;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 
 /// Forward-mode rule for [`StopGradientOperation`]: the operation is the identity on the primal but severs the
 /// tangent, so the primal is replayed (re-tagging the stop-gradient boundary) and paired with a typed zero tangent.

@@ -1,12 +1,11 @@
 use crate::contexts::Context;
-use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::operations::Operation;
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::ArrayType;
 
 /// Implements the erroring [`TransposableOperation`] rule for Boolean-codomain logical operations: they are not

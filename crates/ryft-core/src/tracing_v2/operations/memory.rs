@@ -7,7 +7,7 @@ use crate::batching::{ArrayBatch, BatchableOperation};
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
@@ -16,7 +16,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Memory, TypeError, Typed};
 
 /// Canonical operation name for [`TransferToMemoryOperation`].

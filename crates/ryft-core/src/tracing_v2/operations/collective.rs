@@ -5,7 +5,7 @@ use crate::axes::{AxisError, NamedAxes};
 use crate::batching::BatchingError;
 use crate::contexts::Domain;
 use crate::contexts::{Context, EagerContext};
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Fill, FillOperation, IotaOperation};
@@ -15,7 +15,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 use crate::types::{ArrayType, DataType, TypeError, Typed};
 

@@ -8,7 +8,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiationError, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::AddOperation;
@@ -20,7 +20,7 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, NestedTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::differentiation::{DifferentiableOperation, Linearization};
+use crate::tracing_v2::differentiation::Linearization;
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
 use crate::tracing_v2::{Differentiate, NestedTracer};
 use crate::types::{ArrayType, Size, TypeError, Typed};

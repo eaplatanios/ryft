@@ -13,7 +13,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -27,7 +27,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, TypeError, Typed};
 

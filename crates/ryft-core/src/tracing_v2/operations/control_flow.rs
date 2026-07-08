@@ -4,7 +4,10 @@ use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchableProgramOperation, ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
-use crate::differentiation::{DifferentiableType, TransposableOperation, TransposableProgramOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, LinearizableProgramOperation,
+    TransposableOperation, TransposableProgramOperation,
+};
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
@@ -24,9 +27,7 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
 use crate::operations::control_flow::MaybeWhile;
-use crate::tracing_v2::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, LinearizableProgramOperation, Linearization,
-};
+use crate::tracing_v2::differentiation::Linearization;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;

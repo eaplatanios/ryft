@@ -7,8 +7,8 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
-use crate::differentiation::DifferentiationDual;
 use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
@@ -22,7 +22,6 @@ use crate::payloads::Captured;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
 use crate::tracing_v2::batching::batch_program_inline;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
@@ -145,8 +144,8 @@ where
 /// program, and its outputs split into the primal outputs and the staged output tangents. Because the spliced program
 /// is straight-line primal-enum operations referencing those tracers directly, it introduces no symbolic capture and
 /// the enclosing partial-evaluation split discovers the residual operand edges structurally — so
-/// the rule is a leaf needing no [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation)
-/// or [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation)
+/// the rule is a leaf needing no [`DifferentiableProgramOperation`](crate::differentiation::DifferentiableProgramOperation)
+/// or [`LinearizableProgramOperation`](crate::differentiation::LinearizableProgramOperation)
 /// witness, and reverse mode transposes the spliced bilinear operations exactly as it does for any other straight-line
 /// tangent program.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Constant, C::Operation>
@@ -803,8 +802,8 @@ where
 /// fails with the canonical reverse-only error, while [`transpose_primal_custom_vjp`] replays the user's `backward`
 /// program to produce the input cotangents. Because the residuals flow as operand edges and the carrier is a leaf
 /// primal-enum operation, the rule introduces no symbolic capture and needs no
-/// [`DifferentiableProgramOperation`](crate::tracing_v2::differentiation::DifferentiableProgramOperation) or
-/// [`LinearizableProgramOperation`](crate::tracing_v2::differentiation::LinearizableProgramOperation) witness.
+/// [`DifferentiableProgramOperation`](crate::differentiation::DifferentiableProgramOperation) or
+/// [`LinearizableProgramOperation`](crate::differentiation::LinearizableProgramOperation) witness.
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Constant, C::Operation>
 where
     C::Constant: Clone,

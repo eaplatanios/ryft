@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 
-use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::AddOperation;
@@ -8,7 +10,6 @@ use crate::operations::constants::ZeroOperation;
 use crate::operations::control_flow::MaybeWhile;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::tracing::TracingContext;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::tracing_v2::{Differentiate, NestedTracer};
 use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
 

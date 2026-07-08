@@ -1,5 +1,5 @@
 use crate::contexts::Context;
-use crate::differentiation::TransposableOperation;
+use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
@@ -8,7 +8,6 @@ use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::tracing_v2::differentiation::DifferentiableOperation;
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
 /// Transpose (vector-Jacobian product) for a [`BroadcastOperation`].

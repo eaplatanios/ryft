@@ -14,17 +14,21 @@ use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramE
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{Type, Typed};
 
-/// Represents [`Operation`]s that provide a transpose rule for linear [`Program`]s. For a linear
-/// [`Instruction`](crate::Instruction) `y = L(x)`, [`transpose`](Self::transpose) receives symbolic [`MaybeZero`]
-/// cotangents for `y` and returns symbolic cotangent contributions for `x`, representing the transposed cotangent.
-/// Rules may reuse existing cotangents, return [`MaybeZero::Zero`] for structural zeros, or stage additional linear
+/// Represents [`Operation`]s that provide a transposition rule for linear [`Program`]s. Reading a linear
+/// [`Instruction`](crate::Instruction) as a linear map `y = L(x)` (in differentiation, `L` is a piece of the tangent
+/// map `(∂f/∂x)(x)` produced by linearization), the [`transpose`](Self::transpose) function computes the action of
+/// the *transposed* (i.e., adjoint) map: given a cotangent `ȳ` for the output, it returns the cotangent contribution
+/// `x̄ = Lᵀ(ȳ)` for each input, where `Lᵀ` is the unique linear map satisfying `⟨ȳ, L(x)⟩ = ⟨Lᵀ(ȳ), x⟩`. Applied
+/// instruction by instruction in reverse program order, these rules compute the vector-Jacobian product
+/// `x̄ = (∂f/∂x)(x)ᵀ · ȳ` that reverse-mode differentiation is built on. Cotangents flow symbolically as [`MaybeZero`]s:
+/// rules may reuse existing cotangents, return [`MaybeZero::Zero`] for structural zeros, or stage additional linear
 /// operations in the active [`TracingContext`]. The rule does not receive concrete primal values. Instead, it receives
-/// each operand's [`PartialValue`] knowledge (i.e., its [`Type`] when the operand is linear, or the staged [`Tracer`]
-/// carrying its runtime value when the operand is a known factor) and any further metadata must be encoded in the
-/// operation itself.
+/// each input's/operand's [`PartialValue`] knowledge (i.e., its [`Type`] when the operand is linear, or the staged
+/// [`Tracer`] carrying its runtime value when the operand is a known factor) and any further metadata must be encoded
+/// in the operation itself.
 ///
-/// Refer to the documentation of [`Program::transpose`] for more information what _transposition_ means here and how
-/// it relates to the algebraic notion of transposition.
+/// Refer to the documentation of [`Program::transpose`] for more information on what _transposition_ means here and
+/// how it relates to the algebraic notion of transposition.
 ///
 /// # Deriving Transposable Operation Enums
 ///
@@ -78,7 +82,7 @@ use crate::types::{Type, Typed};
 /// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<V, Enum>` bound.
 /// When those recursive payload rules need value capabilities, express those requirements on the enum's generic
 /// parameters or on the payload implementations themselves, so the generated dispatcher and program-transposition
-/// witness inherit them through normal Rust bounds
+/// witness inherit them through normal Rust bounds.
 ///
 /// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 /// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this
@@ -98,10 +102,11 @@ use crate::types::{Type, Typed};
 /// }
 /// ```
 pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type> {
-    /// Applies this operation's transpose rule to the provided symbolic output cotangents. The returned vector must
-    /// contain one entry per operation input. Each [`MaybeZero::Value`] entry is a staged cotangent contribution in
-    /// the active [`TracingContext`], and each [`MaybeZero::Zero`] means that the corresponding input receives
-    /// a structural zero of the carried cotangent [`Type`] from this operation.
+    /// Applies this operation's transpose rule to the provided symbolic output cotangents, computing `x̄ = Lᵀ(ȳ)` for
+    /// the linear map `y = L(x)` this operation stages. The returned vector must contain one entry per operation input.
+    /// Each [`MaybeZero::Value`] entry is a staged cotangent contribution in the active [`TracingContext`], and each
+    /// [`MaybeZero::Zero`] means that the corresponding input receives a structural zero of the carried cotangent
+    /// [`Type`] from this operation.
     ///
     /// # Parameters
     ///
