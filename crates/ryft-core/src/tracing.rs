@@ -11,7 +11,7 @@ use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
 use crate::operations::Operation;
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::types::{Type, Typed};
 
@@ -284,6 +284,7 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
     ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>), ProgramError> {
         let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
         let input_structure = input_type.parameter_structure();
+
         let (output_types, outputs, output_structure) = {
             let context = Self {
                 builder: builder.clone(),
@@ -292,17 +293,21 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
             };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
             let output = function(input).map_err(|e| builder.borrow_mut().error.take().unwrap_or_else(|| e))?;
+
             // The outputs must belong to this tracing context. A foreign tracer's atom ID would silently alias
             // whichever atom shares its index in this builder, and so we check for this here.
             check_builders!(&builder, [output.parameters().map(|output| output.builder())])?;
+
             builder.borrow_mut().error.take().map_or(Ok(()), Err)?;
             let output_structure = output.parameter_structure();
             let outputs = output.parameters().map(|o| o.atom_id()).collect::<Result<Vec<_>, _>>()?;
             let output_types = output.map_parameters(|o| o.r#type().into_owned()).map_err(ProgramError::from)?;
             (output_types, outputs, output_structure)
         };
+
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program = builder.build(outputs, input_structure, output_structure)?;
+
         Ok((output_types, program))
     }
 
@@ -422,12 +427,18 @@ pub struct NestedTracingContext<C: Context> {
 
     /// [`ProgramBuilder`] that this [`NestedTracingContext`] stages the nested [`Program`] into.
     builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
+
+    /// Named axes this [`NestedTracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation ahead
+    /// of the parent context's bindings. An ordinary nested trace binds no named axes of its own and this stays empty,
+    /// in which case every lookup delegates to the parent. The list is immutable for the [`NestedTracingContext`]'s
+    /// lifetime and shared across cloned contexts.
+    named_axes: Rc<Vec<(String, NamedAxis)>>,
 }
 
 impl<C: Context> NestedTracingContext<C> {
     /// Creates a new [`NestedTracingContext`] that owns a fresh [`ProgramBuilder`] and traces on behalf of `parent`.
     pub fn new(parent: C) -> Self {
-        Self { parent, builder: Rc::new(RefCell::new(ProgramBuilder::new())) }
+        Self { parent, builder: Rc::new(RefCell::new(ProgramBuilder::new())), named_axes: Rc::new(Vec::new()) }
     }
 
     /// Returns the [`Context`] that this [`NestedTracingContext`] is nested into.
@@ -441,11 +452,86 @@ impl<C: Context> NestedTracingContext<C> {
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>> {
         &self.builder
     }
+
+    /// Traces `function` into a flat [`Program`] expressed in the enclosing context `parent`'s universe. This is the
+    /// nested-tracing counterpart of [`TracingContext::trace`], following the same tracing protocol, but with two
+    /// nested-specific differences: runtime captures registered while tracing delegate to `parent` through
+    /// [`CapturingContext`], so nested traces compose with enclosing capturing traces, and the traced program is flat
+    /// (i.e., [`Vec`]-parameterized) on both boundaries (the canonical shape for nested programs that are replayed
+    /// positionally) with the closure's output [`ParameterStructure`](Parameterized::ParameterStructure) returned
+    /// alongside it so that callers can reassemble structured outputs from the program's flat outputs.
+    #[inline]
+    pub fn trace<F, Output>(
+        parent: C,
+        function: F,
+        input_types: Vec<C::Type>,
+    ) -> Result<
+        (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
+        ProgramError,
+    >
+    where
+        F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Output: Parameterized<Tracer<Self>>,
+    {
+        Self::trace_with_named_axes(parent, function, input_types, Vec::new())
+    }
+
+    /// Traces `function` against `input_types` like [`trace`](Self::trace), but seeds the nested trace's context with
+    /// the provided named axes, which shadow same-named bindings of `parent`. This is the nested-tracing counterpart
+    /// of [`TracingContext::trace_with_named_axes`].
+    pub fn trace_with_named_axes<F, Output>(
+        parent: C,
+        function: F,
+        input_types: Vec<C::Type>,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> Result<
+        (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
+        ProgramError,
+    >
+    where
+        F: FnOnce(Vec<Tracer<Self>>) -> Result<Output, ProgramError>,
+        Output: Parameterized<Tracer<Self>>,
+    {
+        let input_count = input_types.len();
+        let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
+        let named_axes = Rc::new(named_axes);
+        let context = Self { parent, builder, named_axes };
+
+        let (output_structure, output_atoms) = {
+            let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
+            let mut builder = context.builder().borrow_mut();
+            let output = function(input_tracers).map_err(|error| builder.error.take().unwrap_or(error))?;
+            builder.error.take().map_or(Ok(()), Err)?;
+            let output_structure = output.parameter_structure();
+
+            // The outputs must belong to this trace. A foreign tracer's atom ID would silently alias whichever atom
+            // shares its index in this builder, so the boundary rejects it with a builder-identity check.
+            check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
+
+            let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
+            (output_structure, output_atoms)
+        };
+
+        // Clone out the builder handle and drop the context so that the clone is the sole owner, letting
+        // `Rc::try_unwrap` recover the builder below unless a `Tracer` escaped the trace and still holds a reference.
+        let builder = context.builder().clone();
+        drop(context);
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+
+        let output_count = output_atoms.len();
+        let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            output_atoms,
+            vec![Placeholder; input_count],
+            vec![Placeholder; output_count],
+        )?;
+
+        Ok((output_structure, program))
+    }
 }
 
 impl<C: Context> Clone for NestedTracingContext<C> {
     fn clone(&self) -> Self {
-        Self { parent: self.parent.clone(), builder: self.builder.clone() }
+        Self { parent: self.parent.clone(), builder: self.builder.clone(), named_axes: self.named_axes.clone() }
     }
 }
 
@@ -502,10 +588,15 @@ impl<C: Context> Context for NestedTracingContext<C> {
 impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
-        // A `NestedTracingContext` binds no named axes of its own, but named axes are dynamically scoped, so a lookup
-        // delegates to the parent context it is nested into. For example, a collective staged inside a nested tracing
-        // context still resolves an axis bound by an enclosing transform.
-        self.parent.named_axis(name)
+        // A lookup resolves against the axes this nested trace was seeded with first, and otherwise delegates to the
+        // parent context it is nested into, because named axes are dynamically scoped: a seeded binding shadows an
+        // enclosing one, while a collective staged inside an unseeded nested tracing context still resolves an axis
+        // bound by an enclosing transform.
+        self.named_axes
+            .iter()
+            .find(|(axis_name, _)| axis_name == name)
+            .map(|(_, axis)| *axis)
+            .or_else(|| self.parent.named_axis(name))
     }
 }
 
@@ -1097,5 +1188,58 @@ mod tests {
         let reference = nested.capture(Scalar::from(7.0)).expect("capture should delegate to the enclosing context");
         assert_eq!(reference.r#type().into_owned(), DataType::F64);
         assert_eq!(capturing_parent.captures().borrow().as_slice(), &[Scalar::from(7.0)]);
+    }
+
+    #[test]
+    fn test_nested_tracing_context_trace() {
+        // `trace` runs the closure once on tracer inputs standing in for the provided input types and finalizes
+        // the staged flat program together with the closure's output structure.
+        let (output_structure, program) = NestedTracingContext::trace(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+            |inputs: Vec<Tracer<_>>| Ok(vec![inputs[0].clone() * inputs[0].clone(), inputs[0].sin()?]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        assert_eq!(output_structure, vec![Placeholder, Placeholder]);
+        assert_eq!(program.interpret(vec![Scalar::from(2.0)]), Ok(vec![Scalar::from(4.0), Scalar::from(2.0f64.sin())]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = mul %0 %0
+                    %2:f64 = sin %0
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+
+        // A tracer escaping the closure keeps the shared builder alive and is reported at the trace boundary.
+        let escaped_tracer = Rc::new(RefCell::new(None));
+        assert!(matches!(
+            NestedTracingContext::trace(
+                EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+                |inputs: Vec<Tracer<_>>| {
+                    *escaped_tracer.borrow_mut() = Some(inputs[0].clone());
+                    Ok(inputs)
+                },
+                vec![DataType::F64],
+            ),
+            Err(ProgramError::EscapedProgramBuilder),
+        ));
+
+        // `trace_with_named_axes` seeds the nested context with axis bindings that named-axis readers resolve inside
+        // the closure, while unseeded names keep delegating to the parent (an eager parent binds none).
+        let (_, program) = NestedTracingContext::trace_with_named_axes(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
+            |inputs: Vec<Tracer<_>>| {
+                assert_eq!(inputs[0].context().named_axis("model"), Some(NamedAxis::Batched { size: 4 }));
+                assert_eq!(inputs[0].context().named_axis("unbound"), None);
+                Ok(inputs)
+            },
+            vec![DataType::F64],
+            vec![("model".to_string(), NamedAxis::Batched { size: 4 })],
+        )
+        .unwrap();
+        assert_eq!(program.interpret(vec![Scalar::from(3.0)]), Ok(vec![Scalar::from(3.0)]));
     }
 }

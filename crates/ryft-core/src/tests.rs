@@ -1567,10 +1567,9 @@ mod linearization_tests {
         let (reference_primals, reference_tangents) =
             domain.jvp(jvp_function, primals.clone(), tangents.clone()).unwrap();
 
-        let (primal_program, ..) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(linearize_function, primals.clone())
-            .unwrap();
-        let linearization = primal_program.linearize().unwrap();
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, primal_program) = NestedTracingContext::trace(domain.clone(), linearize_function, input_types).unwrap();
+        let linearization = primal_program.into_simplified().unwrap().linearize().unwrap();
         let context = EagerContext::<Scalar>::new();
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
@@ -1612,11 +1611,11 @@ mod linearization_tests {
     where
         Function: FnOnce(Vec<ScalarTracer>) -> Vec<ScalarTracer>,
     {
-        let (program, _input_structure, _output_structure, input_values) =
-            domain.trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(|inputs| Ok(function(inputs)), primals)?;
-        let program = unroll_concretizable_whiles(domain, program, input_values.clone())?;
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, program) = NestedTracingContext::trace(domain.clone(), |inputs| Ok(function(inputs)), input_types)?;
+        let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let jvp_program = program.jvp()?.into_simplified()?;
-        let mut combined_inputs = input_values;
+        let mut combined_inputs = primals;
         combined_inputs.extend(tangents);
         let mut outputs = replay_via_bind(domain, &jvp_program, combined_inputs)?;
         let tangent_outputs = outputs.split_off(outputs.len() / 2);
@@ -1638,11 +1637,11 @@ mod linearization_tests {
     where
         Function: FnOnce(Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError>,
     {
-        let (program, _input_structure, _output_structure, input_values) =
-            domain.trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(function, primals)?;
-        let program = unroll_concretizable_whiles(domain, program, input_values.clone())?;
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
+        let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let linearization = program.linearize()?;
-        let primal_side = replay_via_bind(domain, &linearization.primal_program, input_values)?;
+        let primal_side = replay_via_bind(domain, &linearization.primal_program, primals)?;
         let primal_output_count = primal_side.len() - linearization.residual_count;
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
@@ -1793,12 +1792,14 @@ mod linearization_tests {
         // the capability that lets the path differentiate nested loops the legacy eager `while` JVP rule cannot
         // (it linearizes the body symbolically, which has no staged form for a nested unbounded loop).
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (program, _, _, input_values) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![inputs[0].clone().unary(scalar_nested_while())]),
-                vec![Scalar::from(1.5)],
-            )
-            .unwrap();
+        let input_values = vec![Scalar::from(1.5)];
+        let (_, program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![inputs[0].clone().unary(scalar_nested_while())]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let program = program.into_simplified().unwrap();
 
         // The original nested-`while` program interprets eagerly to a concrete value.
         let expected = program.interpret(input_values.clone()).unwrap();
@@ -1821,13 +1822,14 @@ mod linearization_tests {
         // interpretation, and because every operation on the branch taken at `x = 1.5` (adds and doublings) is
         // linear in the carry, the pushforward of a unit tangent is exactly `f(1.5) / 1.5`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (program, _, _, input_values) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![inputs[0].clone().unary(scalar_nested_while())]),
-                vec![Scalar::from(1.5)],
-            )
-            .unwrap();
-        let expected = program.interpret(input_values).unwrap();
+        let input_values = vec![Scalar::from(1.5)];
+        let (_, program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![inputs[0].clone().unary(scalar_nested_while())]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let expected = program.into_simplified().unwrap().interpret(input_values).unwrap();
 
         let (primal, tangent): (Vec<Scalar>, Vec<Scalar>) = domain
             .jvp(
@@ -1997,12 +1999,13 @@ mod linearization_tests {
         // zero-typed `dy` slot reinserted) so the tangent program still presents `[dx, dy, residuals...]`. This
         // exercises the input-restoration branch of `linearize` that straight-line all-differentiable programs do not.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
-                vec![Scalar::from(0.7), Scalar::from(1.3)],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![inputs[0].sin()? + inputs[1].stop_gradient()]),
+            vec![DataType::F64, DataType::F64],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
 
         let linearization = primal_program.linearize().unwrap();
 
@@ -2039,12 +2042,13 @@ mod linearization_tests {
         // f(x) = x * sin(x) has one primal input and one primal output, so the program takes two inputs (primal +
         // tangent) and produces two outputs (primal + tangent).
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
-                vec![Scalar::from(0.7)],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
         let jvp_program = primal_program.jvp().unwrap();
         assert_eq!(jvp_program.input_ids().len(), 2);
         assert_eq!(jvp_program.output_ids().len(), 2);
@@ -2097,16 +2101,17 @@ mod linearization_tests {
         };
 
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                move |inputs| {
-                    let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(condition, body)?;
-                    let mut outputs = inputs[0].context().stage_operation(operation, &[inputs[0].clone()])?;
-                    Ok(vec![outputs.remove(0)])
-                },
-                vec![Scalar::from(1.0)],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            move |inputs| {
+                let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(condition, body)?;
+                let mut outputs = inputs[0].context().stage_operation(operation, &[inputs[0].clone()])?;
+                Ok(vec![outputs.remove(0)])
+            },
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
 
         let error = primal_program.jvp().unwrap_err();
         assert!(
@@ -2129,18 +2134,19 @@ mod linearization_tests {
 
         // f(x) = select(x > 1, x * x, x + x): the comparison contributes a zero tangent and `select` routes the chosen
         // branch's tangent. For x > 1 the derivative is `2x`; otherwise it is `2`.
-        let (select_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| {
-                    let one = inputs[0].context().constant(Scalar::from(1.0));
-                    let mask = inputs[0].clone().greater_than(&one)?;
-                    let on_true = inputs[0].clone() * inputs[0].clone();
-                    let on_false = inputs[0].clone() + inputs[0].clone();
-                    Ok(vec![Select::select(&mask, &on_true, &on_false)?])
-                },
-                vec![Scalar::from(3.0)],
-            )
-            .unwrap();
+        let (_, select_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| {
+                let one = inputs[0].context().constant(Scalar::from(1.0));
+                let mask = inputs[0].clone().greater_than(&one)?;
+                let on_true = inputs[0].clone() * inputs[0].clone();
+                let on_false = inputs[0].clone() + inputs[0].clone();
+                Ok(vec![Select::select(&mask, &on_true, &on_false)?])
+            },
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let select_program = select_program.into_simplified().unwrap();
         let select_jvp = select_program.jvp().unwrap().simplified().unwrap();
 
         // Selected branch (x = 3 > 1): primal x*x = 9, tangent 2x*dx = 6.
@@ -2153,12 +2159,13 @@ mod linearization_tests {
 
         // f(x) = stop_gradient(x * x) + x: the stopped term contributes no tangent, so the derivative is 1. The JVP program
         // `add` drops the severed zero tangent, leaving the trailing `x`'s tangent as the only contribution.
-        let (stop_gradient_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + inputs[0].clone()]),
-                vec![Scalar::from(1.5)],
-            )
-            .unwrap();
+        let (_, stop_gradient_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + inputs[0].clone()]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let stop_gradient_program = stop_gradient_program.into_simplified().unwrap();
         let stop_gradient_jvp = stop_gradient_program.jvp().unwrap().simplified().unwrap();
         // primal = stop_gradient(2.25) + 1.5 = 3.75; tangent = 0 + dx = 1.
         let outputs = stop_gradient_jvp
@@ -2211,12 +2218,13 @@ mod linearization_tests {
         // `add` rule drops the zero term instead of staging `add(zero, dx)`, so the *unsimplified* fused program
         // contains no `zero` instruction at all and its tangent output is the tangent input directly.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + inputs[0].clone()]),
-                vec![Scalar::from(1.5)],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![(inputs[0].clone() * inputs[0].clone()).stop_gradient() + inputs[0].clone()]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
         let jvp_program = primal_program.jvp().unwrap();
         use crate::operations::Operation;
         assert!(
@@ -2231,12 +2239,13 @@ mod linearization_tests {
         // exactly one typed `zero` instruction at the output boundary to preserve the
         // `(primal_outputs ++ tangent_outputs)` program contract.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(
-                |inputs| Ok(vec![inputs[0].clone().stop_gradient()]),
-                vec![Scalar::from(1.5)],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs| Ok(vec![inputs[0].clone().stop_gradient()]),
+            vec![DataType::F64],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
         let jvp_program = primal_program.jvp().unwrap();
         use crate::operations::Operation;
         let zero_count = jvp_program
@@ -2882,8 +2891,9 @@ mod linearization_tests {
         };
 
         // Reference: the partition-based `Program::linearize` split.
-        let (primal_program, ..) =
-            domain.trace_into_primal_program::<_, Vec<Scalar>, Vec<_>>(function, primals.clone()).unwrap();
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, primal_program) = NestedTracingContext::trace(domain.clone(), function, input_types).unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
         let linearization = primal_program.linearize().unwrap();
         let mut reference_known = linearization.primal_program.interpret_in_context(&context, primals.clone()).unwrap();
         let reference_residuals = reference_known.split_off(reference_known.len() - linearization.residual_count);
@@ -2997,9 +3007,9 @@ mod array_linearization_tests {
             ProgramError,
         >,
     {
-        let (primal_program, _input_structure, _output_structure, _input_values) =
-            domain.trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(function, primals)?;
-        primal_program.linearize()
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, primal_program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
+        primal_program.into_simplified()?.linearize()
     }
 
     use crate::contexts::{EagerContext, StagingContext};
@@ -3131,11 +3141,11 @@ mod array_linearization_tests {
     where
         Function: FnOnce(Vec<ArrayTracer>) -> Vec<ArrayTracer>,
     {
-        let (program, _input_structure, _output_structure, input_values) =
-            domain.trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(|inputs| Ok(function(inputs)), primals)?;
-        let program = unroll_concretizable_whiles(domain, program, input_values.clone())?;
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, program) = NestedTracingContext::trace(domain.clone(), |inputs| Ok(function(inputs)), input_types)?;
+        let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let jvp_program = program.jvp()?.into_simplified()?;
-        let mut combined_inputs = input_values;
+        let mut combined_inputs = primals;
         combined_inputs.extend(tangents);
         let mut outputs = replay_via_bind(domain, &jvp_program, combined_inputs)?;
         let tangent_outputs = outputs.split_off(outputs.len() / 2);
@@ -3157,11 +3167,11 @@ mod array_linearization_tests {
     where
         Function: FnOnce(Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError>,
     {
-        let (program, _input_structure, _output_structure, input_values) =
-            domain.trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(function, primals)?;
-        let program = unroll_concretizable_whiles(domain, program, input_values.clone())?;
+        let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let (_, program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
+        let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let linearization = program.linearize()?;
-        let primal_side = replay_via_bind(domain, &linearization.primal_program, input_values)?;
+        let primal_side = replay_via_bind(domain, &linearization.primal_program, primals)?;
         let primal_output_count = primal_side.len() - linearization.residual_count;
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
@@ -3669,12 +3679,13 @@ mod array_linearization_tests {
         // f(x) = x . x over a vector has one primal input and one (scalar) primal output, so the program takes
         // two inputs (primal + tangent) and produces two outputs (primal + tangent).
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(
-                |inputs: Vec<ArrayTracer>| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
-                vec![TestArray::vector(vec![1.0, 2.0, 3.0])],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            |inputs: Vec<ArrayTracer>| Ok(vec![inputs[0].dot(&inputs[0], &DotDimensionNumbers::inner_product())]),
+            vec![TestArray::vector(vec![1.0, 2.0, 3.0]).r#type().into_owned()],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
         let jvp_program = primal_program.jvp().unwrap();
         assert_eq!(jvp_program.input_ids().len(), 2);
         assert_eq!(jvp_program.output_ids().len(), 2);
@@ -3826,12 +3837,13 @@ mod array_linearization_tests {
             )
             .unwrap();
 
-        let (primal_program, _, _, _) = domain
-            .trace_into_primal_program::<_, Vec<TestArray>, Vec<_>>(
-                condition_function,
-                vec![predicate_value.clone(), TestArray::scalar(x)],
-            )
-            .unwrap();
+        let (_, primal_program) = NestedTracingContext::trace(
+            domain.clone(),
+            condition_function,
+            vec![predicate_value.r#type().into_owned(), TestArray::scalar(x).r#type().into_owned()],
+        )
+        .unwrap();
+        let primal_program = primal_program.into_simplified().unwrap();
         let jvp_program = primal_program.jvp().unwrap();
 
         // The program takes `(primals ++ tangents)` and produces `(primal_outputs ++ tangent_outputs)`.

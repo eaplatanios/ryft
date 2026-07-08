@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -6,7 +5,7 @@ use std::rc::Rc;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_builders, check_count};
+use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::MaybeWhile;
@@ -46,7 +45,7 @@ pub trait Differentiate: Context {
     /// This is the shared tracing prologue of the program-level entry points that consume a primal program:
     /// [`linearize`](Self::linearize) and the reverse-mode [`vjp`](Self::vjp) family (transposition consumes a
     /// program, so reverse mode always traces first; forward-mode [`jvp`](Self::jvp) runs the closure directly on
-    /// duals instead). The closure runs inside a [`NestedTracingContext`]
+    /// duals instead). The closure runs through [`NestedTracingContext::trace`]
     /// over this context, so runtime captures registered while tracing delegate to this context, and every operation
     /// is staged without running any differentiation rule. The traced program is then simplified so closure dead code
     /// is dropped before linearization. Returns the simplified program, the closure's output structure, and the
@@ -89,41 +88,24 @@ pub trait Differentiate: Context {
         }
         let input_structure = primals.parameter_structure();
         let input_values = primals.into_parameters().collect::<Vec<_>>();
+        let input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
-        // Trace the closure into a flat primal program over this context's types. Tracing stages every operation
-        // without running any differentiation rule; simplification then drops staged dead code so the JVP replay
-        // below does not pay for it.
-        let context = NestedTracingContext::new(self.clone());
-        let (output_structure, output_atoms) = {
-            let input_tracers =
-                input_values.iter().map(|value| context.input(value.r#type().into_owned())).collect::<Vec<_>>();
-            let input = Input::To::<Tracer<NestedTracingContext<Self>>>::from_parameters(
-                input_structure.clone(),
-                input_tracers,
-            )?;
-            let output =
-                function(input).map_err(|error| context.builder().borrow_mut().error.take().unwrap_or(error))?;
-            context.builder().borrow_mut().error.take().map_or(Ok(()), Err)?;
-            let output_structure = output.parameter_structure();
-            // The outputs must belong to this trace: a foreign tracer's atom id would silently alias whichever atom
-            // shares its index in this builder, so the boundary rejects it with a builder-identity check.
-            check_builders!(context.builder(), [output.parameters().map(|output| output.builder())])?;
-            let output_atoms = output.parameters().map(Tracer::atom_id).collect::<Result<Vec<_>, _>>()?;
-            (output_structure, output_atoms)
-        };
-        // Clone out the builder handle and drop the context so the clone is the sole owner, letting `Rc::try_unwrap`
-        // recover the builder below unless a [`Tracer`] escaped the trace and still holds a reference.
-        let builder = context.builder().clone();
-        drop(context);
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let output_count = output_atoms.len();
-        let program = builder
-            .build::<Vec<<Self as Domain>::Constant>, Vec<<Self as Domain>::Constant>>(
-                output_atoms,
-                vec![Placeholder; input_values.len()],
-                vec![Placeholder; output_count],
-            )?
-            .into_simplified()?;
+        // Trace the closure into a flat primal program over this context's types, reassembling the flat input tracers
+        // into the closure's structured input. Tracing stages every operation without running any differentiation
+        // rule; simplification then drops staged dead code so the JVP replay below does not pay for it.
+        let closure_input_structure = input_structure.clone();
+        let (output_structure, program) = NestedTracingContext::trace(
+            self.clone(),
+            |input_tracers| {
+                let input = Input::To::<Tracer<NestedTracingContext<Self>>>::from_parameters(
+                    closure_input_structure,
+                    input_tracers,
+                )?;
+                function(input)
+            },
+            input_types,
+        )?;
+        let program = program.into_simplified()?;
         Ok((program, input_structure, output_structure, input_values))
     }
 
@@ -371,25 +353,8 @@ pub trait Differentiate: Context {
         TracedOutput:
             Parameterized<Tracer<NestedTracingContext<Self>>, Family: ParameterizedFamily<<Self as Domain>::Value>>,
     {
-        // Flatten the structured primals and wrap the structured closure into the flat closure the universal
-        // reverse entry expects, recording the closure's output structure so the flat primal outputs can be reshaped
-        // back into `TracedOutput::To<Value>` afterwards. The closure runs exactly once, so the recorded structure is
-        // always present when the entry returns successfully.
-        let input_structure = primals.parameter_structure();
-        let flat_primals = primals.into_parameters().collect::<Vec<_>>();
-        let output_structure: RefCell<Option<TracedOutput::ParameterStructure>> = RefCell::new(None);
-        let flat_function = |input_tracers: Vec<Tracer<NestedTracingContext<Self>>>| {
-            let input = Input::To::<Tracer<NestedTracingContext<Self>>>::from_parameters(
-                input_structure.clone(),
-                input_tracers,
-            )?;
-            let output = function(input)?;
-            *output_structure.borrow_mut() = Some(output.parameter_structure());
-            Ok(output.into_parameters().collect::<Vec<_>>())
-        };
-
-        let (program, _flat_input_structure, _flat_output_structure, input_values) =
-            self.trace_into_primal_program::<_, Vec<<Self as Domain>::Value>, Vec<_>>(flat_function, flat_primals)?;
+        let (program, _input_structure, output_structure, input_values) =
+            self.trace_into_primal_program::<_, Input, TracedOutput>(function, primals)?;
 
         // Eager domains unroll any concretizable `while` loop at the concrete primals before fusing, so reverse mode
         // through unbounded / data-dependent loops lowers to a control-flow-free tangent program that transposes via
@@ -436,9 +401,6 @@ pub trait Differentiate: Context {
             output_structure: vec![Placeholder; output_count],
             marker: PhantomData,
         };
-        let output_structure = output_structure
-            .into_inner()
-            .ok_or_else(|| ProgramError::MalformedProgram("vjp closure did not record an output structure".into()))?;
         let output = TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure, primal_outputs)?;
         Ok((output, pullback, residuals))
     }
