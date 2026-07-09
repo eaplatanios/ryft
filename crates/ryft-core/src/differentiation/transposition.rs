@@ -264,7 +264,7 @@ impl<
             }
             input_linearity[index] = true;
         }
-        
+
         /// Accumulates one staged cotangent contribution for `atom` into the reverse-pass adjoint table. The first
         /// contribution is stored directly, while later contributions are summed by staging an add instruction in the
         /// transpose builder.
@@ -505,7 +505,7 @@ impl<
                 }
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-        
+
         // Drop the throwaway context so its builder reference is released; with every staged `Tracer` already dropped,
         // the cloned `builder` handle is now the sole owner and can be unwrapped to finalize the pullback.
         drop(context);
@@ -523,8 +523,6 @@ impl<
         builder.build(outputs, vec![Placeholder; pullback_input_count], vec![Placeholder; pullback_output_count])
     }
 }
-        
-// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
@@ -642,11 +640,11 @@ mod tests {
         }
     }
 
-    impl<'operation> TryFrom<&'operation TestLinearOperation> for &'operation ZeroOperation<DataType> {
+    impl<'o> TryFrom<&'o TestLinearOperation> for &'o ZeroOperation<DataType> {
         type Error = ();
 
         #[inline]
-        fn try_from(value: &'operation TestLinearOperation) -> Result<Self, ()> {
+        fn try_from(value: &'o TestLinearOperation) -> Result<Self, ()> {
             match value {
                 TestLinearOperation::Zero(zero) => Ok(zero),
                 _ => Err(()),
@@ -704,7 +702,8 @@ mod tests {
     }
 
     #[test]
-    fn test_program_transpose_identity() {
+    fn test_program_transpose() {
+        // Test that transposing an identity instruction forwards the output cotangent straight to the input.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::Identity, vec![input]).unwrap()[0];
@@ -721,10 +720,8 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_program_transpose_accumulates_contributions_to_repeated_input() {
+        // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let output = builder.add_instruction(TestLinearOperation::Add, vec![input, input]).unwrap()[0];
@@ -745,10 +742,9 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_program_transpose_passes_zero_for_unused_instruction_output() {
+        // Test that unused instruction outputs are passed to transpose rules as structural zero cotangents (the
+        // `TwoOutputs` rule asserts that its second output cotangent is a structural zero).
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let input = builder.add_input(DataType::F64);
         let outputs = builder.add_instruction(TestLinearOperation::TwoOutputs, vec![input]).unwrap().to_vec();
@@ -766,73 +762,9 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_program_transpose_rejects_invalid_rule_input_cotangent_count() {
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::BadArity, vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        assert!(matches!(program.transpose(), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),));
-    }
-
-    #[test]
-    fn test_program_transpose_rejects_foreign_builder_contribution() {
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::ForeignContribution, vec![input]).unwrap()[0];
-        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
-        assert!(matches!(program.transpose(), Err(ProgramError::MismatchedProgramBuilders),));
-    }
-
-    #[test]
-    fn test_program_transpose_with_respect_to_rejects_invalid_input_indices() {
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-        assert!(matches!(
-            program.transpose_with_respect_to(&[2]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "transposition input index 2 is out of range for a program with 2 input(s)",
-        ));
-        assert!(matches!(
-            program.transpose_with_respect_to(&[1, 1]),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "transposition input index 1 appears more than once",
-        ));
-    }
-
-    #[test]
-    fn test_program_transpose_with_respect_to_orders_outputs_by_the_requested_indices() {
-        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
-        let left = builder.add_input(DataType::F64);
-        let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::Add, vec![left, right]).unwrap()[0];
-        let program = builder
-            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
-            .unwrap();
-
-        // The pullback's cotangent outputs follow the requested index order, not program-input order: both inputs of
-        // the `add` receive the seeded output cotangent, so the two orders are distinguishable only through the
-        // output permutation.
-        let forward = program.transpose_with_respect_to(&[0, 1]).unwrap();
-        let reversed = program.transpose_with_respect_to(&[1, 0]).unwrap();
-        assert_eq!(forward.output_ids().len(), 2);
-        assert_eq!(reversed.output_ids().len(), 2);
-        assert_eq!(
-            reversed.output_ids(),
-            &[forward.output_ids()[1], forward.output_ids()[0]],
-            "requested index order must permute the pullback outputs",
-        );
-    }
-
-    #[test]
-    fn test_program_transpose_materializes_disconnected_input_zero() {
+        // Test that a disconnected primal input's cotangent is emitted as an input-free `ZeroOperation` instruction,
+        // which is materialized at interpretation time rather than at transpose time.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         builder.add_input(DataType::F64);
         let program = builder.build::<Scalar, ()>(Vec::new(), Placeholder, ()).unwrap();
@@ -855,10 +787,9 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_program_transpose_skips_dead_instruction() {
+        // Test that instructions whose outputs carry no adjoint are skipped in the reverse walk, with the dead input
+        // still receiving a zero cotangent output.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
         let dead_input = builder.add_input(DataType::F64);
         let live_input = builder.add_input(DataType::F64);
@@ -887,10 +818,93 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
 
-    #[test]
-    fn test_program_transpose_reports_unbound_input_atom() {
+        // Test that transposing a program whose values are tracers of an outer trace stays self-contained: the
+        // disconnected input's zero is emitted as an instruction in the pullback and nothing is staged into the
+        // outer tracing context.
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let outer_builder = tracing_context.builder().clone();
+        let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
+        let connected_input = builder.add_input(DataType::F64);
+        let disconnected_input = builder.add_input(DataType::F64);
+        let program = builder
+            .build::<Vec<TestTracingValue>, TestTracingValue>(
+                vec![connected_input],
+                vec![Placeholder, Placeholder],
+                Placeholder,
+            )
+            .unwrap();
+        let pullback = program.transpose().unwrap();
+        assert_eq!(disconnected_input, AtomId::new(1));
+        assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
+        assert_eq!(pullback.instructions().len(), 1);
+        assert!(pullback.instructions()[0].inputs().is_empty());
+        assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
+        assert!(matches!(
+            pullback.instructions()[0].operation(),
+            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero [type=f64]
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+        assert!(outer_builder.borrow().atoms().is_empty());
+        assert!(outer_builder.borrow().instructions().is_empty());
+
+        // Test that a transpose-rule-staged structural zero contribution stays an input-free `ZeroOperation`
+        // instruction in the pullback, again leaving the outer tracing context untouched.
+        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let outer_builder = tracing_context.builder().clone();
+        let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
+        let program =
+            builder.build::<TestTracingValue, TestTracingValue>(vec![output], Placeholder, Placeholder).unwrap();
+        let pullback = program.transpose().unwrap();
+        assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
+        assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
+        assert_eq!(pullback.instructions().len(), 1);
+        assert!(pullback.instructions()[0].inputs().is_empty());
+        assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
+        assert!(matches!(
+            pullback.instructions()[0].operation(),
+            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+        ));
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = zero [type=f64]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert!(outer_builder.borrow().atoms().is_empty());
+        assert!(outer_builder.borrow().instructions().is_empty());
+
+        // Test that a transpose rule returning the wrong number of input cotangent contributions is rejected instead
+        // of silently dropping cotangents.
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::BadArity, vec![input]).unwrap()[0];
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        assert!(matches!(program.transpose(), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),));
+
+        // Test that a cotangent contribution staged in a foreign builder is rejected before its atom ID can alias an
+        // unrelated atom in the destination pullback.
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::ForeignContribution, vec![input]).unwrap()[0];
+        let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
+        assert!(matches!(program.transpose(), Err(ProgramError::MismatchedProgramBuilders),));
+
+        // Test that an unbound program input atom is reported.
         let input = AtomId::new(0);
         let program = Program::<Scalar, TestLinearOperation, Scalar, ()> {
             atoms: Vec::new(),
@@ -902,10 +916,8 @@ mod tests {
             marker: PhantomData,
         };
         assert!(matches!(program.transpose(), Err(ProgramError::UnboundAtomId { id }) if id == input));
-    }
 
-    #[test]
-    fn test_program_transpose_reports_unbound_instruction_output_atom() {
+        // Test that an unbound instruction output atom is reported.
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
         let program = Program::<Scalar, TestLinearOperation, Scalar, Scalar> {
@@ -924,84 +936,38 @@ mod tests {
     }
 
     #[test]
-    fn test_tracing_context_transpose_materializes_disconnected_input_zero_as_zero_instruction() {
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let outer_builder = tracing_context.builder().clone();
-        let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
-        let connected_input = builder.add_input(DataType::F64);
-        let disconnected_input = builder.add_input(DataType::F64);
+    fn test_program_transpose_with_respect_to() {
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let left = builder.add_input(DataType::F64);
+        let right = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(TestLinearOperation::Add, vec![left, right]).unwrap()[0];
         let program = builder
-            .build::<Vec<TestTracingValue>, TestTracingValue>(
-                vec![connected_input],
-                vec![Placeholder, Placeholder],
-                Placeholder,
-            )
+            .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        let pullback = program.transpose().unwrap();
-        assert_eq!(disconnected_input, AtomId::new(1));
-        assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
-        assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
 
-        // The disconnected input's cotangent is emitted as an input-free `ZeroOperation` instruction in the pullback,
-        // which is materialized at interpretation time rather than as a pullback constant staged at transpose time.
-        assert_eq!(pullback.instructions().len(), 1);
-        assert!(pullback.instructions()[0].inputs().is_empty());
-        assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
-        assert!(matches!(
-            pullback.instructions()[0].operation(),
-            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
-        ));
+        // Test that the pullback's cotangent outputs follow the requested index order rather than program-input
+        // order: both inputs of the `add` receive the seeded output cotangent, so the two orders are distinguishable
+        // only through the output ordering.
+        let forward = program.transpose_with_respect_to(&[0, 1]).unwrap();
+        let reversed = program.transpose_with_respect_to(&[1, 0]).unwrap();
+        assert_eq!(forward.output_ids().len(), 2);
+        assert_eq!(reversed.output_ids().len(), 2);
         assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero [type=f64]
-                in (%0, %1)
-            "}
-            .trim_end(),
+            reversed.output_ids(),
+            &[forward.output_ids()[1], forward.output_ids()[0]],
+            "requested index order must permute the pullback outputs",
         );
 
-        // The outer tracing context is left untouched: transposition stages no zero into it.
-        let outer_builder = outer_builder.borrow();
-        assert!(outer_builder.atoms().is_empty());
-        assert!(outer_builder.instructions().is_empty());
-    }
-
-    #[test]
-    fn test_tracing_context_transpose_materializes_staged_zero_contribution_as_zero_instruction() {
-        let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let outer_builder = tracing_context.builder().clone();
-        let mut builder = ProgramBuilder::<TestTracingValue, TestLinearOperation>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
-        let program =
-            builder.build::<TestTracingValue, TestTracingValue>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose().unwrap();
-        assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
-        assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
-
-        // The transpose-rule-staged structural zero stays an input-free `ZeroOperation` instruction in the pullback,
-        // materialized at interpretation time rather than as a pullback constant staged at transpose time.
-        assert_eq!(pullback.instructions().len(), 1);
-        assert!(pullback.instructions()[0].inputs().is_empty());
-        assert_eq!(pullback.instructions()[0].outputs(), &[AtomId::new(1)]);
+        // Test that out-of-range and duplicate input indices are rejected.
         assert!(matches!(
-            pullback.instructions()[0].operation(),
-            TestLinearOperation::Zero(zero) if zero.r#type() == &DataType::F64,
+            program.transpose_with_respect_to(&[2]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposition input index 2 is out of range for a program with 2 input(s)",
         ));
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = zero [type=f64]
-                in (%1)
-            "}
-            .trim_end(),
-        );
-
-        // The outer tracing context is left untouched: transposition stages no zero into it.
-        let outer_builder = outer_builder.borrow();
-        assert!(outer_builder.atoms().is_empty());
-        assert!(outer_builder.instructions().is_empty());
+        assert!(matches!(
+            program.transpose_with_respect_to(&[1, 1]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "transposition input index 1 appears more than once",
+        ));
     }
 }

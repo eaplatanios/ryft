@@ -3977,12 +3977,12 @@ mod array_linearization_tests {
     /// themselves `Program<…, ArrayOperation, …>`, so satisfying the bounds below is exactly the recursive case feared
     /// to overflow the trait solver when higher-order rules forward-differentiate and linearize their nested programs.
     /// Because each witness's `T`/`V`/`O` are fixed across the recursion and the fixed bodies ground them in
-    /// [`Program::jvp_program`](crate::Program::jvp_program) and [`Program::linearize`](crate::Program::linearize),
+    /// [`Program::jvp`](crate::Program::jvp) and [`Program::linearize`](crate::Program::linearize),
     /// this reduces to the enum's existing forward-mode proof — so it compiles, with no recursive obligation and no
     /// overflow.
     #[test]
     fn array_operation_satisfies_the_program_witnesses() {
-        use crate::differentiation::LinearizableProgramOperation;
+        use crate::differentiation::{DifferentiableProgramOperation, LinearizableProgramOperation};
         use crate::operations::constants::ZeroOperation;
         use crate::programs::Value;
 
