@@ -12,10 +12,7 @@ use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::MaybeWhile;
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::partial::{
-    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialValue, PartiallyEvaluatableOperation,
-    PartitionedProgram,
-};
+use crate::partial::{PartialEvaluationInput, PartiallyEvaluatableOperation, PartitionedProgram};
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{NestedTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
@@ -193,16 +190,19 @@ pub trait Differentiate: Context {
     /// Linearizes `function` at `primals`, returning the primal output and a reusable
     /// [`Pushforward`] — the JAX `linearize` analogue.
     ///
-    /// This is the program-level sibling of [`jvp`](Self::jvp). The closure is traced once into a primal
-    /// [`Program`] and fused into a single JVP program over the ordinary primal operation family; that program is then
-    /// partially evaluated with the primals known and the tangents unknown, folding the known half through this
-    /// context itself: an eager context folds the primal computation and every residual factor to concrete values
-    /// now, while a *staging* context stages the primal computation into the enclosing trace and carries the residual
-    /// factors as [`Tracer`]s, so linearization composes under an outer trace. Either way only the
-    /// linear tangent map survives as the residual program. The returned [`Pushforward`] holds that tangent
-    /// map, so [`Pushforward::apply`] pushes any number of tangents through the function's Jacobian at this
-    /// point without re-tracing or re-differentiating. In an eager context any concretizable `while` loop is unrolled
-    /// at the primals beforehand.
+    /// This is the program-level sibling of [`jvp`](Self::jvp): where `jvp` runs the closure once per
+    /// `(primal, tangent)` pair, this traces the closure once into a primal [`Program`], splits it through
+    /// [`Program::linearize`] into the primal sub-program `x ↦ (y, r)` and the linear tangent sub-program
+    /// `(ẋ, r) ↦ ẏ`, and interprets the primal sub-program at `primals` through this context to recover the primal
+    /// output `y` and the residuals `r` at the linearization point: concrete values under an eager context,
+    /// enclosing-trace [`Tracer`]s under a staging one, so linearization composes under an outer trace. The returned
+    /// [`Pushforward`] closes the tangent sub-program over those residuals, so [`Pushforward::apply`] pushes any
+    /// number of tangents through the function's Jacobian at this point without re-tracing or re-differentiating.
+    /// In an eager context any concretizable `while` loop is unrolled at the primals beforehand.
+    ///
+    /// Reverse mode is this transform plus transposition: [`vjp`](Self::vjp) shares the same prologue and derives
+    /// its pullback program with [`Linearization::pullback`] where this closes over
+    /// [`Linearization::pushforward`].
     fn linearize<F, Input, TracedOutput>(
         &self,
         function: F,
@@ -215,12 +215,13 @@ pub trait Differentiate: Context {
         ProgramError,
     >
     where
+        <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
         <Self as Domain>::Value: BooleanLike,
         <Self as Domain>::Operation: Clone
-            + PartiallyEvaluatableOperation<Self>
             + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + From<ZeroOperation<<Self as Domain>::Type>>
-            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
+            + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
+            + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
         F: FnOnce(Input::To<Tracer<NestedTracingContext<Self>>>) -> TracedOutput,
         Input: Parameterized<
                 <Self as Domain>::Value,
@@ -238,54 +239,23 @@ pub trait Differentiate: Context {
         // Eager domains unroll any concretizable `while` loop at the concrete primals before fusing; staging domains
         // keep the bounded `while` rule.
         let program = unroll_concretizable_whiles(self, program, input_values.clone())?;
-        let jvp_program = program.jvp()?.into_simplified()?;
+        let linearization = program.linearize()?;
 
-        // The fused program takes `[primals(n) ++ tangents(n)]` and produces `[primal(n) ++ tangent(n)]`. Mark the
-        // primals known and the tangents unknown: the tangent of input `i` has the same type as primal input `i`.
-        let primal_input_count = input_values.len();
-        let mut partial_inputs =
-            input_values.iter().map(|value| PartialValue::Known(value.clone())).collect::<Vec<_>>();
-        partial_inputs.extend(input_values.iter().map(|value| PartialValue::Unknown(value.r#type().into_owned())));
-
-        // Fold the known (primal) half through the differentiation context itself: an eager domain interprets it
-        // immediately, while a staging domain stages it into the enclosing trace.
-        let evaluation = jvp_program.partially_evaluate_in_context(self, partial_inputs.as_slice())?;
-
-        // The fused program emits one tangent output per primal output, so its outputs split into two equal halves:
-        // the leading half are the primal outputs and the trailing half are the tangent outputs. The split point is
-        // the number of *function outputs*, which is the residual output count halved — not the primal *input* count,
-        // which differs whenever the function's input and output arities differ.
-        if evaluation.outputs.len() % 2 != 0 {
-            return Err(ProgramError::MalformedProgram(format!(
-                "fused jvp program produced {} outputs which is not an even split into primal and tangent halves",
-                evaluation.outputs.len(),
-            )));
-        }
-        let primal_output_count = evaluation.outputs.len() / 2;
-
-        // The primals are all known, so each primal output folds to a known value; collect the folded values and
-        // reshape them into the structured primal output.
-        let primal_values = evaluation.outputs[..primal_output_count]
-            .iter()
-            .map(|output| match output {
-                PartialEvaluationOutput::Known(value) => Ok(value.clone()),
-                PartialEvaluationOutput::Unknown(_) => Err(ProgramError::MalformedProgram(
-                    "primal output did not fold to a known value during forward linearization".into(),
-                )),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
+        // Replay the primal side to recover the primal outputs followed by the residuals at the linearization point:
+        // concrete values under an eager context, enclosing-trace tracers under a staging one.
+        let (primal_outputs, residuals) = linearization.interpret_primal(self, input_values)?;
         let output =
-            TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), primal_values)?;
+            TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
-        let forward = Pushforward::<Self, Input, TracedOutput::To<<Self as Domain>::Value>> {
-            evaluation,
-            domain: self.clone(),
-            primal_input_count,
-            primal_output_count,
+        // Close the pushforward program over the linearization-point residuals behind the reusable callable.
+        let pushforward = Pushforward {
+            context: self.clone(),
+            program: linearization.pushforward(),
+            residuals,
             output_structure,
             marker: PhantomData,
         };
-        Ok((output, forward))
+        Ok((output, pushforward))
     }
 
     /// Returns the traced primal output, a traced pullback program, and the linearization-point residuals.
@@ -360,16 +330,7 @@ pub trait Differentiate: Context {
         // Replay the primal side to recover the primal outputs followed by the residuals at the linearization point.
         // Under tracing these are enclosing-trace values, so they are returned for the caller to append to the output
         // cotangents.
-        let primal_side = linearization.primal.interpret_in_context(self, input_values)?;
-        let primal_output_count = primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "primal program produced {} outputs which is fewer than its {} residuals",
-                primal_side.len(),
-                linearization.residual_count,
-            ))
-        })?;
-        let residuals = primal_side[primal_output_count..].to_vec();
-        let primal_outputs = primal_side[..primal_output_count].to_vec();
+        let (primal_outputs, residuals) = linearization.interpret_primal(self, input_values)?;
 
         // Transpose the tangent sub-program in `Constant` space. The pullback stays in that space: interpreting it
         // through `Program::interpret_in_context` lifts its literal constants through the consuming context's `lift`
@@ -968,6 +929,47 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
         (self.primal, self.tangent, self.residual_count)
     }
 
+    /// Interprets the [`primal`](Self::primal) sub-program at the primal inputs `x` through `context`, returning the
+    /// primal outputs `y = f(x)` and the residuals `r`, split at [`residual_count`](Self::residual_count).
+    ///
+    /// This recovers the value-level half of a linearization point: the outputs and residuals flow as `context`'s
+    /// [`Value`](crate::contexts::Domain::Value)s — concrete values under an eager context, enclosing-trace tracers
+    /// under a staging one — while the sub-program's staged constants are lifted through the context's
+    /// [`lift`](Context::lift) at replay time.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context whose [`lift`](Context::lift) and [`bind`](Context::bind) replay the primal
+    ///     sub-program.
+    ///   - `primals`: Flat primal inputs `x`, aligned with the primal sub-program's inputs.
+    pub fn interpret_primal<C>(
+        &self,
+        context: &C,
+        primals: Vec<C::Value>,
+    ) -> Result<(Vec<C::Value>, Vec<C::Value>), ProgramError>
+    where
+        C: Context<Type = V::Type, Constant = V, Operation = O>,
+    {
+        let mut outputs = self.primal.interpret_in_context(context, primals)?;
+        let output_count = outputs.len().checked_sub(self.residual_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "primal program produced {} outputs which is fewer than its {} residuals",
+                outputs.len(),
+                self.residual_count,
+            ))
+        })?;
+        let residuals = outputs.split_off(output_count);
+        Ok((outputs, residuals))
+    }
+
+    /// Returns the forward-mode pushforward program `(ẋ, r) ↦ ẏ`: it takes the tangent inputs `ẋ` followed by the
+    /// residuals `r` and produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`. Because linearization already produces
+    /// the pushforward as its unknown half, this is the [`tangent`](Self::tangent) sub-program itself, cloned — the
+    /// identity counterpart of [`pullback`](Self::pullback), which derives its program by transposition.
+    pub fn pushforward(&self) -> Program<V, O, Vec<V>, Vec<V>> {
+        self.tangent.clone()
+    }
+
     /// Builds the reverse-mode pullback program `(ȳ, r) ↦ x̄` by transposing the [`tangent`](Self::tangent)
     /// sub-program: it takes the output cotangents `ȳ` followed by the residuals `r` and produces the input
     /// cotangents `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this [`Linearization`]'s program family,
@@ -1190,20 +1192,18 @@ where
 /// [`apply`](Self::apply) pushes any tangent at the linearization point through the function's Jacobian without
 /// re-tracing or re-differentiating.
 ///
-/// Where [`jvp`](Differentiate::jvp) interprets the fused JVP program once per `(primal, tangent)` pair,
-/// linearization partially evaluates that program against the *known* primals up front — folding the primal computation
-/// and every residual factor to concrete values — and keeps only the residual program over the still-*unknown*
-/// tangents. That residual program is the linear tangent map `f'(x)`: interpreting it at a flat tangent vector yields
-/// the directional derivative, so the cost of differentiating once is amortized over many tangent applications (for
-/// example, replaying every coordinate basis tangent to build a Jacobian).
+/// It wraps the pushforward program of the closure's [`Linearization`] closed over the residuals recovered at the
+/// linearization point: [`apply`](Self::apply) computes `ẏ = (∂f/∂x)(x) · ẋ` by appending the residuals `r` to the
+/// flattened tangents `ẋ`, interpreting the pushforward program `(ẋ, r) ↦ ẏ`, and reshaping the flat tangent outputs
+/// against the closure's output structure. The cost of differentiating once is thereby amortized over many tangent
+/// applications (for example, replaying every coordinate basis tangent to build a Jacobian). It is the exact
+/// forward-mode dual of [`Pullback`], which closes the transposed pullback program over the same residuals.
 ///
-/// The residual (tangent-map) program is over the primal operation family `<C as Domain>::Operation` in the staged
-/// constant space `<C as Domain>::Constant`, while its feeders and outputs flow as `<C as Domain>::Value`s: under an
-/// eager domain the folded residual factors are concrete values and [`apply`](Self::apply) interprets the tangent map
-/// immediately, while under a staging domain they are [`Tracer`]s into the enclosing trace and
-/// [`apply`](Self::apply) stages the tangent map into that trace. Each [`PartialEvaluationOutput::Known`] tangent
-/// output is a structurally zero tangent that partial evaluation folded away; each
-/// [`PartialEvaluationOutput::Unknown`] indexes a residual-program output.
+/// The pushforward program is over the primal operation family `<C as Domain>::Operation` in the staged constant
+/// space `<C as Domain>::Constant`, while the residuals and tangents flow as `<C as Domain>::Value`s: under an eager
+/// domain the residuals are concrete values and [`apply`](Self::apply) interprets the pushforward immediately, while
+/// under a staging domain they are [`Tracer`]s into the enclosing trace and [`apply`](Self::apply) stages the
+/// pushforward into that trace.
 ///
 /// The differentiation context `C` supplies the value semantics and operation family; `Input` is the closure's
 /// structured input type and `TracedOutput` its structured output type, whose
@@ -1212,32 +1212,33 @@ where
 /// [`apply`](Self::apply) infers the tangent family from the linearization itself rather than requiring a turbofish.
 pub struct Pushforward<C, Input, TracedOutput>
 where
-    C: Context,
+    C: Domain,
     TracedOutput: Parameterized<<C as Domain>::Value>,
 {
-    /// Partial evaluation of the fused JVP program against the known primals: its residual program is the linear
-    /// tangent map over the primal operation family, its
-    /// [`Known`](crate::partial::PartialEvaluationInput::Known) feeders are the folded residual factors, and its
-    /// outputs split into the folded primal half followed by the tangent half.
-    evaluation: PartialEvaluation<C>,
+    /// Differentiation context the linearization was built in; [`apply`](Self::apply) replays the pushforward program
+    /// in it, mirroring how [`Pullback`] replays its pullback program.
+    pub(crate) context: C,
 
-    /// Differentiation context the linearization was built in; [`apply`](Self::apply) replays the tangent map in it.
-    domain: C,
+    /// Pushforward program over the primal operation family in the context's staged [`Constant`](Domain::Constant)
+    /// space, mapping `[tangents ++ residuals]` to flat tangent outputs. Its literal constants are lifted through the
+    /// context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
+    pub(crate) program: Program<
+        <C as Domain>::Constant,
+        <C as Domain>::Operation,
+        Vec<<C as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
+    >,
 
-    /// Number of primal inputs `n`. The fused JVP program takes `[primals(n) ++ tangents(n)]`, so
-    /// [`apply`](Self::apply) expects exactly `n` flat tangents.
-    primal_input_count: usize,
-
-    /// Number of primal outputs; the fused JVP program's outputs split into the leading primal half and the trailing
-    /// tangent half, and [`apply`](Self::apply) returns the tangent half.
-    primal_output_count: usize,
+    /// Linearization-point residuals consumed by [`program`](Self::program), appended after the tangents when
+    /// interpreting it.
+    pub(crate) residuals: Vec<<C as Domain>::Value>,
 
     /// Parameter structure of the closure's output, used to reshape the flat tangent outputs.
-    output_structure: TracedOutput::ParameterStructure,
+    pub(crate) output_structure: TracedOutput::ParameterStructure,
 
-    /// Encodes the closure's input family `Input` so [`apply`](Self::apply) can reshape the flat tangents without a
+    /// Encodes the closure's input family `Input` so [`apply`](Self::apply) can flatten the tangents without a
     /// turbofish. Covariant and ownership-free.
-    marker: PhantomData<fn() -> Input>,
+    pub(crate) marker: PhantomData<fn() -> Input>,
 }
 
 impl<C, Input, TracedOutput> Pushforward<C, Input, TracedOutput>
@@ -1250,12 +1251,11 @@ where
 {
     /// Pushes the structured tangents `tangents` through the linearized Jacobian, returning the tangent outputs.
     ///
-    /// The tangents are flattened and the residual tangent map is replayed through
-    /// [`PartialEvaluation::interpret`] in the differentiation context this linearization was built in — the single
-    /// replay path for both known-side flavors: an eager domain interprets the tangent map immediately, while a
-    /// staging domain stages it into the enclosing trace and returns tracers. Each tangent output is mapped from its
-    /// source — a folded structural zero returns its folded value and the rest index the replayed residual-program
-    /// outputs — before being reshaped against the closure's output structure.
+    /// The tangents are flattened, the linearization-point residuals are appended, the pushforward program is
+    /// interpreted at that vector in the differentiation context this linearization was built in — the single replay
+    /// path for both context flavors: an eager domain interprets the pushforward immediately, while a staging domain
+    /// stages it into the enclosing trace and returns tracers — and the flat tangent outputs are reshaped against the
+    /// closure's output structure.
     ///
     /// # Parameters
     ///
@@ -1264,17 +1264,10 @@ where
         &self,
         tangents: Input::To<<C as Domain>::Value>,
     ) -> Result<TracedOutput::To<<C as Domain>::Value>, ProgramError> {
-        let tangents = tangents.into_parameters().collect::<Vec<_>>();
-        if tangents.len() != self.primal_input_count {
-            return Err(ProgramError::InvalidInputCount { expected: self.primal_input_count, actual: tangents.len() });
-        }
-
-        // Replay the residual program: the fused JVP program's unknown inputs are exactly the tangents, in order, so
-        // the flat tangent vector feeds the unknown residual inputs directly. The replayed outputs are the fused
-        // program's outputs — the folded primal half followed by the tangent half — and `apply` returns the latter.
-        let mut outputs = self.evaluation.interpret(&self.domain, tangents.as_slice())?;
-        let tangent_values = outputs.split_off(self.primal_output_count);
-        Ok(TracedOutput::To::<<C as Domain>::Value>::from_parameters(self.output_structure.clone(), tangent_values)?)
+        let mut inputs = tangents.into_parameters().collect::<Vec<_>>();
+        inputs.extend(self.residuals.iter().cloned());
+        let tangent_outputs = self.program.interpret_in_context(&self.context, inputs)?;
+        Ok(TracedOutput::To::<<C as Domain>::Value>::from_parameters(self.output_structure.clone(), tangent_outputs)?)
     }
 }
 
@@ -1298,7 +1291,7 @@ where
     Input: Parameterized<<C as Domain>::Value>,
 {
     /// Differentiation context the pullback was built in; [`apply`](Self::apply) replays the pullback program in it,
-    /// mirroring how [`Pushforward`] replays its tangent map.
+    /// mirroring how [`Pushforward`] replays its pushforward program.
     pub(crate) context: C,
 
     /// Pullback program over the primal operation family in the context's staged [`Constant`](Domain::Constant)

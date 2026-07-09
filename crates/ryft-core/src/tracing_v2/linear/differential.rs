@@ -167,16 +167,8 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // shapes and structure. The replay goes through this context itself — lifting the sub-program's staged
         // constants into value space and binding each instruction — so an eager backend domain executes it with its
         // own value semantics rather than through a fresh constant-only `EagerContext`.
-        let mut primal_side = linearization.primal().interpret_in_context(self, input_values)?;
-        let primal_output_count = primal_side.len().checked_sub(linearization.residual_count()).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "primal program produced {} outputs which is fewer than its {} residuals",
-                primal_side.len(),
-                linearization.residual_count(),
-            ))
-        })?;
-        primal_side.truncate(primal_output_count);
-        let output = TracedOutput::To::<DomainValue<Self>>::from_parameters(output_structure, primal_side)?;
+        let (primal_outputs, _) = linearization.interpret_primal(self, input_values)?;
+        let output = TracedOutput::To::<DomainValue<Self>>::from_parameters(output_structure, primal_outputs)?;
 
         Differential::from_linearization::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
             self,
@@ -541,27 +533,23 @@ where
     /// once at the primal point and batch-replaying its tangent sub-program across every input-coordinate basis
     /// tangent.
     ///
-    /// This is the forward analogue of [`Self::from_pushforward`] over the front end. Where `from_pushforward`
-    /// instantiates a residualized pushforward into one linear program over `C::LinearOperation` and batch-replays it,
-    /// a [`Linearization`] carries two sub-programs over the *primal* operation family `C::Operation`: a nonlinear
+    /// A [`Linearization`] carries two sub-programs over the *primal* operation family `C::Operation`: a nonlinear
     /// [`primal`](Linearization::primal) taking the primal inputs and producing `[primal_outputs..., residuals...]`,
     /// and a linear [`tangent`](Linearization::tangent) taking `[tangents..., residuals...]` and producing the
     /// tangent outputs. This helper:
     ///
     ///   1. Replays the primal sub-program once at the concrete primal `input_parameters` through `context` itself —
     ///      lifting the sub-program's staged constants with [`Context::lift`](crate::Context::lift) and binding each
-    ///      instruction — and splits its outputs at [`residual_count`](Linearization::residual_count) into the primal
-    ///      outputs and the concrete residuals.
+    ///      instruction, via [`Linearization::interpret_primal`] — recovering the concrete residuals.
     ///   2. Batch-replays the tangent sub-program across the stacked input-coordinate basis tangents (all basis
-    ///      items on axis 0, exactly as `from_pushforward` stacks them), appending the residuals as replicated
-    ///      [`ArrayBatch::replicated`] operands after the batched basis tangents — the same replicated mechanism
-    ///      `from_pushforward` uses for closed constants and [`jacrev`] uses for its reverse-mode residuals. Staged
-    ///      constants are lifted through `context` and broadcast as replicated operands the same way. Because the
-    ///      tangent sub-program is expressed in the primal operation family, each instruction is lifted through its
-    ///      primal-family [`BatchableOperation`] rule by [`batch_linear_program_instruction`], interpreting nullary
-    ///      instructions through `context`.
-    ///   3. Assembles the per-(output-leaf, input-leaf) [`DifferentialBlock`]s from the resulting per-output coordinate
-    ///      columns exactly as [`Self::from_pushforward`] does.
+    ///      items on axis 0), appending the residuals as replicated [`ArrayBatch::replicated`] operands after the
+    ///      batched basis tangents — the same replicated mechanism [`jacrev`] uses for its reverse-mode residuals.
+    ///      Staged constants are lifted through `context` and broadcast as replicated operands the same way. Because
+    ///      the tangent sub-program is expressed in the primal operation family, each instruction is lifted through
+    ///      its primal-family [`BatchableOperation`] rule by [`batch_linear_program_instruction`], interpreting
+    ///      nullary instructions through `context`.
+    ///   3. Assembles the per-(output-leaf, input-leaf) [`DifferentialBlock`]s from the resulting per-output
+    ///      coordinate columns.
     ///
     /// Tangents are ordinary [`Value`](DispatchDomain::Value)s of the same universe as the primals, so the concrete
     /// residuals recovered from the primal replay are tangent-typed and feed the tangent batch directly with no
@@ -605,18 +593,9 @@ where
         let output_structure = output.parameter_structure();
         let output_parameters = output.into_parameters().collect::<Vec<_>>();
 
-        // Replay the primal sub-program once at the concrete primals to recover `[primal_outputs..., residuals...]`,
-        // then split off the residual tail. The residuals depend only on the primal point and so are identical across
-        // every basis item.
-        let mut primal_side = linearization.primal().interpret_in_context(context, input_parameters.clone())?;
-        let residuals =
-            primal_side.split_off(primal_side.len().checked_sub(linearization.residual_count()).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "primal program produced {} outputs which is fewer than its {} residuals",
-                    primal_side.len() + linearization.residual_count(),
-                    linearization.residual_count(),
-                ))
-            })?);
+        // Replay the primal sub-program once at the concrete primals to recover the residuals. The residuals depend
+        // only on the primal point and so are identical across every basis item.
+        let (_, residuals) = linearization.interpret_primal(context, input_parameters.clone())?;
 
         let columns = if batch_size == 0 {
             Vec::new()
