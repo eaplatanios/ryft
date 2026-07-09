@@ -20,7 +20,7 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::Differentiate;
+use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
@@ -83,9 +83,9 @@ type CoordinateScalar<V> = <V as CoordinateValue>::Coordinate;
 
 /// Dense derivative materialization helpers for differentiable array domains.
 ///
-/// This extension trait keeps the core [`Differentiate`] contract focused on primitive
-/// linearization and AD transforms while providing structured Jacobian and Hessian materialization
-/// for domains whose values expose finite coordinate bases.
+/// This extension trait keeps the core [`ForwardModeDifferentiate`] and [`ReverseModeDifferentiate`]
+/// contracts focused on primitive linearization and AD transforms while providing structured Jacobian
+/// and Hessian materialization for domains whose values expose finite coordinate bases.
 pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
     /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
     ///
@@ -144,7 +144,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
 
-        // Dual-driven forward-mode Jacobian: `Differentiate::linearize` runs the closure once on differentiation
+        // Dual-driven forward-mode Jacobian: `ForwardModeDifferentiate::linearize` runs the closure once on differentiation
         // duals over a partial-evaluation context wrapping this context, which executes the primal work through this
         // context — recovering the structured primal output and the linearization-point residuals — while
         // accumulating the linear pushforward program. `from_pushforward_program` then replays every
@@ -233,7 +233,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
                 // `interpret_and_trace` fixes its closure error to `ProgramError`, so fold the inner gradient's
                 // differentiation error into a program error to flow it through the trace. A non-scalar gradient
                 // output cannot occur here for well-formed second-order use (the differentiated function is scalar).
-                crate::tracing_v2::Differentiate::gradient(&context, function, input).map_err(|error| match error {
+                context.gradient(function, input).map_err(|error| match error {
                     DifferentiationError::Program(error) => error,
                     error => ProgramError::MalformedProgram(error.to_string()),
                 })

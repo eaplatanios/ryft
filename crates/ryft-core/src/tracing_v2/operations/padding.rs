@@ -207,7 +207,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
+    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
 
     use super::*;
     use crate::batching::BatchAxis;
@@ -219,16 +219,17 @@ mod tests {
         // strided slice of the weighted cotangent at the pad geometry (positions 1, 3, and 5 of w) and the
         // padding-value gradient is the sum over the padding positions, computed as sum(w) - sum(sliced w) =
         // 36 - 12 = 24.
-        let (value, (input_gradient, padding_value_gradient)) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |(x, padding_value)| {
-                let weights =
-                    x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])).unwrap();
-                (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
-            },
-            (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
-        )
-        .unwrap();
+        let (value, (input_gradient, padding_value_gradient)) =
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .value_and_gradient(
+                    |(x, padding_value)| {
+                        let weights =
+                            x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])).unwrap();
+                        (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
+                    },
+                    (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
+                )
+                .unwrap();
         // f = 2 * 1 + 4 * 2 + 6 * 3 + 24 * 9 = 28 + 216.
         assert_close(value.values[0], 244.0);
         assert_eq!(input_gradient.values, vec![2.0, 4.0, 6.0]);

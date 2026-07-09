@@ -1465,11 +1465,10 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
-    use crate::tracing_v2::{ArrayOperation, Differentiate};
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     use super::*;
-    use crate::tracing_v2::value_and_gradient;
 
     /// Computes `f(x) = u * sin(u)` with `u = x · x`, whose linearization residuals span all three policy classes:
     /// `u` is produced by a dot, `sin(u)` by a sine, and the sine rule's `cos(u)` factor by a cosine.
@@ -1503,7 +1502,7 @@ mod tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
-        let (direct_value, direct_gradient) = value_and_gradient(&domain, |x| dot_sine(x), input.clone()).unwrap();
+        let (direct_value, direct_gradient) = domain.value_and_gradient(|x| dot_sine(x), input.clone()).unwrap();
         for policy in [
             RematerializationPolicy::NothingSaveable,
             RematerializationPolicy::EverythingSaveable,
@@ -1511,7 +1510,7 @@ mod tests {
         ] {
             let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
                 .with_policy(policy);
-            let (value, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), input.clone()).unwrap();
+            let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             assert_close(value.values[0], direct_value.values[0]);
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_close(gradient.values[index], *expected);
@@ -1580,12 +1579,9 @@ mod tests {
             };
             forward_output_counts.push(operation.forward().output_types().len());
 
-            let (value, gradient) = value_and_gradient(
-                &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-                |carry| function.call(carry).unwrap(),
-                TestArray::scalar(2.0),
-            )
-            .unwrap();
+            let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+                .value_and_gradient(|carry| function.call(carry).unwrap(), TestArray::scalar(2.0))
+                .unwrap();
             assert_close(value.values[0], 2.0 * expected_gradient);
             assert_close(gradient.values[0], expected_gradient);
         }
@@ -1639,7 +1635,7 @@ mod tests {
         assert_eq!(primal, 4.0);
         assert_eq!(tangent, 4.0);
         let (value, gradient) =
-            value_and_gradient(&domain, |x| (x.clone() * x).tag("square"), Scalar::from(3.0)).unwrap();
+            domain.value_and_gradient(|x| (x.clone() * x).tag("square"), Scalar::from(3.0)).unwrap();
         assert_eq!(value, 9.0);
         assert_eq!(gradient, 6.0);
     }
@@ -1682,7 +1678,7 @@ mod tests {
                 "unexpected forward output count for policy {policy:?}",
             );
             // Every policy preserves the gradient; only the save/recompute split changes.
-            let (_, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), input.clone()).unwrap();
+            let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_close(gradient.values[index], *expected);
             }
@@ -1698,7 +1694,7 @@ mod tests {
             )
             .with_policy(policy);
             let (value, gradient) =
-                value_and_gradient(&domain, |x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
+                domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
             assert_scalar_close(value, 4.0f64.sin());
             assert_scalar_close(gradient, 4.0f64.cos() * 4.0);
         }
@@ -1725,7 +1721,6 @@ mod tests {
     #[test]
     fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
         use crate::tracing_v2::operations::custom_derivatives::custom_vjp;
-        use crate::tracing_v2::value_and_gradient;
 
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
@@ -1744,7 +1739,7 @@ mod tests {
         .with_policy(RematerializationPolicy::EverythingSaveable);
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (value, gradient) =
-            value_and_gradient(&domain, |x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
+            domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
         assert_close(value.values[0], 2.0f64.sin());
         assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
 
@@ -1875,7 +1870,7 @@ mod tests {
         let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
-        let (value, gradient) = value_and_gradient(&domain, |x| outer.call(x).unwrap(), input).unwrap();
+        let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), input).unwrap();
         assert_close(value.values[0], expected_value);
         for (index, expected) in expected_gradient.iter().enumerate() {
             assert_close(gradient.values[index], *expected);
@@ -1956,7 +1951,7 @@ mod tests {
             },
         );
         // f(x) = sin(x²) x, so f'(x) = sin(x²) + 2 x² cos(x²).
-        let (value, gradient) = value_and_gradient(&domain, |x| outer.call(x).unwrap(), Scalar::from(0.7)).unwrap();
+        let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), Scalar::from(0.7)).unwrap();
         assert_scalar_close(value, 0.49f64.sin() * 0.7);
         assert_scalar_close(gradient, 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos());
     }
@@ -2012,7 +2007,6 @@ mod tests {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::value_and_gradient;
 
         // `grad(vmap(rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(f)))`: the gradient flows through the re-wrapped batched call's derived
         // backward program and matches the analytic per-item gradients.
@@ -2020,18 +2014,24 @@ mod tests {
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
             |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
         );
-        let (value, gradient) = value_and_gradient(
-            &domain,
-            |x| {
-                let context = x.context().clone();
-                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
-                    Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
-                        .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::new(vector_type(2), vec![0.5, 1.0]),
-        )
-        .unwrap();
+        let (value, gradient) = domain
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |item| function.call(item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::new(vector_type(2), vec![0.5, 1.0]),
+            )
+            .unwrap();
         // f(x) = Σᵢ sin(xᵢ²), so ∂f/∂xⱼ = 2 xⱼ cos(xⱼ²).
         assert_close(value.values[0], 0.25f64.sin() + 1.0f64.sin());
         assert_close(gradient.values[0], 2.0 * 0.5 * 0.25f64.cos());
@@ -2040,7 +2040,6 @@ mod tests {
 
     #[test]
     fn test_call_caches_derivations_per_input_types() {
-        use crate::tracing_v2::value_and_gradient;
         use std::cell::Cell;
 
         // The body closure runs only while deriving (the primal trace; the remaining passes replay the traced
@@ -2082,10 +2081,10 @@ mod tests {
         // Cache hits still differentiate correctly: the second gradient call reuses the derivation staged by the
         // first one.
         let (_, first_gradient) =
-            value_and_gradient(&domain, |x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
+            domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         let derivations_after_first_gradient = trace_count.get();
         let (_, second_gradient) =
-            value_and_gradient(&domain, |x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
+            domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         assert_eq!(trace_count.get(), derivations_after_first_gradient);
         assert_close(first_gradient.values[0], 2.0 * 0.7 * 0.49f64.cos());
         assert_close(second_gradient.values[0], first_gradient.values[0]);
@@ -2207,7 +2206,7 @@ mod tests {
             );
             // Custom policies only change the save/recompute split, never the gradient.
             let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
-            let (_, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), input).unwrap();
+            let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_close(gradient.values[index], *expected);
             }
@@ -2234,7 +2233,6 @@ mod tests {
     #[test]
     fn test_scalar_second_order_through_rematerialization_matches_the_analytic_second_derivative() {
         use crate::operations::scalars::ScalarOperation;
-        use crate::tracing_v2::Differentiate;
 
         // The scalar counterpart of the test above, composed through nested transforms: the outer reverse pass
         // differentiates a closure that takes the rematerialized gradient on its nested tracing context.
@@ -2388,7 +2386,7 @@ mod tests {
                 "unexpected tangent transfers for policy {policy:?}",
             );
             // Offloading changes placement, never values: gradients match the direct computation.
-            let (_, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), input.clone()).unwrap();
+            let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
                 assert_close(gradient.values[index], *expected);
             }
@@ -2413,7 +2411,7 @@ mod tests {
 
         let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
-        let (value, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), input).unwrap();
+        let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
         assert_close(value.values[0], u * u.sin());
         for (index, expected) in expected_gradient.iter().enumerate() {
@@ -2461,7 +2459,7 @@ mod tests {
         // f(x) = u sin(u) with u = x · x, so the gradient matches `dot_sine`'s.
         let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
-        let (_, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), input).unwrap();
+        let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
             assert_close(gradient.values[index], *expected);
         }
@@ -2472,7 +2470,6 @@ mod tests {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::value_and_gradient;
 
         // `vmap` re-wraps the rematerialized call around batched programs, and the offloaded saved residual keeps
         // its host placement with the batch axis prepended to its shape.
@@ -2506,18 +2503,24 @@ mod tests {
 
         // `grad(vmap(...))` through the offloaded call matches the analytic per-item gradients.
         let rows = [[0.5, 1.5, 1.0], [0.25, 0.75, 1.25]];
-        let (_, gradient) = value_and_gradient(
-            &domain,
-            |x| {
-                let context = x.context().clone();
-                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
-                    Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
-                        .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::new(matrix_type, rows.as_flattened().to_vec()),
-        )
-        .unwrap();
+        let (_, gradient) = domain
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |item| function.call(item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::new(matrix_type, rows.as_flattened().to_vec()),
+            )
+            .unwrap();
         for (row, values) in rows.iter().enumerate() {
             let expected_row_gradient = dot_sine_gradient(values);
             for (column, expected) in expected_row_gradient.iter().enumerate() {

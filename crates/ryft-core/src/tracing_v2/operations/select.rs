@@ -381,7 +381,7 @@ mod tests {
         // there, so the derivative reaches only the selected branch's input.
         use crate::operations::scalars::ScalarOperation;
         use crate::scalars::Scalar;
-        use crate::tracing_v2::{Differentiate, value_and_gradient};
+        use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
         fn piecewise<V>(x: V, y: V) -> Result<V, crate::programs::ProgramError>
         where
@@ -412,9 +412,9 @@ mod tests {
             )
             .unwrap();
         assert_scalar_close(tangent, 0.0);
-        let (value, gradient) =
-            value_and_gradient(&domain, |(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0)))
-                .unwrap();
+        let (value, gradient) = domain
+            .value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0)))
+            .unwrap();
         assert_scalar_close(value, 6.0);
         assert_scalar_close(gradient.0, 2.0);
         assert_scalar_close(gradient.1, 0.0);
@@ -437,9 +437,9 @@ mod tests {
             )
             .unwrap();
         assert_scalar_close(tangent, 3.0);
-        let (value, gradient) =
-            value_and_gradient(&domain, |(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0)))
-                .unwrap();
+        let (value, gradient) = domain
+            .value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0)))
+            .unwrap();
         assert_scalar_close(value, 6.0);
         assert_scalar_close(gradient.0, 0.0);
         assert_scalar_close(gradient.1, 3.0);

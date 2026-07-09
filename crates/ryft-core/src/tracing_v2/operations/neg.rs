@@ -54,7 +54,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::{Differentiate, value_and_gradient};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]
     fn test_neg_jvp_and_gradient_negate() {
@@ -63,7 +63,7 @@ mod tests {
         assert_eq!(primal, -2.0);
         assert_eq!(tangent, -3.0);
 
-        let (value, gradient) = value_and_gradient(&domain, |x| -x, Scalar::from(2.0)).unwrap();
+        let (value, gradient) = domain.value_and_gradient(|x| -x, Scalar::from(2.0)).unwrap();
         assert_eq!(value, -2.0);
         assert_eq!(gradient, -1.0);
     }

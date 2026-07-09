@@ -1608,7 +1608,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::reduce::ReduceOperation;
-    use crate::tracing_v2::{ArrayOperation, Differentiate};
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape, Size, TypeError};
 
     use super::*;

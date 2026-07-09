@@ -1446,8 +1446,7 @@ mod tests {
 
     use super::*;
     use crate::batching::BatchAxis;
-    use crate::tracing_v2::differentiation::Differentiate;
-    use crate::tracing_v2::value_and_gradient;
+    use crate::tracing_v2::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     /// Returns the canonical test array type with the provided dimensions.
     fn test_type(dimensions: &[usize]) -> ArrayType {
@@ -1618,15 +1617,15 @@ mod tests {
 
     #[test]
     fn test_custom_jvp_governs_reverse_mode() {
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let operation = custom_jvp_sin(&test_type(&[]));
-                x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
-            },
-            TestArray::scalar(3.0),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let operation = custom_jvp_sin(&test_type(&[]));
+                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                },
+                TestArray::scalar(3.0),
+            )
+            .unwrap();
         assert_close(value.values[0], 3.0f64.sin());
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
         assert_close(gradient.values[0], 2.0 * 3.0f64.cos());
@@ -1634,15 +1633,15 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let operation = custom_vjp_sin(&test_type(&[]));
-                x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
-            },
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let operation = custom_vjp_sin(&test_type(&[]));
+                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
         assert_close(value.values[0], 2.0f64.sin());
         // The custom backward rule triples the true gradient, proving it is in control.
         assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
@@ -1753,22 +1752,22 @@ mod tests {
 
     #[test]
     fn test_scalar_custom_vjp_governs_reverse_mode() {
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<Scalar, ScalarOperation<Scalar>>::new(),
-            |x| {
-                let operation = ScalarOperation::CustomVjp(Box::new(
-                    CustomVjpOperation::new(
-                        scalar_sin_program(),
-                        scalar_sin_forward_program(),
-                        scalar_tripled_sin_backward_program(),
-                    )
-                    .unwrap(),
-                ));
-                x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
-            },
-            Scalar::from(2.0),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+            .value_and_gradient(
+                |x| {
+                    let operation = ScalarOperation::CustomVjp(Box::new(
+                        CustomVjpOperation::new(
+                            scalar_sin_program(),
+                            scalar_sin_forward_program(),
+                            scalar_tripled_sin_backward_program(),
+                        )
+                        .unwrap(),
+                    ));
+                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                },
+                Scalar::from(2.0),
+            )
+            .unwrap();
         assert_scalar_close(value, 2.0f64.sin());
         // The custom backward rule triples the true gradient, proving it is in control.
         assert_scalar_close(gradient, 3.0 * 2.0f64.cos());
@@ -1792,12 +1791,9 @@ mod tests {
         assert_close(primal.values[0], 2.0f64.sin());
         assert_close(tangent.values[0], 2.0 * 2.0f64.cos());
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| function.call(x).unwrap(),
-            TestArray::scalar(3.0),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(3.0))
+            .unwrap();
         assert_close(value.values[0], 3.0f64.sin());
         assert_close(gradient.values[0], 2.0 * 3.0f64.cos());
     }
@@ -1814,12 +1810,9 @@ mod tests {
                 Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| function.call(x).unwrap(),
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0))
+            .unwrap();
         assert_close(value.values[0], 2.0f64.sin());
         assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
     }
@@ -1850,12 +1843,12 @@ mod tests {
                 Ok((scaled_x, scaled_y))
             },
         );
-        let (value, (gradient_x, gradient_y)) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |(x, y)| function.call((x, y)).unwrap(),
-            (TestArray::scalar(2.0), TestArray::scalar(5.0)),
-        )
-        .unwrap();
+        let (value, (gradient_x, gradient_y)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |(x, y)| function.call((x, y)).unwrap(),
+                (TestArray::scalar(2.0), TestArray::scalar(5.0)),
+            )
+            .unwrap();
         assert_close(value.values[0], 10.0);
         // The custom rule triples the true gradients `(y, x)`.
         assert_close(gradient_x.values[0], 3.0 * 5.0);
@@ -1873,7 +1866,7 @@ mod tests {
                 Ok(product.clone() + product.clone() + product)
             },
         );
-        let (value, gradient) = value_and_gradient(&domain, |x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
+        let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
         assert_scalar_close(value, 2.0f64.sin());
         assert_scalar_close(gradient, 3.0 * 2.0f64.cos());
     }
@@ -1919,32 +1912,31 @@ mod tests {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::value_and_gradient;
 
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
         // rule: traced batching re-wraps the call around batched programs instead of inlining the primal, so the
         // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let context = x.context().clone();
-                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
-                    &context,
-                    |item| {
-                        let operation = custom_jvp_sin(&test_type(&[]));
-                        Ok(item.context().bind(operation, &[item.clone()])?.into_iter().next().unwrap())
-                    },
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![0.5, 1.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |item| {
+                            let operation = custom_jvp_sin(&test_type(&[]));
+                            Ok(item.context().bind(operation, &[item.clone()])?.into_iter().next().unwrap())
+                        },
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![0.5, 1.0]),
+            )
+            .unwrap();
         assert_close(value.values[0], 0.5f64.sin() + 1.0f64.sin());
         assert_close(gradient.values[0], 2.0 * 0.5f64.cos());
         assert_close(gradient.values[1], 2.0 * 1.0f64.cos());
@@ -1955,31 +1947,30 @@ mod tests {
         use crate::batching::Batch;
         use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::value_and_gradient;
 
         // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
         // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let context = x.context().clone();
-                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
-                    &context,
-                    |item| {
-                        let operation = custom_vjp_sin(&test_type(&[]));
-                        Ok(item.context().bind(operation, &[item.clone()])?.into_iter().next().unwrap())
-                    },
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![0.5, 1.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |item| {
+                            let operation = custom_vjp_sin(&test_type(&[]));
+                            Ok(item.context().bind(operation, &[item.clone()])?.into_iter().next().unwrap())
+                        },
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![0.5, 1.0]),
+            )
+            .unwrap();
         assert_close(value.values[0], 0.5f64.sin() + 1.0f64.sin());
         assert_close(gradient.values[0], 3.0 * 0.5f64.cos());
         assert_close(gradient.values[1], 3.0 * 1.0f64.cos());

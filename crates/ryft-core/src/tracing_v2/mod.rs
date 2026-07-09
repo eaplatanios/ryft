@@ -13,10 +13,10 @@ pub mod benchmarking;
 /// with tangent coefficients carried as plain operand edges rather than symbolic captures — which is then partially
 /// evaluated into a known primal sub-program and an unknown linear tangent sub-program
 /// ([`Program::linearize`](crate::Program::linearize)), whose tangent half transposes directly in the primal
-/// operation family for reverse mode. The value-level entry points on [`Differentiate`] — `jvp`,
-/// `linearize`, `vjp`, `value_and_gradient`, `value_and_gradient` — are sugar that traces the closure into a primal
-/// program and then differentiates it on that path, so whether a transform runs eagerly or stages a program is
-/// decided by the context's value type rather than by a mode flag.
+/// operation family for reverse mode. The value-level entry points on [`ForwardModeDifferentiate`] (`jvp` and
+/// `linearize`) and [`ReverseModeDifferentiate`] (`vjp`, `value_and_gradient`, and `gradient`) run the closure
+/// directly on differentiation duals, so whether a transform runs eagerly or stages a program is decided by the
+/// context's value type rather than by a mode flag.
 pub mod differentiation;
 #[cfg(test)]
 mod forward;
@@ -36,10 +36,12 @@ pub(crate) mod test_util;
 pub use crate::operations::tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use crate::tracing::NestedTracer;
-pub use differentiation::Differentiate;
+pub use differentiation::{
+    ForwardModeDifferentiate, ReverseModeDifferentiate, gradient, jvp, linearize, value_and_gradient, vjp,
+};
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
-    Jacobian, gradient, gradient_with_aux, jacrev, value_and_gradient, value_and_gradient_with_aux,
+    Jacobian, gradient_with_aux, jacrev, value_and_gradient_with_aux,
 };
 pub use operations::collective::{
     AXIS_INDEX_OPERATION_NAME, AxisIndexOperation, Collective, CollectiveKind, CollectiveOperation,

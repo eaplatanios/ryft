@@ -8,7 +8,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext, NestedTracingContext};
-    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::DataType;
 
     #[test]
@@ -39,7 +39,7 @@ mod tests {
                 Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
             ),
             ProgramError,
-        > = Differentiate::jvp(&context, |inputs| Ok(inputs), empty_primals, empty_tangents);
+        > = ForwardModeDifferentiate::jvp(&context, |inputs| Ok(inputs), empty_primals, empty_tangents);
 
         assert!(matches!(result, Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 })));
     }
@@ -62,7 +62,7 @@ mod tests {
                 DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
             ),
             ProgramError,
-        > = Differentiate::jvp(
+        > = ForwardModeDifferentiate::jvp(
             &context_a,
             |inputs| inputs[0].add(&inputs[1]),
             vec![primal_a, primal_b],

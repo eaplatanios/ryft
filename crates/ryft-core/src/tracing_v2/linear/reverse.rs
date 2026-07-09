@@ -5,78 +5,10 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{OneOperation, ZeroOperation};
+use crate::operations::constants::ZeroOperation;
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::tracing_v2::Differentiate;
+use crate::tracing_v2::ReverseModeDifferentiate;
 use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
-
-/// Computes both the primal scalar output and its reverse-mode gradient.
-///
-/// This is the most direct reverse-mode API when the caller needs both the function value and the
-/// gradient at the same primal point. The function must return exactly one rank-0 scalar array
-/// leaf. Use [`Differentiate::vjp`] directly for vector-valued functions that need an explicit output
-/// cotangent.
-#[allow(private_bounds)]
-pub fn value_and_gradient<C, F, Input>(
-    context: &C,
-    function: F,
-    primals: Input,
-) -> Result<(<C as Domain>::Value, Input::To<<C as Domain>::Value>), DifferentiationError>
-where
-    C: Context,
-    <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
-    F: FnOnce(Input::To<LinearizationTracer<C>>) -> LinearizationTracer<C>,
-    Input: Parameterized<
-            <C as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<C>>,
-            To<<C as Domain>::Value> = Input,
-            ParameterStructure: Debug + PartialEq,
-        >,
-    <C as Domain>::Type: DifferentiableType,
-    <C as Domain>::Operation: Clone
-        + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
-        + PartiallyEvaluatableOperation<C>
-        + From<ZeroOperation<<C as Domain>::Type>>
-        + From<OneOperation<<C as Domain>::Type>>
-        + From<AddOperation>
-        + DifferentiableOperation<PartialEvaluationContext<C>>,
-{
-    context.value_and_gradient(function, primals)
-}
-
-/// Computes the reverse-mode gradient of a scalar-output function.
-///
-/// This is [`value_and_gradient`] with the primal value discarded — the analogue of JAX's
-/// [`grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html). The function must return
-/// exactly one rank-0 scalar array leaf. Use [`value_and_gradient`] when the function value is also
-/// needed, and [`gradient_with_aux`] when the function carries auxiliary outputs.
-#[allow(private_bounds)]
-pub fn gradient<C, F, Input>(
-    context: &C,
-    function: F,
-    primals: Input,
-) -> Result<Input::To<<C as Domain>::Value>, DifferentiationError>
-where
-    C: Context,
-    <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
-    F: FnOnce(Input::To<LinearizationTracer<C>>) -> LinearizationTracer<C>,
-    Input: Parameterized<
-            <C as Domain>::Value,
-            Family: ParameterizedFamily<LinearizationTracer<C>>,
-            To<<C as Domain>::Value> = Input,
-            ParameterStructure: Debug + PartialEq,
-        >,
-    <C as Domain>::Type: DifferentiableType,
-    <C as Domain>::Operation: Clone
-        + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
-        + PartiallyEvaluatableOperation<C>
-        + From<ZeroOperation<<C as Domain>::Type>>
-        + From<OneOperation<<C as Domain>::Type>>
-        + From<AddOperation>
-        + DifferentiableOperation<PartialEvaluationContext<C>>,
-{
-    value_and_gradient(context, function, primals).map(|(_, gradient)| gradient)
-}
 
 /// Computes a scalar-output value, auxiliary outputs, and the reverse-mode gradient.
 ///
@@ -208,7 +140,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext};
-    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::ReverseModeDifferentiate;
     use crate::types::DataType;
 
     use super::*;
@@ -296,7 +228,7 @@ mod tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
         let gradient: (Scalar, Scalar) =
-            gradient(&domain, |(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
+            domain.gradient(|(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
 
         assert_eq!(gradient, (Scalar::from(4.0), Scalar::from(2.0)));
     }

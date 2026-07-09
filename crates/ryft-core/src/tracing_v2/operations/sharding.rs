@@ -196,7 +196,7 @@ mod tests {
 
     use super::*;
     use crate::differentiation::LinearizationTracer;
-    use crate::tracing_v2::differentiation::Differentiate;
+    use crate::tracing_v2::differentiation::ReverseModeDifferentiate;
 
     fn mesh() -> LogicalMesh {
         LogicalMesh::new(vec![

@@ -674,7 +674,7 @@ mod tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::differentiation::Differentiate;
+    use crate::tracing_v2::differentiation::ForwardModeDifferentiate;
 
     use crate::types::DataType;
 

@@ -579,7 +579,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
+    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::DataType;
 
     use super::*;
@@ -606,12 +606,12 @@ mod tests {
     fn test_slice_value_and_grad_zero_pads_cotangent() {
         // f(x) = sum(slice(x, [1], [3])): the pullback writes the all-ones cotangent into a zero array at the slice
         // offsets, so the gradient is the indicator of the sliced window.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| x.slice(&[1], &[3], &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
-            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| x.slice(&[1], &[3], &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
+                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+            )
+            .unwrap();
         assert_close(value.values[0], 5.0);
         assert_eq!(gradient.values, vec![0.0, 1.0, 1.0, 0.0]);
     }
@@ -621,15 +621,15 @@ mod tests {
         // f(x) = sum(slice(x, [1], [6], strides=[2]) * w) with w = [1, 2, 3]: the forward slice reads positions 1,
         // 3, and 5, so the pullback pads the weighted cotangent [1, 2, 3] with `low = 1`, `interior = 1`, and
         // `high = 0`, scattering it back to exactly those positions.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let weights = x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
-                (x.slice(&[1], &[6], &[2]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let weights = x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
+                    (x.slice(&[1], &[6], &[2]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+            )
+            .unwrap();
         // f = x[1] + 2 * x[3] + 3 * x[5] = 1 + 6 + 15.
         assert_close(value.values[0], 22.0);
         assert_eq!(gradient.values, vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0]);
@@ -651,12 +651,12 @@ mod tests {
     fn test_update_slice_value_and_grad_splits_cotangent() {
         // f(x, u) = sum(update_slice(x, u, [1])): the input gradient is the cotangent with the update window zeroed
         // and the update gradient is the slice of the cotangent at the update window.
-        let (value, (input_gradient, update_gradient)) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |(x, update)| x.update_slice(&update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
-            (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
-        )
-        .unwrap();
+        let (value, (input_gradient, update_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |(x, update)| x.update_slice(&update, &[1]).unwrap().reduce(&[0], ReductionKind::Sum),
+                (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
+            )
+            .unwrap();
         assert_close(value.values[0], 20.0);
         assert_eq!(input_gradient.values, vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.values, vec![1.0, 1.0]);
@@ -667,15 +667,15 @@ mod tests {
         // f(x) = sum(dynamic_slice(x, [1], [2])): the integer start index is a constant of the trace (its tangent is
         // a structural zero that the JVP rule ignores), and the pullback scatters the all-ones cotangent into a zero
         // array at the captured index.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let start = index_constant(&x, 1.0);
-                x.dynamic_slice(&[start], &[2]).unwrap().reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let start = index_constant(&x, 1.0);
+                    x.dynamic_slice(&[start], &[2]).unwrap().reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+            )
+            .unwrap();
         assert_close(value.values[0], 5.0);
         assert_eq!(gradient.values, vec![0.0, 1.0, 1.0, 0.0]);
     }
@@ -703,15 +703,15 @@ mod tests {
     fn test_dynamic_update_slice_value_and_grad_splits_cotangent() {
         // f(x, u) = sum(dynamic_update_slice(x, u, [1])): the input gradient is the cotangent with the update window
         // zeroed and the update gradient is the dynamic slice of the cotangent at the captured index.
-        let (value, (input_gradient, update_gradient)) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |(x, update)| {
-                let start = index_constant(&x, 1.0);
-                x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
-            },
-            (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
-        )
-        .unwrap();
+        let (value, (input_gradient, update_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |(x, update)| {
+                    let start = index_constant(&x, 1.0);
+                    x.dynamic_update_slice(&update, &[start]).unwrap().reduce(&[0], ReductionKind::Sum)
+                },
+                (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
+            )
+            .unwrap();
         assert_close(value.values[0], 20.0);
         assert_eq!(input_gradient.values, vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.values, vec![1.0, 1.0]);
@@ -949,31 +949,32 @@ mod tests {
         // indices) and the staged slicing operations must transpose. With `starts = [1, 2]` over `x = [1, 2, 3, 4]`
         // the batch items read `[x1, x2]` and `[x2, x3]`, so `f(x) = sum(stack * w)` with `w = [[1, 2], [3, 4]]` is
         // `f = x1 + 2 * x2 + 3 * x2 + 4 * x3` and the gradient is `[0, 1, 5, 4]`.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let context = x.context().clone();
-                let starts = context
-                    .lift(TestArray::new(
-                        ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
-                        vec![1.0, 2.0],
-                    ))
-                    .unwrap();
-                let stacked: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
-                    &context,
-                    |(item, start)| item.dynamic_slice(&[start], &[2]),
-                    (x, starts),
-                    (BatchAxis::replicated(), BatchAxis::new(0)),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap();
-                let weights = context.lift(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
-                (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let starts = context
+                        .lift(TestArray::new(
+                            ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
+                            vec![1.0, 2.0],
+                        ))
+                        .unwrap();
+                    let stacked: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
+                        Batch::batch(
+                            &context,
+                            |(item, start)| item.dynamic_slice(&[start], &[2]),
+                            (x, starts),
+                            (BatchAxis::replicated(), BatchAxis::new(0)),
+                            BatchAxis::new(0),
+                            None,
+                        )
+                        .unwrap();
+                    let weights = context.lift(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                    (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+            )
+            .unwrap();
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
         assert_close(value.values[0], 33.0);
         assert_eq!(gradient.values, vec![0.0, 1.0, 5.0, 4.0]);

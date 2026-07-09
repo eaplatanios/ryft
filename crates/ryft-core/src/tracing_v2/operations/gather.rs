@@ -76,7 +76,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
+    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -94,17 +94,17 @@ mod tests {
         // f(x) = sum(gather(x, [[0], [2]])) takes rows 0 and 2 of a 3x2 matrix; the integer indices are constants of
         // the trace, so the gather/scatter-add transpose duality pulls the all-ones cotangent back into a zero operand
         // at exactly those rows.
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
-                let operation =
-                    GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
-                x.gather(&indices, &operation).unwrap().reduce(&[0, 1], ReductionKind::Sum)
-            },
-            TestArray::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let indices = index_array(&x, vec![2, 1], vec![0.0, 2.0]);
+                    let operation =
+                        GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2]);
+                    x.gather(&indices, &operation).unwrap().reduce(&[0, 1], ReductionKind::Sum)
+                },
+                TestArray::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
+            )
+            .unwrap();
         assert_close(value.values[0], 10.0);
         assert_eq!(gradient.values, vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
     }

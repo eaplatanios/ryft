@@ -55,7 +55,9 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::tracing_v2::{DifferentiableDomainExtension, Differentiate, jacrev};
+    use crate::tracing_v2::{
+        DifferentiableDomainExtension, ForwardModeDifferentiate, ReverseModeDifferentiate, jacrev,
+    };
     use crate::types::{Shape, Size, Typed};
 
     use super::*;

@@ -1091,7 +1091,7 @@ mod differentiation_tests {
     use crate::differentiation::LinearizationTracer;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
@@ -1528,8 +1528,8 @@ mod linearization_tests {
     /// Forward-mode dual leaf seen by the scalar `jvp` closures.
     type ScalarJvpTracer = DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
 
-    /// Forward-mode dual leaf seen by the scalar closures handed to [`Differentiate::linearize`] and
-    /// [`Differentiate::vjp`].
+    /// Forward-mode dual leaf seen by the scalar closures handed to [`ForwardModeDifferentiate::linearize`] and
+    /// [`ReverseModeDifferentiate::vjp`].
     type ScalarLinearizationTracer = LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
@@ -1553,7 +1553,7 @@ mod linearization_tests {
     }
 
     /// Asserts forward equivalence: the primal and tangent sub-programs, reassembled, equal the outputs of
-    /// [`Differentiate::jvp`] for `function` at `primals` with the given `tangents`.
+    /// [`ForwardModeDifferentiate::jvp`] for `function` at `primals` with the given `tangents`.
     fn assert_forward_equivalent<JvpFunction, LinearizeFunction>(
         jvp_function: JvpFunction,
         linearize_function: LinearizeFunction,
@@ -1588,7 +1588,7 @@ mod linearization_tests {
 
     /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
     /// simplification, and direct interpretation at `(primals ++ tangents)` — as an independent oracle for
-    /// [`Differentiate::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
+    /// [`ForwardModeDifferentiate::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
     /// agree with the program-level pipeline. Returns the flat primal and tangent outputs.
     fn fused_pipeline_jvp<Function>(
         domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
@@ -1612,7 +1612,7 @@ mod linearization_tests {
 
     /// Reverse-mode-differentiates `function` at `primals` through the raw linearize-then-transpose pipeline —
     /// trace, eager `while` unroll, fused JVP known-ness split, primal replay, and partitioned transposition — so
-    /// the packaged [`Differentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
+    /// the packaged [`ReverseModeDifferentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
     /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
     fn vjp_direct<Function>(
         domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
@@ -1639,7 +1639,7 @@ mod linearization_tests {
 
     /// Asserts reverse equivalence: the raw-pipeline pullback (built by [`vjp_direct`], which transposes the tangent
     /// sub-program in the primal `ScalarOperation` enum) yields the same input cotangents as the packaged
-    /// [`Differentiate::vjp`] pullback for `function` at `primals`, for the given `output_cotangents`. The
+    /// [`ReverseModeDifferentiate::vjp`] pullback for `function` at `primals`, for the given `output_cotangents`. The
     /// same `function` is supplied twice because each consuming entry point traces it once into a primal program.
     ///
     /// Both pullbacks consume the residuals as ordinary pullback inputs, so each is interpreted at
@@ -2976,7 +2976,7 @@ mod array_linearization_tests {
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
-    use crate::tracing_v2::differentiation::Differentiate;
+    use crate::tracing_v2::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
@@ -2989,8 +2989,8 @@ mod array_linearization_tests {
     /// Forward-mode dual leaf seen by the array `jvp` closures.
     type ArrayJvpTracer = DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>;
 
-    /// Forward-mode dual leaf seen by the array closures handed to [`Differentiate::linearize`] and
-    /// [`Differentiate::vjp`].
+    /// Forward-mode dual leaf seen by the array closures handed to [`ForwardModeDifferentiate::linearize`] and
+    /// [`ReverseModeDifferentiate::vjp`].
     type ArrayLinearizationTracer = LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>;
 
     /// Absolute tolerance for comparing the path against the established transforms.
@@ -3015,7 +3015,7 @@ mod array_linearization_tests {
     }
 
     /// Asserts forward equivalence for array functions: the primal and tangent sub-programs, reassembled, equal
-    /// the outputs of [`Differentiate::jvp`] for `function` at `primals` with the given `tangents`.
+    /// the outputs of [`ForwardModeDifferentiate::jvp`] for `function` at `primals` with the given `tangents`.
     fn assert_array_forward_equivalent<JvpFunction, LinearizeFunction>(
         jvp_function: JvpFunction,
         linearize_function: LinearizeFunction,
@@ -3047,7 +3047,7 @@ mod array_linearization_tests {
     }
 
     /// Asserts reverse equivalence for array functions: transposing the tangent sub-program yields the same input
-    /// cotangents as the [`Differentiate::vjp`] pullback for `function` at `primals`, for the given
+    /// cotangents as the [`ReverseModeDifferentiate::vjp`] pullback for `function` at `primals`, for the given
     /// `output_cotangents`.
     fn assert_array_reverse_equivalent<VjpFunction, LinearizeFunction>(
         vjp_function: VjpFunction,
@@ -3076,7 +3076,7 @@ mod array_linearization_tests {
 
     /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
     /// simplification, and direct interpretation at `(primals ++ tangents)` — as an independent oracle for
-    /// [`Differentiate::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
+    /// [`ForwardModeDifferentiate::jvp`]: the dual-interpreter entry point (including its eager `while` rule) must
     /// agree with the program-level pipeline. Returns the flat primal and tangent outputs.
     fn fused_pipeline_jvp<Function>(
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
@@ -3100,7 +3100,7 @@ mod array_linearization_tests {
 
     /// Reverse-mode-differentiates `function` at `primals` through the raw linearize-then-transpose pipeline —
     /// trace, eager `while` unroll, fused JVP known-ness split, primal replay, and partitioned transposition — so
-    /// the packaged [`Differentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
+    /// the packaged [`ReverseModeDifferentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
     /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
     fn vjp_direct<Function>(
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
@@ -3128,14 +3128,14 @@ mod array_linearization_tests {
     /// Asserts the control-flow reverse-mode equivalence gate: the direct-transpose pullback (built by
     /// [`vjp_direct`], which transposes the primal `Scan` / `Condition` operations of the tangent
     /// sub-program directly) produces the same linear-input cotangents as the established
-    /// [`Differentiate::vjp`] pullback, for a control-flow `function` at `primals` and the given
+    /// [`ReverseModeDifferentiate::vjp`] pullback, for a control-flow `function` at `primals` and the given
     /// `output_cotangents`. The same `function` is supplied twice because each consuming entry point traces it once
     /// into a primal program.
     ///
     /// The direct pullback consumes the residuals as ordinary pullback inputs, so it is interpreted at
     /// `output_cotangents ++ residuals`. It prunes any dead operand tangent — for example the Boolean predicate of a
     /// `condition`, which has no tangent space — so it emits one cotangent per *live* operand, whereas
-    /// [`Differentiate::vjp`] emits a typed zero for every primal input including the predicate. The direct-transpose
+    /// [`ReverseModeDifferentiate::vjp`] emits a typed zero for every primal input including the predicate. The direct-transpose
     /// path is correct precisely when its cotangents equal the trailing (live-operand) cotangents of `vjp`, which this
     /// asserts by comparing against the last `direct.len()` entries of the reference cotangents.
     fn assert_array_control_flow_reverse_equivalent_to_vjp<VjpFunction, DirectFunction>(
@@ -3776,7 +3776,7 @@ mod array_linearization_tests {
     }
 
     /// Asserts that the full JVP program for `condition_function` at `(predicate, x)` with tangent `(0, dx)`,
-    /// interpreted directly, reproduces both the primal and the tangent outputs of [`Differentiate::jvp`].
+    /// interpreted directly, reproduces both the primal and the tangent outputs of [`ForwardModeDifferentiate::jvp`].
     ///
     /// The condition's predicate is a scalar-boolean operand whose tangent input is dead (Boolean predicates have
     /// no tangent space), so the partial-evaluation split prunes it and the reassembling
@@ -4572,10 +4572,10 @@ mod batching_tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;
-    use crate::tracing_v2::Differentiate;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape};
 
     use super::*;
@@ -4781,25 +4781,25 @@ mod batching_tests {
         // The scalar input is replicated inside the batch, so the elementwise batching rule
         // stages a `Broadcast` on the differentiated value; the gradient must flow back
         // through the broadcast's transpose rule (a sum-reduction over the batch axis).
-        let (value, gradient) = crate::tracing_v2::value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let context = x.context().clone();
-                let y = context.lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
-                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
-                    &context,
-                    |(item, shift)| Ok(item * shift),
-                    (y, x),
-                    (BatchAxis::new(0), BatchAxis::replicated()),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::scalar(2.0),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let y = context.lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0])).unwrap();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |(item, shift)| Ok(item * shift),
+                        (y, x),
+                        (BatchAxis::new(0), BatchAxis::replicated()),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::scalar(2.0),
+            )
+            .unwrap();
         assert_close(value.values[0], 20.0);
         assert_eq!(gradient.values, vec![10.0]);
     }
@@ -4810,7 +4810,7 @@ mod batching_tests {
             .batch(
                 |x| {
                     let context = x.context().clone();
-                    Differentiate::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
+                    ForwardModeDifferentiate::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 BatchAxis::new(0),
@@ -4872,24 +4872,24 @@ mod batching_tests {
     fn test_context_batch_composes_inside_value_and_grad() {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
-        let (value, gradient): (TestArray, TestArray) = crate::tracing_v2::value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let context = x.context().clone();
-                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
-                    &context,
-                    |item| Ok(item.clone() * item),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .unwrap();
-                mapped.reduce(&[0], ReductionKind::Sum)
-            },
-            TestArray::vector(vec![2.0, 3.0]),
-        )
-        .unwrap();
+        let (value, gradient): (TestArray, TestArray) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                        &context,
+                        |item| Ok(item.clone() * item),
+                        x,
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        None,
+                    )
+                    .unwrap();
+                    mapped.reduce(&[0], ReductionKind::Sum)
+                },
+                TestArray::vector(vec![2.0, 3.0]),
+            )
+            .unwrap();
 
         assert_eq!(value.values, vec![13.0]);
         assert_eq!(gradient.values, vec![4.0, 6.0]);

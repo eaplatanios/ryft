@@ -67,7 +67,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::ForwardModeDifferentiate;
 
     #[test]
     fn test_sub_jvp_matches_the_difference_rule() {

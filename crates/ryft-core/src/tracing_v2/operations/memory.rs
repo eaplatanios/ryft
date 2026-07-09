@@ -221,8 +221,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size, Typed};
 
     use super::*;
-    use crate::tracing_v2::differentiation::Differentiate;
-    use crate::tracing_v2::value_and_gradient;
+    use crate::tracing_v2::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     const PINNED_HOST: Memory = Memory::Host { pinned: true };
 
@@ -311,16 +310,16 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x| {
-                let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
-                let back = on_host.transfer_to_memory(Memory::Device);
-                back.dot(&back, &DotDimensionNumbers::inner_product())
-            },
-            TestArray::vector(vec![0.5, 1.5]),
-        )
-        .unwrap();
+        let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |x| {
+                    let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
+                    let back = on_host.transfer_to_memory(Memory::Device);
+                    back.dot(&back, &DotDimensionNumbers::inner_product())
+                },
+                TestArray::vector(vec![0.5, 1.5]),
+            )
+            .unwrap();
         assert_close(value.values[0], 2.5);
         assert_close(gradient.values[0], 1.0);
         assert_close(gradient.values[1], 3.0);

@@ -228,7 +228,7 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
 }
 
 /// Pushforward of a function `f` at a linearization point `x` (i.e., the linear map `ẋ ↦ (∂f/∂x)(x) · ẋ`), packaged
-/// as a reusable callable. This is what [`Differentiate::linearize`] returns (i.e., the analogue of
+/// as a reusable callable. This is what [`ForwardModeDifferentiate::linearize`] returns (i.e., the analogue of
 /// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)), and it is the forward-mode
 /// dual of [`Pullback`](crate::Pullback), whose callable applies the transposed map `ȳ ↦ (∂f/∂x)(x)ᵀ · ȳ` instead.
 /// It wraps the pushforward program `(ẋ, r) ↦ ẏ` accumulated while partially evaluating the differentiated closure,
@@ -565,11 +565,11 @@ impl<C: Context> Value for DifferentiationTracer<C> {
 }
 
 /// Value type flowing through the closures of the partial-evaluation-backed differentiation entry points (i.e.,
-/// [`Differentiate::linearize`], [`Differentiate::vjp`], [`Differentiate::gradient`], and their derivatives). It is a
-/// [`DifferentiationTracer`] dual over a [`PartialEvaluationContext`] wrapping the context `C` the transform runs in.
-/// Its primal half is a *known* partial-evaluation value carrying a concrete value under an eager `C` (so that e.g.,
-/// host control flow on primal values works as expected) and its tangent half is *unknown*, accumulating the
-/// pushforward program.
+/// [`ForwardModeDifferentiate::linearize`], [`ReverseModeDifferentiate::vjp`], [`ReverseModeDifferentiate::gradient`],
+/// and their derivatives). It is a [`DifferentiationTracer`] dual over a [`PartialEvaluationContext`] wrapping the
+/// context `C` the transform runs in. Its primal half is a *known* partial-evaluation value carrying a concrete value
+/// under an eager `C` (so that e.g., host control flow on primal values works as expected) and its tangent half is
+/// *unknown*, accumulating the pushforward program.
 pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext<C>>;
 
 /// Forward-mode differentiation [`Context`] that interleaves [`DifferentiableOperation`] implementations with an inner
@@ -581,11 +581,12 @@ pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext
 /// is forward mode's counterpart of [`BatchingContext`](crate::BatchingContext): a transform context that wraps the
 /// receiver and runs the user's closure directly on transform tracers (i.e., [`DifferentiationTracer`] duals here,
 /// and [`BatchingTracer`](crate::BatchingTracer)s there), with eager-versus-staged behavior absorbed entirely by the
-/// wrapped context. It is what makes [`Differentiate::jvp`] the single forward-mode entry point. Structural zero
-/// tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules. The [`bind`](Context::bind) fast path
-/// skips an operation's rule entirely when every input tangent is a structural zero, exactly like the program-level
-/// replay behind [`Program::linearize`], and so no zero values are constructed and no zero work is performed until a
-/// boundary [`materialize`](MaybeZero::materialize)s one through the inner context's [`Zero`] capability.
+/// wrapped context. It is what makes [`ForwardModeDifferentiate::jvp`] the single forward-mode entry point. Structural
+/// zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules. The [`bind`](Context::bind) fast
+/// path skips an operation's rule entirely when every input tangent is a structural zero, exactly like the
+/// program-level replay behind [`Program::linearize`], and so no zero values are constructed and no zero work
+/// is performed until a boundary [`materialize`](MaybeZero::materialize)s one through the inner context's [`Zero`]
+/// capability.
 #[derive(Clone)]
 pub struct DifferentiationContext<C: Context> {
     /// Parent [`Context`] that carries the primal and tangent values and executes (or stages) the operations

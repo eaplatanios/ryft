@@ -107,7 +107,7 @@ mod tests {
     use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::tracing_v2::test_util::assert_scalar_close;
-    use crate::tracing_v2::{ArrayOperation, Differentiate};
+    use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
     use crate::types::{ArrayType, DataType};
 
     fn approx_eq(left: f64, right: f64) {

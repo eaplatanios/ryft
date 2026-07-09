@@ -62,7 +62,7 @@ mod tests {
     use crate::programs::ProgramError;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::Differentiate;
+    use crate::tracing_v2::ForwardModeDifferentiate;
 
     /// `f(x) = select(x > 0, 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
     fn piecewise_select(

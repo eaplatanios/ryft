@@ -198,7 +198,7 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
+    use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
     /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
@@ -217,19 +217,19 @@ mod tests {
         // Scatter-add is the identity in its operand (`∂output/∂operand = I`), so the operand gradient is the all-ones
         // cotangent unchanged, while the update gradient gathers that cotangent at the captured indices — the
         // scatter-add/gather transpose duality.
-        let (value, (operand_gradient, update_gradient)) = value_and_gradient(
-            &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |(x, updates)| {
-                let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
-                let operation = ScatterOperation::new(
-                    ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
-                    ScatterReductionKind::Add,
-                );
-                x.scatter(&indices, &updates, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
-            },
-            (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![10.0, 20.0])),
-        )
-        .unwrap();
+        let (value, (operand_gradient, update_gradient)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .value_and_gradient(
+                |(x, updates)| {
+                    let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
+                    let operation = ScatterOperation::new(
+                        ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Add,
+                    );
+                    x.scatter(&indices, &updates, &operation).unwrap().reduce(&[0], ReductionKind::Sum)
+                },
+                (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![10.0, 20.0])),
+            )
+            .unwrap();
         assert_close(value.values[0], 40.0);
         assert_eq!(operand_gradient.values, vec![1.0, 1.0, 1.0, 1.0]);
         assert_eq!(update_gradient.values, vec![1.0, 1.0]);
