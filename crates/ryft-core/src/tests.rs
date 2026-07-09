@@ -2039,38 +2039,6 @@ mod linearization_tests {
     }
 
     #[test]
-    fn test_program_is_capture_free_and_has_expected_shape() {
-        // f(x) = x * sin(x) has one primal input and one primal output, so the program takes two inputs (primal +
-        // tangent) and produces two outputs (primal + tangent).
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (_, primal_program) = NestedTracingContext::trace(
-            domain.clone(),
-            |inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]),
-            vec![DataType::F64],
-        )
-        .unwrap();
-        let primal_program = primal_program.into_simplified().unwrap();
-        let jvp_program = primal_program.jvp().unwrap();
-        assert_eq!(jvp_program.input_ids().len(), 2);
-        assert_eq!(jvp_program.output_ids().len(), 2);
-
-        // The crux: the program is expressed entirely in the primal `ScalarOperation` enum, whose coefficients are
-        // operand edges (`Mul`) and fresh primal operations (`Cos`) rather than captured factors. The type system
-        // proves the absence of symbolic captures: the program's operation family is `ScalarOperation<Scalar>`, the
-        // ordinary primal operation family, rather than a capture-keyed linear operation family. This binding
-        // documents that distinction at the type level.
-        let _capture_free: &Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> = &jvp_program;
-
-        // Interpreting the program at (primal, tangent) = (0.7, 1.0) reproduces the function value and its
-        // derivative `sin(x) + x*cos(x)`.
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.0)]).unwrap();
-        let expected_primal = 0.7 * 0.7_f64.sin();
-        let expected_tangent = 0.7_f64.sin() + 0.7 * 0.7_f64.cos();
-        assert_close(&outputs, &[Scalar::from(expected_primal), Scalar::from(expected_tangent)], "jvp_program jvp");
-    }
-
-    #[test]
     fn test_rejects_nested_program_operations() {
         use crate::contexts::StagingContext;
         use crate::operations::arithmetic::AddOperation;
@@ -2232,34 +2200,6 @@ mod linearization_tests {
             !jvp_program.instructions().iter().any(|instruction| instruction.operation().name() == "zero"),
             "expected no staged zero instructions in the fused jvp program, but got:\n{jvp_program}",
         );
-    }
-
-    #[test]
-    fn test_program_materializes_structural_zero_tangents_only_at_the_output_boundary() {
-        // f(x) = stop_gradient(x): the sole tangent output is a structural zero, which must be materialized as
-        // exactly one typed `zero` instruction at the output boundary to preserve the
-        // `(primal_outputs ++ tangent_outputs)` program contract.
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (_, primal_program) = NestedTracingContext::trace(
-            domain.clone(),
-            |inputs| Ok(vec![inputs[0].clone().stop_gradient()]),
-            vec![DataType::F64],
-        )
-        .unwrap();
-        let primal_program = primal_program.into_simplified().unwrap();
-        let jvp_program = primal_program.jvp().unwrap();
-        use crate::operations::Operation;
-        let zero_count = jvp_program
-            .instructions()
-            .iter()
-            .filter(|instruction| instruction.operation().name() == "zero")
-            .count();
-        assert_eq!(zero_count, 1, "expected exactly one boundary zero, but got:\n{jvp_program}");
-
-        // The fused program still evaluates correctly: primal passes through and the tangent output is zero.
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let outputs = jvp_program.interpret_in_context(&context, vec![Scalar::from(1.5), Scalar::from(1.0)]).unwrap();
-        assert_close(&outputs, &[Scalar::from(1.5), Scalar::from(0.0)], "boundary-zero jvp");
     }
 
     #[test]

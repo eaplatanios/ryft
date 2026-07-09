@@ -1,22 +1,19 @@
 use std::fmt::Debug;
-use std::rc::Rc;
 
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
-    DifferentiationTracer, Linearization, LinearizationTracer, Pullback, Pushforward, TransposableOperation,
+    DifferentiationTracer, LinearizationTracer, Pullback, Pushforward, TransposableOperation,
 };
 use crate::macros::check_count;
-use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
-use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationValue, PartialTracer, PartialValue,
     PartiallyEvaluatableOperation,
 };
-use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
-use crate::tracing::{Tracer, TracingContext};
+use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::types::{Type, Typed};
 
 /// Extension trait carrying the forward- and reverse-mode differentiation transforms on every [`Context`], mirroring
@@ -34,9 +31,9 @@ use crate::types::{Type, Typed};
 /// differentiation.
 ///
 /// Whether a transform runs eagerly or stages a program is decided by the context's
-/// [`Value`](Domain::Value) (concrete vs [`Tracer`]), not by a separate trait. Values from a *different* trace are
+/// [`Value`](Domain::Value) (concrete vs [`Tracer`](crate::tracing::Tracer)), not by a separate trait. Values from a *different* trace are
 /// detected lazily, like everything else about staging: a foreign tracer fails the builder-identity check either
-/// when an operation binds it ([`StagingContext::stage_operation`]) or when it escapes through a trace boundary
+/// when an operation binds it ([`StagingContext::stage_operation`](crate::contexts::StagingContext::stage_operation)) or when it escapes through a trace boundary
 /// (the boundary output checks), with [`ProgramError::MismatchedProgramBuilders`].
 pub trait Differentiate: Context {
     /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the
@@ -55,7 +52,7 @@ pub trait Differentiate: Context {
     ///     concrete primals, with no iteration bound needed.
     ///   - Over a **staging** context the same closure stages the primal and tangent operations into the enclosing
     ///     trace op by op (this is how a fused JVP computation is built under an outer trace), and branching on a
-    ///     primal errors because it is a [`Tracer`] with no concrete payload.
+    ///     primal errors because it is a [`Tracer`](crate::tracing::Tracer) with no concrete payload.
     ///
     /// The closure executes exactly as written: no dead code is trimmed, and observable effects fire as the closure
     /// runs. Structural zero tangents stay symbolic between operations and are materialized through this context's
@@ -277,7 +274,7 @@ pub trait Differentiate: Context {
     /// resulting pullback program stays in this context's staged [`Constant`](Domain::Constant) space; interpreting
     /// it through [`Program::interpret_in_context`] lifts its literal constants through this context's
     /// [`lift`](Context::lift) at replay time, which is what serves reverse mode *under tracing*: in an eager context
-    /// the lift is the identity, while in a staging context (whose values are [`Tracer`]s) it records the pullback's
+    /// the lift is the identity, while in a staging context (whose values are [`Tracer`](crate::tracing::Tracer)s) it records the pullback's
     /// constants in the enclosing trace, so the backward pass splices into that trace. Host control flow on primals
     /// works exactly as under [`linearize`](Self::linearize) (JAX's `grad`-allows-Python-control-flow property).
     ///
@@ -405,354 +402,6 @@ pub trait Differentiate: Context {
 }
 
 impl<C: Context> Differentiate for C {}
-
-impl<
-    V: Value,
-    O: Clone + Operation<V::Type> + DifferentiableOperation<TracingContext<V, O>> + From<ZeroOperation<V::Type>>,
-> Program<V, O, Vec<V>, Vec<V>>
-{
-    /// Builds the *fused* jvp program of this already-traced flat primal [`Program`].
-    ///
-    /// Read the input program as a function `f` from its flat inputs to its flat outputs, `x ↦ y = f(x)`. This returns
-    /// the program that computes `f` together with its *pushforward* (the forward-mode Jacobian-vector product): given
-    /// an input tangent (i.e., perturbation direction) `ẋ`, the pushforward produces the output tangent
-    /// `ẏ = (∂f/∂x)(x) · ẋ`, the directional derivative of `f` at `x` along `ẋ`. As a single map, the returned program
-    /// computes `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`.
-    ///
-    /// In terms of the flat program boundaries: if the input program has inputs `[x_1, …, x_n]` and outputs
-    /// `[y_1, …, y_m]` (so `y = f(x)`), the returned program has
-    ///
-    ///   - inputs `[x_1, …, x_n, ẋ_1, …, ẋ_n]` — the `n` primal inputs followed by one fresh tangent input `ẋ_i` per
-    ///     primal input `x_i`, of the same type; and
-    ///   - outputs `[y_1, …, y_m, ẏ_1, …, ẏ_m]` — the `m` primal outputs `y_j = f_j(x)` followed by the `m` tangent
-    ///     outputs `ẏ = (∂f/∂x)(x) · ẋ`.
-    ///
-    /// Both halves stay over the same primal operation family; the program is *not* split into separate primal and
-    /// tangent sub-programs (that is [`Self::linearize`], whose partial-evaluation known-ness split consumes this fused
-    /// program as its front half). This un-split form is exposed for fused higher-order JVP rules and direct
-    /// forward-mode interpretation.
-    ///
-    /// Each primal instruction is replayed once through its [`DifferentiableOperation`] rule, which returns the dual
-    /// (primal result plus tangent) for the instruction's outputs; both are staged into the shared builder as ordinary
-    /// primal operations, so the result contains no symbolic capture.
-    ///
-    /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
-    /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path below short-circuits the all-zero case (an
-    /// operation consuming at least one input whose every input tangent is a structural zero) by staging the primal
-    /// operation directly and pairing each primal output with a typed structural zero tangent, so zero-ness propagates
-    /// transitively without staging or scanning instructions. Structural zero tangents are materialized as typed
-    /// [`ZeroOperation`] instructions only at the output boundary, preserving the `(primal_outputs ++ tangent_outputs)`
-    /// program contract.
-    ///
-    /// Operations outside the supported slice fail with the [`DifferentiableOperation`] default's
-    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-    pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
-        let primal_input_count = self.input_ids().len();
-
-        // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so that
-        // scoping every tracer (and the context) inside that block makes the `Rc::try_unwrap` at the end a real ownership
-        // check rather than depending on manual drops. Only raw output atom ids escape the block.
-        let context = TracingContext::<V, O>::new();
-        let builder = context.builder().clone();
-        let output_atoms = {
-            let context = context;
-
-            // Track the primal tracer and symbolic tangent for each source atom. Tangents of atoms not connected to an
-            // input tangent (constants and dead inputs) are derived lazily as structural zeros typed with the atom's
-            // primal type.
-            let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; self.atoms().len()];
-            let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; self.atoms().len()];
-
-            // Primal inputs become the leading inputs; one fresh tangent input is added per primal input afterwards
-            // so the input order is `(primals ++ tangents)`.
-            for input_id in self.input_ids().iter().copied() {
-                let r#type = self.atoms()[input_id.index()].r#type().into_owned();
-                primals[input_id.index()] = Some(context.input(r#type));
-            }
-            for input_id in self.input_ids().iter().copied() {
-                let r#type = self.atoms()[input_id.index()].r#type().into_owned();
-                tangents[input_id.index()] = Some(MaybeZero::Value(context.input(r#type)));
-            }
-
-            // Constants are lifted into the builder as primal constants; their tangents are derived lazily as structural
-            // zeros typed with the atom's primal type. The call is disambiguated to the staging method because the
-            // `Constant` capability trait also provides a `constant` method.
-            for (atom_index, atom) in self.atoms().iter().enumerate() {
-                if let Atom::Constant(value) = atom {
-                    primals[atom_index] = Some(StagingContext::constant(&context, value.clone()));
-                }
-            }
-
-            // Replay each primal instruction in JVP form, staging both the primal result and the tangent operations
-            // into the shared builder.
-            for instruction in self.instructions() {
-                let input_duals = instruction
-                    .inputs()
-                    .iter()
-                    .copied()
-                    .map(|input_atom| {
-                        let primal = primals[input_atom.index()]
-                            .clone()
-                            .ok_or(ProgramError::UnboundAtomId { id: input_atom })?;
-                        // Atoms not connected to an input tangent (constants and dead inputs) take a structural zero typed
-                        // with the atom's primal type.
-                        let tangent = match &tangents[input_atom.index()] {
-                            Some(tangent) => tangent.clone(),
-                            None => MaybeZero::Zero(primal.r#type().into_owned()),
-                        };
-                        Ok(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new(primal, tangent))
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-
-                // All-zero fast path: when an operation consumes at least one input and every input tangent is a
-                // structural zero, the operation's tangent is zero by the chain rule, so the rule is skipped. The primal
-                // outputs are staged directly and each output tangent is a typed structural zero. Zero-input operations
-                // are excluded so their dedicated rules keep handling primal synthesis and tangent typing.
-                let all_input_tangents_are_zero = input_duals.iter().all(|dual| dual.tangent().is_zero());
-                let output_duals = if !input_duals.is_empty() && all_input_tangents_are_zero {
-                    let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-                    context
-                        .stage_operation(instruction.operation().clone(), primal_inputs.as_slice())?
-                        .into_iter()
-                        .map(DifferentiationDual::<Tracer<TracingContext<V, O>>>::new_with_zero_tangent)
-                        .collect()
-                } else {
-                    instruction.operation().jvp(&context, input_duals.as_slice())?
-                };
-
-                check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
-                for (output_atom, dual) in instruction.outputs().iter().copied().zip(output_duals) {
-                    let (primal, tangent) = dual.into_parts();
-                    primals[output_atom.index()] = Some(primal);
-                    tangents[output_atom.index()] = Some(tangent);
-                }
-            }
-
-            // Collect the outputs: the primal outputs followed by the tangent outputs, in the original output order.
-            // Structural zero tangents are materialized as typed `ZeroOperation` instructions here — the output boundary
-            // is the only place the fused program requires a real atom for them.
-            let primal_output_atoms = self
-                .output_ids()
-                .iter()
-                .copied()
-                .map(|output_atom| {
-                    primals[output_atom.index()]
-                        .as_ref()
-                        .map(|primal| primal.atom_id())
-                        .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let tangent_output_atoms = self
-                .output_ids()
-                .iter()
-                .copied()
-                .map(|output_atom| {
-                    // Atoms not connected to an input tangent (constants and dead inputs) take a structural zero typed
-                    // with the atom's primal type.
-                    let tangent = match &tangents[output_atom.index()] {
-                        Some(tangent) => tangent.clone(),
-                        None => MaybeZero::Zero(
-                            primals[output_atom.index()]
-                                .as_ref()
-                                .ok_or(ProgramError::UnboundAtomId { id: output_atom })?
-                                .r#type()
-                                .into_owned(),
-                        ),
-                    };
-                    tangent.materialize(&context)?.atom_id()
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let mut output_atoms = primal_output_atoms;
-            output_atoms.extend(tangent_output_atoms);
-            output_atoms
-        };
-
-        // All tracing handles are dropped here, so the builder can be recovered and finalized.
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let input_count = 2 * primal_input_count;
-        let output_count = output_atoms.len();
-        builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
-    }
-}
-
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
-where
-    V: Value,
-    O: Clone
-        + Operation<V::Type>
-        + PartiallyEvaluatableOperation<TracingContext<V, O>>
-        + DifferentiableOperation<TracingContext<V, O>>
-        + From<ZeroOperation<V::Type>>,
-{
-    /// Builds the linearization core from this already-traced flat primal [`Program`] by fusing the forward-mode
-    /// rules into one jvp program and splitting it into the primal (known) and tangent (unknown) halves through the
-    /// partial-evaluation known-ness split.
-    ///
-    /// This is the domain-free, interpretation-free generic core of the linearization pipeline, shared by every
-    /// concrete entry point. It builds the fused jvp program — replaying each primal instruction once in jvp form so
-    /// the program stages both the primal computation and its pushforward over the primal operation family — and then
-    /// partitions that program through [`Program::partition`](crate::Program::partition) with the leading primal
-    /// inputs marked known and the trailing tangent inputs marked unknown. The split's fresh known-side staging
-    /// trace becomes the primal program, so *linearity separation is known-ness separation*: the per-operation
-    /// partial-evaluation rules
-    /// own the split, higher-order operations (`scan`/`condition`) separate through their known-ness splits instead
-    /// of needing linearize-specific handling, and effectful primal work lands in the primal program per the effect
-    /// placement contract of
-    /// [`PartialEvaluationContext::fold_or_residualize`].
-    /// The known side computes the primal outputs followed by the residual edges and the residual side is the linear
-    /// tangent map taking `(tangents ++ residuals)` — the JAX `linearize` shape, produced by the same machinery JAX
-    /// uses (`partial_eval` of the jvp function). The tangent program's canonical input order is then rebuilt from
-    /// the split's recorded per-input sources rather than assumed from the walk's input layout, so the tangent
-    /// program always presents its full leading tangent inputs ahead of the residuals. No value semantics are
-    /// applied: the returned [`Linearization`] carries only the two split sub-programs and the metadata needed to
-    /// reassemble and transpose them, leaving interpretation of the primal side to callers.
-    ///
-    /// Linearization splits with the known-ness partial-evaluation rules rather than a value-free structural split:
-    /// instruction-granular structural classification cannot separate a fused higher-order operation (a fused jvp
-    /// `scan` mixes primal and tangent carries inside one instruction), while the known-ness rules split inside it.
-    ///
-    /// Operations outside the supported slice fail with the [`DifferentiableOperation`] default's
-    /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-    pub fn linearize(&self) -> Result<Linearization<V, O>, ProgramError> {
-        let primal_input_count = self.input_ids().len();
-        let primal_output_count = self.output_ids().len();
-
-        // Build the fused jvp program over `[primals..., tangents...] -> [primal_outputs..., tangent_outputs...]`.
-        let fused = self.jvp()?;
-
-        // Split the fused program with the leading `primal_input_count` primal inputs known and the trailing tangent
-        // inputs unknown. The split walks the fused program through the per-operation partial-evaluation rules
-        // against a fresh known-side staging trace: known (primal) work folds by staging into that trace, and the
-        // residual program that survives is the linear tangent map.
-        let input_known = [vec![true; primal_input_count], vec![false; primal_input_count]].concat();
-        let partition = fused.partition(input_known.as_slice())?;
-        let residual_count = partition.residual_inputs().iter().filter(|input| input.is_known()).count();
-        let known_output_indices = partition
-            .outputs()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, output)| output.is_known().then_some(index))
-            .collect::<Vec<_>>();
-        let residual_output_indices = partition
-            .outputs()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, output)| output.is_unknown().then_some(index))
-            .collect::<Vec<_>>();
-        let (mut known_program, residual_program, _, residual_inputs, _) = partition.into_parts();
-
-        // The known program's outputs are the fully known fused outputs followed by the residual edges. Every primal
-        // output must be known (the primals are all known, and effectful primal work folds into the known trace);
-        // any *further* known outputs are structurally zero tangent outputs (for example the Boolean mask item of a
-        // vmapped masked `while`, whose all-zero JVP fast path stages a fresh zero rather than threading the input
-        // tangent), which belong to the tangent half and are restored there below.
-        if known_output_indices.len() < primal_output_count
-            || known_output_indices[..primal_output_count]
-                .iter()
-                .zip(0..primal_output_count)
-                .any(|(&index, expected)| index != expected)
-        {
-            return Err(ProgramError::MalformedProgram(
-                "a primal output did not fold to the known side during linearization".into(),
-            ));
-        }
-        // Drop the stray tangent zeros from the known program's outputs so the primal program presents
-        // `[primal_outputs..., residuals...]`: they occupy exactly the window between the primal outputs and the
-        // residual edges.
-        if known_output_indices.len() > primal_output_count {
-            known_program.output_ids.drain(primal_output_count..known_output_indices.len());
-            known_program.output_structure = vec![Placeholder; known_program.output_ids.len()];
-        }
-
-        // Restore the residual (tangent) program's canonical input order `[tangents..., residuals...]` from the
-        // split's recorded per-input sources: each tangent input's atom lands at its original tangent position, a
-        // tangent position missing from the sources is restored as a fresh dead atom of its fused type, and each
-        // residual edge lands after the tangents at its edge ordinal. Today's walk seeds every unknown input up
-        // front in original order, appends residual edges in first-use order, and never prunes residual-program
-        // inputs, so this rebuild is an identity and no tangent position is ever missing; it stays source-driven
-        // anyway because that layout is an implementation detail of the walk rather than part of the
-        // partial-evaluation contract, and a walk that materialized unknown inputs lazily or pruned dead ones (a
-        // structurally zero tangent whose input reaches no tangent output) would invalidate a layout-based rebuild
-        // but not this one. The restored atoms are fresh program inputs that no instruction references, so the
-        // direct program-field extensions preserve every [`Program`] invariant a [`ProgramBuilder`] would have
-        // established.
-        let mut tangent_program = residual_program;
-        let surviving_input_ids = tangent_program.input_ids.split_off(0);
-        let mut tangent_inputs: Vec<Option<AtomId>> = vec![None; primal_input_count];
-        let mut edge_inputs: Vec<Option<AtomId>> = vec![None; residual_count];
-        for (source, atom) in residual_inputs.iter().zip(surviving_input_ids) {
-            match source {
-                PartialEvaluationInput::Unknown(index) => {
-                    let position = index.checked_sub(primal_input_count).ok_or_else(|| {
-                        ProgramError::MalformedProgram(
-                            "a known primal input survived as a residual-program input during linearization".into(),
-                        )
-                    })?;
-                    tangent_inputs[position] = Some(atom);
-                }
-                PartialEvaluationInput::Known(ordinal) => edge_inputs[*ordinal] = Some(atom),
-            }
-        }
-        for (position, atom) in tangent_inputs.into_iter().enumerate() {
-            let restored = match atom {
-                Some(atom) => atom,
-                // The split recorded no source for this tangent position, so restore it as a fresh dead program input
-                // (referenced by no instruction) typed from the corresponding fused-program tangent input. The fused
-                // program's inputs are laid out as `[primals..., tangents...]`, so the tangent for `position` lives at
-                // index `primal_input_count + position`.
-                None => {
-                    let fused_input_index = primal_input_count + position;
-                    let Atom::Variable(tangent_type) = &fused.atoms[fused.input_ids[fused_input_index].index()] else {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "tangent input {fused_input_index} is not a variable",
-                        )));
-                    };
-                    let restored = AtomId::new(tangent_program.atoms.len());
-                    tangent_program.atoms.push(Atom::Variable(tangent_type.clone()));
-                    restored
-                }
-            };
-            tangent_program.input_ids.push(restored);
-        }
-        for atom in edge_inputs.into_iter() {
-            tangent_program.input_ids.push(atom.ok_or_else(|| {
-                ProgramError::MalformedProgram("a linearization residual edge has no residual-program input".into())
-            })?);
-        }
-        tangent_program.input_structure = vec![Placeholder; tangent_program.input_ids.len()];
-
-        // Restore the canonical tangent outputs: the residual program's outputs are the unknown fused outputs in
-        // original order (all within the tangent half, since every primal output is known), and each structurally
-        // zero tangent output that folded to the known side is restored as a fresh staged zero of its fused type.
-        let surviving_outputs = tangent_program.output_ids.split_off(0);
-        let mut survivors = residual_output_indices.into_iter().zip(surviving_outputs).peekable();
-        for output in 0..primal_output_count {
-            let fused_output_index = primal_output_count + output;
-            match survivors.peek() {
-                Some(&(index, atom)) if index == fused_output_index => {
-                    survivors.next();
-                    tangent_program.output_ids.push(atom);
-                }
-                _ => {
-                    let zero_atom = fused.output_ids[fused_output_index];
-                    let zero_type = fused.atoms[zero_atom.index()].r#type().into_owned();
-                    let zero_output = AtomId::new(tangent_program.atoms.len());
-                    tangent_program.atoms.push(Atom::Variable(zero_type.clone()));
-                    tangent_program.instructions.push(Instruction::new(
-                        O::from(ZeroOperation::new(zero_type)),
-                        Vec::new(),
-                        vec![zero_output],
-                    ));
-                    tangent_program.output_ids.push(zero_output);
-                }
-            }
-        }
-        tangent_program.output_structure = vec![Placeholder; tangent_program.output_ids.len()];
-
-        Linearization::new(known_program, tangent_program, residual_count)
-    }
-}
 
 #[cfg(test)]
 mod tests {
