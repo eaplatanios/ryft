@@ -12,6 +12,7 @@ use crate::operations::constants::{Fill, FillOperation, IotaOperation};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::scalars::Scalar;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
@@ -291,7 +292,7 @@ where
 impl<V, O> crate::batching::BatchableOperation<V, EagerContext<V, O>> for CollectiveOperation
 where
     V: Value<Type = ArrayType> + Reduce + Mul<Output = V>,
-    EagerContext<V, O>: Fill<f64, V>,
+    EagerContext<V, O>: Fill<Scalar, V>,
     O: Operation<ArrayType>,
     CollectiveOperation: InterpretableOperation<V, EagerContext<V, O>>,
 {
@@ -301,7 +302,7 @@ where
         inputs: &[crate::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
         collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
-            context.fill(&factor_type, inverse_axis_size)
+            context.fill(&factor_type, Scalar::from(inverse_axis_size))
         })
     }
 }
@@ -319,7 +320,7 @@ impl<C> crate::batching::BatchableOperation<<C as Domain>::Value, crate::batchin
     for CollectiveOperation
 where
     C: Context<Type = ArrayType>,
-    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, f64>>,
+    C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, Scalar>>,
     <C as Domain>::Value: Reduce + Mul<Output = <C as Domain>::Value>,
 {
     fn batch(
@@ -336,7 +337,7 @@ where
             // parent, staged into the enclosing trace under a staging parent.
             context
                 .parent()
-                .bind(FillOperation::new(factor_type, inverse_axis_size), &[])?
+                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), &[])?
                 .into_iter()
                 .next()
                 .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }.into())

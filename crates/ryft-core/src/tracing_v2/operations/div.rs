@@ -51,22 +51,40 @@ where
     }
 }
 
-/// Transpose rule for [`DivOperation`]: division is nonlinear in its operands, so a tangent program never contains a
-/// primal `div` on a linear operand (the quotient-rule forward stages bilinear `mul` coefficients instead) and the
-/// rule reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for DivOperation
+/// Partition-aware transpose rule for [`DivOperation`]. Division is linear in its numerator but nonlinear in its
+/// denominator, so in a valid pushforward the numerator is the linear operand and the denominator is a known runtime
+/// value (rules such as the logarithm, square-root, and absolute-value forward-mode rules stage exactly this
+/// `tangent / known` shape). The transpose of `x ↦ x / k` is `x̄ ↦ x̄ / k` — dividing by a known factor is
+/// self-adjoint, like scaling by one — with the known denominator's value read from its pullback value atom. A
+/// linear denominator reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error because `k / x`
+/// is not a linear map.
+impl<V: Value, O: Operation<V::Type> + From<DivOperation>> TransposableOperation<V, O> for DivOperation
 where
     DivOperation: Operation<V::Type>,
 {
     fn transpose(
         &self,
         _context: &mut TracingContext<V, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        check_count!("input", inputs, 2, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        if inputs[1].is_unknown() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "`div` with a linear denominator is nonlinear and cannot be transposed".to_string(),
+            });
+        }
+        let numerator_contribution = match &outputs[0] {
+            MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+            MaybeZero::Value(output_cotangent) => {
+                // The dispatch guarantees a `Known` operand carries its pullback value, so read it directly.
+                let denominator =
+                    inputs[1].as_known().expect("dispatch guarantees a known operand carries its pullback value");
+                MaybeZero::Value(output_cotangent.binary(denominator, DivOperation))
+            }
+        };
+        Ok(vec![numerator_contribution, MaybeZero::Zero(inputs[1].r#type().into_owned())])
     }
 }
 

@@ -157,6 +157,7 @@ mod tests {
     use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
+    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
@@ -165,24 +166,24 @@ mod tests {
     #[test]
     fn test_fill() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]));
-        let context = EagerContext::<TestArray, FillOperation<ArrayType, f64>>::new();
-        assert_eq!(context.fill(&r#type, 3.5), Ok(TestArray::new(r#type.clone(), vec![3.5, 3.5])));
+        let context = EagerContext::<TestArray, FillOperation<ArrayType, Scalar>>::new();
+        assert_eq!(context.fill(&r#type, Scalar::from(3.5)), Ok(TestArray::new(r#type.clone(), vec![3.5, 3.5])));
 
         // Filling a dynamically sized type cannot materialize element data and surfaces an error.
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Dynamic(None)]));
         assert_eq!(
-            context.fill(&dynamic_type, 3.5),
+            context.fill(&dynamic_type, Scalar::from(3.5)),
             Err(ProgramError::Type(TypeError {
                 message: "cannot materialize a value of dynamically sized type f64[*]".to_string()
             })),
         );
 
-        let operation = FillOperation::new(r#type.clone(), 3.5);
+        let operation = FillOperation::new(r#type.clone(), Scalar::from(3.5));
 
         assert_eq!(Operation::<ArrayType>::name(&operation), FILL_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "fill [type=f64[2], value=3.5]");
         assert_eq!(operation.r#type(), &r#type);
-        assert_eq!(operation.value(), &3.5);
+        assert_eq!(operation.value(), &Scalar::from(3.5));
         assert_eq!(Operation::<ArrayType>::infer_output_types(&operation, &[]), Ok(vec![r#type.clone()]));
         assert_eq!(
             InterpretableOperation::<TestArray, crate::EagerContext<TestArray>>::interpret(
@@ -205,7 +206,7 @@ mod tests {
             Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
         );
 
-        let mut builder = ProgramBuilder::<TestArray, FillOperation<ArrayType, f64>>::new();
+        let mut builder = ProgramBuilder::<TestArray, FillOperation<ArrayType, Scalar>>::new();
         let output = builder.add_instruction(operation, vec![]).unwrap()[0];
         let program = builder.build::<(), TestArray>(vec![output], (), Placeholder).unwrap();
         assert_eq!(

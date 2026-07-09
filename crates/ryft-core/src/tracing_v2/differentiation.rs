@@ -775,8 +775,11 @@ where
 /// integer, the `float0` analogue, whose cotangent space carries no "one" to seed) with
 /// [`DifferentiationError::NonDifferentiableGradientOutput`], and a complex scalar output with
 /// [`DifferentiationError::ComplexGradientOutput`], because the single seed recovers a complex derivative only for
-/// holomorphic functions (use [`value_and_gradient_holomorphic`] to promise holomorphy). Use [`vjp`] directly for
-/// vector-valued functions that need an explicit output cotangent, and
+/// holomorphic functions (use [`value_and_gradient_holomorphic`] to promise holomorphy). Complex *inputs* with a real
+/// scalar output are supported directly: under the bilinear transposition pairing documented on
+/// [`Program::transpose`](crate::Program::transpose), the gradient returned for such a ℂ → ℝ function is `2 · ∂f/∂z̄`
+/// (e.g., `2·z̄` for `f(z) = |z|²`), the steepest-ascent direction and the same value JAX's `grad` returns. Use
+/// [`vjp`] directly for vector-valued functions that need an explicit output cotangent, and
 /// [`value_and_gradient_with_aux`](crate::tracing_v2::value_and_gradient_with_aux) when the function carries
 /// auxiliary outputs.
 ///
@@ -833,8 +836,9 @@ where
 ///
 /// This is [`value_and_gradient`] with the complex-output guard lifted: the caller *promises* that `function` is
 /// holomorphic (i.e., complex-differentiable), and under that promise the single reverse-mode seed `1` pulled back
-/// through the transposed pushforward recovers the complex derivative `∂f/∂z`, exactly as it recovers the gradient of
-/// a real-valued function. The promise is not (and cannot be) checked: for a non-holomorphic function with a complex
+/// through the transposed pushforward (under the bilinear pairing documented on
+/// [`Program::transpose`](crate::Program::transpose)) recovers the complex derivative `∂f/∂z`, exactly as it recovers
+/// the gradient of a real-valued function. The promise is not (and cannot be) checked: for a non-holomorphic function with a complex
 /// output the result is not a derivative in any useful sense, so split such a function into its real and imaginary
 /// parts and differentiate those instead. For real outputs the promise changes nothing and this behaves exactly like
 /// [`value_and_gradient`]; the [`NonScalarGradientOutput`](DifferentiationError::NonScalarGradientOutput) rejection
@@ -1223,6 +1227,33 @@ mod tests {
 
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
         assert_eq!(aux, 5.0);
+    }
+
+    #[test]
+    fn test_holomorphic_gradient_computes_complex_derivatives() {
+        use num_complex::Complex;
+
+        // The holomorphic entry points recover the complex derivative ∂f/∂z from the single reverse-mode seed under
+        // the holomorphy promise: d/dz z² = 2z and d/dz sin(z) = cos(z), evaluated at a genuinely complex point.
+        let z = Complex::new(0.7f64, -0.3f64);
+        let (value, gradient) = super::value_and_gradient_holomorphic(|x| x.clone() * x, Scalar::from(z)).unwrap();
+        assert_eq!(value, Scalar::from(z * z));
+        assert_eq!(gradient, Scalar::from(z + z));
+        let gradient = super::gradient_holomorphic(|x| x.sin().unwrap(), Scalar::from(z)).unwrap();
+        assert_eq!(gradient, Scalar::from(z.cos()));
+
+        // Forward mode agrees: the jvp of z² pushes the tangent ż to 2z · ż through the same rules.
+        let tangent_seed = Complex::new(1.0f64, 0.5f64);
+        let (primal, tangent) = super::jvp(|x| Ok(x.clone() * x), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
+        assert_eq!(primal, Scalar::from(z * z));
+        assert_eq!(tangent, Scalar::from((z + z) * tangent_seed));
+
+        // The plain entry point keeps rejecting the complex output toward the holomorphic ones.
+        let result = super::value_and_gradient(|x| x.clone() * x, Scalar::from(z));
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c128",
+        ));
     }
 
     #[test]

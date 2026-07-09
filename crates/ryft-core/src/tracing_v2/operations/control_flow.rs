@@ -1606,6 +1606,7 @@ mod tests {
     use crate::operations::constants::{One, OneLike, OneLikeOperation, Zero, ZeroLike, ZeroLikeOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{Program, ProgramBuilder, Value};
+    use crate::scalars::Scalar;
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::reduce::ReduceOperation;
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -2027,8 +2028,8 @@ mod tests {
         }
     }
 
-    impl crate::operations::constants::Fill<f64, TestArray> for StagedDispatchTestArrayDomain {
-        fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
+    impl crate::operations::constants::Fill<Scalar, TestArray> for StagedDispatchTestArrayDomain {
+        fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
             crate::operations::constants::Fill::fill(&crate::EagerContext::<TestArray>::new(), r#type, value)
         }
     }

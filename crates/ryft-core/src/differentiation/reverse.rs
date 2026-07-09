@@ -290,6 +290,15 @@ impl<
     /// to accumulate cotangent contributions for the original inputs. This is the same decomposition of reverse-mode
     /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
+    /// Over complex types, transposition is defined with respect to the **bilinear** (i.e., conjugation-free) pairing
+    /// `⟨a, b⟩ = Real(a · b)`: the transpose of multiplying by a known complex factor multiplies by that same factor
+    /// (never its conjugate), which keeps transposition an involution and keeps every bilinear transpose rule identical
+    /// across real and complex types. Conjugation enters only through the transpose rules of the
+    /// ℝ-linear-but-not-ℂ-linear primitives (i.e., `conjugate`, `real`, `imaginary`, and `complex`), whose adjoints
+    /// under this pairing carry the conjugations and negations explicitly. The user-facing consequence is documented on
+    /// the gradient entry points: the holomorphic ones return the complex derivative `∂f/∂z`, and the plain ones return
+    /// `2 · ∂f/∂z̄` for ℂ → ℝ functions.
+    ///
     /// Disconnected primal inputs are emitted as [`ZeroOperation`]s, which the value type's [`Zero`](crate::Zero)
     /// implementation evaluates at interpretation time. This applies uniformly to linear programs whose values are
     /// [`Tracer`]s from an outer trace. Interpreting such a pullback [`ZeroOperation`] over outer-trace [`Tracer`]s

@@ -302,10 +302,10 @@ where
 
 /// Forward-mode rule for [`FillOperation`]: the nullary constant is replayed to synthesize the filled primal
 /// value and paired with a typed zero tangent, since constants carry no tangent.
-impl<C: Context> DifferentiableOperation<C> for FillOperation<C::Type, f64>
+impl<C: Context, F: Clone + Display> DifferentiableOperation<C> for FillOperation<C::Type, F>
 where
-    C::Operation: Clone + From<FillOperation<C::Type, f64>>,
-    FillOperation<C::Type, f64>: Operation<C::Type>,
+    C::Operation: Clone + From<FillOperation<C::Type, F>>,
+    FillOperation<C::Type, F>: Operation<C::Type>,
 {
     fn jvp(
         &self,

@@ -17,11 +17,12 @@ use crate::operations::manipulation::{Broadcast, BroadcastOperation};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::scalars::Scalar;
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
-use crate::types::{ArrayType, DataType, Shape, StaticShape, TypeError, Typed};
+use crate::types::{ArrayType, DataType, Shape, StaticShape, Type, TypeError, Typed};
 
 /// Kind of reduction performed by a [`ReduceOperation`].
 ///
@@ -167,6 +168,12 @@ pub fn reduce_abstract(
     }
     if !kind.requires_boolean() && data_type == DataType::Boolean {
         return Err(TypeError { message: format!("'{op}' kind {kind} requires numeric inputs but got {data_type}") });
+    }
+    // Min/max reductions select elements by order, and complex element types are unordered.
+    if matches!(kind, ReductionKind::Max | ReductionKind::Min) && data_type.is_complex() {
+        return Err(TypeError {
+            message: format!("'{op}' kind {kind} is not defined for the unordered complex element type {data_type}"),
+        });
     }
 
     let dimensions = input
@@ -450,7 +457,7 @@ impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperat
 where
     O: Operation<ArrayType>
         + From<BroadcastOperation>
-        + From<FillOperation<ArrayType, f64>>
+        + From<FillOperation<ArrayType, Scalar>>
         + From<crate::operations::arithmetic::MulOperation>,
 {
     fn transpose(
@@ -491,7 +498,7 @@ where
                             let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
                             let factor = context
                                 .stage_operation::<_, &Tracer<TracingContext<V, O>>>(
-                                    FillOperation::new(factor_type, inverse_count),
+                                    FillOperation::new(factor_type, Scalar::from(inverse_count)),
                                     &[],
                                 )?
                                 .into_iter()
@@ -901,6 +908,24 @@ mod tests {
         assert_eq!(
             reduce_abstract(&boolean, &[1], ReductionKind::Any, "reduce_any"),
             Ok(array_type(&[2], DataType::Boolean))
+        );
+    }
+
+    #[test]
+    fn test_reduce_abstract_rejects_min_max_over_complex_element_types() {
+        // Min/max reductions select elements by order, and complex element types are unordered, so they are rejected
+        // while order-free reductions such as `sum` stay supported.
+        let complex = array_type(&[2, 3], DataType::C64);
+        assert_eq!(
+            reduce_abstract(&complex, &[1], ReductionKind::Max, "reduce_max"),
+            Err(TypeError {
+                message: "'reduce_max' kind max is not defined for the unordered complex element type c64".to_string(),
+            }),
+        );
+        assert!(reduce_abstract(&complex, &[1], ReductionKind::Min, "reduce_min").is_err());
+        assert_eq!(
+            reduce_abstract(&complex, &[1], ReductionKind::Sum, "reduce_sum"),
+            Ok(array_type(&[2], DataType::C64)),
         );
     }
 

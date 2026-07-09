@@ -1,8 +1,11 @@
 use ryft_macros::{DifferentiableOperation, Operation, TransposableOperation};
 
 use crate::operations::BooleanLike;
-use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use crate::operations::arithmetic::{
+    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
+};
 use crate::operations::compare::CompareOperation;
+use crate::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use crate::operations::constants::{
     ConstantOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
@@ -11,8 +14,9 @@ use crate::operations::control_flow::{
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
+use crate::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use crate::operations::tag::{MaybeTag, TagOperation};
-use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use crate::programs::Value;
 use crate::tracing_v2::DotDimensionNumbers;
 use crate::tracing_v2::operations::MaybeDot;
@@ -37,6 +41,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     One(OneOperation<DataType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
+    Abs(AbsOperation),
     Neg(NegOperation),
     Add(AddOperation),
     Sub(SubOperation),
@@ -44,6 +49,14 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Div(DivOperation),
     Sin(SinOperation),
     Cos(CosOperation),
+    Atan2(Atan2Operation),
+    Exponential(ExponentialOperation),
+    Logarithm(LogarithmOperation),
+    SquareRoot(SquareRootOperation),
+    Complex(ComplexOperation),
+    Conjugate(ConjugateOperation),
+    Real(RealOperation),
+    Imaginary(ImaginaryOperation),
     Compare(CompareOperation),
     Select(SelectOperation),
     While(Box<WhileOperation<V, Self>>),

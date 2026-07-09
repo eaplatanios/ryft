@@ -16,6 +16,7 @@ pub const NEG_OPERATION_NAME: &'static str = "neg";
 pub struct NegOperation;
 
 impl Display for NegOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(NEG_OPERATION_NAME)
     }

@@ -19,6 +19,7 @@ use crate::operations::constants::{
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
+use crate::scalars::Scalar;
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use crate::types::{ArrayType, Size, TypeError, Typed};
@@ -206,7 +207,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
                 PartialEvaluationContext<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
             > + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
             + BatchableOperation<DomainValue<Self>, BatchingContext<Self>>
-            + From<FillOperation<ArrayType, f64>>
+            + From<FillOperation<ArrayType, Scalar>>
             + From<ZeroOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
             + From<ZeroLikeOperation>

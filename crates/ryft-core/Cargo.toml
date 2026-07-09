@@ -31,15 +31,14 @@ pre-release-replacements = [
 ryft-macros.workspace = true
 aquamarine.workspace = true
 convert_case.workspace = true
-dyn-clone.workspace = true
 dyn-eq.workspace = true
 dyn-hash.workspace = true
 flate2.workspace = true
 half.workspace = true
+num-complex.workspace = true
 lru.workspace = true
 paste.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

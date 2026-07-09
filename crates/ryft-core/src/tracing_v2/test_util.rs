@@ -578,7 +578,10 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![0.0]);
 
-        let fill = ArrayOperation::<TestArray>::Fill(crate::operations::constants::FillOperation::new(scalar, 7.5));
+        let fill = ArrayOperation::<TestArray>::Fill(crate::operations::constants::FillOperation::new(
+            scalar,
+            crate::scalars::Scalar::from(7.5),
+        ));
         let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &[]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());

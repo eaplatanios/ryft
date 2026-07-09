@@ -17,6 +17,7 @@ pub const ADD_OPERATION_NAME: &'static str = "add";
 pub struct AddOperation;
 
 impl Display for AddOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(ADD_OPERATION_NAME)
     }

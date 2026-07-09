@@ -73,6 +73,19 @@ impl<T: Type + Broadcastable + BooleanLike> Operation<T> for CompareOperation {
 
     fn infer_output_types(&self, input_types: &[T]) -> Result<Vec<T>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
+
+        // Complex operands are unordered, so only the equality comparison directions are defined for them.
+        if !matches!(self.direction, ComparisonDirection::Equal | ComparisonDirection::NotEqual)
+            && input_types.iter().any(|input_type| input_type.is_complex())
+        {
+            return Err(TypeError {
+                message: format!(
+                    "cannot apply an ordered comparison to unordered complex operands of types {} and {}",
+                    input_types[0], input_types[1],
+                ),
+            });
+        }
+
         let broadcasted = T::broadcasted(input_types)
             .map_err(|_| TypeError { message: "comparison input types are not broadcast-compatible".to_string() })?;
         Ok(vec![broadcasted.as_boolean()])
@@ -232,6 +245,27 @@ mod tests {
         assert_eq!(
             Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
             Err(TypeError { message: "comparison input types are not broadcast-compatible".to_string() }),
+        );
+
+        // Complex operands are unordered: ordered directions are rejected while the equality directions stay
+        // supported (at both the data-type and array-type levels).
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64]),
+            Err(TypeError {
+                message: "cannot apply an ordered comparison to unordered complex operands of types c64 and c64"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(
+                &CompareOperation::new(ComparisonDirection::Equal),
+                &[DataType::C64, DataType::C64],
+            ),
+            Ok(vec![DataType::Boolean]),
+        );
+        let complex_array = ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]));
+        assert!(
+            Operation::<ArrayType>::infer_output_types(&operation, &[complex_array.clone(), complex_array]).is_err(),
         );
 
         // Test that `as_boolean` on type metadata produces Boolean counterparts while `boolean` errors because

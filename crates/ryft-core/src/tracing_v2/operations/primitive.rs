@@ -4,8 +4,11 @@ use std::ops::BitAnd;
 use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, TransposableOperation};
 
 use crate::operations::BooleanLike;
-use crate::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use crate::operations::arithmetic::{
+    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
+};
 use crate::operations::compare::CompareOperation;
+use crate::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use crate::operations::constants::{
     ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
@@ -15,6 +18,7 @@ use crate::operations::control_flow::{
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
+use crate::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
@@ -23,8 +27,9 @@ use crate::operations::manipulation::{
 };
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::tag::{MaybeTag, TagOperation};
-use crate::operations::trigonometric::{CosOperation, SinOperation};
+use crate::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use crate::programs::Value;
+use crate::scalars::Scalar;
 use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
@@ -61,8 +66,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
-    // TODO(eaplatanios): Why is this limited to `f64`?
-    Fill(FillOperation<ArrayType, f64>),
+    Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
     Neg(NegOperation),
     Add(AddOperation),
@@ -71,6 +75,15 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Div(DivOperation),
     Sin(SinOperation),
     Cos(CosOperation),
+    Atan2(Atan2Operation),
+    Exponential(ExponentialOperation),
+    Logarithm(LogarithmOperation),
+    SquareRoot(SquareRootOperation),
+    Abs(AbsOperation),
+    Complex(ComplexOperation),
+    Conjugate(ConjugateOperation),
+    Real(RealOperation),
+    Imaginary(ImaginaryOperation),
     StopGradient(StopGradientOperation),
     Tag(TagOperation),
     Print(PrintOperation),

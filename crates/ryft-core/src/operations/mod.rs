@@ -20,6 +20,9 @@ pub mod arithmetic;
 /// Elementwise pairwise comparison operations and capability traits.
 pub mod compare;
 
+/// Elementwise complex-number construction, conjugation, and part-extraction operations and capability traits.
+pub mod complex;
+
 /// Type-driven constant operations and capability traits.
 pub mod constants;
 
@@ -31,6 +34,9 @@ pub mod debugging;
 
 /// Differentiation-control operations and capability traits.
 pub mod differentiation;
+
+/// Elementwise exponential, logarithm, and square-root operations and capability traits.
+pub mod exponential;
 
 /// Elementwise logical operations and capability traits.
 pub mod logical;
@@ -58,10 +64,7 @@ pub mod trigonometric;
 // they do not shadow their `std::ops` counterparts; reach them through `crate::operations::arithmetic` instead.
 use crate::partial::{PartialEvaluationValue, PartialTracer, PartialValue};
 use crate::{DifferentiationDual, DifferentiationTracer, MaybeZero};
-pub use arithmetic::{
-    ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
-    NEG_OPERATION_NAME, NegOperation, SUB_OPERATION_NAME, SubOperation,
-};
+pub use arithmetic::*;
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;

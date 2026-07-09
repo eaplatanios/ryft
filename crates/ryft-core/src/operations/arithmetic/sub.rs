@@ -17,6 +17,7 @@ pub const SUB_OPERATION_NAME: &'static str = "sub";
 pub struct SubOperation;
 
 impl Display for SubOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(SUB_OPERATION_NAME)
     }

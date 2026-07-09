@@ -27,16 +27,21 @@ use crate::contexts::EagerContext;
 #[cfg(test)]
 use crate::contexts::{Context, Domain};
 use crate::operations::BooleanLike;
+use crate::operations::arithmetic::Abs;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
+use crate::operations::complex::{Conjugate, Imaginary, Real};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
+use crate::operations::exponential::{Exponential, Logarithm, SquareRoot};
 use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use crate::operations::tag::Tag;
+use crate::operations::trigonometric::Atan2;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
+use crate::scalars::Scalar;
 use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{ArrayOperation, CoordinateValue};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
@@ -249,8 +254,11 @@ impl<O: crate::operations::Operation<ArrayType>> One<TestArray> for EagerContext
     }
 }
 
-impl<O: crate::operations::Operation<ArrayType>> Fill<f64, TestArray> for EagerContext<TestArray, O> {
-    fn fill(&self, r#type: &ArrayType, value: f64) -> Result<TestArray, ProgramError> {
+impl<O: crate::operations::Operation<ArrayType>> Fill<Scalar, TestArray> for EagerContext<TestArray, O> {
+    fn fill(&self, r#type: &ArrayType, value: Scalar) -> Result<TestArray, ProgramError> {
+        // `TestArray` stores `f64` elements, so any fill value that widens to `f64` is representable and complex
+        // fill values surface the cast's promotion error.
+        let Scalar::F64(value) = value.cast(DataType::F64)? else { unreachable!("a cast to f64 yields an f64 scalar") };
         Ok(TestArray { r#type: r#type.clone(), values: vec![value; TestArray::materialized_element_count(r#type)?] })
     }
 }
@@ -426,6 +434,63 @@ impl Sin for TestArray {
 impl Cos for TestArray {
     fn cos(&self) -> Result<Self, ProgramError> {
         Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::cos).collect() })
+    }
+}
+
+impl Exponential for TestArray {
+    fn exponential(&self) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::exp).collect() })
+    }
+}
+
+impl Logarithm for TestArray {
+    fn logarithm(&self) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::ln).collect() })
+    }
+}
+
+impl SquareRoot for TestArray {
+    fn square_root(&self) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::sqrt).collect() })
+    }
+}
+
+impl Atan2 for TestArray {
+    fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
+        let values = self.values.iter().zip(x.values.iter()).map(|(y, x)| y.atan2(*x)).collect();
+        Ok(Self { r#type: self.r#type.clone(), values })
+    }
+}
+
+impl Abs for TestArray {
+    fn abs(&self) -> Result<Self, ProgramError> {
+        Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::abs).collect() })
+    }
+}
+
+// `TestArray` stores real `f64` payloads only, so the complex capabilities are uniformly rejected: complex array
+// coverage lives in the XLA-backed array domain instead.
+impl crate::operations::complex::Complex for TestArray {
+    fn complex(&self, _imaginary: &Self) -> Result<Self, ProgramError> {
+        Err(TypeError { message: "TestArray does not support complex values".to_string() }.into())
+    }
+}
+
+impl Conjugate for TestArray {
+    fn conjugate(&self) -> Result<Self, ProgramError> {
+        Err(TypeError { message: "TestArray does not support complex values".to_string() }.into())
+    }
+}
+
+impl Real for TestArray {
+    fn real(&self) -> Result<Self, ProgramError> {
+        Err(TypeError { message: "TestArray does not support complex values".to_string() }.into())
+    }
+}
+
+impl Imaginary for TestArray {
+    fn imaginary(&self) -> Result<Self, ProgramError> {
+        Err(TypeError { message: "TestArray does not support complex values".to_string() }.into())
     }
 }
 
@@ -1075,7 +1140,7 @@ mod tests {
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,
         ));
         assert!(matches!(
-            context.fill(&dynamic_type, 42.0),
+            context.fill(&dynamic_type, Scalar::from(42.0)),
             Err(ProgramError::Type(TypeError { message })) if message == expected_message,
         ));
     }
@@ -3448,7 +3513,7 @@ mod array_linearization_tests {
         use crate::types::{DataType, Shape, Size};
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut filled = inputs[0].dispatch_domain().bind(FillOperation::new(vector_type, 2.0), &[])?;
+        let mut filled = inputs[0].dispatch_domain().bind(FillOperation::new(vector_type, Scalar::from(2.0)), &[])?;
         Ok(vec![inputs[0].clone() + filled.remove(0)])
     }
 
@@ -3458,7 +3523,7 @@ mod array_linearization_tests {
         use crate::types::{DataType, Shape, Size};
 
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
-        let mut filled = inputs[0].context().bind(FillOperation::new(vector_type, 2.0), &[])?;
+        let mut filled = inputs[0].context().bind(FillOperation::new(vector_type, Scalar::from(2.0)), &[])?;
         Ok(vec![inputs[0].clone() + filled.remove(0)])
     }
 

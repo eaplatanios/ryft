@@ -17,6 +17,7 @@ pub const DIV_OPERATION_NAME: &'static str = "div";
 pub struct DivOperation;
 
 impl Display for DivOperation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(DIV_OPERATION_NAME)
     }

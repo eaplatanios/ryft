@@ -1,5 +1,11 @@
+/// Elementwise absolute-value differentiation rules.
+pub mod abs;
+
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
+
+/// Elementwise two-argument arc-tangent differentiation rules.
+pub mod atan2;
 
 /// N-dimensional broadcast differentiation and batching rules.
 pub mod broadcasting;
@@ -13,8 +19,14 @@ pub mod concatenation;
 /// Elementwise pairwise comparison primitive.
 pub mod compare;
 
+/// Complex-number construction, conjugation, and part-extraction differentiation rules.
+pub mod complex;
+
 /// Elementwise cosine differentiation rules.
 pub mod cos;
+
+/// Elementwise exponential, logarithm, and square-root differentiation rules.
+pub mod exponential;
 
 /// Value-level identity helpers and built-in scalar constant traits.
 pub mod constants;
