@@ -35,6 +35,18 @@ pub enum DifferentiationError {
     #[error("gradient output type {output_type} is non-differentiable and carries no cotangent space")]
     NonDifferentiableGradientOutput { output_type: String },
 
+    /// Error returned when reverse-mode differentiation is requested through a plain (i.e., non-holomorphic) gradient
+    /// entry point for a function whose scalar output is complex. A single reverse-mode seed recovers the derivative
+    /// of a complex-output function only when the function is holomorphic (i.e., complex-differentiable), a promise
+    /// the plain entry points do not ask for, so they reject complex outputs up front instead of silently computing a
+    /// value that is not a derivative. Use the `*_holomorphic` gradient entry points when the function is holomorphic,
+    /// or split the function into its real and imaginary parts and differentiate those otherwise.
+    #[error(
+        "gradient output type {output_type} is complex; use a holomorphic gradient entry point \
+        if the function is holomorphic"
+    )]
+    ComplexGradientOutput { output_type: String },
+
     #[error(transparent)]
     Program(#[from] ProgramError),
 }

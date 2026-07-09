@@ -37,8 +37,9 @@ pub use crate::operations::tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation
 pub use crate::operations::trigonometric::{Cos, Sin};
 pub use crate::tracing::NestedTracer;
 pub use differentiation::{
-    ForwardModeDifferentiate, ReverseModeDifferentiate, gradient, gradient_with_aux, jvp, linearize,
-    value_and_gradient, value_and_gradient_with_aux, vjp,
+    ForwardModeDifferentiate, ReverseModeDifferentiate, gradient, gradient_holomorphic, gradient_holomorphic_with_aux,
+    gradient_with_aux, jvp, linearize, value_and_gradient, value_and_gradient_holomorphic,
+    value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
 pub use linear::{
     CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

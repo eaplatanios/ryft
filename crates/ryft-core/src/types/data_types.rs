@@ -1411,6 +1411,11 @@ impl Type for DataType {
     fn is_scalar(&self) -> bool {
         true
     }
+
+    #[inline]
+    fn is_complex(&self) -> bool {
+        matches!(self, Self::C64 | Self::C128)
+    }
 }
 
 #[cfg(test)]

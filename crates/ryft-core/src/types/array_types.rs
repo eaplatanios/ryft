@@ -764,6 +764,11 @@ impl Type for ArrayType {
     fn is_scalar(&self) -> bool {
         self.rank() == 0
     }
+
+    #[inline]
+    fn is_complex(&self) -> bool {
+        self.data_type.is_complex()
+    }
 }
 
 // TODO(eaplatanios): Move this to a top-level `ryft_core::arrays` module, parallel to `ryft_core::scalars`.

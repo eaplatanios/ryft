@@ -72,6 +72,14 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// That seed represents the derivative of the output with respect to itself and is only meaningful when the output
     /// is a scalar for simple gradients (i.e., not Jacobians).
     fn is_scalar(&self) -> bool;
+
+    /// Returns `true` if this [`Type`] describes complex-valued (e.g., [`DataType::C64`] or [`DataType::C128`])
+    /// numeric values. Like [`Self::is_scalar`], this predicate primarily exists to serve reverse-mode differentiation.
+    /// A single reverse-mode seed recovers the derivative of a complex-output function only when the function is
+    /// _holomorphic_ (i.e., complex-differentiable), so the gradient entry points route complex scalar outputs through
+    /// their `*_holomorphic` variants. The plain entry points reject output types for which this returns `true`, and
+    /// the holomorphic ones reject output types for which it returns `false`.
+    fn is_complex(&self) -> bool;
 }
 
 /// Associates a runtime value with the abstract [`Type`] descriptor that Ryft should use to reason about it. [`Typed`]
