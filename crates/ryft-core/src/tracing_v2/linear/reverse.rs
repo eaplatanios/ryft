@@ -1,12 +1,13 @@
 use std::fmt::Debug;
 
+use crate::differentiation::LinearizationTracer;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::tracing_v2::{Differentiate, LinearizationTracer};
+use crate::tracing_v2::Differentiate;
 use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.

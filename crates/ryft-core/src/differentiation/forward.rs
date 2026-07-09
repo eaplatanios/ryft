@@ -1,8 +1,14 @@
+use std::fmt::{Debug, Display};
+
+use ryft_macros::Parameter;
+
 use crate::contexts::Context;
 use crate::operations::Operation;
 use crate::operations::constants::ZeroOperation;
+use crate::parameters::Parameter;
+use crate::partial::PartialEvaluationContext;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
-use crate::tracing_v2::differentiation::Linearization;
+use crate::tracing_v2::differentiation::{DifferentiationContext, Linearization};
 use crate::types::Typed;
 
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
@@ -50,6 +56,16 @@ impl<V: Value> DifferentiationDual<V> {
     #[inline]
     pub fn into_parts(self) -> (V, MaybeZero<V>) {
         (self.primal, self.tangent)
+    }
+}
+
+impl<V: Typed + Display> Display for DifferentiationDual<V> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.tangent {
+            MaybeZero::Zero(_) => write!(formatter, "{} + 0ε", self.primal),
+            MaybeZero::Value(tangent) => write!(formatter, "{} + {}ε", self.primal, tangent),
+        }
     }
 }
 
@@ -168,3 +184,118 @@ pub trait LinearizableProgramOperation<V: Value, O: Clone + Operation<V::Type> +
     /// information.
     fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 }
+
+/// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
+/// operates on [`DifferentiationTracer`]s directly, so each operation the closure performs (e.g., `x + y`, `x.sin()`,
+/// etc.) dispatches its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`] on the stamped
+/// [`DifferentiationContext`]. This is forward mode's counterpart of [`BatchingTracer`](crate::BatchingTracer):
+/// the [`DifferentiationDual`] carries the data the rules operate on, exactly as [`ArrayBatch`](crate::ArrayBatch)
+/// does for batching, while this wrapper adds the flowing context so that the value-capability sugar can dispatch.
+#[derive(Clone, Parameter)]
+pub struct DifferentiationTracer<C: Context> {
+    /// [`DifferentiationContext`] this dual flows through.
+    context: DifferentiationContext<C>,
+
+    /// [`DifferentiationDual`] carrying the primal value and its tangent.
+    dual: DifferentiationDual<C::Value>,
+}
+
+impl<C: Context> DifferentiationTracer<C> {
+    /// Creates a new [`DifferentiationTracer`].
+    #[inline]
+    pub fn new(dual: DifferentiationDual<C::Value>, context: DifferentiationContext<C>) -> Self {
+        Self { context, dual }
+    }
+
+    /// Returns the [`DifferentiationContext`] this [`DifferentiationTracer`] flows through.
+    #[inline]
+    pub fn context(&self) -> &DifferentiationContext<C> {
+        &self.context
+    }
+
+    /// Returns the primal value of this [`DifferentiationTracer`].
+    #[inline]
+    pub fn primal(&self) -> &C::Value {
+        self.dual.primal()
+    }
+
+    /// Returns the tangent of this [`DifferentiationTracer`].
+    #[inline]
+    pub fn tangent(&self) -> &MaybeZero<C::Value> {
+        self.dual.tangent()
+    }
+
+    /// Returns the [`DifferentiationDual`] that this [`DifferentiationTracer`] carries.
+    #[inline]
+    pub fn dual(&self) -> &DifferentiationDual<C::Value> {
+        &self.dual
+    }
+
+    /// Consumes this tracer and returns the[`DifferentiationDual`] that it carries.
+    #[inline]
+    pub fn into_dual(self) -> DifferentiationDual<C::Value> {
+        self.dual
+    }
+}
+
+// A dual compares by its two halves (through the carried values' own `PartialEq`, which is identity-shaped for its
+// tracer-valued halves), ignoring the stamped context: consumers such as the scan/while loop-invariance fixed points
+// of partial evaluation compare flowing values across replay rounds to detect passthrough, and a dual passes through
+// exactly when both its halves do.
+impl<C: Context<Value: PartialEq>> PartialEq for DifferentiationTracer<C> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.primal() == other.primal()
+            && match (self.tangent(), other.tangent()) {
+                (MaybeZero::Value(left), MaybeZero::Value(right)) => left == right,
+                (MaybeZero::Zero(left), MaybeZero::Zero(right)) => left == right,
+                _ => false,
+            }
+    }
+}
+
+impl<C: Context> Debug for DifferentiationTracer<C> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DifferentiationTracer").field("dual", &self.dual).finish()
+    }
+}
+
+impl<C: Context> Display for DifferentiationTracer<C> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.dual())
+    }
+}
+
+impl<C: Context> Typed for DifferentiationTracer<C> {
+    type Type = C::Type;
+
+    #[inline]
+    fn r#type(&self) -> std::borrow::Cow<'_, C::Type> {
+        self.primal().r#type()
+    }
+}
+
+impl<C: Context> Value for DifferentiationTracer<C> {
+    type DispatchDomain = DifferentiationContext<C>;
+    type ExecutionDomain = DifferentiationContext<C>;
+
+    #[inline]
+    fn dispatch_domain(&self) -> DifferentiationContext<C> {
+        self.context().clone()
+    }
+
+    #[inline]
+    fn execution_domain(&self) -> DifferentiationContext<C> {
+        self.context().clone()
+    }
+}
+
+/// Value type flowing through the closures of the partial-evaluation-backed differentiation entry points (i.e.,
+/// [`Differentiate::linearize`], [`Differentiate::vjp`], [`Differentiate::gradient`], and their derivatives). It is a
+/// [`DifferentiationTracer`] dual over a [`PartialEvaluationContext`] wrapping the context `C` the transform runs in.
+/// Its primal half is a *known* partial-evaluation value carrying a concrete value under an eager `C` (so that e.g.,
+/// host control flow on primal values works as expected) and its tangent half is *unknown*, accumulating the
+/// pushforward program.
+pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext<C>>;

@@ -8,6 +8,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::contexts::{Context, Domain};
+use crate::differentiation::LinearizationTracer;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
@@ -19,7 +20,7 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::{Differentiate, LinearizationTracer};
+use crate::tracing_v2::Differentiate;
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.

@@ -38,7 +38,8 @@ pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 pub use differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationDual,
-    DifferentiationError, LinearizableProgramOperation, TransposableOperation, TransposableProgramOperation,
+    DifferentiationError, DifferentiationTracer, LinearizableProgramOperation, LinearizationTracer,
+    TransposableOperation, TransposableProgramOperation,
 };
 pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error};
@@ -60,8 +61,6 @@ pub use programs::{
 pub use scalars::Scalar;
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
-pub use tracing_v2::differentiation::{
-    DifferentiationContext, DifferentiationTracer, Linearization, LinearizationTracer,
-};
+pub use tracing_v2::differentiation::{DifferentiationContext, Linearization};
 pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use types::*;

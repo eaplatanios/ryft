@@ -616,7 +616,7 @@ mod tests {
     /// Binds `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` through the
     /// provided value's dispatch domain, feeding its predicate input with a lifted constant `true`. Generic over the
     /// value so it serves both staged closures (a [`Tracer`](crate::tracing::Tracer)) and dual-driven differentiation
-    /// closures (a [`LinearizationTracer`](crate::tracing_v2::LinearizationTracer)).
+    /// closures (a [`LinearizationTracer`](crate::differentiation::LinearizationTracer)).
     fn stage_constant_predicate_condition<V>(x: V) -> V
     where
         V: crate::programs::Value<Type = ArrayType>,

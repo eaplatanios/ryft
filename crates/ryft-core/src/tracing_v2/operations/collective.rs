@@ -705,9 +705,10 @@ mod tests {
         use crate::batching::Batch;
         use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
+        use crate::differentiation::LinearizationTracer;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::{LinearizationTracer, value_and_gradient};
+        use crate::tracing_v2::value_and_gradient;
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
@@ -740,9 +741,10 @@ mod tests {
         use crate::batching::Batch;
         use crate::batching::BatchAxisSpecification;
         use crate::contexts::EagerContext;
+        use crate::differentiation::LinearizationTracer;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::{LinearizationTracer, value_and_gradient};
+        use crate::tracing_v2::value_and_gradient;
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the

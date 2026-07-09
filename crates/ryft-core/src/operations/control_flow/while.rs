@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 
 use crate::batching::BatchingTracer;
 use crate::contexts::Context;
+use crate::differentiation::DifferentiationTracer;
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
@@ -14,7 +15,6 @@ use crate::partial::{
 };
 use crate::payloads::{Captured, Input};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing_v2::differentiation::DifferentiationTracer;
 use crate::types::{ArrayType, DataType, Type, TypeError};
 use crate::{CaptureReference, Tracer};
 

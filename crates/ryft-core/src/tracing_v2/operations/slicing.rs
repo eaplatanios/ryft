@@ -574,11 +574,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::differentiation::LinearizationTracer;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, LinearizationTracer, value_and_gradient};
+    use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
     use crate::types::DataType;
 
     use super::*;

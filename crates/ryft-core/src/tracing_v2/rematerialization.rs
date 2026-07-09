@@ -2010,7 +2010,7 @@ mod tests {
     #[test]
     fn test_rematerialized_gradients_are_correct_through_batching() {
         use crate::batching::Batch;
-        use crate::tracing_v2::LinearizationTracer;
+        use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
         use crate::tracing_v2::value_and_gradient;
 
@@ -2470,7 +2470,7 @@ mod tests {
     #[test]
     fn test_offloaded_rematerialization_survives_batching_with_host_parked_saved_types() {
         use crate::batching::Batch;
-        use crate::tracing_v2::LinearizationTracer;
+        use crate::differentiation::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
         use crate::tracing_v2::value_and_gradient;
 

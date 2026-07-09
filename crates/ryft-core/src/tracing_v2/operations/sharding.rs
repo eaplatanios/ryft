@@ -195,7 +195,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
-    use crate::tracing_v2::LinearizationTracer;
+    use crate::differentiation::LinearizationTracer;
     use crate::tracing_v2::differentiation::Differentiate;
 
     fn mesh() -> LogicalMesh {

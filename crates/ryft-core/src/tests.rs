@@ -1087,10 +1087,11 @@ mod differentiation_tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::DifferentiationTracer;
+    use crate::differentiation::LinearizationTracer;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::differentiation::DifferentiationTracer;
-    use crate::tracing_v2::{Differentiate, LinearizationTracer};
+    use crate::tracing_v2::Differentiate;
 
     #[test]
     fn test_scalar_domain_half_precision_variants_run_jvp() {
@@ -1504,6 +1505,7 @@ mod differentiation_tests {
 #[cfg(test)]
 mod linearization_tests {
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
     use crate::operations::compare::Compare;
     use crate::operations::control_flow::{MaybeWhile, Select, WhileOperation};
     use crate::operations::differentiation::StopGradient;
@@ -3025,6 +3027,7 @@ mod array_linearization_tests {
     }
 
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
     use crate::operations::Operation;
     use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
@@ -3033,9 +3036,7 @@ mod array_linearization_tests {
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
-    use crate::tracing_v2::differentiation::{
-        Differentiate, DifferentiationTracer, Linearization, LinearizationTracer,
-    };
+    use crate::tracing_v2::differentiation::{Differentiate, Linearization};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
@@ -4621,6 +4622,7 @@ mod batching_tests {
         ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, BatchingTracer,
     };
     use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::LinearizationTracer;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::OneLike;
@@ -4630,10 +4632,10 @@ mod batching_tests {
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;
+    use crate::tracing_v2::Differentiate;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
     use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
-    use crate::tracing_v2::{Differentiate, LinearizationTracer};
     use crate::types::{DataType, Shape};
 
     use super::*;

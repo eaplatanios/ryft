@@ -131,6 +131,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::differentiation::DifferentiationTracer;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::{OneLike, ZeroLike};
     use crate::operations::control_flow::Select;
@@ -138,7 +139,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::Differentiate;
-    use crate::tracing_v2::differentiation::DifferentiationTracer;
 
     /// `f(x) = select((x > 0) & (x > 1), 2x, 3x)` expressed over JVP duals of the eager [`TestArray`] context.
     fn masked_select(

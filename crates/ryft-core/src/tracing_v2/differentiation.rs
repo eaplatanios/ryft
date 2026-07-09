@@ -4,13 +4,14 @@ use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDual, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDual, DifferentiationError, DifferentiationTracer,
+    LinearizationTracer, TransposableOperation,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
-use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationValue, PartialTracer, PartialValue,
     PartiallyEvaluatableOperation,
@@ -411,141 +412,6 @@ pub trait Differentiate: Context {
 }
 
 impl<C: Context> Differentiate for C {}
-
-/// Value type flowing through the closures of the partial-evaluation-backed differentiation entry points
-/// ([`Differentiate::linearize`], [`Differentiate::vjp`], [`Differentiate::gradient`], and their derivatives): a
-/// [`DifferentiationTracer`] dual over a [`PartialEvaluationContext`] wrapping the context `C` the transform runs in.
-/// Its primal half is a *known* partial-evaluation value carrying a concrete value under an eager `C` (so host
-/// control flow on primals works) and its tangent half is *unknown*, accumulating the pushforward program.
-pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext<C>>;
-
-/// A dual value flowing through a forward-mode [`DifferentiationContext`]: a [`DifferentiationDual`] paired with the context it
-/// flows through.
-///
-/// The function being differentiated operates on [`DifferentiationTracer`]s directly, so each operation the closure
-/// performs (`x + y`, `x.sin()`, …) dispatches its [`jvp`](DifferentiableOperation::jvp) rule through
-/// [`Context::bind`] on the stamped [`DifferentiationContext`]. This is forward mode's counterpart of
-/// [`BatchingTracer`](crate::batching::BatchingTracer): the context-free [`DifferentiationDual`] carries the data the
-/// rules operate on, exactly as [`ArrayBatch`](crate::batching::ArrayBatch) does for batching, while this wrapper adds
-/// the flowing context so the value-capability sugar can dispatch.
-pub struct DifferentiationTracer<C: Context> {
-    /// [`DifferentiationContext`] this dual flows through, so that the value-capability sugar (`x + y`, `x.sin()`, …) can
-    /// dispatch each operation through the forward-mode rule.
-    context: DifferentiationContext<C>,
-
-    /// Context-free dual number carrying the primal value and its symbolic tangent.
-    dual: DifferentiationDual<C::Value>,
-}
-
-impl<C: Context> DifferentiationTracer<C> {
-    /// Creates a new [`DifferentiationTracer`] from a context-free dual and the [`DifferentiationContext`] it flows through.
-    #[inline]
-    pub(crate) fn new(dual: DifferentiationDual<C::Value>, context: DifferentiationContext<C>) -> Self {
-        Self { context, dual }
-    }
-
-    /// Returns the [`DifferentiationContext`] this dual flows through. The value-capability sugar dispatches
-    /// operations through it, and closures use it to compose further transforms over the differentiation context
-    /// (e.g., a nested `gradient`, or staging a control-flow combinator with [`Context::bind`]).
-    #[inline]
-    pub fn context(&self) -> &DifferentiationContext<C> {
-        &self.context
-    }
-
-    /// Returns the primal value of this dual.
-    #[inline]
-    pub fn primal(&self) -> &C::Value {
-        self.dual.primal()
-    }
-
-    /// Returns the symbolic tangent of this dual.
-    #[inline]
-    pub fn tangent(&self) -> &MaybeZero<C::Value> {
-        self.dual.tangent()
-    }
-
-    /// Returns the context-free [`DifferentiationDual`] this tracer carries.
-    #[inline]
-    pub fn dual(&self) -> &DifferentiationDual<C::Value> {
-        &self.dual
-    }
-
-    /// Consumes this tracer and returns the context-free [`DifferentiationDual`] it carries.
-    #[inline]
-    pub fn into_dual(self) -> DifferentiationDual<C::Value> {
-        self.dual
-    }
-}
-
-impl<C: Context> Clone for DifferentiationTracer<C> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self { context: self.context.clone(), dual: self.dual.clone() }
-    }
-}
-
-// A dual compares by its two halves (through the carried values' own `PartialEq`, which is identity-shaped for
-// tracer-valued halves), ignoring the stamped context: consumers such as the scan/while loop-invariance fixed points
-// of partial evaluation compare flowing values across replay rounds to detect passthrough, and a dual passes through
-// exactly when both its halves do.
-impl<C: Context<Value: PartialEq>> PartialEq for DifferentiationTracer<C> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.primal() == other.primal()
-            && match (self.tangent(), other.tangent()) {
-                (MaybeZero::Value(left), MaybeZero::Value(right)) => left == right,
-                (MaybeZero::Zero(left), MaybeZero::Zero(right)) => left == right,
-                _ => false,
-            }
-    }
-}
-
-impl<C: Context> Debug for DifferentiationTracer<C> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("DifferentiationTracer").field("dual", &self.dual).finish()
-    }
-}
-
-impl<C: Context> std::fmt::Display for DifferentiationTracer<C> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Dual-number notation: the primal plus the tangent-scaled infinitesimal.
-        match self.tangent() {
-            MaybeZero::Zero(_) => write!(formatter, "{} + 0ε", self.primal()),
-            MaybeZero::Value(tangent) => write!(formatter, "{} + {}ε", self.primal(), tangent),
-        }
-    }
-}
-
-impl<C: Context> Typed for DifferentiationTracer<C> {
-    type Type = C::Type;
-
-    #[inline]
-    fn r#type(&self) -> std::borrow::Cow<'_, C::Type> {
-        self.primal().r#type()
-    }
-}
-
-impl<C: Context> Parameter for DifferentiationTracer<C> {}
-
-/// A JVP dual flows through the [`DifferentiationContext`] stamped on it.
-impl<C: Context> Value for DifferentiationTracer<C> {
-    type DispatchDomain = DifferentiationContext<C>;
-    type ExecutionDomain = DifferentiationContext<C>;
-
-    #[inline]
-    fn dispatch_domain(&self) -> DifferentiationContext<C> {
-        self.context().clone()
-    }
-
-    #[inline]
-    fn execution_domain(&self) -> DifferentiationContext<C> {
-        self.context().clone()
-    }
-}
-
-// The elementwise/arithmetic/trigonometric and other operation-specific capability implementations for
-// `DifferentiationTracer` are hand-written in each operation's own module (bind-forwarding through the stamped
-// `DifferentiationContext`). The capabilities whose signatures do not fit that shape are implemented by hand below.
 
 /// A forward-mode differentiation [`Context`] that interleaves [`DifferentiableOperation`] rules with an inner
 /// [`Context`], without building a program: its values are [`DifferentiationTracer`] duals over the inner context's values, and

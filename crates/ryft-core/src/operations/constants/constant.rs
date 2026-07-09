@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use crate::batching::{ArrayBatch, BatchAxis, BatchableOperation, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, StagingContext};
-use crate::differentiation::DifferentiableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationTracer};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::constants::Zero;
@@ -13,7 +13,7 @@ use crate::partial::PartiallyEvaluatableOperation;
 use crate::payloads::{Captured, Input};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
-use crate::tracing_v2::differentiation::{DifferentiationContext, DifferentiationTracer};
+use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Canonical operation name for [`ConstantOperation`].
