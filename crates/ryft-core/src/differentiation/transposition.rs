@@ -12,7 +12,7 @@ use crate::parameters::{Parameterized, Placeholder};
 use crate::partial::PartialValue;
 use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::{Type, Typed};
+use crate::types::Typed;
 
 /// Represents [`Operation`]s that provide a transposition rule for linear [`Program`]s. Reading a linear
 /// [`Instruction`](crate::Instruction) as a linear map `y = L(x)` (in differentiation, `L` is a piece of the tangent
@@ -129,37 +129,29 @@ pub trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::T
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents closed [`Operation`] families whose flat linear [`Program`]s can be transposed as nested programs.
-/// Higher-order transpose rules, such as the rules for linear condition branches and linear scan bodies, need to
-/// transpose captured programs whose operation family is the same closed enum that is currently being proven
+/// Represents closed [`Operation`] families whose linear [`Program`]s can be transposed as nested programs.
+/// Higher-order transpose rules, such as the rules for linear condition branches and linear scan bodies, need
+/// to transpose captured programs whose operation family is the same closed enum that is currently being proven
 /// transposable. Writing that need directly as `O: TransposableOperation<V, O>` at every recursive payload boundary
 /// can send Rust's trait solver through the enum's higher-order variants indefinitely. [`TransposableProgramOperation`]
-/// names the recursive fixed point once: the closed operation enum implements this trait by calling
-/// [`Program::transpose_with_respect_to`], while higher-order payloads depend on this semantic witness instead of
-/// reproducing all variant-level transposition bounds.
+/// names the recursive fixed point once. The closed operation enum implements this trait by calling
+/// [`Program::transpose_with_respect_to`], while higher-order payloads depend on this semantic witness instead
+/// of reproducing all variant-level transposition bounds.
 ///
 /// The trait is intentionally about complete operation families, not individual primitive payloads. Implementations
-/// that delegate to [`Program::transpose_with_respect_to`] add that method's [`Zero`](crate::Zero)/
-/// [`Add`](std::ops::Add) bounds locally because those are requirements of the standard implementation strategy,
-/// not of this semantic witness itself.
-pub trait TransposableProgramOperation<V: Value>: Operation<V::Type> + Sized
-where
-    V::Type: DifferentiableType,
-{
-    /// Transposes the provided flat [`Program`] in this operation family with respect to the inputs flagged in
-    /// `input_linearity`; refer to the documentation of [`Program::transpose_with_respect_to`] for the pullback's
-    /// input and output layout. The operand-form higher-order transpose rules (condition branches and scan bodies
-    /// whose known residual factors ride as ordinary operands) pass their genuine linearity masks, while the fully
-    /// linear captured-program rules pass an all-`true` mask — the flat-transposition case is exactly the partial
-    /// one with every input linear, so this single method serves both. The mask encoding (rather than the public
-    /// entry point's index list) is kept here because it is the seed of the forward linearity propagation and the
-    /// natural per-operand form for the higher-order rules.
+/// that delegate to [`Program::transpose_with_respect_to`] add that function's [`Zero`](crate::Zero), etc. bounds
+/// locally because those are requirements of the standard implementation strategy, not of this semantic witness itself.
+pub trait TransposableProgramOperation<V: Value<Type: DifferentiableType>>: Operation<V::Type> + Sized {
+    /// Transposes the provided [`Program`] in this operation family with respect to the inputs flagged in
+    /// `input_linearity`. Refer to the documentation of [`Program::transpose_with_respect_to`] for the pullback's
+    /// input and output layout. The operand-form higher-order transpose rules (e.g., for condition branches and scan
+    /// bodies whose known residual factors ride as ordinary operands) pass their genuine linearity masks, while the
+    /// fully linear captured-program rules pass an all-`true` mask. The flat-transposition case is exactly the partial
+    /// one with every input linear, so this single function serves both.
     ///
     /// # Parameters
     ///
-    ///   - `program`: Flat [`Program`] whose inputs and outputs are flattened vectors of values.
+    ///   - `program`: [`Program`] whose inputs and outputs are flattened vectors of values.
     ///   - `input_linearity`: Per-input linearity flags, in program-input order.
     fn transpose_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
@@ -175,9 +167,9 @@ impl<
     Output: Parameterized<V>,
 > Program<V, O, Input, Output>
 {
-    /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback. This is the main entrypoint for
-    /// transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map on
-    /// _dual_ spaces `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix
+    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_. This is the main entrypoint
+    /// for transposing linear [`Program`]s. In the algebraic sense, _transposing_ a linear map `L: X -> Y` gives a map
+    /// on _dual_ spaces `L^T: Y* -> X*`. In finite dimensions this is the same operation represented by a matrix
     /// transpose. Here the linear map is not stored as a matrix. It is a staged [`Program`] that maps input tangents
     /// to output tangents, and transposition builds the dual program that maps output cotangents back to input
     /// cotangents. Operationally, transposition creates cotangent inputs for this program's outputs, walks the
@@ -186,20 +178,21 @@ impl<
     /// automatic differentiation as in [this paper](https://arxiv.org/abs/2204.10923).
     ///
     /// Disconnected primal inputs are emitted as [`ZeroOperation`]s, which the value type's [`Zero`](crate::Zero)
-    /// implementation evaluates at interpretation time. For linear programs whose values are [`Tracer`]s from an outer
-    /// trace, use [`TracingContext::transpose_traced`] instead so that those disconnected-input zeros can be
-    /// materialized in the surrounding tracing context.
+    /// implementation evaluates at interpretation time. This applies uniformly to linear programs whose values are
+    /// [`Tracer`]s from an outer trace. Interpreting such a pullback [`ZeroOperation`] over outer-trace [`Tracer`]s
+    /// stages a typed zero into the surrounding tracing context, so that backends whose traced constants are abstract
+    /// metadata do not need to materialize a runtime value just to transpose an enclosing traced program.
     ///
-    /// This is the fully linear case of [`transpose_with_respect_to`](Self::transpose_with_respect_to): the program
+    /// This is the fully linear case of [`transpose_with_respect_to`](Self::transpose_with_respect_to). The program
     /// is transposed with respect to every input, so every reachable [`Atom`] is linear, each operation's transpose
     /// rule receives an all-`true` operand-linearity slice, and the pullback's inputs and outputs preserve this
     /// program's output and input structures respectively.
     #[inline]
     pub fn transpose(&self) -> Result<Program<V, O, Output, Input>, ProgramError> {
+        // Every input is linear, so the pullback has one cotangent input per primal output and one cotangent output
+        // per primal input. Recover the structured form by reattaching this program's output and input structures to
+        // the flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
         let flat = TracingContext::<V, O>::new().transpose(self, &vec![true; self.input_ids().len()])?;
-        // Every input is linear, so the pullback has one cotangent input per primal output and one cotangent output per
-        // primal input. Recover the structured form by reattaching this program's output and input structures to the
-        // flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
         Ok(Program {
             atoms: flat.atoms,
             input_ids: flat.input_ids,
@@ -211,10 +204,10 @@ impl<
         })
     }
 
-    /// Transposes this linear pushforward [`Program`] into its reverse-mode pullback **with respect to** the inputs
-    /// selected by `input_indices`, holding the remaining inputs as known (constant) parameters of the linear map.
-    /// The program must be linear in the selected inputs; it may depend arbitrarily on the known ones. This is the
-    /// partial entry point behind the fully linear [`transpose`](Self::transpose).
+    /// Transposes this linear _pushforward_ [`Program`] into its reverse-mode _pullback_ **with respect to** the inputs
+    /// selected by `input_indices`, holding the remaining inputs as constant parameters of the linear map. The program
+    /// must be linear in the selected inputs, but it can depend arbitrarily on the known ones. This is the partial
+    /// entry point behind the fully linear [`transpose`](Self::transpose).
     ///
     /// Linearity is propagated forward from the program inputs: a program-input [`Atom`] is linear exactly when its
     /// index appears in `input_indices`, constant atoms are always known, and an operation result is linear when any
@@ -223,18 +216,18 @@ impl<
     ///
     /// The pullback's inputs are the cotangents of this program's outputs followed by the runtime values of the known
     /// inputs (in program-input order), and the pullback's outputs are the accumulated cotangents of the selected
-    /// inputs, **in `input_indices` order**; known inputs receive no cotangent output. Because this layout depends on
+    /// inputs, **in `input_indices` order**. Known inputs receive no cotangent output. Because this layout depends on
     /// `input_indices`, the pullback's inputs and outputs are returned as flat [`Vec`]s rather than reusing this
     /// program's structured input and output types. The fully linear [`transpose`](Self::transpose) recovers the
     /// structured form. Disconnected selected inputs are emitted as [`ZeroOperation`]s, exactly as in
     /// [`transpose`](Self::transpose).
     ///
-    /// Known operand values are program inputs and constants: each known input is exposed as a pullback input and each
+    /// Known operand values are program inputs and constants. Each known input is exposed as a pullback input and each
     /// constant atom as a pullback constant, so a bilinear rule can read either as the known operand's pullback value.
     /// If a transpose rule requests the value of a known *intermediate* (a known atom that is neither a program input
-    /// nor a constant), this returns [`ProgramError::UnsupportedOperation`]. This is not yet a limitation in practice
-    /// because the partial-evaluation split that produces a partitioned tangent program prunes known intermediates into
-    /// its known sub-program, leaving only known inputs and constants for an adjoint rule to read.
+    /// nor a constant), this function returns [`ProgramError::UnsupportedOperation`]. This is not a limitation in
+    /// practice because the partial-evaluation split that produces a partitioned tangent program prunes known
+    /// intermediates into its known sub-program, leaving only known inputs and constants for an adjoint rule to read.
     ///
     /// # Parameters
     ///
@@ -266,7 +259,7 @@ impl<
         }
         let mut pullback = TracingContext::<V, O>::new().transpose(self, input_linearity.as_slice())?;
 
-        // The reverse walk emits one cotangent output per selected input in program-input order; permute them so the
+        // The reverse walk emits one cotangent output per selected input in program-input order. Permute them so the
         // pullback's outputs follow the order of `input_indices` instead. The walk position of index `i` is the
         // number of selected indices smaller than `i`.
         let mut sorted_indices = input_indices.to_vec();
@@ -279,53 +272,10 @@ impl<
     }
 }
 
-impl<T: Type + DifferentiableType, V: Value<Type = T>, O: Operation<T>, Capture> TracingContext<V, O, Capture> {
-    /// Transposes the provided traced linear [`Program`] whose values are [`Tracer`]s belonging to this outer
-    /// [`TracingContext`]. This uses the same reverse-walk implementation as [`Program::transpose`] in a fresh
-    /// [`TracingContext`].
-    ///
-    /// The transposed program's values are this context's own [`Tracer`]s, and its operation family `LinearOperation`
-    /// is the linear operation family of the program being transposed (which need not equal this context's own
-    /// operation family).
-    ///
-    /// Use this method when transposing a linear program inside an outer trace, such as when staging a traced
-    /// reverse-mode pullback. Use [`Program::transpose`] for ordinary complete linear program transposition, and use
-    /// [`TracingContext::transpose`] only when you already hold a [`TracingContext`] to consume and want to run the
-    /// lower-level transposition algorithm directly.
-    ///
-    /// Disconnected primal inputs and transpose-rule-staged structural zeros are emitted as input-free
-    /// [`ZeroOperation`] instructions in the pullback. These are materialized at interpretation time: a pullback
-    /// [`ZeroOperation`] interpreted over outer-trace [`Tracer`]s stages a typed zero into the surrounding
-    /// [`TracingContext`] through the threaded interpretation context, and so backends whose traced constants are
-    /// abstract metadata do not need to materialize a runtime value just to transpose an enclosing traced program.
-    #[inline]
-    pub fn transpose_traced<
-        Input: Parameterized<Tracer<Self>>,
-        Output: Parameterized<Tracer<Self>>,
-        LinearOperation: TransposableOperation<Tracer<Self>, LinearOperation> + From<ZeroOperation<T>> + From<AddOperation>,
-    >(
-        &self,
-        program: &Program<Tracer<Self>, LinearOperation, Input, Output>,
-    ) -> Result<Program<Tracer<Self>, LinearOperation, Output, Input>, ProgramError> {
-        let flat = TracingContext::<Tracer<Self>, LinearOperation>::new()
-            .transpose(program, &vec![true; program.input_ids().len()])?;
-        // Every input is linear, so the flat pullback has one cotangent input per primal output and one cotangent
-        // output per primal input. Recover the structured form by reattaching this program's output and input
-        // structures to the flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
-        Ok(Program {
-            atoms: flat.atoms,
-            input_ids: flat.input_ids,
-            output_ids: flat.output_ids,
-            instructions: flat.instructions,
-            input_structure: program.output_structure().clone(),
-            output_structure: program.input_structure().clone(),
-            marker: PhantomData,
-        })
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
-    T: Type + DifferentiableType,
+    T: DifferentiableType,
     V: Value<Type = T>,
     O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
 > TracingContext<V, O>
@@ -356,11 +306,9 @@ impl<
     /// value of a known *intermediate* (a known atom that is neither a program input nor a constant) causes this to
     /// return [`ProgramError::UnsupportedOperation`].
     ///
-    /// This shares the [`transpose`](Program::transpose) name with the [`Program`]-level entry point and the
-    /// outer-trace [`transpose_traced`](Self::transpose_traced) variant on [`TracingContext`]: this builder-level
-    /// method consumes a [`TracingContext`] and stages the pullback into its [`ProgramBuilder`] over the `(T, V, O)`
-    /// universe, whereas [`transpose_traced`](Self::transpose_traced) transposes a program whose values are tracers of
-    /// an enclosing trace.
+    /// This shares the [`transpose`](Program::transpose) name with the [`Program`]-level entry point. This
+    /// builder-level method consumes a [`TracingContext`] and stages the pullback into its [`ProgramBuilder`]
+    /// over the `(T, V, O)` universe.
     ///
     /// # Parameters
     ///
@@ -1049,7 +997,7 @@ mod tests {
                 Placeholder,
             )
             .unwrap();
-        let pullback = tracing_context.transpose_traced(&program).unwrap();
+        let pullback = program.transpose().unwrap();
         assert_eq!(disconnected_input, AtomId::new(1));
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(0), AtomId::new(1)]);
@@ -1088,7 +1036,7 @@ mod tests {
         let output = builder.add_instruction(TestLinearOperation::StagedZeroContribution, vec![input]).unwrap()[0];
         let program =
             builder.build::<TestTracingValue, TestTracingValue>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = tracing_context.transpose_traced(&program).unwrap();
+        let pullback = program.transpose().unwrap();
         assert_eq!(pullback.input_ids(), &[AtomId::new(0)]);
         assert_eq!(pullback.output_ids(), &[AtomId::new(1)]);
 

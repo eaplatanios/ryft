@@ -157,7 +157,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // (primal outputs followed by residuals) and the linear tangent sub-program. `from_linearization` replays
         // every input-coordinate basis tangent through the tangent sub-program in one batched pass — broadcasting the
         // primal-derived residuals as replicated values — preserving the exact Jacobian layout.
-        let (program, _input_structure, output_structure, input_values) =
+        let (program, output_structure, input_values) =
             self.trace_into_primal_program::<F, Input, TracedOutput>(function, primals)?;
         let program = unroll_concretizable_whiles(self, program, input_values.clone())?;
         let linearization = program.linearize()?;
@@ -225,7 +225,6 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         ) -> Tracer<NestedTracingContext<DomainTracingContext<Self>>>,
         <Self as Domain>::Operation: Clone
             + InterpretableOperation<DomainValue<Self>, Self>
-            + InterpretableOperation<Tracer<DomainTracingContext<Self>>, DomainTracingContext<Self>>
             + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + MaybeWhile<<Self as Domain>::Constant, <Self as Domain>::Operation>
             + DifferentiableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>

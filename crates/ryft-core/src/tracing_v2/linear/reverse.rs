@@ -3,10 +3,9 @@ use std::fmt::Debug;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
-use crate::interpretation::InterpretableOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::ZeroOperation;
+use crate::operations::constants::{OneOperation, ZeroOperation};
 use crate::operations::control_flow::MaybeWhile;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::tracing::TracingContext;
@@ -36,34 +35,17 @@ where
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-    C: One<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
-        + InterpretableOperation<<C as Domain>::Value, C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
         + From<ZeroOperation<<C as Domain>::Type>>
+        + From<OneOperation<<C as Domain>::Type>>
         + From<AddOperation>
         + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
 {
-    let input_structure = primals.parameter_structure();
-    let (output, pullback, residuals) = context.vjp(|input| Ok(function(input)), primals)?;
-    // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
-    // (see `DifferentiationError::NonScalarGradientOutput`).
-    if !output.r#type().is_scalar() {
-        return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
-    }
-    // The direct-transpose pullback consumes `[output_cotangents ++ residuals]`, so the single scalar-output seed is
-    // followed by the linearization-point residuals; its flat input cotangents are reshaped against the closure's
-    // input structure. Both the seed and the replay go through the domain itself: an eager domain constructs and
-    // interprets concrete values, while a staging domain stages into its enclosing trace.
-    let mut pullback_inputs = vec![context.one(output.r#type().as_ref())?];
-    pullback_inputs.extend(residuals);
-    let input_cotangents = pullback.interpret_in_context(context, pullback_inputs)?;
-    let gradient = Input::To::<<C as Domain>::Value>::from_parameters(input_structure, input_cotangents)
-        .map_err(ProgramError::from)?;
-    Ok((output, gradient))
+    context.value_and_gradient(function, primals)
 }
 
 /// Computes the reverse-mode gradient of a scalar-output function.
@@ -89,13 +71,12 @@ where
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
-    C: One<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
-        + InterpretableOperation<<C as Domain>::Value, C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
         + From<ZeroOperation<<C as Domain>::Type>>
+        + From<OneOperation<<C as Domain>::Type>>
         + From<AddOperation>
         + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
@@ -141,7 +122,6 @@ where
     C: One<<C as Domain>::Value> + Zero<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
-        + InterpretableOperation<<C as Domain>::Value, C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
         + From<ZeroOperation<<C as Domain>::Type>>
@@ -164,7 +144,13 @@ where
     // a zero cotangent, then append the linearization-point residuals. Both the seeds and the replay go through the
     // domain itself: an eager domain constructs and interprets concrete values, while a staging domain stages into
     // its enclosing trace.
-    let mut pullback_inputs = vec![context.one(output.r#type().as_ref())?];
+    // A non-differentiable scalar output (e.g., a Boolean or an integer) carries no cotangent space and thus no
+    // "one" to seed, so reverse mode is degenerate and is rejected up front. The seed is typed with the output's
+    // cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays).
+    let output_cotangent_type = output.r#type().cotangent().ok_or_else(|| {
+        DifferentiationError::NonDifferentiableGradientOutput { output_type: output.r#type().to_string() }
+    })?;
+    let mut pullback_inputs = vec![context.one(&output_cotangent_type)?];
     for value in Parameterized::<<C as Domain>::Value>::parameters(&aux) {
         pullback_inputs.push(context.zero(value.r#type().as_ref())?);
     }
@@ -210,7 +196,6 @@ where
     C: One<<C as Domain>::Value> + Zero<<C as Domain>::Value>,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
-        + InterpretableOperation<<C as Domain>::Value, C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
         + From<ZeroOperation<<C as Domain>::Type>>
