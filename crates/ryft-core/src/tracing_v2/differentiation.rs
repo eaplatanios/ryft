@@ -1,11 +1,10 @@
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
-    DifferentiationTracer, Linearization, LinearizationTracer, TransposableOperation,
+    DifferentiationTracer, Linearization, LinearizationTracer, Pullback, Pushforward, TransposableOperation,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -262,13 +261,7 @@ pub trait Differentiate: Context {
         }
 
         // Close the pushforward program over the linearization-point residuals behind the reusable callable.
-        let pushforward = Pushforward {
-            context: self.clone(),
-            program: evaluation.program,
-            residuals,
-            output_structure,
-            marker: PhantomData,
-        };
+        let pushforward = Pushforward::new(self.clone(), evaluation.program, residuals, output_structure)?;
         Ok((output, pushforward))
     }
 
@@ -331,7 +324,7 @@ pub trait Differentiate: Context {
         // `(output_cotangents ++ residuals)` to the input cotangents.
         let with_respect_to = (0..program.input_ids().len() - residuals.len()).collect::<Vec<_>>();
         let program = program.transpose_with_respect_to(with_respect_to.as_slice())?;
-        Ok((output, Pullback { context: self.clone(), program, residuals, input_structure, marker: PhantomData }))
+        Ok((output, Pullback::new(self.clone(), program, residuals, input_structure)?))
     }
 
     /// Returns the traced scalar output and reverse-mode gradient for `function`.
@@ -761,239 +754,6 @@ where
     }
 }
 
-/// The *pushforward* of a function `f` at a linearization point `x` — the linear map `ẋ ↦ (∂f/∂x)(x) · ẋ` — as a
-/// reusable callable produced by [`Differentiate::linearize`], the JAX `linearize` analogue. It is the forward-mode
-/// dual of [`Pullback`], whose callable applies the transposed map `ȳ ↦ (∂f/∂x)(x)ᵀ · ȳ` instead:
-/// [`apply`](Self::apply) pushes any tangent at the linearization point through the function's Jacobian without
-/// re-tracing or re-differentiating.
-///
-/// It wraps the pushforward program `(ẋ, r) ↦ ẏ` accumulated while partially evaluating the closure, closed over the
-/// residuals recovered at the linearization point: [`apply`](Self::apply) computes `ẏ = (∂f/∂x)(x) · ẋ` by appending the residuals `r` to the
-/// flattened tangents `ẋ`, interpreting the pushforward program `(ẋ, r) ↦ ẏ`, and reshaping the flat tangent outputs
-/// against the closure's output structure. The cost of differentiating once is thereby amortized over many tangent
-/// applications (for example, replaying every coordinate basis tangent to build a Jacobian). It is the exact
-/// forward-mode dual of [`Pullback`], which closes the transposed pullback program over the same residuals.
-///
-/// The pushforward program is over the primal operation family `<C as Domain>::Operation` in the staged constant
-/// space `<C as Domain>::Constant`, while the residuals and tangents flow as `<C as Domain>::Value`s: under an eager
-/// domain the residuals are concrete values and [`apply`](Self::apply) interprets the pushforward immediately, while
-/// under a staging domain they are [`Tracer`]s into the enclosing trace and [`apply`](Self::apply) stages the
-/// pushforward into that trace.
-///
-/// The differentiation context `C` supplies the value semantics and operation family; `Input` is the closure's
-/// structured input type and `TracedOutput` its structured output type, whose
-/// [`ParameterStructure`](crate::parameters::Parameterized::ParameterStructure) is retained so the flat tangent outputs
-/// reshape back into `TracedOutput::To<<C as Domain>::Value>`. `Input` is carried as a type parameter so
-/// [`apply`](Self::apply) infers the tangent family from the linearization itself rather than requiring a turbofish.
-pub struct Pushforward<C, Input, TracedOutput>
-where
-    C: Domain,
-    TracedOutput: Parameterized<<C as Domain>::Value>,
-{
-    /// Differentiation context the linearization was built in; [`apply`](Self::apply) replays the pushforward program
-    /// in it, mirroring how [`Pullback`] replays its pullback program.
-    context: C,
-
-    /// Pushforward program over the primal operation family in the context's staged [`Constant`](Domain::Constant)
-    /// space, mapping `[tangents ++ residuals]` to flat tangent outputs. Its literal constants are lifted through the
-    /// context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
-    program: Program<
-        <C as Domain>::Constant,
-        <C as Domain>::Operation,
-        Vec<<C as Domain>::Constant>,
-        Vec<<C as Domain>::Constant>,
-    >,
-
-    /// Linearization-point residuals consumed by [`program`](Self::program), appended after the tangents when
-    /// interpreting it.
-    residuals: Vec<<C as Domain>::Value>,
-
-    /// Parameter structure of the closure's output, used to reshape the flat tangent outputs.
-    output_structure: TracedOutput::ParameterStructure,
-
-    /// Encodes the closure's input family `Input` so [`apply`](Self::apply) can flatten the tangents without a
-    /// turbofish. Covariant and ownership-free.
-    marker: PhantomData<fn() -> Input>,
-}
-
-impl<C, Input, TracedOutput> Pushforward<C, Input, TracedOutput>
-where
-    C: Context,
-    <C as Domain>::Operation: Clone,
-    Input: Parameterized<<C as Domain>::Value>,
-    TracedOutput: Parameterized<<C as Domain>::Value>,
-    TracedOutput::Family: ParameterizedFamily<<C as Domain>::Value>,
-{
-    /// Returns the pushforward program `(ẋ, r) ↦ ẏ` this callable closes over. Its inputs are the flat tangents
-    /// followed by the residuals carried by [`residuals`](Self::residuals).
-    pub fn program(
-        &self,
-    ) -> &Program<
-        <C as Domain>::Constant,
-        <C as Domain>::Operation,
-        Vec<<C as Domain>::Constant>,
-        Vec<<C as Domain>::Constant>,
-    > {
-        &self.program
-    }
-
-    /// Returns the linearization-point residuals `r` this callable closes over, aligned with the trailing inputs of
-    /// [`program`](Self::program).
-    pub fn residuals(&self) -> &[<C as Domain>::Value] {
-        &self.residuals
-    }
-
-    /// Consumes this [`Pushforward`] and returns its open parts: the pushforward program `(ẋ, r) ↦ ẏ` and the
-    /// linearization-point residuals `r` its trailing inputs consume, in that order. This is how reverse mode opens
-    /// the closure back up: [`Differentiate::vjp`] linearizes, takes the parts, and transposes the program.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Program<
-            <C as Domain>::Constant,
-            <C as Domain>::Operation,
-            Vec<<C as Domain>::Constant>,
-            Vec<<C as Domain>::Constant>,
-        >,
-        Vec<<C as Domain>::Value>,
-    ) {
-        (self.program, self.residuals)
-    }
-
-    /// Pushes the structured tangents `tangents` through the linearized Jacobian, returning the tangent outputs.
-    ///
-    /// The tangents are flattened, the linearization-point residuals are appended, the pushforward program is
-    /// interpreted at that vector in the differentiation context this linearization was built in — the single replay
-    /// path for both context flavors: an eager domain interprets the pushforward immediately, while a staging domain
-    /// stages it into the enclosing trace and returns tracers — and the flat tangent outputs are reshaped against the
-    /// closure's output structure.
-    ///
-    /// # Parameters
-    ///
-    ///   - `tangents`: Structured tangents at the linearization point, matching the closure's input structure.
-    pub fn apply(
-        &self,
-        tangents: Input::To<<C as Domain>::Value>,
-    ) -> Result<TracedOutput::To<<C as Domain>::Value>, ProgramError> {
-        let mut inputs = tangents.into_parameters().collect::<Vec<_>>();
-        inputs.extend(self.residuals.iter().cloned());
-        let tangent_outputs = self.program.interpret_in_context(&self.context, inputs)?;
-        Ok(TracedOutput::To::<<C as Domain>::Value>::from_parameters(self.output_structure.clone(), tangent_outputs)?)
-    }
-}
-
-/// A reusable reverse-mode linear map produced by [`Differentiate::vjp`]: it wraps the pullback program and
-/// linearization-point residuals that [`Differentiate::vjp`] returns behind a callable that maps output
-/// cotangents to input cotangents — the JAX `vjp` analogue.
-///
-/// The raw [`vjp`](Differentiate::vjp) returns a pullback program plus the residuals it consumes; reconstructing
-/// the input cotangents means appending the residuals to the output cotangents, interpreting the pullback, and reshaping
-/// the flat result against the closure's input structure. [`apply`](Self::apply) performs exactly those steps, so callers
-/// hold one callable instead of threading the residuals by hand.
-///
-/// The differentiation context `C` supplies the value semantics and operation family; `Input` is the closure's
-/// structured input type, whose [`ParameterStructure`](crate::parameters::Parameterized::ParameterStructure) is retained
-/// so the flat input cotangents reshape back into `Input::To<<C as Domain>::Value>`. `TracedOutput` is the closure's structured
-/// output type, carried as a type parameter so [`apply`](Self::apply) infers the cotangent family from the pullback
-/// itself rather than requiring a turbofish.
-pub struct Pullback<C, Input, TracedOutput>
-where
-    C: Domain,
-    Input: Parameterized<<C as Domain>::Value>,
-{
-    /// Differentiation context the pullback was built in; [`apply`](Self::apply) replays the pullback program in it,
-    /// mirroring how [`Pushforward`] replays its pushforward program.
-    context: C,
-
-    /// Pullback program over the primal operation family in the context's staged [`Constant`](Domain::Constant)
-    /// space, mapping `[output_cotangents ++ residuals]` to flat input cotangents. Its literal constants are lifted
-    /// through the context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
-    program: Program<
-        <C as Domain>::Constant,
-        <C as Domain>::Operation,
-        Vec<<C as Domain>::Constant>,
-        Vec<<C as Domain>::Constant>,
-    >,
-
-    /// Linearization-point residuals consumed by [`program`](Self::program), appended after the output cotangents when
-    /// interpreting it.
-    residuals: Vec<<C as Domain>::Value>,
-
-    /// Parameter structure of the closure's input, used to reshape the flat input cotangents.
-    input_structure: Input::ParameterStructure,
-
-    /// Encodes the closure's output family `TracedOutput` so [`apply`](Self::apply) can flatten the cotangents without a
-    /// turbofish. Covariant and ownership-free.
-    marker: PhantomData<fn() -> TracedOutput>,
-}
-
-impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>
-where
-    C: Context,
-    <C as Domain>::Operation: Clone,
-    Input: Parameterized<<C as Domain>::Value>,
-    Input::Family: ParameterizedFamily<<C as Domain>::Value>,
-    TracedOutput: Parameterized<<C as Domain>::Value>,
-{
-    /// Returns the pullback program `(ȳ, r) ↦ x̄` this callable closes over. Its inputs are the flat output
-    /// cotangents followed by the residuals carried by [`residuals`](Self::residuals).
-    pub fn program(
-        &self,
-    ) -> &Program<
-        <C as Domain>::Constant,
-        <C as Domain>::Operation,
-        Vec<<C as Domain>::Constant>,
-        Vec<<C as Domain>::Constant>,
-    > {
-        &self.program
-    }
-
-    /// Returns the linearization-point residuals `r` this callable closes over, aligned with the trailing inputs of
-    /// [`program`](Self::program).
-    pub fn residuals(&self) -> &[<C as Domain>::Value] {
-        &self.residuals
-    }
-
-    /// Consumes this [`Pullback`] and returns its open parts: the pullback program `(ȳ, r) ↦ x̄` and the
-    /// linearization-point residuals `r` its trailing inputs consume, in that order — the raw form that
-    /// [`Differentiate::vjp`] returns directly, mirroring [`Pushforward::into_parts`].
-    pub fn into_parts(
-        self,
-    ) -> (
-        Program<
-            <C as Domain>::Constant,
-            <C as Domain>::Operation,
-            Vec<<C as Domain>::Constant>,
-            Vec<<C as Domain>::Constant>,
-        >,
-        Vec<<C as Domain>::Value>,
-    ) {
-        (self.program, self.residuals)
-    }
-
-    /// Pulls the structured output cotangents `cotangents` back to the closure's input cotangents.
-    ///
-    /// The cotangents are flattened, the linearization-point residuals are appended, the pullback program is
-    /// interpreted at that vector in the differentiation context this pullback was built in — the single replay path
-    /// for both context flavors: an eager domain (a stateless [`EagerContext`](crate::contexts::EagerContext) or a
-    /// backend domain such as a PJRT-client-backed one) interprets the pullback immediately, while a staging domain
-    /// stages it into the enclosing trace — and the flat input cotangents are reshaped against the closure's input
-    /// structure.
-    ///
-    /// # Parameters
-    ///
-    ///   - `cotangents`: Structured output cotangents, matching the closure's output structure.
-    pub fn apply(
-        &self,
-        cotangents: TracedOutput::To<<C as Domain>::Value>,
-    ) -> Result<Input::To<<C as Domain>::Value>, ProgramError> {
-        let mut inputs = cotangents.into_parameters().collect::<Vec<_>>();
-        inputs.extend(self.residuals.iter().cloned());
-        let input_cotangents = self.program.interpret_in_context(&self.context, inputs)?;
-        Ok(Input::To::<<C as Domain>::Value>::from_parameters(self.input_structure.clone(), input_cotangents)?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::operations::scalars::ScalarOperation;
@@ -1022,7 +782,7 @@ mod tests {
 
         let (output, pushforward) = domain.linearize(|x| Ok(function(x)), Scalar::from(3.0)).unwrap();
         assert_scalar_close(output, 9.0);
-        let program = pushforward.program.to_string();
+        let program = pushforward.program().to_string();
         assert!(program.contains("mul"), "{program}");
         assert!(
             !program.contains("sin") && !program.contains("cos"),

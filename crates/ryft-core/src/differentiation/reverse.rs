@@ -47,9 +47,11 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     /// Parameter structure of the closure's input, used to reshape the flat input cotangents.
     input_structure: Input::ParameterStructure,
 
-    // TODO(eaplatanios): Why is there an `input_structure` but no `output_structure` here?
     /// Encodes the closure's output family `Output` so that [`apply`](Self::apply) can flatten the cotangents without
-    /// a turbofish. Covariant and ownership-free.
+    /// a turbofish. No `Output::ParameterStructure` is stored alongside it because [`apply`](Self::apply) only
+    /// _flattens_ its structured cotangent argument, which needs no stored structure, and rebuilds structure only on
+    /// the input-cotangent side through `input_structure`. [`Pushforward`](crate::Pushforward) mirrors this with a
+    /// stored output structure and a phantom `Input`.
     marker: PhantomData<fn() -> Output>,
 }
 
@@ -59,18 +61,34 @@ impl<
     Output: Parameterized<C::Value>,
 > Pullback<C, Input, Output>
 {
-    /// Creates a new [`Pullback`] closing `program` over the linearization-point `residuals`. The caller must uphold
-    /// the contract documented on [`Pullback`] where `program` consumes the flat output cotangents followed by
-    /// `residuals` and produces the flat input cotangents that `input_structure` reshapes.
-    #[inline]
+    /// Creates a new [`Pullback`] closing `program` over the linearization-point `residuals`, validating the contract
+    /// documented on [`Pullback`] where `program` consumes the flat output cotangents followed by `residuals` and
+    /// produces the flat input cotangents that `input_structure` reshapes. Violations are reported as
+    /// [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few program inputs to hold the residuals,
+    /// or a trailing residual input whose type differs from the type of the residual value that feeds it.
     pub fn new(
         context: C,
         program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         residuals: Vec<C::Value>,
         input_structure: Input::ParameterStructure,
-    ) -> Self {
-        // TODO(eaplatanios): Can we make this return a `Result` similar to `Linearization::new`?
-        Self { context, program, residuals, input_structure, marker: PhantomData }
+    ) -> Result<Self, ProgramError> {
+        let cotangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "pullback program consumes {} inputs which is fewer than its {} residuals",
+                program.input_ids().len(),
+                residuals.len(),
+            ))
+        })?;
+        for (index, (input, residual)) in program.inputs().skip(cotangent_input_count).zip(&residuals).enumerate() {
+            if input.r#type().as_ref() != residual.r#type().as_ref() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pullback residual {index} has type {} in the pullback program but carries a value of type {}",
+                    input.r#type(),
+                    residual.r#type(),
+                )));
+            }
+        }
+        Ok(Self { context, program, residuals, input_structure, marker: PhantomData })
     }
 
     /// Returns the pullback [`Program`] `(ȳ, r) ↦ x̄` that this callable closes over. Its inputs are the flat output

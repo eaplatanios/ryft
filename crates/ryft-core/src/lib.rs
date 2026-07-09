@@ -39,7 +39,7 @@ pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolutio
 pub use differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDual, DifferentiationError, DifferentiationTracer, LinearizableProgramOperation, Linearization,
-    LinearizationTracer, TransposableOperation, TransposableProgramOperation,
+    LinearizationTracer, Pullback, Pushforward, TransposableOperation, TransposableProgramOperation,
 };
 pub use effects::{Effect, Effects};
 pub use errors::{CustomError, Error};

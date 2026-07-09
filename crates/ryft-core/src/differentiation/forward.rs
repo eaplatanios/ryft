@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Display};
+use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
@@ -7,7 +8,7 @@ use crate::differentiation::{DifferentiableType, TransposableOperation};
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{Zero, ZeroOperation};
-use crate::parameters::Parameter;
+use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::PartialEvaluationContext;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::types::Typed;
@@ -220,6 +221,120 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
         let tangent_input_count = self.tangent.input_ids().len() - self.residual_count;
         let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
         self.tangent.transpose_with_respect_to(with_respect_to.as_slice())
+    }
+}
+
+/// Pushforward of a function `f` at a linearization point `x` (i.e., the linear map `ẋ ↦ (∂f/∂x)(x) · ẋ`), packaged
+/// as a reusable callable. This is what [`Differentiate::linearize`] returns (i.e., the analogue of
+/// [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)), and it is the forward-mode
+/// dual of [`Pullback`](crate::Pullback), whose callable applies the transposed map `ȳ ↦ (∂f/∂x)(x)ᵀ · ȳ` instead.
+/// It wraps the pushforward program `(ẋ, r) ↦ ẏ` accumulated while partially evaluating the differentiated closure,
+/// closed over the residuals `r` recovered at the linearization point. [`apply`](Self::apply) computes
+/// `ẏ = (∂f/∂x)(x) · ẋ` by appending the residuals to the flattened tangents `ẋ`, interpreting the pushforward program,
+/// and reshaping the flat tangent outputs against the closure's output structure. It thus pushes any number of tangents
+/// through the function's Jacobian without re-tracing or re-differentiating (e.g., replaying every coordinate basis
+/// tangent to build a Jacobian), amortizing the cost of differentiating once over many tangent applications.
+///
+/// The context `C` supplies the value semantics and operation family, `Input` is the closure's structured input type,
+/// and `Output` is its structured output type, whose [`ParameterStructure`](Parameterized::ParameterStructure) is
+/// retained so that the flat tangent outputs reshape back into `Output::To<C::Value>`. `Input` is carried as a type
+/// parameter so that [`apply`](Self::apply) infers the tangent family from the pushforward itself rather than requiring
+/// a turbofish.
+pub struct Pushforward<C: Context, Input, Output: Parameterized<C::Value>> {
+    /// [`Context`] that the pushforward was built in. [`apply`](Self::apply) replays the pushforward program in it,
+    /// mirroring how [`Pullback`](crate::Pullback) replays its pullback program.
+    context: C,
+
+    /// Pushforward [`Program`] over the primal operation family in the context's staged [`Constant`](Domain::Constant)
+    /// space, mapping `[tangents ++ residuals]` to the flat tangent outputs. Its literal constants are lifted through
+    /// the context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
+    program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+
+    /// Linearization-point residuals consumed by [`program`](Self::program), appended after the tangents when
+    /// interpreting it.
+    residuals: Vec<C::Value>,
+
+    /// Parameter structure of the closure's output, used to reshape the flat tangent outputs.
+    output_structure: Output::ParameterStructure,
+
+    /// Encodes the closure's input family `Input` so that [`apply`](Self::apply) can flatten the tangents without a
+    /// turbofish. No `Input::ParameterStructure` is stored alongside it because [`apply`](Self::apply) only _flattens_
+    /// its structured tangent argument, which needs no stored structure, and rebuilds structure only on the
+    /// tangent-output side through `output_structure`. [`Pullback`](crate::Pullback) mirrors this with a stored input
+    /// structure and a phantom `Output`.
+    marker: PhantomData<fn() -> Input>,
+}
+
+impl<
+    C: Context<Operation: Clone>,
+    Input: Parameterized<C::Value>,
+    Output: Parameterized<C::Value, Family: ParameterizedFamily<C::Value>>,
+> Pushforward<C, Input, Output>
+{
+    /// Creates a new [`Pushforward`] closing `program` over the linearization-point `residuals`, validating the
+    /// contract documented on [`Pushforward`] where `program` consumes the flat tangents followed by `residuals`
+    /// and produces the flat tangent outputs that `output_structure` reshapes. Violations are reported as
+    /// [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few program inputs to hold the residuals,
+    /// or a trailing residual input whose type differs from the type of the residual value that feeds it.
+    pub fn new(
+        context: C,
+        program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        residuals: Vec<C::Value>,
+        output_structure: Output::ParameterStructure,
+    ) -> Result<Self, ProgramError> {
+        let tangent_input_count = program.input_ids().len().checked_sub(residuals.len()).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "pushforward program consumes {} inputs which is fewer than its {} residuals",
+                program.input_ids().len(),
+                residuals.len(),
+            ))
+        })?;
+        for (index, (input, residual)) in program.inputs().skip(tangent_input_count).zip(&residuals).enumerate() {
+            if input.r#type().as_ref() != residual.r#type().as_ref() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "pushforward residual {index} has type {} in the pushforward program \
+                     but carries a value of type {}",
+                    input.r#type(),
+                    residual.r#type(),
+                )));
+            }
+        }
+        Ok(Self { context, program, residuals, output_structure, marker: PhantomData })
+    }
+
+    /// Returns the pushforward [`Program`] `(ẋ, r) ↦ ẏ` that this callable closes over. Its inputs are the flat
+    /// tangents followed by the residuals carried by [`residuals`](Self::residuals).
+    #[inline]
+    pub fn program(&self) -> &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>> {
+        &self.program
+    }
+
+    /// Returns the linearization-point residuals `r` that this callable closes over, aligned with the trailing inputs
+    /// of [`program`](Self::program).
+    #[inline]
+    pub fn residuals(&self) -> &[C::Value] {
+        &self.residuals
+    }
+
+    /// Consumes this [`Pushforward`] and returns its open parts: the pushforward program `(ẋ, r) ↦ ẏ` and the
+    /// linearization-point residuals `r` its trailing inputs consume, in that order.
+    #[inline]
+    pub fn into_parts(self) -> (Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>, Vec<C::Value>) {
+        (self.program, self.residuals)
+    }
+
+    /// Pushes the structured tangents `tangents` through the linearized Jacobian, returning the tangent outputs. The
+    /// tangents are flattened, the linearization-point residuals are appended, the pushforward program is interpreted
+    /// at that vector in the context that this pushforward was built in (i.e., the single replay path for both context
+    /// flavors: an eager context interprets the pushforward immediately, while a staging context stages it into the
+    /// enclosing trace and returns tracers), and the flat tangent outputs are reshaped against the closure's output
+    /// structure.
+    #[inline]
+    pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError> {
+        let mut inputs = tangents.into_parameters().collect::<Vec<_>>();
+        inputs.extend(self.residuals.iter().cloned());
+        let tangent_outputs = self.program.interpret_in_context(&self.context, inputs)?;
+        Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), tangent_outputs)?)
     }
 }
 
