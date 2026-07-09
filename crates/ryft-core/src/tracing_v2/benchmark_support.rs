@@ -10,7 +10,7 @@ use crate::tracing_v2::Differentiate;
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::types::{DataType, Type};
+use crate::types::Type;
 
 /// Returns the tracing-only IR benchmark cases.
 pub(crate) fn cases() -> Vec<BenchmarkCase> {

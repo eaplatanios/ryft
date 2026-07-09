@@ -1253,7 +1253,7 @@ where
     }
 }
 
-/// A reusable reverse-mode linear map produced by [`Differentiate::vjp_fn`]: it wraps the pullback program and
+/// A reusable reverse-mode linear map produced by [`Differentiate::vjp`]: it wraps the pullback program and
 /// linearization-point residuals that [`Differentiate::vjp`] returns behind a callable that maps output
 /// cotangents to input cotangents — the JAX `vjp` analogue.
 ///

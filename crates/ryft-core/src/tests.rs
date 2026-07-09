@@ -1372,12 +1372,12 @@ mod differentiation_tests {
     }
 
     #[test]
-    fn test_vjp_fn_scalar_matches_raw_vjp() {
+    fn test_vjp_pullback_apply_scalar_matches_raw_parts() {
         use crate::contexts::EagerContext;
         use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
-        // The `vjp_fn` callable surface must reproduce the raw `vjp` pullback: interpreting the raw pullback manually at
+        // The `Pullback::apply` callable surface must reproduce the raw opened parts: interpreting the raw pullback manually at
         // `[cotangent ++ residuals]` and applying `Pullback::apply` to the same cotangent must agree, for two distinct
         // cotangents. `f(x) = x * sin(x)`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
@@ -1399,12 +1399,12 @@ mod differentiation_tests {
     }
 
     #[test]
-    fn test_vjp_fn_array_multi_input_matches_raw_vjp() {
+    fn test_vjp_pullback_apply_array_multi_input_matches_raw_parts() {
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
 
-        // The array-domain, multi-input `vjp_fn`: `f(a, b) = a * b` returns one scalar output whose pullback maps the
+        // The array-domain, multi-input `Pullback::apply`: `f(a, b) = a * b` returns one scalar output whose pullback maps the
         // output cotangent to `(b * cotangent, a * cotangent)`. The callable's reshaped input cotangents must match the
         // raw pullback interpreted manually.
         let context = crate::contexts::EagerContext::<TestArray, ArrayOperation<TestArray>>::new();

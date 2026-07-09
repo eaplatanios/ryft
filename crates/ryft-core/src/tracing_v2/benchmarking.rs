@@ -519,12 +519,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::Context;
+    use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
     use crate::scalars::Scalar;
-    use crate::types::DataType;
 
     use super::*;
 
@@ -536,7 +535,7 @@ mod tests {
             .interpret_and_trace(
                 |x| {
                     let with_constant = x.clone() + x.context().constant(Scalar::from(1.0));
-                    Ok(with_constant.sin())
+                    with_constant.sin()
                 },
                 Scalar::from(2.0),
             )
