@@ -376,21 +376,20 @@ impl<C: Context<Operation: Clone>> PartialEvaluation<C> {
 /// [`PartialEvaluationContext::inline_partitioned_program`] to inline it as part of an ongoing partial evaluation
 /// transform.
 pub struct PartitionedProgram<V: Value, O: Operation<V::Type>> {
-    // TODO(eaplatanios): Can we make (and should we make) all these fields fully private?
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
-    pub(crate) known_program: Program<V, O, Vec<V>, Vec<V>>,
+    known_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Refer to the documentation of [`residual_program`](Self::residual_program) for more information.
-    pub(crate) residual_program: Program<V, O, Vec<V>, Vec<V>>,
+    residual_program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Refer to the documentation of [`known_input_indices`](Self::known_input_indices) for more information.
-    pub(crate) known_input_indices: Vec<usize>,
+    known_input_indices: Vec<usize>,
 
     /// Refer to the documentation of [`residual_inputs`](Self::residual_inputs) for more information.
-    pub(crate) residual_inputs: Vec<PartialEvaluationInput<usize>>,
+    residual_inputs: Vec<PartialEvaluationInput<usize>>,
 
     /// Refer to the documentation of [`outputs`](Self::outputs) for more information.
-    pub(crate) outputs: Vec<PartialEvaluationOutput<usize>>,
+    outputs: Vec<PartialEvaluationOutput<usize>>,
 }
 
 impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
@@ -438,6 +437,23 @@ impl<V: Value, O: Operation<V::Type>> PartitionedProgram<V, O> {
     #[inline]
     pub fn outputs(&self) -> &[PartialEvaluationOutput<usize>] {
         &self.outputs
+    }
+
+    /// Consumes this [`PartitionedProgram`] and returns its [`known_program`](Self::known_program),
+    /// [`residual_program`](Self::residual_program), [`known_input_indices`](Self::known_input_indices),
+    /// [`residual_inputs`](Self::residual_inputs), and [`outputs`](Self::outputs), in that order.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub fn into_parts(
+        self,
+    ) -> (
+        Program<V, O, Vec<V>, Vec<V>>,
+        Program<V, O, Vec<V>, Vec<V>>,
+        Vec<usize>,
+        Vec<PartialEvaluationInput<usize>>,
+        Vec<PartialEvaluationOutput<usize>>,
+    ) {
+        (self.known_program, self.residual_program, self.known_input_indices, self.residual_inputs, self.outputs)
     }
 }
 

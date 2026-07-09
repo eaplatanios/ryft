@@ -2099,7 +2099,7 @@ mod tests {
         // their mask entries are false, so they must pass tangents through unchanged in the forward scan and cotangents
         // through unchanged in the transposed scan. Locally `f(x) = 8 x`: value 8, gradient 8.
         let while_operation = bounded_doubling_while_operation(8.0, 5);
-        let (output, pullback, residuals) = StagedDispatchTestArrayDomain
+        let (output, pullback) = StagedDispatchTestArrayDomain
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -2109,6 +2109,7 @@ mod tests {
                 TestArray::scalar(1.0),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![8.0]);
 
         // The pullback contains the transposed (reversed) linear scan and no while loop, and every cotangent seed
@@ -2159,7 +2160,7 @@ mod tests {
         // items `[2, 4, 16, 0]` — including the zero batch item beyond the trip count, which the mask must keep inert
         // in both directions. Locally `f(x) = x⁸`: value 256 and gradient `8 x⁷ = 1024`.
         let while_operation = bounded_squaring_while_operation(100.0, 4);
-        let (output, pullback, residuals) = StagedDispatchTestArrayDomain
+        let (output, pullback) = StagedDispatchTestArrayDomain
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -2169,6 +2170,7 @@ mod tests {
                 TestArray::scalar(2.0),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![256.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
@@ -2514,9 +2516,10 @@ mod tests {
 
         // ... and reverse mode composes through the masked linear scan: the pullback contains the reversed scan
         // and no while loop, and the per-item gradients match the tangent scales.
-        let (output, pullback, residuals) = StagedDispatchTestArrayDomain
+        let (output, pullback) = StagedDispatchTestArrayDomain
             .vjp(batched_bounded_while, TestArray::vector(vec![1.0, 5.0, 9.0]))
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![8.0, 10.0, 9.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");

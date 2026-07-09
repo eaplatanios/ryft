@@ -2266,7 +2266,8 @@ mod tests {
         let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(
             |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.clone() * x).sin()?),
         );
-        let (_, pullback, residuals) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let (_, pullback) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         let mut pullback_inputs = vec![TestArray::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let output = pullback.interpret(pullback_inputs).unwrap();

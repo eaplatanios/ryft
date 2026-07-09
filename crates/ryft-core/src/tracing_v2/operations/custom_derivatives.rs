@@ -1996,7 +1996,8 @@ mod tests {
             |x: DomainTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok(residual * cotangent),
         );
-        let (_, pullback, residuals) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let (_, pullback) = domain.vjp(|x| function.call(x), TestArray::scalar(0.7)).unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         let mut pullback_inputs = vec![TestArray::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret(pullback_inputs).unwrap();

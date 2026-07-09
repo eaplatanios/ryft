@@ -879,7 +879,8 @@ where
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
-    let (output, pullback, residuals) = context.vjp(function, primals)?;
+    let (output, pullback) = context.vjp(function, primals)?;
+    let (pullback, residuals) = pullback.into_parts();
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
     let output_shapes = output_parameters

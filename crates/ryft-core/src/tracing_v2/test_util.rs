@@ -765,7 +765,7 @@ mod tests {
         // straight-line pushforward into a reusable pullback (no `while` remains). The loop is locally `f(x) = 8 x`,
         // so every output cotangent is scaled by 8.
         let while_operation = doubling_while_operation().with_iteration_bound(5).unwrap();
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -775,6 +775,7 @@ mod tests {
                 TestArray::scalar(1.0),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![8.0]);
         assert!(!pullback.to_string().contains("while"), "{pullback}");
         let pullback_inputs = |cotangent: TestArray| {
@@ -801,7 +802,7 @@ mod tests {
         // Eager `vjp` transposes the unrolled straight-line pushforward of an *unbounded* loop into a reusable
         // pullback: the doubling loop at `x = 1` is locally `f(x) = 8 x`, so every output cotangent is scaled by 8.
         let while_operation = doubling_while_operation();
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |x| {
                     let mut outputs =
@@ -811,6 +812,7 @@ mod tests {
                 TestArray::scalar(1.0),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![8.0]);
         let pullback_inputs = |cotangent: TestArray| {
             let mut inputs = vec![cotangent];
@@ -882,7 +884,7 @@ mod tests {
         // scan: the same residual stacks with `reverse` flipped to `true`. Each cotangent seed scales the
         // hand-computed gradients `(24, [12, 8, 6])`.
         let scan = product_scan_operation(false);
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -892,6 +894,7 @@ mod tests {
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![24.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
@@ -937,7 +940,7 @@ mod tests {
         // Reverse mode through the reversed scan flips `reverse` back to `false` in the pullback and produces the
         // same product-rule gradients (multiplication commutes across the visit order).
         let scan = product_scan_operation(true);
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
@@ -947,6 +950,7 @@ mod tests {
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![24.0]);
         let rendered_pullback = pullback.to_string();
         assert!(rendered_pullback.contains("reverse=false"), "{rendered_pullback}");
@@ -977,7 +981,7 @@ mod tests {
         // transpose rule: the pullback runs the transposed branch program selected by the captured predicate, so
         // the operand cotangent is 2 * output cotangent at a TRUE-predicate primal point and 3 * output cotangent
         // at a FALSE one. The Boolean predicate has no tangent space, so its cotangent slot is always zero.
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 |(predicate, operand)| {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
@@ -989,6 +993,7 @@ mod tests {
                 (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]), TestArray::scalar(4.0)),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![8.0]);
         let mut pullback_inputs = vec![TestArray::scalar(5.0)];
         pullback_inputs.extend(residuals);
@@ -996,7 +1001,7 @@ mod tests {
         assert_eq!(cotangents[1].values, vec![10.0]);
         assert_eq!(cotangents[0].values, vec![0.0]);
 
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 |(predicate, operand)| {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
@@ -1008,6 +1013,7 @@ mod tests {
                 (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]), TestArray::scalar(4.0)),
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![12.0]);
         let mut pullback_inputs = vec![TestArray::scalar(5.0)];
         pullback_inputs.extend(residuals);

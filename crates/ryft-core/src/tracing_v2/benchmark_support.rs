@@ -1,6 +1,6 @@
 use std::ops::{Add, Mul, Neg};
 
-use crate::contexts::Context;
+use crate::contexts::{Context, EagerContext};
 use crate::differentiation::DifferentiationError;
 use crate::operations::scalars::ScalarOperation;
 use crate::operations::trigonometric::{Cos, Sin};
@@ -97,9 +97,9 @@ fn emit_scalar_bilinear_sin_jit() -> Result<Vec<IrBenchmarkRecord>, BenchmarkErr
 
 /// Emits the staged scalar bilinear pullback benchmark.
 fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pullback): (Scalar, Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>) =
-        EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-            .vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?), (Scalar::from(2.0), Scalar::from(3.0)))?;
+    let (_, pullback): (Scalar, _) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+        .vjp(|inputs| Ok(inputs.0.clone() * inputs.1 + inputs.0.sin()?), (Scalar::from(2.0), Scalar::from(3.0)))?;
+    let (pullback, _residuals) = pullback.into_parts();
     Ok(vec![tracing_record("scalar_bilinear_sin_vjp_pullback", "vjp_pullback", &pullback)?])
 }
 

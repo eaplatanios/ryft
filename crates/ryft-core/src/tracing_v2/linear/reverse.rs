@@ -123,8 +123,9 @@ where
     Aux: Parameterized<<C as Domain>::Value, To<<C as Domain>::Value> = Aux>,
 {
     let input_structure = primals.parameter_structure();
-    let ((output, aux), pullback, residuals): ((<C as Domain>::Value, Aux), _, _) =
+    let ((output, aux), pullback): ((<C as Domain>::Value, Aux), _) =
         context.vjp(|input| Ok(function(input)), primals)?;
+    let (pullback, residuals) = pullback.into_parts();
     // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
     // (see `DifferentiationError::NonScalarGradientOutput`).
     if !output.r#type().is_scalar() {

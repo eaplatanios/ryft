@@ -286,9 +286,10 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_transposition_moves_the_cotangent_back_to_the_source_memory() {
-        let (output, pullback, residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)), TestArray::vector(vec![2.0, 3.0]))
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(output.values, vec![2.0, 3.0]);
         // The linear transfer carries no residual, so the direct-transpose pullback consumes only the pinned-host
         // cotangent and transfers it back to the operand's source memory.

@@ -225,7 +225,7 @@ mod tests {
         let input = TestArray::new(vector_type(8).with_sharding(input_sharding.clone()).unwrap(), vec![1.0; 8]);
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
-        let (_output, pullback, _residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (_output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 {
                     let target = target.clone();
@@ -236,6 +236,7 @@ mod tests {
                 input,
             )
             .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
 
         let staged = pullback
             .instructions()
@@ -254,7 +255,7 @@ mod tests {
         let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         // The input carries no sharding, so the reshard's cotangent flows back unconstrained — the pullback stages no
         // reshard transposition at all.
-        let (_output, pullback, _residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (_output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 {
                     let target = target.clone();
@@ -265,6 +266,7 @@ mod tests {
                 TestArray::vector(vec![1.0; 8]),
             )
             .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         assert!(
             !pullback
                 .instructions()
@@ -310,7 +312,7 @@ mod tests {
         // The hint targets the auto axis `a`. The constraint is self-adjoint, so its transpose re-applies the same
         // hint to the cotangent rather than dualizing it.
         let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let (_output, pullback, _residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (_output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(
                 {
                     let hint = hint.clone();
@@ -321,6 +323,7 @@ mod tests {
                 TestArray::vector(vec![1.0; 8]),
             )
             .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let staged = pullback
             .instructions()
             .iter()

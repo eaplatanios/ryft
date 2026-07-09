@@ -13,7 +13,7 @@ use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationValue, PartialTracer, PartialValue,
-    PartiallyEvaluatableOperation, PartitionedProgram,
+    PartiallyEvaluatableOperation,
 };
 use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
@@ -271,84 +271,31 @@ pub trait Differentiate: Context {
         Ok((output, pushforward))
     }
 
-    /// Returns the primal output, a pullback program, and the linearization-point residuals.
+    /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`] —
+    /// the JAX `vjp` analogue.
     ///
-    /// This is the value-level reverse-mode transform: [`linearize`](Self::linearize)'s dual-driven core followed by
-    /// transposition, exactly JAX's `vjp = linearize + transpose`. The closure runs once on [`DifferentiationTracer`]
-    /// duals over a [`PartialEvaluationContext`] wrapping this context (primal halves known, tangent halves unknown),
-    /// which executes the primal work through this context — recovering the primal outputs and the residual values at
-    /// the linearization point — while accumulating the linear pushforward program `(ẋ, r) ↦ ẏ`; that program is then
+    /// This is the value-level reverse-mode transform: [`linearize`](Self::linearize) followed by transposition,
+    /// exactly JAX's `vjp = linearize + transpose`. The closure runs once on [`DifferentiationTracer`] duals over a
+    /// [`PartialEvaluationContext`] wrapping this context (primal halves known, tangent halves unknown), which
+    /// executes the primal work through this context — recovering the primal outputs and the residual values at the
+    /// linearization point — while accumulating the linear pushforward program `(ẋ, r) ↦ ẏ`; that program is then
     /// transposed with respect to its leading tangent inputs, holding the trailing residuals as known parameters. The
-    /// resulting pullback stays in this context's staged [`Constant`](Domain::Constant) space; interpreting it through
-    /// [`Program::interpret_in_context`] lifts its literal constants through this context's [`lift`](Context::lift)
-    /// at replay time, which is what serves reverse mode *under tracing*: in an eager context the lift is the
-    /// identity, while in a staging context (whose values are [`Tracer`]s) it records the pullback's constants in the
-    /// enclosing trace, so the backward pass splices into that trace. Host control flow on primals works exactly as
-    /// under [`linearize`](Self::linearize) (JAX's `grad`-allows-Python-control-flow property).
+    /// resulting pullback program stays in this context's staged [`Constant`](Domain::Constant) space; interpreting
+    /// it through [`Program::interpret_in_context`] lifts its literal constants through this context's
+    /// [`lift`](Context::lift) at replay time, which is what serves reverse mode *under tracing*: in an eager context
+    /// the lift is the identity, while in a staging context (whose values are [`Tracer`]s) it records the pullback's
+    /// constants in the enclosing trace, so the backward pass splices into that trace. Host control flow on primals
+    /// works exactly as under [`linearize`](Self::linearize) (JAX's `grad`-allows-Python-control-flow property).
     ///
-    /// The returned pullback is a flat program over the primal operation family that maps
-    /// `(output_cotangents ++ residuals)` to flat input cotangents. Because the direct-transpose pullback consumes the
-    /// residuals as ordinary inputs rather than folding them in at transpose time, the recovered residuals are returned
-    /// alongside the pullback so a caller appends them to the output cotangents when interpreting it, then reshapes the
-    /// flat input cotangents through [`Parameterized::from_parameters`] against the closure's input structure.
+    /// The returned [`Pullback`] closes the transposed program over the linearization-point residuals, so
+    /// [`Pullback::apply`] maps output cotangents to input cotangents — appending the residuals, interpreting the
+    /// program, and reshaping the flat input cotangents against the closure's input structure — without the caller
+    /// threading the residuals by hand. Consumers that need the open parts (e.g., to batch-replay or seed the
+    /// pullback program manually) recover them with [`Pullback::into_parts`].
     ///
     /// Functions reaching operations outside the supported straight-line slice fail with an
     /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
     fn vjp<F, Input, TracedOutput>(
-        &self,
-        function: F,
-        primals: Input,
-    ) -> Result<
-        (
-            TracedOutput::To<<Self as Domain>::Value>,
-            Program<
-                <Self as Domain>::Constant,
-                <Self as Domain>::Operation,
-                Vec<<Self as Domain>::Constant>,
-                Vec<<Self as Domain>::Constant>,
-            >,
-            Vec<<Self as Domain>::Value>,
-        ),
-        ProgramError,
-    >
-    where
-        <Self as Domain>::Type: DifferentiableType,
-        <Self as Domain>::Constant: Value<Type = <Self as Domain>::Type>,
-        <Self as Domain>::Operation: Clone
-            + TransposableOperation<<Self as Domain>::Constant, <Self as Domain>::Operation>
-            + PartiallyEvaluatableOperation<Self>
-            + From<ZeroOperation<<Self as Domain>::Type>>
-            + From<AddOperation>
-            + DifferentiableOperation<PartialEvaluationContext<Self>>,
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Result<TracedOutput, ProgramError>,
-        Input: Parameterized<
-                <Self as Domain>::Value,
-                To<<Self as Domain>::Value> = Input,
-                Family: ParameterizedFamily<LinearizationTracer<Self>>,
-            >,
-        TracedOutput: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<<Self as Domain>::Value>>,
-    {
-        let (output, pushforward) = self.linearize(function, primals)?;
-        let (program, residuals) = pushforward.into_parts();
-
-        // Transpose the pushforward program with respect to its leading tangent inputs, holding the trailing residual
-        // inputs as known parameters. Partition-aware transposition threads each residual through to the pullback as
-        // a pullback input rather than folding it into a captured factor, so the pullback maps
-        // `(output_cotangents ++ residuals)` to the input cotangents.
-        let with_respect_to = (0..program.input_ids().len() - residuals.len()).collect::<Vec<_>>();
-        let pullback = program.transpose_with_respect_to(with_respect_to.as_slice())?;
-        Ok((output, pullback, residuals))
-    }
-
-    /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`] —
-    /// the JAX `vjp` analogue.
-    ///
-    /// This is the callable-surface sibling of [`vjp`](Self::vjp). It calls [`vjp`](Self::vjp) once and wraps the
-    /// returned pullback program and linearization-point residuals in a [`Pullback`], so [`Pullback::apply`] maps
-    /// output cotangents to input cotangents — appending the residuals, interpreting the pullback, and reshaping the
-    /// flat input cotangents against the closure's input structure — without the caller threading the residuals by
-    /// hand.
-    fn vjp_fn<F, Input, TracedOutput>(
         &self,
         function: F,
         primals: Input,
@@ -374,7 +321,15 @@ pub trait Differentiate: Context {
         TracedOutput: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<<Self as Domain>::Value>>,
     {
         let input_structure = primals.parameter_structure();
-        let (output, program, residuals) = self.vjp(function, primals)?;
+        let (output, pushforward) = self.linearize(function, primals)?;
+        let (program, residuals) = pushforward.into_parts();
+
+        // Transpose the pushforward program with respect to its leading tangent inputs, holding the trailing residual
+        // inputs as known parameters. Partition-aware transposition threads each residual through to the pullback as
+        // a pullback input rather than folding it into a captured factor, so the pullback maps
+        // `(output_cotangents ++ residuals)` to the input cotangents.
+        let with_respect_to = (0..program.input_ids().len() - residuals.len()).collect::<Vec<_>>();
+        let program = program.transpose_with_respect_to(with_respect_to.as_slice())?;
         Ok((output, Pullback { context: self.clone(), program, residuals, input_structure, marker: PhantomData }))
     }
 
@@ -405,8 +360,7 @@ pub trait Differentiate: Context {
                 Family: ParameterizedFamily<LinearizationTracer<Self>>,
             >,
     {
-        let input_structure = primals.parameter_structure();
-        let (output, pullback, residuals) = self.vjp(|input| Ok(function(input)), primals)?;
+        let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
         // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before
         // seeding (see `DifferentiationError::NonScalarGradientOutput`).
         if !output.r#type().is_scalar() {
@@ -415,20 +369,15 @@ pub trait Differentiate: Context {
         // Seed the single output cotangent with the multiplicative identity of the scalar output, typed with the
         // output's cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays) and staged through
         // `bind`. A non-differentiable scalar output (a Boolean or integer, the `float0` analogue) carries no cotangent
-        // space and thus no "one" to seed, so reverse mode is degenerate and is rejected up front. The direct-transpose
-        // pullback consumes `[output_cotangents ++ residuals]`, so the seed is followed by the linearization-point
-        // residuals; its flat input cotangents are reshaped against the closure's input structure.
+        // space and thus no "one" to seed, so reverse mode is degenerate and is rejected up front. The pullback then
+        // pulls the seed back to the input cotangents, reshaped against the closure's input structure.
         let output_cotangent_type = output.r#type().cotangent().ok_or_else(|| {
             DifferentiationError::NonDifferentiableGradientOutput { output_type: output.r#type().to_string() }
         })?;
         let one_operation = <Self as Domain>::Operation::from(OneOperation::new(output_cotangent_type));
         let mut seeds = self.bind(one_operation, &[])?;
         check_count!("output", seeds, 1, ProgramError);
-        let mut pullback_inputs = vec![seeds.pop().unwrap()];
-        pullback_inputs.extend(residuals);
-        let input_cotangents = pullback.interpret_in_context(self, pullback_inputs)?;
-        let gradient = Input::To::<<Self as Domain>::Value>::from_parameters(input_structure, input_cotangents)
-            .map_err(ProgramError::from)?;
+        let gradient = pullback.apply(seeds.pop().unwrap())?;
         Ok((output, gradient))
     }
 
@@ -1056,20 +1005,20 @@ where
         // residual program that survives is the linear tangent map.
         let input_known = [vec![true; primal_input_count], vec![false; primal_input_count]].concat();
         let partition = fused.partition(input_known.as_slice())?;
-        let residual_count = partition.residual_inputs.iter().filter(|input| input.is_known()).count();
+        let residual_count = partition.residual_inputs().iter().filter(|input| input.is_known()).count();
         let known_output_indices = partition
-            .outputs
+            .outputs()
             .iter()
             .enumerate()
             .filter_map(|(index, output)| output.is_known().then_some(index))
             .collect::<Vec<_>>();
         let residual_output_indices = partition
-            .outputs
+            .outputs()
             .iter()
             .enumerate()
             .filter_map(|(index, output)| output.is_unknown().then_some(index))
             .collect::<Vec<_>>();
-        let PartitionedProgram { mut known_program, residual_program, residual_inputs, .. } = partition;
+        let (mut known_program, residual_program, _, residual_inputs, _) = partition.into_parts();
 
         // The known program's outputs are the fully known fused outputs followed by the residual edges. Every primal
         // output must be known (the primals are all known, and effectful primal work folds into the known trace);
@@ -1214,12 +1163,12 @@ where
 {
     /// Differentiation context the linearization was built in; [`apply`](Self::apply) replays the pushforward program
     /// in it, mirroring how [`Pullback`] replays its pullback program.
-    pub(crate) context: C,
+    context: C,
 
     /// Pushforward program over the primal operation family in the context's staged [`Constant`](Domain::Constant)
     /// space, mapping `[tangents ++ residuals]` to flat tangent outputs. Its literal constants are lifted through the
     /// context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
-    pub(crate) program: Program<
+    program: Program<
         <C as Domain>::Constant,
         <C as Domain>::Operation,
         Vec<<C as Domain>::Constant>,
@@ -1228,14 +1177,14 @@ where
 
     /// Linearization-point residuals consumed by [`program`](Self::program), appended after the tangents when
     /// interpreting it.
-    pub(crate) residuals: Vec<<C as Domain>::Value>,
+    residuals: Vec<<C as Domain>::Value>,
 
     /// Parameter structure of the closure's output, used to reshape the flat tangent outputs.
-    pub(crate) output_structure: TracedOutput::ParameterStructure,
+    output_structure: TracedOutput::ParameterStructure,
 
     /// Encodes the closure's input family `Input` so [`apply`](Self::apply) can flatten the tangents without a
     /// turbofish. Covariant and ownership-free.
-    pub(crate) marker: PhantomData<fn() -> Input>,
+    marker: PhantomData<fn() -> Input>,
 }
 
 impl<C, Input, TracedOutput> Pushforward<C, Input, TracedOutput>
@@ -1325,12 +1274,12 @@ where
 {
     /// Differentiation context the pullback was built in; [`apply`](Self::apply) replays the pullback program in it,
     /// mirroring how [`Pushforward`] replays its pushforward program.
-    pub(crate) context: C,
+    context: C,
 
     /// Pullback program over the primal operation family in the context's staged [`Constant`](Domain::Constant)
     /// space, mapping `[output_cotangents ++ residuals]` to flat input cotangents. Its literal constants are lifted
     /// through the context's [`lift`](Context::lift) when [`apply`](Self::apply) replays it.
-    pub(crate) program: Program<
+    program: Program<
         <C as Domain>::Constant,
         <C as Domain>::Operation,
         Vec<<C as Domain>::Constant>,
@@ -1339,14 +1288,14 @@ where
 
     /// Linearization-point residuals consumed by [`program`](Self::program), appended after the output cotangents when
     /// interpreting it.
-    pub(crate) residuals: Vec<<C as Domain>::Value>,
+    residuals: Vec<<C as Domain>::Value>,
 
     /// Parameter structure of the closure's input, used to reshape the flat input cotangents.
-    pub(crate) input_structure: Input::ParameterStructure,
+    input_structure: Input::ParameterStructure,
 
     /// Encodes the closure's output family `TracedOutput` so [`apply`](Self::apply) can flatten the cotangents without a
     /// turbofish. Covariant and ownership-free.
-    pub(crate) marker: PhantomData<fn() -> TracedOutput>,
+    marker: PhantomData<fn() -> TracedOutput>,
 }
 
 impl<C, Input, TracedOutput> Pullback<C, Input, TracedOutput>

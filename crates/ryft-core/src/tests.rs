@@ -1384,9 +1384,9 @@ mod differentiation_tests {
         let context = crate::contexts::EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let function = |x: LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
 
-        let (output, pullback) = domain.vjp_fn(function, Scalar::from(0.7)).unwrap();
-        let (reference_output, reference_pullback, reference_residuals) =
-            domain.vjp(function, Scalar::from(0.7)).unwrap();
+        let (output, pullback) = domain.vjp(function, Scalar::from(0.7)).unwrap();
+        let (reference_output, reference_pullback) = domain.vjp(function, Scalar::from(0.7)).unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         assert_eq!(output, reference_output);
 
         for cotangent in [1.0, 2.5] {
@@ -1413,11 +1413,12 @@ mod differentiation_tests {
             LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
         )| Ok(a * b);
         let (output, pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .vjp_fn(function, (TestArray::scalar(3.0), TestArray::scalar(2.0)))
-            .unwrap();
-        let (_, reference_pullback, reference_residuals) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0)))
             .unwrap();
+        let (_, reference_pullback) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(function, (TestArray::scalar(3.0), TestArray::scalar(2.0)))
+            .unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         assert_eq!(output.values, vec![6.0]);
 
         for cotangent in [1.0, 4.0] {
@@ -1653,7 +1654,8 @@ mod linearization_tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
-        let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
+        let (_, pullback) = domain.vjp(vjp_function, primals.clone()).unwrap();
+        let (pullback, vjp_residuals) = pullback.into_parts();
         let mut reference_inputs = output_cotangents.clone();
         reference_inputs.extend(vjp_residuals);
         let reference_cotangents = pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -1842,12 +1844,13 @@ mod linearization_tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
-        let (_, reference_pullback, reference_residuals) = domain
+        let (_, reference_pullback) = domain
             .vjp(
                 |inputs| inputs[0].context().bind(scalar_squaring_while(), &[inputs[0].clone()]),
                 vec![Scalar::from(1.5)],
             )
             .unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = vec![Scalar::from(1.0)];
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -2426,7 +2429,7 @@ mod linearization_tests {
         let primal_x = outer_context.input(DataType::F64);
         let cotangent = outer_context.input(DataType::F64);
 
-        let (primal_outputs, pullback, residuals) = outer_context
+        let (primal_outputs, pullback) = outer_context
             .vjp(
                 |inputs: Vec<
                     LinearizationTracer<DomainTracingContext<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
@@ -2434,6 +2437,7 @@ mod linearization_tests {
                 vec![primal_x],
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(primal_outputs.len(), 1);
 
         // The pullback is genuinely tracer-valued (its value type is the enclosing trace's `Tracer`), so interpreting
@@ -2460,9 +2464,10 @@ mod linearization_tests {
 
         // Reference: the established `vjp` pullback at `x = 0.7`, seeded with the same cotangent `1.0`. For
         // `f(x) = x * sin(x)` the gradient is `sin(x) + x * cos(x)`.
-        let (_, reference_pullback, reference_residuals) = domain
+        let (_, reference_pullback) = domain
             .vjp(|inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]), vec![Scalar::from(0.7)])
             .unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = vec![Scalar::from(1.0)];
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -2665,8 +2670,8 @@ mod linearization_tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
 
-        let (_, reference_pullback, reference_residuals) =
-            domain.vjp(scalar_custom_vjp_function, vec![Scalar::from(0.7)]).unwrap();
+        let (_, reference_pullback) = domain.vjp(scalar_custom_vjp_function, vec![Scalar::from(0.7)]).unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = vec![Scalar::from(2.5)];
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -3115,7 +3120,8 @@ mod array_linearization_tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
-        let (_, pullback, vjp_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
+        let (_, pullback) = domain.vjp(vjp_function, primals.clone()).unwrap();
+        let (pullback, vjp_residuals) = pullback.into_parts();
         let mut reference_inputs = output_cotangents.clone();
         reference_inputs.extend(vjp_residuals);
         let reference_cotangents = pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -3205,7 +3211,8 @@ mod array_linearization_tests {
 
         // Reference: the established `vjp` pullback emits one input cotangent per primal input and consumes
         // `output_cotangents ++ residuals`.
-        let (_, reference_pullback, reference_residuals) = domain.vjp(vjp_function, primals.clone()).unwrap();
+        let (_, reference_pullback) = domain.vjp(vjp_function, primals.clone()).unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = output_cotangents.clone();
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -3328,12 +3335,13 @@ mod array_linearization_tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
-        let (_, reference_pullback, reference_residuals) = domain
+        let (_, reference_pullback) = domain
             .vjp(
                 |inputs| inputs[0].context().bind(array_squaring_while(), &[inputs[0].clone()]),
                 vec![TestArray::scalar(1.5)],
             )
             .unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = vec![TestArray::scalar(1.0)];
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -4385,7 +4393,8 @@ mod array_linearization_tests {
         let primals = vec![TestArray::scalar(0.7)];
         let output_cotangents = vec![TestArray::scalar(2.5)];
 
-        let (_, reference_pullback, reference_residuals) = domain.vjp(custom_vjp_function, primals.clone()).unwrap();
+        let (_, reference_pullback) = domain.vjp(custom_vjp_function, primals.clone()).unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = output_cotangents.clone();
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
@@ -4556,7 +4565,7 @@ mod array_linearization_tests {
         let primal_x = outer_context.input(vector_type.clone());
         let cotangent = outer_context.input(vector_type.clone());
 
-        let (primal_outputs, pullback, residuals) = outer_context
+        let (primal_outputs, pullback) = outer_context
             .vjp(
                 |inputs: Vec<
                     LinearizationTracer<DomainTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>,
@@ -4564,6 +4573,7 @@ mod array_linearization_tests {
                 vec![primal_x],
             )
             .unwrap();
+        let (pullback, residuals) = pullback.into_parts();
         assert_eq!(primal_outputs.len(), 1);
 
         // The pullback is genuinely tracer-valued, so interpreting it through the enclosing `TracingContext` splices
@@ -4591,8 +4601,9 @@ mod array_linearization_tests {
 
         // Reference: the established `vjp` pullback at the sample `x`, seeded with the same cotangent. For the
         // elementwise `f(x) = x * sin(x)` the per-element gradient is `sin(x) + x * cos(x)` scaled by the cotangent.
-        let (_, reference_pullback, reference_residuals) =
+        let (_, reference_pullback) =
             domain.vjp(|inputs| Ok(vec![inputs[0].clone() * inputs[0].sin()?]), vec![sample_x]).unwrap();
+        let (reference_pullback, reference_residuals) = reference_pullback.into_parts();
         let mut reference_inputs = vec![sample_cotangent];
         reference_inputs.extend(reference_residuals);
         let reference_cotangents = reference_pullback.interpret_in_context(&context, reference_inputs).unwrap();
