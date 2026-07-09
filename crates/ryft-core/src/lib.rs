@@ -50,9 +50,9 @@ pub use parameters::{
     PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, VecParameterizedFamily,
 };
 pub use partial::{
-    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialEvaluator,
-    PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
-    PartitionedProgram,
+    PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
+    PartialEvaluationValue, PartialTracer, PartialValue, PartialValueMaterialization, PartiallyEvaluatableOperation,
+    PartiallyEvaluatableProgramOperation, PartitionedProgram,
 };
 pub use programs::{
     Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value,
@@ -60,6 +60,8 @@ pub use programs::{
 pub use scalars::Scalar;
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
-pub use tracing_v2::differentiation::{DifferentiationContext, DifferentiationTracer, Linearization};
+pub use tracing_v2::differentiation::{
+    DifferentiationContext, DifferentiationTracer, Linearization, LinearizationTracer,
+};
 pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};
 pub use types::*;

@@ -7,7 +7,7 @@ use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{DifferentiationContext, DifferentiationTracer};
@@ -118,6 +118,17 @@ impl<C: StagingContext<Operation: From<ZeroOperation<C::Type>>>> Zero<Tracer<C>>
     }
 }
 
+impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<ZeroOperation<C::Type>>>> Zero<PartialTracer<C>>
+    for PartialEvaluationContext<C>
+{
+    #[inline]
+    fn zero(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
+        let mut outputs = self.bind(ZeroOperation::new(r#type.clone()), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Zero<C::Value>>
     Zero<BatchingTracer<C>> for BatchingContext<C>
 {
@@ -133,7 +144,7 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.context().zero(r#type)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().zero(r#type)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

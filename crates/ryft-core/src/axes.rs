@@ -1,10 +1,18 @@
 use thiserror::Error;
 
-use crate::batching::BatchingError;
-use crate::contexts::Context;
+use crate::batching::{BatchableOperation, BatchingContext, BatchingError};
+use crate::contexts::{Context, EagerContext};
+use crate::differentiation::DifferentiableOperation;
+use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::programs::ProgramError;
+use crate::operations::Operation;
+use crate::operations::constants::Zero;
+use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::programs::{ProgramError, Value};
+use crate::tracing::{NestedTracingContext, TracingContext};
+use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::tracing_v2::operations::collective::AxisIndexOperation;
+use crate::types::ArrayType;
 
 /// Represents axis-related errors.
 #[derive(Error, Clone, Debug, PartialEq, Eq, Hash)]
@@ -49,6 +57,77 @@ pub trait NamedAxes: Context {
     /// Resolves `name` against this context, returning the [`NamedAxis`] it is bound to,
     /// or `None` when no enclosing binder binds it.
     fn named_axis(&self, name: &str) -> Option<NamedAxis>;
+}
+
+impl<V: Value, O: InterpretableOperation<V, Self>> NamedAxes for EagerContext<V, O> {
+    #[inline]
+    fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
+        // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
+        None
+    }
+}
+
+impl<V: Value, O: Operation<V::Type>, C> NamedAxes for TracingContext<V, O, C> {
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
+        // (e.g., a `shard_map` body's device mesh axes) and reports every other name unbound. Ordinary traces are
+        // seeded with no axes. Named-axis binders such as `BatchingContext` wrap a base trace and resolve against it.
+        self.named_axes().iter().find(|(axis_name, _)| axis_name == name).map(|(_, axis)| *axis)
+    }
+}
+
+impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A lookup resolves against the axes this nested trace was seeded with first, and otherwise delegates to the
+        // parent context it is nested into, because named axes are dynamically scoped: a seeded binding shadows an
+        // enclosing one, while a collective staged inside an unseeded nested tracing context still resolves an axis
+        // bound by an enclosing transform.
+        self.named_axes()
+            .iter()
+            .find(|(axis_name, _)| axis_name == name)
+            .map(|(_, axis)| *axis)
+            .or_else(|| self.parent().named_axis(name))
+    }
+}
+
+impl<C: Context<Operation: PartiallyEvaluatableOperation<C>> + NamedAxes> NamedAxes for PartialEvaluationContext<C> {
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A partial-evaluation context resolves named axes against its known-side inner context, so collectives
+        // inside a partially evaluated closure resolve against the enclosing batching levels and mesh regions.
+        self.parent().named_axis(name)
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>> + NamedAxes> NamedAxes
+    for BatchingContext<C>
+{
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to
+        // `NamedAxis::Batched` with this level's batch size, and any other name delegates to the parent context.
+        // Because nested batching composes by context wrapping, the delegation chain naturally shadows outer
+        // bindings with inner ones.
+        if self.axis_name() == Some(name) {
+            Some(NamedAxis::Batched { size: self.axis_size() })
+        } else {
+            self.parent().named_axis(name)
+        }
+    }
+}
+
+impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + NamedAxes + Zero<C::Value>> NamedAxes
+    for DifferentiationContext<C>
+{
+    #[inline]
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A `DifferentiationContext` binds no named axes of its own: axis-name resolution passes through to the inner
+        // context, so collectives inside a differentiated closure resolve against the enclosing batching levels and
+        // mesh regions.
+        self.parent().named_axis(name)
+    }
 }
 
 /// Capability to read the index of the current element along a named axis. This is the value-producing counterpart of

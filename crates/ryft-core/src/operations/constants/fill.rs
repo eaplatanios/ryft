@@ -8,7 +8,7 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::Zero;
 use crate::operations::{Operation, OperationFormatter};
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::tracing_v2::differentiation::{DifferentiationContext, DifferentiationTracer};
@@ -115,6 +115,17 @@ impl<V: Clone + Display, C: StagingContext<Operation: From<FillOperation<C::Type
     }
 }
 
+impl<S: Clone + Display, C: Context<Operation: PartiallyEvaluatableOperation<C> + From<FillOperation<C::Type, S>>>>
+    Fill<S, PartialTracer<C>> for PartialEvaluationContext<C>
+{
+    #[inline]
+    fn fill(&self, r#type: &C::Type, value: S) -> Result<PartialTracer<C>, ProgramError> {
+        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Fill<S, C::Value>, S>
     Fill<S, BatchingTracer<C>> for BatchingContext<C>
 {
@@ -130,7 +141,7 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value> 
 {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: S) -> Result<DifferentiationTracer<C>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.context().fill(r#type, value)?);
+        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?);
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }

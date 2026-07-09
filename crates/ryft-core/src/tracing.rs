@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use ryft_macros::Parameter;
 
-use crate::axes::{NamedAxes, NamedAxis};
+use crate::axes::NamedAxis;
 use crate::compilation::captures::CaptureReference;
 use crate::compilation::context::CapturingContext;
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
@@ -252,6 +252,13 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         &self.captures
     }
 
+    /// Returns the named axes this trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
+    /// implementation. Ordinary traces are seeded with no axes.
+    #[inline]
+    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+        self.named_axes.as_slice()
+    }
+
     /// Traces `function` into a [`Program`] for the provided input types. This is the symbolic ordinary-tracing entry
     /// point. It creates a fresh [`TracingContext`] over the `(V, O)` type universe, executes `function` once on
     /// [`Tracer`] inputs standing in for `input_type`, and returns the output types plus the finalized program.
@@ -385,16 +392,6 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     }
 }
 
-impl<V: Value, O: Operation<V::Type>, C> NamedAxes for TracingContext<V, O, C> {
-    #[inline]
-    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
-        // A `TracingContext` is a leaf of the resolution stack and it resolves only the named axes it was seeded with
-        // (e.g., a `shard_map` body's device mesh axes) and reports every other name unbound. Ordinary traces are
-        // seeded with no axes. Named-axis binders such as `BatchingContext` wrap a base trace and resolve against it.
-        self.named_axes.iter().find(|(axis_name, _)| axis_name == name).map(|(_, axis)| *axis)
-    }
-}
-
 impl<V: Value, O: Operation<V::Type>, C> StagingContext for TracingContext<V, O, C> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
@@ -451,6 +448,13 @@ impl<C: Context> NestedTracingContext<C> {
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>> {
         &self.builder
+    }
+
+    /// Returns the named axes this nested trace was seeded with, resolved by its [`NamedAxes`](crate::NamedAxes)
+    /// implementation ahead of the parent context's bindings. Ordinary nested traces are seeded with no axes.
+    #[inline]
+    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
+        self.named_axes.as_slice()
     }
 
     /// Traces `function` into a flat [`Program`] expressed in the enclosing context `parent`'s universe. This is the
@@ -585,21 +589,6 @@ impl<C: Context> Context for NestedTracingContext<C> {
     }
 }
 
-impl<C: Context + NamedAxes> NamedAxes for NestedTracingContext<C> {
-    #[inline]
-    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
-        // A lookup resolves against the axes this nested trace was seeded with first, and otherwise delegates to the
-        // parent context it is nested into, because named axes are dynamically scoped: a seeded binding shadows an
-        // enclosing one, while a collective staged inside an unseeded nested tracing context still resolves an axis
-        // bound by an enclosing transform.
-        self.named_axes
-            .iter()
-            .find(|(axis_name, _)| axis_name == name)
-            .map(|(_, axis)| *axis)
-            .or_else(|| self.parent.named_axis(name))
-    }
-}
-
 impl<C: Context> StagingContext for NestedTracingContext<C> {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
@@ -642,6 +631,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::axes::NamedAxes;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};

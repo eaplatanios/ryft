@@ -6,14 +6,13 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::ElementwiseOperation;
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
+use crate::axes::AxisError;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
-use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::{ElementwiseOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Program, ProgramError, Value};
 use crate::sharding::ShardingDimension;
@@ -777,23 +776,6 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>> + NamedAxes> NamedAxes
-    for BatchingContext<C>
-{
-    #[inline]
-    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
-        // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to
-        // `NamedAxis::Batched` with this level's batch size, and any other name delegates to the parent context.
-        // Because nested batching composes by context wrapping, the delegation chain naturally shadows outer
-        // bindings with inner ones.
-        if self.axis_name() == Some(name) {
-            Some(NamedAxis::Batched { size: self.axis_size() })
-        } else {
-            self.parent().named_axis(name)
-        }
-    }
-}
-
 /// Batch-carrying value flowing through a [`BatchingContext`]. The function being batched operates
 /// on [`BatchingTracer`]s directly. Each operation dispatches through the stamped context via
 /// [`Context::bind`](Context::bind), which applies the operation's [`BatchableOperation`] implementation against the
@@ -838,6 +820,18 @@ impl<C: Context<Type = ArrayType>> BatchingTracer<C> {
     #[inline]
     pub fn into_batch(self) -> ArrayBatch<C::Value> {
         self.batch
+    }
+}
+
+impl<C: Context<Type = ArrayType, Value: PartialEq>> PartialEq for BatchingTracer<C> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        // A batch-carrying value compares by its packed value (through that value's own `PartialEq`, which is
+        // identity-shaped for tracer-valued parents) and its batch axis, ignoring the stamped context. Consumers such
+        // as the scan/while loop-invariance fixed points of partial evaluation compare flowing values across replay
+        // rounds to detect passthrough, and a batched value passes through exactly when its packed value does on the
+        // same axis.
+        self.batch.batch_axis() == other.batch.batch_axis() && self.batch.value() == other.batch.value()
     }
 }
 

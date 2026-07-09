@@ -9,6 +9,7 @@ use crate::batching::BatchingContext;
 use crate::contexts::Context;
 use crate::differentiation::DifferentiableOperation;
 use crate::operations::constants::Zero;
+use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::NestedTracingContext;
 use crate::tracing_v2::differentiation::DifferentiationContext;
@@ -198,6 +199,18 @@ impl<Capture: Value<Type = C::Type>, C: CapturingContext<Capture>> CapturingCont
     }
 }
 
+impl<Capture, C> CapturingContext<Capture> for PartialEvaluationContext<C>
+where
+    Capture: Value<Type = C::Type>,
+    C: CapturingContext<Capture>,
+    C::Operation: PartiallyEvaluatableOperation<C>,
+{
+    #[inline]
+    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+        self.parent().capture(value)
+    }
+}
+
 impl<
     Capture: Value<Type = ArrayType>,
     C: CapturingContext<Capture, Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>,
@@ -216,7 +229,7 @@ impl<
 {
     #[inline]
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
-        self.context().capture(value)
+        self.parent().capture(value)
     }
 }
 

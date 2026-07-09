@@ -46,7 +46,7 @@ mod tests {
     use crate::batching::ArrayBatch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
-    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
     use crate::operations::compare::CompareOperation;
@@ -613,22 +613,20 @@ mod tests {
         assert_close(block.values()[0], 1.0);
     }
 
-    /// Stages `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` inside an
-    /// active differentiation trace, feeding its predicate input with a staged constant `true`.
-    fn stage_constant_predicate_condition<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+    /// Binds `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` through the
+    /// provided value's dispatch domain, feeding its predicate input with a lifted constant `true`. Generic over the
+    /// value so it serves both staged closures (a [`Tracer`](crate::tracing::Tracer)) and dual-driven differentiation
+    /// closures (a [`LinearizationTracer`](crate::tracing_v2::LinearizationTracer)).
+    fn stage_constant_predicate_condition<V>(x: V) -> V
     where
-        C: crate::contexts::StagingContext<
-                Type = ArrayType,
-                Constant = TestArray,
-                Operation = ArrayOperation<TestArray>,
-            >,
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain:
+            crate::contexts::Context<Type = ArrayType, Constant = TestArray, Operation = ArrayOperation<TestArray>>,
     {
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-        let predicate = x.context().constant(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]));
-        let mut outputs = x
-            .context()
-            .stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&predicate, &x])
-            .unwrap();
+        let context = x.dispatch_domain();
+        let predicate = context.lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
+        let mut outputs = context.bind(ArrayOperation::Condition(Box::new(condition)), &[predicate, x]).unwrap();
         outputs.remove(0)
     }
 
@@ -709,7 +707,7 @@ mod tests {
             .jacfwd(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -729,7 +727,7 @@ mod tests {
             .value_and_gradient(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
+                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(1.0),
@@ -750,7 +748,7 @@ mod tests {
             .value_and_gradient(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x]).unwrap();
+                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(1.0),
@@ -771,7 +769,7 @@ mod tests {
             .vjp(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -807,7 +805,7 @@ mod tests {
             .vjp(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(ArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                        x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -867,7 +865,7 @@ mod tests {
             .value_and_gradient(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs]).unwrap();
+                        init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
@@ -888,7 +886,7 @@ mod tests {
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs])?;
+                        init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
@@ -943,7 +941,7 @@ mod tests {
             .vjp(
                 move |(init, xs)| {
                     let mut outputs =
-                        init.context().stage_operation(ArrayOperation::Scan(Box::new(scan)), &[&init, &xs])?;
+                        init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 (TestArray::scalar(1.0), TestArray::vector(vec![2.0, 3.0, 4.0])),
@@ -985,7 +983,7 @@ mod tests {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
                     let mut outputs = predicate
                         .context()
-                        .stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&predicate, &operand])?;
+                        .bind(ArrayOperation::Condition(Box::new(condition)), &[predicate.clone(), operand.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]), TestArray::scalar(4.0)),
@@ -1004,7 +1002,7 @@ mod tests {
                     let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
                     let mut outputs = predicate
                         .context()
-                        .stage_operation(ArrayOperation::Condition(Box::new(condition)), &[&predicate, &operand])?;
+                        .bind(ArrayOperation::Condition(Box::new(condition)), &[predicate.clone(), operand.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 (TestArray::new(ArrayType::scalar(DataType::Boolean), vec![0.0]), TestArray::scalar(4.0)),

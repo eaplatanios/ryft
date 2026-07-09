@@ -56,6 +56,7 @@ pub mod trigonometric;
 // TODO(eaplatanios): We should be importing specific symbols here.
 // The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
 // they do not shadow their `std::ops` counterparts; reach them through `crate::operations::arithmetic` instead.
+use crate::partial::{PartialEvaluationValue, PartialTracer, PartialValue};
 use crate::{DifferentiationDual, DifferentiationTracer, MaybeZero};
 pub use arithmetic::{
     ADD_OPERATION_NAME, AddOperation, DIV_OPERATION_NAME, DivOperation, MUL_OPERATION_NAME, MulOperation,
@@ -472,6 +473,38 @@ impl BooleanLike for CaptureReference<ArrayType> {
         Err(ProgramError::Concretization {
             message: "cannot extract a concrete boolean from a captured constant reference".to_string(),
         })
+    }
+}
+
+// A partial-evaluation value's Boolean view uses its known payload's: a known value reinterprets (and decodes) the
+// carried known-side value, so branching on a known value in a closure succeeds exactly when the known-side inner
+// context is eager, while an unknown value names a residual program variable that carries no concrete payload and so
+// returns itself unchanged from `as_boolean` and errors from `boolean`. This is what lets host control flow branch on
+// known values while partial evaluation is in progress.
+impl<C: Context<Value: BooleanLike, Type: BooleanLike>> BooleanLike for PartialTracer<C> {
+    #[inline]
+    fn as_boolean(&self) -> Self {
+        // Unknown and poisoned values carry no concrete payload to reinterpret and return themselves unchanged.
+        match self.value() {
+            Ok(value) => match value.value() {
+                PartialValue::Known(known) => {
+                    PartialTracer::new(self.context().clone(), PartialEvaluationValue::known(known.as_boolean()))
+                }
+                PartialValue::Unknown(_) => self.clone(),
+            },
+            Err(_) => self.clone(),
+        }
+    }
+
+    #[inline]
+    fn boolean(&self) -> Result<bool, ProgramError> {
+        // A poisoned value surfaces its deferred error here, since branching on it cannot proceed anyway.
+        match self.value()?.value() {
+            PartialValue::Known(known) => known.boolean(),
+            PartialValue::Unknown(_) => Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from an unknown partial-evaluation value".to_string(),
+            }),
+        }
     }
 }
 

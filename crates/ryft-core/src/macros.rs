@@ -111,8 +111,8 @@ macro_rules! check_builders {
     }};
 }
 
-/// Implements a foreign `std::ops` operator trait as panicking sugar for the three core transform
-/// tracer types (i.e., [`Tracer`](crate::Tracer), [`BatchingTracer`](crate::BatchingTracer), and
+/// Implements a foreign `std::ops` operator trait as panicking sugar for the four core transform tracer types (i.e.,
+/// [`Tracer`](crate::Tracer), [`PartialTracer`](crate::PartialTracer), [`BatchingTracer`](crate::BatchingTracer), and
 /// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
 /// The operator traits (i.e., `std::ops::Add`, `std::ops::Neg`, `std::ops::BitAnd`, etc.) are foreign and so a single
 /// `impl<V: Value>` blanket implementation (i.e., the shape used for the fallible in-crate capability traits) is not
@@ -122,8 +122,10 @@ macro_rules! check_builders {
 /// [`binary`](crate::Tracer::binary) helpers, which *poison* on a failed bind so that the error surfaces later at
 /// tracing boundaries, whereas [`BatchingTracer`](crate::BatchingTracer) and
 /// [`DifferentiationTracer`](crate::DifferentiationTracer) have no deferral point and bind directly, panicking with
-/// `$message` if the bind fails. Binding directly rather than delegating to the fallible capability trait keeps the
-/// eager arms' bounds minimal (e.g., no `Type = ArrayType` pin is needed on the batching arm).
+/// `$message` if the bind fails, and [`PartialTracer`](crate::PartialTracer) follows the same direct-bind shape (i.e.,
+/// a mixed known/unknown bind residualizes rather than fails, so a bind error is a genuine type error). Binding
+/// directly rather than delegating to the fallible capability trait keeps the eager arms' bounds minimal (e.g.,
+/// no `Type = ArrayType` pin is needed on the batching arm).
 ///
 /// # Parameters
 ///
@@ -143,6 +145,19 @@ macro_rules! implement_tracer_operator {
             #[inline]
             fn $method(self) -> Self {
                 self.unary($operation)
+            }
+        }
+
+        impl<C: $crate::Context> $trait for $crate::PartialTracer<C>
+        where
+            $crate::PartialEvaluationContext<C>:
+                $crate::Context<Value = $crate::PartialTracer<C>, Operation: ::std::convert::From<$operation>>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self) -> Self {
+                self.context().bind($operation, &[self.clone()]).expect($message).remove(0)
             }
         }
 
@@ -179,6 +194,19 @@ macro_rules! implement_tracer_operator {
             #[inline]
             fn $method(self, rhs: Self) -> Self {
                 self.binary(&rhs, $operation)
+            }
+        }
+
+        impl<C: $crate::Context> $trait for $crate::PartialTracer<C>
+        where
+            $crate::PartialEvaluationContext<C>:
+                $crate::Context<Value = $crate::PartialTracer<C>, Operation: ::std::convert::From<$operation>>,
+        {
+            type Output = Self;
+
+            #[inline]
+            fn $method(self, rhs: Self) -> Self {
+                self.context().bind($operation, &[self.clone(), rhs.clone()]).expect($message).remove(0)
             }
         }
 
