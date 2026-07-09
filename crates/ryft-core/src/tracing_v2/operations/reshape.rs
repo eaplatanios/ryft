@@ -144,7 +144,7 @@ where
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let Some(k_in) = inputs[0].batch_axis().axis() else {
+        let Some(k_in) = inputs[0].batch_axis_position() else {
             // Replicated input: there is no batch axis to thread through the reshape, so interpret it as given and
             // report the output replicated.
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
@@ -164,6 +164,6 @@ where
             .into());
         };
         let lifted_op = ReshapeOperation::new(lifted_output_shape);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::new(k_out)])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(k_out)])
     }
 }

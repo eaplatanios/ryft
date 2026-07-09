@@ -19,6 +19,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use ryft_core::Batch;
+use ryft_core::LinearizationTracer;
 use ryft_core::batching::BatchAxis;
 use ryft_core::compilation::context::CapturingContext;
 use ryft_core::compilation::{ClosedProgram, CompilationDomain, CompilationOptions, FunctionFingerprint};
@@ -27,8 +28,8 @@ use ryft_core::operations::constants::Constant;
 use ryft_core::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::sharding::{DeviceMesh, Sharding};
-use ryft_core::tracing::{DomainTracingContext, NestedTracer, Tracer};
-use ryft_core::tracing_v2::DifferentiationContext;
+use ryft_core::tracing::{DomainTracingContext, Tracer};
+use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::types::{ArrayType, Typed};
 
 use crate::Array;
@@ -42,7 +43,9 @@ type XlaCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, Array<'c>
 type XlaSourceProgramOutput<Out> = <Out as Parameterized<ArrayType>>::To<XlaConstant>;
 
 /// Tracer leaf used while linearizing a compiled XLA function inside a compile trace.
-type XlaCompileNestedTracer<'c> = NestedTracer<DomainTracingContext<XlaDomain<'c>, Array<'c>>>;
+/// Closure tracer type of the partial-evaluation-backed differentiation entry points (`gradient`, `vjp`, …) over the
+/// jit compile trace.
+type XlaCompileLinearizationTracer<'c> = LinearizationTracer<DomainTracingContext<XlaDomain<'c>, Array<'c>>>;
 
 /// Staged-but-uncompiled XLA function handle. Returned by [`stage`] and [`stage_with_captures`].
 ///
@@ -198,10 +201,8 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         full_inputs.extend(inputs);
-        context.bind(
-            XlaOperation::JitCall(Box::new(JitCallOperation::new(self.opened_program()?.clone()))),
-            full_inputs.as_slice(),
-        )
+        context
+            .bind(XlaOperation::JitCall(Box::new(JitCallOperation::new(self.opened_program()?.clone()))), &full_inputs)
     }
 
     /// Compiles this staged function into a [`CompiledXlaFunction`] backed by a PJRT executable.
@@ -429,18 +430,20 @@ impl<
     /// impl-block constraint above). The returned compiled function has the same input shape
     /// and produces an output whose leaves carry the partial derivative at each input leaf.
     #[track_caller]
-    pub fn value_and_gradient<'domain>(&'domain self) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError>
+    pub fn gradient<'domain>(&'domain self) -> Result<CompiledXlaFunction<'c, In, In>, XlaDomainError>
     where
         'c: 'domain,
-        In::Family: ParameterizedFamily<XlaCompileTracer<'c>> + ParameterizedFamily<XlaCompileNestedTracer<'c>>,
+        In::Family: ParameterizedFamily<XlaCompileTracer<'c>> + ParameterizedFamily<XlaCompileLinearizationTracer<'c>>,
         In::To<XlaCompileTracer<'c>>: Parameterized<
                 XlaCompileTracer<'c>,
                 To<XlaCompileTracer<'c>> = In::To<XlaCompileTracer<'c>>,
                 To<ArrayType> = In,
             >,
-        In::To<XlaCompileTracer<'c>>:
-            Parameterized<XlaCompileTracer<'c>, To<XlaCompileNestedTracer<'c>> = In::To<XlaCompileNestedTracer<'c>>>,
-        In::To<XlaCompileNestedTracer<'c>>: Parameterized<XlaCompileNestedTracer<'c>>,
+        In::To<XlaCompileTracer<'c>>: Parameterized<
+                XlaCompileTracer<'c>,
+                To<XlaCompileLinearizationTracer<'c>> = In::To<XlaCompileLinearizationTracer<'c>>,
+            >,
+        In::To<XlaCompileLinearizationTracer<'c>>: Parameterized<XlaCompileLinearizationTracer<'c>>,
     {
         let function = self;
         let input_signature = function.staged.input_signature().map_err(|error| XlaDomainError::Array(error.into()))?;
@@ -451,11 +454,11 @@ impl<
                 let context = tracers
                     .parameters()
                     .next()
-                    .expect("compiled value_and_gradient requires at least one input")
+                    .expect("compiled gradient requires at least one input")
                     .context()
                     .clone();
                 context
-                    .value_and_gradient(
+                    .gradient(
                         move |y| {
                             let outputs = function
                                 .staged
@@ -463,10 +466,10 @@ impl<
                                     capture_references.as_slice(),
                                     y.into_parameters().collect(),
                                 )
-                                .expect("compiled value_and_gradient call staging should succeed");
-                            let output: XlaCompileNestedTracer<'c> =
+                                .expect("compiled gradient call staging should succeed");
+                            let output: XlaCompileLinearizationTracer<'c> =
                                 Parameterized::from_parameters(function.staged.output_structure.clone(), outputs)
-                                    .expect("compiled value_and_gradient output reassembly should succeed");
+                                    .expect("compiled gradient output reassembly should succeed");
                             output
                         },
                         tracers,
@@ -1029,7 +1032,7 @@ mod tests {
     use ryft_core::operations::differentiation::StopGradient;
     use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
-    use ryft_core::tracing_v2::DifferentiationContext;
+    use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;
     use ryft_core::types::{ArrayType, Shape, Size};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -1500,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn test_value_and_gradient_method_preserves_compiled_function_captures() {
+    fn test_gradient_method_preserves_compiled_function_captures() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1523,7 +1526,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let grad_compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
+        let grad_compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient().unwrap();
 
         assert_eq!(grad_compiled.source_program().captures().len(), 1);
 
@@ -1536,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_can_stage_value_and_gradient_of_captured_compiled_function() {
+    fn test_compile_can_stage_gradient_of_captured_compiled_function() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1562,9 +1565,7 @@ mod tests {
         let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compile(
             move |x| {
                 let context = x.context().clone();
-                context
-                    .value_and_gradient(move |y| inner.call(y), x)
-                    .expect("nested captured grad(jit) should stage")
+                context.gradient(move |y| inner.call(y), x).expect("nested captured grad(jit) should stage")
             },
             input_type.clone(),
             &engine,
@@ -1699,7 +1700,7 @@ mod tests {
     /// The mechanism: [`CompiledXlaFunction::call`] stages a `jit_call` operation inside a `grad` trace. The outer
     /// transform differentiates that operation through the same capture-free linearization machinery as primitive ops.
     #[test]
-    fn test_value_and_gradient_of_compiled_function_round_trips() {
+    fn test_gradient_of_compiled_function_round_trips() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1712,7 +1713,7 @@ mod tests {
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
 
-        let grad_compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
+        let grad_compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient().unwrap();
 
         // d/dx sin(x) = cos(x). Verify at a few points.
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
@@ -1740,11 +1741,11 @@ mod tests {
         }
     }
 
-    /// Equivalent to [`test_value_and_gradient_of_compiled_function_round_trips`] but through the
-    /// [`CompiledXlaFunction::value_and_gradient`] method. Verifies that `inner.value_and_gradient()` produces a
+    /// Equivalent to [`test_gradient_of_compiled_function_round_trips`] but through the
+    /// [`CompiledXlaFunction::gradient`] method. Verifies that `inner.gradient()` produces a
     /// compiled function whose `.interpret(point)` matches `cos(point)` for sample points.
     #[test]
-    fn test_value_and_gradient_method_matches_in_trace_value_and_gradient() {
+    fn test_gradient_method_matches_in_trace_gradient() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1755,7 +1756,7 @@ mod tests {
 
         let inner: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let grad_compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
+        let grad_compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient().unwrap();
 
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
             let source = Array::from_host_buffer(
@@ -1778,17 +1779,14 @@ mod tests {
                 .unwrap();
             let observed = values_from_bytes::<f32>(shard_bytes.as_slice())[0];
             let expected = point.cos();
-            assert!(
-                (observed - expected).abs() < 1e-5,
-                "f.value_and_gradient()({point}) expected ~{expected}, got {observed}",
-            );
+            assert!((observed - expected).abs() < 1e-5, "f.gradient()({point}) expected ~{expected}, got {observed}",);
         }
     }
 
-    /// Distinct `inner.value_and_gradient()` call sites must yield distinct cache entries (confirming
+    /// Distinct `inner.gradient()` call sites must yield distinct cache entries (confirming
     /// `#[track_caller]` propagation through the method). Same-line repeats share one entry.
     #[test]
-    fn test_value_and_gradient_method_partitions_cache_by_call_site() {
+    fn test_gradient_method_partitions_cache_by_call_site() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -1801,15 +1799,15 @@ mod tests {
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         let baseline = engine.cache_size();
 
-        // Two `value_and_gradient` calls at DIFFERENT source lines: must produce two distinct cache entries.
-        let _grad_a: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
-        let _grad_b: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
+        // Two `gradient` calls at DIFFERENT source lines: must produce two distinct cache entries.
+        let _grad_a: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient().unwrap();
+        let _grad_b: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient().unwrap();
         assert_eq!(engine.cache_size(), baseline + 2);
 
-        // Multiple `value_and_gradient` calls at the SAME source line: must share one cache entry.
+        // Multiple `gradient` calls at the SAME source line: must share one cache entry.
         let baseline = engine.cache_size();
         for _ in 0..3 {
-            let _: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.value_and_gradient().unwrap();
+            let _: CompiledXlaFunction<'_, ArrayType, ArrayType> = inner.gradient().unwrap();
         }
         assert_eq!(engine.cache_size(), baseline + 1);
     }
@@ -1945,11 +1943,12 @@ mod tests {
             "outer program should stage the inner compiled function as exactly one jit_call",
         );
 
-        // Linearize the outer `jit_call` program. This drives the replay through `JitCallOperation`'s
-        // `jvp` rule, which re-wraps the split callee into a primal `jit_call` (outputs followed by residuals)
-        // and a tangent `jit_call` (input tangents followed by residuals).
-        let linearization = outer_program.linearize().unwrap();
-        assert!(linearization.residual_count >= 1, "sin's pushforward needs at least one residual (cos(x))");
+        // Linearize the outer `jit_call` program, flattened first because `Program::linearize` is defined on the
+        // canonical flat form. This drives the replay through `JitCallOperation`'s `jvp` rule, which re-wraps the
+        // split callee into a primal `jit_call` (outputs followed by residuals) and a tangent `jit_call` (input
+        // tangents followed by residuals).
+        let linearization = outer_program.to_flat_program().linearize().unwrap();
+        assert!(linearization.residual_count() >= 1, "sin's pushforward needs at least one residual (cos(x))");
 
         // Both halves must keep the callee behind a `jit_call` boundary rather than inlining `sin`/`cos`.
         let count_operations = |program: &FlatXlaProgram| {
@@ -1965,29 +1964,28 @@ mod tests {
                 .count();
             (jit_calls, inlined)
         };
-        let (primal_jit_calls, primal_inlined) = count_operations(&linearization.primal_program);
-        let (tangent_jit_calls, tangent_inlined) = count_operations(&linearization.tangent_program);
+        let (primal_jit_calls, primal_inlined) = count_operations(linearization.primal());
+        let (tangent_jit_calls, tangent_inlined) = count_operations(linearization.tangent());
         assert_eq!(primal_jit_calls, 1, "primal half should keep the callee behind one jit_call");
         assert_eq!(primal_inlined, 0, "primal half should not inline the callee body");
         assert_eq!(tangent_jit_calls, 1, "tangent half should keep the pushforward behind one jit_call");
         assert_eq!(tangent_inlined, 0, "tangent half should not inline the pushforward body");
         assert_eq!(
-            linearization.primal_program.output_types().len(),
-            1 + linearization.residual_count,
+            linearization.primal().output_types().len(),
+            1 + linearization.residual_count(),
             "primal half should produce the primal output followed by the residuals",
         );
         assert_eq!(
-            linearization.tangent_program.input_types().len(),
-            1 + linearization.residual_count,
+            linearization.tangent().input_types().len(),
+            1 + linearization.residual_count(),
             "tangent half should consume the input tangent followed by the residuals",
         );
 
         // Re-wrap the two halves as a compiled `(x, dx) -> (primal, tangent)` function. This mirrors the
         // structure the value-level reroute will stage and exercises the real XLA lowering and execution of both
         // jit_call boundaries.
-        let primal_half = Rc::new(linearization.primal_program);
-        let tangent_half = Rc::new(linearization.tangent_program);
-        let residual_count = linearization.residual_count;
+        let (primal_half, tangent_half, residual_count) = linearization.into_parts();
+        let (primal_half, tangent_half) = (Rc::new(primal_half), Rc::new(tangent_half));
         let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal_input, tangent_input)| {
                 let context = primal_input.context().clone();
@@ -2566,7 +2564,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_value_and_gradient_compiles_and_runs() {
+    fn test_jit_gradient_compiles_and_runs() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
@@ -2576,7 +2574,7 @@ mod tests {
 
         let primal: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = primal.value_and_gradient().unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = primal.gradient().unwrap();
 
         let input_value = 0.75f32;
         let source = Array::from_host_buffer(
@@ -2766,7 +2764,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = primal.value_and_gradient().unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> = primal.gradient().unwrap();
 
         let input_value = 0.5f32;
         let source = Array::from_host_buffer(
@@ -2952,7 +2950,7 @@ mod tests {
             stage(|x| x.sin().unwrap(), input_type.clone(), &engine).unwrap();
         let outer: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(move |x| inner.call(x.clone()) + inner.call(x), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.value_and_gradient().unwrap();
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = outer.gradient().unwrap();
 
         for &point in &[0.0f32, 0.25, 0.5, 1.0] {
             let input = Array::from_host_buffer(

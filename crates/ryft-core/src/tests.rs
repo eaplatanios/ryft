@@ -43,7 +43,7 @@ use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::scalars::Scalar;
 use crate::tracing_v2::operations::TransferToMemory;
-use crate::tracing_v2::{ArrayOperation, CoordinateValue};
+use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
@@ -305,43 +305,26 @@ impl OneLike for TestArray {
     }
 }
 
-impl CoordinateValue for TestArray {
-    type Coordinate = f64;
-
-    fn coordinate_count(&self) -> usize {
-        self.values.len()
-    }
-
-    fn coordinate_basis(&self) -> Vec<Self> {
-        (0..self.values.len())
-            .map(|index| {
-                let mut values = vec![0.0; self.values.len()];
-                values[index] = 1.0;
-                Self { r#type: self.r#type.clone(), values }
-            })
-            .collect()
-    }
-
-    fn coordinates(&self) -> Vec<Self::Coordinate> {
-        self.values.clone()
-    }
-
-    fn stack(values: Vec<Self>) -> Result<Self, ProgramError> {
-        let batch_size = values.len();
-        assert!(batch_size > 0, "cannot stack zero values");
-        let first_type = &values[0].r#type;
-        for value in values.iter().skip(1) {
-            assert_eq!(value.r#type, *first_type, "stacked test arrays must share the same type");
+impl<O: crate::operations::Operation<ArrayType>> CoordinateBasis<TestArray> for EagerContext<TestArray, O> {
+    fn coordinate_basis(
+        &self,
+        leaf_type: &ArrayType,
+        coordinate_offset: usize,
+        basis_size: usize,
+    ) -> Result<TestArray, ProgramError> {
+        let leaf_count = TestArray::materialized_element_count(leaf_type)?;
+        let value_count = basis_size.checked_mul(leaf_count).ok_or_else(|| ProgramError::InvalidArgument {
+            message: format!("coordinate basis size overflows usize for leaf type {leaf_type}"),
+        })?;
+        let mut values = vec![0.0; value_count];
+        for basis_index in 0..basis_size {
+            if let Some(leaf_index) = basis_index.checked_sub(coordinate_offset)
+                && leaf_index < leaf_count
+            {
+                values[basis_index * leaf_count + leaf_index] = 1.0;
+            }
         }
-        let stacked_dimensions = std::iter::once(Size::Static(batch_size))
-            .chain(first_type.shape().dimensions().iter().copied())
-            .collect::<Vec<_>>();
-        let stacked_type = ArrayType::new(first_type.data_type(), Shape::new(stacked_dimensions));
-        let mut stacked_values = Vec::with_capacity(batch_size * values[0].values.len());
-        for value in values {
-            stacked_values.extend(value.values);
-        }
-        Ok(Self { r#type: stacked_type, values: stacked_values })
+        Ok(TestArray { r#type: leaf_type.with_inserted_dimension(0, Size::Static(basis_size))?, values })
     }
 }
 
@@ -5145,17 +5128,14 @@ mod batching_tests {
     }
 
     #[test]
-    fn test_batch_with_out_axes_position_rejects_replicated_output() {
-        // No input is mapped, so the output never picks up the batch axis, but `out_axes = Some(0)`
-        // requests a mapped output; `batch` refuses to materialize the axis with an implicit broadcast.
+    fn test_batch_with_out_axes_position_broadcasts_replicated_output() {
+        // No input is mapped, so the natural output is replicated. A mapped output declaration materializes the
+        // requested axis with a broadcast, matching JAX `vmap` output instantiation.
         let x = TestArray::vector(vec![1.0, 2.0, 3.0]);
-        let result: Result<TestArray, BatchingError> = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-            .batch(|x| Ok(x.clone() + x), x, BatchAxis::replicated(), BatchAxis::new(0), Some(3));
-        assert!(matches!(
-            result,
-            Err(BatchingError::MismatchedOutputAxes { expected, actual })
-                if expected == BatchAxis::new(0) && actual == BatchAxis::replicated(),
-        ));
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(|x| Ok(x.clone() + x), x, BatchAxis::replicated(), BatchAxis::new(0), Some(3))
+            .unwrap();
+        assert_eq!(output, TestArray::matrix(3, 3, vec![2.0, 4.0, 6.0, 2.0, 4.0, 6.0, 2.0, 4.0, 6.0]));
     }
 
     #[test]

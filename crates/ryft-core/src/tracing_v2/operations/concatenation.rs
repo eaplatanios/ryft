@@ -138,18 +138,20 @@ where
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         }
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let Some(batch_axis) = batch_axes.iter().copied().flatten().next() else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let materialized =
-            inputs.iter().map(|input| input.match_axis(batch_axis, axis_size)).collect::<Result<Vec<_>, _>>()?;
+        let materialized = inputs
+            .iter()
+            .map(|input| input.match_axis(batch_axis as isize, axis_size))
+            .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         ConcatenateOperation::new(lifted_axis).interpret_with_batch_axes(
             context,
             materialized.as_slice(),
-            &[BatchAxis::new(batch_axis)],
+            &[BatchAxis::from_position(batch_axis)],
         )
     }
 }
@@ -204,11 +206,11 @@ mod tests {
         assert_eq!(x_block.output_shape(), &[3]);
         assert_eq!(x_block.input_shape(), &[2]);
         // d(output)/d(x): output rows 0 and 1 are x0 and x1; row 2 (from y) is unaffected by x.
-        assert_eq!(x_block.values(), &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(x_block.value().values(), &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         assert_eq!(y_block.output_shape(), &[3]);
         assert_eq!(y_block.input_shape(), &[1]);
         // d(output)/d(y): only output row 2 (from y0) depends on y.
-        assert_eq!(y_block.values(), &[0.0, 0.0, 1.0]);
+        assert_eq!(y_block.value().values(), &[0.0, 0.0, 1.0]);
     }
 
     #[test]

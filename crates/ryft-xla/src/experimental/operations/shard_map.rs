@@ -3,22 +3,22 @@ use std::marker::PhantomData;
 
 use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingError};
 use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::TransposableOperation;
+use ryft_core::differentiation::{DifferentiableOperation, TransposableOperation};
 use ryft_core::effects::Effects;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
-use ryft_core::materialize;
 use ryft_core::operations::Operation;
-use ryft_core::operations::constants::ZeroOperation;
+use ryft_core::operations::constants::{Zero, ZeroOperation};
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::partial::{
-    PartialEvaluationInput, PartialEvaluationValue, PartialEvaluator, PartialValue, PartiallyEvaluatableOperation,
+    PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
 };
 use ryft_core::programs::{MaybeZero, ProgramError, Value};
 use ryft_core::sharding::{LogicalMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tracing::{Tracer, TracingContext};
 
-use ryft_core::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, Linearization};
+use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::types::{ArrayType, TypeError, Typed};
 
 use crate::experimental::ops::{XlaConstant, XlaOperation};
@@ -230,13 +230,13 @@ where
 {
     fn partially_evaluate(
         &self,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed boundary with at least one known-but-symbolic input; everything else keeps the default
         // fold-or-residualize behavior and therefore the original boundary.
-        if !evaluator.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
-            return evaluator.fold_or_residualize(XlaOperation::ShardMap(Box::new(self.clone())), inputs);
+        if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
+            return context.fold_or_residualize(XlaOperation::ShardMap(Box::new(self.clone())), inputs);
         }
 
         // Split the local body through the shared online boundary machinery. The body's inputs are index-aligned
@@ -247,7 +247,7 @@ where
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return evaluator.fold_or_residualize(XlaOperation::ShardMap(Box::new(self.clone())), inputs);
+            return context.fold_or_residualize(XlaOperation::ShardMap(Box::new(self.clone())), inputs);
         }
 
         // Derive each residual edge's global boundary type and sharding from its local type.
@@ -317,9 +317,9 @@ where
             }
         }
 
-        // Bind the known-side `shard_map` into the enclosing known-side evaluator, emit the residual `shard_map`
+        // Bind the known-side `shard_map` into the enclosing known-side context, emit the residual `shard_map`
         // over the surviving unknown boundary inputs plus the residual edges, and reassemble the original outputs.
-        evaluator.inline_partitioned_program(
+        context.inline_partitioned_program(
             partition,
             inputs,
             |known_program| {
@@ -438,7 +438,7 @@ fn shard_map_bodies(
     body: &FlatTracedShardMap,
 ) -> Result<(FlatTracedShardMap, FlatTracedShardMap, usize), ShardMapTraceError> {
     let output_count = body.global_output_types().len();
-    let Linearization { primal_program, tangent_program, residual_count, .. } = body.program().linearize()?;
+    let (primal_program, tangent_program, residual_count) = body.program().linearize()?.into_parts();
 
     let mesh = body.shard_map().mesh();
     let manual_axes = body.shard_map().manual_axes();
@@ -499,8 +499,9 @@ fn shard_map_bodies(
     Ok((primal_body, tangent_body, residual_count))
 }
 
-/// Capture-free forward-mode (JVP) rule for [`ShardMapOperation`], staging a primal `shard_map` and a tangent
-/// `shard_map` as ordinary [`XlaOperation`]s over the shared builder.
+/// Capture-free forward-mode (JVP) rule for [`ShardMapOperation`], binding a primal `shard_map` and a tangent
+/// `shard_map` as ordinary [`XlaOperation`]s through the active context: a staging context stages both operations
+/// over its shared builder, while an eager context compiles and executes them immediately.
 ///
 /// This realizes the identity `jvp(shard_map(f)) = shard_map(jvp f)`: rather than capturing the global primals as
 /// residual factors and staging a linear `shard_map`, the rule keeps the
@@ -517,20 +518,24 @@ fn shard_map_bodies(
 /// sub-programs are valid for every `V`.
 impl<C, V> DifferentiableOperation<C> for ShardMapOperation<V>
 where
-    C: StagingContext<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
+    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
     V: Value<Type = ArrayType>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let output_count = self.output_types.len();
         check_count!("input", inputs, self.input_types.len(), ProgramError);
 
         let (primal_body, tangent_body, _residual_count) =
             shard_map_bodies(&self.body).map_err(trace_error_from_shard_map)?;
 
-        // Stage the primal `shard_map`, recovering the primal outputs followed by the residual values.
+        // Bind the primal `shard_map`, recovering the primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(primal_body)));
-        let mut primal_outputs = context.stage_operation(primal_operation, primal_operands.as_slice())?;
+        let mut primal_outputs = context.bind(primal_operation, &primal_operands)?;
         if primal_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "shard_map primal body produced {} outputs which is fewer than its {output_count} primal \
@@ -549,23 +554,23 @@ where
         let tangent_body =
             tangent_body.with_global_output_types(primal_output_types).map_err(trace_error_from_shard_map)?;
 
-        // Stage the tangent `shard_map` over the operand tangents followed by the residual values, recovering one
+        // Bind the tangent `shard_map` over the operand tangents followed by the residual values, recovering one
         // output tangent per primal output.
         // The tangent `shard_map` takes every operand tangent as a real program input, so materialize structural
         // zeros at this sub-program boundary.
         let mut tangent_operands = inputs
             .iter()
-            .map(|input| materialize(context, input.tangent().clone()))
+            .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(tangent_body)));
-        let tangent_outputs = context.stage_operation(tangent_operation, tangent_operands.as_slice())?;
+        let tangent_outputs = context.bind(tangent_operation, &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect())
     }
 }
@@ -811,26 +816,24 @@ where
 fn apply_traced_shard_map<C, Output>(
     context: C,
     traced: FlatTracedShardMap,
-    traced_inputs: Vec<Tracer<C>>,
+    traced_inputs: Vec<C::Value>,
     output_structure: Output::ParameterStructure,
 ) -> Result<Output, ShardMapTraceError>
 where
-    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Output: Parameterized<Tracer<C>>,
+    C: Context<Type = ArrayType, Operation = XlaOperation>,
+    Output: Parameterized<C::Value>,
 {
-    let staged_outputs = context.stage_operation(
-        XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
-        traced_inputs.as_slice(),
-    )?;
+    let staged_outputs = context
+        .bind(XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))), traced_inputs.as_slice())?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }
 
-fn global_input_types_from_traced_inputs<C, Input>(
+fn global_input_types_from_traced_inputs<V, Input>(
     traced_inputs: &Input,
 ) -> Result<Input::To<ArrayType>, ShardMapTraceError>
 where
-    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-    Input: Parameterized<Tracer<C>>,
+    V: Value<Type = ArrayType>,
+    Input: Parameterized<V>,
     Input::Family: ParameterizedFamily<ArrayType>,
 {
     Ok(Input::To::<ArrayType>::from_parameters(
@@ -910,12 +913,26 @@ impl ShardMapInvocationLeaf for ArrayType {
     }
 }
 
-impl<C> ShardMapInvocationLeaf for Tracer<C>
-where
-    C: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-{
+/// Implements [`ShardMapInvocationLeaf`] for a tracer-shaped value type whose dispatch domain operates in the XLA
+/// operation universe: the traced shard map binds through the value's own dispatch domain, so one body serves the
+/// plain staged form (a [`Tracer`] records the operation) and transform-context forms (e.g., a
+/// [`DifferentiationTracer`](ryft_core::DifferentiationTracer) dual dispatches the operation's rules). A blanket
+/// implementation over every [`Value`] is not possible because [`ArrayType`] itself is a [`Value`] and carries its
+/// own dedicated implementation above.
+macro_rules! implement_shard_map_invocation_leaf {
+    ($value:ty, [$($parameters:tt)*], [$($bounds:tt)*]) => {
+        impl<$($parameters)*> ShardMapInvocationLeaf for $value
+        where
+            $value: Value<Type = ArrayType>,
+            <$value as Value>::DispatchDomain: Context<Type = ArrayType, Operation = XlaOperation>,
+            $($bounds)*
+        {
+            implement_shard_map_invocation_leaf!(@body $value);
+        }
+    };
+    (@body $value:ty) => {
     type Return<Input: Parameterized<Self>, Output: Parameterized<ArrayType>>
-        = Output::To<Tracer<C>>
+        = Output::To<$value>
     where
         Input::Family: ParameterizedFamily<ArrayType>
             + ParameterizedFamily<Sharding>
@@ -926,9 +943,9 @@ where
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<Tracer<C>>,
+            + ParameterizedFamily<$value>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<Tracer<C>>: Parameterized<Tracer<C>>;
+        Output::To<$value>: Parameterized<$value>;
 
     fn invoke<F, Input, Output>(
         function: F,
@@ -951,22 +968,22 @@ where
             + ParameterizedFamily<ArrayType>
             + ParameterizedFamily<XlaConstant>
             + ParameterizedFamily<ShardMapTracer>
-            + ParameterizedFamily<Tracer<C>>,
+            + ParameterizedFamily<$value>,
         Output::To<ShardMapTracer>: Parameterized<ShardMapTracer, To<ArrayType> = Output>,
-        Output::To<Tracer<C>>: Parameterized<Tracer<C>>,
+        Output::To<$value>: Parameterized<$value>,
         F: FnOnce(ShardMapLocalTraceInput<Input::To<ArrayType>>) -> ShardMapLocalTraceOutput<Output>,
     {
         let output_structure = out_specs.parameter_structure();
-        let global_input_types = global_input_types_from_traced_inputs::<C, _>(&inputs)?;
+        let global_input_types = global_input_types_from_traced_inputs::<$value, _>(&inputs)?;
         let global_in_specs = reparameterize_shardings::<
             Input::To<Sharding>,
             <Input::To<ArrayType> as Parameterized<ArrayType>>::To<Sharding>,
         >(in_specs, global_input_types.parameter_structure())?;
         let traced_inputs = inputs.into_parameters().collect::<Vec<_>>();
         let context = match traced_inputs.first() {
-            Some(input) => input.context().clone(),
+            Some(input) => input.dispatch_domain(),
             None if output_structure.parameter_count() == 0 => {
-                return Ok(Output::To::<Tracer<C>>::from_parameters(output_structure, Vec::new())?);
+                return Ok(Output::To::<$value>::from_parameters(output_structure, Vec::new())?);
             }
             None => return Err(ShardMapTraceError::MissingTracedInvocationDomain),
         };
@@ -981,7 +998,11 @@ where
         )?;
         apply_traced_shard_map(context, traced, traced_inputs, output_structure)
     }
+    };
 }
+
+implement_shard_map_invocation_leaf!(Tracer<C>, [C], [C: ryft_core::StagingContext<Type = ArrayType, Operation = XlaOperation>]);
+implement_shard_map_invocation_leaf!(ryft_core::DifferentiationTracer<C>, [C], [C: Context]);
 
 #[cfg(test)]
 mod tests {

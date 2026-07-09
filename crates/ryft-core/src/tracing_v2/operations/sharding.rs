@@ -15,6 +15,7 @@
 //!   the backend to fill), matching JAX's `with_sharding_constraint` batcher.
 
 use crate::batching::ArrayBatch;
+use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
@@ -93,7 +94,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_sharding, output_axis) = match inputs[0].batch_axis().axis() {
+        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
                 let batch_dimension = ArrayBatch::sharding_for_inputs(inputs)?;
                 let lifted = self
@@ -105,7 +106,7 @@ where
             None => (self.sharding().clone(), None),
         };
         let lifted_op = ReshardOperation::new(lifted_sharding);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[output_axis.into()])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
     }
 }
 
@@ -166,7 +167,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_sharding, output_axis) = match inputs[0].batch_axis().axis() {
+        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
                 let lifted = self
                     .sharding()
@@ -177,7 +178,7 @@ where
             None => (self.sharding().clone(), None),
         };
         let lifted_op = ShardingConstraintOperation::new(lifted_sharding);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[output_axis.into()])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
     }
 }
 

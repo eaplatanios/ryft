@@ -11,44 +11,34 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::LinearizationTracer;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
+use crate::macros::check_count;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{
-    FillOperation, OneLike, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
-};
+use crate::operations::constants::{FillOperation, OneOperation, ZeroLikeOperation, ZeroOperation};
+use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
 use crate::scalars::Scalar;
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-use crate::types::{ArrayType, Size, TypeError, Typed};
+use crate::types::{ArrayType, Shape, Size, TypeError, Typed};
 
-/// Leaf type that can be materialized into a dense finite-dimensional coordinate representation.
+/// Context capability that synthesizes a packed standard-basis value for dense differential replay.
 ///
-/// Structured differential materialization only makes sense for leaf types with a finite, explicit
-/// basis. [`CoordinateValue`] is the bridge from the generic tracing world into that coordinate-based
-/// view: it teaches the differential helpers how many coordinates a leaf contributes, what basis
-/// vectors to probe with, and how to flatten outputs back into numeric entries.
-pub trait CoordinateValue: Value<Type = ArrayType> + ZeroLike + OneLike {
-    /// Scalar-like coordinate type used by [`DifferentialBlock`] entries.
-    type Coordinate: Clone + Debug + PartialEq + 'static;
-
-    /// Returns the number of coordinates contributed by this leaf.
-    fn coordinate_count(&self) -> usize;
-
-    /// Returns a standard basis for the coordinate space of this leaf.
-    fn coordinate_basis(&self) -> Vec<Self>;
-
-    /// Flattens the leaf into its coordinate values in a deterministic order.
-    fn coordinates(&self) -> Vec<Self::Coordinate>;
-
-    /// Stacks the provided values along a new leading batch axis. All values must share the same
-    /// [`ArrayType`]; the resulting value carries that type prefixed with `Size::Static(values.len())`
-    /// on axis `0`. Used by `Differential::from_pushforward_program` and [`jacrev`] to pack `N`
-    /// per-basis-tangent values into one batched input that flows through the value-level
-    /// [`BatchableOperation::batch`] rule for tangent values.
-    fn stack(values: Vec<Self>) -> Result<Self, ProgramError>;
+/// For a leaf type `T` with `n` row-major coordinates, `coordinate_basis(T, offset, size)` returns one value with
+/// physical type `[size] ++ T.shape`. Row `k` is the leaf's one-hot vector at coordinate `k - offset` when
+/// `offset <= k < offset + n`, and zero otherwise. The inserted leading basis axis is replicated; the leaf axes keep
+/// `T`'s placement metadata. Owning this operation on the context lets eager device backends synthesize the whole
+/// packed basis directly on device instead of uploading `n` host one-hot buffers.
+pub trait CoordinateBasis<V: Value<Type = ArrayType>> {
+    /// Synthesizes one packed standard-basis leaf with a leading axis of length `basis_size`.
+    fn coordinate_basis(
+        &self,
+        leaf_type: &ArrayType,
+        coordinate_offset: usize,
+        basis_size: usize,
+    ) -> Result<V, ProgramError>;
 }
 
 /// Structured forward- or reverse-mode Jacobian of a function `Input -> Output` over leaf value
@@ -56,17 +46,11 @@ pub trait CoordinateValue: Value<Type = ArrayType> + ZeroLike + OneLike {
 ///
 /// The outer [`Parameterized`] family mirrors the function's output; each output-leaf position
 /// holds a [`DifferentialRow`] whose internal family mirrors the function's input and whose leaves
-/// are [`DifferentialBlock`]s of partial derivatives. Block entries are stored as `V::Coordinate`
-/// scalars.
+/// are [`DifferentialBlock`]s whose partial-derivative tensors remain values in the same execution domain.
 pub type Jacobian<Input, Output, V> = Differential<
-    <Output as Parameterized<V>>::To<
-        DifferentialRow<
-            <Input as Parameterized<V>>::To<DifferentialBlock<<V as CoordinateValue>::Coordinate>>,
-            <V as CoordinateValue>::Coordinate,
-        >,
-    >,
-    <Input as Parameterized<V>>::To<DifferentialBlock<<V as CoordinateValue>::Coordinate>>,
-    <V as CoordinateValue>::Coordinate,
+    <Output as Parameterized<V>>::To<DifferentialRow<<Input as Parameterized<V>>::To<DifferentialBlock<V>>, V>>,
+    <Input as Parameterized<V>>::To<DifferentialBlock<V>>,
+    V,
 >;
 
 /// Structured Hessian of a scalar-output function over a [`Parameterized`] input with leaf value
@@ -79,14 +63,11 @@ pub type Hessian<Input, V> = Jacobian<Input, Input, V>;
 /// Concrete value type selected by a [`Domain`].
 type DomainValue<D> = <D as Domain>::Value;
 
-/// Scalar coordinate type used to materialize dense differential blocks for `V`.
-type CoordinateScalar<V> = <V as CoordinateValue>::Coordinate;
-
 /// Dense derivative materialization helpers for differentiable array domains.
 ///
 /// This extension trait keeps the core [`ForwardModeDifferentiate`] and [`ReverseModeDifferentiate`]
 /// contracts focused on primitive linearization and AD transforms while providing structured Jacobian
-/// and Hessian materialization for domains whose values expose finite coordinate bases.
+/// and Hessian materialization for domains that can synthesize finite coordinate bases.
 pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
     /// Materializes a structured [`Jacobian`] using forward-mode differentiation.
     ///
@@ -101,7 +82,8 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         primal: Input,
     ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>, ProgramError>
     where
-        DomainValue<Self>: CoordinateValue + BooleanLike + 'domain,
+        Self: CoordinateBasis<DomainValue<Self>>,
+        DomainValue<Self>: Value<Type = ArrayType> + BooleanLike + Broadcast + Reshape + Slice + Transpose + 'domain,
         Input: Parameterized<
                 DomainValue<Self>,
                 To<DomainValue<Self>> = Input,
@@ -109,13 +91,13 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             >,
         TracedOutput: Parameterized<LinearizationTracer<Self>, ParameterStructure: PartialEq>,
         Input::Family: ParameterizedFamily<LinearizationTracer<Self>>
-            + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
+            + ParameterizedFamily<DifferentialBlock<DomainValue<Self>>>,
         TracedOutput::Family: ParameterizedFamily<DomainValue<Self>>
             + ParameterizedFamily<LinearizationTracer<Self>>
             + ParameterizedFamily<
                 DifferentialRow<
-                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
-                    CoordinateScalar<DomainValue<Self>>,
+                    Input::To<DifferentialBlock<DomainValue<Self>>>,
+                    DomainValue<Self>,
                 >,
             >,
         TracedOutput::To<DomainValue<Self>>: Parameterized<
@@ -123,13 +105,13 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
                 To<DomainValue<Self>> = TracedOutput::To<DomainValue<Self>>,
                 To<
                     DifferentialRow<
-                        Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
-                        CoordinateScalar<DomainValue<Self>>,
+                        Input::To<DifferentialBlock<DomainValue<Self>>>,
+                        DomainValue<Self>,
                     >,
                 > = TracedOutput::To<
                     DifferentialRow<
-                        Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
-                        CoordinateScalar<DomainValue<Self>>,
+                        Input::To<DifferentialBlock<DomainValue<Self>>>,
+                        DomainValue<Self>,
                     >,
                 >,
         >,
@@ -153,7 +135,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // replicated values — preserving the exact Jacobian layout.
         let (output, pushforward) = self.linearize(function, primals)?;
         let (program, residuals) = pushforward.into_parts();
-        Differential::from_pushforward_program::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
+        Differential::from_pushforward_program::<Self, Input, TracedOutput::To<DomainValue<Self>>>(
             self,
             input_structure,
             input_parameters,
@@ -174,18 +156,14 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         primals: Input,
     ) -> Result<Hessian<Input, DomainValue<Self>>, DifferentiationError>
     where
-        DomainValue<Self>: CoordinateValue + 'domain,
+        Self: CoordinateBasis<DomainValue<Self>>,
+        DomainValue<Self>: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose + 'domain,
         Input: Parameterized<DomainValue<Self>, To<DomainValue<Self>> = Input, ParameterStructure: Debug + PartialEq>,
         Input::Family: ParameterizedFamily<LinearizationTracer<DomainTracingContext<Self>>>
             + ParameterizedFamily<Tracer<DomainTracingContext<Self>>>
             + ParameterizedFamily<<Self as Domain>::Constant>
-            + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>
-            + ParameterizedFamily<
-                DifferentialRow<
-                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<Self>>>>,
-                    CoordinateScalar<DomainValue<Self>>,
-                >,
-            >,
+            + ParameterizedFamily<DifferentialBlock<DomainValue<Self>>>
+            + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<DomainValue<Self>>>, DomainValue<Self>>>,
         Input::To<Tracer<DomainTracingContext<Self>>>: Parameterized<
                 Tracer<DomainTracingContext<Self>>,
                 To<Tracer<DomainTracingContext<Self>>> = Input::To<Tracer<DomainTracingContext<Self>>>,
@@ -252,7 +230,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             .interpret_in_context(self, input_parameters.clone())
             .map_err(DifferentiationError::from)?;
         let residuals = primal_outputs.split_off(primal_outputs.len() - residual_count);
-        Differential::from_pushforward_program::<Self, Input, Input, DomainValue<Self>>(
+        Differential::from_pushforward_program::<Self, Input, Input>(
             self,
             input_structure,
             input_parameters,
@@ -269,37 +247,43 @@ impl<D> DifferentiableDomainExtension for D where D: Context<Type = ArrayType> {
 /// Partial derivatives of one output leaf with respect to one input leaf.
 ///
 /// For an output leaf of shape `O` and an input leaf of shape `I`, a `DifferentialBlock` carries
-/// the `O ++ I`-shaped partial-derivative tensor stored in row-major order, with the output
-/// dimensions varying slowest. The two shapes are reported alongside the values so callers can
-/// index into the tensor without consulting any external metadata.
+/// one `O ++ I`-shaped partial-derivative tensor in the execution domain, with the output dimensions varying
+/// slowest. Keeping the tensor as a domain value preserves device placement, sharding, and element type and avoids
+/// an implicit device-to-host synchronization at the transform boundary.
 #[derive(Parameter, Clone, Debug)]
-pub struct DifferentialBlock<S> {
+pub struct DifferentialBlock<V> {
     /// Shape of the output leaf this block contributes to.
     output_shape: Vec<usize>,
 
     /// Shape of the input leaf this block differentiates with respect to.
     input_shape: Vec<usize>,
 
-    /// Row-major partial-derivative values; length is `prod(output_shape) * prod(input_shape)`.
-    values: Vec<S>,
+    /// Device/domain partial-derivative tensor with shape `output_shape ++ input_shape`.
+    value: V,
 }
 
-impl<S> DifferentialBlock<S> {
-    /// Constructs a [`DifferentialBlock`] from explicit shapes and row-major values.
+impl<V: Value<Type = ArrayType>> DifferentialBlock<V> {
+    /// Constructs a [`DifferentialBlock`] from explicit logical shapes and its domain tensor.
     ///
     /// # Parameters
     ///
     ///   - `output_shape`: Shape of the output leaf this block contributes to.
     ///   - `input_shape`: Shape of the input leaf this block differentiates with respect to.
-    ///   - `values`: Row-major partial-derivative values with the output dimensions varying slowest.
-    ///     Length must equal `prod(output_shape) * prod(input_shape)`.
-    pub fn new(output_shape: Vec<usize>, input_shape: Vec<usize>, values: Vec<S>) -> Self {
-        debug_assert_eq!(
-            values.len(),
-            output_shape.iter().product::<usize>() * input_shape.iter().product::<usize>(),
-            "differential block value count must equal the product of the output and input shape sizes",
-        );
-        Self { output_shape, input_shape, values }
+    ///   - `value`: Partial-derivative tensor. Its shape must equal `output_shape ++ input_shape`.
+    pub fn new(output_shape: Vec<usize>, input_shape: Vec<usize>, value: V) -> Result<Self, ProgramError> {
+        let expected_shape =
+            Shape::new(output_shape.iter().chain(input_shape.iter()).copied().map(Size::Static).collect());
+        if value.r#type().shape() != &expected_shape {
+            return Err(TypeError {
+                message: format!(
+                    "differential block value has shape {} but output shape {output_shape:?} and input shape \
+                     {input_shape:?} require {expected_shape}",
+                    value.r#type().shape(),
+                ),
+            }
+            .into());
+        }
+        Ok(Self { output_shape, input_shape, value })
     }
 
     /// Returns the shape of the output leaf this block contributes to.
@@ -314,26 +298,16 @@ impl<S> DifferentialBlock<S> {
         &self.input_shape
     }
 
-    /// Returns the row-major partial-derivative values stored in this block.
+    /// Returns the domain value storing this block's partial-derivative tensor.
     #[inline]
-    pub fn values(&self) -> &[S] {
-        &self.values
+    pub fn value(&self) -> &V {
+        &self.value
     }
 
-    /// Returns the partial derivative at `(output_index, input_index)` if both lie within the
-    /// block's output and input shapes respectively.
-    ///
-    /// # Parameters
-    ///
-    ///   - `output_index`: Multidimensional index into the output leaf. Must have the same length
-    ///     as [`Self::output_shape`].
-    ///   - `input_index`: Multidimensional index into the input leaf. Must have the same length
-    ///     as [`Self::input_shape`].
-    pub fn get(&self, output_index: &[usize], input_index: &[usize]) -> Option<&S> {
-        let output_offset = flat_offset(&self.output_shape, output_index)?;
-        let input_offset = flat_offset(&self.input_shape, input_index)?;
-        let input_size = self.input_shape.iter().product::<usize>();
-        Some(&self.values[output_offset * input_size + input_offset])
+    /// Consumes this block and returns its partial-derivative tensor.
+    #[inline]
+    pub fn into_value(self) -> V {
+        self.value
     }
 }
 
@@ -341,31 +315,31 @@ impl<S> DifferentialBlock<S> {
 /// input leaf.
 ///
 /// `Partials` is the input `Parameterized` value already reparameterized to [`DifferentialBlock`]
-/// leaves (typically `Input::To<DifferentialBlock<S>>` at the call site). Carries [`Parameter`] —
+/// leaves (typically `Input::To<DifferentialBlock<V>>` at the call site). Carries [`Parameter`] —
 /// **not** [`Parameterized`] — so it can appear as a leaf inside the outer `Parameterized` value
 /// held by [`Differential`]. Internal structure is accessed via [`Self::partials`].
 #[derive(Parameter, Clone, Debug)]
-pub struct DifferentialRow<Partials, S>
+pub struct DifferentialRow<Partials, V>
 where
-    Partials: Parameterized<DifferentialBlock<S>>,
+    Partials: Parameterized<DifferentialBlock<V>>,
 {
     /// Input-shaped [`Parameterized`] value whose leaves are the partial-derivative blocks for the
     /// output leaf this row corresponds to.
     partials: Partials,
 
-    /// Marker keeping the scalar coordinate type fixed at the type level.
-    _scalar: PhantomData<S>,
+    /// Marker keeping the domain value type fixed at the type level.
+    _value: PhantomData<V>,
 }
 
-impl<Partials, S> DifferentialRow<Partials, S>
+impl<Partials, V> DifferentialRow<Partials, V>
 where
-    Partials: Parameterized<DifferentialBlock<S>>,
+    Partials: Parameterized<DifferentialBlock<V>>,
 {
     /// Constructs a [`DifferentialRow`] from an input-shaped [`Parameterized`] value of
     /// [`DifferentialBlock`]s.
     #[inline]
     pub fn new(partials: Partials) -> Self {
-        Self { partials, _scalar: PhantomData }
+        Self { partials, _value: PhantomData }
     }
 
     /// Returns the input-shaped [`Parameterized`] value backing this row.
@@ -385,7 +359,7 @@ where
     #[inline]
     pub fn iter_partials(
         &self,
-    ) -> <Partials as Parameterized<DifferentialBlock<S>>>::NamedParameterIterator<'_, DifferentialBlock<S>> {
+    ) -> <Partials as Parameterized<DifferentialBlock<V>>>::NamedParameterIterator<'_, DifferentialBlock<V>> {
         self.partials.named_parameters()
     }
 }
@@ -406,23 +380,23 @@ where
 /// }
 /// ```
 #[derive(Clone, Debug)]
-pub struct Differential<Rows, Partials, S>
+pub struct Differential<Rows, Partials, V>
 where
-    Rows: Parameterized<DifferentialRow<Partials, S>>,
-    Partials: Parameterized<DifferentialBlock<S>>,
+    Rows: Parameterized<DifferentialRow<Partials, V>>,
+    Partials: Parameterized<DifferentialBlock<V>>,
 {
     /// Output-shaped [`Parameterized`] value whose leaves are the [`DifferentialRow`]s for each
     /// output leaf.
     rows: Rows,
 
     /// Marker keeping the inner partials and scalar types fixed at the type level.
-    _phantom: PhantomData<(Partials, S)>,
+    _phantom: PhantomData<(Partials, V)>,
 }
 
-impl<Rows, Partials, S> Differential<Rows, Partials, S>
+impl<Rows, Partials, V> Differential<Rows, Partials, V>
 where
-    Rows: Parameterized<DifferentialRow<Partials, S>>,
-    Partials: Parameterized<DifferentialBlock<S>>,
+    Rows: Parameterized<DifferentialRow<Partials, V>>,
+    Partials: Parameterized<DifferentialBlock<V>>,
 {
     /// Constructs a [`Differential`] from an output-shaped [`Parameterized`] value of
     /// [`DifferentialRow`]s.
@@ -448,77 +422,9 @@ where
     #[inline]
     pub fn iter_rows(
         &self,
-    ) -> <Rows as Parameterized<DifferentialRow<Partials, S>>>::NamedParameterIterator<'_, DifferentialRow<Partials, S>>
+    ) -> <Rows as Parameterized<DifferentialRow<Partials, V>>>::NamedParameterIterator<'_, DifferentialRow<Partials, V>>
     {
         self.rows.named_parameters()
-    }
-
-    /// Constructs a [`Differential`] from flat per-item output-coordinate columns.
-    ///
-    /// Each entry in `columns` is the full flattened output differential produced by one input-coordinate basis item.
-    /// This helper only handles the structure rearrangement into output rows and input blocks; callers decide how those
-    /// columns are produced.
-    fn from_coordinate_columns<Input, Output, V>(
-        input_structure: Input::ParameterStructure,
-        input_parameters: &[V],
-        output_structure: Output::ParameterStructure,
-        output_parameters: &[V],
-        columns: Vec<Vec<S>>,
-    ) -> Result<Self, ProgramError>
-    where
-        S: Clone,
-        V: CoordinateValue<Coordinate = S>,
-        Input:
-            Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
-        Output:
-            Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, S>> = Rows, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<DifferentialBlock<S>>,
-        Output::Family: ParameterizedFamily<DifferentialRow<Partials, S>>,
-        Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
-        Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
-    {
-        let input_shapes = input_parameters
-            .iter()
-            .map(|parameter| static_shape(parameter.r#type().as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let input_coordinate_counts = coordinate_counts(input_parameters);
-        let input_offsets = coordinate_offsets(&input_coordinate_counts);
-
-        let output_shapes = output_parameters
-            .iter()
-            .map(|parameter| static_shape(parameter.r#type().as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_coordinate_counts = coordinate_counts(output_parameters);
-        let output_offsets = coordinate_offsets(&output_coordinate_counts);
-
-        let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
-        for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {
-            let output_offset = output_offsets[output_leaf_index];
-            let output_shape = &output_shapes[output_leaf_index];
-
-            let mut blocks = Vec::with_capacity(input_coordinate_counts.len());
-            for (input_leaf_index, &input_count) in input_coordinate_counts.iter().enumerate() {
-                let input_offset = input_offsets[input_leaf_index];
-                let input_shape = &input_shapes[input_leaf_index];
-
-                let mut values = Vec::with_capacity(output_count * input_count);
-                for output_local in 0..output_count {
-                    for input_local in 0..input_count {
-                        let item = input_offset + input_local;
-                        let coordinate = output_offset + output_local;
-                        values.push(columns[item][coordinate].clone());
-                    }
-                }
-
-                blocks.push(DifferentialBlock::new(output_shape.clone(), input_shape.clone(), values));
-            }
-
-            let partials = Partials::from_parameters(input_structure.clone(), blocks)?;
-            rows_list.push(DifferentialRow::new(partials));
-        }
-
-        let rows = Rows::from_parameters(output_structure, rows_list)?;
-        Ok(Self::new(rows))
     }
 
     /// Constructs a [`Differential`] from a capture-free [`Linearization`] by replaying its primal sub-program
@@ -536,8 +442,8 @@ where
     ///      the pushforward program is expressed in the primal operation family, each instruction is lifted through
     ///      its primal-family [`BatchableOperation`] rule by [`batch_linear_program_instruction`], interpreting
     ///      nullary instructions through `context`.
-    ///   2. Assembles the per-(output-leaf, input-leaf) [`DifferentialBlock`]s from the resulting per-output
-    ///      coordinate columns.
+    ///   2. Slices, reshapes, and transposes the packed output values into per-(output-leaf, input-leaf)
+    ///      [`DifferentialBlock`] domain tensors.
     ///
     /// Tangents are ordinary [`Value`](DispatchDomain::Value)s of the same universe as the primals, so the concrete
     /// residuals recovered from the primal replay are tangent-typed and feed the tangent batch directly with no
@@ -548,12 +454,12 @@ where
     ///   - `context`: Context whose [`lift`](crate::Context::lift) and [`bind`](crate::Context::bind) replay the
     ///     primal sub-program and supply the value semantics for the batched tangent replay.
     ///   - `input_structure`: Placeholder shape of the function's `Input` argument.
-    ///   - `input_parameters`: Concrete leaf values of `Input` at the point of linearization, used both to derive each
-    ///     input leaf's static shape and to replay the primal sub-program.
+    ///   - `input_parameters`: Concrete leaf values of `Input` at the point of linearization, used to derive each input
+    ///     leaf's type, static shape, and coordinate range.
     ///   - `output`: Primal output of the linearized function, consumed to recover its placeholder shape and the static
     ///     shapes of its output leaves.
     ///   - `linearization`: Capture-free linearization whose primal and tangent sub-programs are replayed.
-    pub(crate) fn from_pushforward_program<C, Input, Output, V>(
+    pub(crate) fn from_pushforward_program<C, Input, Output>(
         context: &C,
         input_structure: Input::ParameterStructure,
         input_parameters: Vec<V>,
@@ -567,86 +473,80 @@ where
         residuals: Vec<V>,
     ) -> Result<Self, ProgramError>
     where
-        S: Clone,
-        C: Context<Type = ArrayType, Value = V>,
-        V: CoordinateValue<Coordinate = S>,
+        C: Context<Type = ArrayType, Value = V> + CoordinateBasis<V>,
+        V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
         Input:
-            Parameterized<V, To<V> = Input, To<DifferentialBlock<S>> = Partials, ParameterStructure: Debug + PartialEq>,
+            Parameterized<V, To<V> = Input, To<DifferentialBlock<V>> = Partials, ParameterStructure: Debug + PartialEq>,
         Output:
-            Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, S>> = Rows, ParameterStructure: PartialEq>,
-        Input::Family: ParameterizedFamily<DifferentialBlock<S>>,
-        Output::Family: ParameterizedFamily<DifferentialRow<Partials, S>>,
-        Partials: Parameterized<DifferentialBlock<S>, ParameterStructure = Input::ParameterStructure>,
-        Rows: Parameterized<DifferentialRow<Partials, S>, ParameterStructure = Output::ParameterStructure>,
+            Parameterized<V, To<V> = Output, To<DifferentialRow<Partials, V>> = Rows, ParameterStructure: PartialEq>,
+        Input::Family: ParameterizedFamily<DifferentialBlock<V>>,
+        Output::Family: ParameterizedFamily<DifferentialRow<Partials, V>>,
+        Partials: Parameterized<DifferentialBlock<V>, ParameterStructure = Input::ParameterStructure>,
+        Rows: Parameterized<DifferentialRow<Partials, V>, ParameterStructure = Output::ParameterStructure>,
         <C as Domain>::Operation: Clone + InterpretableOperation<V, C> + BatchableOperation<V, BatchingContext<C>>,
     {
-        let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
-        let batch_size: usize = input_coordinate_counts.iter().sum();
-        let batched_basis_parameters = batched_standard_basis::<V>(input_parameters.as_slice(), batch_size)?;
+        let input_types = input_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
+        let input_shapes = input_types.iter().map(static_shape).collect::<Result<Vec<_>, _>>()?;
+        let input_coordinate_counts = coordinate_counts(input_types.as_slice())?;
+        let input_offsets = coordinate_offsets(&input_coordinate_counts)?;
+        let batch_size = input_offsets.last().copied().unwrap_or(0);
+        let batched_basis_parameters = batched_standard_basis(context, input_types.as_slice(), batch_size)?;
 
         let output_structure = output.parameter_structure();
         let output_parameters = output.into_parameters().collect::<Vec<_>>();
+        let output_shapes = output_parameters
+            .iter()
+            .map(|parameter| static_shape(parameter.r#type().as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let columns = if batch_size == 0 {
-            Vec::new()
-        } else {
-            // Feed the pushforward program `[batched_basis_tangents..., unbatched_residuals...]`: the basis tangents
-            // carry one item per input coordinate on axis 0, and the residuals are broadcast as replicated values.
-            // Each instruction lifts through its batching dispatcher at an anonymous one-level `BatchingContext` over
-            // this context, so primitive work executes through the context itself.
-            let batching_context = BatchingContext::new(context.clone(), batch_size, None);
-            let mut tangent_inputs = batched_basis_parameters;
-            tangent_inputs.extend(residuals.into_iter().map(ArrayBatch::replicated));
-            let batched_output = program.interpret_with(
-                tangent_inputs,
-                |_, constant| Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?)),
-                |instruction, inputs: &[ArrayBatch<V>]| {
-                    batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
-                },
-            )?;
-            unstack_batched_coordinates::<V>(batched_output, output_parameters.as_slice(), batch_size)?
-        };
+        // Feed `[batched_basis_tangents..., unbatched_residuals...]` through one batched pushforward replay. The packed
+        // result leaves stay in the execution domain; slicing and axis rearrangement below carve them directly into
+        // per-(output, input) derivative tensors without coordinate readback.
+        let batching_context = BatchingContext::new(context.clone(), batch_size, None);
+        let mut tangent_inputs = batched_basis_parameters;
+        tangent_inputs.extend(residuals.into_iter().map(ArrayBatch::replicated));
+        let batched_outputs = program.interpret_with(
+            tangent_inputs,
+            |_, constant| Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?)),
+            |instruction, inputs: &[ArrayBatch<V>]| {
+                batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
+            },
+        )?;
+        check_count!("output", batched_outputs, output_parameters.len(), ProgramError);
 
-        Self::from_coordinate_columns::<Input, Output, V>(
-            input_structure,
-            input_parameters.as_slice(),
-            output_structure,
-            output_parameters.as_slice(),
-            columns,
-        )
+        let mut rows_list = Vec::with_capacity(output_parameters.len());
+        for (output_leaf_index, output_batch) in batched_outputs.iter().enumerate() {
+            let output_shape = &output_shapes[output_leaf_index];
+            let mut blocks = Vec::with_capacity(input_shapes.len());
+            for (input_leaf_index, input_shape) in input_shapes.iter().enumerate() {
+                blocks.push(forward_differential_block(
+                    output_batch,
+                    batch_size,
+                    input_offsets[input_leaf_index],
+                    input_shape,
+                    output_shape,
+                )?);
+            }
+            rows_list.push(DifferentialRow::new(Partials::from_parameters(input_structure.clone(), blocks)?));
+        }
+
+        Ok(Self::new(Rows::from_parameters(output_structure, rows_list)?))
     }
 }
 
-impl<Rows, Partials, S> Differential<Rows, Partials, S>
+impl<Rows, Partials, V> Differential<Rows, Partials, V>
 where
-    Rows: Parameterized<DifferentialRow<Partials, S>>,
-    Partials: Parameterized<DifferentialBlock<S>>,
-    S: Clone,
+    Rows: Parameterized<DifferentialRow<Partials, V>>,
+    Partials: Parameterized<DifferentialBlock<V>>,
 {
     /// Returns an iterator over every (output path, input path, [`DifferentialBlock`]) triple in
     /// this differential. The output path is yielded by [`Self::iter_rows`] and the input path by
     /// [`DifferentialRow::iter_partials`].
-    pub fn iter_blocks(&self) -> impl Iterator<Item = (ParameterPath, ParameterPath, &DifferentialBlock<S>)> + '_ {
+    pub fn iter_blocks(&self) -> impl Iterator<Item = (ParameterPath, ParameterPath, &DifferentialBlock<V>)> + '_ {
         self.rows.named_parameters().flat_map(|(output_path, row)| {
             row.iter_partials().map(move |(input_path, block)| (output_path.clone(), input_path, block))
         })
     }
-}
-
-/// Computes the flat offset of `index` within a tensor of `shape`, returning `None` if `index` is
-/// out of bounds or has the wrong rank.
-fn flat_offset(shape: &[usize], index: &[usize]) -> Option<usize> {
-    if shape.len() != index.len() {
-        return None;
-    }
-    let mut offset = 0;
-    for (dimension_size, dimension_index) in shape.iter().zip(index.iter()) {
-        if *dimension_index >= *dimension_size {
-            return None;
-        }
-        offset = offset * dimension_size + dimension_index;
-    }
-    Some(offset)
 }
 
 /// Extracts the static shape of `array_type` as a `Vec<usize>`. Returns an error if any dimension is
@@ -668,84 +568,146 @@ fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
         .collect()
 }
 
-/// Returns the per-leaf coordinate counts produced by [`CoordinateValue::coordinate_count`].
-fn coordinate_counts<V: CoordinateValue>(parameters: &[V]) -> Vec<usize> {
-    parameters.iter().map(CoordinateValue::coordinate_count).collect::<Vec<_>>()
+/// Returns the row-major coordinate count of each statically shaped leaf type.
+fn coordinate_counts(types: &[ArrayType]) -> Result<Vec<usize>, ProgramError> {
+    types
+        .iter()
+        .map(|r#type| {
+            static_shape(r#type)?.into_iter().try_fold(1usize, |count, size| {
+                count.checked_mul(size).ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!("differential coordinate count overflows usize for array type {type}"),
+                })
+            })
+        })
+        .collect()
 }
 
 /// Computes inclusive-prefix offsets given a slice of per-leaf coordinate counts. The returned
 /// slice has length `counts.len() + 1`, with the first element being `0` and the last being the
 /// total coordinate count.
-fn coordinate_offsets(counts: &[usize]) -> Vec<usize> {
+fn coordinate_offsets(counts: &[usize]) -> Result<Vec<usize>, ProgramError> {
     let mut offsets = Vec::with_capacity(counts.len() + 1);
     offsets.push(0);
     for count in counts {
-        offsets.push(offsets.last().copied().unwrap_or(0) + count);
+        offsets.push(offsets.last().copied().unwrap_or(0usize).checked_add(*count).ok_or_else(|| {
+            ProgramError::InvalidArgument { message: "total differential coordinate count overflows usize".into() }
+        })?);
     }
-    offsets
-}
-
-/// Builds one leaf's per-item values for a stacked standard basis.
-///
-/// The returned vector has `batch_size` entries and contains the appropriate one-hot basis value for this leaf's
-/// coordinate range and a zero-like value elsewhere.
-fn standard_basis_leaf_item_values<V: CoordinateValue>(
-    parameter: &V,
-    leaf_start: usize,
-    leaf_count: usize,
-    batch_size: usize,
-) -> Vec<V> {
-    let leaf_basis = parameter.coordinate_basis();
-    let leaf_zero = parameter.zero_like();
-
-    (0..batch_size)
-        .map(|item| {
-            if item >= leaf_start && item < leaf_start + leaf_count {
-                leaf_basis[item - leaf_start].clone()
-            } else {
-                leaf_zero.clone()
-            }
-        })
-        .collect()
-}
-
-/// Builds the standard basis metadata shared by forward- and reverse-mode differential materialization.
-fn standard_basis_metadata<V: CoordinateValue>(parameters: &[V], batch_size: usize) -> (Vec<usize>, Vec<usize>) {
-    let counts = coordinate_counts(parameters);
-    let offsets = coordinate_offsets(&counts);
-    debug_assert_eq!(offsets.last().copied().unwrap_or(0), batch_size, "batch size must equal total coord count");
-    (counts, offsets)
+    Ok(offsets)
 }
 
 /// Builds the standard basis for the coordinate space of a [`Parameterized`] tangent value,
 /// packed per-leaf into [`ArrayBatch`]es for batched program interpretation.
 ///
-/// For each input leaf, the returned [`ArrayBatch`] carries a `batch_size`-item stacked tangent
-/// whose item `k` is the one-hot basis vector at position `k - leaf_offset[i]` when `k` falls
-/// within leaf `i`'s coordinate range, and `zero_like` otherwise.
-fn batched_standard_basis<V: CoordinateValue>(
-    parameters: &[V],
+/// For each leaf, the context produces one `[batch_size] ++ leaf_shape` value whose row `k` is the leaf-local one-hot
+/// vector selected by the global coordinate offset, or zero when that global row belongs to another leaf.
+fn batched_standard_basis<C, V>(
+    context: &C,
+    types: &[ArrayType],
     batch_size: usize,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-    let (counts, offsets) = standard_basis_metadata(parameters, batch_size);
-    parameters
+) -> Result<Vec<ArrayBatch<V>>, ProgramError>
+where
+    C: CoordinateBasis<V>,
+    V: Value<Type = ArrayType>,
+{
+    let counts = coordinate_counts(types)?;
+    let offsets = coordinate_offsets(&counts)?;
+    if offsets.last().copied().unwrap_or(0) != batch_size {
+        return Err(ProgramError::InvalidArgument {
+            message: "basis size must equal the total coordinate count".into(),
+        });
+    }
+    types
         .iter()
         .enumerate()
-        .map(|(leaf_index, parameter)| -> Result<_, BatchingError> {
-            let leaf_type = parameter.r#type().into_owned();
-            let item_values =
-                standard_basis_leaf_item_values(parameter, offsets[leaf_index], counts[leaf_index], batch_size);
-            let stacked = V::stack(item_values)?;
-
-            // Insert the batch axis through the type itself so the batched basis keeps the leaf's optional metadata:
-            // in particular, a sharded leaf yields a batched basis carrying the same per-dimension sharding with a
-            // replicated inserted batch axis, matching the sharded declared input types of the replayed tangent
-            // program. Rank-changing insertion clears any explicit layout, per `with_inserted_dimension`'s contract.
-            let batched_type = leaf_type.with_inserted_dimension(0, Size::Static(batch_size))?;
-
-            ArrayBatch::new(batched_type, stacked, Some(0))
+        .map(|(leaf_index, leaf_type)| {
+            let expected_type = leaf_type.with_inserted_dimension(0, Size::Static(batch_size))?;
+            let value = context.coordinate_basis(leaf_type, offsets[leaf_index], batch_size)?;
+            if value.r#type().as_ref() != &expected_type {
+                return Err(TypeError {
+                    message: format!(
+                        "coordinate basis for leaf type {leaf_type} has type {} but expected {expected_type}",
+                        value.r#type(),
+                    ),
+                }
+                .into());
+            }
+            ArrayBatch::new(expected_type, value, Some(0)).map_err(ProgramError::from)
         })
         .collect()
+}
+
+/// Extracts a contiguous range of leading basis rows and reshapes that flattened basis range back to
+/// `basis_shape`, leaving the per-item axes after it.
+fn basis_range_value<V>(
+    batch: &ArrayBatch<V>,
+    batch_size: usize,
+    basis_offset: usize,
+    basis_shape: &[usize],
+    item_shape: &[usize],
+) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
+{
+    let aligned = batch.match_axis(0, batch_size)?;
+    let actual_item_shape = static_shape(&aligned.unbatched_type()?)?;
+    if actual_item_shape != item_shape {
+        return Err(TypeError {
+            message: format!(
+                "batched differential output has per-item shape {actual_item_shape:?} but expected {item_shape:?}",
+            ),
+        }
+        .into());
+    }
+    let basis_count = basis_shape.iter().try_fold(1usize, |count, size| {
+        count.checked_mul(*size).ok_or_else(|| ProgramError::InvalidArgument {
+            message: format!("differential basis shape {basis_shape:?} overflows usize"),
+        })
+    })?;
+    let physical_shape = static_shape(aligned.r#type().as_ref())?;
+    let mut start_indices = vec![0; physical_shape.len()];
+    start_indices[0] = basis_offset;
+    let mut limit_indices = physical_shape;
+    limit_indices[0] = basis_offset + basis_count;
+    let strides = vec![1; limit_indices.len()];
+    let sliced = aligned.value().slice(&start_indices, &limit_indices, &strides)?;
+    let reshaped_shape = Shape::new(basis_shape.iter().chain(item_shape.iter()).copied().map(Size::Static).collect());
+    sliced.reshape(reshaped_shape)
+}
+
+/// Builds one forward-mode block. The packed replay is `[input_coordinates] ++ output_shape`; move the input basis
+/// axes behind the output axes to obtain the public `output_shape ++ input_shape` layout.
+fn forward_differential_block<V>(
+    batch: &ArrayBatch<V>,
+    batch_size: usize,
+    input_offset: usize,
+    input_shape: &[usize],
+    output_shape: &[usize],
+) -> Result<DifferentialBlock<V>, ProgramError>
+where
+    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
+{
+    let value = basis_range_value(batch, batch_size, input_offset, input_shape, output_shape)?;
+    let input_rank = input_shape.len();
+    let output_rank = output_shape.len();
+    let permutation = (input_rank..input_rank + output_rank).chain(0..input_rank).collect::<Vec<_>>();
+    DifferentialBlock::new(output_shape.to_vec(), input_shape.to_vec(), value.transpose(permutation)?)
+}
+
+/// Builds one reverse-mode block. Pullback replay already packs the output basis rows before each input leaf's axes,
+/// so restoring the flattened output range to `output_shape` yields the public layout directly.
+fn reverse_differential_block<V>(
+    batch: &ArrayBatch<V>,
+    batch_size: usize,
+    output_offset: usize,
+    output_shape: &[usize],
+    input_shape: &[usize],
+) -> Result<DifferentialBlock<V>, ProgramError>
+where
+    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
+{
+    let value = basis_range_value(batch, batch_size, output_offset, output_shape, input_shape)?;
+    DifferentialBlock::new(output_shape.to_vec(), input_shape.to_vec(), value)
 }
 
 /// Batches one direct linear-program instruction for dense forward/reverse Jacobian interpretation, special-casing
@@ -785,39 +747,10 @@ where
     BatchableOperation::<V, BatchingContext<C>>::batch(operation, context, inputs)
 }
 
-/// Extracts per-item flat output coordinates from a structured batched program output.
-///
-/// For each output leaf, the batched leaf value contributes `leaf_coord_count` coordinates per batch item carved out
-/// of the batched flat coordinate buffer.
-fn unstack_batched_coordinates<V>(
-    output_batches: Vec<ArrayBatch<V>>,
-    output_parameters: &[V],
-    batch_size: usize,
-) -> Result<Vec<Vec<V::Coordinate>>, ProgramError>
-where
-    V: CoordinateValue,
-{
-    assert_eq!(output_batches.len(), output_parameters.len(), "output parameter count mismatch");
-    let mut columns: Vec<Vec<V::Coordinate>> = (0..batch_size).map(|_| Vec::new()).collect();
-    for (leaf_batch, leaf_exemplar) in output_batches.into_iter().zip(output_parameters.iter()) {
-        let leaf_coord_count = leaf_exemplar.coordinate_count();
-        let all_coords = leaf_batch.into_value().coordinates();
-        assert_eq!(
-            all_coords.len(),
-            batch_size * leaf_coord_count,
-            "expected {batch_size} batch items x {leaf_coord_count} coords per output leaf",
-        );
-        for (item, item_coords) in all_coords.chunks(leaf_coord_count).enumerate() {
-            columns[item].extend_from_slice(item_coords);
-        }
-    }
-    Ok(columns)
-}
-
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.
 ///
-/// [`jacrev`] replays all output-coordinate basis cotangents through the pullback and reassembles
-/// the resulting input coordinates into per-(output-leaf, input-leaf) [`DifferentialBlock`]s.
+/// [`jacrev`] replays all output-coordinate basis cotangents through the pullback and slices the packed input
+/// cotangents into per-(output-leaf, input-leaf) device/domain [`DifferentialBlock`] tensors.
 #[allow(private_bounds)]
 pub fn jacrev<C, F, Input, TracedOutput>(
     context: &C,
@@ -825,37 +758,24 @@ pub fn jacrev<C, F, Input, TracedOutput>(
     primals: Input,
 ) -> Result<Jacobian<Input, TracedOutput::To<DomainValue<C>>, DomainValue<C>>, ProgramError>
 where
-    C: Context<Type = ArrayType>,
-    DomainValue<C>: CoordinateValue + BooleanLike,
+    C: Context<Type = ArrayType> + CoordinateBasis<DomainValue<C>>,
+    DomainValue<C>: Value<Type = ArrayType> + BooleanLike + Broadcast + Reshape + Slice + Transpose,
     <C as Domain>::Constant: Value<Type = ArrayType>,
     Input: Parameterized<DomainValue<C>, To<DomainValue<C>> = Input, ParameterStructure: Debug + PartialEq>,
     TracedOutput: Parameterized<LinearizationTracer<C>, ParameterStructure: Debug + PartialEq>,
     Input::Family: ParameterizedFamily<<C as Domain>::Value>
         + ParameterizedFamily<LinearizationTracer<C>>
-        + ParameterizedFamily<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
+        + ParameterizedFamily<DifferentialBlock<DomainValue<C>>>,
     TracedOutput::Family: ParameterizedFamily<DomainValue<C>>
         + ParameterizedFamily<<C as Domain>::Value>
         + ParameterizedFamily<LinearizationTracer<C>>
-        + ParameterizedFamily<
-            DifferentialRow<
-                Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
-                CoordinateScalar<DomainValue<C>>,
-            >,
-        >,
+        + ParameterizedFamily<DifferentialRow<Input::To<DifferentialBlock<DomainValue<C>>>, DomainValue<C>>>,
     TracedOutput::To<DomainValue<C>>: Parameterized<
             DomainValue<C>,
             To<DomainValue<C>> = TracedOutput::To<DomainValue<C>>,
             To<<C as Domain>::Value> = TracedOutput::To<<C as Domain>::Value>,
-            To<
-                DifferentialRow<
-                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
-                    CoordinateScalar<DomainValue<C>>,
-                >,
-            > = TracedOutput::To<
-                DifferentialRow<
-                    Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
-                    CoordinateScalar<DomainValue<C>>,
-                >,
+            To<DifferentialRow<Input::To<DifferentialBlock<DomainValue<C>>>, DomainValue<C>>> = TracedOutput::To<
+                DifferentialRow<Input::To<DifferentialBlock<DomainValue<C>>>, DomainValue<C>>,
             >,
             ParameterStructure: Debug + PartialEq,
         >,
@@ -868,19 +788,13 @@ where
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation>
         + DifferentiableOperation<PartialEvaluationContext<C>>,
-    C: Zero<<C as Domain>::Value>,
 {
     let input_structure = primals.parameter_structure();
     let input_parameters = primals.into_parameters().collect::<Vec<_>>();
+    let input_types = input_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
     let input_shapes = input_parameters
         .iter()
         .map(|parameter| static_shape(parameter.r#type().as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let input_coordinate_counts = coordinate_counts(input_parameters.as_slice());
-    let input_offsets = coordinate_offsets(&input_coordinate_counts);
-    let tangent_input_parameters = input_parameters
-        .iter()
-        .map(|parameter| context.zero(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
@@ -888,81 +802,54 @@ where
     let (pullback, residuals) = pullback.into_parts();
     let output_structure = output.parameter_structure();
     let output_parameters = output.into_parameters().collect::<Vec<_>>();
+    let output_types = output_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
     let output_shapes = output_parameters
         .iter()
         .map(|parameter| static_shape(parameter.r#type().as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
-    let output_coordinate_counts = coordinate_counts(output_parameters.as_slice());
-    let output_offsets = coordinate_offsets(&output_coordinate_counts);
-    let batch_size: usize = output_coordinate_counts.iter().sum();
-    let cotangent_parameters = output_parameters
-        .iter()
-        .map(|parameter| context.zero(parameter.r#type().as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut batched_basis_parameters =
-        batched_standard_basis::<<C as Domain>::Value>(cotangent_parameters.as_slice(), batch_size)?;
+    let output_coordinate_counts = coordinate_counts(output_types.as_slice())?;
+    let output_offsets = coordinate_offsets(&output_coordinate_counts)?;
+    let batch_size = output_offsets.last().copied().unwrap_or(0);
+    let mut batched_basis_parameters = batched_standard_basis(context, output_types.as_slice(), batch_size)?;
     // The direct-transpose pullback consumes `[output_cotangents ++ residuals]`. The residuals depend only on the
     // primal, so they are identical across all cotangent rows; feed them as replicated operands
     // appended after the per-item cotangent basis.
     batched_basis_parameters.extend(residuals.into_iter().map(ArrayBatch::replicated));
 
-    let rows = if batch_size == 0 {
-        Vec::new()
-    } else {
-        // Each pullback instruction lifts through its batching dispatcher at an anonymous one-level
-        // `BatchingContext` over the caller's context, so primitive work executes through that context itself.
-        let batching_context = BatchingContext::new(context.clone(), batch_size, None);
-        let batched_input = pullback.interpret_with(
-            batched_basis_parameters,
-            // The pullback stays in the context's staged constant space, so each live constant is lifted into the
-            // value space first and then replicated across the batch (residuals get the same treatment above).
-            |_, constant: &<C as Domain>::Constant| {
-                Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?))
-            },
-            |instruction, inputs: &[ArrayBatch<<C as Domain>::Value>]| {
-                batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
-            },
-        )?;
-        unstack_batched_coordinates::<<C as Domain>::Value>(
-            batched_input,
-            tangent_input_parameters.as_slice(),
-            batch_size,
-        )?
-    };
+    // Replay all output cotangent basis rows through the pullback in one batch. The returned input leaves stay as
+    // packed domain values and are sliced directly into derivative blocks below.
+    let batching_context = BatchingContext::new(context.clone(), batch_size, None);
+    let batched_inputs = pullback.interpret_with(
+        batched_basis_parameters,
+        |_, constant: &<C as Domain>::Constant| {
+            Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?))
+        },
+        |instruction, inputs: &[ArrayBatch<<C as Domain>::Value>]| {
+            batch_linear_program_instruction(&batching_context, instruction.operation(), inputs)
+        },
+    )?;
+    check_count!("output", batched_inputs, input_types.len(), ProgramError);
 
     let mut rows_list = Vec::with_capacity(output_coordinate_counts.len());
-    for (output_leaf_index, &output_count) in output_coordinate_counts.iter().enumerate() {
+    for output_leaf_index in 0..output_coordinate_counts.len() {
         let output_offset = output_offsets[output_leaf_index];
         let output_shape = &output_shapes[output_leaf_index];
 
-        let mut blocks = Vec::with_capacity(input_coordinate_counts.len());
-        for (input_leaf_index, &input_count) in input_coordinate_counts.iter().enumerate() {
-            let input_offset = input_offsets[input_leaf_index];
+        let mut blocks = Vec::with_capacity(input_shapes.len());
+        for (input_leaf_index, input_batch) in batched_inputs.iter().enumerate() {
             let input_shape = &input_shapes[input_leaf_index];
-
-            let mut values = Vec::with_capacity(output_count * input_count);
-            for output_local in 0..output_count {
-                for input_local in 0..input_count {
-                    let item = output_offset + output_local;
-                    let coordinate = input_offset + input_local;
-                    values.push(rows[item][coordinate].clone());
-                }
-            }
-
-            blocks.push(DifferentialBlock::new(output_shape.clone(), input_shape.clone(), values));
+            blocks.push(reverse_differential_block(input_batch, batch_size, output_offset, output_shape, input_shape)?);
         }
 
-        let partials = <Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>>::from_parameters(
-            input_structure.clone(),
-            blocks,
-        )?;
+        let partials =
+            <Input::To<DifferentialBlock<DomainValue<C>>>>::from_parameters(input_structure.clone(), blocks)?;
         rows_list.push(DifferentialRow::new(partials));
     }
 
     let outer_rows = <TracedOutput::To<
         DifferentialRow<
-            Input::To<DifferentialBlock<CoordinateScalar<DomainValue<C>>>>,
-            CoordinateScalar<DomainValue<C>>,
+            Input::To<DifferentialBlock<DomainValue<C>>>,
+            DomainValue<C>,
         >,
     >>::from_parameters(output_structure, rows_list)?;
 

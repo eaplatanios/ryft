@@ -2,6 +2,6 @@
 mod differential;
 
 pub use differential::{
-    CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
+    CoordinateBasis, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, jacrev,
 };

@@ -418,7 +418,7 @@ where
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         match batch_axes[0] {
             None => self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]),
             Some(batch_axis) => {
@@ -430,7 +430,7 @@ where
                 let mut strides = self.strides().to_vec();
                 strides.insert(batch_axis, 1);
                 let lifted = SliceOperation::new(start_indices, limit_indices).with_strides(strides)?;
-                lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::new(batch_axis)])
+                lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)])
             }
         }
     }
@@ -445,19 +445,19 @@ where
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let Some(batch_axis) = batch_axes.iter().copied().flatten().next() else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let axis_size = ArrayBatch::common_batch_size(inputs)?.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis, axis_size)?;
-        let update = inputs[1].match_axis(batch_axis, axis_size)?;
+        let input = inputs[0].match_axis(batch_axis as isize, axis_size)?;
+        let update = inputs[1].match_axis(batch_axis as isize, axis_size)?;
         let mut start_indices = self.start_indices().to_vec();
         start_indices.insert(batch_axis, 0);
         UpdateSliceOperation::new(start_indices).interpret_with_batch_axes(
             context,
             &[input, update],
-            &[BatchAxis::new(batch_axis)],
+            &[BatchAxis::from_position(batch_axis)],
         )
     }
 }
@@ -486,7 +486,7 @@ where
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 }.into());
         }
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[1..].iter().any(Option::is_some) {
             return batch_by_item_expansion(
@@ -512,7 +512,7 @@ where
         DynamicSliceOperation::new(sizes).interpret_with_batch_axes(
             context,
             lifted_inputs.as_slice(),
-            &[BatchAxis::new(batch_axis)],
+            &[BatchAxis::from_position(batch_axis)],
         )
     }
 }
@@ -541,7 +541,7 @@ where
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[2..].iter().any(Option::is_some) {
             return batch_by_item_expansion(
@@ -559,13 +559,13 @@ where
             return Ok(vec![inputs[1].clone()]);
         }
         let axis_size = axis_size.expect("a mapped input pins the batch size");
-        let input = inputs[0].match_axis(batch_axis, axis_size)?;
-        let update = inputs[1].match_axis(batch_axis, axis_size)?;
+        let input = inputs[0].match_axis(batch_axis as isize, axis_size)?;
+        let update = inputs[1].match_axis(batch_axis as isize, axis_size)?;
         let zero_index = ArrayBatch::replicated(inputs[2].value().clone().zero_like());
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
         lifted_inputs.insert(2 + batch_axis, zero_index);
-        self.interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::new(batch_axis)])
+        self.interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])
     }
 }
 
@@ -644,7 +644,7 @@ mod tests {
         let block = jacobian.rows().partials();
         assert_eq!(block.output_shape(), &[2]);
         assert_eq!(block.input_shape(), &[4]);
-        assert_eq!(block.values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     }
 
     #[test]
@@ -696,7 +696,7 @@ mod tests {
         let block = jacobian.rows().partials();
         assert_eq!(block.output_shape(), &[2]);
         assert_eq!(block.input_shape(), &[4]);
-        assert_eq!(block.values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        assert_eq!(block.value().values(), &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
     }
 
     #[test]

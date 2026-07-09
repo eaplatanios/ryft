@@ -3,18 +3,23 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use ryft_core::operations::arithmetic::{
+    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
+};
 use ryft_core::operations::compare::ComparisonDirection;
+use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
+use ryft_core::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use ryft_core::operations::manipulation::{
     BroadcastOperation, GatherOperation, GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation,
     ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
-use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
+use ryft_core::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
+use ryft_core::scalars::Scalar;
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 use ryft_core::tracing_v2::ArrayOperation;
 use ryft_core::tracing_v2::operations::DotOperation;
@@ -393,6 +398,151 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for CosOperat
     }
 }
 
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Atan2Operation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result =
+            lowerer
+                .block
+                .append_operation(stable_hlo::atan2(input_values[0], input_values[1], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.atan2 should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ExponentialOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(stable_hlo::exponential(
+            input_values[0],
+            Accuracy::Default,
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).expect("stablehlo.exponential should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogarithmOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result =
+            lowerer
+                .block
+                .append_operation(stable_hlo::log(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.log should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SquareRootOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result =
+            lowerer
+                .block
+                .append_operation(stable_hlo::sqrt(input_values[0], Accuracy::Default, lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.sqrt should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for AbsOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(stable_hlo::abs(input_values[0], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.abs should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ComplexOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result =
+            lowerer
+                .block
+                .append_operation(stable_hlo::complex(input_values[0], input_values[1], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
+    }
+}
+
+/// StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
+/// composition (the same decomposition JAX's `conj` lowering uses).
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ConjugateOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let real = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
+        let imaginary = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
+        let negated = lowerer.block.append_operation(stable_hlo::negate(
+            imaginary.result(0).expect("stablehlo.imag should return one result").as_ref(),
+            lowerer.location,
+        )?)?;
+        let result = lowerer.block.append_operation(stable_hlo::complex(
+            real.result(0).expect("stablehlo.real should return one result").as_ref(),
+            negated.result(0).expect("stablehlo.negate should return one result").as_ref(),
+            lowerer.location,
+        )?)?;
+        Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for RealOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.real should return one result").as_ref()])
+    }
+}
+
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ImaginaryOperation {
+    fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
+        &self,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _output_types: &[ArrayType],
+        _mode: PlainMlirLoweringMode,
+        lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
+        let result = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
+        Ok(vec![result.result(0).expect("stablehlo.imag should return one result").as_ref()])
+    }
+}
+
 impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for TransposeOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -439,7 +589,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for DotOperat
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FillOperation<ArrayType, f64> {
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FillOperation<ArrayType, Scalar> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -451,7 +601,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for FillOpera
         check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
         let output_tensor_type = lowerer.lower_tensor_type(output_type)?;
-        let constant_value = lower_f64_constant_splat(
+        let constant_value = lower_scalar_constant_splat(
             *self.value(),
             output_type,
             output_tensor_type,
@@ -572,11 +722,35 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
     check_count!("output", output_types, 1, ProgramError);
     let output_type = &output_types[0];
     let tensor_type = lower_tensor_type(output_type, context, location)?;
+    let data_type = output_type.data_type();
+
+    // Complex constants are composed as `value + 0i` from two real part constants through `stablehlo.complex`, so
+    // that the dense-elements attribute helpers stay real-valued (MLIR has no complex scalar attribute to splat).
+    if matches!(data_type, DataType::C64 | DataType::C128) {
+        let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
+        let part_tensor_type =
+            context.tensor_type(lower_element_type(part_data_type, context)?, &[], None, location)?;
+        let real_elements =
+            lower_constant_elements_attribute(part_data_type, part_tensor_type, integer_value, context)?;
+        let real = block.append_operation(stable_hlo::constant(real_elements, location)?)?;
+        let imaginary_elements = lower_constant_elements_attribute(part_data_type, part_tensor_type, 0, context)?;
+        let imaginary = block.append_operation(stable_hlo::constant(imaginary_elements, location)?)?;
+        let complex = block.append_operation(stable_hlo::complex(
+            real.result(0).expect("stablehlo.constant should return one result").as_ref(),
+            imaginary.result(0).expect("stablehlo.constant should return one result").as_ref(),
+            location,
+        )?)?;
+        let complex = complex.result(0).expect("stablehlo.complex should return one result").as_ref();
+        if output_type.shape().dimensions().is_empty() {
+            return Ok(vec![complex]);
+        }
+        let broadcast = block.append_operation(stable_hlo::broadcast(complex, tensor_type, &[], location)?)?;
+        return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
+    }
+
     if !output_type.shape().dimensions().is_empty() {
-        let scalar_tensor_type =
-            context.tensor_type(lower_element_type(output_type.data_type(), context)?, &[], None, location)?;
-        let scalar_elements =
-            lower_constant_elements_attribute(output_type.data_type(), scalar_tensor_type, integer_value, context)?;
+        let scalar_tensor_type = context.tensor_type(lower_element_type(data_type, context)?, &[], None, location)?;
+        let scalar_elements = lower_constant_elements_attribute(data_type, scalar_tensor_type, integer_value, context)?;
         let scalar_constant = block.append_operation(stable_hlo::constant(scalar_elements, location)?)?;
         let broadcast = block.append_operation(stable_hlo::broadcast(
             scalar_constant.result(0).unwrap().as_ref(),
@@ -586,7 +760,7 @@ fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Loc
         )?)?;
         return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
     }
-    let elements = lower_constant_elements_attribute(output_type.data_type(), tensor_type, integer_value, context)?;
+    let elements = lower_constant_elements_attribute(data_type, tensor_type, integer_value, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
 }
@@ -698,7 +872,7 @@ where
                 lowerer.location,
             ),
             Self::Constant(operation) => operation.lower_to_mlir(input_values, output_types, mode, lowerer),
-            Self::Fill(operation) => <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Fill(operation) => <FillOperation<ArrayType, Scalar> as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -755,6 +929,69 @@ where
                 lowerer,
             ),
             Self::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Atan2(operation) => <Atan2Operation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Exponential(operation) => <ExponentialOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Logarithm(operation) => <LogarithmOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::SquareRoot(operation) => <SquareRootOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Abs(operation) => <AbsOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Complex(operation) => <ComplexOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Conjugate(operation) => <ConjugateOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Real(operation) => <RealOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            Self::Imaginary(operation) => <ImaginaryOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -1228,13 +1465,15 @@ where
                 lower_constant_output(output_types, 1, &mut lowerer.block, lowerer.context, lowerer.location)
             }
             ArrayOperation::Constant(constant) => constant.lower_to_mlir(input_values, output_types, mode, lowerer),
-            ArrayOperation::Fill(fill) => <FillOperation<ArrayType, f64> as LowerableXlaOperation<V>>::lower_to_mlir(
-                fill,
-                input_values,
-                output_types,
-                mode,
-                lowerer,
-            ),
+            ArrayOperation::Fill(fill) => {
+                <FillOperation<ArrayType, Scalar> as LowerableXlaOperation<V>>::lower_to_mlir(
+                    fill,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
             ArrayOperation::Iota(iota) => <IotaOperation<ArrayType> as LowerableXlaOperation<V>>::lower_to_mlir(
                 iota,
                 input_values,
@@ -1285,6 +1524,71 @@ where
                 lowerer,
             ),
             ArrayOperation::Cos(operation) => <CosOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Atan2(operation) => <Atan2Operation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Exponential(operation) => {
+                <ExponentialOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                    operation,
+                    input_values,
+                    output_types,
+                    mode,
+                    lowerer,
+                )
+            }
+            ArrayOperation::Logarithm(operation) => <LogarithmOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::SquareRoot(operation) => <SquareRootOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Abs(operation) => <AbsOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Complex(operation) => <ComplexOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Conjugate(operation) => <ConjugateOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Real(operation) => <RealOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Imaginary(operation) => <ImaginaryOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -3806,6 +4110,74 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
         }
+        XlaOperation::Atan2(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::atan2(
+                input_values[0],
+                input_values[1],
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.atan2 should return one result").as_ref()])
+        }
+        XlaOperation::Exponential(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::exponential(
+                input_values[0],
+                Accuracy::Default,
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.exponential should return one result").as_ref()])
+        }
+        XlaOperation::Logarithm(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::log(
+                input_values[0],
+                Accuracy::Default,
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.log should return one result").as_ref()])
+        }
+        XlaOperation::SquareRoot(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::sqrt(
+                input_values[0],
+                Accuracy::Default,
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.sqrt should return one result").as_ref()])
+        }
+        XlaOperation::Abs(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::abs(input_values[0], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.abs should return one result").as_ref()])
+        }
+        XlaOperation::Complex(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::complex(
+                input_values[0],
+                input_values[1],
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
+        }
+        // StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
+        // composition (the same decomposition JAX's `conj` lowering uses).
+        XlaOperation::Conjugate(_) => {
+            let real = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
+            let imaginary = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
+            let negated = lowerer.block.append_operation(stable_hlo::negate(
+                imaginary.result(0).expect("stablehlo.imag should return one result").as_ref(),
+                lowerer.location,
+            )?)?;
+            let result = lowerer.block.append_operation(stable_hlo::complex(
+                real.result(0).expect("stablehlo.real should return one result").as_ref(),
+                negated.result(0).expect("stablehlo.negate should return one result").as_ref(),
+                lowerer.location,
+            )?)?;
+            Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
+        }
+        XlaOperation::Real(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.real should return one result").as_ref()])
+        }
+        XlaOperation::Imaginary(_) => {
+            let result = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
+            Ok(vec![result.result(0).expect("stablehlo.imag should return one result").as_ref()])
+        }
         // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
         // forward the operand without emitting any MLIR operation (matching JAX's lowering).
         XlaOperation::StopGradient(_) => {
@@ -3924,7 +4296,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             check_count!("input", input_values, 0, ProgramError);
             check_count!("output", output_types, 1, ProgramError);
             let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
-            let constant_value = lower_f64_constant_splat(
+            let constant_value = lower_scalar_constant_splat(
                 *fill.value(),
                 &output_types[0],
                 output_tensor_type,
@@ -4783,6 +5155,55 @@ where
     Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
 }
 
+/// Lowers a [`Scalar`] fill value as a splatted constant of `output_type`. Real fill values route through
+/// [`lower_f64_constant_splat`] after an exact widening cast to `f64`, while complex fill values compose two real
+/// part splats through `stablehlo.complex` (MLIR has no complex scalar attribute to splat) and broadcast the
+/// composed scalar when the output is not rank zero. A complex fill value with a real output data type surfaces the
+/// cast's promotion error.
+fn lower_scalar_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
+    value: Scalar,
+    output_type: &ArrayType,
+    output_tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, LoweringError>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    let data_type = output_type.data_type();
+    if matches!(data_type, DataType::C64 | DataType::C128) {
+        let (real, imaginary) = match value {
+            Scalar::C64(value) => (value.re as f64, value.im as f64),
+            Scalar::C128(value) => (value.re, value.im),
+            value => {
+                let Scalar::F64(real) = value.cast(DataType::F64)? else {
+                    unreachable!("a cast to f64 yields an f64 scalar")
+                };
+                (real, 0.0)
+            }
+        };
+        let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
+        let part_type = ArrayType::scalar(part_data_type);
+        let part_tensor_type = context
+            .tensor_type(lower_element_type(part_data_type, context)?, &[], None, location)
+            .map_err(|_| LoweringError::InvalidTensorType { array_type: part_type.clone() })?;
+        let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
+        let imaginary_value =
+            lower_f64_constant_splat(imaginary, &part_type, part_tensor_type, block, context, location)?;
+        let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
+        let complex = complex.result(0).expect("stablehlo.complex should return one result").as_ref();
+        if output_type.shape().dimensions().is_empty() {
+            return Ok(complex);
+        }
+        let broadcast = block.append_operation(stable_hlo::broadcast(complex, output_tensor_type, &[], location)?)?;
+        return Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref());
+    }
+    let Scalar::F64(value) = value.cast(DataType::F64)? else { unreachable!("a cast to f64 yields an f64 scalar") };
+    lower_f64_constant_splat(value, output_type, output_tensor_type, block, context, location)
+}
+
 fn lower_f64_scalar_elements_attribute<'c, 't>(
     data_type: DataType,
     tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
@@ -5004,7 +5425,7 @@ mod tests {
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tests::TestArray;
     use ryft_core::tracing_v2::ArrayOperation;
-    use ryft_core::tracing_v2::DifferentiationContext;
+    use ryft_core::tracing_v2::ReverseModeDifferentiate;
     use ryft_core::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use ryft_core::types::{Shape, Size};
 
@@ -6156,7 +6577,7 @@ mod tests {
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| (x.clone() * x).print("y"), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.value_and_gradient().unwrap();
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient().unwrap();
 
         let input =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&[3.0]).as_slice())
@@ -6249,8 +6670,7 @@ mod tests {
             .interpret_and_trace(
                 |x| {
                     let context = x.context().clone();
-                    Ok(DifferentiationContext::value_and_gradient(&context, scalar_quartic_plus_sin, x)
-                        .expect("scalar value_and_gradient should succeed"))
+                    Ok(context.gradient(scalar_quartic_plus_sin, x).expect("scalar gradient should succeed"))
                 },
                 TestArray::scalar(2.0),
             )
@@ -6382,11 +6802,7 @@ mod tests {
 
     #[test]
     fn test_slicing_vjp_pullbacks_lower_to_stablehlo() {
-        use ryft_core::StagingContext;
         use ryft_core::operations::manipulation::{DynamicSlice, Slice};
-
-        type TestPullbackProgram =
-            ryft_core::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>;
 
         // The static slice pullback writes the cotangent into a zero array at the static offsets via the
         // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
@@ -6394,10 +6810,10 @@ mod tests {
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
         // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
-        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(|x| Ok(x.slice(&[1], &[3], &[1]).unwrap()), TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]))
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -6416,10 +6832,10 @@ mod tests {
 
         // The strided slice pullback pads the cotangent with a zero scalar at the inverse geometry
         // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
-        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(|x| Ok(x.slice(&[1], &[6], &[2]).unwrap()), TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -6436,18 +6852,16 @@ mod tests {
 
         // The pad pullback splits the cotangent into the strided slice at the pad geometry (for the input) and the
         // full-sum-minus-sliced-sum subtraction (for the padding value), all of which lower to StableHLO.
-        type TestPadPullbackProgram =
-            ryft_core::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>;
-        let (_, pullback, _): (TestArray, TestPadPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(
-                    |(x, padding_value)| {
-                        use ryft_core::operations::manipulation::Pad;
-                        Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
-                    },
-                    (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
-                )
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(
+                |(x, padding_value)| {
+                    use ryft_core::operations::manipulation::Pad;
+                    Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
+                },
+                (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
+            )
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -6468,16 +6882,16 @@ mod tests {
 
         // The dynamic slice pullback scatters the cotangent at the captured index factors, which materialize as
         // integer constants through `lower_literal_value`.
-        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(
-                    |x| {
-                        let start = x.context().constant(TestArray::new(ArrayType::scalar(DataType::I32), vec![1.0]));
-                        Ok(x.dynamic_slice(&[start], &[2]).unwrap())
-                    },
-                    TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
-                )
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(
+                |x| {
+                    let start = x.context().lift(TestArray::new(ArrayType::scalar(DataType::I32), vec![1.0])).unwrap();
+                    Ok(x.dynamic_slice(&[start], &[2]).unwrap())
+                },
+                TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
+            )
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -6503,13 +6917,10 @@ mod tests {
         // backward pass as `stablehlo.multiply`s of the cotangent against those residual inputs rather than baking the
         // primal point in as constants — the analogue of JAX's standalone `vjp_fn`, with the residuals threaded as
         // explicit arguments.
-        let (_, pullback, _): (
-            TestArray,
-            ryft_core::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>,
-            Vec<TestArray>,
-        ) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .vjp(|inputs| Ok(scalar_bilinear_sin(inputs)), (TestArray::scalar(2.0), TestArray::scalar(3.0)))
             .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
 
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
@@ -6535,9 +6946,6 @@ mod tests {
     #[test]
     fn test_rematerialized_vjp_pullback_lowers_without_a_rematerialization_boundary() {
         use ryft_core::tracing_v2::rematerialize;
-
-        type TestPullbackProgram =
-            ryft_core::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>;
 
         // The value-level `vjp` runs on the partition-aware reverse path, which splices the rematerialized
         // region's recompute-and-pushforward into the program as ordinary straight-line primal operations and
@@ -6566,10 +6974,10 @@ mod tests {
                 Ok((x.clone() * x).sin()?)
             },
         );
-        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(|x| function.call(x), TestArray::scalar(2.0))
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(|x| function.call(x), TestArray::scalar(2.0))
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert!(
             !stablehlo.contains("stablehlo.optimization_barrier"),
@@ -6585,10 +6993,10 @@ mod tests {
             },
         )
         .with_prevent_cse(false);
-        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(|x| function.call(x), TestArray::scalar(2.0))
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(|x| function.call(x), TestArray::scalar(2.0))
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(stablehlo, expected, "the reverse pullback is independent of the prevent_cse hint");
     }
@@ -6637,15 +7045,12 @@ mod tests {
     fn test_transfer_to_memory_vjp_pullback_lowers_with_a_placement_annotation() {
         use ryft_core::tracing_v2::operations::TransferToMemory;
 
-        type TestPullbackProgram =
-            ryft_core::programs::Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>;
-
         // The pullback of a transfer moves the cotangent back to the operand's source memory (the default device
         // space here), so it lowers to an `annotate_device_placement` custom call targeting `device`.
-        let (_, pullback, _): (TestArray, TestPullbackProgram, Vec<TestArray>) =
-            EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
-                .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), TestArray::scalar(2.0))
-                .unwrap();
+        let (_, pullback): (TestArray, _) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .vjp(|x| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), TestArray::scalar(2.0))
+            .unwrap();
+        let (pullback, _residuals) = pullback.into_parts();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(), 1, "{stablehlo}");
         assert!(stablehlo.contains("_xla_buffer_placement = \"device\""), "{stablehlo}");
@@ -6667,8 +7072,7 @@ mod tests {
             .interpret_and_trace(
                 |inputs| {
                     let context = inputs.0.context().clone();
-                    Ok(DifferentiationContext::value_and_gradient(&context, scalar_bilinear_sin, inputs)
-                        .expect("scalar value_and_gradient should succeed"))
+                    Ok(context.gradient(scalar_bilinear_sin, inputs).expect("scalar gradient should succeed"))
                 },
                 (TestArray::scalar(2.0), TestArray::scalar(3.0)),
             )

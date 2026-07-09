@@ -392,7 +392,7 @@ where
 {
     check_count!("input", inputs, 1, ProgramError);
     let input = &inputs[0];
-    let Some(batch_axis) = input.batch_axis().axis() else {
+    let Some(batch_axis) = input.batch_axis_position() else {
         // Outside any matching batching context: identity pass-through.
         return Ok(vec![input.clone()]);
     };

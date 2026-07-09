@@ -50,7 +50,9 @@ fn test_array_new_requires_sharding_without_single_buffer() {
     .unwrap();
     let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(8)]));
 
-    assert!(matches!(Array::from_addressable_buffers(array_type, mesh, Vec::new()), Err(Error::MissingSharding),));
+    assert!(
+        matches!(Array::from_addressable_buffers(None, array_type, mesh, Vec::new()), Err(Error::MissingSharding),)
+    );
 }
 
 #[test]
@@ -72,7 +74,7 @@ fn test_array_new_accepts_unsharded_type_with_single_buffer() {
         .buffer(values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(), BufferType::F32, [2u64], None, device, None)
         .unwrap();
 
-    let array = Array::from_addressable_buffers(array_type, mesh, vec![buffer]).unwrap();
+    let array = Array::from_addressable_buffers(&client, array_type, mesh, vec![buffer]).unwrap();
 
     assert_eq!(array.shape(), StaticShape::new(vec![2]));
     assert_eq!(array.data_type(), DataType::F32);
@@ -96,7 +98,7 @@ fn test_array_new_rejects_dynamic_shape() {
         .unwrap();
 
     assert!(matches!(
-        Array::from_addressable_buffers(array_type, mesh, Vec::new()),
+        Array::from_addressable_buffers(None, array_type, mesh, Vec::new()),
         Err(Error::DynamicShape { shape }) if shape == Shape::new(vec![Size::Dynamic(Some(10))]),
     ));
 }
@@ -329,7 +331,7 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&client, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let engine = XlaDomain::new(&client);
     let copied_array = source_array
@@ -375,7 +377,7 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
         .with_sharding(source_sharding)
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&client, source_array_type, source_mesh, vec![local_source_buffer]).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(remote_device_id, 1), Device::new(local_device_id, client.process_index().unwrap())],
@@ -417,7 +419,7 @@ fn test_array_put_rejects_non_addressable_source_shards() {
     let source_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
         .with_sharding(source_sharding)
         .unwrap();
-    let source_array = Array::from_addressable_buffers(source_array_type, source_mesh, Vec::new()).unwrap();
+    let source_array = Array::from_addressable_buffers(None, source_array_type, source_mesh, Vec::new()).unwrap();
     let target_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0)],
@@ -554,7 +556,7 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&client, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let engine = XlaDomain::new(&client);
     let copied_array = device_put(&engine, source_array, DevicePutOptions::defaults()).unwrap();
@@ -597,7 +599,7 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
         .with_sharding(sharding.clone())
         .unwrap();
     let source_array =
-        Array::from_addressable_buffers(source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
+        Array::from_addressable_buffers(&client, source_array_type, mesh.clone(), vec![local_source_buffer]).unwrap();
 
     let engine = XlaDomain::new(&client);
     let copied_array = source_array
@@ -740,8 +742,8 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     let rhs_array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(2)]))
         .with_sharding(rhs_sharding)
         .unwrap();
-    let lhs_array = Array::from_addressable_buffers(lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
-    let rhs_array = Array::from_addressable_buffers(rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
+    let lhs_array = Array::from_addressable_buffers(&client, lhs_array_type, mesh.clone(), lhs_buffers).unwrap();
+    let rhs_array = Array::from_addressable_buffers(&client, rhs_array_type, mesh.clone(), rhs_buffers).unwrap();
 
     assert_eq!(lhs_array.data_type(), DataType::F32);
     assert_eq!(rhs_array.data_type(), DataType::F32);

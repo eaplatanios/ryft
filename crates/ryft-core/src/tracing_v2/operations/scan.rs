@@ -1,6 +1,7 @@
 use std::fmt::Display;
 
 use crate::batching::ArrayBatch;
+use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
@@ -138,7 +139,7 @@ fn read_scan_iteration_batch<V>(stack: &ArrayBatch<V>, iteration: usize) -> Resu
 where
     V: Value<Type = ArrayType> + Slice + Reshape,
 {
-    let stack_axis = match stack.batch_axis().axis() {
+    let stack_axis = match stack.batch_axis_position() {
         Some(0) => 1,
         _ => 0,
     };
@@ -174,8 +175,8 @@ where
         .collect::<Vec<_>>();
     let iteration_value = iteration_value.reshape(Shape::new(iteration_dimensions))?;
     let iteration_type = iteration_value.r#type().into_owned();
-    let batch_axis = stack.batch_axis().axis().map(|axis| if axis > stack_axis { axis - 1 } else { axis });
-    ArrayBatch::new(iteration_type, iteration_value, batch_axis)
+    let batch_axis = stack.batch_axis_position().map(|axis| if axis > stack_axis { axis - 1 } else { axis });
+    ArrayBatch::new(iteration_type, iteration_value, BatchAxis::from_optional_position(batch_axis))
 }
 
 /// Per-output stacking state used by [`batch_scan_with_interpreter`]: the accumulator batch holding the iterations
@@ -227,7 +228,7 @@ where
         let iteration_ys = iteration_outputs.split_off(carry_count);
         carries = iteration_outputs;
         for (accumulator, iteration_y) in accumulators.iter_mut().zip(iteration_ys.into_iter()) {
-            let batch_axis = iteration_y.batch_axis().axis();
+            let batch_axis = iteration_y.batch_axis_position();
             let iteration_type = iteration_y.r#type().into_owned();
             let accumulator = match accumulator {
                 Some(accumulator) => {
@@ -262,7 +263,11 @@ where
         match accumulator {
             Some(ScanOutputAccumulator { accumulator, batch_axis }) => {
                 let stacked_type = accumulator.r#type().into_owned();
-                outputs.push(ArrayBatch::new(stacked_type, accumulator, batch_axis.map(|axis| axis + 1))?);
+                outputs.push(ArrayBatch::new(
+                    stacked_type,
+                    accumulator,
+                    BatchAxis::from_optional_position(batch_axis.map(|axis| axis + 1)),
+                )?);
             }
             None => {
                 // A zero-length scan writes no iterations, so each stacked output is the replicated empty stack of

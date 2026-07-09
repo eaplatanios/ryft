@@ -41,6 +41,7 @@ thiserror.workspace = true
 [dev-dependencies]
 ryft-core = { workspace = true, features = ["test-utilities"] }
 indoc.workspace = true
+num-complex.workspace = true
 pretty_assertions.workspace = true
 tempfile.workspace = true
 

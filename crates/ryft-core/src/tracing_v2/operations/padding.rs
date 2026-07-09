@@ -177,7 +177,7 @@ where
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[1].is_none() {
             let Some(batch_axis) = batch_axes[0] else {
@@ -190,7 +190,7 @@ where
             let mut interior_padding = self.interior_padding().to_vec();
             interior_padding.insert(batch_axis, 0);
             let lifted = PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?;
-            return lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::new(batch_axis)]);
+            return lifted.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(batch_axis)]);
         }
         // Batch-varying padding value: pad each batch item independently and restack along a fresh leading batch axis.
         let axis_size = axis_size.expect("a mapped input pins the batch size");
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(block.output_shape(), &[8]);
         assert_eq!(block.input_shape(), &[3]);
         assert_eq!(
-            block.values(),
+            block.value().values(),
             &[
                 0.0, 0.0, 0.0, //
                 1.0, 0.0, 0.0, //

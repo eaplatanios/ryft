@@ -198,6 +198,7 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
         self.tangent.clone()
     }
 
+    // TODO(eaplatanios): Move this function to `reverse.rs`.
     /// Builds the reverse-mode pullback program `(ȳ, r) ↦ x̄` by transposing the [`tangent`](Self::tangent) sub-program.
     /// It takes the output cotangents `ȳ` followed by the residuals `r` and produces the input cotangents
     /// `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this [`Linearization`]'s program family, alongside the
@@ -215,7 +216,7 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
     where
         V::Type: DifferentiableType,
-        O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
+        O: Clone + TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
     {
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are

@@ -2227,7 +2227,7 @@ mod tests {
         let hessian = domain.hessian(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         let (_, _, block) = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
-        assert_close(block.values()[0], 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+        assert_close(block.value().values()[0], 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
     }
 
     #[test]
@@ -2285,10 +2285,10 @@ mod tests {
         );
         let jacobian = jacrev(&domain, |x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
         let (_, _, block) = jacobian.iter_blocks().next().unwrap();
-        assert_close(block.values()[0], 0.25f64.cos());
-        assert_close(block.values()[1], 0.0);
-        assert_close(block.values()[2], 0.0);
-        assert_close(block.values()[3], 1.0f64.cos() * 2.0);
+        assert_close(block.value().values()[0], 0.25f64.cos());
+        assert_close(block.value().values()[1], 0.0);
+        assert_close(block.value().values()[2], 0.0);
+        assert_close(block.value().values()[3], 1.0f64.cos() * 2.0);
     }
 
     /// Canonical offload destination used by the offloading policy tests.

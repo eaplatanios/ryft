@@ -191,10 +191,10 @@ mod tests {
         assert_eq!(block_00.output_shape(), &[] as &[usize]);
         assert_eq!(block_00.input_shape(), &[] as &[usize]);
 
-        assert_close(block_00.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(block_01.values()[0], 2.0);
-        assert_close(block_10.values()[0], 1.0);
-        assert_close(block_11.values()[0], 1.0);
+        assert_close(block_00.value().values()[0], 3.0 + 2.0f64.cos());
+        assert_close(block_01.value().values()[0], 2.0);
+        assert_close(block_10.value().values()[0], 1.0);
+        assert_close(block_11.value().values()[0], 1.0);
     }
 
     #[test]
@@ -210,10 +210,32 @@ mod tests {
         let (block_00, block_01) = row_0.partials();
         let (block_10, block_11) = row_1.partials();
 
-        assert_close(block_00.values()[0], 3.0 + 2.0f64.cos());
-        assert_close(block_01.values()[0], 2.0);
-        assert_close(block_10.values()[0], 1.0);
-        assert_close(block_11.values()[0], 1.0);
+        assert_close(block_00.value().values()[0], 3.0 + 2.0f64.cos());
+        assert_close(block_01.value().values()[0], 2.0);
+        assert_close(block_10.value().values()[0], 1.0);
+        assert_close(block_11.value().values()[0], 1.0);
+    }
+
+    #[test]
+    fn test_dense_jacobians_keep_zero_sized_blocks_as_domain_values() {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(0)]));
+        let input = TestArray::new(r#type.clone(), Vec::new());
+        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+
+        let forward = context.jacfwd(|x| Ok(x.clone() + x), input.clone()).unwrap();
+        let forward_block = forward.rows().partials();
+        assert_eq!(forward_block.output_shape(), &[0]);
+        assert_eq!(forward_block.input_shape(), &[0]);
+        let block_type = r#type.with_inserted_dimension(0, Size::Static(0)).unwrap();
+        assert_eq!(forward_block.value().r#type().as_ref(), &block_type);
+        assert!(forward_block.value().values().is_empty());
+
+        let reverse = jacrev(&context, |x| Ok(x.clone() + x), input).unwrap();
+        let reverse_block = reverse.rows().partials();
+        assert_eq!(reverse_block.output_shape(), &[0]);
+        assert_eq!(reverse_block.input_shape(), &[0]);
+        assert_eq!(reverse_block.value().r#type(), forward_block.value().r#type());
+        assert!(reverse_block.value().values().is_empty());
     }
 
     #[test]
@@ -228,7 +250,7 @@ mod tests {
         let triples = jacobian
             .iter_blocks()
             .map(|(output_path, input_path, block)| {
-                (output_path.to_string(), input_path.to_string(), block.values()[0])
+                (output_path.to_string(), input_path.to_string(), block.value().values()[0])
             })
             .collect::<Vec<_>>();
 
@@ -257,10 +279,10 @@ mod tests {
         let (block_00, block_01) = row_0.partials();
         let (block_10, block_11) = row_1.partials();
 
-        assert_close(block_00.values()[0], -2.0f64.sin());
-        assert_close(block_01.values()[0], 1.0);
-        assert_close(block_10.values()[0], 1.0);
-        assert_close(block_11.values()[0], 0.0);
+        assert_close(block_00.value().values()[0], -2.0f64.sin());
+        assert_close(block_01.value().values()[0], 1.0);
+        assert_close(block_10.value().values()[0], 1.0);
+        assert_close(block_11.value().values()[0], 0.0);
     }
 
     #[test]
@@ -276,7 +298,7 @@ mod tests {
         let triples = jacobian
             .iter_blocks()
             .map(|(output_path, input_path, block)| {
-                (output_path.to_string(), input_path.to_string(), block.values()[0])
+                (output_path.to_string(), input_path.to_string(), block.value().values()[0])
             })
             .collect::<Vec<_>>();
 
@@ -419,8 +441,8 @@ mod tests {
 
         let row = jacobian.rows();
         let (block_x, block_y) = row.partials();
-        assert_eq!(block_x.values(), &[7.0, 11.0, 13.0]);
-        assert_eq!(block_y.values(), &[2.0, 3.0, 5.0]);
+        assert_eq!(block_x.value().values(), &[7.0, 11.0, 13.0]);
+        assert_eq!(block_y.value().values(), &[2.0, 3.0, 5.0]);
     }
 
     #[test]
@@ -439,8 +461,8 @@ mod tests {
 
         let row = jacobian.rows();
         let (block_x, block_y) = row.partials();
-        assert_eq!(block_x.values(), &[7.0, 11.0, 13.0]);
-        assert_eq!(block_y.values(), &[2.0, 3.0, 5.0]);
+        assert_eq!(block_x.value().values(), &[7.0, 11.0, 13.0]);
+        assert_eq!(block_y.value().values(), &[2.0, 3.0, 5.0]);
     }
 
     #[test]
@@ -602,7 +624,7 @@ mod tests {
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 0) / dx = 1 at the scalar point.
-        assert_close(block.values()[0], 1.0);
+        assert_close(block.value().values()[0], 1.0);
     }
 
     #[test]
@@ -615,7 +637,7 @@ mod tests {
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 1) / dx = 1.
-        assert_close(block.values()[0], 1.0);
+        assert_close(block.value().values()[0], 1.0);
     }
 
     /// Binds `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` through the
@@ -645,12 +667,12 @@ mod tests {
             TestArray::scalar(4.0),
         )
         .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 2.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 2.0);
 
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0))
             .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 2.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 2.0);
     }
 
     /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests.
@@ -718,7 +740,7 @@ mod tests {
                 TestArray::scalar(1.0),
             )
             .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 8.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 8.0);
     }
 
     #[test]

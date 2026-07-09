@@ -6,7 +6,7 @@ use ryft_core::tracing_v2::benchmarking::{
     summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{DifferentiationContext, Dot};
+use ryft_core::tracing_v2::{Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
 
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
@@ -221,7 +221,7 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
             move |x: ShardMapTracer| {
                 let context = x.context().clone();
                 context
-                    .value_and_gradient(
+                    .gradient(
                         {
                             let mesh = mesh.clone();
                             let sharding = sharding.clone();
@@ -264,7 +264,7 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
                         let context = local_x.context().clone();
-                        context.value_and_gradient(|y| y.sin(), local_x).unwrap_or_else(|error| {
+                        context.gradient(|y| y.sin(), local_x).unwrap_or_else(|error| {
                             panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
                         })
                     },

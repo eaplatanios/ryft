@@ -1,6 +1,7 @@
 pub mod arrays;
 pub mod arrays_v0;
 pub mod distributed;
+pub mod eager;
 pub mod errors;
 pub mod experimental;
 pub mod jit;

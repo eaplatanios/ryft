@@ -105,7 +105,7 @@ impl<'o> Array<'o> {
         )? {
             let shape = Shape::new(global_dimensions.iter().copied().map(Size::Static).collect());
             let array_type = ArrayType::new(self.data_type(), shape).with_sharding(target_sharding)?;
-            return Ok(Self::from_addressable_buffers(array_type, target_mesh, addressable_buffers)?);
+            return Ok(Self::from_addressable_buffers(client, array_type, target_mesh, addressable_buffers)?);
         }
 
         // Tier 2: compiled-XLA SPMD path. Captures whatever error the path produces so we can

@@ -42,7 +42,7 @@ pub use differentiation::{
     value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
 pub use linear::{
-    CoordinateValue, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
+    CoordinateBasis, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
     Jacobian, jacrev,
 };
 pub use operations::collective::{

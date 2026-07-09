@@ -1,8 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 
-use crate::batching::BatchingError;
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{BatchAxis, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::Domain;
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{DifferentiableOperation, TransposableOperation};
@@ -633,7 +632,7 @@ where
         inputs: &[crate::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::batching::ArrayBatch<V>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         // Validate the common batch size across both operands (catching mismatched batched operands) before the
         // mixed arms consult it; a mixed operand pair always has at least one mapped operand.
         let axis_size = crate::batching::ArrayBatch::common_batch_size(inputs)?;
@@ -646,7 +645,7 @@ where
             (Some(_), None) => vec![inputs[0].clone(), inputs[1].broadcast(0, mixed_axis_size())?],
             (None, Some(_)) => vec![inputs[0].broadcast(0, mixed_axis_size())?, inputs[1].clone()],
         };
-        let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let aligned_axes: Vec<Option<usize>> = aligned_inputs.iter().map(|input| input.batch_axis_position()).collect();
         let (lifted_dimensions, output_axis) = lift_dot_dimensions(&self.dimensions, aligned_axes[0], aligned_axes[1])
             .ok_or_else(|| BatchingError::MisalignedBatchAxes {
                 message: "'dot' batching failed to lift its dimension numbers for the aligned batch axes".to_string(),
@@ -657,7 +656,7 @@ where
             output_axis,
             batch_dimension,
         )?);
-        lifted_op.interpret_with_batch_axes(context, &aligned_inputs, &[output_axis.into()])
+        lifted_op.interpret_with_batch_axes(context, &aligned_inputs, &[BatchAxis::from_optional_position(output_axis)])
     }
 }
 

@@ -323,7 +323,7 @@ mod tests {
             TestArray::scalar(2.0),
         )
         .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 2.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 2.0);
 
         let jacobian = jacrev(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
@@ -331,7 +331,7 @@ mod tests {
             TestArray::scalar(-2.0),
         )
         .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 3.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 3.0);
     }
 
     #[test]
@@ -347,12 +347,12 @@ mod tests {
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0))
             .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 2.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 2.0);
 
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0))
             .unwrap();
-        assert_close(jacobian.rows().partials().values()[0], 3.0);
+        assert_close(jacobian.rows().partials().value().values()[0], 3.0);
     }
 
     #[test]
@@ -368,10 +368,10 @@ mod tests {
         let block = jacobian.rows().partials();
         assert_eq!(block.output_shape(), &[2]);
         assert_eq!(block.input_shape(), &[2]);
-        assert_close(block.values()[0], 2.0);
-        assert_close(block.values()[1], 0.0);
-        assert_close(block.values()[2], 0.0);
-        assert_close(block.values()[3], 3.0);
+        assert_close(block.value().values()[0], 2.0);
+        assert_close(block.value().values()[1], 0.0);
+        assert_close(block.value().values()[2], 0.0);
+        assert_close(block.value().values()[3], 3.0);
     }
 
     #[test]

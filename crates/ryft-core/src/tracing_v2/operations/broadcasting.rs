@@ -1,3 +1,4 @@
+use crate::batching::BatchAxis;
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::macros::check_count;
@@ -141,7 +142,7 @@ impl<V: Value<Type = ArrayType> + Broadcast, C> crate::batching::BatchableOperat
         inputs: &[crate::batching::ArrayBatch<V>],
     ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         match batch_axes[0] {
             None => {
                 // Replicated input: the broadcast itself does not change. Pass through.
@@ -156,7 +157,11 @@ impl<V: Value<Type = ArrayType> + Broadcast, C> crate::batching::BatchableOperat
                     lift_broadcast(self.output_axes(), self.output_type(), batch_axis, axis_size)?;
                 let output_value =
                     inputs[0].value().clone().broadcast(lifted_target.clone(), lifted_dimensions.as_slice())?;
-                Ok(vec![crate::batching::ArrayBatch::new(lifted_target, output_value, Some(target_batch_axis))?])
+                Ok(vec![crate::batching::ArrayBatch::new(
+                    lifted_target,
+                    output_value,
+                    BatchAxis::from_position(target_batch_axis),
+                )?])
             }
         }
     }

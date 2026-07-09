@@ -10,21 +10,25 @@ use ryft_core::batching::BatchingError;
 use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
 use ryft_core::compilation::CaptureReference;
 use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::TransposableOperation;
+use ryft_core::differentiation::{DifferentiableOperation, TransposableOperation};
 use ryft_core::effects::Effects;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
-use ryft_core::materialize;
-use ryft_core::operations::arithmetic::{AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use ryft_core::operations::arithmetic::{
+    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
+};
 use ryft_core::operations::compare::CompareOperation;
+use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{
-    ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
+    ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, Zero, ZeroLikeOperation,
+    ZeroOperation,
 };
 use ryft_core::operations::control_flow::{
     ConditionOperation, MaybeScan, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts,
     WhilePredicate,
 };
 use ryft_core::operations::differentiation::StopGradientOperation;
+use ryft_core::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
@@ -32,15 +36,18 @@ use ryft_core::operations::manipulation::{
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
-use ryft_core::operations::trigonometric::{CosOperation, SinOperation};
+use ryft_core::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
-use ryft_core::partial::{PartialEvaluationValue, PartialEvaluator, PartialValue, PartiallyEvaluatableOperation};
+use ryft_core::partial::{
+    PartialEvaluationContext, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
+};
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
+use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::tag::TagOperation;
-use ryft_core::tracing_v2::differentiation::{DifferentiableOperation, JvpTracer, Linearization};
+use ryft_core::scalars::Scalar;
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
@@ -77,7 +84,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     One(OneOperation<ArrayType>),
     OneLike(OneLikeOperation),
     Constant(ConstantOperation<V>),
-    Fill(FillOperation<ArrayType, f64>),
+    Fill(FillOperation<ArrayType, Scalar>),
     Iota(IotaOperation<ArrayType>),
     Neg(NegOperation),
     Add(AddOperation),
@@ -86,6 +93,15 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Div(DivOperation),
     Sin(SinOperation),
     Cos(CosOperation),
+    Atan2(Atan2Operation),
+    Exponential(ExponentialOperation),
+    Logarithm(LogarithmOperation),
+    SquareRoot(SquareRootOperation),
+    Abs(AbsOperation),
+    Complex(ComplexOperation),
+    Conjugate(ConjugateOperation),
+    Real(RealOperation),
+    Imaginary(ImaginaryOperation),
     StopGradient(StopGradientOperation),
     Tag(TagOperation),
     Print(PrintOperation),
@@ -173,6 +189,15 @@ where
             ArrayOperation::Div(operation) => Self::Div(operation),
             ArrayOperation::Sin(operation) => Self::Sin(operation),
             ArrayOperation::Cos(operation) => Self::Cos(operation),
+            ArrayOperation::Atan2(operation) => Self::Atan2(operation),
+            ArrayOperation::Exponential(operation) => Self::Exponential(operation),
+            ArrayOperation::Logarithm(operation) => Self::Logarithm(operation),
+            ArrayOperation::SquareRoot(operation) => Self::SquareRoot(operation),
+            ArrayOperation::Abs(operation) => Self::Abs(operation),
+            ArrayOperation::Complex(operation) => Self::Complex(operation),
+            ArrayOperation::Conjugate(operation) => Self::Conjugate(operation),
+            ArrayOperation::Real(operation) => Self::Real(operation),
+            ArrayOperation::Imaginary(operation) => Self::Imaginary(operation),
             ArrayOperation::StopGradient(operation) => Self::StopGradient(operation),
             ArrayOperation::Tag(operation) => Self::Tag(operation),
             ArrayOperation::Print(operation) => Self::Print(operation),
@@ -433,6 +458,19 @@ fn missing_traced_input() -> ProgramError {
     ProgramError::InvalidInputCount { expected: 1, actual: 0 }
 }
 
+/// Bridges canonical internal physical positions to the signed public batching declaration without reintroducing a
+/// public `usize` conversion on [`BatchAxis`].
+fn batch_axis_from_position(axis: Option<usize>) -> BatchAxis {
+    axis.map(|axis| BatchAxis::new(isize::try_from(axis).expect("a physical array rank fits in isize")))
+        .unwrap_or_default()
+}
+
+/// Recovers a canonical physical position returned by the core program batching pass.
+fn batch_axis_position(axis: &BatchAxis) -> Option<usize> {
+    axis.axis()
+        .map(|axis| usize::try_from(axis).expect("program batching returns canonical nonnegative axes"))
+}
+
 fn ensure_call_input_types(
     operation_name: &'static str,
     expected_types: &[ArrayType],
@@ -464,10 +502,10 @@ fn build_batched_call_program(
 ) -> Result<(FlatXlaProgram, Vec<Option<usize>>), ProgramError> {
     // Delegate to the core program-batching pass, which replays `program` through a `BatchingContext` over a fresh
     // trace and packages the batched program with its natural (rule-produced) output axes.
-    let input_batch_axes = batch_axes.iter().map(|axis| BatchAxis::from(*axis)).collect::<Vec<_>>();
+    let input_batch_axes = batch_axes.iter().copied().map(batch_axis_from_position).collect::<Vec<_>>();
     let (batched_program, output_axes) =
         program.batched(axis_size, input_batch_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;
-    let output_axes = output_axes.iter().map(BatchAxis::axis).collect();
+    let output_axes = output_axes.iter().map(batch_axis_position).collect();
     Ok((batched_program.into_simplified()?, output_axes))
 }
 
@@ -516,17 +554,17 @@ where
 {
     fn partially_evaluate(
         &self,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Split only a mixed call with at least one known-but-symbolic input; everything else keeps the default
         // fold-or-residualize behavior and therefore the original boundary.
-        if !evaluator.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
-            return evaluator.fold_or_residualize(XlaOperation::JitCall(Box::new(self.clone())), inputs);
+        if !context.any_known_is_symbolic(inputs) || inputs.iter().all(PartialEvaluationValue::is_known) {
+            return context.fold_or_residualize(XlaOperation::JitCall(Box::new(self.clone())), inputs);
         }
 
         // Split the callee through the shared online boundary machinery, bind the known side into the enclosing
-        // known-side evaluator wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
+        // known-side context wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
         // side as the residual `jit_call`, and reassemble the original output order.
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
         let partition = self.program.partition(input_known.as_slice())?;
@@ -534,9 +572,9 @@ where
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return evaluator.fold_or_residualize(XlaOperation::JitCall(Box::new(self.clone())), inputs);
+            return context.fold_or_residualize(XlaOperation::JitCall(Box::new(self.clone())), inputs);
         }
-        evaluator.inline_partitioned_program(
+        context.inline_partitioned_program(
             partition,
             inputs,
             |known_program| XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(known_program)))),
@@ -551,7 +589,7 @@ impl JitCallOperation {
         &self,
         inputs: &[ArrayBatch<V>],
     ) -> Result<(Self, Vec<Option<usize>>), ProgramError> {
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis().axis()).collect();
+        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         match ArrayBatch::common_batch_size(inputs)? {
             Some(axis_size) => {
                 let (batched_program, output_axes) =
@@ -575,7 +613,30 @@ impl<C> BatchableOperation<ArrayType, C> for JitCallOperation {
         outputs
             .into_iter()
             .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
+            .collect()
+    }
+}
+
+/// Eager batching rule for [`JitCallOperation`] over concrete runtime [`Array`](crate::Array)s: the callee program
+/// is rebatched over the mapped input axes (exactly like the type-level and staged rules above) and the batched
+/// call is then bound — compiled and executed — through the eager context.
+impl<'c, C> BatchableOperation<crate::Array<'c>, C> for JitCallOperation
+where
+    C: Context<Type = ArrayType, Value = crate::Array<'c>, Operation = XlaOperation>,
+{
+    fn batch(
+        &self,
+        context: &C,
+        inputs: &[ArrayBatch<crate::Array<'c>>],
+    ) -> Result<Vec<ArrayBatch<crate::Array<'c>>>, BatchingError> {
+        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let (operation, output_axes) = self.batched_call_operation(inputs)?;
+        let outputs = context.bind(operation, &physical_inputs)?;
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
             .collect()
     }
 }
@@ -596,13 +657,43 @@ where
         outputs
             .into_iter()
             .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, axis))
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
             .collect()
     }
 }
 
-/// Capture-free forward-mode (JVP) rule for [`JitCallOperation`], staging a primal `jit_call` and a tangent
-/// `jit_call` as ordinary XLA-enum operations over the shared builder.
+/// Batching rule for [`JitCallOperation`] over differentiation duals, mirroring the staged [`Tracer`] rule above:
+/// the callee program is rebatched over the mapped input axes and the batched call is bound through the duals' own
+/// differentiation context, whose `jit_call` JVP rule then differentiates the batched callee. This is what serves
+/// `vmap` nested inside `gradient`/`linearize` closures.
+impl<S, C> BatchableOperation<ryft_core::DifferentiationTracer<S>, C> for JitCallOperation
+where
+    S: Context,
+    ryft_core::DifferentiationTracer<S>: Value<Type = ArrayType>,
+    ryft_core::DifferentiationContext<S>:
+        Context<Type = ArrayType, Value = ryft_core::DifferentiationTracer<S>, Operation = XlaOperation>,
+{
+    fn batch(
+        &self,
+        _context: &C,
+        inputs: &[ArrayBatch<ryft_core::DifferentiationTracer<S>>],
+    ) -> Result<Vec<ArrayBatch<ryft_core::DifferentiationTracer<S>>>, BatchingError> {
+        let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
+        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let (operation, output_axes) = self.batched_call_operation(inputs)?;
+        let outputs = context.bind(operation, physical_inputs.as_slice())?;
+        outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
+            .collect()
+    }
+}
+
+/// Capture-free forward-mode (JVP) rule for [`JitCallOperation`], binding a primal `jit_call` and a tangent
+/// `jit_call` as ordinary XLA-enum operations through the active context: a staging context stages both calls over
+/// its shared builder, while an eager context (e.g. a client-backed [`XlaDomain`](crate::XlaDomain)) compiles and
+/// executes them immediately, which is what powers top-level `jvp` over concrete arrays.
 ///
 /// This realizes the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual factors
 /// and staging a linear `jit_call`, the rule keeps the compilation boundary and threads every residual as a plain
@@ -619,7 +710,7 @@ where
 ///      primal outputs followed by the residual values (program variables produced by the staged primal call).
 ///   2. Wraps the tangent sub-program in a fresh `jit_call` and stages it over the operand tangents followed by those
 ///      residual values, recovering one output tangent per primal output.
-///   3. Pairs each primal output tracer with its tangent output tracer into a [`JvpTracer`].
+///   3. Pairs each primal output tracer with its tangent output tracer into a [`DifferentiationDual`].
 ///
 /// The callee program is concretely keyed on [`XlaConstant`] (it is a [`FlatXlaProgram`]) regardless of the enclosing
 /// value type `V`, so the split halves are themselves [`FlatXlaProgram`]s and the rule is valid for every `V`.
@@ -627,23 +718,27 @@ where
 /// jitted call stays compiled rather than inlined.
 impl<C, V> DifferentiableOperation<C> for JitCallOperation
 where
-    C: StagingContext<Type = ArrayType, Constant = V, Operation = XlaOperation<V>>,
+    C: Context<Type = ArrayType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
     V: Value<Type = ArrayType>,
 {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         let output_count = self.program().output_types().len();
         check_count!("input", inputs, self.program().input_types().len(), ProgramError);
 
         // Linearize the callee capture-free. The primal sub-program produces `[outputs..., residuals...]` and the
         // tangent sub-program consumes `[input_tangents..., residuals...]`; the residual count is the number of
         // trailing outputs of the primal sub-program beyond the original callee outputs.
-        let Linearization { primal_program, tangent_program, .. } = self.program().linearize()?;
+        let (primal_program, tangent_program, _) = self.program().linearize()?.into_parts();
 
-        // Wrap the primal sub-program in a fresh `jit_call` and stage it over the operand primals, recovering the
+        // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
         // primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(primal_program))));
-        let mut primal_call_outputs = context.stage_operation(primal_call, primal_operands.as_slice())?;
+        let mut primal_call_outputs = context.bind(primal_call, &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -654,23 +749,23 @@ where
         let residuals = primal_call_outputs.split_off(output_count);
         let primal_outputs = primal_call_outputs;
 
-        // Wrap the tangent sub-program in a fresh `jit_call` and stage it over the operand tangents followed by the
+        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over the operand tangents followed by the
         // residual values, recovering one output tangent per primal output.
         // The tangent `jit_call` takes every operand tangent as a real program input, so materialize structural
         // zeros at this sub-program boundary.
         let mut tangent_operands = inputs
             .iter()
-            .map(|input| materialize(context, input.tangent().clone()))
+            .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(tangent_program))));
-        let tangent_outputs = context.stage_operation(tangent_call, tangent_operands.as_slice())?;
+        let tangent_outputs = context.bind(tangent_call, &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
             .into_iter()
             .zip(tangent_outputs)
-            .map(|(primal, tangent)| JvpTracer::new(primal, tangent))
+            .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
             .collect())
     }
 }

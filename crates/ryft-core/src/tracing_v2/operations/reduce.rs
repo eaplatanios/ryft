@@ -605,7 +605,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         crate::batching::ArrayBatch::common_batch_size(inputs)?;
-        let Some(batch_axis) = inputs[0].batch_axis().axis() else {
+        let Some(batch_axis) = inputs[0].batch_axis_position() else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);
         };
         let Some((lifted_axes, output_axis)) = lift_reduce_axes(self.axes.as_slice(), batch_axis) else {
@@ -631,7 +631,7 @@ where
             None => None,
         };
         let lifted_op = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::new(output_axis)])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(output_axis)])
     }
 }
 

@@ -46,10 +46,10 @@ pub enum BatchingError {
     MisalignedBatchAxes { message: String },
 
     #[error("batch axis {axis} of array type {type} has dynamic size")]
-    DynamicBatchAxis { r#type: ArrayType, axis: usize },
+    DynamicBatchAxis { r#type: ArrayType, axis: isize },
 
     #[error("batch axis {axis} is out of bounds for array type {type}")]
-    BatchAxisOutOfBounds { r#type: ArrayType, axis: usize },
+    BatchAxisOutOfBounds { r#type: ArrayType, axis: isize },
 
     #[error("{message}")]
     UnsupportedOperation { message: String },
@@ -103,13 +103,25 @@ impl From<BatchingError> for ProgramError {
 /// Carrying it on the value itself lets the per-operation batching rules route the mapped batch axis straight from the
 /// value in hand.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
-pub struct BatchAxis(Option<usize>);
+pub struct BatchAxis(Option<isize>);
 
 impl BatchAxis {
     /// Creates a mapped [`BatchAxis`] at physical position `axis`.
     #[inline]
-    pub fn new(axis: usize) -> Self {
+    pub fn new(axis: isize) -> Self {
         Self(Some(axis))
+    }
+
+    /// Creates a mapped [`BatchAxis`] from an already-normalized physical position.
+    #[inline]
+    pub fn from_position(position: usize) -> Self {
+        Self::new(isize::try_from(position).expect("a physical array rank fits in isize"))
+    }
+
+    /// Creates a replicated or mapped [`BatchAxis`] from an already-normalized optional physical position.
+    #[inline]
+    pub fn from_optional_position(position: Option<usize>) -> Self {
+        position.map(Self::from_position).unwrap_or_default()
     }
 
     /// Creates a replicated [`BatchAxis`] (i.e., the batched value is shared unchanged across every batch item).
@@ -121,7 +133,7 @@ impl BatchAxis {
 
     /// Returns the mapped batch axis position, or `None` if this [`BatchAxis`] is replicated.
     #[inline]
-    pub fn axis(&self) -> Option<usize> {
+    pub fn axis(&self) -> Option<isize> {
         self.0
     }
 
@@ -142,16 +154,16 @@ impl Display for BatchAxis {
     }
 }
 
-impl From<Option<usize>> for BatchAxis {
+impl From<Option<isize>> for BatchAxis {
     #[inline]
-    fn from(axis: Option<usize>) -> Self {
+    fn from(axis: Option<isize>) -> Self {
         Self(axis)
     }
 }
 
-impl From<usize> for BatchAxis {
+impl From<isize> for BatchAxis {
     #[inline]
-    fn from(axis: usize) -> Self {
+    fn from(axis: isize) -> Self {
         Self(Some(axis))
     }
 }
@@ -248,12 +260,14 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// Creates a new [`ArrayBatch`].
     #[inline]
     pub fn new<A: Into<BatchAxis>>(r#type: ArrayType, value: V, batch_axis: A) -> Result<Self, BatchingError> {
-        let batch_axis = batch_axis.into();
-        if let Some(axis) = batch_axis.axis()
-            && axis >= r#type.rank()
-        {
-            return Err(BatchingError::BatchAxisOutOfBounds { r#type, axis }.into());
-        }
+        // A possibly-negative mapped axis is normalized against the physical rank, following Python/JAX indexing:
+        // valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
+        let rank = r#type.rank() as isize;
+        let batch_axis = match batch_axis.into().axis() {
+            Some(axis) if (-rank..rank).contains(&axis) => BatchAxis::new(if axis < 0 { axis + rank } else { axis }),
+            Some(axis) => return Err(BatchingError::BatchAxisOutOfBounds { r#type, axis }),
+            None => BatchAxis::replicated(),
+        };
         Ok(Self { r#type, value, batch_axis })
     }
 
@@ -267,6 +281,14 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     #[inline]
     pub fn batch_axis(&self) -> BatchAxis {
         self.batch_axis
+    }
+
+    /// Returns the canonical nonnegative physical position of this [`ArrayBatch`]'s mapped [`BatchAxis`].
+    /// [`ArrayBatch::new`] normalizes signed declarations before storing them, and so internal batching rules
+    /// can use this index directly.
+    #[inline]
+    pub fn batch_axis_position(&self) -> Option<usize> {
+        self.batch_axis.axis().map(|axis| usize::try_from(axis).expect("stored batch axes are canonical"))
     }
 
     /// Returns the packed array value.
@@ -290,7 +312,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         };
         let size = self
             .r#type
-            .dimension(axis as isize)
+            .dimension(axis)
             .value()
             .ok_or_else(|| BatchingError::DynamicBatchAxis { r#type: self.r#type.clone(), axis })?;
         Ok(Some(size))
@@ -299,7 +321,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     /// Returns the [`ArrayType`] of each item in the batch (i.e., with the batch axis removed, if any).
     #[inline]
     pub fn unbatched_type(&self) -> Result<ArrayType, BatchingError> {
-        let Some(axis) = self.batch_axis.axis() else {
+        let Some(axis) = self.batch_axis_position() else {
             return Ok(self.r#type.clone());
         };
         Ok(self.r#type.without_dimension(axis)?.0)
@@ -327,9 +349,10 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     /// # Parameters
     ///
-    ///   - `axis`: Position of the inserted batch axis in the output.
+    ///   - `axis`: Possibly-negative position of the inserted batch axis in the output, normalized against the
+    ///     physical output rank (e.g., `-1` denotes the final output axis).
     ///   - `axis_size`: Size of the inserted batch axis.
-    pub fn broadcast(&self, axis: usize, axis_size: usize) -> Result<Self, BatchingError>
+    pub fn broadcast(&self, axis: isize, axis_size: usize) -> Result<Self, BatchingError>
     where
         V: Broadcast,
     {
@@ -340,13 +363,20 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             }
             .into());
         }
+        // The insertion position is normalized against the physical output rank (i.e., the per-item rank plus the
+        // inserted batch dimension). Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
         let per_item_type = self.unbatched_type()?;
-        let physical_type = per_item_type.with_inserted_dimension(axis, Size::Static(axis_size))?;
+        let output_rank = per_item_type.rank() as isize + 1;
+        if !(-output_rank..output_rank).contains(&axis) {
+            return Err(BatchingError::BatchAxisOutOfBounds { r#type: self.r#type.clone(), axis });
+        }
+        let position = (if axis < 0 { axis + output_rank } else { axis }) as usize;
+        let physical_type = per_item_type.with_inserted_dimension(position, Size::Static(axis_size))?;
         let output_axes = (0..per_item_type.rank())
-            .map(|dimension| if dimension < axis { dimension } else { dimension + 1 })
+            .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
         let broadcasted = self.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
-        ArrayBatch::new(physical_type, broadcasted, Some(axis))
+        ArrayBatch::new(physical_type, broadcasted, axis)
     }
 
     /// Returns a copy of this [`ArrayBatch`] with its mapped batch axis moved to `axis`, staging a transpose on the
@@ -358,20 +388,28 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     /// # Parameters
     ///
-    ///   - `axis`: Position the mapped batch axis should occupy in the returned [`ArrayBatch`].
-    pub fn move_axis(&self, axis: usize) -> Result<Self, BatchingError>
+    ///   - `axis`: Possibly-negative position the mapped batch axis should occupy in the returned [`ArrayBatch`],
+    ///     normalized against the (unchanged) physical rank (e.g., `-1` denotes the final axis).
+    pub fn move_axis(&self, axis: isize) -> Result<Self, BatchingError>
     where
         V: Transpose,
     {
-        let Some(current_axis) = self.batch_axis().axis() else {
+        let Some(current_axis) = self.batch_axis_position() else {
             return Ok(self.clone());
         };
-        if current_axis == axis {
+        // The target is normalized against the (unchanged) physical rank.
+        // Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
+        let rank = self.r#type.rank() as isize;
+        if !(-rank..rank).contains(&axis) {
+            return Err(BatchingError::BatchAxisOutOfBounds { r#type: self.r#type.clone(), axis });
+        }
+        let position = (if axis < 0 { axis + rank } else { axis }) as usize;
+        if current_axis == position {
             return Ok(self.clone());
         }
-        let permuted_value = self.value().clone().move_axis(current_axis, axis)?;
+        let permuted_value = self.value().clone().move_axis(current_axis, position)?;
         let permuted_type = permuted_value.r#type().into_owned();
-        ArrayBatch::new(permuted_type, permuted_value, Some(axis))
+        ArrayBatch::new(permuted_type, permuted_value, axis)
     }
 
     /// Returns a copy of this [`ArrayBatch`] with a batch axis of size `axis_size` materialized at `axis`. An
@@ -382,35 +420,37 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     ///
     /// # Parameters
     ///
-    ///   - `axis`: Position the batch axis should occupy in the output.
+    ///   - `axis`: Possibly-negative position the batch axis should occupy in the output, normalized against the
+    ///     physical output rank (e.g., `-1` denotes the final output axis).
     ///   - `axis_size`: Size of the batch axis.
     #[inline]
-    pub fn match_axis(&self, axis: usize, axis_size: usize) -> Result<Self, BatchingError>
+    pub fn match_axis(&self, axis: isize, axis_size: usize) -> Result<Self, BatchingError>
     where
         V: Broadcast + Transpose,
     {
         if self.batch_axis().is_replicated() { self.broadcast(axis, axis_size) } else { self.move_axis(axis) }
     }
 
-    /// Returns a copy of this [`ArrayBatch`] with its batch axis aligned to the provided `batch_axis`, staging a
-    /// transpose via [`Self::move_axis`] when only the mapped position differs. This is the *strict* counterpart of
-    /// [`match_axis`](Self::match_axis): the declared axis must agree with the packed axis on presence, because
-    /// changing presence has no implicit meaning at a declaration boundary (collapsing a mapped value requires an
-    /// explicit reduction and materializing a missing axis requires an explicit broadcast) so a presence disagreement
-    /// surfaces as a [`BatchingError::MismatchedOutputAxes`]. [`Batch::batch`] uses this function to realign each
-    /// output to the caller's declared `output_batch_axes`.
+    /// Returns a copy of this [`ArrayBatch`] aligned to the provided output `batch_axis`. A mapped value is moved to
+    /// a different requested position, while a replicated value is broadcast across `axis_size` when the declaration
+    /// requests a mapped result. This matches JAX's mapped-output instantiation. A mapped value cannot be collapsed
+    /// into a replicated declaration without an explicit reduction and that direction returns
+    /// [`BatchingError::MismatchedOutputAxes`]. Signed declarations are normalized against the resulting physical
+    /// rank. [`Batch::batch`] uses this function to realize the caller's declared `output_batch_axes`.
     #[inline]
-    pub fn align_axis(&self, batch_axis: BatchAxis) -> Result<Self, BatchingError>
+    pub fn align_axis(&self, batch_axis: BatchAxis, axis_size: usize) -> Result<Self, BatchingError>
     where
-        V: Transpose,
+        V: Broadcast + Transpose,
     {
-        match (self.batch_axis().axis(), batch_axis.axis()) {
+        // Signed declaration normalization is owned by the delegates: `move_axis` normalizes against the (unchanged)
+        // physical rank and `broadcast` against the physical output rank gaining the batch dimension.
+        match (self.batch_axis.axis(), batch_axis.axis()) {
             (None, None) => Ok(self.clone()),
-            (Some(_), Some(expected)) => self.move_axis(expected),
-            (actual, expected) => Err(BatchingError::MismatchedOutputAxes {
-                expected: BatchAxis::from(expected),
-                actual: BatchAxis::from(actual),
-            }),
+            (Some(_), Some(axis)) => self.move_axis(axis),
+            (None, Some(axis)) => self.broadcast(axis, axis_size),
+            (Some(_), None) => {
+                Err(BatchingError::MismatchedOutputAxes { expected: batch_axis, actual: self.batch_axis() })
+            }
         }
     }
 
@@ -426,7 +466,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
     pub fn sharding_for_inputs(inputs: &[Self]) -> Result<ShardingDimension, ProgramError> {
         let dimension = inputs
             .iter()
-            .filter_map(|input| Some(input.r#type().sharding()?.dimensions()[input.batch_axis().axis()?].clone()))
+            .filter_map(|input| Some(input.r#type().sharding()?.dimensions()[input.batch_axis_position()?].clone()))
             .try_fold(
                 None,
                 |folded_dimension, current_dimension| -> Result<Option<ShardingDimension>, ProgramError> {
@@ -527,15 +567,19 @@ impl<
 > BatchableOperation<V, C> for O
 {
     fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let input_axes = inputs.iter().map(|input| input.batch_axis().axis()).collect::<Vec<_>>();
+        let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
 
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
-        let Some(batch_axis) = input_axes.iter().copied().flatten().next() else {
+        let Some(batch_axis) = input_axes.iter().find_map(BatchAxis::axis) else {
             let physical_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let output_count = Operation::infer_output_types(self, physical_types.as_slice())?.len();
             return self.interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); output_count]);
         };
+
+        // The stored batch axes are canonical since `ArrayBatch::new` normalized them and so the common axis is also
+        // a valid nonnegative physical position for the index arithmetic below.
+        let batch_axis_position = batch_axis as usize;
 
         // Realign every mapped input's batch axis to the common position, then broadcast every input
         // to the common batched physical shape.
@@ -557,7 +601,8 @@ impl<
                 // against numeric branches), with the batch axis inserted at `batch_axis`.
                 let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
                 target_type.data_type = unbatched_type.data_type();
-                let physical_type = target_type.with_inserted_dimension(batch_axis, Size::Static(axis_size))?;
+                let physical_type =
+                    target_type.with_inserted_dimension(batch_axis_position, Size::Static(axis_size))?;
                 if physical_type == *input.r#type() {
                     return Ok(input.clone());
                 }
@@ -566,16 +611,16 @@ impl<
                 // per-item dimensions right-align within the target's per-item dimensions, skipping the inserted
                 // batch axis.
                 let target_unbatched_rank = physical_type.rank() - 1;
-                let is_mapped = input_axis.is_some();
+                let is_mapped = !input_axis.is_replicated();
                 let output_axes = (0..input.r#type().rank())
                     .map(|dimension| {
-                        if is_mapped && dimension == batch_axis {
-                            return batch_axis;
+                        if is_mapped && dimension == batch_axis_position {
+                            return batch_axis_position;
                         }
                         let per_item_index =
-                            if is_mapped && dimension > batch_axis { dimension - 1 } else { dimension };
+                            if is_mapped && dimension > batch_axis_position { dimension - 1 } else { dimension };
                         let position = (target_unbatched_rank - unbatched_type.rank()) + per_item_index;
-                        if position < batch_axis { position } else { position + 1 }
+                        if position < batch_axis_position { position } else { position + 1 }
                     })
                     .collect::<Vec<_>>();
                 let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
@@ -603,7 +648,7 @@ pub enum ProgramBatchingOutputAxesPolicy {
 
     /// Align/normalize every output to the specified mapped axis, moving already-batched outputs with [`Transpose`]
     /// and broadcasting replicated outputs across the batch.
-    AlignAllTo(usize),
+    AlignAllTo(isize),
 
     /// Align each output `i` to the mapped axis of the `i`-th entry, with one entry per program output. A *mapped*
     /// entry forces the output to carry its batch axis at that position, moving an already-batched output with
@@ -933,7 +978,21 @@ impl<
                 .zip(input_batch_axes.iter())
                 .map(|(unbatched_type, batch_axis)| {
                     let batched_type = match batch_axis.axis() {
-                        Some(position) => unbatched_type.with_inserted_dimension(position, Size::Static(axis_size))?,
+                        Some(axis) => {
+                            // A possibly-negative mapped axis is normalized against the physical input rank (i.e.,
+                            // with the inserted batch dimension counted). Valid axes lie in `[-rank, rank)`, with `-1`
+                            // denoting the final axis.
+                            let physical_rank = unbatched_type.rank() + 1;
+                            let position = usize::try_from(axis)
+                                .ok()
+                                .or_else(|| physical_rank.checked_sub(axis.unsigned_abs()))
+                                .filter(|&axis| axis < physical_rank)
+                                .ok_or_else(|| BatchingError::BatchAxisOutOfBounds {
+                                    r#type: unbatched_type.clone(),
+                                    axis,
+                                })?;
+                            unbatched_type.with_inserted_dimension(position, Size::Static(axis_size))?
+                        }
                         None => unbatched_type.clone(),
                     };
                     let input = builder.borrow_mut().add_input(batched_type.clone());
@@ -943,15 +1002,16 @@ impl<
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let outputs = batching_context.interpret_program(self, inputs)?;
 
-            // Resolve `output_axes_policy` into one alignment target per output. `None` keeps the natural axis, and a
-            // mapped target forces the output to carry its batch axis at that position (a replicated `AlignEachTo`
-            // entry is a lower bound, not an equality constraint, mirroring JAX's `instantiate`).
+            // Resolve `output_axes_policy` into one optional alignment declaration per output. The outer `None` keeps
+            // the natural axis, while `Some(mapped)` forces the output to carry its batch axis at that signed position.
+            // A replicated `AlignEachTo` entry is a lower bound rather than an equality constraint, mirroring JAX's
+            // `instantiate` behavior.
             let output_target_batch_axes = match &output_axes_policy {
                 ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => vec![Some(*axis); outputs.len()],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => vec![Some(BatchAxis::new(*axis)); outputs.len()],
                 ProgramBatchingOutputAxesPolicy::AlignEachTo(axes) => {
                     check_count!("output", outputs, axes.len(), ProgramError);
-                    axes.iter().map(|target| target.axis()).collect::<Vec<_>>()
+                    axes.iter().map(|target| (!target.is_replicated()).then_some(*target)).collect::<Vec<_>>()
                 }
             };
             let mut output_atom_ids = Vec::with_capacity(outputs.len());
@@ -960,29 +1020,19 @@ impl<
                 // The batched outputs must belong to this batched trace. A foreign tracer's atom ID would silently
                 // alias whichever atom shares its index in this builder, and so we perform a check here to avoid that.
                 check_builders!(&builder, output.value().builder())?;
-                let output_batch_axis = output.batch_axis();
 
-                // For untargeted or already-aligned outputs we keep the batch axis that the batching rules produced.
+                // Untargeted outputs keep the natural axis produced by their batching rules.
                 let Some(target_batch_axis) = output_target_batch_axis else {
                     output_atom_ids.push(output.value().atom_id()?);
-                    output_axes.push(output_batch_axis);
+                    output_axes.push(output.batch_axis());
                     continue;
                 };
-                if output_batch_axis.axis() == Some(target_batch_axis) {
-                    output_atom_ids.push(output.value().atom_id()?);
-                    output_axes.push(output_batch_axis);
-                    continue;
-                }
 
-                // For the remaining outputs, we move them to the target batch axis, or broadcast a replicated output
-                // across the batch, staging the axis-adjusting operation into the batched program while its outputs
-                // are still live tracers.
-                let output = match output_batch_axis.axis() {
-                    Some(_) => output.move_axis(target_batch_axis)?,
-                    None => output.broadcast(target_batch_axis, axis_size)?,
-                };
+                // Move naturally mapped outputs or broadcast naturally replicated outputs while they are still live
+                // tracers, then report the normalized physical position stored by `ArrayBatch`.
+                let output = output.align_axis(target_batch_axis, axis_size)?;
+                output_axes.push(output.batch_axis());
                 output_atom_ids.push(output.into_value().atom_id()?);
-                output_axes.push(BatchAxis::new(target_batch_axis));
             }
 
             Ok::<_, ProgramError>((output_atom_ids, output_axes))
@@ -1001,7 +1051,7 @@ impl<
 /// documentation of the [`batch`] function for information on what the batching transform does and how to use it. This
 /// trait serves the call sites that must name the [`Context`] explicitly (most notably inputs with no values to recover
 /// a context from).
-pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
+pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
     /// Batches `function` over the mapped axes of `input`, with this [`Context`] executing (or staging) the batched
     /// operations. Refer to the documentation of the [`batch`] function for information on the batching transform and
     /// its arguments. Unlike that function, this method also serves inputs with no leaf values (i.e., that are empty),
@@ -1074,19 +1124,22 @@ pub trait Batch: Context<Type = ArrayType, Value: Transpose> {
 
         // Realign each output's packed batch axis to the caller's `output_batch_axes` and unwrap the parent tracer,
         // which already carries any enclosing level's metadata, so nested `batch` calls thread through with no side
-        // table. `ArrayBatch::align_axis` owns the boundary contract: position-only disagreements are repaired with a
-        // staged transpose, while presence disagreements surface as `MismatchedOutputAxes`.
+        // table. `ArrayBatch::align_axis` owns the boundary contract: mapped positions are normalized and moved,
+        // replicated outputs are broadcast for mapped declarations, and mapped outputs cannot be collapsed into a
+        // replicated declaration without an explicit reduction.
         let parent_outputs = output
             .into_parameters()
             .zip(output_batch_axis_values)
-            .map(|(output, output_batch_axis)| Ok(output.into_batch().align_axis(output_batch_axis)?.into_value()))
+            .map(|(output, output_batch_axis)| {
+                Ok(output.into_batch().align_axis(output_batch_axis, batch_size)?.into_value())
+            })
             .collect::<Result<Vec<_>, BatchingError>>()?;
 
         Ok(O::To::<Self::Value>::from_parameters(output_structure, parent_outputs)?)
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> Batch for C {}
 
 /// Batches the provided `function` over the mapped axes of `input`, running it once over whole batches instead of once
 /// per batch item. This is the batching (i.e., vectorization) transform and the analogue of
@@ -1109,9 +1162,10 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
 /// applies to every leaf, a value whose structure matches gives one axis per leaf, and a smaller compatible structure
 /// broadcasts based on its prefixes. On the input side, [`BatchAxis::new(k)`](BatchAxis::new) maps the leaf on axis
 /// `k` of its physical type, while [`BatchAxis::replicated`] shares the leaf unchanged across the batch. On the output
-/// side, [`BatchAxis::new(k)`](BatchAxis::new) requests the mapped axis at position `k` (an explicit transpose is
-/// staged when the natural output axis differs), while [`BatchAxis::replicated`] declares the output replicated (e.g.,
-/// a value produced from replicated inputs without any per-item work). Collapsing a genuinely mapped output instead
+/// side, [`BatchAxis::new(k)`](BatchAxis::new) requests the mapped axis at position `k`: a naturally mapped output is
+/// transposed when needed, while a naturally replicated output is broadcast across the batch, matching JAX's `vmap`.
+/// Negative axes are normalized against the physical input or requested output rank, so `-1` denotes the final axis.
+/// [`BatchAxis::replicated`] requires the output to remain replicated; collapsing a genuinely mapped output instead
 /// requires an explicit reduction inside `function`.
 ///
 /// When at least one input is mapped, the batch size is inferred from those inputs. The `batch_axis` argument accepts
@@ -1129,7 +1183,7 @@ impl<C: Context<Type = ArrayType, Value: Transpose>> Batch for C {}
 ///     batch axis name.
 #[inline]
 pub fn batch<
-    V: Value<Type = ArrayType, ExecutionDomain: Context> + Transpose,
+    V: Value<Type = ArrayType, ExecutionDomain: Context> + Broadcast + Transpose,
     F: FnOnce(I::To<BatchingTracer<V::ExecutionDomain>>) -> Result<O, ProgramError>,
     I: Parameterized<V, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<BatchingTracer<V::ExecutionDomain>>>,
     O: Parameterized<BatchingTracer<V::ExecutionDomain>, Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>>,
@@ -1186,10 +1240,24 @@ mod tests {
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))),
         );
 
+        // Negative axes follow Python/JAX indexing and are normalized once at construction.
+        // `-1` denotes the final physical axis and the stored metadata is the canonical nonnegative position.
+        let batched_axis_negative_one =
+            ArrayBatch::new(matrix_type.clone(), matrix.clone(), BatchAxis::new(-1)).unwrap();
+        assert_eq!(batched_axis_negative_one.batch_axis(), BatchAxis::new(1));
+        assert_eq!(batched_axis_negative_one.batch_size(), Ok(Some(3)));
+
         // `new` rejects an out-of-bounds mapped axis.
         assert_eq!(
             ArrayBatch::new(matrix_type.clone(), matrix, Some(2)),
             Err(BatchingError::BatchAxisOutOfBounds { r#type: matrix_type, axis: 2 }),
+        );
+
+        let matrix = TestArray::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let matrix_type = matrix.r#type().into_owned();
+        assert_eq!(
+            ArrayBatch::new(matrix_type.clone(), matrix, BatchAxis::new(-3)),
+            Err(BatchingError::BatchAxisOutOfBounds { r#type: matrix_type, axis: -3 }),
         );
 
         // `replicated` shares the value unchanged across the batch: no mapped axis, no batch size, and the per-item
@@ -1319,11 +1387,11 @@ mod tests {
         .unwrap();
 
         // Aligning a batched value to the axis it already maps returns it unchanged.
-        assert_eq!(batched.align_axis(BatchAxis::new(0)).unwrap(), batched);
+        assert_eq!(batched.align_axis(BatchAxis::new(0), 2).unwrap(), batched);
 
         // Aligning to a different mapped position stages a transpose (like `move_axis`). [2, 3] mapped at 0 becomes
-        // [3, 2] mapped at 1. Unlike `match_axis`, presence never changes, so no `axis_size` is needed.
-        let aligned = batched.align_axis(BatchAxis::new(1)).unwrap();
+        // [3, 2] mapped at 1. The equivalent negative declaration is normalized against the physical output rank.
+        let aligned = batched.align_axis(BatchAxis::new(-1), 2).unwrap();
         assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
         assert_eq!(
             *aligned.r#type(),
@@ -1333,16 +1401,16 @@ mod tests {
 
         // Aligning a replicated value to a replicated declaration returns it unchanged.
         let replicated = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        assert_eq!(replicated.align_axis(BatchAxis::replicated()).unwrap(), replicated);
+        assert_eq!(replicated.align_axis(BatchAxis::replicated(), 2).unwrap(), replicated);
 
-        // Presence disagreements are rejected: unlike `match_axis`, `align_axis` never broadcasts a replicated value
-        // to gain an axis nor collapses a mapped one, so both directions surface `MismatchedOutputAxes`.
+        // A mapped output declaration instantiates a naturally replicated value by broadcasting it across the batch.
+        let aligned = replicated.align_axis(BatchAxis::new(-1), 2).unwrap();
+        assert_eq!(aligned.batch_axis(), BatchAxis::new(1));
+        assert_eq!(aligned.value(), &TestArray::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
+
+        // The reverse presence change remains invalid: collapsing a mapped output requires an explicit reduction.
         assert_eq!(
-            replicated.align_axis(BatchAxis::new(0)),
-            Err(BatchingError::MismatchedOutputAxes { expected: BatchAxis::new(0), actual: BatchAxis::replicated() }),
-        );
-        assert_eq!(
-            batched.align_axis(BatchAxis::replicated()),
+            batched.align_axis(BatchAxis::replicated(), 2),
             Err(BatchingError::MismatchedOutputAxes { expected: BatchAxis::replicated(), actual: BatchAxis::new(0) }),
         );
     }
@@ -1400,7 +1468,7 @@ mod tests {
         // and reports each output on that common axis.
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)]));
         let matrix_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]));
-        let make_batch = |r#type: &ArrayType, values: Vec<f64>, axis: Option<usize>| {
+        let make_batch = |r#type: &ArrayType, values: Vec<f64>, axis: Option<isize>| {
             ArrayBatch::new(r#type.clone(), TestArray::new(r#type.clone(), values), axis).unwrap()
         };
 
@@ -1494,6 +1562,15 @@ mod tests {
         let outputs = batched.interpret(vec![input]).unwrap();
         assert_eq!(outputs, vec![TestArray::matrix(2, 3, vec![1.0, 4.0, 9.0, 16.0, 25.0, 36.0])]);
 
+        // A negative input axis is normalized against the physical input rank. Mapping the final axis consumes a
+        // `[3, 2]` physical value and preserves that canonical axis through the elementwise body.
+        let (batched, output_axes) =
+            program.batched(2, &[BatchAxis::new(-1)], ProgramBatchingOutputAxesPolicy::Natural).unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        let input = TestArray::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        let outputs = batched.interpret(vec![input]).unwrap();
+        assert_eq!(outputs, vec![TestArray::matrix(3, 2, vec![1.0, 16.0, 4.0, 25.0, 9.0, 36.0])]);
+
         // A replicated input keeps its logical `[3]` type, and `AlignAllTo(0)` broadcasts the naturally replicated
         // output across the batch so the batched program still produces one `[2, 3]` output per item.
         let (batched, output_axes) = program
@@ -1502,6 +1579,15 @@ mod tests {
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         let outputs = batched.interpret(vec![TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap();
         assert_eq!(outputs, vec![TestArray::matrix(2, 3, vec![1.0, 4.0, 9.0, 1.0, 4.0, 9.0])]);
+
+        // Signed output policies normalize after accounting for the inserted batch dimension. `-1` places the
+        // instantiated batch axis last.
+        let (batched, output_axes) = program
+            .batched(2, &[BatchAxis::replicated()], ProgramBatchingOutputAxesPolicy::AlignAllTo(-1))
+            .unwrap();
+        assert_eq!(output_axes, vec![BatchAxis::new(1)]);
+        let outputs = batched.interpret(vec![TestArray::vector(vec![1.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(outputs, vec![TestArray::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0])]);
 
         // A mismatched `input_batch_axes` count is rejected.
         assert!(program.batched(2, &[], ProgramBatchingOutputAxesPolicy::Natural).is_err());
@@ -1521,6 +1607,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output, TestArray::vector(vec![1.0, 4.0, 9.0]));
+
+        // A mapped output declaration broadcasts a naturally replicated result across the explicit batch.
+        // The signed `-1` declaration places that new batch dimension last.
+        let output: TestArray = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
+            .batch(
+                |x| Ok(x.clone() * x),
+                TestArray::vector(vec![1.0, 2.0, 3.0]),
+                BatchAxis::replicated(),
+                BatchAxis::new(-1),
+                2,
+            )
+            .unwrap();
+        assert_eq!(output, TestArray::matrix(3, 2, vec![1.0, 1.0, 4.0, 4.0, 9.0, 9.0]));
 
         // The free `batch` serves top-level concrete values through their `Value::ExecutionDomain` declarations: a
         // plain `TestArray` input recovers the test backend's rich eager domain, mirroring how JAX's `vmap` falls back

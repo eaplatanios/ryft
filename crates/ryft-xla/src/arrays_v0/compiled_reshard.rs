@@ -322,7 +322,7 @@ fn try_replicated_cross_mesh<'o>(
     let intermediate_type = ArrayType::new(element_type, shape.into())
         .with_sharding(replicated_on_dst)
         .map_err(XlaError::from)?;
-    let intermediate = Array::from_addressable_buffers(intermediate_type, dst_mesh.clone(), buffers)?;
+    let intermediate = Array::from_addressable_buffers(client, intermediate_type, dst_mesh.clone(), buffers)?;
 
     // The intermediate is owned exclusively by this function and is never observed by callers.
     // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.

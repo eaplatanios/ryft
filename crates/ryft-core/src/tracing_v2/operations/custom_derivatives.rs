@@ -251,7 +251,7 @@ where
     let axis_size = context.axis_size();
     let aligned_inputs = inputs
         .iter()
-        .map(|input| match input.batch_axis().axis() {
+        .map(|input| match input.batch_axis_position() {
             Some(_) => input.move_axis(0),
             None => input.broadcast(0, axis_size),
         })
@@ -1682,10 +1682,10 @@ mod tests {
         )
         .unwrap();
         let (_, _, block) = jacobian.iter_blocks().next().unwrap();
-        assert_close(block.values()[0], 3.0 * 0.5f64.cos());
-        assert_close(block.values()[1], 0.0);
-        assert_close(block.values()[2], 0.0);
-        assert_close(block.values()[3], 3.0 * 1.0f64.cos());
+        assert_close(block.value().values()[0], 3.0 * 0.5f64.cos());
+        assert_close(block.value().values()[1], 0.0);
+        assert_close(block.value().values()[2], 0.0);
+        assert_close(block.value().values()[3], 3.0 * 1.0f64.cos());
     }
 
     /// Builds the scalar `f(x) = sin(x)` program.

@@ -1,4 +1,4 @@
-use crate::batching::InterpretableBatchableOperation;
+use crate::batching::{BatchAxis, InterpretableBatchableOperation};
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
@@ -86,11 +86,11 @@ where
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         crate::batching::ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_permutation, output_axis) = match inputs[0].batch_axis().axis() {
+        let (lifted_permutation, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => (lift_permutation(self.permutation(), batch_axis), Some(batch_axis)),
             None => (self.permutation().to_vec(), None),
         };
         let lifted_op = TransposeOperation::new(lifted_permutation);
-        lifted_op.interpret_with_batch_axes(context, inputs, &[output_axis.into()])
+        lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])
     }
 }

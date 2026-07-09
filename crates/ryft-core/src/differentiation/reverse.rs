@@ -275,7 +275,7 @@ pub trait TransposableProgramOperation<V: Value<Type: DifferentiableType>>: Oper
 impl<
     T: DifferentiableType,
     V: Value<Type = T>,
-    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
+    O: Clone + TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
 > Program<V, O, Input, Output>
@@ -346,10 +346,10 @@ impl<
     ///
     /// Known operand values are program inputs and constants. Each known input is exposed as a pullback input and each
     /// constant atom as a pullback constant, so a bilinear rule can read either as the known operand's pullback value.
-    /// If a transpose rule requests the value of a known *intermediate* (a known atom that is neither a program input
-    /// nor a constant), this function returns [`ProgramError::UnsupportedOperation`]. This is not a limitation in
-    /// practice because the partial-evaluation split that produces a partitioned tangent program prunes known
-    /// intermediates into its known sub-program, leaving only known inputs and constants for an adjoint rule to read.
+    /// When a transpose rule requests a known *intermediate*, its pure producer subgraph is replayed lazily in the
+    /// pullback and cached there, so repeated uses share one rebuilt value. Effectful known producers are rejected:
+    /// replaying one in the pullback could duplicate or reorder an effect that belongs on the primal side, and callers
+    /// must instead partial-evaluate the program so that the value crosses the linear boundary as a residual input.
     ///
     /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
     /// per program output, walks this program in reverse instruction order applying each [`Operation`]'s
@@ -426,6 +426,70 @@ impl<
             Ok(())
         }
 
+        /// Replays the pure producer subgraph of one known atom into the pullback builder. Program inputs are seeded
+        /// in `known_map` by the caller, constants are copied directly, and instruction outputs are memoized together
+        /// so requesting two results of one producer never replays that producer twice.
+        fn materialize_known<
+            V: Value,
+            O: Clone + Operation<V::Type>,
+            Input: Parameterized<V>,
+            Output: Parameterized<V>,
+        >(
+            program: &Program<V, O, Input, Output>,
+            instruction_by_output: &[Option<usize>],
+            linear: &[bool],
+            builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
+            known_map: &mut [Option<AtomId>],
+            atom: AtomId,
+        ) -> Result<AtomId, ProgramError> {
+            if let Some(mapped) = known_map.get(atom.index()).copied().flatten() {
+                return Ok(mapped);
+            }
+            if *linear.get(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })? {
+                return Err(ProgramError::MalformedProgram(
+                    "a linear atom was requested as a known transpose operand".to_string(),
+                ));
+            }
+            let source = program.atoms().get(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })?;
+            if let Atom::Constant(value) = source {
+                let mapped = builder.borrow_mut().add_constant(value.clone());
+                known_map[atom.index()] = Some(mapped);
+                return Ok(mapped);
+            }
+            let instruction_index = instruction_by_output.get(atom.index()).copied().flatten().ok_or_else(|| {
+                ProgramError::MalformedProgram("known variable atom has no owning instruction".into())
+            })?;
+            let instruction = program
+                .instructions()
+                .get(instruction_index)
+                .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
+            if !instruction.operation().effects().is_pure() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "partition-aware transpose cannot replay effectful known intermediate producer `{}`; \
+                         partial-evaluate it into a residual input first",
+                        instruction.operation().name(),
+                    ),
+                });
+            }
+            let inputs = instruction
+                .inputs()
+                .iter()
+                .copied()
+                .map(|input| materialize_known(program, instruction_by_output, linear, builder, known_map, input))
+                .collect::<Result<Vec<_>, _>>()?;
+            let outputs = builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+            for (source, mapped) in instruction.outputs().iter().copied().zip(outputs) {
+                known_map[source.index()] = Some(mapped);
+            }
+            known_map
+                .get(atom.index())
+                .copied()
+                .flatten()
+                .ok_or_else(|| ProgramError::MalformedProgram("known producer output was not remapped".into()))
+        }
+
         // Propagate operand linearity forward over the primal atoms. A program-input atom takes its linearity from
         // `input_linearity`, a constant atom is always known (non-linear), and an instruction result is linear when
         // any of its operands is linear. Because instructions are stored in evaluation order, a single forward pass
@@ -478,7 +542,9 @@ impl<
             let output_type = output_atom.r#type();
             let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.into_owned());
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
-            accumulate::<V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
+            if *linear.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })? {
+                accumulate::<V, O>(&builder, adjoints.as_mut_slice(), output, cotangent_input)?;
+            }
         }
 
         // Add a pullback input carrying the runtime value of each known program input, after the cotangent inputs so
@@ -494,16 +560,9 @@ impl<
             }
         }
 
-        // Constant atoms are also known operands, so expose each one to transpose rules as a pullback constant. A
-        // bilinear operation such as `Mul` whose known operand is a constant (for example, the `3` in `3 * x`) reads
-        // this pullback atom exactly as it reads a known input's value. This is the partition-aware analogue of folding
-        // a rebuilt constant into a captured factor, and it keeps a constant-scaled tangent transposable directly
-        // rather than reporting it as an unsupported known intermediate.
-        for (index, atom) in self.atoms().iter().enumerate() {
-            if let Some(value) = atom.as_constant() {
-                known_map[index] = Some(builder.borrow_mut().add_constant(value.clone()));
-            }
-        }
+        // Constants and pure known intermediates are materialized lazily below, only when a live transpose rule
+        // needs them. This avoids copying dead constants and replaying dead known-side work into the pullback.
+        let instruction_by_output = self.instruction_by_output();
 
         // Walk the primal program backward, applying each operation's transpose rule only when at least one of its
         // outputs has a non-zero accumulated cotangent. The scratch vector avoids allocating a fresh cotangent vector
@@ -513,13 +572,9 @@ impl<
         let mut instruction_output_cotangents = Vec::with_capacity(max_instruction_output_count);
         for instruction in self.instructions().iter().rev() {
             // Skip dead reverse edges early. If none of an instruction's outputs carries an adjoint, the instruction
-            // cannot contribute to any input cotangent. This is the only operand-side guard. A non-linear instruction
-            // whose transpose rule would read a known operand is always safe because the partial-evaluation split that
-            // produces partitioned tangent programs exposes every known operand's value (as a known input or constant),
-            // so the known-intermediate guard below stays purely defensive. Note that a batched masked `while` threads
-            // its structurally-zero Boolean-mask carry as a plain pushforward tangent rather than through an all-known
-            // `select` operation over a restored zero, and so no such instruction reads an unexposed known
-            // intermediate value.
+            // cannot contribute to any input cotangent. This is the only operand-side guard. A live transpose rule may
+            // read non-linear operands; pure known producer subgraphs are materialized lazily below, while effectful
+            // known producers are rejected rather than duplicated or reordered in the pullback.
             let mut has_output_adjoint = false;
             for output in instruction.outputs().iter().copied() {
                 if adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?.is_some() {
@@ -558,10 +613,8 @@ impl<
             // prevents malformed rules from silently dropping or inventing cotangents through iterator truncation. Each
             // input/operand becomes a self-describing `PartialValue`: a linear operand is `Unknown` of its type (the
             // rule produces a cotangent of that type), and a known operand is `Known` of the tracer reading its
-            // pullback value atom from `known_map` (a known program input or a constant). A known operand with no
-            // pullback value would be a known *intermediate* (i.e., a known atom that is neither a program input nor a
-            // constant). The partial-evaluation split that produces partitioned tangent programs never leaves one, and
-            // so guarding it here once lets every rule assume a `Known` operand carries its value.
+            // pullback value atom from `known_map`. Known inputs are seeded above, constants are copied lazily, and
+            // pure known intermediates recursively replay their producer subgraphs exactly once before the rule runs.
             let inputs = instruction
                 .inputs()
                 .iter()
@@ -576,13 +629,15 @@ impl<
                     if *linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? {
                         Ok(PartialValue::Unknown(r#type))
                     } else {
-                        match known_map.get(input.index()).copied().ok_or(ProgramError::UnboundAtomId { id: input })? {
-                            Some(atom) => Ok(PartialValue::Known(context.tracer(atom, Some(r#type)))),
-                            None => Err(ProgramError::UnsupportedOperation {
-                                message: "partition-aware transpose of a known intermediate is not yet supported"
-                                    .to_string(),
-                            }),
-                        }
+                        let atom = materialize_known(
+                            self,
+                            instruction_by_output.as_slice(),
+                            linear.as_slice(),
+                            &builder,
+                            known_map.as_mut_slice(),
+                            input,
+                        )?;
+                        Ok(PartialValue::Known(context.tracer(atom, Some(r#type))))
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -593,6 +648,9 @@ impl<
             )?;
             check_count!("input", input_cotangents, instruction.inputs().len(), ProgramError);
             for (input, contribution) in instruction.inputs().iter().copied().zip(input_cotangents) {
+                if !*linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? {
+                    continue;
+                }
                 if let Some(contribution) = contribution.as_value() {
                     // Staged contributions must belong to this builder before their atom IDs can be accumulated.
                     check_builders!(&builder, contribution.builder())?;
@@ -657,7 +715,7 @@ mod tests {
     use crate::contexts::StagingContext;
     use crate::macros::check_count;
     use crate::operations::Operation;
-    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::constants::ZeroOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
@@ -666,6 +724,7 @@ mod tests {
     use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
     use crate::types::{DataType, TypeError};
+    use crate::{Effect, Effects};
 
     use super::*;
 
@@ -679,6 +738,9 @@ mod tests {
     enum TestLinearOperation {
         /// Single-input passthrough used when a test needs a live instruction whose transpose forwards its cotangent.
         Identity,
+
+        /// Effectful passthrough used to verify that known-side producer replay never duplicates observable effects.
+        EffectfulIdentity,
 
         /// Two-input addition used to verify cotangent accumulation through repeated primal inputs.
         Add,
@@ -713,6 +775,7 @@ mod tests {
         fn name(&self) -> &'static str {
             match self {
                 Self::Identity => "identity",
+                Self::EffectfulIdentity => "effectful_identity",
                 Self::Add => "add",
                 Self::TwoOutputs => "two_outputs",
                 Self::StagedZeroContribution => "staged_zero_contribution",
@@ -724,7 +787,11 @@ mod tests {
 
         fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
             match self {
-                Self::Identity | Self::StagedZeroContribution | Self::BadArity | Self::ForeignContribution => {
+                Self::Identity
+                | Self::EffectfulIdentity
+                | Self::StagedZeroContribution
+                | Self::BadArity
+                | Self::ForeignContribution => {
                     check_count!("input", input_types, 1, TypeError);
                     Ok(vec![input_types[0].clone()])
                 }
@@ -744,6 +811,13 @@ mod tests {
             match self {
                 Self::Zero(zero) => zero.render(formatter, indentation),
                 _ => formatter.write_str(self.name()),
+            }
+        }
+
+        fn effects(&self) -> Effects {
+            match self {
+                Self::EffectfulIdentity => Effects::single(Effect::OrderedIo),
+                _ => Effects::PURE,
             }
         }
     }
@@ -782,7 +856,7 @@ mod tests {
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>],
         ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestLinearOperation>>>>, ProgramError> {
             match self {
-                Self::Identity => {
+                Self::Identity | Self::EffectfulIdentity => {
                     check_count!("output", outputs, 1, ProgramError);
                     Ok(vec![outputs[0].clone()])
                 }
@@ -1090,6 +1164,42 @@ mod tests {
             program.transpose_with_respect_to(&[1, 1]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "transposition input index 1 appears more than once",
+        ));
+
+        // A live transpose rule may need a pure value produced entirely from known inputs. For `f(a, x) = (a², a²x)`,
+        // transposing only with respect to `x` must replay `a²` in the pullback, ignore the cotangent supplied for the
+        // non-linear `a²` output, and produce `d_x = d_product · a²`.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let known = builder.add_input(DataType::F64);
+        let linear = builder.add_input(DataType::F64);
+        let known_square = builder.add_instruction(MulOperation, vec![known, known]).unwrap()[0];
+        let product = builder.add_instruction(MulOperation, vec![known_square, linear]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(
+                vec![known_square, product],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+        let outputs = pullback.interpret(vec![Scalar::F64(100.0), Scalar::F64(2.0), Scalar::F64(3.0)]).unwrap();
+        assert_eq!(outputs, vec![Scalar::F64(18.0)]);
+
+        // Replaying a known producer with observable effects in the pullback could duplicate or reorder that effect,
+        // so the partition-aware transpose must require partial evaluation to residualize the value instead.
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let known = builder.add_input(DataType::F64);
+        let linear = builder.add_input(DataType::F64);
+        let known_intermediate =
+            builder.add_instruction(TestLinearOperation::EffectfulIdentity, vec![known]).unwrap()[0];
+        let output = builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, linear]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        assert!(matches!(
+            program.transpose_with_respect_to(&[1]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message.contains("cannot replay effectful known intermediate producer `effectful_identity`"),
         ));
     }
 }

@@ -1986,7 +1986,7 @@ mod tests {
     use crate::{Array, FromPjrt};
     use ryft_core::operations::trigonometric::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use ryft_core::tracing_v2::{DifferentiationContext, Dot, DotDimensionNumbers};
+    use ryft_core::tracing_v2::{Dot, DotDimensionNumbers, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;
 
     use super::*;
@@ -2909,6 +2909,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let input_array = Array::from_addressable_buffers(
+            &client,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -3036,12 +3037,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         let lhs_array = Array::from_addressable_buffers(
+            &client,
             static_sharded_array_type(DataType::F32, &[8, 4], lhs_sharding.clone()),
             device_mesh.clone(),
             lhs_buffers,
         )
         .unwrap();
         let rhs_array = Array::from_addressable_buffers(
+            &client,
             static_sharded_array_type(DataType::F32, &[4, 2], rhs_sharding),
             device_mesh,
             rhs_buffers,
@@ -3141,7 +3144,7 @@ mod tests {
                 move |x: ShardMapTracer| {
                     let context = x.context().clone();
                     context
-                        .value_and_gradient(
+                        .gradient(
                             {
                                 let mesh = mesh.clone();
                                 let sharding = sharding.clone();
@@ -3298,6 +3301,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let input_array = Array::from_addressable_buffers(
+            &client,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -3415,6 +3419,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
+            &client,
             static_sharded_array_type(DataType::F32, &[8], sharding),
             device_mesh,
             input_buffers,
@@ -3803,6 +3808,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let input_array = Array::from_addressable_buffers(
+            &client,
             static_sharded_array_type(DataType::U64, &[4], sharding),
             device_mesh,
             input_buffers,

@@ -36,15 +36,10 @@ impl<V: Value<Type = ArrayType> + BooleanLike> BooleanLike for ArrayBatch<V> {
     /// Returns an [`ArrayBatch`] that wraps the Boolean reinterpretation of the carried value (via the value's own
     /// [`BooleanLike::as_boolean`]) under the same batch axis.
     fn as_boolean(&self) -> Self {
-        match self.batch_axis().axis() {
-            // This unwrap is safe because `as_boolean` preserves structural metadata, so the batch axis that was
-            // valid for this batch remains in bounds for the reinterpreted value.
-            Some(axis) => {
-                let value = self.value().as_boolean();
-                Self::new(value.r#type().into_owned(), value, Some(axis)).unwrap()
-            }
-            None => Self::replicated(self.value().as_boolean()),
-        }
+        // This unwrap is safe because `as_boolean` preserves structural metadata, so the batch axis that was valid
+        // for this batch remains in bounds for the reinterpreted value.
+        let value = self.value().as_boolean();
+        Self::new(value.r#type().into_owned(), value, self.batch_axis()).unwrap()
     }
 
     fn boolean(&self) -> Result<bool, ProgramError> {
@@ -837,7 +832,7 @@ where
         }
         .into());
     };
-    match predicate_batch.batch_axis().axis() {
+    match predicate_batch.batch_axis_position() {
         None => {
             let predicate = predicate_batch.value().boolean()?;
             let branch = if predicate { true_branch } else { false_branch };
@@ -851,7 +846,7 @@ where
                 .into_iter()
                 .zip(false_outputs)
                 .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, BatchingError> {
-                    let output_axis = match (true_output.batch_axis().axis(), false_output.batch_axis().axis()) {
+                    let output_axis = match (true_output.batch_axis_position(), false_output.batch_axis_position()) {
                         (Some(left), Some(right)) if left != right => {
                             return Err(BatchingError::MisalignedBatchAxes {
                                 message: format!(
@@ -866,7 +861,7 @@ where
                     };
                     let selected = V::select(predicate_batch.value(), true_output.value(), false_output.value())?;
                     let output_type = selected.r#type().into_owned();
-                    ArrayBatch::new(output_type, selected, Some(output_axis))
+                    ArrayBatch::new(output_type, selected, BatchAxis::from_position(output_axis))
                 })
                 .collect()
         }
@@ -1398,7 +1393,7 @@ where
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
 {
-    let predicate_axis = initial_predicate.batch_axis().axis().ok_or_else(|| BatchingError::MisalignedBatchAxes {
+    let predicate_axis = initial_predicate.batch_axis_position().ok_or_else(|| BatchingError::MisalignedBatchAxes {
         message: "batch-varying while batching requires a batched initial predicate".to_string(),
     })?;
     let mut active_mask = initial_predicate;
@@ -1474,7 +1469,7 @@ where
         + crate::operations::control_flow::Select<Condition = V>
         + crate::operations::manipulation::Broadcast,
 {
-    let candidate_axis = candidate.batch_axis().axis().or(prior.batch_axis().axis()).ok_or_else(|| {
+    let candidate_axis = candidate.batch_axis_position().or(prior.batch_axis_position()).ok_or_else(|| {
         BatchingError::UnsupportedOperation {
             message: "batch-varying while body produced a replicated state element; this is not yet supported"
                 .to_string(),
@@ -1499,7 +1494,7 @@ where
     let broadcasted_mask = active_mask.value().broadcast(mask_output_type, mask_output_axes.as_slice())?;
     let selected = V::select(&broadcasted_mask, &candidate.into_value(), &prior.into_value())?;
     let selected_type = selected.r#type().into_owned();
-    ArrayBatch::new(selected_type, selected, Some(candidate_axis))
+    ArrayBatch::new(selected_type, selected, BatchAxis::from_position(candidate_axis))
 }
 
 impl<V, F, O, C> InterpretableOperation<V, C> for ConditionOperation<V, O, F, Captured>

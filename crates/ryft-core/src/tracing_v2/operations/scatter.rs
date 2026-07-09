@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(block.output_shape(), &[4]);
         assert_eq!(block.input_shape(), &[4]);
         assert_eq!(
-            block.values(),
+            block.value().values(),
             &[
                 1.0, 0.0, 0.0, 0.0, //
                 0.0, 1.0, 0.0, 0.0, //
