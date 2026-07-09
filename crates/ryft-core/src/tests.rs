@@ -1149,8 +1149,7 @@ mod differentiation_tests {
         // distinct tangents reproduces `jvp`'s tangent output each time. Linearizing once and applying many times is
         // the headline `linearize` capability.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let function =
-            |x: LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| x.clone() * x.sin().unwrap();
+        let function = |x: LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
         let jvp_function =
             |x: DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = domain.linearize(function, Scalar::from(0.7)).unwrap();
@@ -1176,7 +1175,7 @@ mod differentiation_tests {
         let function = |(a, b): (
             LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
             LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
-        )| a.clone() * b + a.sin().unwrap();
+        )| Ok(a.clone() * b + a.sin()?);
         let jvp_function = |(a, b): (
             DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
             DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
@@ -1207,7 +1206,7 @@ mod differentiation_tests {
         // The array-domain counterpart of the straight-line scalar test: `f(x) = x * sin(x)` over a `TestArray`. Two
         // distinct tangents are applied through the one linearization and each matches `jvp`.
         let function =
-            |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| x.clone() * x.sin().unwrap();
+            |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
         let jvp_function =
             |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.clone() * x.sin()?);
         let (output, forward) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
@@ -1243,11 +1242,11 @@ mod differentiation_tests {
         // executable partial-evaluation rule, so the residual tangent map is the scale-by-2 linear map. The result
         // must match `jvp` both for the primal and the tangent.
         let condition_function = |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
-            let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-            let predicate = x.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
+            let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
+            let predicate = x.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
             let mut outputs =
-                x.context().bind(ArrayOperation::Condition(Box::new(condition)), &[predicate, x.clone()]).unwrap();
-            outputs.remove(0)
+                x.context().bind(ArrayOperation::Condition(Box::new(condition)), &[predicate, x.clone()])?;
+            Ok(outputs.remove(0))
         };
         let condition_jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
@@ -1290,8 +1289,8 @@ mod differentiation_tests {
 
         let while_function = |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let while_operation = doubling_while_for_linearize();
-            let mut outputs = x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
-            outputs.remove(0)
+            let mut outputs = x.context().bind(ArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
+            Ok(outputs.remove(0))
         };
         let while_jvp_function = |x: DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
             let while_operation = doubling_while_for_linearize();
@@ -1335,8 +1334,8 @@ mod differentiation_tests {
             LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
         )| {
             let scan = product_scan_for_linearize();
-            let mut outputs = init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs]).unwrap();
-            outputs.remove(0)
+            let mut outputs = init.context().bind(ArrayOperation::Scan(Box::new(scan)), &[init.clone(), xs])?;
+            Ok(outputs.remove(0))
         };
         let scan_jvp_function = |(init, xs): (
             DifferentiationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>,
@@ -2788,7 +2787,7 @@ mod linearization_tests {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let (reference_primal, reference_forward) = domain
             .linearize::<_, Vec<Scalar>, Vec<ScalarLinearizationTracer>>(
-                |inputs| vec![inputs[0].sin().unwrap() * inputs[1].clone()],
+                |inputs| Ok(vec![inputs[0].sin()? * inputs[1].clone()]),
                 primal_values.clone(),
             )
             .unwrap();
@@ -2799,7 +2798,7 @@ mod linearization_tests {
         let primals = vec![outer.input(DataType::F64), outer.input(DataType::F64)];
         let (staged_primal, staged_forward) = outer
             .linearize::<_, Vec<Tracer<Outer>>, Vec<LinearizationTracer<Outer>>>(
-                |inputs| vec![inputs[0].sin().unwrap() * inputs[1].clone()],
+                |inputs| Ok(vec![inputs[0].sin()? * inputs[1].clone()]),
                 primals,
             )
             .unwrap();
@@ -2844,11 +2843,11 @@ mod linearization_tests {
         type Outer = TracingContext<TestArray, ArrayOperation<TestArray>>;
 
         let condition_function = |x: LinearizationTracer<Outer>| {
-            let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
-            let predicate = x.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0])).unwrap();
+            let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0))?;
+            let predicate = x.context().lift(TestArray::new(ArrayType::scalar(DataType::Boolean), vec![1.0]))?;
             let mut outputs =
-                x.context().bind(ArrayOperation::Condition(Box::new(condition)), &[predicate, x.clone()]).unwrap();
-            outputs.remove(0)
+                x.context().bind(ArrayOperation::Condition(Box::new(condition)), &[predicate, x.clone()])?;
+            Ok(outputs.remove(0))
         };
 
         // The eager behavior of the same function is pinned by `test_linearize_through_condition_matches_jvp`:
@@ -2856,7 +2855,8 @@ mod linearization_tests {
         // into the outer program, and `apply` stages the scale-by-2 tangent map into the same trace.
         let outer = Outer::new();
         let primal = outer.input(ArrayType::scalar(DataType::F64));
-        let (staged_primal, staged_forward) = outer.linearize(condition_function, primal).unwrap();
+        let (staged_primal, staged_forward) =
+            outer.linearize::<_, Tracer<Outer>, LinearizationTracer<Outer>>(condition_function, primal).unwrap();
         let tangent = outer.input(ArrayType::scalar(DataType::F64));
         let staged_tangent = staged_forward.apply(tangent).unwrap();
 

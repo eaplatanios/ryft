@@ -143,8 +143,9 @@ pub trait Differentiate: Context {
     /// directly at the concrete primals. This matches JAX's `linearize`/`grad` tracing semantics, where the same JVP
     /// interpreter runs over a partial-evaluation trace instead of the eval trace.
     ///
-    /// Reverse mode is this transform plus transposition: [`vjp`](Self::vjp) shares the same linearization core and
-    /// transposes the pushforward program into the pullback.
+    /// Reverse mode is this transform plus transposition, literally: [`vjp`](Self::vjp) calls this, opens the
+    /// returned [`Pushforward`] back up with [`Pushforward::into_parts`], and transposes its program into the
+    /// pullback (and the forward-mode Jacobian transform batch-replays it the same way).
     fn linearize<F, Input, TracedOutput>(
         &self,
         function: F,
@@ -161,7 +162,7 @@ pub trait Differentiate: Context {
             + PartiallyEvaluatableOperation<Self>
             + From<ZeroOperation<<Self as Domain>::Type>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>,
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> TracedOutput,
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Result<TracedOutput, ProgramError>,
         Input: Parameterized<
                 <Self as Domain>::Value,
                 To<<Self as Domain>::Value> = Input,
@@ -169,12 +170,104 @@ pub trait Differentiate: Context {
             >,
         TracedOutput: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<<Self as Domain>::Value>>,
     {
-        let (output, output_structure, program, residuals) =
-            linearize_on_duals::<_, _, Input, TracedOutput>(self, |input| Ok(function(input)), primals)?;
+        if primals.parameters().next().is_none() {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        }
+        let input_structure = primals.parameter_structure();
+        let input_values = primals.into_parameters().collect::<Vec<_>>();
+        let tangent_input_count = input_values.len();
+
+        // Wrap each primal as a dual over a partial-evaluation context wrapping this context: the primal half is a
+        // known value and the tangent half is an unknown seeded as a leading residual-program input, in primal-input
+        // order.
+        let evaluation_context = PartialEvaluationContext::new(self.clone());
+        let differentiation_context = DifferentiationContext::new(evaluation_context.clone());
+        let input_duals = input_values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let tangent = evaluation_context.unknown_input(value.r#type().into_owned(), index);
+                let dual = DifferentiationDual::new(
+                    PartialTracer::new(evaluation_context.clone(), PartialEvaluationValue::known_input(value)),
+                    MaybeZero::Value(PartialTracer::new(evaluation_context.clone(), tangent)),
+                );
+                DifferentiationTracer::new(dual, differentiation_context.clone())
+            })
+            .collect::<Vec<_>>();
+        let input = Input::To::<LinearizationTracer<Self>>::from_parameters(input_structure, input_duals)?;
+        let output = function(input)?;
+
+        // Split each output dual into its known primal value and its tangent. Primal work depends only on the known
+        // primal inputs, so every primal half must have folded to a known value. Tangent halves that are structural
+        // zeros — or that folded to known values, which a map linear in `ẋ` produces only for its constant-zero
+        // components — are restored as staged zeros, so the pushforward program presents the canonical
+        // one-tangent-output-per-primal-output arity (matching `Program::linearize`'s restoration).
+        let output_structure = output.parameter_structure();
+        let output_duals = output.into_parameters().collect::<Vec<_>>();
+        let staged_zero = |r#type: <Self as Domain>::Type| {
+            let mut outputs = evaluation_context.residualize(ZeroOperation::new(r#type), &[])?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok::<_, ProgramError>(outputs.remove(0))
+        };
+        let mut primal_outputs = Vec::with_capacity(output_duals.len());
+        let mut tangent_outputs = Vec::with_capacity(output_duals.len());
+        for dual in output_duals {
+            let (primal, tangent) = dual.into_dual().into_parts();
+            let primal = match primal.into_value()?.value() {
+                PartialValue::Known(value) => value.clone(),
+                PartialValue::Unknown(_) => {
+                    return Err(ProgramError::MalformedProgram(
+                        "linearization produced an unknown primal output but primal work depends only on the known \
+                         primal inputs"
+                            .to_string(),
+                    ));
+                }
+            };
+            let tangent = match tangent {
+                MaybeZero::Value(tracer) => {
+                    let value = tracer.into_value()?;
+                    match value.value() {
+                        PartialValue::Unknown(_) => value,
+                        PartialValue::Known(known) => staged_zero(known.r#type().into_owned())?,
+                    }
+                }
+                MaybeZero::Zero(r#type) => staged_zero(r#type)?,
+            };
+            primal_outputs.push(primal);
+            tangent_outputs.push(tangent);
+        }
+        let output =
+            TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
+
+        // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be
+        // finalized.
+        drop(differentiation_context);
+        let evaluation = evaluation_context.into_evaluation(tangent_outputs)?;
+
+        // The pushforward program's inputs are the leading tangent unknowns followed by the residuals materialized
+        // during the trace; collect the residual values in input order.
+        let mut residuals = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
+        for (index, input) in evaluation.inputs.iter().enumerate() {
+            match input {
+                PartialEvaluationInput::Unknown(ordinal) if index < tangent_input_count && *ordinal == index => {}
+                PartialEvaluationInput::Known(value) if index >= tangent_input_count => residuals.push(value.clone()),
+                _ => {
+                    return Err(ProgramError::MalformedProgram(
+                        "linearization produced a pushforward program whose tangent inputs do not lead its residuals"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
 
         // Close the pushforward program over the linearization-point residuals behind the reusable callable.
-        let pushforward =
-            Pushforward { context: self.clone(), program, residuals, output_structure, marker: PhantomData };
+        let pushforward = Pushforward {
+            context: self.clone(),
+            program: evaluation.program,
+            residuals,
+            output_structure,
+            marker: PhantomData,
+        };
         Ok((output, pushforward))
     }
 
@@ -235,7 +328,8 @@ pub trait Differentiate: Context {
             >,
         TracedOutput: Parameterized<LinearizationTracer<Self>, Family: ParameterizedFamily<<Self as Domain>::Value>>,
     {
-        let (output, _, program, residuals) = linearize_on_duals::<_, _, Input, TracedOutput>(self, function, primals)?;
+        let (output, pushforward) = self.linearize(function, primals)?;
+        let (program, residuals) = pushforward.into_parts();
 
         // Transpose the pushforward program with respect to its leading tangent inputs, holding the trailing residual
         // inputs as known parameters. Partition-aware transposition threads each residual through to the pullback as
@@ -375,132 +469,6 @@ impl<C: Context> Differentiate for C {}
 /// Its primal half is a *known* partial-evaluation value carrying a concrete value under an eager `C` (so host
 /// control flow on primals works) and its tangent half is *unknown*, accumulating the pushforward program.
 pub type LinearizationTracer<C> = DifferentiationTracer<PartialEvaluationContext<C>>;
-
-/// Shared linearization core of [`Differentiate::linearize`] and [`Differentiate::vjp`]: runs `function` directly on
-/// [`DifferentiationTracer`] duals over a [`PartialEvaluationContext`] wrapping `context`, with each dual's primal
-/// half *known* at its primal value and its tangent half *unknown*, and returns the structured primal output, the
-/// closure's output structure, the pushforward program `(ẋ, r) ↦ ẏ` accumulated as the evaluation's residual
-/// program, and the linearization-point residuals `r` aligned with the program's trailing inputs.
-///
-/// This composes the two halves of the JAX architecture directly: the [`DifferentiationContext`] dual interpreter
-/// dispatches each operation's [`jvp`](DifferentiableOperation::jvp) rule, and the [`PartialEvaluationContext`]
-/// underneath decides eager-versus-staged per dual half — primal-side operations are all-known and fold through
-/// `context` itself (executing eagerly under an eager context, so host control flow can branch on primal values and
-/// the untaken branch is never traced, and staging into the enclosing trace under a staging one), while tangent-side
-/// operations residualize into the accumulating pushforward program. The tangent inputs are seeded before the trace,
-/// so they lead the pushforward program's inputs in primal-input order, followed by the residuals in
-/// first-materialization order.
-pub(crate) fn linearize_on_duals<C, F, Input, TracedOutput>(
-    context: &C,
-    function: F,
-    primals: Input,
-) -> Result<
-    (
-        TracedOutput::To<C::Value>,
-        TracedOutput::ParameterStructure,
-        Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        Vec<C::Value>,
-    ),
-    ProgramError,
->
-where
-    C: Context,
-    C::Operation: Clone
-        + PartiallyEvaluatableOperation<C>
-        + From<ZeroOperation<C::Type>>
-        + DifferentiableOperation<PartialEvaluationContext<C>>,
-    F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<TracedOutput, ProgramError>,
-    Input: Parameterized<C::Value, Family: ParameterizedFamily<LinearizationTracer<C>>>,
-    TracedOutput: Parameterized<LinearizationTracer<C>, Family: ParameterizedFamily<C::Value>>,
-{
-    if primals.parameters().next().is_none() {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
-    }
-    let input_structure = primals.parameter_structure();
-    let input_values = primals.into_parameters().collect::<Vec<_>>();
-    let tangent_input_count = input_values.len();
-
-    // Wrap each primal as a dual over a partial-evaluation context wrapping this context: the primal half is a known
-    // value and the tangent half is an unknown seeded as a leading residual-program input, in primal-input order.
-    let context = PartialEvaluationContext::new(context.clone());
-    let differentiation = DifferentiationContext::new(context.clone());
-    let input_duals = input_values
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let tangent = context.unknown_input(value.r#type().into_owned(), index);
-            let dual = DifferentiationDual::new(
-                PartialTracer::new(context.clone(), PartialEvaluationValue::known_input(value)),
-                MaybeZero::Value(PartialTracer::new(context.clone(), tangent)),
-            );
-            DifferentiationTracer::new(dual, differentiation.clone())
-        })
-        .collect::<Vec<_>>();
-    let input = Input::To::<LinearizationTracer<C>>::from_parameters(input_structure, input_duals)?;
-    let output = function(input)?;
-
-    // Split each output dual into its known primal value and its tangent. Primal work depends only on the known
-    // primal inputs, so every primal half must have folded to a known value. Tangent halves that are structural zeros
-    // — or that folded to known values, which a map linear in `ẋ` produces only for its constant-zero components —
-    // are restored as staged zeros, so the pushforward program presents the canonical
-    // one-tangent-output-per-primal-output arity (matching `Program::linearize`'s restoration).
-    let output_structure = output.parameter_structure();
-    let output_duals = output.into_parameters().collect::<Vec<_>>();
-    let staged_zero = |r#type: C::Type| -> Result<PartialEvaluationValue<C::Value>, ProgramError> {
-        let mut outputs = context.residualize(ZeroOperation::new(r#type), &[])?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    };
-    let mut primal_outputs = Vec::with_capacity(output_duals.len());
-    let mut tangent_outputs = Vec::with_capacity(output_duals.len());
-    for dual in output_duals {
-        let (primal, tangent) = dual.into_dual().into_parts();
-        let primal = match primal.into_value()?.value() {
-            PartialValue::Known(value) => value.clone(),
-            PartialValue::Unknown(_) => {
-                return Err(ProgramError::MalformedProgram(
-                    "linearization produced an unknown primal output but primal work depends only on the known \
-                     primal inputs"
-                        .to_string(),
-                ));
-            }
-        };
-        let tangent = match tangent {
-            MaybeZero::Value(tracer) => {
-                let value = tracer.into_value()?;
-                match value.value() {
-                    PartialValue::Unknown(_) => value,
-                    PartialValue::Known(known) => staged_zero(known.r#type().into_owned())?,
-                }
-            }
-            MaybeZero::Zero(r#type) => staged_zero(r#type)?,
-        };
-        primal_outputs.push(primal);
-        tangent_outputs.push(tangent);
-    }
-    let output = TracedOutput::To::<C::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
-
-    // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
-    drop(differentiation);
-    let evaluation = context.into_evaluation(tangent_outputs)?;
-
-    // The pushforward program's inputs are the leading tangent unknowns followed by the residuals materialized
-    // during the trace; collect the residual values in input order.
-    let mut residuals = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
-    for (index, input) in evaluation.inputs.iter().enumerate() {
-        match input {
-            PartialEvaluationInput::Unknown(ordinal) if index < tangent_input_count && *ordinal == index => {}
-            PartialEvaluationInput::Known(value) if index >= tangent_input_count => residuals.push(value.clone()),
-            _ => {
-                return Err(ProgramError::MalformedProgram(
-                    "linearization produced a pushforward program whose tangent inputs do not lead its residuals"
-                        .to_string(),
-                ));
-            }
-        }
-    }
-    Ok((output, output_structure, evaluation.program, residuals))
-}
 
 /// A dual value flowing through a forward-mode [`DifferentiationContext`]: a [`DifferentiationDual`] paired with the context it
 /// flows through.
@@ -1278,6 +1246,42 @@ where
     TracedOutput: Parameterized<<C as Domain>::Value>,
     TracedOutput::Family: ParameterizedFamily<<C as Domain>::Value>,
 {
+    /// Returns the pushforward program `(ẋ, r) ↦ ẏ` this callable closes over. Its inputs are the flat tangents
+    /// followed by the residuals carried by [`residuals`](Self::residuals).
+    pub fn program(
+        &self,
+    ) -> &Program<
+        <C as Domain>::Constant,
+        <C as Domain>::Operation,
+        Vec<<C as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
+    > {
+        &self.program
+    }
+
+    /// Returns the linearization-point residuals `r` this callable closes over, aligned with the trailing inputs of
+    /// [`program`](Self::program).
+    pub fn residuals(&self) -> &[<C as Domain>::Value] {
+        &self.residuals
+    }
+
+    /// Consumes this [`Pushforward`] and returns its open parts: the pushforward program `(ẋ, r) ↦ ẏ` and the
+    /// linearization-point residuals `r` its trailing inputs consume, in that order. This is how reverse mode opens
+    /// the closure back up: [`Differentiate::vjp`] linearizes, takes the parts, and transposes the program.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Program<
+            <C as Domain>::Constant,
+            <C as Domain>::Operation,
+            Vec<<C as Domain>::Constant>,
+            Vec<<C as Domain>::Constant>,
+        >,
+        Vec<<C as Domain>::Value>,
+    ) {
+        (self.program, self.residuals)
+    }
+
     /// Pushes the structured tangents `tangents` through the linearized Jacobian, returning the tangent outputs.
     ///
     /// The tangents are flattened, the linearization-point residuals are appended, the pushforward program is
@@ -1353,6 +1357,42 @@ where
     Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     TracedOutput: Parameterized<<C as Domain>::Value>,
 {
+    /// Returns the pullback program `(ȳ, r) ↦ x̄` this callable closes over. Its inputs are the flat output
+    /// cotangents followed by the residuals carried by [`residuals`](Self::residuals).
+    pub fn program(
+        &self,
+    ) -> &Program<
+        <C as Domain>::Constant,
+        <C as Domain>::Operation,
+        Vec<<C as Domain>::Constant>,
+        Vec<<C as Domain>::Constant>,
+    > {
+        &self.program
+    }
+
+    /// Returns the linearization-point residuals `r` this callable closes over, aligned with the trailing inputs of
+    /// [`program`](Self::program).
+    pub fn residuals(&self) -> &[<C as Domain>::Value] {
+        &self.residuals
+    }
+
+    /// Consumes this [`Pullback`] and returns its open parts: the pullback program `(ȳ, r) ↦ x̄` and the
+    /// linearization-point residuals `r` its trailing inputs consume, in that order — the raw form that
+    /// [`Differentiate::vjp`] returns directly, mirroring [`Pushforward::into_parts`].
+    pub fn into_parts(
+        self,
+    ) -> (
+        Program<
+            <C as Domain>::Constant,
+            <C as Domain>::Operation,
+            Vec<<C as Domain>::Constant>,
+            Vec<<C as Domain>::Constant>,
+        >,
+        Vec<<C as Domain>::Value>,
+    ) {
+        (self.program, self.residuals)
+    }
+
     /// Pulls the structured output cotangents `cotangents` back to the closure's input cotangents.
     ///
     /// The cotangents are flattened, the linearization-point residuals are appended, the pullback program is
@@ -1402,7 +1442,7 @@ mod tests {
         assert_scalar_close(value, 9.0);
         assert_scalar_close(gradient, 6.0);
 
-        let (output, pushforward) = domain.linearize(function, Scalar::from(3.0)).unwrap();
+        let (output, pushforward) = domain.linearize(|x| Ok(function(x)), Scalar::from(3.0)).unwrap();
         assert_scalar_close(output, 9.0);
         let program = pushforward.program.to_string();
         assert!(program.contains("mul"), "{program}");

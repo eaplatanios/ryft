@@ -19,7 +19,6 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
-use crate::tracing_v2::differentiation::linearize_on_duals;
 use crate::tracing_v2::{Differentiate, LinearizationTracer};
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
@@ -144,14 +143,14 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
         let primals = Input::from_parameters(input_structure.clone(), input_parameters.iter().cloned())?;
 
-        // Dual-driven forward-mode Jacobian: run the closure once on differentiation duals over a
-        // partial-evaluation context wrapping this context (the same core as `Differentiate::linearize`), which
-        // executes the primal work through this context — recovering the structured primal output and the
-        // linearization-point residuals — while accumulating the linear pushforward program.
-        // `from_pushforward_program` then replays every input-coordinate basis tangent through that program in one
-        // batched pass — broadcasting the residuals as replicated values — preserving the exact Jacobian layout.
-        let (output, _, program, residuals) =
-            linearize_on_duals::<Self, F, Input, TracedOutput>(self, function, primals)?;
+        // Dual-driven forward-mode Jacobian: `Differentiate::linearize` runs the closure once on differentiation
+        // duals over a partial-evaluation context wrapping this context, which executes the primal work through this
+        // context — recovering the structured primal output and the linearization-point residuals — while
+        // accumulating the linear pushforward program. `from_pushforward_program` then replays every
+        // input-coordinate basis tangent through that program in one batched pass — broadcasting the residuals as
+        // replicated values — preserving the exact Jacobian layout.
+        let (output, pushforward) = self.linearize(function, primals)?;
+        let (program, residuals) = pushforward.into_parts();
         Differential::from_pushforward_program::<Self, Input, TracedOutput::To<DomainValue<Self>>, DomainValue<Self>>(
             self,
             input_structure,
