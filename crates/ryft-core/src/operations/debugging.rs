@@ -237,13 +237,13 @@ mod tests {
         .unwrap();
         let linearization = program.to_flat_program().linearize().unwrap();
         let primal_prints = linearization
-            .primal_program
+            .primal()
             .instructions()
             .iter()
             .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Print(_)))
             .count();
         let tangent_prints = linearization
-            .tangent_program
+            .tangent()
             .instructions()
             .iter()
             .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Print(_)))

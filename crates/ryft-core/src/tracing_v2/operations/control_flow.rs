@@ -27,7 +27,6 @@ use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
 use crate::operations::control_flow::MaybeWhile;
-use crate::tracing_v2::differentiation::Linearization;
 use crate::tracing_v2::operations::custom_derivatives::CustomVjpResidual;
 use crate::tracing_v2::operations::reduce::{Reduce, ReduceOperation, ReductionKind};
 use crate::tracing_v2::unroll::unroll_concretizable_whiles;
@@ -534,8 +533,8 @@ where
         // Linearize the body capture-free. The primal body produces `[next_state..., residuals...]` and the
         // tangent body consumes `[state_tangent..., residuals...]`; the residual count is the number of trailing
         // outputs of the primal body beyond the loop state.
-        let Linearization { primal_program, tangent_program, residual_count, .. } =
-            C::Operation::linearize_program(operation.body())?;
+        let (primal_program, tangent_program, residual_count) =
+            C::Operation::linearize_program(operation.body())?.into_parts();
         let residual_types = primal_program.output_types().split_off(state_count);
 
         // Build and bind the augmented primal while over `[state..., counter, residual_stacks..., mask_stack]`, with

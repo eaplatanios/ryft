@@ -360,7 +360,7 @@ pub trait Differentiate: Context {
         // Replay the primal side to recover the primal outputs followed by the residuals at the linearization point.
         // Under tracing these are enclosing-trace values, so they are returned for the caller to append to the output
         // cotangents.
-        let primal_side = linearization.primal_program.interpret_in_context(self, input_values)?;
+        let primal_side = linearization.primal.interpret_in_context(self, input_values)?;
         let primal_output_count = primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "primal program produced {} outputs which is fewer than its {} residuals",
@@ -375,7 +375,7 @@ pub trait Differentiate: Context {
         // through `Program::interpret_in_context` lifts its literal constants through the consuming context's `lift`
         // at replay time, so reverse-mode-under-tracing consumers splice it into the enclosing trace without any
         // eager per-atom conversion here.
-        let pullback = linearization.pullback_program()?;
+        let pullback = linearization.pullback()?;
         let output = TracedOutput::To::<<Self as Domain>::Value>::from_parameters(output_structure, primal_outputs)?;
         Ok((output, pullback, residuals))
     }
@@ -903,68 +903,97 @@ where
     }
 }
 
-/// Result of [`Program::linearize`](crate::Program::linearize): the partially evaluated known (primal) and unknown
-/// (tangent) sub-programs together with the metadata needed to reassemble and transpose them.
+/// Result of [`Program::linearize`]: the linearization of a program computing `y = f(x)`,
+/// split into a nonlinear primal sub-program and a linear tangent sub-program that communicate through a residual
+/// environment.
 ///
-/// This is the domain-free, interpretation-free core shared by every linearization entry point: it carries only
-/// the two split sub-programs and the structural metadata that relates them, leaving the concrete primal outputs to be
-/// recovered by callers that interpret [`primal_program`](Self::primal_program) under a value semantics of their
-/// choice.
+/// Linearization splits the program's fused jvp program `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ)` by known-ness into:
 ///
-/// Its tangent sub-program is expressed in the primal operation family `O` with inputs `(tangents ++ residuals)`, which
-/// is why [`pullback_program`](Self::pullback_program) can transpose it directly through
-/// [`Program::transpose_with_respect_to`](crate::Program::transpose_with_respect_to) without re-keying it into a linear
-/// operation family.
+///   - the [`primal`](Self::primal) sub-program `x ↦ (y, r)`, computing the primal outputs `y = f(x)` together with
+///     the residuals `r` — the intermediate values of the derivative computation that depend only on `x` (e.g.,
+///     `cos(x)` when `f` is `sin`); and
+///   - the [`tangent`](Self::tangent) sub-program `(ẋ, r) ↦ ẏ`, computing the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
+///     It is linear in `ẋ`, with the linearization point `x` entering only through the residuals `r`.
+///
+/// This is the domain-free, interpretation-free core shared by every linearization entry point: it carries only the
+/// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
+/// callers that interpret [`primal`](Self::primal) under a value semantics of their choice. The tangent sub-program
+/// stays in the primal operation family `O` with the residuals as ordinary trailing inputs, which is why
+/// [`pullback`](Self::pullback) can transpose it directly through
+/// [`Program::transpose_with_respect_to`] without re-keying it into a
+/// linear operation family.
 ///
 /// The value type `V` and operation family `O` match the primal program being linearized.
 pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
-    /// Known sub-program. It takes the primal inputs and produces the primal outputs followed by the residuals; its
-    /// trailing [`residual_count`](Self::residual_count) outputs are the residual environment consumed by the tangent
-    /// sub-program.
-    pub primal_program: Program<V, O, Vec<V>, Vec<V>>,
+    /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs
+    /// `y = f(x)` followed by the residuals `r`, its trailing [`residual_count`](Self::residual_count) outputs, which
+    /// form the residual environment consumed by the tangent sub-program.
+    primal: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Unknown sub-program. It takes the tangent inputs followed by the residuals and produces the tangent outputs.
-    pub tangent_program: Program<V, O, Vec<V>, Vec<V>>,
+    /// Linear tangent sub-program `(ẋ, r) ↦ ẏ`. It takes the tangent inputs `ẋ` followed by the residuals `r` and
+    /// produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
+    tangent: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// For each original function output, `true` if it is produced by the tangent sub-program and `false` if by the
-    /// primal sub-program. Used to reassemble the combined program's outputs from the two sides.
-    pub output_unknowns: Vec<bool>,
-
-    /// Number of residuals threaded from the primal sub-program into the tangent sub-program — the count of trailing
-    /// outputs of [`primal_program`](Self::primal_program) and trailing inputs of
-    /// [`tangent_program`](Self::tangent_program).
-    pub residual_count: usize,
+    /// Number of residuals `r` threaded from the primal sub-program into the tangent sub-program — the count of the
+    /// trailing outputs of [`primal`](Self::primal) and of the trailing inputs of [`tangent`](Self::tangent).
+    residual_count: usize,
 }
 
 impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
-    /// Transposes this [`Linearization`]'s [`tangent_program`](Self::tangent_program) into the reverse-mode pullback
-    /// program directly, without re-keying it into a linear operation enum. It is the derived third member of this
-    /// [`Linearization`]'s program family, alongside the stored [`primal_program`](Self::primal_program) and
-    /// [`tangent_program`](Self::tangent_program).
+    /// Returns the nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal
+    /// outputs `y = f(x)` followed by the residuals `r` — the intermediate values of the derivative computation that
+    /// depend only on `x` — whose trailing [`residual_count`](Self::residual_count) outputs form the residual
+    /// environment consumed by the [`tangent`](Self::tangent) sub-program.
+    pub fn primal(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
+        &self.primal
+    }
+
+    /// Returns the linear tangent sub-program `(ẋ, r) ↦ ẏ`. It takes the tangent inputs `ẋ` followed by the
+    /// residuals `r` and produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`. The sub-program is linear in `ẋ`, with
+    /// the linearization point `x` entering only through the residuals `r`.
+    pub fn tangent(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
+        &self.tangent
+    }
+
+    /// Returns the number of residuals `r` threaded from the primal sub-program into the tangent sub-program — the
+    /// count of the trailing outputs of [`primal`](Self::primal) and of the trailing inputs of
+    /// [`tangent`](Self::tangent).
+    pub fn residual_count(&self) -> usize {
+        self.residual_count
+    }
+
+    /// Consumes this [`Linearization`] and returns its [`primal`](Self::primal) sub-program,
+    /// [`tangent`](Self::tangent) sub-program, and [`residual_count`](Self::residual_count), in that order.
+    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, usize) {
+        (self.primal, self.tangent, self.residual_count)
+    }
+
+    /// Builds the reverse-mode pullback program `(ȳ, r) ↦ x̄` by transposing the [`tangent`](Self::tangent)
+    /// sub-program: it takes the output cotangents `ȳ` followed by the residuals `r` and produces the input
+    /// cotangents `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this [`Linearization`]'s program family,
+    /// alongside the stored [`primal`](Self::primal) and [`tangent`](Self::tangent) sub-programs.
     ///
     /// Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured factor (for
     /// example, folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding the
     /// consuming residual value, this function leaves the tangent sub-program in the primal operation family `O` and
     /// transposes it through
-    /// [`Program::transpose_with_respect_to`](crate::Program::transpose_with_respect_to). The tangent sub-program's
-    /// inputs are `[tangents..., residuals...]`, so the partition mask marks the leading `tangent_input_count` inputs
-    /// linear and the trailing [`residual_count`](Self::residual_count) inputs known. Partition-aware transposition
-    /// then threads each known residual through to the pullback as a pullback input (consumed by the adjoint operation
-    /// that the bilinear operation's transpose rule stages), rather than folding it into a captured factor. The
-    /// returned pullback program is therefore over the primal operation family `O` and maps
-    /// `(output_cotangents ++ residuals)` to the cotangents of the linear tangent inputs only.
-    pub fn pullback_program(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+    /// [`Program::transpose_with_respect_to`]. The tangent sub-program's
+    /// inputs are `(ẋ, r)`, so it is transposed with respect to the leading tangent inputs `ẋ` while the trailing
+    /// [`residual_count`](Self::residual_count) residual inputs are held as known parameters. Partition-aware
+    /// transposition then threads each known residual through to the pullback as a pullback input (consumed by the
+    /// adjoint operation that the bilinear operation's transpose rule stages), rather than folding it into a captured
+    /// factor, so the returned pullback program stays over the primal operation family `O` and produces the
+    /// cotangents of the linear tangent inputs only.
+    pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
     where
         V::Type: DifferentiableType,
         O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
     {
-        let tangent_program = &self.tangent_program;
-        let residual_count = self.residual_count;
-        let tangent_input_count = tangent_program.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
+        let tangent_input_count = self.tangent.input_ids().len().checked_sub(self.residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "tangent program has {} inputs which is fewer than its {} residuals",
-                tangent_program.input_ids().len(),
-                residual_count,
+                self.tangent.input_ids().len(),
+                self.residual_count,
             ))
         })?;
 
@@ -972,7 +1001,7 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are not
         // folded into captured factors here.
         let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
-        tangent_program.transpose_with_respect_to(with_respect_to.as_slice())
+        self.tangent.transpose_with_respect_to(with_respect_to.as_slice())
     }
 }
 
@@ -1151,13 +1180,7 @@ where
         }
         tangent_program.output_structure = vec![Placeholder; tangent_program.output_ids.len()];
 
-        Ok(Linearization {
-            primal_program: known_program,
-            tangent_program,
-            // Every consumer sees canonical arity: the primal half is known and the tangent half is unknown.
-            output_unknowns: [vec![false; primal_output_count], vec![true; primal_output_count]].concat(),
-            residual_count,
-        })
+        Ok(Linearization { primal: known_program, tangent: tangent_program, residual_count })
     }
 }
 

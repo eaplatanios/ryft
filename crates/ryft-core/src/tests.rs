@@ -1574,28 +1574,16 @@ mod linearization_tests {
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
         // primal outputs that the linearization core no longer caches.
-        let mut known_outputs = linearization.primal_program.interpret_in_context(&context, primals).unwrap();
-        let residuals = known_outputs.split_off(known_outputs.len() - linearization.residual_count);
+        let mut known_outputs = linearization.primal().interpret_in_context(&context, primals).unwrap();
+        let residuals = known_outputs.split_off(known_outputs.len() - linearization.residual_count());
         assert_close(&known_outputs, &reference_primals, "forward primal");
 
-        // The unknown side is the linear tangent map, taking the tangents followed by the residuals.
+        // The unknown side is the linear tangent map, taking the tangents followed by the residuals. Canonical arity
+        // places all tangent outputs on the unknown side in original order, so they are compared directly.
         let mut tangent_inputs = tangents;
         tangent_inputs.extend(residuals);
-        let unknown_outputs = linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
-
-        // Reassemble the program's outputs from the two sides by `output_unknowns`. The program produces
-        // the primal outputs followed by the tangent outputs, so the reassembled vector splits into a primal and a
-        // tangent half.
-        let mut known_iterator = known_outputs.into_iter();
-        let mut unknown_iterator = unknown_outputs.into_iter();
-        let reassembled = linearization
-            .output_unknowns
-            .iter()
-            .map(|&unknown| if unknown { unknown_iterator.next() } else { known_iterator.next() }.unwrap())
-            .collect::<Vec<_>>();
-        let (reassembled_primals, reassembled_tangents) = reassembled.split_at(reference_primals.len());
-        assert_close(reassembled_primals, &reference_primals, "forward primal (reassembled)");
-        assert_close(reassembled_tangents, &reference_tangents, "forward tangent");
+        let unknown_outputs = linearization.tangent().interpret_in_context(&context, tangent_inputs).unwrap();
+        assert_close(&unknown_outputs, &reference_tangents, "forward tangent");
     }
 
     /// Runs the raw fused-JVP program pipeline — trace, eager `while` unroll, fused JVP program build,
@@ -1641,11 +1629,11 @@ mod linearization_tests {
         let (_, program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
         let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let linearization = program.linearize()?;
-        let primal_side = linearization.primal_program.interpret_in_context(domain, primals)?;
-        let primal_output_count = primal_side.len() - linearization.residual_count;
+        let primal_side = linearization.primal().interpret_in_context(domain, primals)?;
+        let primal_output_count = primal_side.len() - linearization.residual_count();
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
-        let pullback = linearization.pullback_program()?;
+        let pullback = linearization.pullback()?;
         Ok((primal_outputs, pullback, residuals))
     }
 
@@ -2010,13 +1998,21 @@ mod linearization_tests {
         let linearization = primal_program.linearize().unwrap();
 
         // Structural asserts: the function uses both inputs primally (so `sin(x)` threads at least one residual) and
-        // only the second output direction is a tangent. The pruned `dy` slot is restored, so the tangent program
-        // presents both tangent inputs (`dx`, the restored `dy`) ahead of its residuals — `2 + residual_count`.
-        assert!(linearization.residual_count > 0, "the chosen function must produce a non-empty residual environment");
-        assert_eq!(linearization.output_unknowns, vec![false, true], "output classification");
+        // the primal sub-program produces the single primal output followed by those residuals. The pruned `dy` slot
+        // is restored, so the tangent program presents both tangent inputs (`dx`, the restored `dy`) ahead of its
+        // residuals — `2 + residual_count`.
+        assert!(
+            linearization.residual_count() > 0,
+            "the chosen function must produce a non-empty residual environment"
+        );
         assert_eq!(
-            linearization.tangent_program.input_ids().len(),
-            2 + linearization.residual_count,
+            linearization.primal().output_ids().len(),
+            1 + linearization.residual_count(),
+            "primal program output count",
+        );
+        assert_eq!(
+            linearization.tangent().input_ids().len(),
+            2 + linearization.residual_count(),
             "tangent program input count (restored dy slot)",
         );
 
@@ -2026,14 +2022,14 @@ mod linearization_tests {
         // both tangent inputs even though `stop_gradient` blocks `y`'s tangent and `dy` feeds nothing.
         let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let primal_outputs = linearization
-            .primal_program
+            .primal()
             .interpret_in_context(&context, vec![Scalar::from(0.7), Scalar::from(1.3)])
             .unwrap();
-        let residuals = primal_outputs[primal_outputs.len() - linearization.residual_count..].to_vec();
+        let residuals = primal_outputs[primal_outputs.len() - linearization.residual_count()..].to_vec();
 
         let mut tangent_inputs = vec![Scalar::from(1.0), Scalar::from(1.0)];
         tangent_inputs.extend(residuals);
-        let tangent_outputs = linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
+        let tangent_outputs = linearization.tangent().interpret_in_context(&context, tangent_inputs).unwrap();
         assert_close(&tangent_outputs, &[Scalar::from(0.7_f64.cos())], "restored-input tangent program");
     }
 
@@ -2895,12 +2891,12 @@ mod linearization_tests {
         let (_, primal_program) = NestedTracingContext::trace(domain.clone(), function, input_types).unwrap();
         let primal_program = primal_program.into_simplified().unwrap();
         let linearization = primal_program.linearize().unwrap();
-        let mut reference_known = linearization.primal_program.interpret_in_context(&context, primals.clone()).unwrap();
-        let reference_residuals = reference_known.split_off(reference_known.len() - linearization.residual_count);
+        let mut reference_known = linearization.primal().interpret_in_context(&context, primals.clone()).unwrap();
+        let reference_residuals = reference_known.split_off(reference_known.len() - linearization.residual_count());
         let mut reference_tangent_inputs = tangents.clone();
         reference_tangent_inputs.extend(reference_residuals);
         let reference_tangents =
-            linearization.tangent_program.interpret_in_context(&context, reference_tangent_inputs).unwrap();
+            linearization.tangent().interpret_in_context(&context, reference_tangent_inputs).unwrap();
 
         // Generic trace: partially evaluate the same fused JVP program with `C` = a fresh staging context, primals
         // seeded `Known(C.input(..))` and tangents `Unknown(type)`.
@@ -2916,7 +2912,7 @@ mod linearization_tests {
         }
         let evaluation = jvp_program.partially_evaluate_in_context(&outer, knowledge.as_slice()).unwrap();
 
-        // The outer program plays `Linearization::primal_program`'s role: its outputs are the folded primal outputs
+        // The outer program plays `Linearization::primal`'s role: its outputs are the folded primal outputs
         // followed by the known feeders (the residual edges), in feeder order.
         let (primal_outputs, tangent_outputs) = evaluation.outputs.split_at(evaluation.outputs.len() / 2);
         let mut outer_output_atoms = Vec::new();
@@ -2950,7 +2946,7 @@ mod linearization_tests {
         let residual_values = known_values.split_off(known_values.len() - residual_edge_count);
         assert_close(&known_values, &reference_known, "staging-trace primal outputs");
 
-        // The residual program plays `Linearization::tangent_program`'s role: interpret it at the tangents plus the
+        // The residual program plays `Linearization::tangent`'s role: interpret it at the tangents plus the
         // residual-edge values, in feeder order, and reassemble the tangent outputs.
         let mut remaining_tangents = tangents.into_iter();
         let mut remaining_residuals = residual_values.into_iter();
@@ -2982,7 +2978,7 @@ mod array_linearization_tests {
     /// [`Program::linearize`](crate::Program::linearize) core, which builds the capture-free JVP program over the array
     /// slice and partially evaluates it. The returned [`Linearization`] carries the known primal sub-program, the unknown
     /// linear tangent sub-program, and the metadata needed to reassemble their outputs and transpose the tangent side; the
-    /// concrete primal outputs are recovered by interpreting [`primal_program`](Linearization::primal_program).
+    /// concrete primal outputs are recovered by interpreting [`primal`](Linearization::primal).
     ///
     /// This entry point is specialized to [`EagerContext<TestArray, ArrayOperation<TestArray>>`] and to straight-line array functions over the supported
     /// slice, mirroring the array partial-evaluation driver whose array linearization-context obligations also do not
@@ -3075,28 +3071,16 @@ mod array_linearization_tests {
 
         // The known side computes the primal outputs followed by the residuals; interpreting it recovers the concrete
         // primal outputs that the linearization core no longer caches.
-        let mut known_outputs = linearization.primal_program.interpret_in_context(&context, primals).unwrap();
-        let residuals = known_outputs.split_off(known_outputs.len() - linearization.residual_count);
+        let mut known_outputs = linearization.primal().interpret_in_context(&context, primals).unwrap();
+        let residuals = known_outputs.split_off(known_outputs.len() - linearization.residual_count());
         assert_arrays_close(&known_outputs, &reference_primals, "forward primal");
 
-        // The unknown side is the linear tangent map, taking the tangents followed by the residuals.
+        // The unknown side is the linear tangent map, taking the tangents followed by the residuals. Canonical arity
+        // places all tangent outputs on the unknown side in original order, so they are compared directly.
         let mut tangent_inputs = tangents;
         tangent_inputs.extend(residuals);
-        let unknown_outputs = linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
-
-        // Reassemble the program's outputs from the two sides by `output_unknowns`. The program produces
-        // the primal outputs followed by the tangent outputs, so the reassembled vector splits into a primal and a
-        // tangent half.
-        let mut known_iterator = known_outputs.into_iter();
-        let mut unknown_iterator = unknown_outputs.into_iter();
-        let reassembled = linearization
-            .output_unknowns
-            .iter()
-            .map(|&unknown| if unknown { unknown_iterator.next() } else { known_iterator.next() }.unwrap())
-            .collect::<Vec<_>>();
-        let (reassembled_primals, reassembled_tangents) = reassembled.split_at(reference_primals.len());
-        assert_arrays_close(reassembled_primals, &reference_primals, "forward primal (reassembled)");
-        assert_arrays_close(reassembled_tangents, &reference_tangents, "forward tangent");
+        let unknown_outputs = linearization.tangent().interpret_in_context(&context, tangent_inputs).unwrap();
+        assert_arrays_close(&unknown_outputs, &reference_tangents, "forward tangent");
     }
 
     /// Asserts reverse equivalence for array functions: transposing the tangent sub-program yields the same input
@@ -3169,11 +3153,11 @@ mod array_linearization_tests {
         let (_, program) = NestedTracingContext::trace(domain.clone(), function, input_types)?;
         let program = unroll_concretizable_whiles(domain, program.into_simplified()?, primals.clone())?;
         let linearization = program.linearize()?;
-        let primal_side = linearization.primal_program.interpret_in_context(domain, primals)?;
-        let primal_output_count = primal_side.len() - linearization.residual_count;
+        let primal_side = linearization.primal().interpret_in_context(domain, primals)?;
+        let primal_output_count = primal_side.len() - linearization.residual_count();
         let residuals = primal_side[primal_output_count..].to_vec();
         let primal_outputs = primal_side[..primal_output_count].to_vec();
-        let pullback = linearization.pullback_program()?;
+        let pullback = linearization.pullback()?;
         Ok((primal_outputs, pullback, residuals))
     }
 
@@ -4473,8 +4457,8 @@ mod array_linearization_tests {
         let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
 
         // The known side computes the primal outputs followed by the residuals; its primal half is [8, 10, 9].
-        let mut known_outputs = linearization.primal_program.interpret_in_context(&context, primals).unwrap();
-        let residuals = known_outputs.split_off(known_outputs.len() - linearization.residual_count);
+        let mut known_outputs = linearization.primal().interpret_in_context(&context, primals).unwrap();
+        let residuals = known_outputs.split_off(known_outputs.len() - linearization.residual_count());
         assert_eq!(known_outputs.len(), 1, "expected one primal output");
         assert_close(&known_outputs[0].values, &[8.0, 10.0, 9.0], "masked-while primal");
 
@@ -4482,7 +4466,7 @@ mod array_linearization_tests {
         // per-item doubling scales [8, 2, 1].
         let mut tangent_inputs = tangents;
         tangent_inputs.extend(residuals);
-        let tangent_outputs = linearization.tangent_program.interpret_in_context(&context, tangent_inputs).unwrap();
+        let tangent_outputs = linearization.tangent().interpret_in_context(&context, tangent_inputs).unwrap();
         assert_eq!(tangent_outputs.len(), 1, "expected one tangent output");
         assert_close(&tangent_outputs[0].values, &[8.0, 2.0, 1.0], "masked-while tangent");
 

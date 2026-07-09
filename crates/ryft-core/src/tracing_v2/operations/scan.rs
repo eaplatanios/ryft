@@ -767,7 +767,7 @@ mod tests {
 
         // Linearizing the same program is what materializes residual stacks, as known-scan edges.
         let linearization = program.linearize().unwrap();
-        assert!(linearization.residual_count >= 1);
+        assert!(linearization.residual_count() >= 1);
     }
 
     #[test]

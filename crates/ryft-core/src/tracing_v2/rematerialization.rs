@@ -1329,9 +1329,9 @@ where
         // sub-program is the linear tangent map over `[input_tangents..., residuals...]`. The three derived programs
         // below all replay these two sub-programs, so the residual order is fixed once here and shared across them.
         let linearization = primal.linearize()?;
-        let residual_count = linearization.residual_count;
-        let residual_atoms = linearization.primal_program.output_ids()[output_count..].to_vec();
-        let residual_types = linearization.primal_program.output_types().split_off(output_count);
+        let residual_count = linearization.residual_count();
+        let residual_atoms = linearization.primal().output_ids()[output_count..].to_vec();
+        let residual_types = linearization.primal().output_types().split_off(output_count);
 
         // Classify each residual from the producing-operation provenance recovered from the primal sub-program (the
         // operation that defines the residual atom), recording which residual indices the policy saves. Residuals
@@ -1341,7 +1341,7 @@ where
         let saved_indices = (0..residual_count)
             .filter(|&index| {
                 RematerializationCandidate::from_program_residual(
-                    &linearization.primal_program,
+                    linearization.primal(),
                     residual_atoms[index],
                     residual_types[index].clone(),
                 )
@@ -1359,13 +1359,13 @@ where
             |xs: Vec<DomainTracer<D>>| {
                 let context = xs.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context();
                 let context = context.clone();
-                let mut primal_side = linearization.primal_program.interpret_in_context(&context, xs.clone())?;
+                let mut primal_side = linearization.primal().interpret_in_context(&context, xs.clone())?;
                 let residuals = primal_side.split_off(output_count);
                 let mut outputs = primal_side;
                 outputs.extend(xs.iter().cloned());
                 for (slot, &index) in saved_indices.iter().enumerate() {
                     let candidate = RematerializationCandidate::from_program_residual(
-                        &linearization.primal_program,
+                        linearization.primal(),
                         residual_atoms[index],
                         residual_types[index].clone(),
                     )
@@ -1396,7 +1396,7 @@ where
         // its pullback consumes `[output_cotangents..., residuals...]` and produces one cotangent per region input.
         let backward_input_types =
             input_types.iter().chain(saved_types.iter()).chain(output_types.iter()).cloned().collect::<Vec<_>>();
-        let pullback = linearization.pullback_program()?;
+        let pullback = linearization.pullback()?;
         let (_, backward) = D::trace(
             |flat: Vec<DomainTracer<D>>| {
                 let context = flat.first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?.context();
@@ -1404,7 +1404,7 @@ where
                 let primal_tracers = flat[..input_count].to_vec();
                 let saved_tracers = &flat[input_count..input_count + saved_count];
                 let cotangent_tracers = flat[input_count + saved_count..].to_vec();
-                let mut primal_side = linearization.primal_program.interpret_in_context(&context, primal_tracers)?;
+                let mut primal_side = linearization.primal().interpret_in_context(&context, primal_tracers)?;
                 let mut residuals = primal_side.split_off(output_count);
                 for (slot, &index) in saved_indices.iter().enumerate() {
                     residuals[index] = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[index])?;
@@ -1430,14 +1430,14 @@ where
                 let primal_tracers = flat[..input_count].to_vec();
                 let saved_tracers = &flat[input_count..input_count + saved_count];
                 let tangent_tracers = flat[input_count + saved_count..].to_vec();
-                let mut primal_side = linearization.primal_program.interpret_in_context(&context, primal_tracers)?;
+                let mut primal_side = linearization.primal().interpret_in_context(&context, primal_tracers)?;
                 let mut residuals = primal_side.split_off(output_count);
                 for (slot, &index) in saved_indices.iter().enumerate() {
                     residuals[index] = self.policy.restore_saved(saved_tracers[slot].clone(), &residuals[index])?;
                 }
                 let mut tangent_inputs = tangent_tracers;
                 tangent_inputs.extend(residuals);
-                linearization.tangent_program.interpret_in_context(&context, tangent_inputs)
+                linearization.tangent().interpret_in_context(&context, tangent_inputs)
             },
             tangent_input_types,
         )?;

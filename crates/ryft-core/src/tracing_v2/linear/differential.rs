@@ -167,12 +167,12 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // shapes and structure. The replay goes through this context itself — lifting the sub-program's staged
         // constants into value space and binding each instruction — so an eager backend domain executes it with its
         // own value semantics rather than through a fresh constant-only `EagerContext`.
-        let mut primal_side = linearization.primal_program.interpret_in_context(self, input_values)?;
-        let primal_output_count = primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
+        let mut primal_side = linearization.primal().interpret_in_context(self, input_values)?;
+        let primal_output_count = primal_side.len().checked_sub(linearization.residual_count()).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "primal program produced {} outputs which is fewer than its {} residuals",
                 primal_side.len(),
-                linearization.residual_count,
+                linearization.residual_count(),
             ))
         })?;
         primal_side.truncate(primal_output_count);
@@ -543,16 +543,17 @@ where
     ///
     /// This is the forward analogue of [`Self::from_pushforward`] over the front end. Where `from_pushforward`
     /// instantiates a residualized pushforward into one linear program over `C::LinearOperation` and batch-replays it,
-    /// a [`Linearization`] carries two sub-programs over the *primal* operation family `C::Operation`: a known
-    /// `primal_program` taking the primal inputs and producing `[primal_outputs..., residuals...]`, and an unknown
-    /// `tangent_program` taking `[tangents..., residuals...]` and producing the tangent outputs. This helper:
+    /// a [`Linearization`] carries two sub-programs over the *primal* operation family `C::Operation`: a nonlinear
+    /// [`primal`](Linearization::primal) taking the primal inputs and producing `[primal_outputs..., residuals...]`,
+    /// and a linear [`tangent`](Linearization::tangent) taking `[tangents..., residuals...]` and producing the
+    /// tangent outputs. This helper:
     ///
-    ///   1. Replays `primal_program` once at the concrete primal `input_parameters` through `context` itself —
+    ///   1. Replays the primal sub-program once at the concrete primal `input_parameters` through `context` itself —
     ///      lifting the sub-program's staged constants with [`Context::lift`](crate::Context::lift) and binding each
     ///      instruction — and splits its outputs at [`residual_count`](Linearization::residual_count) into the primal
     ///      outputs and the concrete residuals.
-    ///   2. Batch-replays `tangent_program` across the stacked input-coordinate basis tangents (all basis items on
-    ///      axis 0, exactly as `from_pushforward` stacks them), appending the residuals as replicated
+    ///   2. Batch-replays the tangent sub-program across the stacked input-coordinate basis tangents (all basis
+    ///      items on axis 0, exactly as `from_pushforward` stacks them), appending the residuals as replicated
     ///      [`ArrayBatch::replicated`] operands after the batched basis tangents — the same replicated mechanism
     ///      `from_pushforward` uses for closed constants and [`jacrev`] uses for its reverse-mode residuals. Staged
     ///      constants are lifted through `context` and broadcast as replicated operands the same way. Because the
@@ -607,13 +608,13 @@ where
         // Replay the primal sub-program once at the concrete primals to recover `[primal_outputs..., residuals...]`,
         // then split off the residual tail. The residuals depend only on the primal point and so are identical across
         // every basis item.
-        let mut primal_side = linearization.primal_program.interpret_in_context(context, input_parameters.clone())?;
+        let mut primal_side = linearization.primal().interpret_in_context(context, input_parameters.clone())?;
         let residuals =
-            primal_side.split_off(primal_side.len().checked_sub(linearization.residual_count).ok_or_else(|| {
+            primal_side.split_off(primal_side.len().checked_sub(linearization.residual_count()).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "primal program produced {} outputs which is fewer than its {} residuals",
-                    primal_side.len() + linearization.residual_count,
-                    linearization.residual_count,
+                    primal_side.len() + linearization.residual_count(),
+                    linearization.residual_count(),
                 ))
             })?);
 
@@ -627,7 +628,7 @@ where
             let batching_context = BatchingContext::new(context.clone(), batch_size, None);
             let mut tangent_inputs = batched_basis_parameters;
             tangent_inputs.extend(residuals.into_iter().map(ArrayBatch::replicated));
-            let batched_output = linearization.tangent_program.interpret_with(
+            let batched_output = linearization.tangent().interpret_with(
                 tangent_inputs,
                 |_, constant| Ok::<_, BatchingError>(ArrayBatch::replicated(context.lift(constant.clone())?)),
                 |instruction, inputs: &[ArrayBatch<V>]| {
