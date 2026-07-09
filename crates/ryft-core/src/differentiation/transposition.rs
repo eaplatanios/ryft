@@ -192,7 +192,7 @@ impl<
         // Every input is linear, so the pullback has one cotangent input per primal output and one cotangent output
         // per primal input. Recover the structured form by reattaching this program's output and input structures to
         // the flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
-        let flat = TracingContext::<V, O>::new().transpose(self, &vec![true; self.input_ids().len()])?;
+        let flat = self.transpose_with_respect_to(&(0..self.input_ids().len()).collect::<Vec<_>>())?;
         Ok(Program {
             atoms: flat.atoms,
             input_ids: flat.input_ids,
@@ -229,6 +229,13 @@ impl<
     /// practice because the partial-evaluation split that produces a partitioned tangent program prunes known
     /// intermediates into its known sub-program, leaving only known inputs and constants for an adjoint rule to read.
     ///
+    /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
+    /// per program output, walks this program in reverse instruction order applying each [`Operation`]'s
+    /// [`transpose`](TransposableOperation::transpose) rule, and accumulates the per-input cotangent contributions
+    /// (summing repeated contributions with staged adds). A transpose rule that needs to transpose a nested subprogram
+    /// (e.g., a captured control-flow branch) calls [`transpose`](Self::transpose) on it, which transposes it in its
+    /// own fresh context.
+    ///
     /// # Parameters
     ///
     ///   - `input_indices`: Indices of the program inputs the program is transposed with respect to. Each index must
@@ -257,70 +264,7 @@ impl<
             }
             input_linearity[index] = true;
         }
-        let mut pullback = TracingContext::<V, O>::new().transpose(self, input_linearity.as_slice())?;
-
-        // The reverse walk emits one cotangent output per selected input in program-input order. Permute them so the
-        // pullback's outputs follow the order of `input_indices` instead. The walk position of index `i` is the
-        // number of selected indices smaller than `i`.
-        let mut sorted_indices = input_indices.to_vec();
-        sorted_indices.sort_unstable();
-        pullback.output_ids = input_indices
-            .iter()
-            .map(|index| pullback.output_ids[sorted_indices.binary_search(index).unwrap()])
-            .collect();
-        Ok(pullback)
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-impl<
-    T: DifferentiableType,
-    V: Value<Type = T>,
-    O: TransposableOperation<V, O> + From<ZeroOperation<T>> + From<AddOperation>,
-> TracingContext<V, O>
-{
-    /// Transposes the provided linear [`Program`] using this [`TracingContext`]'s [`ProgramBuilder`]. This is the
-    /// builder-level implementation behind [`Program::transpose`]. Refer to the documentation of [`Program::transpose`]
-    /// for the conceptual relationship between program transposition, algebraic transposition, pushforward functions,
-    /// and pullback functions. This function is for callers that hold a [`TracingContext`] to consume as the
-    /// destination for the pullback.
-    ///
-    /// This function uses the context's [`builder`](Self::builder) as the destination for the transposed program,
-    /// records cotangent inputs for the primal outputs, walks `program` in reverse instruction order, and transposes
-    /// each [`Instruction`](crate::programs::Instruction) using [`TransposableOperation::transpose`]. It then consumes
-    /// the context, taking sole ownership of its builder to build the pullback. A transpose rule that needs to
-    /// transpose a nested subprogram (e.g., a captured control-flow branch) should instead call [`Program::transpose`],
-    /// which transposes it in its own fresh context.
-    ///
-    /// `input_linearity` carries one linearity flag per program input. Linearity is propagated forward to every [`Atom`]
-    /// so that each instruction's transpose rule receives a per-operand linearity slice. Callers that transpose a fully
-    /// linear program pass an all-`true` mask, which keeps every reachable atom linear.
-    ///
-    /// The pullback's inputs are the cotangents of the primal outputs followed by the runtime values of the known
-    /// (non-linear) inputs, and its outputs are the accumulated cotangents of the linear inputs only. Because this
-    /// layout depends on `input_linearity`, the pullback is returned with flat [`Vec`] input and output structures;
-    /// callers that know every input is linear recover the structured form by reattaching the program's input and
-    /// output structures to the flat pullback. Known inputs are exposed as pullback inputs and constant atoms as
-    /// pullback constants, so a transpose rule can read either as a known operand's value. A rule that requests the
-    /// value of a known *intermediate* (a known atom that is neither a program input nor a constant) causes this to
-    /// return [`ProgramError::UnsupportedOperation`].
-    ///
-    /// This shares the [`transpose`](Program::transpose) name with the [`Program`]-level entry point. This
-    /// builder-level method consumes a [`TracingContext`] and stages the pullback into its [`ProgramBuilder`]
-    /// over the `(T, V, O)` universe.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Linear pushforward [`Program`] to transpose.
-    ///   - `input_linearity`: Per-input linearity flags, in program-input order. Its length must equal the number of
-    ///     program inputs, otherwise this returns [`ProgramError::InvalidInputCount`].
-    #[inline]
-    pub fn transpose<Input: Parameterized<V>, Output: Parameterized<V>>(
-        mut self,
-        program: &Program<V, O, Input, Output>,
-        input_linearity: &[bool],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        
         /// Accumulates one staged cotangent contribution for `atom` into the reverse-pass adjoint table. The first
         /// contribution is stored directly, while later contributions are summed by staging an add instruction in the
         /// transpose builder.
@@ -360,25 +304,22 @@ impl<
             Ok(())
         }
 
-        // Validate the per-input linearity mask before doing any work so a mismatched mask is reported up front.
-        check_count!("input", input_linearity, program.input_ids().len(), ProgramError);
-
         // Propagate operand linearity forward over the primal atoms. A program-input atom takes its linearity from
-        // `input_linearity`, a constant atom is always known (non-linear), and an instruction result is linear when any of
-        // its operands is linear. Because instructions are stored in evaluation order, a single forward pass suffices:
-        // every operand atom of an instruction is defined before that instruction. With an all-`true` mask every
-        // reachable variable becomes linear, so each operation's transpose rule sees an all-`true` operand slice and
-        // behaves exactly as it did before partition-aware transposition.
-        let mut linear = vec![false; program.atoms().len()];
-        for (input, &input_is_linear) in program.input_ids().iter().copied().zip(input_linearity) {
+        // `input_linearity`, a constant atom is always known (non-linear), and an instruction result is linear when
+        // any of its operands is linear. Because instructions are stored in evaluation order, a single forward pass
+        // suffices: every operand atom of an instruction is defined before that instruction. With an all-`true` mask
+        // every reachable variable becomes linear, so each operation's transpose rule sees an all-`true` operand slice
+        // and behaves exactly as it did before partition-aware transposition.
+        let mut linear = vec![false; self.atoms().len()];
+        for (input, &input_is_linear) in self.input_ids().iter().copied().zip(input_linearity.iter()) {
             *linear.get_mut(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? = input_is_linear;
         }
-        for (index, atom) in program.atoms().iter().enumerate() {
+        for (index, atom) in self.atoms().iter().enumerate() {
             if matches!(atom, Atom::Constant(_)) {
                 linear[index] = false;
             }
         }
-        for instruction in program.instructions().iter() {
+        for instruction in self.instructions().iter() {
             let mut output_is_linear = false;
             for input in instruction.inputs().iter().copied() {
                 if *linear.get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? {
@@ -391,28 +332,27 @@ impl<
             }
         }
 
-        // Reuse this context's current builder as the destination for the pullback program, and reserve the main
-        // structural vectors up front. These are conservative lower bounds that cover cotangent inputs, one instruction
-        // per reversed primal instruction, and possible zero outputs for disconnected primal inputs.
-        let builder = self.builder().clone();
+        // Stage the pullback into a fresh tracing context's builder, and reserve the main structural vectors up front.
+        // These are conservative lower bounds that cover cotangent inputs, one instruction per reversed primal
+        // instruction, and possible zero outputs for disconnected primal inputs.
+        let mut context = TracingContext::<V, O>::new();
+        let builder = context.builder().clone();
         {
             let mut builder_borrow = builder.borrow_mut();
-            builder_borrow
-                .atoms
-                .reserve(program.output_ids.len() + program.instructions.len() + program.input_ids.len());
-            builder_borrow.input_ids.reserve(program.output_ids.len());
-            builder_borrow.instructions.reserve(program.instructions.len() + program.input_ids.len());
+            builder_borrow.atoms.reserve(self.output_ids.len() + self.instructions.len() + self.input_ids.len());
+            builder_borrow.input_ids.reserve(self.output_ids.len());
+            builder_borrow.instructions.reserve(self.instructions.len() + self.input_ids.len());
         }
 
         // Seed the reverse pass with one cotangent input for each primal output, typed with that output's cotangent
         // slot type. A differentiable output's slot carries its cotangent dual (e.g., swapping unreduced and reduced
-        // sharding axes for arrays); a non-differentiable output (the `float0` analogue, such as a Boolean or integer)
-        // has no cotangent space, so its slot carries only structural zeros typed by the output's own primal type. The
-        // adjoint table is indexed by atoms from the original program, and each slot stores the staged pullback atom
-        // that currently represents the accumulated cotangent for that primal atom.
-        let mut adjoints = vec![None; program.atoms().len()];
-        for output in program.output_ids().iter().copied() {
-            let output_atom = program.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
+        // sharding axes for arrays). A non-differentiable output (i.e., the analogue to JAX's `float0`, such as a
+        // Boolean or integer) has no cotangent space, so its slot carries only structural zeros typed by the output's
+        // own primal type. The adjoint table is indexed by atoms from the original program, and each slot stores the
+        // staged pullback atom that currently represents the accumulated cotangent for that primal atom.
+        let mut adjoints = vec![None; self.atoms().len()];
+        for output in self.output_ids().iter().copied() {
+            let output_atom = self.atoms().get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
             let output_type = output_atom.r#type();
             let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.into_owned());
             let cotangent_input = builder.borrow_mut().add_input(cotangent_type);
@@ -423,10 +363,10 @@ impl<
         // the all-`true` mask leaves the pullback input numbering unchanged. Known inputs are exposed to transpose
         // rules as ordinary operand values, typed with the known input's own type (a runtime value, not a cotangent),
         // and recorded in `known_map` indexed by the primal atom so a rule can read the known operand's pullback atom.
-        let mut known_map = vec![None; program.atoms().len()];
-        for (input, &input_is_linear) in program.input_ids().iter().copied().zip(input_linearity) {
+        let mut known_map = vec![None; self.atoms().len()];
+        for (input, &input_is_linear) in self.input_ids().iter().copied().zip(input_linearity.iter()) {
             if !input_is_linear {
-                let input_atom = program.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
+                let input_atom = self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                 let known_input = builder.borrow_mut().add_input(input_atom.r#type().into_owned());
                 known_map[input.index()] = Some(known_input);
             }
@@ -437,7 +377,7 @@ impl<
         // this pullback atom exactly as it reads a known input's value. This is the partition-aware analogue of folding
         // a rebuilt constant into a captured factor, and it keeps a constant-scaled tangent transposable directly
         // rather than reporting it as an unsupported known intermediate.
-        for (index, atom) in program.atoms().iter().enumerate() {
+        for (index, atom) in self.atoms().iter().enumerate() {
             if let Some(value) = atom.as_constant() {
                 known_map[index] = Some(builder.borrow_mut().add_constant(value.clone()));
             }
@@ -447,16 +387,17 @@ impl<
         // outputs has a non-zero accumulated cotangent. The scratch vector avoids allocating a fresh cotangent vector
         // for every live instruction.
         let max_instruction_output_count =
-            program.instructions().iter().map(|instruction| instruction.outputs().len()).max().unwrap_or(0);
+            self.instructions().iter().map(|instruction| instruction.outputs().len()).max().unwrap_or(0);
         let mut instruction_output_cotangents = Vec::with_capacity(max_instruction_output_count);
-        for instruction in program.instructions().iter().rev() {
-            // Skip dead reverse edges early: if none of an instruction's outputs carries an adjoint, the instruction
-            // cannot contribute to any input cotangent. This is the only operand-side guard: a non-linear instruction
+        for instruction in self.instructions().iter().rev() {
+            // Skip dead reverse edges early. If none of an instruction's outputs carries an adjoint, the instruction
+            // cannot contribute to any input cotangent. This is the only operand-side guard. A non-linear instruction
             // whose transpose rule would read a known operand is always safe because the partial-evaluation split that
             // produces partitioned tangent programs exposes every known operand's value (as a known input or constant),
-            // so the known-intermediate guard below stays purely defensive. (A vmapped masked `while` threads its
-            // structurally-zero Boolean-mask carry as a plain pushforward tangent rather than through an all-known
-            // `select` over a restored zero, so no such instruction reads an unexposed known intermediate.)
+            // so the known-intermediate guard below stays purely defensive. Note that a batched masked `while` threads
+            // its structurally-zero Boolean-mask carry as a plain pushforward tangent rather than through an all-known
+            // `select` operation over a restored zero, and so no such instruction reads an unexposed known
+            // intermediate value.
             let mut has_output_adjoint = false;
             for output in instruction.outputs().iter().copied() {
                 if adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?.is_some() {
@@ -470,18 +411,18 @@ impl<
 
             // Materialize the instruction's output cotangents in operation-result order. Missing adjoint slots become
             // structural zeros so transpose rules can distinguish unused outputs without staging zero operations.
-            // Structural zeros carry the output's cotangent slot type: a differentiable output's cotangent dual, or —
-            // for a non-differentiable output (the `float0` analogue) — the output's own primal type. Accumulated
-            // adjoints are always live: rules communicate zero-ness symbolically through [`MaybeZero`] (opaque
-            // program splices such as the custom-VJP backward replay recover it at their own boundary), so no staged
-            // canonical zero ever needs to be recognized here.
+            // Structural zeros carry the output's cotangent slot type: a differentiable output's cotangent dual or,
+            // for a non-differentiable output (i.e., the analogue to JAX's `float0`), the output's own primal type.
+            // Accumulated adjoints are always live: rules communicate zero-ness symbolically through `MaybeZero`
+            // (opaque program splices such as the custom-VJP backward replay recover it at their own boundary),
+            // and so no staged canonical zero ever needs to be recognized here.
             instruction_output_cotangents.clear();
             for output in instruction.outputs().iter().copied() {
                 let cotangent = adjoints.get(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
                 instruction_output_cotangents.push(match cotangent {
-                    Some(atom) => MaybeZero::Value(self.tracer(*atom, None)),
+                    Some(atom) => MaybeZero::Value(context.tracer(*atom, None)),
                     None => {
-                        let output_type = program
+                        let output_type = self
                             .atoms()
                             .get(output.index())
                             .ok_or(ProgramError::UnboundAtomId { id: output })?
@@ -492,20 +433,19 @@ impl<
             }
 
             // Apply the primitive transpose rule and require exactly one cotangent contribution per primal input. This
-            // prevents malformed rules from silently dropping or inventing cotangents through iterator truncation.
-            //
-            // Each operand becomes a self-describing `PartialValue`: a linear operand is `Unknown` of its type (the
+            // prevents malformed rules from silently dropping or inventing cotangents through iterator truncation. Each
+            // input/operand becomes a self-describing `PartialValue`: a linear operand is `Unknown` of its type (the
             // rule produces a cotangent of that type), and a known operand is `Known` of the tracer reading its
             // pullback value atom from `known_map` (a known program input or a constant). A known operand with no
-            // pullback value would be a known *intermediate* (a known atom that is neither a program input nor a
-            // constant). The partial-evaluation split that produces partitioned tangent programs never leaves one (see
-            // this module's docs), so guarding it here once lets every rule assume a `Known` operand carries its value.
+            // pullback value would be a known *intermediate* (i.e., a known atom that is neither a program input nor a
+            // constant). The partial-evaluation split that produces partitioned tangent programs never leaves one, and
+            // so guarding it here once lets every rule assume a `Known` operand carries its value.
             let inputs = instruction
                 .inputs()
                 .iter()
                 .copied()
                 .map(|input| {
-                    let r#type = program
+                    let r#type = self
                         .atoms()
                         .get(input.index())
                         .ok_or(ProgramError::UnboundAtomId { id: input })?
@@ -515,7 +455,7 @@ impl<
                         Ok(PartialValue::Unknown(r#type))
                     } else {
                         match known_map.get(input.index()).copied().ok_or(ProgramError::UnboundAtomId { id: input })? {
-                            Some(atom) => Ok(PartialValue::Known(self.tracer(atom, Some(r#type)))),
+                            Some(atom) => Ok(PartialValue::Known(context.tracer(atom, Some(r#type)))),
                             None => Err(ProgramError::UnsupportedOperation {
                                 message: "partition-aware transpose of a known intermediate is not yet supported"
                                     .to_string(),
@@ -525,7 +465,7 @@ impl<
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let input_cotangents = instruction.operation().transpose(
-                &mut self,
+                &mut context,
                 inputs.as_slice(),
                 instruction_output_cotangents.as_slice(),
             )?;
@@ -540,24 +480,21 @@ impl<
         }
         instruction_output_cotangents.clear();
 
-        // The pullback outputs are the accumulated cotangents for the linear primal inputs only; known inputs receive
-        // no cotangent output. Disconnected linear inputs are emitted as input-free [`ZeroOperation`] instructions,
-        // which the value type's [`Zero`](crate::Zero) implementation evaluates at interpretation time, typed with the
-        // input's cotangent slot type: a differentiable input's cotangent dual, or — for a non-differentiable linear
-        // input (the `float0` analogue) — the input's own primal type, whose cotangent slot carries only structural
-        // zeros. With an all-`true` mask every input is linear, so this keeps one cotangent output per primal input.
-        let outputs = program
-            .input_ids()
+        // The pullback outputs are the accumulated cotangents of the selected inputs, emitted directly in
+        // `input_indices` order. Known inputs receive no cotangent output. Disconnected selected inputs are emitted
+        // as input-free `ZeroOperation` instructions, which the value type's `Zero` implementation evaluates at
+        // interpretation time, typed with the input's cotangent slot type: a differentiable input's cotangent dual,
+        // or, for a non-differentiable selected input (i.e., the analogue to JAX's `float0`), the input's own primal
+        // type, whose cotangent slot carries only structural zeros.
+        let outputs = input_indices
             .iter()
-            .copied()
-            .zip(input_linearity.iter().copied())
-            .filter(|&(_, input_is_linear)| input_is_linear)
-            .map(|(input, _)| {
+            .map(|&index| {
+                let input = self.input_ids()[index];
                 match adjoints.get(input.index()).copied().ok_or(ProgramError::UnboundAtomId { id: input })? {
                     Some(adjoint) => Ok::<AtomId, ProgramError>(adjoint),
                     None => {
                         let input_atom =
-                            program.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
+                            self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                         let input_type = input_atom.r#type();
                         let cotangent_type = input_type.cotangent().unwrap_or_else(|| input_type.into_owned());
                         let mut builder_borrow = builder.borrow_mut();
@@ -568,16 +505,17 @@ impl<
                 }
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
-
-        // Build the pullback from this context's builder. The pullback inputs (cotangents per primal output, then
-        // known-input values) and outputs (cotangents for the linear inputs) are flat, so they are built with flat
-        // `Vec` structures; the fully linear callers recover the structured form by reattaching the program's input
-        // and output structures.
-        let pullback_input_count = builder.borrow().input_ids().len();
-        let pullback_output_count = outputs.len();
+        
         // Drop the throwaway context so its builder reference is released; with every staged `Tracer` already dropped,
         // the cloned `builder` handle is now the sole owner and can be unwrapped to finalize the pullback.
-        drop(self);
+        drop(context);
+
+        // Build the pullback from the context's builder. The pullback inputs (i.e., cotangents per primal output, then
+        // known-input values) and outputs (i.e., cotangents for the linear inputs) are flat, and so they are built with
+        // flat `Vec` structures. The fully linear callers recover the structured form by reattaching the program's
+        // input and output structures.
+        let pullback_input_count = builder.borrow().input_ids().len();
+        let pullback_output_count = outputs.len();
         let builder = match Rc::try_unwrap(builder) {
             Ok(builder) => builder.into_inner(),
             Err(_) => return Err(ProgramError::EscapedProgramBuilder),
@@ -585,6 +523,8 @@ impl<
         builder.build(outputs, vec![Placeholder; pullback_input_count], vec![Placeholder; pullback_output_count])
     }
 }
+        
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {

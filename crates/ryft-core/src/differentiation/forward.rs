@@ -5,8 +5,6 @@ use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing_v2::differentiation::Linearization;
 use crate::types::Typed;
 
-// TODO(eaplatanios): Should we rename this module to `forward.rs`?
-
 /// Represents a differentiation _dual_ value which is a _primal_ value paired with a _tangent_ value. In the
 /// context of differentiating a function `f(x)`, the value `y = f(x)` is the primal value and its tangent `ẏ` is
 /// the directional derivative of `f` at `x` along an input tangent (i.e., perturbation direction) `ẋ` (i.e., the
@@ -156,10 +154,10 @@ pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type>
 /// [`Linearization`] holding the primal (known) sub-program `x ↦ (y, r)` — where the residuals `r` are the
 /// intermediate values the derivative is evaluated at — and the tangent (unknown) sub-program
 /// `(ẋ, r) ↦ ẏ = (∂f/∂x)(x) · ẋ`, which is linear in `ẋ`. Refer to
-/// [`Program::linearize`](crate::Program::linearize) for the full contract.
+/// [`Program::linearize`] for the full contract.
 ///
 /// It breaks the same recursive fixed point the same way as [`DifferentiableProgramOperation`]: a closed operation
-/// enum implements it directly, calling [`Program::linearize`](crate::Program::linearize) in the body while spelling
+/// enum implements it directly, calling [`Program::linearize`] in the body while spelling
 /// only the *leaf* closure of capabilities that body needs, so a higher-order rule can require
 /// `Self: LinearizableProgramOperation<V, Self>` without the trait solver re-entering the enum's own
 /// [`DifferentiableOperation`] obligation. The bounded `while` rule uses it because a loop must stack per-iteration
@@ -169,13 +167,12 @@ pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type>
 /// Like [`DifferentiableProgramOperation`], it is implemented explicitly per operation enum rather than through a
 /// blanket impl, which would reintroduce the recursion it exists to break. The value type `V` (whose carried type
 /// descriptor types the programs) and operation family `O` match the primal program being linearized.
-pub trait LinearizableProgramOperation<V: Value, O>: Clone + Operation<V::Type> + Sized
-where
-    O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>,
+pub trait LinearizableProgramOperation<V: Value, O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>>:
+    Clone + Operation<V::Type> + Sized
 {
     /// Linearizes `program` capture-free, splitting its fused jvp form `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ)` into the
     /// primal sub-program `x ↦ (y, r)` and the linear tangent sub-program `(ẋ, r) ↦ ẏ`; refer to
-    /// [`Program::linearize`](crate::Program::linearize) for the returned packaging.
+    /// [`Program::linearize`] for the returned packaging.
     ///
     /// # Parameters
     ///

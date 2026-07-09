@@ -26,7 +26,6 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 #[cfg(test)]
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiableProgramOperation;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
