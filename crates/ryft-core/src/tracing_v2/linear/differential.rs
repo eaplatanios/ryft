@@ -240,14 +240,17 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             },
             primals,
         )?;
-        // Linearize the gradient program through the program-level split, replay its primal sub-program at the
-        // primals to recover the linearization-point residuals, and then replay every input-coordinate basis tangent
-        // through its pushforward program. The already-evaluated `gradient` supplies the output shapes and structure
-        // `from_pushforward_program` needs.
-        let linearization = gradient_program.linearize().map_err(DifferentiationError::from)?;
-        let (_, residuals) =
-            linearization.interpret_primal(self, input_parameters.clone()).map_err(DifferentiationError::from)?;
-        let (_, pushforward_program, _) = linearization.into_parts();
+        // Linearize the gradient program through the program-level split (defined on the canonical flat form, so the
+        // structured trace is flattened first), replay its primal sub-program at the primals to recover the
+        // linearization-point residuals — its trailing `residual_count` outputs, per the `Linearization` output
+        // contract — and then replay every input-coordinate basis tangent through its pushforward program. The
+        // already-evaluated `gradient` supplies the output shapes and structure `from_pushforward_program` needs.
+        let linearization = gradient_program.into_flat_program().linearize().map_err(DifferentiationError::from)?;
+        let (primal_program, pushforward_program, residual_count) = linearization.into_parts();
+        let mut primal_outputs = primal_program
+            .interpret_in_context(self, input_parameters.clone())
+            .map_err(DifferentiationError::from)?;
+        let residuals = primal_outputs.split_off(primal_outputs.len() - residual_count);
         Differential::from_pushforward_program::<Self, Input, Input, DomainValue<Self>>(
             self,
             input_structure,

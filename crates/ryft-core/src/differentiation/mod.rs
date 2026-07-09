@@ -8,7 +8,7 @@ use crate::programs::ProgramError;
 
 pub use forward::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiationContext, DifferentiationDual,
-    DifferentiationTracer, LinearizableProgramOperation, LinearizationTracer,
+    DifferentiationTracer, LinearizableProgramOperation, Linearization, LinearizationTracer,
 };
 pub use transposition::{TransposableOperation, TransposableProgramOperation};
 pub use types::DifferentiableType;

@@ -3027,7 +3027,7 @@ mod array_linearization_tests {
     }
 
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
+    use crate::differentiation::{DifferentiationTracer, Linearization, LinearizationTracer};
     use crate::operations::Operation;
     use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
@@ -3036,7 +3036,7 @@ mod array_linearization_tests {
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
-    use crate::tracing_v2::differentiation::{Differentiate, Linearization};
+    use crate::tracing_v2::differentiation::Differentiate;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;

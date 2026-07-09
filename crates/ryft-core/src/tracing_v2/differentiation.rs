@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
-    DifferentiationTracer, LinearizationTracer, TransposableOperation,
+    DifferentiationTracer, Linearization, LinearizationTracer, TransposableOperation,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -413,16 +413,12 @@ pub trait Differentiate: Context {
 
 impl<C: Context> Differentiate for C {}
 
-impl<T, V, O, Input, Output> Program<V, O, Input, Output>
-where
-    T: Type,
-    V: Value<Type = T>,
-    O: Clone + Operation<T> + From<ZeroOperation<T>>,
-    O: DifferentiableOperation<TracingContext<V, O>>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
+impl<
+    V: Value,
+    O: Clone + Operation<V::Type> + DifferentiableOperation<TracingContext<V, O>> + From<ZeroOperation<V::Type>>,
+> Program<V, O, Vec<V>, Vec<V>>
 {
-    /// Builds the *fused* jvp program of this already-traced primal [`Program`].
+    /// Builds the *fused* jvp program of this already-traced flat primal [`Program`].
     ///
     /// Read the input program as a function `f` from its flat inputs to its flat outputs, `x ↦ y = f(x)`. This returns
     /// the program that computes `f` together with its *pushforward* (the forward-mode Jacobian-vector product): given
@@ -587,161 +583,17 @@ where
     }
 }
 
-/// Result of [`Program::linearize`]: the linearization of a program computing `y = f(x)`,
-/// split into a nonlinear primal sub-program and a linear tangent sub-program that communicate through a residual
-/// environment.
-///
-/// Linearization splits the program's fused jvp program `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ)` by known-ness into:
-///
-///   - the [`primal`](Self::primal) sub-program `x ↦ (y, r)`, computing the primal outputs `y = f(x)` together with
-///     the residuals `r` — the intermediate values of the derivative computation that depend only on `x` (e.g.,
-///     `cos(x)` when `f` is `sin`); and
-///   - the [`tangent`](Self::tangent) sub-program `(ẋ, r) ↦ ẏ`, computing the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
-///     It is linear in `ẋ`, with the linearization point `x` entering only through the residuals `r`.
-///
-/// This is the domain-free, interpretation-free core shared by every linearization entry point: it carries only the
-/// two sub-programs and the residual count that relates them, leaving the concrete primal outputs to be recovered by
-/// callers that interpret [`primal`](Self::primal) under a value semantics of their choice. The tangent sub-program
-/// stays in the primal operation family `O` with the residuals as ordinary trailing inputs, which is why
-/// [`pullback`](Self::pullback) can transpose it directly through
-/// [`Program::transpose_with_respect_to`] without re-keying it into a
-/// linear operation family.
-///
-/// The value type `V` and operation family `O` match the primal program being linearized.
-pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
-    /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs
-    /// `y = f(x)` followed by the residuals `r`, its trailing [`residual_count`](Self::residual_count) outputs, which
-    /// form the residual environment consumed by the tangent sub-program.
-    primal: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Linear tangent sub-program `(ẋ, r) ↦ ẏ`. It takes the tangent inputs `ẋ` followed by the residuals `r` and
-    /// produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`.
-    tangent: Program<V, O, Vec<V>, Vec<V>>,
-
-    /// Number of residuals `r` threaded from the primal sub-program into the tangent sub-program — the count of the
-    /// trailing outputs of [`primal`](Self::primal) and of the trailing inputs of [`tangent`](Self::tangent).
-    residual_count: usize,
-}
-
-impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
-    /// Returns the nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal
-    /// outputs `y = f(x)` followed by the residuals `r` — the intermediate values of the derivative computation that
-    /// depend only on `x` — whose trailing [`residual_count`](Self::residual_count) outputs form the residual
-    /// environment consumed by the [`tangent`](Self::tangent) sub-program.
-    pub fn primal(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.primal
-    }
-
-    /// Returns the linear tangent sub-program `(ẋ, r) ↦ ẏ`. It takes the tangent inputs `ẋ` followed by the
-    /// residuals `r` and produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`. The sub-program is linear in `ẋ`, with
-    /// the linearization point `x` entering only through the residuals `r`.
-    pub fn tangent(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
-        &self.tangent
-    }
-
-    /// Returns the number of residuals `r` threaded from the primal sub-program into the tangent sub-program — the
-    /// count of the trailing outputs of [`primal`](Self::primal) and of the trailing inputs of
-    /// [`tangent`](Self::tangent).
-    pub fn residual_count(&self) -> usize {
-        self.residual_count
-    }
-
-    /// Consumes this [`Linearization`] and returns its [`primal`](Self::primal) sub-program,
-    /// [`tangent`](Self::tangent) sub-program, and [`residual_count`](Self::residual_count), in that order.
-    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, usize) {
-        (self.primal, self.tangent, self.residual_count)
-    }
-
-    /// Interprets the [`primal`](Self::primal) sub-program at the primal inputs `x` through `context`, returning the
-    /// primal outputs `y = f(x)` and the residuals `r`, split at [`residual_count`](Self::residual_count).
-    ///
-    /// This recovers the value-level half of a linearization point: the outputs and residuals flow as `context`'s
-    /// [`Value`](crate::contexts::Domain::Value)s — concrete values under an eager context, enclosing-trace tracers
-    /// under a staging one — while the sub-program's staged constants are lifted through the context's
-    /// [`lift`](Context::lift) at replay time.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Context whose [`lift`](Context::lift) and [`bind`](Context::bind) replay the primal
-    ///     sub-program.
-    ///   - `primals`: Flat primal inputs `x`, aligned with the primal sub-program's inputs.
-    pub fn interpret_primal<C>(
-        &self,
-        context: &C,
-        primals: Vec<C::Value>,
-    ) -> Result<(Vec<C::Value>, Vec<C::Value>), ProgramError>
-    where
-        C: Context<Type = V::Type, Constant = V, Operation = O>,
-    {
-        let mut outputs = self.primal.interpret_in_context(context, primals)?;
-        let output_count = outputs.len().checked_sub(self.residual_count).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "primal program produced {} outputs which is fewer than its {} residuals",
-                outputs.len(),
-                self.residual_count,
-            ))
-        })?;
-        let residuals = outputs.split_off(output_count);
-        Ok((outputs, residuals))
-    }
-
-    /// Returns the forward-mode pushforward program `(ẋ, r) ↦ ẏ`: it takes the tangent inputs `ẋ` followed by the
-    /// residuals `r` and produces the tangent outputs `ẏ = (∂f/∂x)(x) · ẋ`. Because linearization already produces
-    /// the pushforward as its unknown half, this is the [`tangent`](Self::tangent) sub-program itself, cloned — the
-    /// identity counterpart of [`pullback`](Self::pullback), which derives its program by transposition.
-    pub fn pushforward(&self) -> Program<V, O, Vec<V>, Vec<V>> {
-        self.tangent.clone()
-    }
-
-    /// Builds the reverse-mode pullback program `(ȳ, r) ↦ x̄` by transposing the [`tangent`](Self::tangent)
-    /// sub-program: it takes the output cotangents `ȳ` followed by the residuals `r` and produces the input
-    /// cotangents `x̄ = (∂f/∂x)(x)ᵀ · ȳ`. It is the derived third member of this [`Linearization`]'s program family,
-    /// alongside the stored [`primal`](Self::primal) and [`tangent`](Self::tangent) sub-programs.
-    ///
-    /// Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured factor (for
-    /// example, folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding the
-    /// consuming residual value, this function leaves the tangent sub-program in the primal operation family `O` and
-    /// transposes it through
-    /// [`Program::transpose_with_respect_to`]. The tangent sub-program's
-    /// inputs are `(ẋ, r)`, so it is transposed with respect to the leading tangent inputs `ẋ` while the trailing
-    /// [`residual_count`](Self::residual_count) residual inputs are held as known parameters. Partition-aware
-    /// transposition then threads each known residual through to the pullback as a pullback input (consumed by the
-    /// adjoint operation that the bilinear operation's transpose rule stages), rather than folding it into a captured
-    /// factor, so the returned pullback program stays over the primal operation family `O` and produces the
-    /// cotangents of the linear tangent inputs only.
-    pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
-    where
-        V::Type: DifferentiableType,
-        O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
-    {
-        let tangent_input_count = self.tangent.input_ids().len().checked_sub(self.residual_count).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "tangent program has {} inputs which is fewer than its {} residuals",
-                self.tangent.input_ids().len(),
-                self.residual_count,
-            ))
-        })?;
-
-        // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
-        // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are not
-        // folded into captured factors here.
-        let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
-        self.tangent.transpose_with_respect_to(with_respect_to.as_slice())
-    }
-}
-
-impl<T, V, O, Input, Output> Program<V, O, Input, Output>
+impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
-    T: Type,
-    V: Value<Type = T>,
-    O: Clone + Operation<T> + From<ZeroOperation<T>>,
-    O: DifferentiableOperation<TracingContext<V, O>>,
-    O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
+    V: Value,
+    O: Clone
+        + Operation<V::Type>
+        + PartiallyEvaluatableOperation<TracingContext<V, O>>
+        + DifferentiableOperation<TracingContext<V, O>>
+        + From<ZeroOperation<V::Type>>,
 {
-    /// Builds the linearization core from this already-traced primal [`Program`] by fusing the forward-mode rules into
-    /// one jvp program and splitting it into the primal (known) and tangent (unknown) halves through the
+    /// Builds the linearization core from this already-traced flat primal [`Program`] by fusing the forward-mode
+    /// rules into one jvp program and splitting it into the primal (known) and tangent (unknown) halves through the
     /// partial-evaluation known-ness split.
     ///
     /// This is the domain-free, interpretation-free generic core of the linearization pipeline, shared by every
@@ -754,7 +606,7 @@ where
     /// own the split, higher-order operations (`scan`/`condition`) separate through their known-ness splits instead
     /// of needing linearize-specific handling, and effectful primal work lands in the primal program per the effect
     /// placement contract of
-    /// [`PartialEvaluationContext::fold_or_residualize`](crate::partial::PartialEvaluationContext::fold_or_residualize).
+    /// [`PartialEvaluationContext::fold_or_residualize`].
     /// The known side computes the primal outputs followed by the residual edges and the residual side is the linear
     /// tangent map taking `(tangents ++ residuals)` — the JAX `linearize` shape, produced by the same machinery JAX
     /// uses (`partial_eval` of the jvp function). The tangent program's canonical input order is then rebuilt from
@@ -905,7 +757,7 @@ where
         }
         tangent_program.output_structure = vec![Placeholder; tangent_program.output_ids.len()];
 
-        Ok(Linearization { primal: known_program, tangent: tangent_program, residual_count })
+        Ok(Linearization::new(known_program, tangent_program, residual_count))
     }
 }
 
