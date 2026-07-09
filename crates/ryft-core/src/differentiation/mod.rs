@@ -1,5 +1,5 @@
 pub mod forward;
-pub mod transposition;
+pub mod reverse;
 pub mod types;
 
 use thiserror::Error;
@@ -8,9 +8,9 @@ use crate::programs::ProgramError;
 
 pub use forward::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiationContext, DifferentiationDual,
-    DifferentiationTracer, LinearizableProgramOperation, Linearization, LinearizationTracer,
+    DifferentiationTracer, LinearizableProgramOperation, Linearization, LinearizationTracer, Pushforward,
 };
-pub use transposition::{TransposableOperation, TransposableProgramOperation};
+pub use reverse::{Pullback, TransposableOperation, TransposableProgramOperation};
 pub use types::DifferentiableType;
 
 /// Represents differentiation-related errors.
