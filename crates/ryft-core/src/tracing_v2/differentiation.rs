@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDual, DifferentiationError, DifferentiationTracer,
-    LinearizationTracer, TransposableOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError,
+    DifferentiationTracer, LinearizationTracer, TransposableOperation,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -412,95 +412,6 @@ pub trait Differentiate: Context {
 }
 
 impl<C: Context> Differentiate for C {}
-
-/// A forward-mode differentiation [`Context`] that interleaves [`DifferentiableOperation`] rules with an inner
-/// [`Context`], without building a program: its values are [`DifferentiationTracer`] duals over the inner context's values, and
-/// binding an operation dispatches the operation's [`jvp`](DifferentiableOperation::jvp) rule against the inner
-/// context directly. Over an eager inner context this computes primal and tangent values operation by operation
-/// (the analogue of [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html) interpreter), while over
-/// a staging inner context the rules stage the primal and tangent operations into the enclosing trace.
-///
-/// This is forward mode's counterpart of [`BatchingContext`](crate::batching::BatchingContext): a transform context
-/// that wraps the receiver and runs the user's closure directly on transform tracers ([`DifferentiationTracer`] duals here,
-/// [`BatchingTracer`](crate::batching::BatchingTracer)s there), with eager-versus-staged behavior absorbed entirely
-/// by the wrapped context. It is what makes [`Differentiate::jvp`] the single forward-mode entry point.
-///
-/// Structural zero tangents stay symbolic [`MaybeZero::Zero`]s while they flow between rules: the
-/// [`bind`](Context::bind) fast path skips an operation's rule entirely when every input tangent is a structural
-/// zero, exactly like the program-level replay behind [`Program::linearize`], so no zero values are constructed and no
-/// zero work is performed until a boundary [`materialize`](MaybeZero::materialize)s one through the inner
-/// context's [`Zero`] capability.
-#[derive(Clone)]
-pub struct DifferentiationContext<C: Context> {
-    /// Parent context that carries the primal and tangent values and executes (or stages) the operations that the
-    /// forward-mode rules bind.
-    parent: C,
-}
-
-impl<C: Context> DifferentiationContext<C> {
-    /// Creates a new [`DifferentiationContext`] over the provided parent [`Context`].
-    #[inline]
-    pub fn new(parent: C) -> Self {
-        Self { parent }
-    }
-
-    /// Returns the parent [`Context`].
-    #[inline]
-    pub fn parent(&self) -> &C {
-        &self.parent
-    }
-}
-
-impl<C: Context> Domain for DifferentiationContext<C> {
-    type Type = C::Type;
-    type Value = DifferentiationTracer<C>;
-    type Constant = C::Constant;
-    type Operation = C::Operation;
-}
-
-impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>> Context for DifferentiationContext<C> {
-    #[inline]
-    fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
-        // Constants are independent of every differentiation input, so their tangents are structural zeros.
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent.lift(constant)?);
-        Ok(DifferentiationTracer::new(dual, self.clone()))
-    }
-
-    fn bind<O: Into<C::Operation>>(
-        &self,
-        operation: O,
-        inputs: &[DifferentiationTracer<C>],
-    ) -> Result<Vec<DifferentiationTracer<C>>, ProgramError> {
-        let operation = operation.into();
-        // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
-        // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
-        let input_duals = inputs.iter().map(|input| input.dual().clone()).collect::<Vec<_>>();
-        // All-zero fast path mirroring `Program::jvp`: when an operation consumes at least one input and every
-        // input tangent is a structural zero, the operation's tangent is zero by the chain rule, so the rule is
-        // skipped and the primal operation binds directly. Zero-input operations are excluded so their dedicated
-        // rules keep handling primal synthesis and tangent typing.
-        let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
-            let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-            self.parent
-                .bind(operation, &primal_inputs)?
-                .into_iter()
-                .map(DifferentiationDual::new_with_zero_tangent)
-                .collect()
-        } else {
-            operation.jvp(&self.parent, input_duals.as_slice())?
-        };
-        // Stamp this context onto every value handed back to the caller so its capability sugar dispatches through this
-        // forward-mode context (the `jvp` rules build their outputs context-free via `DifferentiationDual::new`).
-        Ok(output_duals.into_iter().map(|dual| DifferentiationTracer::new(dual, self.clone())).collect())
-    }
-
-    /// A forward-mode context is eager exactly when the inner context carrying its duals' values is (never over a
-    /// staging inner context, always over an eager one).
-    #[inline]
-    fn is_eager(&self) -> bool {
-        self.parent.is_eager()
-    }
-}
 
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where

@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::batching::{BatchableOperation, BatchingContext, BatchingError};
 use crate::contexts::{Context, EagerContext};
-use crate::differentiation::DifferentiableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -10,7 +10,6 @@ use crate::operations::constants::Zero;
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::{NestedTracingContext, TracingContext};
-use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::tracing_v2::operations::collective::AxisIndexOperation;
 use crate::types::ArrayType;
 

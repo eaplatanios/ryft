@@ -4,17 +4,17 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use lru::LruCache;
+
 use crate::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::contexts::Context;
-use crate::differentiation::DifferentiableOperation;
+use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::operations::constants::Zero;
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{ProgramError, Value};
 use crate::tracing::NestedTracingContext;
-use crate::tracing_v2::differentiation::DifferentiationContext;
 use crate::types::ArrayType;
-use lru::LruCache;
 
 use super::disk_cache::{CacheDigest, DiskCache};
 use super::domain::CompilationDomain;
