@@ -7,7 +7,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
+use crate::operations::constants::{One, OneOperation, Zero, ZeroOperation};
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationValue, PartialTracer, PartialValue,
@@ -435,6 +435,110 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     {
         self.value_and_gradient(function, primals).map(|(_, gradient)| gradient)
     }
+
+    /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its reverse-mode gradient,
+    /// with this [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to the
+    /// documentation of the [`value_and_gradient_with_aux`] function for information on the transform and its
+    /// arguments. This method serves the call sites that must name the [`Context`] explicitly instead of recovering
+    /// it from the input's leaf values.
+    fn value_and_gradient_with_aux<F, Input, Aux>(
+        &self,
+        function: F,
+        primals: Input,
+    ) -> Result<((Self::Value, Aux), Input::To<Self::Value>), DifferentiationError>
+    where
+        Self: One<Self::Value> + Zero<Self::Value>,
+        Self::Type: DifferentiableType,
+        Self::Operation: Clone
+            + DifferentiableOperation<PartialEvaluationContext<Self>>
+            + PartiallyEvaluatableOperation<Self>
+            + TransposableOperation<Self::Constant, Self::Operation>
+            + From<ZeroOperation<Self::Type>>
+            + From<AddOperation>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<Self>>,
+        ) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        Input:
+            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Aux: Parameterized<
+                Self::Value,
+                To<Self::Value> = Aux,
+                Family: ParameterizedFamily<LinearizationTracer<Self>, To = Aux::To<LinearizationTracer<Self>>>,
+            >,
+        (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>): Parameterized<
+                LinearizationTracer<Self>,
+                To<Self::Value> = (Self::Value, Aux),
+                Family: ParameterizedFamily<Self::Value>,
+            >,
+    {
+        let input_structure = primals.parameter_structure();
+        let ((output, aux), pullback): ((Self::Value, Aux), _) = self.vjp(|input| Ok(function(input)), primals)?;
+        let (pullback, residuals) = pullback.into_parts();
+        // Reverse mode only defines a gradient for scalar-output functions; reject non-scalar outputs before seeding
+        // (see `DifferentiationError::NonScalarGradientOutput`).
+        if !output.r#type().is_scalar() {
+            return Err(DifferentiationError::NonScalarGradientOutput { output_type: output.r#type().to_string() });
+        }
+        // The flat pullback consumes `[output_cotangents ++ residuals]`. The traced output flattens as the scalar
+        // output leaf followed by the auxiliary leaves, so seed the output leaf with a one cotangent and every
+        // auxiliary leaf with a zero cotangent, then append the linearization-point residuals. Both the seeds and the
+        // replay go through this context itself: an eager context constructs and interprets concrete values, while a
+        // staging context stages into its enclosing trace.
+        // A non-differentiable scalar output (e.g., a Boolean or an integer) carries no cotangent space and thus no
+        // "one" to seed, so reverse mode is degenerate and is rejected up front. The seed is typed with the output's
+        // cotangent type (e.g., swapping unreduced and reduced sharding axes for arrays).
+        let output_cotangent_type = output.r#type().cotangent().ok_or_else(|| {
+            DifferentiationError::NonDifferentiableGradientOutput { output_type: output.r#type().to_string() }
+        })?;
+        let mut pullback_inputs = vec![self.one(&output_cotangent_type)?];
+        for value in Parameterized::<Self::Value>::parameters(&aux) {
+            pullback_inputs.push(self.zero(value.r#type().as_ref())?);
+        }
+        pullback_inputs.extend(residuals);
+        let input_cotangents = pullback.interpret_in_context(self, pullback_inputs)?;
+        let gradient =
+            Input::To::<Self::Value>::from_parameters(input_structure, input_cotangents).map_err(ProgramError::from)?;
+        Ok(((output, aux), gradient))
+    }
+
+    /// Computes the reverse-mode gradient of `function` at `primals` and its auxiliary outputs, with this [`Context`]
+    /// executing (or staging) the primal-side operations and the pullback replay. This is the gradient-only
+    /// counterpart of [`value_and_gradient_with_aux`](Self::value_and_gradient_with_aux), discarding the primal
+    /// scalar output; refer to the documentation of the [`gradient_with_aux`] function for information on the
+    /// transform and its arguments.
+    #[inline]
+    fn gradient_with_aux<F, Input, Aux>(
+        &self,
+        function: F,
+        primals: Input,
+    ) -> Result<(Input::To<Self::Value>, Aux), DifferentiationError>
+    where
+        Self: One<Self::Value> + Zero<Self::Value>,
+        Self::Type: DifferentiableType,
+        Self::Operation: Clone
+            + DifferentiableOperation<PartialEvaluationContext<Self>>
+            + PartiallyEvaluatableOperation<Self>
+            + TransposableOperation<Self::Constant, Self::Operation>
+            + From<ZeroOperation<Self::Type>>
+            + From<AddOperation>,
+        F: FnOnce(
+            Input::To<LinearizationTracer<Self>>,
+        ) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        Input:
+            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Aux: Parameterized<
+                Self::Value,
+                To<Self::Value> = Aux,
+                Family: ParameterizedFamily<LinearizationTracer<Self>, To = Aux::To<LinearizationTracer<Self>>>,
+            >,
+        (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>): Parameterized<
+                LinearizationTracer<Self>,
+                To<Self::Value> = (Self::Value, Aux),
+                Family: ParameterizedFamily<Self::Value>,
+            >,
+    {
+        self.value_and_gradient_with_aux(function, primals).map(|((_, aux), gradient)| (gradient, aux))
+    }
 }
 
 impl<C: Context> ReverseModeDifferentiate for C {}
@@ -552,17 +656,205 @@ where
     value_and_gradient(function, primals).map(|(_, gradient)| gradient)
 }
 
+/// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its reverse-mode gradient.
+///
+/// This is the `has_aux` counterpart of [`value_and_gradient`], spelled as a separate function because the auxiliary
+/// outputs change the closure's return type: the differentiated value is the first element returned by `function` and
+/// must be exactly one rank-0 scalar leaf (subject to the same
+/// [`NonScalarGradientOutput`](DifferentiationError::NonScalarGradientOutput) and
+/// [`NonDifferentiableGradientOutput`](DifferentiationError::NonDifferentiableGradientOutput) rejections), while the
+/// auxiliary leaves are returned to the caller as ordinary primal values but seeded with typed zero cotangents when
+/// the pullback is interpreted, so that they do not contribute to the gradient. The primal value and auxiliary data
+/// are returned as `((value, aux), gradient)`.
+///
+/// Like [`value_and_gradient`], the transform recovers a [`Context`] from the input's leaf values through
+/// [`Value::ExecutionDomain`](crate::programs::Value::ExecutionDomain), and host control flow on primals works
+/// exactly as under [`linearize`]. [`ReverseModeDifferentiate::value_and_gradient_with_aux`] is the explicit-context
+/// method form behind this function.
+#[inline]
+pub fn value_and_gradient_with_aux<V, F, Input, Aux>(
+    function: F,
+    primals: Input,
+) -> Result<((V, Aux), Input::To<V>), DifferentiationError>
+where
+    V: Value<Type: DifferentiableType, ExecutionDomain: Context + One<V> + Zero<V>>,
+    <V::ExecutionDomain as Domain>::Operation: Clone
+        + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+        + PartiallyEvaluatableOperation<V::ExecutionDomain>
+        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
+        + From<ZeroOperation<V::Type>>
+        + From<AddOperation>,
+    F: FnOnce(
+        Input::To<LinearizationTracer<V::ExecutionDomain>>,
+    ) -> (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+    Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Aux: Parameterized<
+            V,
+            To<V> = Aux,
+            Family: ParameterizedFamily<
+                LinearizationTracer<V::ExecutionDomain>,
+                To = Aux::To<LinearizationTracer<V::ExecutionDomain>>,
+            >,
+        >,
+    (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>):
+        Parameterized<LinearizationTracer<V::ExecutionDomain>, To<V> = (V, Aux), Family: ParameterizedFamily<V>>,
+{
+    let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    };
+    context.value_and_gradient_with_aux(function, primals)
+}
+
+/// Computes the reverse-mode gradient of `function` at `primals` and its auxiliary outputs. This is the gradient-only
+/// counterpart of [`value_and_gradient_with_aux`], discarding the primal scalar output; refer to its documentation
+/// for information on the transform, its arguments, and its scalar-output requirements. The return order is
+/// `(gradient, aux)`, matching the common use case where auxiliary outputs are diagnostics or cached intermediates
+/// and the gradient remains the primary result. [`ReverseModeDifferentiate::gradient_with_aux`] is the
+/// explicit-context method form behind this function.
+#[inline]
+pub fn gradient_with_aux<V, F, Input, Aux>(
+    function: F,
+    primals: Input,
+) -> Result<(Input::To<V>, Aux), DifferentiationError>
+where
+    V: Value<Type: DifferentiableType, ExecutionDomain: Context + One<V> + Zero<V>>,
+    <V::ExecutionDomain as Domain>::Operation: Clone
+        + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+        + PartiallyEvaluatableOperation<V::ExecutionDomain>
+        + TransposableOperation<<V::ExecutionDomain as Domain>::Constant, <V::ExecutionDomain as Domain>::Operation>
+        + From<ZeroOperation<V::Type>>
+        + From<AddOperation>,
+    F: FnOnce(
+        Input::To<LinearizationTracer<V::ExecutionDomain>>,
+    ) -> (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+    Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Aux: Parameterized<
+            V,
+            To<V> = Aux,
+            Family: ParameterizedFamily<
+                LinearizationTracer<V::ExecutionDomain>,
+                To = Aux::To<LinearizationTracer<V::ExecutionDomain>>,
+            >,
+        >,
+    (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>):
+        Parameterized<LinearizationTracer<V::ExecutionDomain>, To<V> = (V, Aux), Family: ParameterizedFamily<V>>,
+{
+    value_and_gradient_with_aux(function, primals).map(|((_, aux), gradient)| (gradient, aux))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::scalars::Scalar;
+    use crate::tracing::{DomainTracer, DomainTracingContext};
     use crate::tracing_v2::test_util::assert_scalar_close;
+    use crate::types::DataType;
 
     use super::{ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate};
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::differentiation::DifferentiationError;
     use crate::operations::BooleanLike;
     use crate::programs::ProgramError;
+
+    #[test]
+    fn test_traced_value_and_grad_requires_input_leaves() {
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let empty_primals: Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>> = Vec::new();
+
+        let result = context.value_and_gradient(
+            |_inputs: Vec<_>| panic!("closure should not run without traced inputs"),
+            empty_primals,
+        );
+
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }))
+        ));
+    }
+
+    #[test]
+    fn test_traced_value_and_grad_rejects_mismatched_program_builders() {
+        // Mixing tracers of two different traces is rejected with `MismatchedProgramBuilders`. The closure runs on
+        // differentiation duals whose operator sugar has no deferral point of its own, so the partial-evaluation
+        // context defers the failed bind by poisoning its outputs, and the original error surfaces as a plain `Err`
+        // at the evaluation boundary.
+        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let primal_a = context_a.input(DataType::F64);
+        let primal_b = context_b.input(DataType::F64);
+
+        let result =
+            context_a.value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal_a, primal_b]);
+
+        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
+    }
+
+    #[test]
+    fn test_traced_value_and_grad_invokes_function_once() {
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let primal = context.input(DataType::F64);
+        let calls = Cell::new(0);
+
+        let (_value, gradient): (
+            DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
+        ) = context
+            .value_and_gradient(
+                |inputs| {
+                    calls.set(calls.get() + 1);
+                    inputs[0].clone() * inputs[0].clone()
+                },
+                vec![primal],
+            )
+            .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(gradient.len(), 1);
+    }
+
+    #[test]
+    fn test_value_and_grad_with_aux_ignores_aux_cotangents() {
+        // The free `value_and_gradient_with_aux` recovers the eager scalar domain from the concrete primals; the
+        // auxiliary outputs are returned as primal values and receive zero cotangent seeds, so they do not
+        // contribute to the gradient of f(x, y) = x * y.
+        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) =
+            super::value_and_gradient_with_aux(
+                |(x, y)| {
+                    let value = x.clone() * y.clone();
+                    let aux = (x.clone() + y, x.clone() * x);
+                    (value, aux)
+                },
+                (Scalar::from(2.0), Scalar::from(3.0)),
+            )
+            .unwrap();
+
+        assert_eq!(value, 6.0);
+        assert_eq!(aux, (Scalar::from(5.0), Scalar::from(4.0)));
+        assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
+    }
+
+    #[test]
+    fn test_grad_returns_only_the_gradient() {
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+
+        let gradient: (Scalar, Scalar) =
+            domain.gradient(|(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
+
+        assert_eq!(gradient, (Scalar::from(4.0), Scalar::from(2.0)));
+    }
+
+    #[test]
+    fn test_grad_with_aux_returns_gradient_and_aux() {
+        let (gradient, aux): ((Scalar, Scalar), Scalar) =
+            super::gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
+                .unwrap();
+
+        assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
+        assert_eq!(aux, 5.0);
+    }
 
     #[test]
     fn test_free_functions_recover_the_context_from_input_leaves() {
