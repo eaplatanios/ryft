@@ -100,17 +100,57 @@ pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
 }
 
 impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
-    /// Creates a new [`Linearization`] from its parts. The caller must uphold the boundary contract documented on
-    /// [`Linearization`] where `primal` produces its outputs followed by its trailing `residual_count` residuals,
-    /// and `tangent` consumes its tangent inputs followed by those same residuals. [`Program::linearize`] is the
-    /// constructing entry point that establishes this contract.
-    #[inline]
+    /// Creates a new [`Linearization`] from its parts, validating the boundary contract documented on [`Linearization`]
+    /// where `primal` produces its primal outputs followed by its trailing `residual_count` residuals, and `tangent`
+    /// consumes one tangent input per primal input followed by those same residuals and produces one tangent output per
+    /// primal output. Violations are reported as [`MalformedProgram`](ProgramError::MalformedProgram) errors: too few
+    /// primal outputs or tangent inputs to hold the residuals, sub-program boundary counts that disagree with each
+    /// other, or a residual whose primal output type differs from its tangent input type. [`Program::linearize`] is the
+    /// function that typically calls this function and constructs [`Linearization`]s.
     pub fn new(
         primal: Program<V, O, Vec<V>, Vec<V>>,
         tangent: Program<V, O, Vec<V>, Vec<V>>,
         residual_count: usize,
-    ) -> Self {
-        Self { primal, tangent, residual_count }
+    ) -> Result<Self, ProgramError> {
+        let primal_output_count = primal.output_ids().len().checked_sub(residual_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "linearization primal program produces {} outputs which is fewer than its {residual_count} residuals",
+                primal.output_ids().len(),
+            ))
+        })?;
+        let tangent_input_count = tangent.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "linearization tangent program consumes {} inputs which is fewer than its {residual_count} residuals",
+                tangent.input_ids().len(),
+            ))
+        })?;
+        if tangent_input_count != primal.input_ids().len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "linearization tangent program consumes {tangent_input_count} tangent inputs \
+                 while the primal program consumes {} inputs",
+                primal.input_ids().len(),
+            )));
+        }
+        if tangent.output_ids().len() != primal_output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "linearization tangent program produces {} outputs \
+                 while the primal program produces {primal_output_count} primal outputs",
+                tangent.output_ids().len(),
+            )));
+        }
+        let primal_residuals = primal.outputs().skip(primal_output_count);
+        let tangent_residuals = tangent.inputs().skip(tangent_input_count);
+        for (index, (residual, input)) in primal_residuals.zip(tangent_residuals).enumerate() {
+            if residual.r#type().as_ref() != input.r#type().as_ref() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "linearization residual {index} has type {} in the primal program \
+                     but type {} in the tangent program",
+                    residual.r#type(),
+                    input.r#type(),
+                )));
+            }
+        }
+        Ok(Self { primal, tangent, residual_count })
     }
 
     /// Returns the nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal
@@ -173,17 +213,11 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
         V::Type: DifferentiableType,
         O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
     {
-        let tangent_input_count = self.tangent.input_ids().len().checked_sub(self.residual_count).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "tangent program has {} inputs which is fewer than its {} residuals",
-                self.tangent.input_ids().len(),
-                self.residual_count,
-            ))
-        })?;
-
         // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
         // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are
-        // not folded into captured factors here.
+        // not folded into captured factors here. The subtraction cannot underflow because `Self::new` validated that
+        // the tangent program consumes at least `residual_count` inputs.
+        let tangent_input_count = self.tangent.input_ids().len() - self.residual_count;
         let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
         self.tangent.transpose_with_respect_to(with_respect_to.as_slice())
     }

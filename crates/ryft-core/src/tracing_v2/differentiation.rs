@@ -757,7 +757,7 @@ where
         }
         tangent_program.output_structure = vec![Placeholder; tangent_program.output_ids.len()];
 
-        Ok(Linearization::new(known_program, tangent_program, residual_count))
+        Linearization::new(known_program, tangent_program, residual_count)
     }
 }
 
