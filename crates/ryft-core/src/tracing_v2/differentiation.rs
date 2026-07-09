@@ -149,10 +149,11 @@ pub trait ForwardModeDifferentiate: Context {
         let output = function(input)?;
 
         // Split each output dual into its known primal value and its tangent. Primal work depends only on the known
-        // primal inputs, so every primal half must have folded to a known value. Tangent halves that are structural
-        // zeros — or that folded to known values, which a map linear in `ẋ` produces only for its constant-zero
-        // components — are restored as staged zeros, so the pushforward program presents the canonical
-        // one-tangent-output-per-primal-output arity (matching `Program::linearize`'s restoration).
+        // primal inputs, so every primal half must have folded to a known value. Structural-zero tangent halves are
+        // restored as staged zeros, so the pushforward program presents the canonical one-tangent-output-per-primal-
+        // output arity (matching `Program::linearize`'s restoration). A value tangent that folded to known is
+        // malformed: a well-formed rule must preserve an input-independent zero as `MaybeZero::Zero`, while accepting
+        // an arbitrary known value would silently turn the pushforward into an affine map.
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
         let staged_zero = |r#type: Self::Type| {
@@ -179,7 +180,13 @@ pub trait ForwardModeDifferentiate: Context {
                     let value = tracer.into_value()?;
                     match value.value() {
                         PartialValue::Unknown(_) => value,
-                        PartialValue::Known(known) => staged_zero(known.r#type().into_owned())?,
+                        PartialValue::Known(_) => {
+                            return Err(ProgramError::MalformedProgram(
+                                "linearization produced a known tangent output; differentiation rules must represent \
+                                 input-independent zero tangents structurally"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 }
                 MaybeZero::Zero(r#type) => staged_zero(r#type)?,

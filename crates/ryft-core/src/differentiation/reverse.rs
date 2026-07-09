@@ -445,19 +445,31 @@ impl<
             Visiting,
             Complete,
         }
-        
+
         /// Helper internal enum for the [`materialize_known`] implementation.
         #[derive(Copy, Clone, PartialEq, Eq)]
         enum MaterializationStep {
-                Visit(AtomId),
-                Replay(usize),
-            }
+            Visit(AtomId),
+            Replay(usize),
+        }
 
         /// Replays the pure producer subgraph of one known atom into the pullback builder using an iterative postorder
         /// traversal. Program inputs are seeded in `known_map` by the caller, constants are copied directly, and all
         /// outputs of a replayed instruction are memoized together so shared producers and sibling results are emitted
         /// only once. `materialization_state` distinguishes scheduled producers from completed ones, both detecting a
         /// malformed cycle and keeping the traversal independent of the native call stack.
+        ///
+        /// # Parameters
+        ///
+        ///   - `program`: Source program containing the known atom and its producer subgraph.
+        ///   - `instruction_by_output`: Source-instruction index for each produced atom, or `None` for atoms
+        ///     without an instruction producer.
+        ///   - `linear`: Per-source-atom mask indicating whether the atom depends on a selected linear input.
+        ///   - `builder`: Destination pullback builder into which demanded pure producers are replayed.
+        ///   - `known_map`: Per-source-atom mapping to an already materialized pullback atom.
+        ///   - `materialization_state`: Per-source-instruction traversal state used for memoization
+        ///      and cycle detection.
+        ///   - `atom`: ID of the known source atom to materialize in the pullback builder.
         fn materialize_known<
             V: Value,
             O: Clone + Operation<V::Type>,

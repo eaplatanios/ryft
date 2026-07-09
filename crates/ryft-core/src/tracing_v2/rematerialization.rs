@@ -36,7 +36,7 @@ use crate::operations::control_flow::MaybeScan;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::tag::MaybeTag;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
@@ -1252,7 +1252,9 @@ where
         + From<AddOperation>
         + TransposableOperation<<D as Domain>::Constant, <D as Domain>::Operation>
         + DifferentiableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>
-        + PartiallyEvaluatableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
+        + DifferentiableOperation<
+            PartialEvaluationContext<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
+        > + PartiallyEvaluatableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
     Vec<D::Type>: Parameterized<
             D::Type,
             Family: ParameterizedFamily<<D as Domain>::Constant> + ParameterizedFamily<DomainTracer<D>>,

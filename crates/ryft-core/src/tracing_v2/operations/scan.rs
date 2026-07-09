@@ -731,8 +731,8 @@ mod tests {
 
     /// The fused JVP rule stages exactly one scan with doubled carries and **no** per-iteration residual stacks:
     /// pure forward mode pays a single loop pass and no reverse-mode storage. Residual stacks appear only when
-    /// [`Program::linearize`] actually splits the fused program (its known scan then stacks the known→unknown
-    /// edges), which the trailing assertion pins.
+    /// [`Program::linearize`] directly differentiates over partial evaluation (its known scan then stacks the
+    /// known→unknown edges), which the trailing assertion pins.
     #[test]
     fn test_scan_jvp_stages_one_fused_scan_with_no_residual_stacks() {
         use crate::contexts::Domain;

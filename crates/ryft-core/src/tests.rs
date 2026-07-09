@@ -1658,10 +1658,11 @@ mod linearization_tests {
         Ok((outputs, tangent_outputs))
     }
 
-    /// Reverse-mode-differentiates `function` at `primals` through the raw linearize-then-transpose pipeline —
-    /// trace, eager `while` unroll, fused JVP known-ness split, primal replay, and partitioned transposition — so
-    /// the packaged [`ReverseModeDifferentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
-    /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
+    /// Reverse-mode-differentiates `function` at `primals` through the raw program pipeline — trace, eager `while`
+    /// unroll, direct program linearization, primal replay, and partition-aware transposition — so the packaged
+    /// closure-level [`ReverseModeDifferentiate::vjp`] surface can be compared against the independently staged
+    /// program-level path. Returns the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and
+    /// the residuals.
     fn vjp_direct<Function>(
         domain: &EagerContext<Scalar, ScalarOperation<Scalar>>,
         function: Function,
@@ -2869,13 +2870,12 @@ mod linearization_tests {
         assert_eq!(values[1].values, vec![3.0]);
     }
 
-    /// Equivalence of the raw context-generic partial-evaluation trace with `Program::linearize`: the fused JVP
-    /// program, partially evaluated with the primals seeded as inputs of a *fresh staging context* and the tangents
-    /// unknown, reproduces the `linearize` split — the primal work folds (stages) into the outer program, the
-    /// residual program is the linear tangent map, and the known feeders are the residual edges. `Program::linearize`
-    /// now *is* this walk (wrapped by `Program::partition` plus canonical-arity restoration), so
-    /// the test pins that the packaged entry point and a hand-driven walk agree value-for-value: interpreting both
-    /// splits at concrete primals and tangents yields identical primal outputs and identical tangents.
+    /// Equivalence of the raw context-generic partial-evaluation trace with `Program::linearize`: partially evaluating
+    /// a fused JVP with primals seeded as inputs of a *fresh staging context* and tangents unknown reproduces the same
+    /// split — primal work folds into the outer program, the residual program is the linear tangent map, and known
+    /// feeders are residual edges. `Program::linearize` now obtains that split directly by composing differentiation
+    /// over partial evaluation rather than constructing this fused intermediary. The test pins their semantic
+    /// equivalence: interpreting both splits at concrete primals and tangents yields identical results.
     #[test]
     fn test_staging_partial_evaluation_reproduces_the_linearize_split() {
         use crate::contexts::StagingContext;
@@ -2892,7 +2892,7 @@ mod linearization_tests {
             Ok(vec![inputs[0].sin()? * inputs[1].clone(), inputs[0].clone() * inputs[0].clone() + inputs[1].clone()])
         };
 
-        // Reference: the partition-based `Program::linearize` split.
+        // Reference: the direct `Program::linearize` split.
         let input_types = primals.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let (_, primal_program) = NestedTracingContext::trace(domain.clone(), function, input_types).unwrap();
         let primal_program = primal_program.into_simplified().unwrap();
@@ -3146,10 +3146,11 @@ mod array_linearization_tests {
         Ok((outputs, tangent_outputs))
     }
 
-    /// Reverse-mode-differentiates `function` at `primals` through the raw linearize-then-transpose pipeline —
-    /// trace, eager `while` unroll, fused JVP known-ness split, primal replay, and partitioned transposition — so
-    /// the packaged [`ReverseModeDifferentiate::vjp`] surface can be compared against the pipeline it wraps. Returns
-    /// the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and the residuals.
+    /// Reverse-mode-differentiates `function` at `primals` through the raw program pipeline — trace, eager `while`
+    /// unroll, direct program linearization, primal replay, and partition-aware transposition — so the packaged
+    /// closure-level [`ReverseModeDifferentiate::vjp`] surface can be compared against the independently staged
+    /// program-level path. Returns the flat primal outputs, the pullback over `(output_cotangents ++ residuals)`, and
+    /// the residuals.
     fn vjp_direct<Function>(
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
         function: Function,

@@ -1430,7 +1430,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::batching::Batch;
-    use crate::contexts::EagerContext;
+    use crate::contexts::{Context, EagerContext};
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
@@ -1711,6 +1711,19 @@ mod tests {
             .unwrap()
     }
 
+    /// Builds the malformed rule `jvp(x, dx) = (sin(x), 1)`. Its tangent ignores `dx` and is therefore an affine
+    /// constant rather than a linear tangent map.
+    fn scalar_known_tangent_jvp_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
+        let mut builder = ProgramBuilder::new();
+        let x = builder.add_input(DataType::F64);
+        builder.add_input(DataType::F64);
+        let y = builder.add_instruction(SinOperation, vec![x]).unwrap()[0];
+        let tangent = builder.add_constant(Scalar::from(1.0));
+        builder
+            .build(vec![y, tangent], vec![Placeholder, Placeholder], vec![Placeholder, Placeholder])
+            .unwrap()
+    }
+
     /// Builds the scalar forward rule `forward(x) = (sin(x), cos(x))`, with the cosine as the residual.
     fn scalar_sin_forward_program() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
         let mut builder = ProgramBuilder::new();
@@ -1748,6 +1761,35 @@ mod tests {
         assert_scalar_close(primal, 2.0f64.sin());
         // The custom rule doubles the true derivative, proving it is in control.
         assert_scalar_close(tangent, 2.0 * 2.0f64.cos());
+    }
+
+    #[test]
+    fn test_linearization_rejects_known_custom_jvp_tangents() {
+        let operation = ScalarOperation::CustomJvp(Box::new(
+            CustomJvpOperation::new(scalar_sin_program(), scalar_known_tangent_jvp_program()).unwrap(),
+        ));
+        let expected = "linearization produced a known tangent output; differentiation rules must represent \
+                        input-independent zero tangents structurally";
+
+        // Program-level direct linearization must reject the malformed rule rather than silently replacing its
+        // constant tangent with zero.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_instruction(operation.clone(), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(program.linearize(), Err(ProgramError::MalformedProgram(message)) if message == expected));
+
+        // Value-level direct linearization enforces the same rule contract before exposing a reusable pushforward.
+        let result = EagerContext::<Scalar, ScalarOperation<Scalar>>::new().linearize(
+            |input| {
+                let mut outputs = input.context().bind(operation, &[input.clone()])?;
+                Ok(outputs.remove(0))
+            },
+            Scalar::from(2.0),
+        );
+        assert!(matches!(result, Err(ProgramError::MalformedProgram(message)) if message == expected));
     }
 
     #[test]
