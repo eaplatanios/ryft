@@ -344,12 +344,24 @@ impl<
     /// structured form. Disconnected selected inputs are emitted as [`ZeroOperation`]s, exactly as in
     /// [`transpose`](Self::transpose).
     ///
-    /// Known operand values are program inputs and constants. Each known input is exposed as a pullback input and each
-    /// constant atom as a pullback constant, so a bilinear rule can read either as the known operand's pullback value.
-    /// When a transpose rule requests a known *intermediate*, its pure producer subgraph is replayed lazily in the
-    /// pullback and cached there, so repeated uses share one rebuilt value. Effectful known producers are rejected:
-    /// replaying one in the pullback could duplicate or reorder an effect that belongs on the primal side, and callers
-    /// must instead partial-evaluate the program so that the value crosses the linear boundary as a residual input.
+    /// # Known Intermediates and Rematerialization
+    ///
+    /// The normal differentiation path linearizes and partially evaluates before transposition. Values computed only
+    /// from primals then cross the linear boundary as residual inputs, and so transposing such a normalized pushforward
+    /// does **not** rebuild their producer instructions in the pullback. This method nevertheless accepts a hand-built
+    /// or otherwise unnormalized linear program whose live transpose rules read internal known values. For such a
+    /// value, transposition lazily copies the demanded, pure known-producer ancestor subgraph into the generated
+    /// pullback. This is _rematerialization_: the copied instructions execute every time the pullback is interpreted,
+    /// trading saved residuals for recomputation. Only ancestors of a known value actually demanded by a live transpose
+    /// rule are copied; dead known instructions and dead constants remain absent. Each source producer is copied at
+    /// most once, all of its output atoms are memoized together, and every later consumer reuses those mapped outputs.
+    /// The producer walk is iterative, so its call-stack usage does not grow with producer-chain depth. This behavior
+    /// is a correctness fallback, and not an implicit recommendation to rematerialize hot or expensive primal work.
+    /// Callers that want predictable pullback cost should partially evaluate and carry such values as residual inputs.
+    /// Effectful known producers are never copied. Replaying one in the pullback could duplicate, omit, or reorder an
+    /// effect that belongs on the primal side, so this method returns [`ProgramError::UnsupportedOperation`] and asks
+    /// the caller to partial-evaluate that value into a residual input. Known program inputs are always exposed as
+    /// pullback inputs, while literal constants are copied lazily under the same demand-driven policy.
     ///
     /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
     /// per program output, walks this program in reverse instruction order applying each [`Operation`]'s
@@ -426,9 +438,26 @@ impl<
             Ok(())
         }
 
-        /// Replays the pure producer subgraph of one known atom into the pullback builder. Program inputs are seeded
-        /// in `known_map` by the caller, constants are copied directly, and instruction outputs are memoized together
-        /// so requesting two results of one producer never replays that producer twice.
+        /// Helper internal enum for the [`materialize_known`] implementation.
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum MaterializationState {
+            Unseen,
+            Visiting,
+            Complete,
+        }
+        
+        /// Helper internal enum for the [`materialize_known`] implementation.
+        #[derive(Copy, Clone, PartialEq, Eq)]
+        enum MaterializationStep {
+                Visit(AtomId),
+                Replay(usize),
+            }
+
+        /// Replays the pure producer subgraph of one known atom into the pullback builder using an iterative postorder
+        /// traversal. Program inputs are seeded in `known_map` by the caller, constants are copied directly, and all
+        /// outputs of a replayed instruction are memoized together so shared producers and sibling results are emitted
+        /// only once. `materialization_state` distinguishes scheduled producers from completed ones, both detecting a
+        /// malformed cycle and keeping the traversal independent of the native call stack.
         fn materialize_known<
             V: Value,
             O: Clone + Operation<V::Type>,
@@ -440,48 +469,90 @@ impl<
             linear: &[bool],
             builder: &Rc<RefCell<ProgramBuilder<V, O>>>,
             known_map: &mut [Option<AtomId>],
+            materialization_state: &mut [MaterializationState],
             atom: AtomId,
         ) -> Result<AtomId, ProgramError> {
-            if let Some(mapped) = known_map.get(atom.index()).copied().flatten() {
-                return Ok(mapped);
-            }
-            if *linear.get(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })? {
-                return Err(ProgramError::MalformedProgram(
-                    "a linear atom was requested as a known transpose operand".to_string(),
-                ));
-            }
-            let source = program.atoms().get(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })?;
-            if let Atom::Constant(value) = source {
-                let mapped = builder.borrow_mut().add_constant(value.clone());
-                known_map[atom.index()] = Some(mapped);
-                return Ok(mapped);
-            }
-            let instruction_index = instruction_by_output.get(atom.index()).copied().flatten().ok_or_else(|| {
-                ProgramError::MalformedProgram("known variable atom has no owning instruction".into())
-            })?;
-            let instruction = program
-                .instructions()
-                .get(instruction_index)
-                .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
-            if !instruction.operation().effects().is_pure() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "partition-aware transpose cannot replay effectful known intermediate producer `{}`; \
-                         partial-evaluate it into a residual input first",
-                        instruction.operation().name(),
-                    ),
-                });
-            }
-            let inputs = instruction
-                .inputs()
-                .iter()
-                .copied()
-                .map(|input| materialize_known(program, instruction_by_output, linear, builder, known_map, input))
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs = builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs)?.to_vec();
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-            for (source, mapped) in instruction.outputs().iter().copied().zip(outputs) {
-                known_map[source.index()] = Some(mapped);
+            let mut steps = vec![MaterializationStep::Visit(atom)];
+            while let Some(step) = steps.pop() {
+                match step {
+                    MaterializationStep::Visit(current) => {
+                        if known_map.get(current.index()).copied().flatten().is_some() {
+                            continue;
+                        }
+                        if *linear.get(current.index()).ok_or(ProgramError::UnboundAtomId { id: current })? {
+                            return Err(ProgramError::MalformedProgram(
+                                "a linear atom was requested as a known transpose operand".to_string(),
+                            ));
+                        }
+                        let source =
+                            program.atoms().get(current.index()).ok_or(ProgramError::UnboundAtomId { id: current })?;
+                        if let Atom::Constant(value) = source {
+                            let mapped = builder.borrow_mut().add_constant(value.clone());
+                            known_map[current.index()] = Some(mapped);
+                            continue;
+                        }
+                        let instruction_index =
+                            instruction_by_output.get(current.index()).copied().flatten().ok_or_else(|| {
+                                ProgramError::MalformedProgram("known variable atom has no owning instruction".into())
+                            })?;
+                        let instruction = program
+                            .instructions()
+                            .get(instruction_index)
+                            .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
+                        if !instruction.operation().effects().is_pure() {
+                            return Err(ProgramError::UnsupportedOperation {
+                                message: format!(
+                                    "partition-aware transpose cannot replay effectful known intermediate producer \
+                                     `{}`; partial-evaluate it into a residual input first",
+                                    instruction.operation().name(),
+                                ),
+                            });
+                        }
+                        match materialization_state.get_mut(instruction_index).ok_or_else(|| {
+                            ProgramError::MalformedProgram("known atom producer state is missing".into())
+                        })? {
+                            state @ MaterializationState::Unseen => *state = MaterializationState::Visiting,
+                            MaterializationState::Visiting => {
+                                return Err(ProgramError::MalformedProgram(
+                                    "known intermediate producer graph contains a cycle".into(),
+                                ));
+                            }
+                            MaterializationState::Complete => {
+                                return Err(ProgramError::MalformedProgram(
+                                    "materialized known producer output was not remapped".into(),
+                                ));
+                            }
+                        }
+                        steps.push(MaterializationStep::Replay(instruction_index));
+                        steps.extend(instruction.inputs().iter().rev().copied().map(MaterializationStep::Visit));
+                    }
+                    MaterializationStep::Replay(instruction_index) => {
+                        let instruction = program
+                            .instructions()
+                            .get(instruction_index)
+                            .ok_or_else(|| ProgramError::MalformedProgram("known atom producer is missing".into()))?;
+                        let inputs = instruction
+                            .inputs()
+                            .iter()
+                            .map(|input| {
+                                known_map.get(input.index()).copied().flatten().ok_or_else(|| {
+                                    ProgramError::MalformedProgram(
+                                        "known producer input was not remapped before replay".into(),
+                                    )
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let outputs =
+                            builder.borrow_mut().add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+                        check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+                        for (source, mapped) in instruction.outputs().iter().copied().zip(outputs) {
+                            known_map[source.index()] = Some(mapped);
+                        }
+                        *materialization_state.get_mut(instruction_index).ok_or_else(|| {
+                            ProgramError::MalformedProgram("known atom producer state is missing".into())
+                        })? = MaterializationState::Complete;
+                    }
+                }
             }
             known_map
                 .get(atom.index())
@@ -563,6 +634,7 @@ impl<
         // Constants and pure known intermediates are materialized lazily below, only when a live transpose rule
         // needs them. This avoids copying dead constants and replaying dead known-side work into the pullback.
         let instruction_by_output = self.instruction_by_output();
+        let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
         // Walk the primal program backward, applying each operation's transpose rule only when at least one of its
         // outputs has a non-zero accumulated cotangent. The scratch vector avoids allocating a fresh cotangent vector
@@ -614,7 +686,7 @@ impl<
             // input/operand becomes a self-describing `PartialValue`: a linear operand is `Unknown` of its type (the
             // rule produces a cotangent of that type), and a known operand is `Known` of the tracer reading its
             // pullback value atom from `known_map`. Known inputs are seeded above, constants are copied lazily, and
-            // pure known intermediates recursively replay their producer subgraphs exactly once before the rule runs.
+            // pure known intermediates iteratively replay their producer subgraphs exactly once before the rule runs.
             let inputs = instruction
                 .inputs()
                 .iter()
@@ -635,6 +707,7 @@ impl<
                             linear.as_slice(),
                             &builder,
                             known_map.as_mut_slice(),
+                            materialization_state.as_mut_slice(),
                             input,
                         )?;
                         Ok(PartialValue::Known(context.tracer(atom, Some(r#type))))
@@ -1185,6 +1258,41 @@ mod tests {
         let outputs = pullback.interpret(vec![Scalar::F64(100.0), Scalar::F64(2.0), Scalar::F64(3.0)]).unwrap();
         assert_eq!(outputs, vec![Scalar::F64(18.0)]);
 
+        // Two live transpose rules that demand the same pure known intermediate must share one rematerialized producer.
+        // The pullback contains one `identity`, not one copy per `add` consumer, and both linear inputs still receive
+        // their corresponding output cotangents.
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let known = builder.add_input(DataType::F64);
+        let first_linear = builder.add_input(DataType::F64);
+        let second_linear = builder.add_input(DataType::F64);
+        let known_intermediate = builder.add_instruction(TestLinearOperation::Identity, vec![known]).unwrap()[0];
+        let first_output =
+            builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, first_linear]).unwrap()[0];
+        let second_output =
+            builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, second_linear]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(
+                vec![first_output, second_output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder, Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
+        assert_eq!(
+            pullback
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(instruction.operation(), TestLinearOperation::Identity))
+                .count(),
+            1,
+            "a shared pure known producer must be replayed exactly once",
+        );
+        assert_eq!(
+            pullback.output_ids(),
+            &pullback.input_ids()[..2],
+            "each linear input must receive its corresponding output cotangent",
+        );
+
         // Replaying a known producer with observable effects in the pullback could duplicate or reorder that effect,
         // so the partition-aware transpose must require partial evaluation to residualize the value instead.
         let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
@@ -1201,5 +1309,36 @@ mod tests {
             Err(ProgramError::UnsupportedOperation { message })
                 if message.contains("cannot replay effectful known intermediate producer `effectful_identity`"),
         ));
+    }
+
+    #[test]
+    fn test_program_transpose_deep_known_chain_iteratively() {
+        // This chain is intentionally much deeper than realistic scalar code. Materializing its tail exercises the
+        // explicit postorder work stack and would make a recursive implementation consume one native stack frame per
+        // producer. Keep the assertion structural so the test characterizes transformation behavior independently of
+        // any interpretation backend.
+        const CHAIN_LENGTH: usize = 10_000;
+
+        let mut builder = ProgramBuilder::<Scalar, TestLinearOperation>::new();
+        let known = builder.add_input(DataType::F64);
+        let linear = builder.add_input(DataType::F64);
+        let mut known_intermediate = known;
+        for _ in 0..CHAIN_LENGTH {
+            known_intermediate =
+                builder.add_instruction(TestLinearOperation::Identity, vec![known_intermediate]).unwrap()[0];
+        }
+        let output = builder.add_instruction(TestLinearOperation::Add, vec![known_intermediate, linear]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Scalar>(vec![output], vec![Placeholder, Placeholder], Placeholder)
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            pullback
+                .instructions()
+                .iter()
+                .filter(|instruction| matches!(instruction.operation(), TestLinearOperation::Identity))
+                .count(),
+            CHAIN_LENGTH,
+        );
     }
 }
