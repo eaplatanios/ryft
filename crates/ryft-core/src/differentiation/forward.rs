@@ -135,7 +135,7 @@ pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type>
     /// Builds the *fused* JVP [`Program`] of `program`. Interpreting the provided program as a function `x ↦ y = f(x)`
     /// over its flattened inputs and outputs, the returned program computes `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ) = (y, ẏ)`
     /// over the flat boundary `[x₁, …, xₙ, ẋ₁, …, ẋₙ] ↦ [y₁, …, yₘ, ẏ₁, …, ẏₘ]`, without splitting it into primal and
-    /// tangent halves. Refer to [`Program::jvp`] for the full contract. This is what the fused higher-order JVP rules
+    /// tangent halves. Refer to [`Program::jvp`] for more information. This is what the fused higher-order JVP rules
     /// (e.g., `scan`, `condition`, etc.) stage as their nested JVP bodies. Keeping the body fused defers the
     /// primal/tangent separation to the partial-evaluation known-ness split that [`Program::linearize`] performs,
     /// and so pure forward mode stages no residual stacks and pays the cost of only a single pass.
@@ -144,39 +144,27 @@ pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type>
     ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Represents closed [`Operation`] families whose captured flat programs can be linearized capture-free on behalf of
-/// an enclosing rule.
-///
-/// This is the split-form sibling of [`DifferentiableProgramOperation`]: where that witness builds the fused jvp
+/// Represents closed [`Operation`] families whose captured [`Program`]s can be _linearized_ on behalf of an enclosing
+/// rule. This is the split-form sibling of [`DifferentiableProgramOperation`]: where that witness builds the fused JVP
 /// program `(x, ẋ) ↦ (y, ẏ)`, this one additionally splits it through the partial-evaluation known-ness split into a
-/// [`Linearization`] holding the primal (known) sub-program `x ↦ (y, r)` — where the residuals `r` are the
-/// intermediate values the derivative is evaluated at — and the tangent (unknown) sub-program
-/// `(ẋ, r) ↦ ẏ = (∂f/∂x)(x) · ẋ`, which is linear in `ẋ`. Refer to
-/// [`Program::linearize`] for the full contract.
+/// [`Linearization`] holding the primal (i.e., known) sub-program `x ↦ (y, r)`, where the residuals `r` are the
+/// intermediate values the derivative is evaluated at, and the tangent (i.e., unknown) sub-program
+/// `(ẋ, r) ↦ ẏ = (∂f/∂x)(x) · ẋ`, which is linear in `ẋ`. Refer to [`Program::linearize`] for more information.
 ///
-/// It breaks the same recursive fixed point the same way as [`DifferentiableProgramOperation`]: a closed operation
-/// enum implements it directly, calling [`Program::linearize`] in the body while spelling
-/// only the *leaf* closure of capabilities that body needs, so a higher-order rule can require
-/// `Self: LinearizableProgramOperation<V, Self>` without the trait solver re-entering the enum's own
-/// [`DifferentiableOperation`] obligation. The bounded `while` rule uses it because a loop must stack per-iteration
-/// residuals for its tangent map to replay; the fused forward-mode rules that keep their bodies un-split depend on
-/// [`DifferentiableProgramOperation`] instead.
+/// It breaks the same recursive fixed point the same way as [`DifferentiableProgramOperation`]. A closed operation
+/// enum implements it directly, calling [`Program::linearize`] in the body while spelling only the *leaf* closure of
+/// capabilities that body needs, so that a higher-order rule can require `Self: LinearizableProgramOperation<V, Self>`
+/// without the trait solver re-entering the enum's own [`DifferentiableOperation`] obligation. For example, the bounded
+/// `while` rule uses it because a loop must stack per-iteration residuals for its tangent map to replay. The fused
+/// forward-mode rules that keep their bodies un-split depend on [`DifferentiableProgramOperation`] instead.
 ///
 /// Like [`DifferentiableProgramOperation`], it is implemented explicitly per operation enum rather than through a
-/// blanket impl, which would reintroduce the recursion it exists to break. The value type `V` (whose carried type
-/// descriptor types the programs) and operation family `O` match the primal program being linearized.
+/// blanket implementation, which would reintroduce the recursion it exists to break.
 pub trait LinearizableProgramOperation<V: Value, O: Clone + Operation<V::Type> + From<ZeroOperation<V::Type>>>:
     Clone + Operation<V::Type> + Sized
 {
-    /// Linearizes `program` capture-free, splitting its fused jvp form `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ)` into the
-    /// primal sub-program `x ↦ (y, r)` and the linear tangent sub-program `(ẋ, r) ↦ ẏ`; refer to
-    /// [`Program::linearize`] for the returned packaging.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Already-traced flat sub-program over this operation family, with [`Vec`]-parameterized inputs
-    ///     and outputs.
+    /// Linearizes `program`, splitting its fused jvp form `(x, ẋ) ↦ (f(x), (∂f/∂x)(x) · ẋ)` into the primal sub-program
+    /// `x ↦ (y, r)` and the linear tangent sub-program `(ẋ, r) ↦ ẏ`. Refer to [`Program::linearize`] for more
+    /// information.
     fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 }

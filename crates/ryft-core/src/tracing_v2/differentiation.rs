@@ -936,6 +936,46 @@ pub struct Linearization<V: Value, O: Clone + Operation<V::Type>> {
     pub residual_count: usize,
 }
 
+impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
+    /// Transposes this [`Linearization`]'s [`tangent_program`](Self::tangent_program) into the reverse-mode pullback
+    /// program directly, without re-keying it into a linear operation enum. It is the derived third member of this
+    /// [`Linearization`]'s program family, alongside the stored [`primal_program`](Self::primal_program) and
+    /// [`tangent_program`](Self::tangent_program).
+    ///
+    /// Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured factor (for
+    /// example, folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding the
+    /// consuming residual value, this function leaves the tangent sub-program in the primal operation family `O` and
+    /// transposes it through
+    /// [`Program::transpose_with_respect_to`](crate::Program::transpose_with_respect_to). The tangent sub-program's
+    /// inputs are `[tangents..., residuals...]`, so the partition mask marks the leading `tangent_input_count` inputs
+    /// linear and the trailing [`residual_count`](Self::residual_count) inputs known. Partition-aware transposition
+    /// then threads each known residual through to the pullback as a pullback input (consumed by the adjoint operation
+    /// that the bilinear operation's transpose rule stages), rather than folding it into a captured factor. The
+    /// returned pullback program is therefore over the primal operation family `O` and maps
+    /// `(output_cotangents ++ residuals)` to the cotangents of the linear tangent inputs only.
+    pub fn pullback_program(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+    where
+        V::Type: DifferentiableType,
+        O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
+    {
+        let tangent_program = &self.tangent_program;
+        let residual_count = self.residual_count;
+        let tangent_input_count = tangent_program.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "tangent program has {} inputs which is fewer than its {} residuals",
+                tangent_program.input_ids().len(),
+                residual_count,
+            ))
+        })?;
+
+        // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
+        // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are not
+        // folded into captured factors here.
+        let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
+        tangent_program.transpose_with_respect_to(with_respect_to.as_slice())
+    }
+}
+
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
 where
     T: Type,
@@ -1118,46 +1158,6 @@ where
             output_unknowns: [vec![false; primal_output_count], vec![true; primal_output_count]].concat(),
             residual_count,
         })
-    }
-}
-
-impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
-    /// Transposes this [`Linearization`]'s [`tangent_program`](Self::tangent_program) into the reverse-mode pullback
-    /// program directly, without re-keying it into a linear operation enum. It is the derived third member of this
-    /// [`Linearization`]'s program family, alongside the stored [`primal_program`](Self::primal_program) and
-    /// [`tangent_program`](Self::tangent_program).
-    ///
-    /// Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured factor (for
-    /// example, folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding the
-    /// consuming residual value, this function leaves the tangent sub-program in the primal operation family `O` and
-    /// transposes it through
-    /// [`Program::transpose_with_respect_to`](crate::Program::transpose_with_respect_to). The tangent sub-program's
-    /// inputs are `[tangents..., residuals...]`, so the partition mask marks the leading `tangent_input_count` inputs
-    /// linear and the trailing [`residual_count`](Self::residual_count) inputs known. Partition-aware transposition
-    /// then threads each known residual through to the pullback as a pullback input (consumed by the adjoint operation
-    /// that the bilinear operation's transpose rule stages), rather than folding it into a captured factor. The
-    /// returned pullback program is therefore over the primal operation family `O` and maps
-    /// `(output_cotangents ++ residuals)` to the cotangents of the linear tangent inputs only.
-    pub fn pullback_program(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
-    where
-        V::Type: DifferentiableType,
-        O: TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
-    {
-        let tangent_program = &self.tangent_program;
-        let residual_count = self.residual_count;
-        let tangent_input_count = tangent_program.input_ids().len().checked_sub(residual_count).ok_or_else(|| {
-            ProgramError::MalformedProgram(format!(
-                "tangent program has {} inputs which is fewer than its {} residuals",
-                tangent_program.input_ids().len(),
-                residual_count,
-            ))
-        })?;
-
-        // Transpose with respect to the leading tangent inputs, holding the trailing residual inputs as known
-        // parameters. Partial transposition exposes each known residual as a pullback input, so the residuals are not
-        // folded into captured factors here.
-        let with_respect_to = (0..tangent_input_count).collect::<Vec<_>>();
-        tangent_program.transpose_with_respect_to(with_respect_to.as_slice())
     }
 }
 
