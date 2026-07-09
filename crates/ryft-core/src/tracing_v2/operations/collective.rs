@@ -509,10 +509,10 @@ where
 {
     fn partially_evaluate(
         &self,
-        evaluator: &mut crate::partial::PartialEvaluator<C>,
+        context: &crate::partial::PartialEvaluationContext<C>,
         inputs: &[crate::partial::PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<crate::partial::PartialEvaluationValue<C::Value>>, ProgramError> {
-        evaluator.residualize(self.clone(), inputs)
+        context.residualize(self.clone(), inputs)
     }
 }
 
@@ -707,7 +707,7 @@ mod tests {
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::{NestedTracer, value_and_gradient};
+        use crate::tracing_v2::{LinearizationTracer, value_and_gradient};
 
         // `g(x) = psum_i(x)`: the vmapped `psum` over the mapped axis `"i"` consumes that axis, producing the
         // replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
@@ -715,9 +715,9 @@ mod tests {
         // for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
         let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+            |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                 let context = x.context().clone();
-                let total: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                let total: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                     &context,
                     |item| item.collective("i", CollectiveKind::PSum),
                     x,
@@ -742,7 +742,7 @@ mod tests {
         use crate::contexts::EagerContext;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
-        use crate::tracing_v2::{NestedTracer, value_and_gradient};
+        use crate::tracing_v2::{LinearizationTracer, value_and_gradient};
 
         // `g(x) = pmean_i(x)`: the vmapped `pmean` over the mapped axis `"i"` consumes that axis, producing the
         // replicated mean `M = (1/N)·Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through the
@@ -751,9 +751,9 @@ mod tests {
         // scaling that distinguishes `pmean` from `psum`.
         let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-            |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+            |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                 let context = x.context().clone();
-                let mean: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                let mean: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                     &context,
                     |item| item.collective("i", CollectiveKind::PMean),
                     x,

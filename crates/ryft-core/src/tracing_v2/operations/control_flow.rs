@@ -2103,7 +2103,7 @@ mod tests {
             .vjp(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -2140,10 +2140,8 @@ mod tests {
         let (value, gradient) = StagedDispatchTestArrayDomain
             .value_and_gradient(
                 move |x| {
-                    let mut outputs = x
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])
-                        .unwrap();
+                    let mut outputs =
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(1.0),
@@ -2165,7 +2163,7 @@ mod tests {
             .vjp(
                 move |x| {
                     let mut outputs =
-                        x.context().stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])?;
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(2.0),
@@ -2186,10 +2184,8 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
-                    let mut outputs = x
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])
-                        .unwrap();
+                    let mut outputs =
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(2.0),
@@ -2233,14 +2229,12 @@ mod tests {
         let (value, gradient) = StagedDispatchTestArrayDomain
             .value_and_gradient(
                 move |x| {
-                    let mut outputs = x
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])
-                        .unwrap();
+                    let mut outputs =
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     let state = outputs.remove(0);
                     let mut outputs = state
                         .context()
-                        .stage_operation(ReduceOperation::new(vec![0], ReductionKind::Sum), &[&state])
+                        .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), &[state.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -2259,10 +2253,8 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
-                    let mut outputs = x
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])
-                        .unwrap();
+                    let mut outputs =
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(1.0),
@@ -2288,10 +2280,8 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
-                    let mut outputs = x
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])
-                        .unwrap();
+                    let mut outputs =
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(2.0),
@@ -2304,10 +2294,8 @@ mod tests {
         let (value, gradient) = StagedDispatchTestArrayDomain
             .value_and_gradient(
                 move |x| {
-                    let mut outputs = x
-                        .context()
-                        .stage_operation(TestArrayOperation::While(Box::new(while_operation)), &[&x])
-                        .unwrap();
+                    let mut outputs =
+                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(2.0),

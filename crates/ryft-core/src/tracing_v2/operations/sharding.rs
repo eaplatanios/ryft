@@ -195,7 +195,7 @@ mod tests {
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
-    use crate::tracing_v2::NestedTracer;
+    use crate::tracing_v2::LinearizationTracer;
     use crate::tracing_v2::differentiation::Differentiate;
 
     fn mesh() -> LogicalMesh {
@@ -229,7 +229,9 @@ mod tests {
             .vjp(
                 {
                     let target = target.clone();
-                    move |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.reshard(&target))
+                    move |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                        Ok(x.reshard(&target))
+                    }
                 },
                 input,
             )
@@ -256,7 +258,9 @@ mod tests {
             .vjp(
                 {
                     let target = target.clone();
-                    move |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| Ok(x.reshard(&target))
+                    move |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                        Ok(x.reshard(&target))
+                    }
                 },
                 TestArray::vector(vec![1.0; 8]),
             )
@@ -310,7 +314,7 @@ mod tests {
             .vjp(
                 {
                     let hint = hint.clone();
-                    move |x: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
+                    move |x: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>>| {
                         Ok(x.constrain_sharding(&hint))
                     }
                 },

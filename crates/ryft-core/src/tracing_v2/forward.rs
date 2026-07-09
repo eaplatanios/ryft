@@ -2,7 +2,6 @@
 mod tests {
     use crate::contexts::StagingContext;
     use crate::contexts::{Domain, EagerContext};
-    use crate::differentiation::DifferentiationError;
     use crate::operations::arithmetic::Add;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized};
@@ -87,13 +86,13 @@ mod tests {
     }
 
     #[test]
-    fn primal_program_trace_rejects_mismatched_program_builder_outputs() {
-        // The reverse-mode tracing prologue performs the same boundary check on the closure's outputs, so a foreign
-        // nested tracer smuggled out of a differentiated closure is rejected instead of aliasing a local atom.
+    fn nested_trace_rejects_mismatched_program_builder_outputs() {
+        // The nested trace performs the same boundary check on the closure's outputs, so a foreign nested tracer
+        // smuggled out of a traced closure is rejected instead of aliasing a local atom.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let foreign_context = NestedTracingContext::new(domain.clone());
         let foreign = foreign_context.input(DataType::F64);
-        let result = domain.gradient(move |_input| foreign, Scalar::from(1.0));
-        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
+        let result = NestedTracingContext::trace(domain, move |_input| Ok(vec![foreign]), vec![DataType::F64]);
+        assert!(matches!(result, Err(ProgramError::MismatchedProgramBuilders)));
     }
 }

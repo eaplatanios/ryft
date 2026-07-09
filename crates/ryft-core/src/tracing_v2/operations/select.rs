@@ -284,6 +284,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::operations::arithmetic::Add;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
@@ -294,17 +295,21 @@ mod tests {
 
     use super::LinearSelectOperation;
 
-    /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged tracers of any context with [`TestArray`] semantics.
-    fn piecewise_select<C>(x: crate::tracing::Tracer<C>) -> crate::tracing::Tracer<C>
+    /// `f(x) = select(x > 0, 2x, 3x)` expressed over staged or differentiation-dual values of any context with
+    /// [`TestArray`] semantics.
+    fn piecewise_select<V>(x: V) -> V
     where
-        C: crate::contexts::StagingContext<
+        V: crate::programs::Value<Type = crate::types::ArrayType>,
+        V::DispatchDomain: crate::contexts::Context<
                 Type = crate::types::ArrayType,
                 Constant = TestArray,
                 Operation = crate::tracing_v2::ArrayOperation<TestArray>,
             >,
     {
         let mask = x.compare(&x.zero_like(), ComparisonDirection::GreaterThan).unwrap();
-        Select::select(&mask, &(x.clone() + x.clone()), &(x.clone() + x.clone() + x)).unwrap()
+        let doubled = x.add(&x).unwrap();
+        let tripled = doubled.add(&x).unwrap();
+        Select::select(&mask, &doubled, &tripled).unwrap()
     }
 
     #[test]

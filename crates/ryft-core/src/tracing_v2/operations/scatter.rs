@@ -191,24 +191,24 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::Context;
     use crate::contexts::EagerContext;
-    use crate::contexts::StagingContext;
     use crate::operations::manipulation::{Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
     use crate::tests::TestArray;
-    use crate::tracing::Tracer;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, value_and_gradient};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
-    /// Lifts a constant integer index array into the differentiation trace that `exemplar` belongs to.
-    fn index_array<C>(exemplar: &Tracer<C>, shape: Vec<usize>, values: Vec<f64>) -> Tracer<C>
+    /// Lifts a constant integer index array into the trace or differentiation context that `exemplar` belongs to.
+    fn index_array<V>(exemplar: &V, shape: Vec<usize>, values: Vec<f64>) -> V
     where
-        C: StagingContext<Constant = TestArray>,
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain: crate::contexts::Context<Constant = TestArray>,
     {
         let r#type = ArrayType::new(DataType::I32, Shape::new(shape.into_iter().map(Size::Static).collect()));
-        exemplar.context().constant(TestArray::new(r#type, values))
+        exemplar.dispatch_domain().lift(TestArray::new(r#type, values)).unwrap()
     }
 
     #[test]
@@ -244,7 +244,7 @@ mod tests {
             .jacfwd(
                 |x| {
                     let indices = index_array(&x, vec![2, 1], vec![1.0, 3.0]);
-                    let updates = x.context().constant(TestArray::vector(vec![10.0, 20.0]));
+                    let updates = x.context().lift(TestArray::vector(vec![10.0, 20.0]))?;
                     let operation = ScatterOperation::new(
                         ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
                         ScatterReductionKind::Add,

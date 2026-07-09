@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::contexts::{Context, StagingContext};
+use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
 use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
 use crate::effects::{Effect, Effects};
@@ -113,10 +113,20 @@ pub trait Print: Sized {
     fn print(self, label: &str) -> Self;
 }
 
-impl<C: StagingContext<Operation: From<PrintOperation>>> Print for Tracer<C> {
+/// Any context-carrying value prints by binding a [`PrintOperation`] through its own context. The
+/// `From<PrintOperation>` bound makes this disjoint from the eager value types (whose context operation is
+/// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers
+/// without conflicting with concrete implementations.
+impl<V: Value> Print for V
+where
+    V::DispatchDomain: Context<Operation: From<PrintOperation>>,
+{
     #[inline]
     fn print(self, label: &str) -> Self {
-        self.unary(PrintOperation::new(label))
+        self.dispatch_domain()
+            .bind(PrintOperation::new(label), std::slice::from_ref(&self))
+            .expect("`print` operation failed")
+            .remove(0)
     }
 }
 

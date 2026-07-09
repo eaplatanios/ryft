@@ -578,18 +578,22 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::test_util::assert_close;
-    use crate::tracing_v2::{DifferentiableDomainExtension, NestedTracer, value_and_gradient};
+    use crate::tracing_v2::{DifferentiableDomainExtension, LinearizationTracer, value_and_gradient};
     use crate::types::DataType;
 
     use super::*;
     use crate::batching::BatchAxis;
 
-    /// Lifts a scalar `i32` index constant into the differentiation trace that `exemplar` belongs to.
-    fn index_constant<C>(exemplar: &crate::tracing::Tracer<C>, value: f64) -> crate::tracing::Tracer<C>
+    /// Lifts a scalar `i32` index constant into the trace or differentiation context that `exemplar` belongs to.
+    fn index_constant<V>(exemplar: &V, value: f64) -> V
     where
-        C: crate::contexts::StagingContext<Constant = TestArray>,
+        V: crate::programs::Value<Type = ArrayType>,
+        V::DispatchDomain: crate::contexts::Context<Constant = TestArray>,
     {
-        exemplar.context().constant(TestArray::new(ArrayType::scalar(DataType::I32), vec![value]))
+        exemplar
+            .dispatch_domain()
+            .lift(TestArray::new(ArrayType::scalar(DataType::I32), vec![value]))
+            .unwrap()
     }
 
     /// Returns a scalar integer-typed test array carrying `value` as its in-band payload.
@@ -619,7 +623,7 @@ mod tests {
         let (value, gradient) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
-                let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0]));
+                let weights = x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0])).unwrap();
                 (x.slice(&[1], &[6], &[2]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
             },
             TestArray::vector(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
@@ -948,11 +952,13 @@ mod tests {
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
-                let starts = context.constant(TestArray::new(
-                    ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
-                    vec![1.0, 2.0],
-                ));
-                let stacked: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                let starts = context
+                    .lift(TestArray::new(
+                        ArrayType::new(DataType::I32, Shape::new(vec![Size::Static(2)])),
+                        vec![1.0, 2.0],
+                    ))
+                    .unwrap();
+                let stacked: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                     &context,
                     |(item, start)| item.dynamic_slice(&[start], &[2]),
                     (x, starts),
@@ -961,7 +967,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-                let weights = context.constant(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]));
+                let weights = context.lift(TestArray::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])).unwrap();
                 (stacked * weights).reduce(&[0, 1], ReductionKind::Sum)
             },
             TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),

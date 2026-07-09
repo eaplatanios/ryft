@@ -9,8 +9,8 @@ use crate::operations::constants::ZeroOperation;
 use crate::operations::{BooleanLike, Operation, OperationFormatter};
 use crate::parameters::Placeholder;
 use crate::partial::{
-    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialEvaluator,
-    PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
+    PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
 };
 use crate::payloads::{Captured, Input};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -241,7 +241,7 @@ where
 /// With a [`Known`](PartialValue::Known) predicate that the known-side context can
 /// [`resolve`](Context::resolve) to a [`Concrete`](crate::ValueResolution::Concrete) constant it selects the taken
 /// branch and inlines it via
-/// [`PartialEvaluator::inline_program`], so the condition disappears from the residual program; the inlined
+/// [`PartialEvaluationContext::inline_program`], so the condition disappears from the residual program; the inlined
 /// branch is fed the remaining inputs. A known predicate that is *not* concretizable — under a staging known-side
 /// context, a genuine [`Tracer`](crate::Tracer) into the outer program — cannot select a branch at
 /// partial-evaluation time; the condition is instead split by `split_condition_by_knownness` into a *known*
@@ -274,26 +274,26 @@ where
 {
     fn partially_evaluate(
         &self,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         // Input 0 is the predicate; inputs 1.. feed both branches.
         if let PartialValue::Known(predicate) = inputs[0].value() {
             // A known predicate selects a branch only when it resolves to a concrete constant: under a staging
-            // known-side evaluator "known" means known to the outer program, and a genuine tracer carries no boolean
+            // known-side context "known" means known to the outer program, and a genuine tracer carries no boolean
             // to branch on. A known-but-symbolic predicate — or a concrete constant payload that exposes no concrete
             // boolean, such as an abstract backend capture reference — keeps the conditional on both sides of the
             // split instead.
-            if let Some(predicate) = evaluator.context().resolve(predicate).into_concrete() {
+            if let Some(predicate) = context.parent().resolve(predicate).into_concrete() {
                 if let Ok(predicate) = predicate.boolean() {
                     let branch = if predicate { self.true_branch() } else { self.false_branch() };
-                    return evaluator.inline_program(branch, inputs[1..].to_vec());
+                    return context.inline_program(branch, inputs[1..].to_vec());
                 }
             }
             if inputs.iter().all(PartialEvaluationValue::is_known) {
-                return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+                return context.fold_or_residualize(O::from(self.clone()), inputs);
             }
-            return split_condition_by_knownness(evaluator, self, inputs);
+            return split_condition_by_knownness(context, self, inputs);
         }
 
         // Unknown predicate: partially evaluate each branch against the input knowledge and reconcile the two
@@ -302,21 +302,19 @@ where
         // directly, so this impl avoids re-entering the operation-enum trait-solver cycle.
         //
         // Two conservative gates keep the conditional whole instead: effectful branches, because the branch folds
-        // below run through the *live* known-side evaluator and would execute or stage a branch's effects
+        // below run through the *live* known-side context and would execute or stage a branch's effects
         // speculatively (the predicate is unknown, so neither branch is selected yet); and symbolic knowns, because
         // the reconciled branch programs must embed folded known values as inline constants, which a live-trace
         // tracer cannot be.
         if !self.true_branch().effects().is_pure()
             || !self.false_branch().effects().is_pure()
-            || evaluator.any_known_is_symbolic(&inputs[1..])
+            || context.any_known_is_symbolic(&inputs[1..])
         {
-            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+            return context.fold_or_residualize(O::from(self.clone()), inputs);
         }
         let branch_knowledge = inputs[1..].iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let true_evaluation =
-            O::partially_evaluate_program(evaluator.context(), self.true_branch(), &branch_knowledge)?;
-        let false_evaluation =
-            O::partially_evaluate_program(evaluator.context(), self.false_branch(), &branch_knowledge)?;
+        let true_evaluation = O::partially_evaluate_program(context.parent(), self.true_branch(), &branch_knowledge)?;
+        let false_evaluation = O::partially_evaluate_program(context.parent(), self.false_branch(), &branch_knowledge)?;
 
         // Map each branch's residual inputs (true then false) back to a source feeding the rewritten condition.
         let source = |residual_input: &PartialEvaluationInput<C::Value>| match residual_input {
@@ -331,14 +329,14 @@ where
         let true_count = true_evaluation.inputs.len();
         let mut combined_input_types = true_evaluation.program.input_types();
         combined_input_types.extend(false_evaluation.program.input_types());
-        let reconciled_true = reconcile_branch(evaluator, &combined_input_types, 0, &true_evaluation)?;
-        let reconciled_false = reconcile_branch(evaluator, &combined_input_types, true_count, &false_evaluation)?;
+        let reconciled_true = reconcile_branch(context, &combined_input_types, 0, &true_evaluation)?;
+        let reconciled_false = reconcile_branch(context, &combined_input_types, true_count, &false_evaluation)?;
 
         let condition = ConditionOperation::new(reconciled_true, reconciled_false)?;
         let mut rewritten_inputs = Vec::with_capacity(combined_inputs.len() + 1);
         rewritten_inputs.push(inputs[0].clone());
         rewritten_inputs.extend(combined_inputs);
-        evaluator.fold_or_residualize(O::from(condition), rewritten_inputs.as_slice())
+        context.fold_or_residualize(O::from(condition), rewritten_inputs.as_slice())
     }
 }
 
@@ -380,7 +378,7 @@ struct ConditionBranchSplit<V: Value<Type = ArrayType>, O: Operation<ArrayType>>
 /// `[unknown inputs..., true edges..., false edges...] -> [residual outputs...]`, each branch reading only its own
 /// edges.
 fn split_condition_by_knownness<V, O, C>(
-    evaluator: &mut PartialEvaluator<C>,
+    context: &PartialEvaluationContext<C>,
     condition: &ConditionOperation<V, O, V, Input>,
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
@@ -400,7 +398,7 @@ where
     let input_known = branch_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
     let output_count = condition.true_branch.output_types().len();
 
-    // Split each branch through its own fresh known-side evaluator.
+    // Split each branch through its own fresh known-side context.
     let split_branch = |branch: &Program<V, O, Vec<V>, Vec<V>>| -> Result<
         (TracingContext<V, O>, PartialEvaluation<TracingContext<V, O>>),
         ProgramError,
@@ -476,7 +474,7 @@ where
     let known_side_is_empty =
         !out_known.iter().any(|&known| known) && true_split.edge_atoms.is_empty() && false_split.edge_atoms.is_empty();
     if known_side_is_empty {
-        return evaluator.fold_or_residualize(O::from(condition.clone()), inputs);
+        return context.fold_or_residualize(O::from(condition.clone()), inputs);
     }
 
     // Build each known branch over the shared `[known outputs..., true edges..., false edges...]` output signature,
@@ -527,7 +525,7 @@ where
     let known_true = build_known_branch(&true_split, &false_split, true)?;
     let known_false = build_known_branch(&false_split, &true_split, false)?;
 
-    // Bind the known condition into the enclosing known-side evaluator over the predicate and the known inputs.
+    // Bind the known condition into the enclosing known-side context over the predicate and the known inputs.
     let known_condition = ConditionOperation::new(known_true, known_false)?;
     let mut known_condition_inputs = Vec::with_capacity(inputs.len());
     known_condition_inputs.push(inputs[0].clone());
@@ -538,7 +536,7 @@ where
             .filter(|(_, known)| **known)
             .map(|(input, _)| input.clone()),
     );
-    let known_outputs = evaluator.fold_or_residualize(O::from(known_condition), known_condition_inputs.as_slice())?;
+    let known_outputs = context.fold_or_residualize(O::from(known_condition), known_condition_inputs.as_slice())?;
     let known_output_count = out_known.iter().filter(|&&known| known).count();
     let true_edge_offset = known_output_count;
     let false_edge_offset = known_output_count + true_split.edge_types.len();
@@ -657,7 +655,7 @@ where
                 )
             })?);
         }
-        evaluator.residualize(O::from(residual_condition), residual_condition_inputs.as_slice())?
+        context.residualize(O::from(residual_condition), residual_condition_inputs.as_slice())?
     } else {
         Vec::new()
     };
@@ -698,17 +696,17 @@ where
 /// residual program over the `offset..offset + evaluation.inputs.len()` inputs (leaving the rest unused), and
 /// produces the original condition's outputs by reading each [`PartialEvaluationOutput`]: a folded
 /// [`Known`](PartialEvaluationOutput::Known) output becomes an inline constant (its staged payload recovered through
-/// [`PartialEvaluator::known_constant`]), and an [`Unknown`](PartialEvaluationOutput::Unknown) output
+/// [`PartialEvaluationContext::known_constant`]), and an [`Unknown`](PartialEvaluationOutput::Unknown) output
 /// reads the spliced residual program's corresponding output.
 ///
 /// # Parameters
 ///
-///   - `evaluator`: Active [`PartialEvaluator`], used to recover constant payloads for folded known outputs.
+///   - `context`: Active [`PartialEvaluationContext`], used to recover constant payloads for folded known outputs.
 ///   - `combined_input_types`: Shared input signature both reconciled branches are built over.
 ///   - `offset`: Index of the first of this branch's inputs within `combined_input_types`.
 ///   - `evaluation`: Partial evaluation of this branch against the condition's input knowledge.
 fn reconcile_branch<C: Context>(
-    evaluator: &PartialEvaluator<C>,
+    context: &PartialEvaluationContext<C>,
     combined_input_types: &[C::Type],
     offset: usize,
     evaluation: &PartialEvaluation<C>,
@@ -724,7 +722,7 @@ where
         .outputs
         .iter()
         .map(|output| match output {
-            PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(evaluator.known_constant(value)?)),
+            PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(context.known_constant(value)?)),
             PartialEvaluationOutput::Unknown(index) => Ok(residual_outputs[*index]),
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;

@@ -3,13 +3,10 @@ use std::fmt::Debug;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
 };
-use crate::operations::BooleanLike;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, ZeroOperation};
-use crate::operations::control_flow::MaybeWhile;
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::tracing::TracingContext;
-use crate::tracing_v2::{Differentiate, NestedTracer};
+use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
+use crate::tracing_v2::{Differentiate, LinearizationTracer};
 use crate::{Context, Domain, One, Parameterized, ParameterizedFamily, ProgramError, Type, Typed, Value, Zero};
 
 /// Computes both the primal scalar output and its reverse-mode gradient.
@@ -27,23 +24,21 @@ pub fn value_and_gradient<C, F, Input>(
 where
     C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
-    <C as Domain>::Value: BooleanLike,
-    F: FnOnce(Input::To<NestedTracer<C>>) -> NestedTracer<C>,
+    F: FnOnce(Input::To<LinearizationTracer<C>>) -> LinearizationTracer<C>,
     Input: Parameterized<
             <C as Domain>::Value,
-            Family: ParameterizedFamily<NestedTracer<C>>,
+            Family: ParameterizedFamily<LinearizationTracer<C>>,
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
-        + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
+        + PartiallyEvaluatableOperation<C>
         + From<ZeroOperation<<C as Domain>::Type>>
         + From<OneOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
-        + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
+        + DifferentiableOperation<PartialEvaluationContext<C>>,
 {
     context.value_and_gradient(function, primals)
 }
@@ -63,23 +58,21 @@ pub fn gradient<C, F, Input>(
 where
     C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
-    <C as Domain>::Value: BooleanLike,
-    F: FnOnce(Input::To<NestedTracer<C>>) -> NestedTracer<C>,
+    F: FnOnce(Input::To<LinearizationTracer<C>>) -> LinearizationTracer<C>,
     Input: Parameterized<
             <C as Domain>::Value,
-            Family: ParameterizedFamily<NestedTracer<C>>,
+            Family: ParameterizedFamily<LinearizationTracer<C>>,
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
-        + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
+        + PartiallyEvaluatableOperation<C>
         + From<ZeroOperation<<C as Domain>::Type>>
         + From<OneOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
-        + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
+        + DifferentiableOperation<PartialEvaluationContext<C>>,
 {
     value_and_gradient(context, function, primals).map(|(_, gradient)| gradient)
 }
@@ -101,21 +94,20 @@ pub fn value_and_gradient_with_aux<C, F, Input, Aux>(
 where
     C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
-    <C as Domain>::Value: BooleanLike,
-    F: FnOnce(Input::To<NestedTracer<C>>) -> (NestedTracer<C>, Aux::To<NestedTracer<C>>),
+    F: FnOnce(Input::To<LinearizationTracer<C>>) -> (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>),
     Input: Parameterized<
             <C as Domain>::Value,
-            Family: ParameterizedFamily<NestedTracer<C>>,
+            Family: ParameterizedFamily<LinearizationTracer<C>>,
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
             <C as Domain>::Value,
-            Family: ParameterizedFamily<NestedTracer<C>, To = Aux::To<NestedTracer<C>>>,
+            Family: ParameterizedFamily<LinearizationTracer<C>, To = Aux::To<LinearizationTracer<C>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    (NestedTracer<C>, Aux::To<NestedTracer<C>>): Parameterized<
-            NestedTracer<C>,
+    (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>): Parameterized<
+            LinearizationTracer<C>,
             To<<C as Domain>::Value> = (<C as Domain>::Value, Aux),
             Family: ParameterizedFamily<<C as Domain>::Value>,
         >,
@@ -123,11 +115,10 @@ where
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
-        + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
+        + PartiallyEvaluatableOperation<C>
         + From<ZeroOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
-        + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
+        + DifferentiableOperation<PartialEvaluationContext<C>>,
     Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     Aux: Parameterized<<C as Domain>::Value, To<<C as Domain>::Value> = Aux>,
 {
@@ -175,21 +166,20 @@ pub fn gradient_with_aux<C, F, Input, Aux>(
 where
     C: Context,
     <C as Domain>::Constant: Value<Type = <C as Domain>::Type>,
-    <C as Domain>::Value: BooleanLike,
-    F: FnOnce(Input::To<NestedTracer<C>>) -> (NestedTracer<C>, Aux::To<NestedTracer<C>>),
+    F: FnOnce(Input::To<LinearizationTracer<C>>) -> (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>),
     Input: Parameterized<
             <C as Domain>::Value,
-            Family: ParameterizedFamily<NestedTracer<C>>,
+            Family: ParameterizedFamily<LinearizationTracer<C>>,
             To<<C as Domain>::Value> = Input,
             ParameterStructure: Debug + PartialEq,
         >,
     Aux: Parameterized<
             <C as Domain>::Value,
-            Family: ParameterizedFamily<NestedTracer<C>, To = Aux::To<NestedTracer<C>>>,
+            Family: ParameterizedFamily<LinearizationTracer<C>, To = Aux::To<LinearizationTracer<C>>>,
             ParameterStructure: Debug + PartialEq,
         >,
-    (NestedTracer<C>, Aux::To<NestedTracer<C>>): Parameterized<
-            NestedTracer<C>,
+    (LinearizationTracer<C>, Aux::To<LinearizationTracer<C>>): Parameterized<
+            LinearizationTracer<C>,
             To<<C as Domain>::Value> = (<C as Domain>::Value, Aux),
             Family: ParameterizedFamily<<C as Domain>::Value>,
         >,
@@ -197,11 +187,10 @@ where
     <C as Domain>::Type: DifferentiableType,
     <C as Domain>::Operation: Clone
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
-        + MaybeWhile<<C as Domain>::Constant, <C as Domain>::Operation>
+        + PartiallyEvaluatableOperation<C>
         + From<ZeroOperation<<C as Domain>::Type>>
         + From<AddOperation>
-        + DifferentiableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>
-        + PartiallyEvaluatableOperation<TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>>,
+        + DifferentiableOperation<PartialEvaluationContext<C>>,
     Input::Family: ParameterizedFamily<<C as Domain>::Value>,
     Aux: Parameterized<<C as Domain>::Value, To<<C as Domain>::Value> = Aux>,
 {
@@ -242,6 +231,10 @@ mod tests {
 
     #[test]
     fn test_traced_value_and_grad_rejects_mismatched_program_builders() {
+        // Mixing tracers of two different traces is rejected with `MismatchedProgramBuilders`. The closure runs on
+        // differentiation duals whose operator sugar has no deferral point of its own, so the partial-evaluation
+        // context defers the failed bind by poisoning its outputs, and the original error surfaces as a plain `Err`
+        // at the evaluation boundary.
         let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let primal_a = context_a.input(DataType::F64);

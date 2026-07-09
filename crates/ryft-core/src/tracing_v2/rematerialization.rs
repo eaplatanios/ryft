@@ -2010,7 +2010,7 @@ mod tests {
     #[test]
     fn test_rematerialized_gradients_are_correct_through_batching() {
         use crate::batching::Batch;
-        use crate::tracing_v2::NestedTracer;
+        use crate::tracing_v2::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
         use crate::tracing_v2::value_and_gradient;
 
@@ -2024,7 +2024,7 @@ mod tests {
             &domain,
             |x| {
                 let context = x.context().clone();
-                let mapped: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
+                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
                     Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
                         .unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)
@@ -2469,7 +2469,7 @@ mod tests {
     #[test]
     fn test_offloaded_rematerialization_survives_batching_with_host_parked_saved_types() {
         use crate::batching::Batch;
-        use crate::tracing_v2::NestedTracer;
+        use crate::tracing_v2::LinearizationTracer;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
         use crate::tracing_v2::value_and_gradient;
 
@@ -2509,7 +2509,7 @@ mod tests {
             &domain,
             |x| {
                 let context = x.context().clone();
-                let mapped: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
+                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> =
                     Batch::batch(&context, |item| function.call(item), x, BatchAxis::new(0), BatchAxis::new(0), None)
                         .unwrap();
                 mapped.reduce(&[0], ReductionKind::Sum)

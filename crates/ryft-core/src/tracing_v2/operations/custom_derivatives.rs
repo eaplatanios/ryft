@@ -1918,7 +1918,7 @@ mod tests {
     fn test_custom_jvp_survives_batching_and_governs_the_batched_gradient() {
         use crate::batching::Batch;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::{NestedTracer, value_and_gradient};
+        use crate::tracing_v2::{LinearizationTracer, value_and_gradient};
 
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
         // rule: traced batching re-wraps the call around batched programs instead of inlining the primal, so the
@@ -1927,7 +1927,7 @@ mod tests {
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
-                let mapped: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                     &context,
                     |item| {
                         let operation = custom_jvp_sin(&test_type(&[]));
@@ -1953,7 +1953,7 @@ mod tests {
     fn test_custom_vjp_survives_batching_and_governs_the_batched_gradient() {
         use crate::batching::Batch;
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-        use crate::tracing_v2::{NestedTracer, value_and_gradient};
+        use crate::tracing_v2::{LinearizationTracer, value_and_gradient};
 
         // The reverse-mode analogue of the test above: the (deliberately tripled) custom backward rule governs the
         // gradient through the batched call — mirroring JAX's `vmap`-of-`custom_vjp` semantics.
@@ -1961,7 +1961,7 @@ mod tests {
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let context = x.context().clone();
-                let mapped: NestedTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
+                let mapped: LinearizationTracer<EagerContext<TestArray, ArrayOperation<TestArray>>> = Batch::batch(
                     &context,
                     |item| {
                         let operation = custom_vjp_sin(&test_type(&[]));

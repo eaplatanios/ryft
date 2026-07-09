@@ -222,7 +222,8 @@ mod tests {
         let (value, (input_gradient, padding_value_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, padding_value)| {
-                let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]));
+                let weights =
+                    x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])).unwrap();
                 (x.pad(&padding_value, &[1], &[2], &[1]).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
             },
             (TestArray::vector(vec![1.0, 2.0, 3.0]), TestArray::scalar(9.0)),
@@ -241,7 +242,7 @@ mod tests {
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(
                 |x| {
-                    let padding_value = x.context().constant(TestArray::scalar(0.0));
+                    let padding_value = x.context().lift(TestArray::scalar(0.0))?;
                     x.pad(&padding_value, &[1], &[2], &[1])
                 },
                 TestArray::vector(vec![1.0, 2.0, 3.0]),

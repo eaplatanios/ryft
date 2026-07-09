@@ -10,8 +10,8 @@ use crate::operations::manipulation::{Reshape, Slice, UpdateSlice};
 use crate::operations::{Operation, OperationFormatter};
 use crate::parameters::Placeholder;
 use crate::partial::{
-    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialEvaluator,
-    PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
+    PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
 };
 use crate::payloads::Captured;
 use crate::programs::{Program, ProgramBuilder, ProgramError, Value};
@@ -808,50 +808,50 @@ where
 {
     fn partially_evaluate(
         &self,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // When every input is known the whole scan folds by binding it in the known-side evaluator; defer to that
+        // When every input is known the whole scan folds by binding it in the known-side context; defer to that
         // default behavior.
         if inputs.iter().all(PartialEvaluationValue::is_known) {
-            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+            return context.fold_or_residualize(O::from(self.clone()), inputs);
         }
 
         let carry_count = self.carry_count;
         let body_input_types = self.body.input_types();
 
-        // The invariance fixed point below probes by folding the body through the *live* known-side evaluator. For an
+        // The invariance fixed point below probes by folding the body through the *live* known-side context. For an
         // effectful body each probe round would execute (eager) or stage (staging) the body's effects once more, so
         // effectful bodies skip invariance probing entirely: the known-ness split's probes run through fresh,
         // discarded contexts and remain safe (see the effect placement contract on
-        // `PartialEvaluator::fold_or_residualize`).
+        // `PartialEvaluationContext::fold_or_residualize`).
         if !self.body.effects().is_pure() {
             let time_varying_known = inputs.iter().any(PartialEvaluationValue::is_known);
             if time_varying_known {
-                return split_scan_by_knownness(evaluator, self, inputs);
+                return split_scan_by_knownness(context, self, inputs);
             }
-            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+            return context.fold_or_residualize(O::from(self.clone()), inputs);
         }
 
-        // A carry can only fold if its init input is known *and* concretizable in the known-side evaluator: the folded
+        // A carry can only fold if its init input is known *and* concretizable in the known-side context: the folded
         // value must be embeddable as a rebuilt-body constant, and skipping symbolic knowns also keeps the fixed
-        // point's probe rounds from folding symbolic known work into a live staging evaluator.
+        // point's probe rounds from folding symbolic known work into a live staging context.
         let carry_inits = (0..carry_count)
             .map(|index| {
-                inputs[index].as_known().filter(|value| evaluator.context().resolve(value).is_concrete()).cloned()
+                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_concrete()).cloned()
             })
             .collect::<Vec<Option<C::Value>>>();
 
         // Monotonically narrow the set of loop-invariant-known carries to a fixed point. A round binds each invariant
         // carry to its init, leaves everything else unknown, and keeps a carry only if the body reproduces its init.
         // With no invariance candidates at all there is nothing the rebuild below could embed, so skip the
-        // live-evaluator probe entirely and go straight to the known-ness split (or the default).
+        // live-context probe entirely and go straight to the known-ness split (or the default).
         let mut invariant = carry_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
         if invariant.iter().all(|candidate| !candidate) {
             if inputs.iter().any(PartialEvaluationValue::is_known) {
-                return split_scan_by_knownness(evaluator, self, inputs);
+                return split_scan_by_knownness(context, self, inputs);
             }
-            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+            return context.fold_or_residualize(O::from(self.clone()), inputs);
         }
         let body_knowledge = |invariant: &[bool]| -> Vec<PartialValue<C::Value>> {
             let mut knowledge = Vec::with_capacity(body_input_types.len());
@@ -868,7 +868,7 @@ where
         };
 
         let mut body_evaluation =
-            O::partially_evaluate_program(evaluator.context(), &self.body, &body_knowledge(&invariant))?;
+            O::partially_evaluate_program(context.parent(), &self.body, &body_knowledge(&invariant))?;
         loop {
             let refined = (0..carry_count)
                 .map(|index| {
@@ -883,8 +883,7 @@ where
                 break;
             }
             invariant = refined;
-            body_evaluation =
-                O::partially_evaluate_program(evaluator.context(), &self.body, &body_knowledge(&invariant))?;
+            body_evaluation = O::partially_evaluate_program(context.parent(), &self.body, &body_knowledge(&invariant))?;
         }
 
         // Beyond the invariants, the remaining knowledge may still contain *time-varying* known work: known
@@ -897,16 +896,16 @@ where
         // the default residualize-unchanged behavior otherwise. A loop-invariant-known carry always shrinks the body
         // (its uses fold to constants), so the only way nothing folds is an empty invariant set whose residual body
         // did not shrink either. The rebuild below embeds the probe's known values as inline body constants, which
-        // is only possible when they are all concrete — under a staging known-side evaluator the probe can fold a
+        // is only possible when they are all concrete — under a staging known-side context the probe can fold a
         // constant-only chain into a live-trace tracer — so a non-concrete probe takes the same fallback.
         if (invariant.iter().all(|folded| !folded)
             && body_evaluation.program.instructions().len() >= self.body.instructions().len())
-            || !evaluator.all_knowns_are_concrete(&body_evaluation)
+            || !context.all_knowns_are_concrete(&body_evaluation)
         {
             if time_varying_known {
-                return split_scan_by_knownness(evaluator, self, inputs);
+                return split_scan_by_knownness(context, self, inputs);
             }
-            return evaluator.fold_or_residualize(O::from(self.clone()), inputs);
+            return context.fold_or_residualize(O::from(self.clone()), inputs);
         }
 
         // The residual scan keeps the same carry set, so its output arity matches the original scan. A
@@ -920,13 +919,13 @@ where
         // Feed the residual body program's inputs in its own input order. A surviving unknown body input is a
         // non-invariant carry or a scanned element and maps to the matching body input atom; a known residual (a
         // folded invariant carry value or another value the body closed over) is rebuilt as an inline constant by
-        // recovering its staged payload through the known-side evaluator.
+        // recovering its staged payload through the known-side context.
         let mut residual_body_inputs = Vec::with_capacity(body_evaluation.inputs.len());
         for residual_input in body_evaluation.inputs.iter() {
             match residual_input {
                 PartialEvaluationInput::Unknown(body_input) => residual_body_inputs.push(body_input_atoms[*body_input]),
                 PartialEvaluationInput::Known(value) => {
-                    residual_body_inputs.push(builder.add_constant(evaluator.known_constant(value)?))
+                    residual_body_inputs.push(builder.add_constant(context.known_constant(value)?))
                 }
             }
         }
@@ -937,7 +936,7 @@ where
         // reads the spliced residual program's corresponding output.
         let body_output_atoms = (0..self.body.output_types().len())
             .map(|output_index| match &body_evaluation.outputs[output_index] {
-                PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(evaluator.known_constant(value)?)),
+                PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(context.known_constant(value)?)),
                 PartialEvaluationOutput::Unknown(index) => Ok(spliced_outputs[*index]),
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -957,9 +956,9 @@ where
         // job; otherwise the residual scan's inputs are exactly the original scan's inputs: each carry init (now a
         // known residual for the folded carries) followed by each stacked input.
         if time_varying_known {
-            return split_scan_by_knownness(evaluator, &scan, inputs);
+            return split_scan_by_knownness(context, &scan, inputs);
         }
-        evaluator.fold_or_residualize(O::from(scan), inputs)
+        context.fold_or_residualize(O::from(scan), inputs)
     }
 }
 
@@ -984,7 +983,7 @@ where
 /// residual edge that the unknown body passes through, mirroring JAX's `instantiate` flag. If the split turns out to
 /// have an empty known side, the scan residualizes unchanged through the default rule instead.
 fn split_scan_by_knownness<V, O, C>(
-    evaluator: &mut PartialEvaluator<C>,
+    context: &PartialEvaluationContext<C>,
     scan: &ScanOperation<V, O, V, Captured>,
     inputs: &[PartialEvaluationValue<C::Value>],
 ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
@@ -1002,7 +1001,7 @@ where
     let body_output_count = scan.body.output_types().len();
     let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
 
-    // Fixed point over carry known-ness, each round splitting the body through a fresh staging evaluator.
+    // Fixed point over carry known-ness, each round splitting the body through a fresh staging context.
     let split_body = |carry_known: &[bool]| -> Result<
         (TracingContext<V, O>, PartialEvaluation<TracingContext<V, O>>),
         ProgramError,
@@ -1090,10 +1089,10 @@ where
 
     // An empty known side means the split folds nothing; residualize unchanged through the default rule.
     if known_output_atoms.is_empty() {
-        return evaluator.fold_or_residualize(O::from(scan.clone()), inputs);
+        return context.fold_or_residualize(O::from(scan.clone()), inputs);
     }
 
-    // Bind the known scan into the enclosing known-side evaluator over the original known inputs.
+    // Bind the known scan into the enclosing known-side context over the original known inputs.
     let known_carry_count = carry_known.iter().filter(|&&known| known).count();
     let known_scan_inputs = inputs
         .iter()
@@ -1115,7 +1114,7 @@ where
     let known_scan = ScanOperation::<V, O>::new(known_body, known_carry_count, scan.length)?
         .with_reverse(scan.reverse)
         .with_unroll(scan.unroll)?;
-    let known_outputs = evaluator.fold_or_residualize(O::from(known_scan), known_scan_inputs.as_slice())?;
+    let known_outputs = context.fold_or_residualize(O::from(known_scan), known_scan_inputs.as_slice())?;
 
     // Assemble the unknown body over `[unknown carries..., unknown stacked slices..., edge slices...]`, splicing the
     // residual body program over its unknown inputs and edge inputs, with instantiated known next-carries passed
@@ -1216,7 +1215,7 @@ where
                 )
             })?);
         }
-        residual_outputs = evaluator.residualize(O::from(unknown_scan), unknown_scan_inputs.as_slice())?;
+        residual_outputs = context.residualize(O::from(unknown_scan), unknown_scan_inputs.as_slice())?;
     }
 
     // Reassemble the original scan's outputs from the two sides.

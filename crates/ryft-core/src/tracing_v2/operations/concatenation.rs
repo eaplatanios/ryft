@@ -178,7 +178,7 @@ mod tests {
         let (value, (x_gradient, y_gradient)) = value_and_gradient(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |(x, y)| {
-                let weights = x.context().constant(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0]));
+                let weights = x.context().lift(TestArray::vector(vec![1.0, 2.0, 3.0, 4.0, 5.0])).unwrap();
                 (Concatenate::concatenate(&[x, y], 0).unwrap() * weights).reduce(&[0], ReductionKind::Sum)
             },
             (TestArray::vector(vec![1.0, 2.0]), TestArray::vector(vec![3.0, 4.0, 5.0])),

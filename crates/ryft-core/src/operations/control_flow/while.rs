@@ -9,8 +9,8 @@ use crate::macros::{check_count, check_types};
 use crate::operations::{BooleanLike, Operation, OperationFormatter};
 use crate::parameters::Placeholder;
 use crate::partial::{
-    PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialEvaluator,
-    PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
+    PartialEvaluation, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartiallyEvaluatableProgramOperation,
 };
 use crate::payloads::{Captured, Input};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
@@ -432,7 +432,7 @@ where
 ///     back to.
 ///   - `evaluation`: Partial evaluation of this sub-program against the loop-invariant-known state knowledge.
 fn rebuild_while_program<C: Context<Type = ArrayType>>(
-    evaluator: &PartialEvaluator<C>,
+    context: &PartialEvaluationContext<C>,
     builder: &mut ProgramBuilder<C::Constant, C::Operation>,
     state_atoms: &[AtomId],
     evaluation: &PartialEvaluation<C>,
@@ -445,7 +445,7 @@ where
         match residual_input {
             PartialEvaluationInput::Unknown(state_index) => residual_inputs.push(state_atoms[*state_index]),
             PartialEvaluationInput::Known(value) => {
-                residual_inputs.push(builder.add_constant(evaluator.known_constant(value)?))
+                residual_inputs.push(builder.add_constant(context.known_constant(value)?))
             }
         }
     }
@@ -454,7 +454,7 @@ where
         .outputs
         .iter()
         .map(|output| match output {
-            PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(evaluator.known_constant(value)?)),
+            PartialEvaluationOutput::Known(value) => Ok(builder.add_constant(context.known_constant(value)?)),
             PartialEvaluationOutput::Unknown(index) => Ok(spliced_outputs[*index]),
         })
         .collect()
@@ -474,7 +474,7 @@ where
     /// [`PartiallyEvaluatableOperation::partially_evaluate`] for the contract.
     fn partially_evaluate_while(
         operation: &WhileOperation<V, O, Captured>,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>;
 }
@@ -520,43 +520,43 @@ where
 {
     fn partially_evaluate_while(
         operation: &WhileOperation<V, O, Captured>,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // When every input is known the whole loop folds by binding it in the known-side evaluator; defer to that
+        // When every input is known the whole loop folds by binding it in the known-side context; defer to that
         // default behavior.
         if inputs.iter().all(PartialEvaluationValue::is_known) {
-            return evaluator.fold_or_residualize(O::from(operation.clone()), inputs);
+            return context.fold_or_residualize(O::from(operation.clone()), inputs);
         }
 
         let state_types = operation.state_types();
         let state_count = state_types.len();
 
         // The invariance fixed point below probes by folding the condition and body through the *live* known-side
-        // evaluator. For an effectful loop each probe round would execute (eager) or stage (staging) the loop's
+        // context. For an effectful loop each probe round would execute (eager) or stage (staging) the loop's
         // effects once more, so effectful loops skip invariance probing and residualize unchanged (see the effect
-        // placement contract on `PartialEvaluator::fold_or_residualize`); `while` has no known-ness
+        // placement contract on `PartialEvaluationContext::fold_or_residualize`); `while` has no known-ness
         // split to fall back to.
         if !operation.condition.effects().is_pure() || !operation.body.effects().is_pure() {
-            return evaluator.fold_or_residualize(O::from(operation.clone()), inputs);
+            return context.fold_or_residualize(O::from(operation.clone()), inputs);
         }
 
-        // A state element can only fold if its init input is known *and* concretizable in the known-side evaluator:
+        // A state element can only fold if its init input is known *and* concretizable in the known-side context:
         // the folded value must be embeddable as a rebuilt-program constant, and skipping symbolic knowns also keeps
-        // the fixed point's probe rounds from folding symbolic known work into a live staging evaluator.
+        // the fixed point's probe rounds from folding symbolic known work into a live staging context.
         let state_inits = (0..state_count)
             .map(|index| {
-                inputs[index].as_known().filter(|value| evaluator.context().resolve(value).is_concrete()).cloned()
+                inputs[index].as_known().filter(|value| context.parent().resolve(value).is_concrete()).cloned()
             })
             .collect::<Vec<Option<C::Value>>>();
 
         // Monotonically narrow the set of loop-invariant-known state elements to a fixed point. A round binds each
         // invariant element to its init, leaves everything else unknown, and keeps an element only if the body
         // reproduces its init as the next-state value. With no invariance candidates at all there is nothing the
-        // rebuild below could embed, so skip the live-evaluator probe entirely and residualize unchanged.
+        // rebuild below could embed, so skip the live-context probe entirely and residualize unchanged.
         let mut invariant = state_inits.iter().map(Option::is_some).collect::<Vec<bool>>();
         if invariant.iter().all(|candidate| !candidate) {
-            return evaluator.fold_or_residualize(O::from(operation.clone()), inputs);
+            return context.fold_or_residualize(O::from(operation.clone()), inputs);
         }
         let state_knowledge = |invariant: &[bool]| -> Vec<PartialValue<C::Value>> {
             (0..state_count)
@@ -568,7 +568,7 @@ where
         };
 
         let mut body_evaluation =
-            O::partially_evaluate_program(evaluator.context(), &operation.body, &state_knowledge(&invariant))?;
+            O::partially_evaluate_program(context.parent(), &operation.body, &state_knowledge(&invariant))?;
         loop {
             let refined = (0..state_count)
                 .map(|index| {
@@ -584,26 +584,26 @@ where
             }
             invariant = refined;
             body_evaluation =
-                O::partially_evaluate_program(evaluator.context(), &operation.body, &state_knowledge(&invariant))?;
+                O::partially_evaluate_program(context.parent(), &operation.body, &state_knowledge(&invariant))?;
         }
 
         // The condition reads the loop state too, so folding the invariant-known state can shrink it as well.
         let condition_evaluation =
-            O::partially_evaluate_program(evaluator.context(), &operation.condition, &state_knowledge(&invariant))?;
+            O::partially_evaluate_program(context.parent(), &operation.condition, &state_knowledge(&invariant))?;
 
         // Nothing folded: defer to the default residualize-unchanged behavior. A loop-invariant-known element always
         // shrinks the body (its uses fold to constants), so the only way nothing folds is an empty invariant set whose
         // residual condition and body did not shrink either. The rebuild below embeds the probes' known values as
         // inline program constants, which is only possible when they are all concrete — under a staging known-side
-        // evaluator a probe can fold a constant-only chain into a live-trace tracer — so a non-concrete probe takes
+        // context a probe can fold a constant-only chain into a live-trace tracer — so a non-concrete probe takes
         // the same fallback.
         if (invariant.iter().all(|folded| !folded)
             && body_evaluation.program.instructions().len() >= operation.body.instructions().len()
             && condition_evaluation.program.instructions().len() >= operation.condition.instructions().len())
-            || !evaluator.all_knowns_are_concrete(&body_evaluation)
-            || !evaluator.all_knowns_are_concrete(&condition_evaluation)
+            || !context.all_knowns_are_concrete(&body_evaluation)
+            || !context.all_knowns_are_concrete(&condition_evaluation)
         {
-            return evaluator.fold_or_residualize(O::from(operation.clone()), inputs);
+            return context.fold_or_residualize(O::from(operation.clone()), inputs);
         }
 
         // The residual while keeps the same state set, so its output arity matches the original while. The condition
@@ -615,7 +615,7 @@ where
             .map(|state_type| condition_builder.add_input(state_type.clone()))
             .collect::<Vec<_>>();
         let condition_outputs =
-            rebuild_while_program(evaluator, &mut condition_builder, &condition_state_atoms, &condition_evaluation)?;
+            rebuild_while_program(context, &mut condition_builder, &condition_state_atoms, &condition_evaluation)?;
         let residual_condition = condition_builder.build::<Vec<V>, Vec<V>>(
             condition_outputs,
             vec![Placeholder; state_count],
@@ -625,7 +625,7 @@ where
         let mut body_builder = ProgramBuilder::<V, O>::new();
         let body_state_atoms =
             state_types.iter().map(|state_type| body_builder.add_input(state_type.clone())).collect::<Vec<_>>();
-        let body_outputs = rebuild_while_program(evaluator, &mut body_builder, &body_state_atoms, &body_evaluation)?;
+        let body_outputs = rebuild_while_program(context, &mut body_builder, &body_state_atoms, &body_evaluation)?;
         let residual_body = body_builder.build::<Vec<V>, Vec<V>>(
             body_outputs,
             vec![Placeholder; state_count],
@@ -637,7 +637,7 @@ where
 
         // The residual while's inputs are exactly the original while's inputs: each state element's init value (now a
         // known residual for the folded elements) in state order.
-        evaluator.fold_or_residualize(O::from(while_operation), inputs)
+        context.fold_or_residualize(O::from(while_operation), inputs)
     }
 }
 
@@ -654,10 +654,10 @@ where
 {
     fn partially_evaluate_while(
         operation: &WhileOperation<V, O, Captured>,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        evaluator.fold_or_residualize(C::Operation::from(operation.clone()), inputs)
+        context.fold_or_residualize(C::Operation::from(operation.clone()), inputs)
     }
 }
 
@@ -671,10 +671,10 @@ where
 {
     fn partially_evaluate(
         &self,
-        evaluator: &mut PartialEvaluator<C>,
+        context: &PartialEvaluationContext<C>,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        <V::Type>::partially_evaluate_while(self, evaluator, inputs)
+        <V::Type>::partially_evaluate_while(self, context, inputs)
     }
 }
 
