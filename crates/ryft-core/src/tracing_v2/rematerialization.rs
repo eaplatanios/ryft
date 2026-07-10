@@ -1469,13 +1469,13 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::tag::Tag;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};

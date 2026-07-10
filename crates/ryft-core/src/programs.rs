@@ -1528,6 +1528,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
@@ -1536,7 +1537,6 @@ mod tests {
     use crate::operations::debugging::PrintOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
-    use crate::scalars::Scalar;
     use crate::types::{DataType, TypeError};
 
     use super::*;

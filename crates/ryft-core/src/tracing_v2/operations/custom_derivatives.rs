@@ -1447,6 +1447,7 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -1456,7 +1457,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;
-    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};

@@ -444,12 +444,12 @@ mod tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::Scalar;
     use crate::tracing::{DomainTracingContext, TracerState};
     use crate::types::{DataType, Typed};
 

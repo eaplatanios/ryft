@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 use std::ops::Mul;
 
 use crate::axes::{AxisError, NamedAxes};
+use crate::backends::scalars::Scalar;
 use crate::batching::BatchingError;
 use crate::contexts::Domain;
 use crate::contexts::{Context, EagerContext};
@@ -12,7 +13,6 @@ use crate::operations::constants::{Fill, FillOperation, IotaOperation};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::scalars::Scalar;
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;

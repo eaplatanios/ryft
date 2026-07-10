@@ -274,7 +274,7 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// ```rust
 /// # use ryft_core as ryft;
 /// # use ryft_core::{ConstantOperation, DataType, Operation, Value, ZeroOperation};
-/// # use ryft_core::scalars::Scalar;
+/// # use ryft_core::backends::scalars::Scalar;
 /// # use ryft_macros::Operation;
 ///
 /// #[derive(Clone, Debug, Operation)]
@@ -558,11 +558,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_count;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder, ProgramError};
-    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size};
 

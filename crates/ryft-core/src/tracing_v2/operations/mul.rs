@@ -101,12 +101,12 @@ mod tests {
     use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
-    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
     use crate::types::{ArrayType, DataType};

@@ -519,11 +519,11 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
-    use crate::scalars::Scalar;
 
     use super::*;
 

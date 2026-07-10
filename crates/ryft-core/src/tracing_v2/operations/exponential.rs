@@ -151,8 +151,8 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::operations::exponential::{Exponential, Logarithm, SquareRoot};
-    use crate::scalars::Scalar;
     use crate::tracing_v2::{ReverseModeDifferentiate, gradient, value_and_gradient_holomorphic};
 
     #[test]

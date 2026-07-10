@@ -57,9 +57,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
-    use crate::scalars::Scalar;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]

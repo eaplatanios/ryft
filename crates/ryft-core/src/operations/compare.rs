@@ -194,9 +194,9 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::operations::Operation;
-    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size};
 

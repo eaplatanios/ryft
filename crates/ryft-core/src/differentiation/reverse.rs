@@ -1513,6 +1513,7 @@ mod tests {
 
     use std::cell::Cell;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
     use crate::effects::{Effect, Effects};
@@ -1526,7 +1527,6 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
-    use crate::scalars::Scalar;
     use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
     use crate::types::{DataType, TypeError, Typed};
 

@@ -389,8 +389,8 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
-    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::types::{Shape, Size};
 

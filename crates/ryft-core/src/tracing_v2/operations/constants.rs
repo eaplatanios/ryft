@@ -350,12 +350,12 @@ where
 mod tests {
     use indoc::indoc;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::Context;
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::programs::Program;
-    use crate::scalars::Scalar;
 
     #[test]
     fn float_ext_matches_scalar_intrinsics() {

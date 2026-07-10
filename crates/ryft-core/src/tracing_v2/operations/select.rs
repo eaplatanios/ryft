@@ -379,8 +379,8 @@ mod tests {
         // Differentiating `f(x, y) = select(x > y, 2x, 3y)` over `EagerContext<Scalar, ScalarOperation<Scalar>>` exercises the scalar select rule:
         // forward mode routes each branch tangent through the selected branch, and reverse mode routes the cotangent
         // there, so the derivative reaches only the selected branch's input.
+        use crate::backends::scalars::Scalar;
         use crate::operations::scalars::ScalarOperation;
-        use crate::scalars::Scalar;
         use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
         fn piecewise<V>(x: V, y: V) -> Result<V, crate::programs::ProgramError>

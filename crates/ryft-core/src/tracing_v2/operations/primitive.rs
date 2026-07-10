@@ -3,6 +3,7 @@ use std::ops::BitAnd;
 
 use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, TransposableOperation};
 
+use crate::backends::scalars::Scalar;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::{
     AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
@@ -29,7 +30,6 @@ use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation}
 use crate::operations::tag::{MaybeTag, TagOperation};
 use crate::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use crate::programs::Value;
-use crate::scalars::Scalar;
 use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,

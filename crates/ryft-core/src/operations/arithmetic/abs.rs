@@ -169,11 +169,11 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::{TestArray, check_gradient};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};

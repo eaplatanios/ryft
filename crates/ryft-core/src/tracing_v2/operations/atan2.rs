@@ -79,9 +79,9 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::operations::complex::{Imaginary, Real};
     use crate::operations::trigonometric::Atan2;
-    use crate::scalars::Scalar;
     use crate::tracing_v2::{gradient, value_and_gradient};
 
     #[test]

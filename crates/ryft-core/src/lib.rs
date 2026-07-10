@@ -3,6 +3,7 @@
 extern crate self as ryft;
 
 pub mod axes;
+pub mod backends;
 pub mod batching;
 pub mod broadcasting;
 pub mod compilation;
@@ -16,7 +17,6 @@ pub mod operations;
 pub mod parameters;
 pub mod partial;
 pub mod programs;
-pub mod scalars;
 pub mod sharding;
 pub mod tracing;
 pub mod tracing_v2;
@@ -28,6 +28,7 @@ pub mod tests;
 
 // TODO(eaplatanios): Make all of the following more specific.
 pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
+pub use backends::*;
 pub use batching::{
     ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableProgramOperation,
     BatchingContext, BatchingError, BatchingTracer, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
@@ -54,7 +55,6 @@ pub use partial::{
 pub use programs::{
     Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, ProgramLiveSets, Value,
 };
-pub use scalars::Scalar;
 pub use sharding::*;
 pub use tracing::{DomainTracer, DomainTracingContext, NestedTracer, Tracer, TracerState, TracingContext};
 pub use tracing_v2::operations::custom_derivatives::{CustomJvpOperation, CustomVjpOperation};

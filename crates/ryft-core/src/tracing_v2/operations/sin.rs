@@ -58,10 +58,10 @@ where
 mod tests {
     use approx::assert_abs_diff_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
-    use crate::scalars::Scalar;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]

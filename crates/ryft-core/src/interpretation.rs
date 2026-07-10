@@ -272,12 +272,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::scalars::ScalarOperation;
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::Scalar;
     use crate::tests::TestArray;
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 

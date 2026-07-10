@@ -1595,6 +1595,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
     use crate::operations::arithmetic::{
@@ -1604,7 +1605,6 @@ mod tests {
     use crate::operations::constants::{One, OneLike, OneLikeOperation, Zero, ZeroLike, ZeroLikeOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{Program, ProgramBuilder, Value};
-    use crate::scalars::Scalar;
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::reduce::ReduceOperation;
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};

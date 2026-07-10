@@ -2,6 +2,7 @@ use std::fmt::Display;
 use std::ops::Mul;
 
 use crate::Compare;
+use crate::backends::scalars::Scalar;
 use crate::batching::BatchAxis;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
@@ -17,7 +18,6 @@ use crate::operations::manipulation::{Broadcast, BroadcastOperation};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
-use crate::scalars::Scalar;
 use crate::sharding::Sharding;
 use crate::tracing::{Tracer, TracingContext};
 

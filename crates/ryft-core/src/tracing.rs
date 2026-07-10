@@ -631,6 +631,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::axes::NamedAxes;
+    use crate::backends::scalars::Scalar;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, NegOperation};
@@ -639,7 +640,6 @@ mod tests {
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::Scalar;
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;

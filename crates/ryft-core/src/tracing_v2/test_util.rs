@@ -581,7 +581,7 @@ mod tests {
 
         let fill = ArrayOperation::<TestArray>::Fill(crate::operations::constants::FillOperation::new(
             scalar,
-            crate::scalars::Scalar::from(7.5),
+            crate::backends::scalars::Scalar::from(7.5),
         ));
         let outputs: Vec<ArrayBatch<TestArray>> = fill.batch(&context, &[]).unwrap();
         assert_eq!(outputs.len(), 1);

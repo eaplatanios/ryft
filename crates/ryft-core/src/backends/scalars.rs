@@ -1,10 +1,12 @@
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::fmt::Display;
+
+#[cfg(any(test, feature = "test-utilities"))]
 use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
 use ryft_macros::Parameter;
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::fmt::Display;
 
 #[cfg(test)]
 use crate::contexts::Context;
@@ -35,7 +37,7 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 /// # Examples
 ///
 /// ```rust
-/// # use ryft_core::scalars::Scalar;
+/// # use ryft_core::backends::scalars::Scalar;
 /// # use ryft_core::types::{DataType, Typed};
 /// let scalar = Scalar::from(1.5f64);
 /// assert_eq!(scalar.r#type().into_owned(), DataType::F64);

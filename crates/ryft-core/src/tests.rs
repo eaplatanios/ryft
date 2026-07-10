@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
+use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 #[cfg(test)]
@@ -41,7 +42,6 @@ use crate::operations::trigonometric::Atan2;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
-use crate::scalars::Scalar;
 use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
@@ -51,11 +51,11 @@ use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 /// of its derivative within absolute tolerance `$tolerance`. This is the standard oracle for testing operation
 /// gradient rules without hand-deriving the expected derivative — and without trusting the machinery under test: the
 /// gradient side runs `$function` through [`gradient`](crate::differentiation::gradient), while the
-/// finite-difference side evaluates `$function` directly on concrete [`Scalar`](crate::scalars::Scalar) values at
+/// finite-difference side evaluates `$function` directly on concrete [`Scalar`](crate::backends::scalars::Scalar) values at
 /// the perturbed points, never touching the differentiation machinery it is checking. That double instantiation is
 /// why this is a macro: `$function` must be a closure literal (or a generic function), and the expansion
 /// instantiates it once over [`LinearizationTracer`](crate::differentiation::LinearizationTracer) inputs and once
-/// over concrete [`Scalar`](crate::scalars::Scalar) inputs.
+/// over concrete [`Scalar`](crate::backends::scalars::Scalar) inputs.
 ///
 /// An `f64` input estimates the ordinary derivative `(f(x + h) - f(x - h)) / (2h)`. A `c128` input requires a
 /// ℂ → ℝ `$function` (the only shape the plain [`gradient`](crate::differentiation::gradient) entry point accepts)
@@ -71,8 +71,8 @@ macro_rules! check_gradient {
         // Closure parameter types infer from an expected type, so each instantiation of `$function` flows through
         // an identity function pinning the signature that instantiation is used at.
         type EagerScalarContext = $crate::contexts::EagerContext<
-            $crate::scalars::Scalar,
-            $crate::operations::scalars::ScalarOperation<$crate::scalars::Scalar>,
+            $crate::backends::scalars::Scalar,
+            $crate::operations::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
         >;
         fn pin_traced<F>(function: F) -> F
         where
@@ -82,37 +82,37 @@ macro_rules! check_gradient {
         {
             function
         }
-        fn pin_eager<F: Fn($crate::scalars::Scalar) -> $crate::scalars::Scalar>(function: F) -> F {
+        fn pin_eager<F: Fn($crate::backends::scalars::Scalar) -> $crate::backends::scalars::Scalar>(function: F) -> F {
             function
         }
-        let input: $crate::scalars::Scalar = ::core::convert::Into::into($input);
+        let input: $crate::backends::scalars::Scalar = ::core::convert::Into::into($input);
         let step: f64 = $step;
         let tolerance: f64 = $tolerance;
         let gradient = $crate::differentiation::gradient(pin_traced($function), input).unwrap();
         let evaluate = pin_eager($function);
-        let central_difference = |plus: $crate::scalars::Scalar, minus: $crate::scalars::Scalar| {
-            (evaluate(plus) - evaluate(minus)) / $crate::scalars::Scalar::from(2.0 * step)
+        let central_difference = |plus: $crate::backends::scalars::Scalar, minus: $crate::backends::scalars::Scalar| {
+            (evaluate(plus) - evaluate(minus)) / $crate::backends::scalars::Scalar::from(2.0 * step)
         };
         match input {
-            $crate::scalars::Scalar::F64(input) => {
+            $crate::backends::scalars::Scalar::F64(input) => {
                 let estimate = central_difference(
-                    $crate::scalars::Scalar::from(input + step),
-                    $crate::scalars::Scalar::from(input - step),
+                    $crate::backends::scalars::Scalar::from(input + step),
+                    $crate::backends::scalars::Scalar::from(input - step),
                 );
                 ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
             }
-            $crate::scalars::Scalar::C128(_) => {
+            $crate::backends::scalars::Scalar::C128(_) => {
                 // Both perturbation steps are built as `c128` values (binary `Scalar` arithmetic requires
                 // same-variant operands), and the two central differences estimate the two real partials that
                 // assemble the conjugate steepest-ascent gradient.
                 let real_step = $crate::operations::complex::Complex::complex(
-                    &$crate::scalars::Scalar::from(step),
-                    &$crate::scalars::Scalar::from(0.0),
+                    &$crate::backends::scalars::Scalar::from(step),
+                    &$crate::backends::scalars::Scalar::from(0.0),
                 )
                 .unwrap();
                 let imaginary_step = $crate::operations::complex::Complex::complex(
-                    &$crate::scalars::Scalar::from(0.0),
-                    &$crate::scalars::Scalar::from(step),
+                    &$crate::backends::scalars::Scalar::from(0.0),
+                    &$crate::backends::scalars::Scalar::from(step),
                 )
                 .unwrap();
                 let real_estimate = central_difference(input + real_step, input - real_step);
@@ -1218,11 +1218,11 @@ mod differentiation_tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::DifferentiationTracer;
     use crate::differentiation::LinearizationTracer;
     use crate::operations::scalars::ScalarOperation;
-    use crate::scalars::Scalar;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]
@@ -1636,6 +1636,7 @@ mod differentiation_tests {
 
 #[cfg(test)]
 mod linearization_tests {
+    use crate::backends::scalars::Scalar;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
@@ -1648,7 +1649,6 @@ mod linearization_tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::scalars::Scalar;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
     use crate::types::DataType;

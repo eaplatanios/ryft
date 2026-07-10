@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 
 use ryft_macros::Parameter;
 
+use crate::backends::scalars::Scalar;
 use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingContext;
@@ -19,7 +20,6 @@ use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};
-use crate::scalars::Scalar;
 use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use crate::types::{ArrayType, Shape, Size, TypeError, Typed};

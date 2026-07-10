@@ -1409,6 +1409,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::backends::scalars::{Scalar, ScalarTracingContext};
     use crate::contexts::{Context, StagingContext};
     use crate::operations::BooleanLike;
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
@@ -1418,7 +1419,6 @@ mod tests {
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
-    use crate::scalars::{Scalar, ScalarTracingContext};
     use crate::types::DataType;
 
     use super::*;
