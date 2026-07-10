@@ -837,13 +837,13 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         Ok((output, Pullback::new(self.clone(), program, residuals, input_structure)?))
     }
 
-    // TODO(eaplatanios): Review this function.
     /// Computes both the primal scalar output of `function` at `primals` and its reverse-mode gradient, with this
     /// [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to the
-    /// documentation of the [`value_and_gradient`] function for information on the transform and its arguments. This
-    /// method serves the call sites that must name the [`Context`] explicitly instead of recovering it from the
-    /// input's leaf values — which is also what lets nested reverse mode compose with any enclosing context.
-    fn value_and_gradient<F, Input>(
+    /// documentation of the [`value_and_gradient`] function for information on the transform and its arguments.
+    fn value_and_gradient<
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
+        Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+    >(
         &self,
         function: F,
         primals: Input,
@@ -857,81 +857,24 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
             + From<AddOperation>,
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
-        Input:
-            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
     {
-        // Seed the single output cotangent with the multiplicative identity of the scalar output and pull it back to
-        // the input cotangents, reshaped against the closure's input structure.
+        // Seed the single output cotangent with the multiplicative identity of the scalar output and pull it back
+        // to the input cotangents, reshaped against the closure's input structure.
         let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
         let seed = self.gradient_seed(&output, false)?;
         let gradient = pullback.apply(seed)?;
         Ok((output, gradient))
     }
 
-    // TODO(eaplatanios): Review this function.
     /// Computes the reverse-mode gradient of `function` at `primals`, with this [`Context`] executing (or staging)
     /// the primal-side operations and the pullback replay. This is the gradient-only counterpart of
-    /// [`value_and_gradient`](Self::value_and_gradient), discarding the primal output; refer to the documentation of
+    /// [`value_and_gradient`](Self::value_and_gradient), discarding the primal output. Refer to the documentation of
     /// the [`gradient`] function for information on the transform and its arguments.
     #[inline]
-    fn gradient<F, Input>(&self, function: F, primals: Input) -> Result<Input::To<Self::Value>, DifferentiationError>
-    where
-        Self::Type: DifferentiableType,
-        Self::Operation: Clone
-            + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
-            + TransposableOperation<Self::Constant, Self::Operation>
-            + From<ZeroOperation<Self::Type>>
-            + From<OneOperation<Self::Type>>
-            + From<AddOperation>,
+    fn gradient<
         F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
-        Input:
-            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
-    {
-        self.value_and_gradient(function, primals).map(|(_, gradient)| gradient)
-    }
-
-    // TODO(eaplatanios): Review this function.
-    /// Computes both the primal scalar output of `function` at `primals` and its holomorphic reverse-mode
-    /// gradient, with this [`Context`] executing (or staging) the primal-side operations and the pullback replay.
-    /// Refer to the documentation of the [`value_and_gradient_holomorphic`] function for information on the transform,
-    /// its arguments, and the holomorphy promise it relies on. This method serves the call sites that must name the
-    /// [`Context`] explicitly instead of recovering it from the input's leaf values.
-    fn value_and_gradient_holomorphic<F, Input>(
-        &self,
-        function: F,
-        primals: Input,
-    ) -> Result<(Self::Value, Input::To<Self::Value>), DifferentiationError>
-    where
-        Self::Type: DifferentiableType,
-        Self::Operation: Clone
-            + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + PartiallyEvaluatableOperation<Self>
-            + TransposableOperation<Self::Constant, Self::Operation>
-            + From<ZeroOperation<Self::Type>>
-            + From<OneOperation<Self::Type>>
-            + From<AddOperation>,
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
-        Input:
-            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
-    {
-        // Identical to `value_and_gradient` except that the seed is gated on holomorphy: the output must be complex,
-        // and under the caller's holomorphy promise the single seed recovers the complex derivative ∂f/∂z.
-        let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
-        let seed = self.gradient_seed(&output, true)?;
-        let gradient = pullback.apply(seed)?;
-        Ok((output, gradient))
-    }
-
-    // TODO(eaplatanios): Review this function.
-    /// Computes the holomorphic reverse-mode gradient of `function` at `primals`, with this [`Context`] executing
-    /// (or staging) the primal-side operations and the pullback replay. This is the gradient-only counterpart of
-    /// [`value_and_gradient_holomorphic`](Self::value_and_gradient_holomorphic), discarding the primal output; refer
-    /// to the documentation of the [`gradient_holomorphic`] function for information on the transform, its arguments,
-    /// and the holomorphy promise it relies on.
-    #[inline]
-    fn gradient_holomorphic<F, Input>(
+        Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+    >(
         &self,
         function: F,
         primals: Input,
@@ -945,20 +888,81 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
             + From<AddOperation>,
+    {
+        self.value_and_gradient(function, primals).map(|(_, gradient)| gradient)
+    }
+
+    /// Computes both the primal scalar output of `function` at `primals` and its holomorphic reverse-mode gradient,
+    /// with this [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to the
+    /// documentation of the [`value_and_gradient_holomorphic`] function for information on the transform,
+    /// its arguments, and the holomorphy promise it relies on.
+    fn value_and_gradient_holomorphic<
         F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
-        Input:
-            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+    >(
+        &self,
+        function: F,
+        primals: Input,
+    ) -> Result<(Self::Value, Input::To<Self::Value>), DifferentiationError>
+    where
+        Self::Type: DifferentiableType,
+        Self::Operation: Clone
+            + DifferentiableOperation<PartialEvaluationContext<Self>>
+            + PartiallyEvaluatableOperation<Self>
+            + TransposableOperation<Self::Constant, Self::Operation>
+            + From<ZeroOperation<Self::Type>>
+            + From<OneOperation<Self::Type>>
+            + From<AddOperation>,
+    {
+        // This function implementation is identical to `value_and_gradient` except that the seed is gated on
+        // holomorphy. the output must be complex, and under the caller's holomorphy promise the single seed recovers
+        // the complex derivative ∂f/∂z.
+        let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
+        let seed = self.gradient_seed(&output, true)?;
+        let gradient = pullback.apply(seed)?;
+        Ok((output, gradient))
+    }
+
+    /// Computes the holomorphic reverse-mode gradient of `function` at `primals`, with this [`Context`] executing
+    /// (or staging) the primal-side operations and the pullback replay. This is the gradient-only counterpart of
+    /// [`value_and_gradient_holomorphic`](Self::value_and_gradient_holomorphic), discarding the primal output. Refer
+    /// to the documentation of the [`gradient_holomorphic`] function for information on the transform, its arguments,
+    /// and the holomorphy promise it relies on.
+    #[inline]
+    fn gradient_holomorphic<
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
+        Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+    >(
+        &self,
+        function: F,
+        primals: Input,
+    ) -> Result<Input::To<Self::Value>, DifferentiationError>
+    where
+        Self::Type: DifferentiableType,
+        Self::Operation: Clone
+            + DifferentiableOperation<PartialEvaluationContext<Self>>
+            + PartiallyEvaluatableOperation<Self>
+            + TransposableOperation<Self::Constant, Self::Operation>
+            + From<ZeroOperation<Self::Type>>
+            + From<OneOperation<Self::Type>>
+            + From<AddOperation>,
     {
         self.value_and_gradient_holomorphic(function, primals).map(|(_, gradient)| gradient)
     }
 
-    // TODO(eaplatanios): Review this function.
     /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its reverse-mode gradient,
     /// with this [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to the
     /// documentation of the [`value_and_gradient_with_aux`] function for information on the transform and its
-    /// arguments. This method serves the call sites that must name the [`Context`] explicitly instead of recovering
-    /// it from the input's leaf values.
-    fn value_and_gradient_with_aux<F, Input, Aux>(
+    /// arguments.
+    fn value_and_gradient_with_aux<
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Aux: Parameterized<
+                Self::Value,
+                To<Self::Value> = Aux,
+                Family: ParameterizedFamily<LinearizationTracer<Self>, To = Aux::To<LinearizationTracer<Self>>>,
+            >,
+    >(
         &self,
         function: F,
         primals: Input,
@@ -973,16 +977,6 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
             + From<ZeroOperation<Self::Type>>
             + From<OneOperation<Self::Type>>
             + From<AddOperation>,
-        F: FnOnce(
-            Input::To<LinearizationTracer<Self>>,
-        ) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
-        Input:
-            Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
-        Aux: Parameterized<
-                Self::Value,
-                To<Self::Value> = Aux,
-                Family: ParameterizedFamily<LinearizationTracer<Self>, To = Aux::To<LinearizationTracer<Self>>>,
-            >,
         (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>): Parameterized<
                 LinearizationTracer<Self>,
                 To<Self::Value> = (Self::Value, Aux),
@@ -995,7 +989,7 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         // The flat pullback consumes `[output_cotangents ++ residuals]`. The traced output flattens as the scalar
         // output leaf followed by the auxiliary leaves, so seed the output leaf with a one cotangent and every
         // auxiliary leaf with a zero cotangent, then append the linearization-point residuals. Both the seeds and the
-        // replay go through this context itself: an eager context constructs and interprets concrete values, while a
+        // replay go through this context itself. An eager context constructs and interprets concrete values, while a
         // staging context stages into its enclosing trace.
         let mut pullback_inputs = vec![self.gradient_seed(&output, false)?];
         for value in Parameterized::<Self::Value>::parameters(&aux) {
