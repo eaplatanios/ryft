@@ -1048,7 +1048,7 @@ impl<
 /// everything else about staging: a foreign tracer fails the builder-identity check either when an operation binds it
 /// (via [`StagingContext::stage_operation`]) or when it escapes through a trace boundary (i.e., the boundary output
 /// checks), with [`ProgramError::MismatchedProgramBuilders`].
-pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOperation<Self>> {
+pub trait ForwardModeDifferentiate: Context {
     /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward, with this
     /// [`Context`] executing (or staging) the differentiated operations. Refer to the documentation of the [`jvp`]
     /// function for information on the forward-mode transform and its arguments.
@@ -1068,6 +1068,7 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
         Self: Zero<Self::Value>,
+        Self::Operation: Clone + DifferentiableOperation<Self>,
     {
         if primals.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -1233,12 +1234,15 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
     }
 }
 
-impl<C: Context<Operation: Clone + DifferentiableOperation<Self>>> ForwardModeDifferentiate for C {}
+impl<C: Context> ForwardModeDifferentiate for C {}
 
-// TODO(eaplatanios): Add mathematical notation explanation.
 /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the closure
 /// **directly on [`DifferentiationTracer`] duals** (i.e., the single forward-mode entry point, and the analogue of
-/// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html)). The transform recovers a [`Context`] from
+/// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html)). For `f` computing `y = f(x)`, this
+/// computes the dual `(y, ẏ) = (f(x), (∂f/∂x)(x) · ẋ)` — the primal output paired with the Jacobian-vector product
+/// of the input tangent `ẋ`.
+///
+/// The transform recovers a [`Context`] from
 /// the input's leaf values through [`Value::ExecutionDomain`], exactly like [`batch`](crate::batching::batch):
 /// staged [`Tracer`]s recover their trace, transform tracers recover their transform level, and concrete values recover
 /// the eager backend domain they name, so the transform composes uniformly across the whole stack. Each input is then
@@ -1286,52 +1290,48 @@ pub fn jvp<
     context.jvp(function, primals, tangents)
 }
 
-// TODO(eaplatanios): Review this function.
-/// Linearizes `function` at `primals`, returning the primal output and a reusable [`Pushforward`] (i.e., the analogue
-/// of [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)).
+/// Linearizes `function` at `primals`, returning the primal output and a reusable [`Pushforward`] (i.e., the
+/// analogue of [JAX's `linearize`](https://docs.jax.dev/en/latest/_autosummary/jax.linearize.html)). For `f` computing
+/// `y = f(x)`, this computes `y` together with the reusable linear pushforward map `ẋ ↦ ẏ = (∂f/∂x)(x) · ẋ` at the
+/// linearization point `x`, so that differentiating once serves any number of tangents.
 ///
-/// This is the partial-evaluation sibling of [`jvp`]: where `jvp` runs the closure once per `(primal, tangent)` pair,
-/// this runs the closure once on [`DifferentiationTracer`] duals over a [`PartialEvaluationContext`] wrapping the
-/// context recovered from the input's leaf values through
-/// [`Value::ExecutionDomain`](crate::programs::Value::ExecutionDomain) (exactly like [`jvp`] and
-/// [`batch`](crate::batching::batch)), with each dual's primal half *known* at its primal value and its tangent half
-/// *unknown*. Primal-side operations are then all-known and fold through the recovered context itself (i.e.,
-/// executing eagerly under an eager context or staging into the enclosing trace under a staging one, so that
-/// linearization composes under an outer trace), while tangent-side operations residualize into the accumulated
-/// pushforward program `(ẋ, r) ↦ ẏ`, which is linear in `ẋ` with the linearization point entering only through the
-/// residuals `r` recovered along the way. The returned [`Pushforward`] closes that program over those residuals, so
-/// that [`Pushforward::apply`] pushes any number of tangents through the function's Jacobian at this point without
-/// re-tracing or re-differentiating.
+/// This is the partial-evaluation sibling of [`jvp`]. Where `jvp` runs the closure once per `(primal, tangent)` pair,
+/// this function runs the closure once on [`DifferentiationTracer`] duals over a [`PartialEvaluationContext`] wrapping
+/// the context recovered from the input's leaf values through [`Value::ExecutionDomain`] (exactly like [`jvp`] and
+/// [`batch`](crate::batch)), with each dual's primal half *known* at its primal value and its tangent half *unknown*.
+/// Primal-side operations are then all-known and fold through the recovered context itself (i.e., executing eagerly
+/// under an eager context or staging into the enclosing trace under a staging one, so that linearization composes under
+/// an outer trace), while tangent-side operations residualize into the accumulated pushforward program `(ẋ, r) ↦ ẏ`,
+/// which is linear in `ẋ` with the linearization point entering only through the residuals `r` recovered along the way.
+/// The returned [`Pushforward`] closes that program over those residuals, so that [`Pushforward::apply`] pushes any
+/// number of tangents through the function's Jacobian at this point without re-tracing or re-differentiating.
 ///
-/// Because the closure's primal halves carry concrete values under an eager context, host control flow on primals
-/// works exactly as under [`jvp`]: the closure can branch on a primal (`if x.boolean()? { … }`), the untaken branch
-/// is never traced at all, and a data-dependent `while` combinator differentiates by running directly at the concrete
+/// Because the closure's primal halves carry concrete values under an eager context, host control flow on primals works
+/// exactly as under [`jvp`]: the closure can branch on a primal (e.g., `if x.boolean()? { … }`), the untaken branch is
+/// never traced at all, and a data-dependent `while` combinator differentiates by running directly at the concrete
 /// primals. This matches JAX's `linearize`/`grad` tracing semantics, where the same JVP interpreter runs over a
 /// partial-evaluation trace instead of the eval trace.
 ///
-/// Reverse mode is this transform plus transposition, literally: [`vjp`](crate::tracing_v2::vjp) calls this, opens the returned
-/// [`Pushforward`] back up with [`Pushforward::into_parts`], and transposes its program into the pullback (and the
-/// forward-mode Jacobian transform batch-replays it the same way).
-///
-/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error:
-/// there is nothing to recover a context from, and linearizing a function of no inputs is degenerate anyway.
+/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error: there is nothing to
+/// recover a context from, and linearizing a function of no inputs is degenerate anyway.
 /// [`ForwardModeDifferentiate::linearize`] is the explicit-context method form behind this function.
 #[inline]
-pub fn linearize<V, F, Input, Output>(
-    function: F,
-    primals: Input,
-) -> Result<(Output::To<V>, Pushforward<V::ExecutionDomain, Input, Output::To<V>>), DifferentiationError>
-where
-    V: Value<ExecutionDomain: Context>,
-    <V::ExecutionDomain as Domain>::Operation: Clone
-        + DifferentiableOperation<V::ExecutionDomain>
-        + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
-        + PartiallyEvaluatableOperation<V::ExecutionDomain>
-        + From<ZeroOperation<V::Type>>,
+pub fn linearize<
+    V: Value<
+        ExecutionDomain: Context<
+            Operation: Clone
+                           + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
+                           + PartiallyEvaluatableOperation<V::ExecutionDomain>
+                           + From<ZeroOperation<V::Type>>,
+        >,
+    >,
     F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
     Output: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
-{
+>(
+    function: F,
+    primals: Input,
+) -> Result<(Output::To<V>, Pushforward<V::ExecutionDomain, Input, Output::To<V>>), DifferentiationError> {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
         return Err(DifferentiationError::EmptyInput);
     };
@@ -1512,20 +1512,19 @@ mod tests {
         assert!(linearization.tangent().output_ids().is_empty());
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_jvp() {
-        // `ForwardModeDifferentiate::jvp` on an explicit context runs the closure directly on duals: for
+        // `ForwardModeDifferentiate::jvp` on an explicit context runs the closure directly on duals. For
         // `f(x) = sin(x)` at `x = 2` along the tangent `ẋ = 3`, the primal output is `sin(2)` and the tangent
         // output is `3 · cos(2)`.
-        let (value, tangent): (Scalar, Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+        let (value, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0))
             .unwrap();
         assert_scalar_close(value, 2.0f64.sin());
         assert_scalar_close(tangent, 3.0 * 2.0f64.cos());
 
-        // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations: a
-        // plain `Scalar` input recovers the eager scalar domain, so both dual halves are concrete.
+        // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
+        // A plain `Scalar` input recovers the eager scalar domain, so both dual halves are concrete.
         let (value, tangent): (Scalar, Scalar) = jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
         assert_scalar_close(value, 2.0f64.sin());
         assert_scalar_close(tangent, 3.0 * 2.0f64.cos());
@@ -1546,28 +1545,27 @@ mod tests {
         assert_scalar_close(outputs[0], 2.0f64.sin());
         assert_scalar_close(outputs[1], 3.0 * 2.0f64.cos());
 
-        // Tangents pair with primals leaf-for-leaf, so a tangent structure that does not match the primal structure
-        // is rejected.
-        let error =
-            jvp(|x: Vec<_>| Ok(x), vec![Scalar::from(1.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]).unwrap_err();
+        // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
+        // structure is rejected.
         assert!(matches!(
-            error,
+            jvp(|x: Vec<_>| Ok(x), vec![Scalar::from(1.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]).unwrap_err(),
             DifferentiationError::Program(ProgramError::Parameter(
-                ParameterError::MismatchedParameterStructures { .. }
-            ))
+                ParameterError::MismatchedParameterStructures { .. },
+            )),
         ));
 
         // With no leaf value to recover a context from, the free `jvp` reports an invalid input count.
-        let error = jvp(
-            |x: Vec<DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
-            Vec::<Scalar>::new(),
-            Vec::new(),
-        )
-        .unwrap_err();
-        assert_eq!(error, DifferentiationError::EmptyInput);
+        assert_eq!(
+            jvp(
+                |x: Vec<DifferentiationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
+                Vec::<Scalar>::new(),
+                Vec::new(),
+            )
+            .unwrap_err(),
+            DifferentiationError::EmptyInput,
+        );
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_linearize() {
         // `ForwardModeDifferentiate::linearize` on an explicit context runs the closure once at the primal point and
@@ -1580,14 +1578,14 @@ mod tests {
         assert_scalar_close(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos());
         assert_scalar_close(pushforward.apply(Scalar::from(3.0)).unwrap(), 3.0 * 2.0f64.cos());
 
-        // The free `linearize` serves top-level concrete values through their `Value::ExecutionDomain` declarations:
-        // primal work executes eagerly at the concrete linearization point while the pushforward program accumulates.
+        // The free `linearize` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
+        // Primal work executes eagerly at the concrete linearization point while the pushforward program accumulates.
         let (value, pushforward) = linearize(|x| x.sin(), Scalar::from(2.0)).unwrap();
         assert_scalar_close(value, 2.0f64.sin());
         assert_scalar_close(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos());
 
-        // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead, so
-        // primal work stages into the enclosing trace and the pushforward replays there when applied.
+        // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead,
+        // so primal work stages into the enclosing trace and the pushforward replays there when applied.
         let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
             |inputs: Vec<_>| {
                 let (value, pushforward) = linearize(|x| x.sin(), inputs[0].clone())?;
@@ -1603,12 +1601,14 @@ mod tests {
         assert_scalar_close(outputs[1], 3.0 * 2.0f64.cos());
 
         // With no leaf value to recover a context from, the free `linearize` reports an invalid input count.
-        let error = linearize(
-            |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
-            Vec::<Scalar>::new(),
-        )
-        .map(|(outputs, _)| outputs)
-        .unwrap_err();
-        assert_eq!(error, DifferentiationError::EmptyInput);
+        assert_eq!(
+            linearize(
+                |x: Vec<LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>| Ok(x),
+                Vec::<Scalar>::new(),
+            )
+            .map(|(outputs, _)| outputs)
+            .unwrap_err(),
+            DifferentiationError::EmptyInput
+        );
     }
 }
