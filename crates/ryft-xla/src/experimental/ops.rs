@@ -9,6 +9,7 @@ use ryft_core::batching::BatchableOperation;
 use ryft_core::batching::BatchingError;
 use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
 use ryft_core::compilation::CaptureReference;
+use ryft_core::compilation::function::CompiledProgramOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{DifferentiableOperation, TransposableOperation};
 use ryft_core::effects::Effects;
@@ -451,6 +452,13 @@ impl JitCallOperation {
     #[inline]
     pub(crate) fn program_rc(&self) -> &Rc<FlatXlaProgram> {
         &self.program
+    }
+}
+
+impl CompiledProgramOperation<XlaConstant> for XlaOperation {
+    #[inline]
+    fn compiled_call(program: Rc<FlatXlaProgram>) -> Self {
+        Self::JitCall(Box::new(JitCallOperation::new(program)))
     }
 }
 

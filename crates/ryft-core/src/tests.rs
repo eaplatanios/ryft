@@ -1553,7 +1553,9 @@ mod differentiation_tests {
 #[cfg(test)]
 mod linearization_tests {
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationTracer, LinearizationTracer};
+    use crate::differentiation::{
+        DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
+    };
     use crate::operations::compare::Compare;
     use crate::operations::control_flow::{MaybeWhile, Select, WhileOperation};
     use crate::operations::differentiation::StopGradient;
@@ -1564,7 +1566,6 @@ mod linearization_tests {
     use crate::programs::{Program, ProgramBuilder};
     use crate::scalars::Scalar;
     use crate::tracing::{NestedTracingContext, Tracer};
-    use crate::tracing_v2::differentiation::*;
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
     use crate::types::DataType;
 
@@ -3024,10 +3025,10 @@ mod array_linearization_tests {
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
-    use crate::tracing_v2::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
+    use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     use super::*;
 

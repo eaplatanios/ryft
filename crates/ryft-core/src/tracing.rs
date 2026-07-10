@@ -6,8 +6,7 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::axes::NamedAxis;
-use crate::compilation::captures::CaptureReference;
-use crate::compilation::context::CapturingContext;
+use crate::compilation::captures::{CaptureReference, CapturingContext};
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
 use crate::operations::Operation;

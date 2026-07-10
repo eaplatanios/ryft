@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ryft_core::compilation::{CompilationDomain, FunctionFingerprint};
+use ryft_core::compilation::CompilationDomain;
 use ryft_core::contexts::Domain;
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::types::ArrayType;
@@ -8,7 +8,7 @@ use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDe
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions, XlaTracer};
+use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions, XlaTracer};
 use crate::{Array, ArrayError, Error as XlaError, ToPjrt};
 
 /// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
@@ -108,19 +108,13 @@ fn is_fully_replicated(sharding: &Sharding) -> bool {
         && sharding.varying_manual_axes().is_empty()
 }
 
-/// Stable identifier for the compiled identity-reshard primitive. Combined with the input
-/// [`ArrayType`], the destination [`DeviceMesh`] and the in/out shardings inside the engine's
-/// [`XlaDomain::compilation_key`] computation, this is what makes two reshards share a
-/// compile-cache entry.
-const RESHARD_FINGERPRINT: FunctionFingerprint = FunctionFingerprint::Primitive("compiled_reshard.identity");
-
 /// Runs the compiled identity-with-sharding-constraints program against `dst_mesh`. Assumes the
 /// source array already lives on `dst_mesh`. If `donate` is true, the source's input buffers are
 /// marked donatable so PJRT can reuse their memory for output buffers; the caller must guarantee
 /// that the source's buffer is not read after this call.
 ///
-/// On cache hits the trace + lower phases are skipped entirely; only the cache miss path
-/// instantiates the staged program and renders MLIR.
+/// The compilation cache is keyed by the complete lowered computation, including its input/output sharding
+/// annotations and PJRT options.
 fn try_same_mesh<'o>(
     source: &Array<'o>,
     engine: &XlaDomain<'o>,
@@ -144,19 +138,26 @@ fn try_same_mesh<'o>(
         donation_flags: vec![donate],
     };
 
-    let input_types_for_key = [bare_input_type.clone()];
-    let cache_key = engine.compilation_key(&RESHARD_FINGERPRINT, &input_types_for_key, &xla_options);
+    let (_output_types_tree, program): (ArrayType, _) =
+        XlaDomain::<'o>::trace(|x: XlaTracer<'o>| Ok(x), bare_input_type.clone()).map_err(|error| {
+            ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") }
+        })?;
+    let program = program.into_flat_program();
+    let lowered = CompilationDomain::lower(engine, &program, 0, &xla_options).map_err(|error| match error {
+        XlaDomainError::Array(array_error) => array_error,
+        other => ArrayError::CompiledReshardInternalError { message: format!("lowering failed: {other}") },
+    })?;
+    let cache_key =
+        CompilationDomain::compilation_key(engine, &lowered, &xla_options).map_err(|error| match error {
+            XlaDomainError::Array(array_error) => array_error,
+            other => {
+                ArrayError::CompiledReshardInternalError { message: format!("cache-key construction failed: {other}") }
+            }
+        })?;
 
     let cache = engine.cache().expect("XlaDomain always exposes a compile cache");
-    let compiled: XlaCompiledProgram<'o> = cache
-        .get_or_compile(engine, cache_key, || -> Result<XlaCompiledProgram<'o>, XlaDomainError> {
-            // Trace `identity(x) = x` through the engine's tracing pipeline. The resulting XLA program is what
-            // `CompilationDomain::compile` lowers and feeds to PJRT.
-            let (_output_types_tree, program): (ArrayType, _) =
-                XlaDomain::<'o>::trace(|x: XlaTracer<'o>| Ok(x), bare_input_type.clone())
-                    .map_err(XlaDomainError::from)?;
-            CompilationDomain::compile(engine, &program, &xla_options)
-        })
+    let compiled = cache
+        .get_or_compile(engine, cache_key, || CompilationDomain::compile(engine, &lowered, &xla_options))
         .map_err(|error| match error {
             XlaDomainError::Array(array_error) => array_error,
             other => ArrayError::CompiledReshardInternalError { message: format!("{other}") },

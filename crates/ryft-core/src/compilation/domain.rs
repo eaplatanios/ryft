@@ -3,98 +3,166 @@ use std::hash::Hash;
 use crate::contexts::Domain;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError};
+use crate::types::Type;
 
 use super::context::CompilationContext;
-use super::fingerprint::FunctionFingerprint;
 
-/// Backend interface for the backend-agnostic compilation pipeline.
+/// Backend contract for lowering, compiling, and executing staged [`Program`]s.
 ///
-/// A [`CompilationDomain`] is a [`Domain`] that can additionally lower a traced
-/// [`Program`] into a backend-specific compiled artifact and execute it against runtime values.
-/// The trait is intentionally minimal: everything backend-specific (mesh, device placement,
-/// buffer donation, layout overrides, platform identity for disk caching, ...) flows through
-/// the [`Self::Options`] associated type and is interpreted entirely by the domain.
+/// Compilation is deliberately split into three semantic stages:
 ///
-/// # Composition with transforms
+/// 1. Ryft traces a Rust closure into a backend-independent [`Program`] expressed in this domain's constant and
+///    operation universe.
+/// 2. [`Self::lower`] translates the flat program into [`Self::LoweredProgram`], the backend's compiler input.
+/// 3. [`Self::compile`] turns that lowering into [`Self::CompiledProgram`], which [`Self::execute`] can invoke.
 ///
-/// Because a [`CompilationDomain`] *is a* [`Domain`], the existing `ryft-core` transforms
-/// (`grad`, `value_and_gradient`, `jvp`, `vjp`, `linearize`, `jacrev`, `jacfwd`, `hessian`, `batch`)
-/// compose naturally inside the closure passed to
-/// [`compile_with_options`](super::compile_with_options). The transform is traced as part of the
-/// staged program, so the resulting executable computes the transformed function directly.
-pub trait CompilationDomain: Domain {
-    /// Backend's compiled artifact. Carries everything needed to execute, baked in by the
-    /// domain's [`Self::compile`] step (output types, donation flags, expected layouts,
-    /// mesh, etc.). `Clone` is required so the in-memory cache can hand the same artifact
-    /// to multiple [`CompiledFunction`](super::CompiledFunction) handles.
-    type CompiledProgram: Clone;
+/// Keeping lowered and compiled artifacts backend-owned lets `ryft-core` provide a common lifecycle without exposing
+/// StableHLO, PJRT, XLA, or any other compiler-specific representation. It also makes cache identity precise:
+/// [`Self::compilation_key`] receives the complete lowering and must account for every option and piece of backend
+/// state that can change the executable.
+pub trait CompilationDomain: Domain + Clone {
+    /// Backend-owned compiler input produced by [`Self::lower`].
+    type LoweredProgram;
 
-    /// Backend-specific compile options. For XLA: mesh, donation flags, sharding overrides.
-    /// For backends without per-call options, set to `()`. The cache uses the domain's
-    /// [`Self::compilation_key`] method to derive its key, so [`Self::Options`] does not need
-    /// to implement marker traits such as [`Hash`].
+    /// Backend-owned executable produced by [`Self::compile`]. Core stores this artifact behind an [`Arc`](std::sync::Arc)
+    /// so cache hits and compiled-function clones do not require a potentially expensive backend clone.
+    type CompiledProgram;
+
+    /// Backend-specific compilation options. Meshes, sharding and layout overrides, donation declarations, compiler
+    /// flags, and similar target-specific state belong here rather than in `ryft-core`.
     type Options;
 
-    /// Backend-specific error type. Must absorb [`ProgramError`] so that errors raised inside
-    /// the trace path can flow through the domain's own error channel.
+    /// Backend error channel. Staging and call-boundary errors flow through it as [`ProgramError`]s.
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Structural cache key for a compilation. Two compilations whose keys compare equal are
-    /// guaranteed to produce the same compiled artifact; conversely, two compilations whose
-    /// keys differ get distinct cache entries. The cache uses `Hash` for bucketing and `Eq`
-    /// for collision-free lookup — hash-only schemes have a non-zero (if tiny) probability of
-    /// silently serving the wrong artifact, which we eliminate by carrying the structured key
-    /// through to the equality check.
+    /// Exact in-memory cache key for one lowered compilation.
+    ///
+    /// Equality must mean that the corresponding compiled artifacts are interchangeable for execution. In
+    /// particular, the key must include the complete computation represented by [`Self::LoweredProgram`] as well as
+    /// every compile-relevant option, target property, compiler version, and backend setting. A source location or a
+    /// hash of input types is not a sufficient computation identity.
     type CompilationKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    /// Computes the structural cache key for a given compilation. The domain has full control
-    /// over what goes in: the call-site [`FunctionFingerprint`], the input type signatures,
-    /// the [`Self::Options`], and any backend-specific state (compile options, platform
-    /// identity for cross-machine disk caches, etc.). The cache stores entries keyed by
-    /// [`Self::CompilationKey`], using `Eq` to disambiguate hash collisions.
+    /// Applies options that affect abstract input types before tracing.
+    ///
+    /// Most domains leave input types unchanged. A sharded backend can override this to apply explicit input sharding
+    /// or layout declarations before the closure observes its abstract arguments.
+    #[inline]
+    fn prepare_input_types<Input: Parameterized<Self::Type>>(
+        &self,
+        input_types: Input,
+        _options: &Self::Options,
+    ) -> Result<Input, Self::Error> {
+        Ok(input_types)
+    }
+
+    /// Validates that options affecting abstract inputs are already represented by a staged signature.
+    ///
+    /// This hook protects the explicit `stage(...).lower(options)` path: a backend whose input options affect tracing
+    /// must reject a staged signature that was not prepared consistently. [`Self::prepare_input_types`] remains the
+    /// mechanism used by the combined compile entry point before tracing.
+    #[inline]
+    fn validate_staged_input_types(
+        &self,
+        _input_types: &[Self::Type],
+        _options: &Self::Options,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Lowers a flat source program into the backend's compiler input.
+    ///
+    /// `capture_count` identifies the leading inputs that came from a closed program's runtime capture table. Backends
+    /// use it to keep capture-only policy (for example, non-donation) separate from public input policy.
+    fn lower(
+        &self,
+        program: &Program<Self::Constant, Self::Operation, Vec<Self::Constant>, Vec<Self::Constant>>,
+        capture_count: usize,
+        options: &Self::Options,
+    ) -> Result<Self::LoweredProgram, Self::Error>;
+
+    /// Returns the effective flat output types produced by `program` after lowering-time option rewrites.
+    fn lowered_output_types<'a>(&self, program: &'a Self::LoweredProgram) -> &'a [Self::Type];
+
+    /// Constructs the exact in-memory cache key for `program` and `options`.
     fn compilation_key(
         &self,
-        function: &FunctionFingerprint,
-        inputs: &[Self::Type],
+        program: &Self::LoweredProgram,
         options: &Self::Options,
-    ) -> Self::CompilationKey;
+    ) -> Result<Self::CompilationKey, Self::Error>;
 
-    /// Lowers a traced [`Program`] into a [`Self::CompiledProgram`]. The domain reads its own
-    /// backend-specific per-call state (donation, mesh, shardings, etc.) out of `options` and
-    /// bakes whatever [`Self::execute`] needs into the artifact.
-    fn compile<Input: Parameterized<Self::Constant>, Output: Parameterized<Self::Constant>>(
+    /// Compiles one lowered program into a backend executable.
+    fn compile(
         &self,
-        program: &Program<Self::Constant, Self::Operation, Input, Output>,
+        program: &Self::LoweredProgram,
         options: &Self::Options,
     ) -> Result<Self::CompiledProgram, Self::Error>;
 
-    /// Executes a compiled program. Every piece of per-call state is already in the artifact; the caller hands over
-    /// [`Domain::Value`]s in flat input order and gets runtime values back in flat output order.
+    /// Returns the effective flat output types produced by `program` at execution.
+    fn compiled_output_types<'a>(&self, program: &'a Self::CompiledProgram) -> &'a [Self::Type];
+
+    /// Validates one runtime input type against the declared staged type.
+    ///
+    /// The default accepts exact refinements. Backends that implement an explicit call-boundary conversion, such as
+    /// implicit resharding, may accept a broader relation here as long as [`Self::execute`] performs that conversion
+    /// before invoking the executable.
+    #[inline]
+    fn validate_input_type(&self, declared: &Self::Type, actual: &Self::Type) -> Result<(), Self::Error> {
+        if declared.is_refined_by(actual) {
+            Ok(())
+        } else {
+            Err(ProgramError::InvalidArgument {
+                message: format!("runtime input type {actual} does not refine declared type {declared}"),
+            }
+            .into())
+        }
+    }
+
+    /// Validates one runtime output type against the executable's declared output type.
+    #[inline]
+    fn validate_output_type(&self, declared: &Self::Type, actual: &Self::Type) -> Result<(), Self::Error> {
+        if declared.is_refined_by(actual) {
+            Ok(())
+        } else {
+            Err(ProgramError::InvalidArgument {
+                message: format!("output type {actual} does not refine declared type {declared}"),
+            }
+            .into())
+        }
+    }
+
+    /// Executes `program` against flat runtime inputs and returns flat runtime outputs.
     fn execute(
         &self,
         program: &Self::CompiledProgram,
         inputs: Vec<Self::Value>,
     ) -> Result<Vec<Self::Value>, Self::Error>;
 
-    /// Serializes a compiled program for the disk-cache tier. Backends that don't support
-    /// persistent caching return an "unsupported" error variant; the cache treats any error
-    /// as a signal to skip the disk tier for that entry.
-    fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Vec<u8>, Self::Error>;
-
-    /// Deserializes a compiled program previously emitted by [`Self::serialize_program`].
-    /// Backends should validate platform compatibility (e.g. PJRT platform name + version) and
-    /// return an error on mismatch; the cache treats any error as a signal to skip the disk
-    /// tier for that entry.
-    fn deserialize_program(&self, bytes: &[u8]) -> Result<Self::CompiledProgram, Self::Error>;
-
-    /// Returns the [`CompilationContext`] this domain uses to memoize compiled programs, if any.
+    /// Returns stable canonical bytes for persistent cache identity, or `None` when this domain does not support
+    /// persistent executable caching.
     ///
-    /// The default returns `None`, in which case the core entry points
-    /// ([`compile_with_options`](super::compile_with_options),
-    /// [`compile`](super::compile)) compile fresh on every call. Domains that want caching
-    /// override this to return a reference to their internal cache — typically stored as an
-    /// [`Arc<CompilationContext<Self>>`](std::sync::Arc) field so domain clones share the same
-    /// cache.
+    /// These bytes must remain stable across processes that may share the cache and must cover the complete
+    /// computation, options, compiler/backend versions, and target topology. Core hashes them only for filename-safe
+    /// addressing; it does not add missing semantic state.
+    #[inline]
+    fn persistent_cache_key(&self, _key: &Self::CompilationKey) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Serializes a compiled program for persistent caching. `Ok(None)` means unsupported.
+    #[inline]
+    fn serialize_program(&self, _program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Deserializes a persistent-cache payload. `Ok(None)` means unsupported or incompatible.
+    #[inline]
+    fn deserialize_program(&self, _bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
+        Ok(None)
+    }
+
+    /// Returns the process-local compilation context used by this domain, when caching is enabled.
+    #[inline]
     fn cache(&self) -> Option<&CompilationContext<Self>> {
         None
     }

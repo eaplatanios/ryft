@@ -1429,8 +1429,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::batching::Batch;
+    use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
+    use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
@@ -1445,8 +1446,6 @@ mod tests {
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
-    use crate::batching::BatchAxis;
-    use crate::tracing_v2::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     /// Returns the canonical test array type with the provided dimensions.
     fn test_type(dimensions: &[usize]) -> ArrayType {

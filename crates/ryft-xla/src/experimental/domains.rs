@@ -1,5 +1,4 @@
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
@@ -7,7 +6,7 @@ use std::sync::{Arc, LazyLock};
 use ryft_pjrt::protos::CompilationOptions;
 use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
 
-use ryft_core::compilation::{CompilationContext, CompilationDomain, FunctionFingerprint};
+use ryft_core::compilation::{CompilationContext, CompilationDomain};
 use ryft_core::contexts::{Context, Domain};
 use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
@@ -26,10 +25,10 @@ use ryft_core::scalars::Scalar;
 use ryft_core::sharding::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
 use ryft_core::tracing::DomainTracer;
 use ryft_core::tracing_v2::CoordinateBasis;
-use ryft_core::types::{ArrayType, DataType, Shape, TypeError, Typed};
+use ryft_core::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
 
 use super::operations::ShardMapOperation;
-use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgram, XlaProgramBuilder};
+use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
 use super::shard_map::ShardMapTraceError;
 use crate::arrays_v0::{ArrayError, ShardDescriptor, ShardLayout};
 use crate::{Array, Error, FromPjrt, ToPjrt};
@@ -174,17 +173,17 @@ impl<'c> XlaDomain<'c> {
     /// Creates a new [`XlaDomain`] whose compile cache also writes through to a
     /// [`DiskCache`](ryft_core::compilation::DiskCache) configured via the
     /// [`DiskCache::ENV_VAR`](ryft_core::compilation::DiskCache::ENV_VAR) environment variable,
-    /// if it is set. Falls back to an in-memory-only cache when the variable is absent or
-    /// unparseable.
+    /// if it is set. An absent variable produces an in-memory-only cache; an invalid cache directory returns the
+    /// corresponding I/O error.
     #[inline]
-    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> Self {
-        Self {
+    pub fn with_disk_cache_from_env(client: &'c Client<'c>) -> std::io::Result<Self> {
+        Ok(Self {
             client: Some(client),
             mesh: None,
             compilation_options: CompilationOptions::default(),
-            cache: Arc::new(CompilationContext::new().with_disk_cache_from_env()),
+            cache: Arc::new(CompilationContext::new().with_disk_cache_from_env()?),
             marker: PhantomData,
-        }
+        })
     }
 
     /// Returns the singleton tracing-only domain token that carries the XLA staged operation
@@ -462,22 +461,20 @@ impl<'c> CoordinateBasis<Array<'c>> for XlaDomain<'c> {
         let output = builder.add_instruction(SelectOperation, vec![selected, one, zero])?[0];
         let program: FlatXlaProgram = builder.build(vec![output], Vec::new(), vec![Placeholder])?;
 
-        // Cache by the complete basis declaration; execution has no runtime inputs. The output type carries the
-        // inserted replicated basis axis and the leaf's original sharding on its remaining axes.
-        let mut hasher = DefaultHasher::new();
-        leaf_type.hash(&mut hasher);
-        coordinate_offset.hash(&mut hasher);
-        basis_size.hash(&mut hasher);
-        let fingerprint = FunctionFingerprint::Composite {
-            base: Box::new(FunctionFingerprint::Primitive("ryft.coordinate_basis")),
-            extra: hasher.finish(),
-        };
+        // Execution has no runtime inputs. The complete lowered computation is the cache identity, so the output
+        // type and coordinate declaration are represented directly by its StableHLO instead of a separate source
+        // fingerprint.
         let mesh = self.eager_mesh(client, &[], program.output_types().as_slice())?;
         let options = XlaOptions::new(mesh);
-        let cache_key = self.compilation_key(&fingerprint, &[], &options);
+        let lowered = self
+            .lower(&program, 0, &options)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let cache_key = self
+            .compilation_key(&lowered, &options)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
             .cache
-            .get_or_compile(self, cache_key, || self.compile(&program, &options))
+            .get_or_compile(self, cache_key, || self.compile(&lowered, &options))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let mut outputs = self
             .execute(&compiled, Vec::new())
@@ -537,22 +534,6 @@ fn eager_identity_output_type<O: Operation<ArrayType>>(operation: &O) -> Result<
     Ok(output_types.pop().expect("output count checked above"))
 }
 
-/// Returns the process-local compile-cache fingerprint for one eagerly bound operation.
-///
-/// The fingerprint hashes the operation's `Debug` rendering because derived `Debug` output includes every semantic
-/// field — nested `condition` / `while` / `scan` bodies, `jit_call` callee programs, and literal payloads — whereas
-/// the canonical rendered form summarizes call-like payloads by arity only, which would alias distinct callees. Input
-/// types (with shardings), mesh, and compilation options are carried by the rest of the compilation key, so this
-/// fingerprint only needs to identify the operation itself.
-fn eager_operation_fingerprint(operation: &XlaOperation) -> FunctionFingerprint {
-    let mut hasher = DefaultHasher::new();
-    format!("{operation:?}").hash(&mut hasher);
-    FunctionFingerprint::Composite {
-        base: Box::new(FunctionFingerprint::Primitive("ryft.eager_bind")),
-        extra: hasher.finish(),
-    }
-}
-
 fn validate_identity_synthesis(identity: &'static str, array_type: &ArrayType) -> Result<(), ProgramError> {
     match array_type.data_type() {
         DataType::Token => Err(TypeError {
@@ -572,10 +553,11 @@ impl<'c> XlaDomain<'c> {
     ///
     /// The operation is traced into a single-instruction flat program over the inputs' physical [`ArrayType`]s
     /// (shardings included), compiled through this domain's compile cache, and executed on this domain's PJRT client.
-    /// The cache key combines the operation's structural fingerprint with the input types and the derived mesh, so
-    /// repeated eager binds of the same operation signature reuse one compiled executable. Higher-order operations
-    /// (`condition` / `while` / `scan` / `jit_call` / `shard_map`) carry their nested programs as payloads and flow
-    /// through this same path — the compiler handles the control flow, so no host interpreter loops are needed.
+    /// The cache key contains the complete lowered computation, its effective compilation options, and the derived
+    /// mesh, so repeated eager binds of the same lowering reuse one compiled executable without conflating distinct
+    /// computations. Higher-order operations (`condition` / `while` / `scan` / `jit_call` / `shard_map`) carry their
+    /// nested programs as payloads and flow through this same path — the compiler handles the control flow, so no host
+    /// interpreter loops are needed.
     fn eager_bind(&self, operation: XlaOperation, inputs: &[Array<'c>]) -> Result<Vec<Array<'c>>, ProgramError> {
         let Some(client) = self.client else {
             return Err(ProgramError::InvalidArgument {
@@ -589,7 +571,6 @@ impl<'c> XlaDomain<'c> {
 
         // Trace the single-instruction program over the inputs' physical types, shardings included.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let fingerprint = eager_operation_fingerprint(&operation);
         let mut builder = XlaProgramBuilder::new();
         let input_atoms = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
         let output_atoms = builder.add_instruction(operation, input_atoms)?.to_vec();
@@ -602,10 +583,15 @@ impl<'c> XlaDomain<'c> {
         // execute via PJRT.
         let mesh = self.eager_mesh(client, inputs, program.output_types().as_slice())?;
         let options = XlaOptions::new(mesh);
-        let cache_key = self.compilation_key(&fingerprint, input_types.as_slice(), &options);
+        let lowered = self
+            .lower(&program, 0, &options)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        let cache_key = self
+            .compilation_key(&lowered, &options)
+            .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
             .cache
-            .get_or_compile(self, cache_key, || self.compile(&program, &options))
+            .get_or_compile(self, cache_key, || self.compile(&lowered, &options))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let outputs = self
             .execute(&compiled, inputs.to_vec())
@@ -974,70 +960,82 @@ impl std::hash::Hash for XlaOptions {
     }
 }
 
-/// Structural compilation key for [`XlaDomain`]. Implements the
-/// [`CompilationKey`](CompilationDomain::CompilationKey) associated type so the cache can use
-/// `Eq` on the structured fields to eliminate silent hash collisions.
-///
-/// Two compilations whose `XlaCompilationKey`s compare equal are guaranteed to produce the
-/// same compiled artifact (modulo non-deterministic XLA passes, which we treat as one
-/// equivalence class). Two compilations whose keys differ get distinct cache entries.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct XlaCompilationKey {
-    /// Identity of the user function being compiled (source location or primitive name).
-    pub function: FunctionFingerprint,
+/// StableHLO lowering and call-boundary metadata produced before PJRT compilation.
+#[derive(Clone, Debug)]
+pub struct XlaLoweredProgram {
+    /// Textual StableHLO/Shardy module accepted by PJRT.
+    stable_hlo: Arc<str>,
 
-    /// Flat input types in trace order. Determines the executable's expected input layouts.
-    pub inputs: Vec<ArrayType>,
+    /// Effective PJRT compilation options, including SPMD partition count.
+    compilation_options: CompilationOptions,
 
-    /// Per-call options bundle: mesh, sharding overrides, donation flags.
-    pub options: XlaOptions,
+    /// Effective output types after applying output-sharding overrides.
+    output_types: Arc<[ArrayType]>,
 
-    /// `Debug` rendering of the domain's base [`PjrtCompilationOptions`](ryft_pjrt::protos::CompilationOptions).
-    /// Stored as a string because the protobuf-generated type doesn't derive `Hash`/`Eq`;
-    /// `Debug` is stable enough for cache-key purposes.
-    pub base_options_debug: String,
+    /// Donation declarations for public inputs. Captures are always non-donatable.
+    donation_flags: Arc<[bool]>,
 
-    /// PJRT platform name reported by the domain's client, if available. Distinguishes CPU
-    /// from GPU from TPU artifacts so a disk cache shared across machines doesn't accidentally
-    /// serve a wrong-platform executable.
-    pub platform_name: Option<String>,
-
-    /// PJRT platform version reported by the domain's client, if available. Mirrors
-    /// [`Self::platform_name`].
-    pub platform_version: Option<String>,
-}
-
-/// XLA's compiled-program type returned by [`CompilationDomain::compile`]. Carries the loaded
-/// PJRT executable plus every piece of per-call state [`CompilationDomain::execute`] needs.
-#[derive(Clone)]
-pub struct XlaCompiledProgram<'c> {
-    /// Compiled PJRT executable. Shared via `std::sync::Arc` so multiple
-    /// [`CompiledXlaFunction`](ryft_core::compilation::CompiledXlaFunction)s can share the same
-    /// underlying compilation.
-    executable: std::sync::Arc<LoadedExecutable<'c>>,
-
-    /// Flat output [`ArrayType`]s in executor-output order. Used by `execute` to reassemble
-    /// per-device PJRT buffers into distributed [`Array`] values.
-    output_types: std::sync::Arc<[ArrayType]>,
-
-    /// Flat per-input donation flags forwarded to PJRT at execute time.
-    donation_flags: std::sync::Arc<[bool]>,
-
-    /// Number of hidden captured-value arguments prepended to the executable signature.
+    /// Number of leading executable arguments supplied by the staged capture table.
     capture_count: usize,
 
-    /// Expected per-argument shardings captured at compile time. Hidden captures come first,
-    /// followed by user inputs. [`CompilationDomain::execute`] uses these to silently reshard
-    /// mismatched runtime inputs at the call boundary, mirroring JAX's implicit reshard.
-    expected_argument_shardings: std::sync::Arc<[Sharding]>,
+    /// Effective sharding expected for every executable argument, including captures first.
+    expected_argument_shardings: Arc<[Sharding]>,
 
-    /// Mesh the compiled program runs against. Cloned from the
-    /// [`XlaOptions`](XlaOptions::mesh) used at compile time.
+    /// Concrete mesh against which the module was lowered.
+    mesh: DeviceMesh,
+}
+
+impl XlaLoweredProgram {
+    /// Returns the textual StableHLO/Shardy module.
+    #[inline]
+    pub fn stable_hlo(&self) -> &str {
+        &self.stable_hlo
+    }
+
+    /// Returns the effective flat output types.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        &self.output_types
+    }
+
+    /// Returns the device mesh this lowering targets.
+    #[inline]
+    pub fn mesh(&self) -> &DeviceMesh {
+        &self.mesh
+    }
+}
+
+/// Exact process-local compilation key for an XLA lowering.
+///
+/// Unlike the former call-site fingerprint, this key carries the complete StableHLO computation and every
+/// execution-relevant field retained by [`XlaLoweredProgram`]. Equality therefore means that cached compiled
+/// artifacts are interchangeable, even when unrelated call sites happen to share the same input signature.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct XlaCompilationKey {
+    stable_hlo: Arc<str>,
+    compilation_options_debug: String,
+    output_types: Arc<[ArrayType]>,
+    donation_flags: Arc<[bool]>,
+    capture_count: usize,
+    expected_argument_shardings: Arc<[Sharding]>,
+    options: XlaOptions,
+    platform_name: Option<String>,
+    platform_version: Option<String>,
+}
+
+/// Loaded PJRT executable plus the metadata required to invoke it safely.
+#[derive(Clone)]
+pub struct XlaCompiledProgram<'c> {
+    executable: Arc<LoadedExecutable<'c>>,
+    output_types: Arc<[ArrayType]>,
+    donation_flags: Arc<[bool]>,
+    capture_count: usize,
+    expected_argument_shardings: Arc<[Sharding]>,
     mesh: DeviceMesh,
 }
 
 impl<'c> XlaCompiledProgram<'c> {
-    /// Returns a reference to the loaded PJRT executable.
+    /// Returns the loaded PJRT executable.
     #[inline]
     pub fn executable(&self) -> &LoadedExecutable<'c> {
         &self.executable
@@ -1056,186 +1054,181 @@ impl<'c> XlaCompiledProgram<'c> {
     }
 }
 
-impl<'c> XlaDomain<'c> {
-    /// Compiles one XLA program with hidden captured-value arguments.
-    pub(crate) fn compile_program_with_captures<Input, Output>(
+impl<'c> CompilationDomain for XlaDomain<'c> {
+    type LoweredProgram = XlaLoweredProgram;
+    type CompiledProgram = XlaCompiledProgram<'c>;
+    type Options = XlaOptions;
+    type Error = XlaDomainError;
+    type CompilationKey = XlaCompilationKey;
+
+    fn prepare_input_types<Input: Parameterized<ArrayType>>(
         &self,
-        program: &XlaProgram<Input, Output>,
-        capture_types: &[ArrayType],
+        input_types: Input,
         options: &XlaOptions,
-    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
-    where
-        Input: Parameterized<XlaConstant>,
-        Output: Parameterized<XlaConstant>,
-    {
-        // Walk input atoms to read each input's `ArrayType`, then apply the optional
-        // `in_shardings` override to rewrite the sharding metadata used during lowering.
-        let input_types_vec: Vec<ArrayType> = program
-            .input_ids()
-            .iter()
-            .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
-            .collect();
-        let input_types_vec = apply_signature_shardings(input_types_vec, options.in_shardings.as_deref(), "in")?;
+    ) -> Result<Input, XlaDomainError> {
+        let Some(in_shardings) = options.in_shardings.as_deref() else {
+            return Ok(input_types);
+        };
+        let structure = input_types.parameter_structure();
+        let input_types = apply_signature_shardings(input_types.into_parameters().collect(), Some(in_shardings), "in")?;
+        Input::from_parameters(structure, input_types).map_err(|error| XlaDomainError::Array(error.into()))
+    }
 
-        // Walk output atoms similarly and apply `out_shardings` override.
-        let output_types_vec: Vec<ArrayType> = program
-            .output_ids()
-            .iter()
-            .map(|atom_id| program.atoms()[atom_id.index()].r#type().into_owned())
-            .collect();
-        let output_types_vec = apply_signature_shardings(output_types_vec, options.out_shardings.as_deref(), "out")?;
-
-        // Validate donation arity. The core jit constructs `donation_flags` from
-        // `donate_argnums`; here we just verify the length matches the program's input arity.
-        if !options.donation_flags.is_empty() && options.donation_flags.len() != input_types_vec.len() {
+    fn validate_staged_input_types(
+        &self,
+        input_types: &[ArrayType],
+        options: &XlaOptions,
+    ) -> Result<(), XlaDomainError> {
+        let Some(in_shardings) = options.in_shardings.as_deref() else {
+            return Ok(());
+        };
+        if input_types.len() != in_shardings.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
-                    "donation_flags has {} entries but the program has {} flat input(s)",
+                    "in_shardings has {} entries but the staged signature has {} flat input(s)",
+                    in_shardings.len(),
+                    input_types.len(),
+                ),
+            });
+        }
+        for (index, (input_type, sharding)) in input_types.iter().zip(in_shardings).enumerate() {
+            if input_type.sharding() != Some(sharding) {
+                return Err(XlaDomainError::InvalidCompilationOptions {
+                    reason: format!(
+                        "in_shardings[{index}] is not represented by staged input type {input_type}; apply options \
+                         before staging",
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn lower(
+        &self,
+        program: &FlatXlaProgram,
+        capture_count: usize,
+        options: &XlaOptions,
+    ) -> Result<XlaLoweredProgram, XlaDomainError> {
+        let input_types = program.input_types();
+        if capture_count > input_types.len() {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "capture_count is {capture_count}, but the program has only {} flat input(s)",
+                    input_types.len(),
+                ),
+            });
+        }
+        let (capture_types, public_input_types) = input_types.split_at(capture_count);
+        let public_input_types =
+            apply_signature_shardings(public_input_types.to_vec(), options.in_shardings.as_deref(), "in")?;
+        if !options.donation_flags.is_empty() && options.donation_flags.len() != public_input_types.len() {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "donation_flags has {} entries but the program has {} flat public input(s)",
                     options.donation_flags.len(),
-                    input_types_vec.len(),
+                    public_input_types.len(),
                 ),
             });
         }
 
-        // Extract per-argument and per-result shardings for the SPMD partitioner.
-        let result_shardings: Option<Vec<Sharding>> =
-            output_types_vec.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
-        let capture_shardings: Vec<Sharding> = capture_types
+        let effective_input_types = capture_types.iter().cloned().chain(public_input_types).collect::<Vec<_>>();
+        let output_types = apply_signature_shardings(program.output_types(), options.out_shardings.as_deref(), "out")?;
+        let expected_argument_shardings = effective_input_types
             .iter()
             .map(|array_type| {
                 array_type.sharding().cloned().unwrap_or_else(|| {
                     Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
                 })
             })
-            .collect();
-        let argument_shardings = capture_shardings
-            .iter()
-            .cloned()
-            .chain(input_types_vec.iter().map(|array_type| {
-                array_type.sharding().cloned().unwrap_or_else(|| {
-                    Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
-                })
-            }))
             .collect::<Vec<_>>();
-
-        // Derive SPMD compilation options from the mesh size, mirroring `jit_compilation_options`.
+        let result_shardings =
+            output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
         let compilation_options = jit_compilation_options(&self.compilation_options, options.mesh.devices().len());
-
-        // Lower → MLIR text via the existing pipeline.
-        let mlir_module = crate::experimental::lowering::to_mlir_module_for_program(
+        let stable_hlo = crate::experimental::lowering::to_mlir_module_for_program(
             program,
-            capture_types,
-            // The lowering helper takes `&Input` typed as `Parameterized<ArrayType>` for the
-            // global input/output type trees. We pass the flat input/output type Vecs since
-            // they implement `Parameterized<ArrayType>` (the trivial leaf-only family).
-            &input_types_vec,
-            &output_types_vec,
+            &[],
+            &effective_input_types,
+            &output_types,
             "main",
-            Some(argument_shardings.as_slice()),
+            Some(expected_argument_shardings.as_slice()),
             result_shardings.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
 
-        // Compile MLIR via PJRT.
-        let pjrt_program = PjrtProgram::Mlir { bytecode: mlir_module.into_bytes() };
-        let executable = self.client().compile(&pjrt_program, &compilation_options)?;
-
-        Ok(XlaCompiledProgram {
-            executable: std::sync::Arc::new(executable),
-            output_types: output_types_vec.into(),
+        Ok(XlaLoweredProgram {
+            stable_hlo: stable_hlo.into(),
+            compilation_options,
+            output_types: output_types.into(),
             donation_flags: options.donation_flags.clone().into(),
-            capture_count: capture_types.len(),
-            expected_argument_shardings: argument_shardings.into(),
+            capture_count,
+            expected_argument_shardings: expected_argument_shardings.into(),
             mesh: options.mesh.clone(),
         })
     }
 
-    /// Executes one compiled program with captured runtime values prepended as hidden arguments.
-    pub(crate) fn execute_with_captures(
-        &self,
-        program: &XlaCompiledProgram<'c>,
-        captures: &[Array<'c>],
-        inputs: Vec<Array<'c>>,
-    ) -> Result<Vec<Array<'c>>, XlaDomainError> {
-        if captures.len() != program.capture_count {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "compiled program expects {} capture(s) but got {}",
-                    program.capture_count,
-                    captures.len(),
-                ),
-            });
-        }
-        let arguments = captures.iter().cloned().chain(inputs).collect::<Vec<_>>();
-        let resharded_arguments =
-            reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, arguments)?;
-        let donation_flags = if program.donation_flags.is_empty() {
-            vec![false; resharded_arguments.len()]
-        } else {
-            std::iter::repeat(false)
-                .take(program.capture_count)
-                .chain(program.donation_flags.iter().copied())
-                .collect::<Vec<_>>()
-        };
-        execute_pjrt(
-            self.client,
-            &program.executable,
-            &program.mesh,
-            resharded_arguments,
-            donation_flags.as_slice(),
-            &program.output_types,
-        )
-    }
-}
-
-impl<'c> CompilationDomain for XlaDomain<'c> {
-    type CompiledProgram = XlaCompiledProgram<'c>;
-    type Options = XlaOptions;
-    type Error = XlaDomainError;
-    type CompilationKey = XlaCompilationKey;
-
     #[inline]
-    fn cache(&self) -> Option<&CompilationContext<Self>> {
-        Some(&self.cache)
+    fn lowered_output_types<'a>(&self, program: &'a XlaLoweredProgram) -> &'a [ArrayType] {
+        program.output_types()
     }
 
     fn compilation_key(
         &self,
-        function: &FunctionFingerprint,
-        inputs: &[ArrayType],
+        program: &XlaLoweredProgram,
         options: &XlaOptions,
-    ) -> XlaCompilationKey {
-        // Materialize platform identity once at key-construction time. The PJRT client API
-        // returns owned `String`s, so storing them in the key avoids re-querying on every
-        // cache lookup. Missing platform info (e.g. on the clientless static-staging token) yields `None`,
-        // which still distinguishes "no platform" from any concrete platform.
+    ) -> Result<XlaCompilationKey, XlaDomainError> {
         let (platform_name, platform_version) = match self.client {
-            Some(client) => (
-                client.platform_name().ok().map(|name| name.into_owned()),
-                client.platform_version().ok().map(|version| version.into_owned()),
-            ),
+            Some(client) => (Some(client.platform_name()?.into_owned()), Some(client.platform_version()?.into_owned())),
             None => (None, None),
         };
-        XlaCompilationKey {
-            function: function.clone(),
-            inputs: inputs.to_vec(),
+        Ok(XlaCompilationKey {
+            stable_hlo: Arc::clone(&program.stable_hlo),
+            compilation_options_debug: format!("{:?}", program.compilation_options),
+            output_types: Arc::clone(&program.output_types),
+            donation_flags: Arc::clone(&program.donation_flags),
+            capture_count: program.capture_count,
+            expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
             options: options.clone(),
-            base_options_debug: format!("{:?}", &self.compilation_options),
             platform_name,
             platform_version,
-        }
+        })
     }
 
-    fn compile<Input, Output>(
+    fn compile(
         &self,
-        program: &XlaProgram<Input, Output>,
-        options: &XlaOptions,
-    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError>
-    where
-        Input: Parameterized<XlaConstant>,
-        Output: Parameterized<XlaConstant>,
-    {
-        self.compile_program_with_captures(program, &[], options)
+        program: &XlaLoweredProgram,
+        _options: &XlaOptions,
+    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
+        let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
+        let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
+        Ok(XlaCompiledProgram {
+            executable: Arc::new(executable),
+            output_types: Arc::clone(&program.output_types),
+            donation_flags: Arc::clone(&program.donation_flags),
+            capture_count: program.capture_count,
+            expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
+            mesh: program.mesh.clone(),
+        })
+    }
+
+    #[inline]
+    fn compiled_output_types<'a>(&self, program: &'a XlaCompiledProgram<'c>) -> &'a [ArrayType] {
+        program.output_types()
+    }
+
+    fn validate_input_type(&self, declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
+        let declared_without_sharding =
+            declared.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
+        let actual_without_sharding =
+            actual.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
+        if declared_without_sharding.is_refined_by(&actual_without_sharding) {
+            Ok(())
+        } else {
+            Err(ProgramError::InvalidArgument {
+                message: format!("runtime input type {actual} does not refine declared type {declared}"),
+            }
+            .into())
+        }
     }
 
     fn execute(
@@ -1243,29 +1236,54 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Vec<Array<'c>>, XlaDomainError> {
-        self.execute_with_captures(program, &[], inputs)
+        if inputs.len() != program.expected_argument_shardings.len() {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "compiled program expects {} flat argument(s), including {} capture(s), but got {}",
+                    program.expected_argument_shardings.len(),
+                    program.capture_count,
+                    inputs.len(),
+                ),
+            });
+        }
+        let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
+        let donation_flags = if program.donation_flags.is_empty() {
+            vec![false; inputs.len()]
+        } else {
+            std::iter::repeat_n(false, program.capture_count)
+                .chain(program.donation_flags.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        execute_pjrt(
+            self.client,
+            &program.executable,
+            &program.mesh,
+            inputs,
+            donation_flags.as_slice(),
+            &program.output_types,
+        )
     }
 
-    fn serialize_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Vec<u8>, XlaDomainError> {
-        // PJRT executables serialize directly to bytes. Note: this loses the metadata that
-        // `XlaCompiledProgram` carries alongside (output_types, donation_flags, etc.) — a
-        // production-grade disk cache would prepend a header. For now we just round-trip the
-        // executable bytes; deserialize_program returns "unsupported" to fall back to a
-        // fresh compile on disk-cache hit.
-        let exec = program.executable.executable()?;
-        let bytes = exec.serialize()?;
-        Ok(bytes.data().to_vec())
+    /// Persistent XLA caching remains disabled until the executable payload carries and validates all metadata needed
+    /// to reconstruct an [`XlaCompiledProgram`] safely.
+    #[inline]
+    fn persistent_cache_key(&self, _key: &XlaCompilationKey) -> Option<Vec<u8>> {
+        None
     }
 
-    fn deserialize_program(&self, _bytes: &[u8]) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
-        // Disk-cache deserialization not yet wired up — would need a header carrying
-        // output_types, donation_flags, expected_argument_shardings, and mesh metadata so the
-        // full `XlaCompiledProgram` shape can be reconstructed. For now, always treat disk
-        // cache hits as misses so the cache falls back to re-compile.
-        Err(XlaDomainError::InvalidCompilationOptions {
-            reason: "XlaDomain::deserialize_program is not yet implemented; disk cache will fall back to re-compile"
-                .to_string(),
-        })
+    #[inline]
+    fn serialize_program(&self, _program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
+        Ok(None)
+    }
+
+    #[inline]
+    fn deserialize_program(&self, _bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
+        Ok(None)
+    }
+
+    #[inline]
+    fn cache(&self) -> Option<&CompilationContext<Self>> {
+        Some(&self.cache)
     }
 }
 
@@ -1543,7 +1561,7 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
-        let compiled: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             compile_with_options(&engine, |x| x.sin().unwrap(), input_type.clone(), options).unwrap();
 
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
@@ -1572,10 +1590,10 @@ mod tests {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
         }
 
-        // Repeat invocations at the same source line should share one cache entry.
+        // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
         let cache_size_before = engine.cache_size();
         for _ in 0..3 {
-            let _: ryft_core::compilation::CompiledFunction<'_, XlaDomain<'_>, ArrayType, ArrayType> =
+            let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
                 compile_with_options(
                     &engine,
                     |x| x.sin().unwrap(),
@@ -1586,8 +1604,8 @@ mod tests {
         }
         assert_eq!(
             engine.cache_size(),
-            cache_size_before + 1,
-            "three repeat jit calls at the same source line should populate exactly one new cache entry",
+            cache_size_before,
+            "equivalent repeat compilations should reuse the existing cache entry",
         );
     }
 

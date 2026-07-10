@@ -6,18 +6,15 @@
 //! matching the structural cache key, deserializes if found, and otherwise compiles fresh and
 //! writes the serialized executable back to disk.
 //!
-//! Entries are stored gzip-compressed as `<dir>/<hex-digest>.executable`, where the digest is a
-//! pseudo-random fingerprint derived from the structural cache key produced by
-//! [`CompilationDomain::compilation_key`](super::CompilationDomain::compilation_key). Platform
-//! scoping (e.g. so a CPU executable can't be loaded against a GPU client) is the domain's
-//! responsibility: the domain includes platform identity in its
-//! [`CompilationKey`](super::CompilationDomain::CompilationKey) and validates platform
-//! compatibility inside
-//! [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
+//! Entries are stored gzip-compressed as `<dir>/<sha256>.executable`. A backend opts into this
+//! tier by providing stable canonical bytes for the complete persistent cache key. The filename
+//! is the SHA-256 digest of those bytes. The compressed entry is a versioned envelope that repeats
+//! the key digest and records the payload length and SHA-256 checksum, all of which are validated
+//! before backend deserialization.
 //!
-//! Writes are atomic via the standard temp-file-plus-rename pattern. Read errors and domain
-//! deserialization failures are treated as cache misses, so the cache never blocks compilation
-//! when a stored entry can't be loaded.
+//! Writes are atomic via the standard temp-file-plus-rename pattern. Filesystem and validation
+//! failures are returned to [`CompilationContext`](super::CompilationContext), which records the
+//! failure and degrades it to a cache miss without suppressing the fallible operation.
 //!
 //! When constructed via [`DiskCache::with_capacity`] or with the
 //! [`DiskCache::MAX_BYTES_ENV_VAR`] environment variable, the cache evicts oldest entries by
@@ -25,16 +22,23 @@
 //! cap. Caches opened via [`DiskCache::open`] have no cap by default.
 
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use sha2::{Digest, Sha256};
+
+const ENTRY_MAGIC: &[u8; 8] = b"RYFTCACH";
+const ENTRY_FORMAT_VERSION: u32 = 1;
+const SHA256_LENGTH: usize = 32;
+const ENTRY_HEADER_LENGTH: usize = ENTRY_MAGIC.len() + 4 + SHA256_LENGTH + 8 + SHA256_LENGTH;
+const DEFAULT_MINIMUM_COMPILE_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 
 /// Directory-backed cache of serialized compiled programs.
 ///
@@ -55,6 +59,12 @@ pub struct DiskCache {
     /// after each successful write to keep the total under the cap. Newly-written entries are
     /// preserved (they have the most recent mtime).
     max_bytes: Option<u64>,
+
+    /// Minimum producer duration required before a newly compiled program is persisted.
+    minimum_compile_duration: Duration,
+
+    /// Minimum serialized backend payload size required before it is persisted.
+    minimum_entry_size: usize,
 }
 
 impl DiskCache {
@@ -78,16 +88,43 @@ impl DiskCache {
         Self::open_inner(directory, Some(max_bytes))
     }
 
+    /// Configures the minimum producer duration and serialized payload size required before a
+    /// newly compiled program is written. Reads are unaffected: an existing validated entry is
+    /// always eligible for reuse.
+    #[inline]
+    pub fn with_write_thresholds(mut self, minimum_compile_duration: Duration, minimum_entry_size: usize) -> Self {
+        self.minimum_compile_duration = minimum_compile_duration;
+        self.minimum_entry_size = minimum_entry_size;
+        self
+    }
+
     /// Reads the [`RYFT_COMPILATION_CACHE_DIR`](Self::ENV_VAR) environment variable. Returns
-    /// `Some(cache)` when the variable is set and points to a directory we can read or create;
-    /// returns `None` when the variable is unset or opening the directory fails.
+    /// `Ok(Some(cache))` when the variable is set and points to a directory we can read or
+    /// create, and `Ok(None)` when it is unset. Invalid capacity configuration and filesystem
+    /// failures are returned explicitly.
     ///
-    /// When [`RYFT_COMPILATION_CACHE_MAX_BYTES`](Self::MAX_BYTES_ENV_VAR) is also set to a
-    /// non-zero integer, the resulting cache is capped via [`Self::with_capacity`].
-    pub fn from_env() -> Option<Self> {
-        let dir = std::env::var_os(Self::ENV_VAR)?;
-        let max_bytes = std::env::var(Self::MAX_BYTES_ENV_VAR).ok().and_then(|raw| raw.parse::<u64>().ok());
-        Self::open_inner(dir, max_bytes).ok()
+    /// When [`RYFT_COMPILATION_CACHE_MAX_BYTES`](Self::MAX_BYTES_ENV_VAR) is also set to an
+    /// integer, the resulting cache is capped via [`Self::with_capacity`].
+    pub fn from_env() -> std::io::Result<Option<Self>> {
+        let Some(directory) = std::env::var_os(Self::ENV_VAR) else {
+            return Ok(None);
+        };
+        let max_bytes = match std::env::var(Self::MAX_BYTES_ENV_VAR) {
+            Ok(raw) => Some(raw.parse::<u64>().map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid {} value `{raw}`: {error}", Self::MAX_BYTES_ENV_VAR),
+                )
+            })?),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid {} value: {error}", Self::MAX_BYTES_ENV_VAR),
+                ));
+            }
+        };
+        Self::open_inner(directory, max_bytes).map(Some)
     }
 
     /// Environment variable that [`Self::from_env`] reads for the cache directory.
@@ -100,7 +137,13 @@ impl DiskCache {
     fn open_inner(directory: impl Into<PathBuf>, max_bytes: Option<u64>) -> std::io::Result<Self> {
         let directory = directory.into();
         fs::create_dir_all(&directory)?;
-        Ok(Self { directory, write_counter: AtomicU64::new(0), max_bytes })
+        Ok(Self {
+            directory,
+            write_counter: AtomicU64::new(0),
+            max_bytes,
+            minimum_compile_duration: DEFAULT_MINIMUM_COMPILE_DURATION,
+            minimum_entry_size: DEFAULT_MINIMUM_ENTRY_SIZE,
+        })
     }
 
     /// Returns the filesystem path to the entry for `digest`, suitable for [`fs::read`] /
@@ -109,16 +152,19 @@ impl DiskCache {
         self.directory.join(format!("{}.executable", digest.as_hex()))
     }
 
-    /// Reads the cached serialized bytes for `digest`, returning `None` on any error
-    /// (missing file, permission denied, malformed contents, decompression failure). Read errors
-    /// are intentionally non-fatal — they just degrade to a cache miss.
-    pub(crate) fn get(&self, digest: &CacheDigest) -> Option<Vec<u8>> {
+    /// Reads and validates the cached serialized payload for `digest`. A missing entry is a cache
+    /// miss; filesystem, decompression, envelope, and checksum failures are returned explicitly.
+    pub(crate) fn get(&self, digest: &CacheDigest) -> std::io::Result<Option<Vec<u8>>> {
         let path = self.entry_path(digest);
-        let file = File::open(&path).ok()?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let mut decoder = GzDecoder::new(file);
-        let mut buffer = Vec::new();
-        decoder.read_to_end(&mut buffer).ok()?;
-        Some(buffer)
+        let mut envelope = Vec::new();
+        decoder.read_to_end(&mut envelope)?;
+        Self::decode_envelope(digest, envelope.as_slice()).map(Some)
     }
 
     /// Writes `data` to the cache under `digest`. Compresses with gzip, then uses the
@@ -126,34 +172,122 @@ impl DiskCache {
     /// half-written entry visible to other readers. After a successful write, evicts older
     /// entries by file modification time when a `max_bytes` cap is configured.
     ///
-    /// Returns an error only if the underlying filesystem op fails irrecoverably; the caller can
-    /// ignore the error since we degrade to no caching when persistence fails.
+    /// Returns any write, synchronization, rename, cleanup, or eviction failure explicitly. The
+    /// compilation context records such failures before degrading to an in-memory-only result.
     pub(crate) fn put(&self, digest: &CacheDigest, data: &[u8]) -> std::io::Result<()> {
         let final_path = self.entry_path(digest);
         let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
         let temp_path =
             self.directory.join(format!("{}.executable.tmp.{}.{}", digest.as_hex(), process::id(), counter));
-        {
-            // `Compression::fast()` trades ratio for CPU; compile-cache writes happen on every
-            // miss and we'd rather not stall the compile pipeline for marginal extra savings.
+        let write_result = (|| -> std::io::Result<()> {
+            // Fast compression bounds host-side overhead after an already-expensive compile.
             let tmp_file = File::create(&temp_path)?;
             let mut encoder = GzEncoder::new(tmp_file, Compression::fast());
-            encoder.write_all(data)?;
+            Self::write_envelope(&mut encoder, digest, data)?;
             let tmp_file = encoder.finish()?;
             tmp_file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            return Self::remove_temporary_entry(&temp_path, error);
         }
         if let Err(error) = fs::rename(&temp_path, &final_path) {
-            // Best-effort cleanup; if the temp file is gone (e.g., racing rename) ignore.
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
+            return Self::remove_temporary_entry(&temp_path, error);
         }
         if let Some(max_bytes) = self.max_bytes {
-            // Best-effort eviction: if listing or unlinking fails we leave the directory at its
-            // current size and let the next write try again. Don't surface the error since it
-            // doesn't invalidate the entry we just wrote.
-            let _ = self.evict_to_fit(digest, max_bytes);
+            self.evict_to_fit(digest, max_bytes)?;
         }
         Ok(())
+    }
+
+    fn remove_temporary_entry(path: &Path, error: std::io::Error) -> std::io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(cleanup_error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("{error}; failed to clean up temporary cache entry: {cleanup_error}"),
+            )),
+        }
+    }
+
+    /// Returns whether a newly compiled serialized payload meets this cache's write policy.
+    #[inline]
+    pub(crate) fn should_persist(&self, compile_duration: Duration, entry_size: usize) -> bool {
+        compile_duration >= self.minimum_compile_duration && entry_size >= self.minimum_entry_size
+    }
+
+    /// Returns whether producer latency meets the write policy before backend serialization.
+    #[inline]
+    pub(crate) fn should_serialize(&self, compile_duration: Duration) -> bool {
+        compile_duration >= self.minimum_compile_duration
+    }
+
+    #[cfg(test)]
+    fn encode_envelope(digest: &CacheDigest, payload: &[u8]) -> Vec<u8> {
+        let mut envelope = Vec::with_capacity(ENTRY_HEADER_LENGTH + payload.len());
+        Self::write_envelope(&mut envelope, digest, payload).expect("writing an envelope to memory cannot fail");
+        envelope
+    }
+
+    fn write_envelope(writer: &mut impl Write, digest: &CacheDigest, payload: &[u8]) -> std::io::Result<()> {
+        let payload_checksum = Sha256::digest(payload);
+        let payload_length = u64::try_from(payload.len())
+            .map_err(|_| Self::invalid_data("persistent cache payload length does not fit in u64"))?;
+        writer.write_all(ENTRY_MAGIC)?;
+        writer.write_all(&ENTRY_FORMAT_VERSION.to_le_bytes())?;
+        writer.write_all(digest.as_bytes())?;
+        writer.write_all(&payload_length.to_le_bytes())?;
+        writer.write_all(payload_checksum.as_slice())?;
+        writer.write_all(payload)
+    }
+
+    fn decode_envelope(digest: &CacheDigest, envelope: &[u8]) -> std::io::Result<Vec<u8>> {
+        if envelope.len() < ENTRY_HEADER_LENGTH {
+            return Err(Self::invalid_data("persistent cache entry is shorter than its header"));
+        }
+        if &envelope[..ENTRY_MAGIC.len()] != ENTRY_MAGIC {
+            return Err(Self::invalid_data("persistent cache entry has an invalid magic value"));
+        }
+
+        let mut offset = ENTRY_MAGIC.len();
+        let version = u32::from_le_bytes(envelope[offset..offset + 4].try_into().expect("version slice has length 4"));
+        offset += 4;
+        if version != ENTRY_FORMAT_VERSION {
+            return Err(Self::invalid_data(format!(
+                "persistent cache entry uses unsupported format version {version}"
+            )));
+        }
+
+        let stored_digest = &envelope[offset..offset + SHA256_LENGTH];
+        offset += SHA256_LENGTH;
+        if stored_digest != digest.as_bytes() {
+            return Err(Self::invalid_data("persistent cache entry key digest does not match its requested key"));
+        }
+
+        let payload_length =
+            u64::from_le_bytes(envelope[offset..offset + 8].try_into().expect("payload length slice has length 8"));
+        offset += 8;
+        let payload_length = usize::try_from(payload_length)
+            .map_err(|_| Self::invalid_data("persistent cache payload length does not fit in memory"))?;
+        let stored_checksum = &envelope[offset..offset + SHA256_LENGTH];
+        offset += SHA256_LENGTH;
+        let payload = &envelope[offset..];
+        if payload.len() != payload_length {
+            return Err(Self::invalid_data(format!(
+                "persistent cache payload declares {payload_length} bytes but contains {}",
+                payload.len(),
+            )));
+        }
+        if Sha256::digest(payload).as_slice() != stored_checksum {
+            return Err(Self::invalid_data("persistent cache payload checksum does not match"));
+        }
+        Ok(payload.to_vec())
+    }
+
+    #[inline]
+    fn invalid_data(message: impl Into<String>) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
     }
 
     /// Returns the directory backing this cache. Mostly useful for tests.
@@ -206,7 +340,7 @@ impl DiskCache {
             if path.file_name().is_some_and(|name| name == keep_filename.as_str()) {
                 continue;
             }
-            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let modified = metadata.modified()?;
             candidates.push((path, modified, size));
         }
         if total_bytes <= max_bytes {
@@ -233,59 +367,38 @@ impl DiskCache {
     }
 }
 
-/// Digest used to key disk-cache entries. The wrapped bytes are a hex-rendered filename-safe
-/// representation of the domain's `u64` cache key, expanded into ~192 bits of pseudo-entropy to
-/// keep accidental filename collisions vanishingly rare.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// SHA-256 digest of a domain-provided stable persistent cache key.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CacheDigest {
-    /// Pre-rendered hex string. Keeping this as a `String` avoids re-rendering on each filename
-    /// lookup; the digest is small (48 hex chars for the three-chunk SipHash digest).
-    hex: String,
+    bytes: [u8; SHA256_LENGTH],
 }
 
 impl CacheDigest {
-    /// Builds a digest from any `Hash`-implementing cache key. Platform-identity scoping (so
-    /// that a cached CPU artifact doesn't accidentally serve a GPU client) is the domain's
-    /// responsibility — the domain includes platform identity in its
-    /// [`CompilationKey`](super::CompilationDomain::CompilationKey), and validates platform
-    /// compatibility inside
-    /// [`CompilationDomain::deserialize_program`](super::CompilationDomain::deserialize_program).
-    ///
-    /// We don't pull in a cryptographic-hash crate; SHA-1 is overkill for collision resistance
-    /// at this scale anyway. Use Rust's standard `DefaultHasher` (SipHash) repeatedly with
-    /// different seed bytes to derive a ~192-bit-equivalent digest — enough entropy to avoid
-    /// accidental collisions across the lifetime of a single cache directory while staying
-    /// dependency-free.
-    pub(crate) fn from_key<K: Hash + ?Sized>(cache_key: &K) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-
-        // Three independent hashes seeded with different domain-separation strings together
-        // yield ~192 bits of pseudo-entropy. More than enough for our use case.
-        let mut chunks = Vec::with_capacity(3);
-        for seed in ["ryft.disk_cache.v1.chunk0", "ryft.disk_cache.v1.chunk1", "ryft.disk_cache.v1.chunk2"] {
-            let mut hasher = DefaultHasher::new();
-            seed.hash(&mut hasher);
-            cache_key.hash(&mut hasher);
-            chunks.push(hasher.finish());
-        }
-        let mut hex = String::with_capacity(chunks.len() * 16);
-        for chunk in chunks {
-            hex.push_str(&format!("{:016x}", chunk));
-        }
-        Self { hex }
+    /// Hashes stable canonical persistent-key bytes supplied by a compilation domain.
+    pub(crate) fn from_bytes(key: &[u8]) -> Self {
+        Self { bytes: Sha256::digest(key).into() }
     }
 
-    /// Returns the hex-encoded digest as a string slice suitable for filename construction.
+    /// Returns the hex-encoded digest suitable for filename construction.
+    pub(crate) fn as_hex(&self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut result = String::with_capacity(SHA256_LENGTH * 2);
+        for byte in self.bytes {
+            result.push(HEX[(byte >> 4) as usize] as char);
+            result.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        result
+    }
+
     #[inline]
-    pub(crate) fn as_hex(&self) -> &str {
-        &self.hex
+    fn as_bytes(&self) -> &[u8; SHA256_LENGTH] {
+        &self.bytes
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
-    use std::time::Duration;
+    use std::fs::FileTimes;
 
     use super::*;
 
@@ -293,37 +406,65 @@ mod tests {
     fn test_disk_cache_put_then_get_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        let digest = CacheDigest::from_key(&42u64);
+        let digest = CacheDigest::from_bytes(b"stable-key");
         let data = b"hello compiled bytes".to_vec();
 
-        assert!(cache.get(&digest).is_none(), "empty cache should miss");
+        assert!(cache.get(&digest).unwrap().is_none(), "empty cache should miss");
         cache.put(&digest, &data).unwrap();
-        assert_eq!(cache.get(&digest).as_deref(), Some(data.as_slice()));
+        assert_eq!(cache.get(&digest).unwrap().as_deref(), Some(data.as_slice()));
     }
 
     #[test]
-    fn test_disk_cache_digest_distinguishes_keys() {
-        let a = CacheDigest::from_key(&42u64);
-        let b = CacheDigest::from_key(&43u64);
-        let c = CacheDigest::from_key(&u64::MAX);
-        assert_ne!(a.as_hex(), b.as_hex());
-        assert_ne!(a.as_hex(), c.as_hex());
-        assert_ne!(b.as_hex(), c.as_hex());
+    fn test_disk_cache_digest_is_sha256_of_stable_key_bytes() {
+        let digest = CacheDigest::from_bytes(b"abc");
+        assert_eq!(digest.as_hex(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 
     #[test]
     fn test_disk_cache_get_returns_none_for_unwritten_key() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        assert!(cache.get(&CacheDigest::from_key(&0u64)).is_none());
+        assert!(cache.get(&CacheDigest::from_bytes(b"missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_disk_cache_envelope_rejects_wrong_key() {
+        let first = CacheDigest::from_bytes(b"first");
+        let second = CacheDigest::from_bytes(b"second");
+        let envelope = DiskCache::encode_envelope(&first, b"compiled");
+
+        let error = DiskCache::decode_envelope(&second, &envelope).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("key digest"));
+    }
+
+    #[test]
+    fn test_disk_cache_envelope_rejects_unsupported_version() {
+        let digest = CacheDigest::from_bytes(b"key");
+        let mut envelope = DiskCache::encode_envelope(&digest, b"compiled");
+        envelope[ENTRY_MAGIC.len()..ENTRY_MAGIC.len() + 4].copy_from_slice(&2u32.to_le_bytes());
+
+        let error = DiskCache::decode_envelope(&digest, &envelope).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unsupported format version 2"));
+    }
+
+    #[test]
+    fn test_disk_cache_envelope_rejects_corrupted_payload() {
+        let digest = CacheDigest::from_bytes(b"key");
+        let mut envelope = DiskCache::encode_envelope(&digest, b"compiled");
+        *envelope.last_mut().unwrap() ^= 0xff;
+
+        let error = DiskCache::decode_envelope(&digest, &envelope).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum"));
     }
 
     #[test]
     fn test_disk_cache_compresses_entries() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::open(dir.path()).unwrap();
-        let digest = CacheDigest::from_key(&7u64);
-        // 64 KiB of zeros — a worst case for incompressible data, best case for gzip.
+        let digest = CacheDigest::from_bytes(b"compressible");
         let payload = vec![0u8; 64 * 1024];
         cache.put(&digest, &payload).unwrap();
 
@@ -332,50 +473,52 @@ mod tests {
             on_disk_size < payload.len() as u64,
             "expected gzip to compress 64 KiB of zeros below the raw size, got {on_disk_size} bytes",
         );
-        // Round-trip: decompression must recover the original bytes byte-for-byte.
-        assert_eq!(cache.get(&digest).as_deref(), Some(payload.as_slice()));
+        assert_eq!(cache.get(&digest).unwrap().as_deref(), Some(payload.as_slice()));
     }
 
     #[test]
-    fn test_disk_cache_evicts_oldest_entries_when_over_capacity() {
+    fn test_disk_cache_evicts_oldest_entries_deterministically() {
         let dir = tempfile::tempdir().unwrap();
-        // Each entry compresses to well under 1 KiB; capping at 600 bytes forces eviction after
-        // the third entry lands.
-        let cache = DiskCache::with_capacity(dir.path(), 600).unwrap();
-        // Distinct, non-trivial payloads so each entry has a measurable compressed size.
+        let cache = DiskCache::open(dir.path()).unwrap();
         let payloads: Vec<Vec<u8>> = (0..3).map(|i| (0..256).map(|j| (i * 31 + j) as u8).collect()).collect();
-        let digests: Vec<CacheDigest> = (0..3).map(|i| CacheDigest::from_key(&(i as u64))).collect();
+        let digests: Vec<CacheDigest> = (0..3).map(|index| CacheDigest::from_bytes(&[index])).collect();
 
-        // Write the entries with mtime gaps wide enough to be measurable on any common
-        // filesystem (HFS+, APFS, ext4 all support millisecond mtime resolution).
         for index in 0..3 {
             cache.put(&digests[index], &payloads[index]).unwrap();
-            // Sleep between writes to ensure mtimes order strictly: most filesystems track
-            // mtime at second or sub-second resolution, but `fs::rename` may collapse two
-            // adjacent writes into the same tick. 100 ms is conservative.
-            if index < 2 {
-                sleep(Duration::from_millis(100));
-            }
+            let file = File::options().write(true).open(cache.entry_path(&digests[index])).unwrap();
+            let modified = SystemTime::UNIX_EPOCH + Duration::from_secs(index as u64 + 1);
+            file.set_times(FileTimes::new().set_modified(modified)).unwrap();
         }
 
-        // Newest entry must still be readable.
-        assert_eq!(cache.get(&digests[2]).as_deref(), Some(payloads[2].as_slice()));
-        // Oldest entry must have been evicted to keep us under the byte cap.
-        assert!(cache.get(&digests[0]).is_none(), "oldest entry should be evicted after a write that exceeds the cap");
-        // Total on-disk size is at or below the cap.
-        let total = cache.cache_size_bytes().unwrap();
-        assert!(total <= 600, "cache size {total} exceeds 600-byte cap");
+        let sizes = digests
+            .iter()
+            .map(|digest| std::fs::metadata(cache.entry_path(digest)).unwrap().len())
+            .collect::<Vec<_>>();
+        let capacity = sizes[1] + sizes[2];
+        assert_eq!(cache.evict_to_fit(&digests[2], capacity).unwrap(), 1);
+        assert!(cache.get(&digests[0]).unwrap().is_none());
+        assert_eq!(cache.get(&digests[1]).unwrap().as_deref(), Some(payloads[1].as_slice()));
+        assert_eq!(cache.get(&digests[2]).unwrap().as_deref(), Some(payloads[2].as_slice()));
+        assert!(cache.cache_size_bytes().unwrap() <= capacity);
     }
 
     #[test]
     fn test_disk_cache_with_capacity_keeps_most_recent_even_when_alone_exceeds_cap() {
         let dir = tempfile::tempdir().unwrap();
         let cache = DiskCache::with_capacity(dir.path(), 64).unwrap();
-        let digest = CacheDigest::from_key(&13u64);
-        // 16 KiB of zeros compresses to a few dozen bytes, but even at minimum still likely >
-        // 64 bytes — confirming we never evict the entry we just wrote.
+        let digest = CacheDigest::from_bytes(b"oversized");
         let payload = vec![0u8; 16 * 1024];
         cache.put(&digest, &payload).unwrap();
-        assert_eq!(cache.get(&digest).as_deref(), Some(payload.as_slice()));
+        assert_eq!(cache.get(&digest).unwrap().as_deref(), Some(payload.as_slice()));
+    }
+
+    #[test]
+    fn test_disk_cache_write_thresholds_require_both_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(dir.path()).unwrap().with_write_thresholds(Duration::from_secs(2), 128);
+
+        assert!(!cache.should_persist(Duration::from_secs(1), 256));
+        assert!(!cache.should_persist(Duration::from_secs(3), 64));
+        assert!(cache.should_persist(Duration::from_secs(2), 128));
     }
 }

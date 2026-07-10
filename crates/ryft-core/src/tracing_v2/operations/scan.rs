@@ -670,21 +670,19 @@ where
 
 #[cfg(test)]
 mod tests {
-
     use pretty_assertions::assert_eq;
 
+    use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
+    use crate::differentiation::ForwardModeDifferentiate;
     use crate::operations::arithmetic::MulOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::differentiation::ForwardModeDifferentiate;
-
     use crate::types::DataType;
 
     use super::*;
-    use crate::batching::BatchAxis;
 
     type TestOperation = ArrayOperation<TestArray>;
     type TestEagerContext = EagerContext<TestArray, TestOperation>;

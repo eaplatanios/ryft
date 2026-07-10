@@ -190,14 +190,13 @@ mod tests {
     use crate::batching::BatchAxis;
     use crate::contexts::Domain;
     use crate::contexts::EagerContext;
+    use crate::differentiation::{LinearizationTracer, ReverseModeDifferentiate};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
-    use crate::differentiation::LinearizationTracer;
-    use crate::tracing_v2::differentiation::ReverseModeDifferentiate;
 
     fn mesh() -> LogicalMesh {
         LogicalMesh::new(vec![

@@ -8,9 +8,14 @@ use crate::programs::ProgramError;
 
 pub use forward::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiationContext, DifferentiationDual,
-    DifferentiationTracer, LinearizableProgramOperation, Linearization, LinearizationTracer, Pushforward,
+    DifferentiationTracer, ForwardModeDifferentiate, LinearizableProgramOperation, Linearization, LinearizationTracer,
+    Pushforward, jvp, linearize,
 };
-pub use reverse::{Pullback, TransposableOperation, TransposableProgramOperation};
+pub use reverse::{
+    Pullback, ReverseModeDifferentiate, TransposableOperation, TransposableProgramOperation, gradient,
+    gradient_holomorphic, gradient_holomorphic_with_aux, gradient_with_aux, value_and_gradient,
+    value_and_gradient_holomorphic, value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
+};
 pub use types::DifferentiableType;
 
 /// Represents differentiation-related errors.
