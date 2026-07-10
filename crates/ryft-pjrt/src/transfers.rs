@@ -1,6 +1,5 @@
-use std::cell::RefCell;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::{
     Api, Buffer, BufferSpecification, Client, Device, Error, Event, HostBufferData, Memory, NamedValue,
@@ -138,16 +137,16 @@ impl<'c> HostToDeviceTransferManager<'c> {
     ///     transfer calls (via [`HostToDeviceTransferManager::transfer_data`] or
     ///     [`HostToDeviceTransferManager::set_error`]) will be allowed for the same buffer `index` in this
     ///     [`HostToDeviceTransferManager`].
-    pub fn transfer_data<B: AsRef<[u8]>>(
+    pub fn transfer_data<B: AsRef<[u8]> + Send + Sync + 'static>(
         &self,
         index: usize,
-        data: Rc<RefCell<B>>,
+        data: Arc<B>,
         offset: usize,
         is_last_transfer: bool,
     ) -> Result<Event<()>, Error> {
         use ffi::PJRT_AsyncHostToDeviceTransferManager_TransferData_Args;
-        let transfer_size = data.borrow().as_ref().len();
-        let data = HostBufferData::from_host_buffer_rc_refcell(&data, false);
+        let transfer_size = data.as_ref().as_ref().len();
+        let data = HostBufferData::from_host_buffer_arc(&data);
         let handle = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_AsyncHostToDeviceTransferManager_TransferData,
@@ -211,15 +210,15 @@ impl<'c> HostToDeviceTransferManager<'c> {
     ///     for information on the memory layout of this buffer.
     ///   - `specification`: [`BufferSpecification`] describing how the provided `data` should be interpreted
     ///     as an XLA literal.
-    pub fn transfer_literal<B: AsRef<[u8]>, D: AsRef<[u64]>>(
+    pub fn transfer_literal<B: AsRef<[u8]> + Send + Sync + 'static, D: AsRef<[u64]>>(
         &self,
         index: usize,
-        data: Rc<RefCell<B>>,
+        data: Arc<B>,
         specification: BufferSpecification<D>,
     ) -> Result<Event<()>, Error> {
         use ffi::PJRT_AsyncHostToDeviceTransferManager_TransferLiteral_Args;
         let dimensions = specification.dimensions.as_ref().iter().map(|&d| d as i64).collect::<Vec<_>>();
-        let data = HostBufferData::from_host_buffer_rc_refcell(&data, false);
+        let data = HostBufferData::from_host_buffer_arc(&data);
         let handle = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_AsyncHostToDeviceTransferManager_TransferLiteral,
@@ -964,9 +963,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::ffi::c_void;
-    use std::rc::Rc;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
@@ -1024,10 +1022,10 @@ mod tests {
                     assert_eq!(manager.device().unwrap().id(), device.id());
                     assert_eq!(manager.buffer_count(), Ok(1));
                     assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
-                    let rc = Rc::new(RefCell::new(&[1u8, 3u8, 5u8, 7u8]));
-                    assert!(manager.transfer_data(0, rc.clone(), 0, false).is_ok());
-                    let rc = Rc::new(RefCell::new(&[9u8, 11u8, 13u8, 15u8]));
-                    assert!(manager.transfer_data(0, rc.clone(), 4, true).unwrap().r#await().is_ok());
+                    let data = Arc::new([1u8, 3u8, 5u8, 7u8]);
+                    assert!(manager.transfer_data(0, data, 0, false).is_ok());
+                    let data = Arc::new([9u8, 11u8, 13u8, 15u8]);
+                    assert!(manager.transfer_data(0, data, 4, true).unwrap().r#await().is_ok());
                     assert!(manager.add_metadata(vec![NamedValue::new("4", "2")]).is_ok());
                     let buffer = manager.retrieve_buffer(0).unwrap();
                     assert_eq!(buffer.ready().unwrap().r#await(), Ok(()));
@@ -1041,8 +1039,8 @@ mod tests {
                     assert_eq!(manager.device().unwrap().id(), device.id());
                     assert_eq!(manager.buffer_count(), Ok(1));
                     assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
-                    let rc = Rc::new(RefCell::new(&[1u8, 3u8, 5u8, 7u8]));
-                    assert!(manager.transfer_data(0, rc.clone(), 0, false).is_ok());
+                    let data = Arc::new([1u8, 3u8, 5u8, 7u8]);
+                    assert!(manager.transfer_data(0, data, 0, false).is_ok());
                     assert!(manager.set_error(0, Error::aborted("test error")).is_ok());
                     assert!(manager.add_metadata(vec![NamedValue::new("4", "2")]).is_ok());
                     let buffer = manager.retrieve_buffer(0).unwrap();
@@ -1059,13 +1057,13 @@ mod tests {
                     assert_eq!(manager.buffer_count(), Ok(2));
                     assert_eq!(manager.buffer_on_device_size_in_bytes(0), Ok(8));
                     assert_eq!(manager.buffer_on_device_size_in_bytes(1), Ok(8));
-                    let data_0 = Rc::new(RefCell::new(&[1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8]));
-                    assert!(manager.transfer_data(0, data_0.clone(), 0, true).unwrap().r#await().is_ok());
-                    let data_1 = Rc::new(RefCell::new(&[20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8]));
+                    let data_0 = Arc::new([1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8]);
+                    assert!(manager.transfer_data(0, data_0, 0, true).unwrap().r#await().is_ok());
+                    let data_1 = Arc::new([20u8, 21u8, 22u8, 23u8, 24u8, 25u8, 26u8, 27u8]);
                     assert!(
                         manager.transfer_literal(1, data_1.clone(), specification.clone()).unwrap().r#await().is_ok(),
                     );
-                    let data_2 = Rc::new(RefCell::new(&[30u8, 31u8, 32u8, 33u8, 34u8, 35u8, 36u8, 37u8]));
+                    let data_2 = Arc::new([30u8, 31u8, 32u8, 33u8, 34u8, 35u8, 36u8, 37u8]);
                     assert!(manager.transfer_literal(1, data_2.clone(), specification.clone()).is_err());
                     let buffer_0 = manager.retrieve_buffer(0).unwrap();
                     let buffer_1 = manager.retrieve_buffer(1).unwrap();
