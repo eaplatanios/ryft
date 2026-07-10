@@ -1832,7 +1832,6 @@ dependencies = [
  "num-complex",
  "paste",
  "pretty_assertions",
- "ryft-core",
  "ryft-macros",
  "serde",
  "sha2",

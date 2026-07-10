@@ -29,7 +29,7 @@ pre-release-replacements = [
 
 [dependencies]
 ryft-macros.workspace = true
-approx = { workspace = true, optional = true }
+approx.workspace = true
 aquamarine.workspace = true
 convert_case.workspace = true
 dyn-eq.workspace = true
@@ -44,10 +44,6 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-# Self-referential dev-dependency that enables the `test-utilities` feature for this crate's own doctests, which link
-# against the externally built library and therefore do not see `cfg(test)`.
-ryft-core = { path = ".", features = ["test-utilities"] }
-approx.workspace = true
 indoc.workspace = true
 pretty_assertions.workspace = true
 tempfile.workspace = true
@@ -55,4 +51,3 @@ tempfile.workspace = true
 [features]
 default = []
 benchmarking = []
-test-utilities = ["dep:approx"]

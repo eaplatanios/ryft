@@ -31,6 +31,10 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 /// Scalar [`Value`] whose [`Type`](crate::Type) is a [`DataType`] and which is meant to be used primarily for testing
 /// the Ryft infrastructure and machinery with programs that do not involve multidimensional arrays.
 ///
+/// The `F4*` and `F8*` variants carry their exact encoded bits in a `u8`, preserving signed zeros and NaN payloads.
+/// Prefer [`Scalar::from_low_precision_float_bits`] when constructing them dynamically because it validates the
+/// four-bit format, and use [`Scalar::low_precision_float_bits`] to recover the encoding.
+///
 /// # Examples
 ///
 /// ```rust
@@ -41,8 +45,9 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 /// assert_eq!(scalar, 1.5f64);
 /// assert_eq!(scalar + Scalar::from(0.5f64), Scalar::from(2.0f64));
 /// ```
-#[derive(Copy, Clone, Debug, PartialEq, Parameter)]
+#[derive(Copy, Clone, Debug, Parameter)]
 pub enum Scalar {
+    Token,
     Bool(bool),
     I8(i8),
     I16(i16),
@@ -52,15 +57,195 @@ pub enum Scalar {
     U16(u16),
     U32(u32),
     U64(u64),
+    F4E2M1FN(u8),
+    F8E3M4(u8),
+    F8E4M3(u8),
+    F8E4M3FN(u8),
+    F8E4M3FNUZ(u8),
+    F8E4M3B11FNUZ(u8),
+    F8E5M2(u8),
+    F8E5M2FNUZ(u8),
+    F8E8M0FNU(u8),
     BF16(bf16),
     F16(f16),
     F32(f32),
     F64(f64),
     C64(Complex<f32>),
     C128(Complex<f64>),
-    // TODO(eaplatanios): Support token values and the remaining quantized floating-point types. Once more are
-    //  supported, we will also need to update certain implementations later on in this module that return a
-    //  `TypeError` when they encounter any of those types.
+}
+
+impl PartialEq for Scalar {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (self.low_precision_float_parts(), other.low_precision_float_parts())
+        {
+            return left_type == right_type
+                && Self::decode_low_precision_float(left_type, left_bits)
+                    == Self::decode_low_precision_float(right_type, right_bits);
+        }
+        match (self, other) {
+            (Scalar::Token, Scalar::Token) => true,
+            (Scalar::Bool(left), Scalar::Bool(right)) => left == right,
+            (Scalar::I8(left), Scalar::I8(right)) => left == right,
+            (Scalar::I16(left), Scalar::I16(right)) => left == right,
+            (Scalar::I32(left), Scalar::I32(right)) => left == right,
+            (Scalar::I64(left), Scalar::I64(right)) => left == right,
+            (Scalar::U8(left), Scalar::U8(right)) => left == right,
+            (Scalar::U16(left), Scalar::U16(right)) => left == right,
+            (Scalar::U32(left), Scalar::U32(right)) => left == right,
+            (Scalar::U64(left), Scalar::U64(right)) => left == right,
+            (Scalar::BF16(left), Scalar::BF16(right)) => left == right,
+            (Scalar::F16(left), Scalar::F16(right)) => left == right,
+            (Scalar::F32(left), Scalar::F32(right)) => left == right,
+            (Scalar::F64(left), Scalar::F64(right)) => left == right,
+            (Scalar::C64(left), Scalar::C64(right)) => left == right,
+            (Scalar::C128(left), Scalar::C128(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Scalar {
+    /// Constructs a low-precision floating-point scalar from its raw bit representation.
+    pub fn from_low_precision_float_bits(r#type: DataType, bits: u8) -> Result<Self, ProgramError> {
+        if r#type == DataType::F4E2M1FN && bits > 0x0f {
+            return Err(
+                TypeError { message: format!("raw f4e2m1fn value 0x{bits:02x} does not fit in four bits") }.into()
+            );
+        }
+        Ok(match r#type {
+            DataType::F4E2M1FN => Scalar::F4E2M1FN(bits),
+            DataType::F8E3M4 => Scalar::F8E3M4(bits),
+            DataType::F8E4M3 => Scalar::F8E4M3(bits),
+            DataType::F8E4M3FN => Scalar::F8E4M3FN(bits),
+            DataType::F8E4M3FNUZ => Scalar::F8E4M3FNUZ(bits),
+            DataType::F8E4M3B11FNUZ => Scalar::F8E4M3B11FNUZ(bits),
+            DataType::F8E5M2 => Scalar::F8E5M2(bits),
+            DataType::F8E5M2FNUZ => Scalar::F8E5M2FNUZ(bits),
+            DataType::F8E8M0FNU => Scalar::F8E8M0FNU(bits),
+            other => {
+                return Err(TypeError { message: format!("data type {other} is not a low-precision float") }.into());
+            }
+        })
+    }
+
+    /// Returns the raw bit representation of this low-precision floating-point scalar, or `None` for other scalars.
+    pub fn low_precision_float_bits(&self) -> Option<u8> {
+        match self {
+            Scalar::F4E2M1FN(bits)
+            | Scalar::F8E3M4(bits)
+            | Scalar::F8E4M3(bits)
+            | Scalar::F8E4M3FN(bits)
+            | Scalar::F8E4M3FNUZ(bits)
+            | Scalar::F8E4M3B11FNUZ(bits)
+            | Scalar::F8E5M2(bits)
+            | Scalar::F8E5M2FNUZ(bits)
+            | Scalar::F8E8M0FNU(bits) => Some(*bits),
+            _ => None,
+        }
+    }
+
+    fn low_precision_float_parts(&self) -> Option<(DataType, u8)> {
+        Some(match self {
+            Scalar::F4E2M1FN(bits) => (DataType::F4E2M1FN, *bits),
+            Scalar::F8E3M4(bits) => (DataType::F8E3M4, *bits),
+            Scalar::F8E4M3(bits) => (DataType::F8E4M3, *bits),
+            Scalar::F8E4M3FN(bits) => (DataType::F8E4M3FN, *bits),
+            Scalar::F8E4M3FNUZ(bits) => (DataType::F8E4M3FNUZ, *bits),
+            Scalar::F8E4M3B11FNUZ(bits) => (DataType::F8E4M3B11FNUZ, *bits),
+            Scalar::F8E5M2(bits) => (DataType::F8E5M2, *bits),
+            Scalar::F8E5M2FNUZ(bits) => (DataType::F8E5M2FNUZ, *bits),
+            Scalar::F8E8M0FNU(bits) => (DataType::F8E8M0FNU, *bits),
+            _ => return None,
+        })
+    }
+
+    fn decode_low_precision_float(r#type: DataType, bits: u8) -> f64 {
+        if r#type == DataType::F8E8M0FNU {
+            return 2.0f64.powi(i32::from(bits) - 127);
+        }
+        let (total_bits, exponent_bits, mantissa_bits, bias, nan_bits, has_infinity) = match r#type {
+            DataType::F4E2M1FN => (4, 2, 1, 1, None, false),
+            DataType::F8E3M4 => (8, 3, 4, 3, None, true),
+            DataType::F8E4M3 => (8, 4, 3, 7, None, true),
+            DataType::F8E4M3FN => (8, 4, 3, 7, Some(0x7f), false),
+            DataType::F8E4M3FNUZ => (8, 4, 3, 8, Some(0x80), false),
+            DataType::F8E4M3B11FNUZ => (8, 4, 3, 11, Some(0x80), false),
+            DataType::F8E5M2 => (8, 5, 2, 15, None, true),
+            DataType::F8E5M2FNUZ => (8, 5, 2, 16, Some(0x80), false),
+            _ => unreachable!("only low-precision floating-point data types reach this helper"),
+        };
+        let bits = bits & if total_bits == 8 { u8::MAX } else { (1 << total_bits) - 1 };
+        if nan_bits == Some(bits) {
+            return f64::NAN;
+        }
+        let sign = if bits & (1 << (total_bits - 1)) == 0 { 1.0 } else { -1.0 };
+        let mantissa_mask = (1 << mantissa_bits) - 1;
+        let mantissa = bits & mantissa_mask;
+        let exponent_mask = (1 << exponent_bits) - 1;
+        let exponent = (bits >> mantissa_bits) & exponent_mask;
+        if has_infinity && exponent == exponent_mask {
+            return if mantissa == 0 { sign * f64::INFINITY } else { f64::NAN };
+        }
+        if exponent == 0 {
+            sign * 2.0f64.powi(1 - bias) * f64::from(mantissa) / f64::from(1 << mantissa_bits)
+        } else {
+            sign * 2.0f64.powi(i32::from(exponent) - bias) * (1.0 + f64::from(mantissa) / f64::from(1 << mantissa_bits))
+        }
+    }
+
+    fn encode_low_precision_float(r#type: DataType, value: f64) -> Result<Self, ProgramError> {
+        let (maximum_bits, canonical_nan) = match r#type {
+            DataType::F4E2M1FN => (0x0f, None),
+            DataType::F8E3M4 => (0xff, Some(0x71)),
+            DataType::F8E4M3 => (0xff, Some(0x79)),
+            DataType::F8E4M3FN => (0xff, Some(0x7f)),
+            DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ => (0xff, Some(0x80)),
+            DataType::F8E5M2 => (0xff, Some(0x7d)),
+            DataType::F8E5M2FNUZ => (0xff, Some(0x80)),
+            DataType::F8E8M0FNU => (0xff, None),
+            // TODO(eaplatanios): Shouldn't this return a `ProgramError`?
+            other => unreachable!("{} is not a low-precision floating-point data type", other),
+        };
+        if value.is_nan() {
+            return match canonical_nan {
+                Some(bits) => Scalar::from_low_precision_float_bits(r#type, bits),
+                None => {
+                    Err(TypeError { message: format!("data type {type} cannot represent NaN", type = r#type) }.into())
+                }
+            };
+        }
+        if value == 0.0 {
+            if r#type == DataType::F8E8M0FNU {
+                return Err(TypeError { message: "data type f8e8m0fnu cannot represent zero".to_string() }.into());
+            }
+            let has_signed_zero =
+                !matches!(r#type, DataType::F8E4M3FNUZ | DataType::F8E4M3B11FNUZ | DataType::F8E5M2FNUZ);
+            let bits = if has_signed_zero && value.is_sign_negative() {
+                if r#type == DataType::F4E2M1FN { 0x08 } else { 0x80 }
+            } else {
+                0
+            };
+            return Self::from_low_precision_float_bits(r#type, bits);
+        }
+        let mut best_bits = None;
+        let mut best_distance = f64::INFINITY;
+        for bits in 0..=maximum_bits {
+            let candidate = Self::decode_low_precision_float(r#type, bits);
+            if candidate.is_nan() || candidate.is_infinite() != value.is_infinite() {
+                continue;
+            }
+            let distance = (candidate - value).abs();
+            if distance < best_distance || (distance == best_distance && bits & 1 == 0) {
+                best_bits = Some(bits);
+                best_distance = distance;
+            }
+        }
+        let bits = best_bits.ok_or_else(|| TypeError {
+            message: format!("data type {type} cannot represent {value}", type = r#type),
+        })?;
+        Self::from_low_precision_float_bits(r#type, bits)
+    }
 }
 
 // `PartialOrd` is implemented manually rather than derived because the complex variants are unordered: same-variant
@@ -69,6 +254,16 @@ pub enum Scalar {
 // order, which is meaningless for scalars of different data types).
 impl PartialOrd for Scalar {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (self.low_precision_float_parts(), other.low_precision_float_parts())
+        {
+            return (left_type == right_type)
+                .then(|| {
+                    Self::decode_low_precision_float(left_type, left_bits)
+                        .partial_cmp(&Self::decode_low_precision_float(right_type, right_bits))
+                })
+                .flatten();
+        }
         match (self, other) {
             (Scalar::Bool(left), Scalar::Bool(right)) => left.partial_cmp(right),
             (Scalar::I8(left), Scalar::I8(right)) => left.partial_cmp(right),
@@ -90,7 +285,11 @@ impl PartialOrd for Scalar {
 
 impl Display for Scalar {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Display::fmt(&Self::decode_low_precision_float(r#type, bits), formatter);
+        }
         match self {
+            Scalar::Token => formatter.write_str("token"),
             Scalar::Bool(value) => Display::fmt(value, formatter),
             Scalar::I8(value) => Display::fmt(value, formatter),
             Scalar::I16(value) => Display::fmt(value, formatter),
@@ -100,6 +299,15 @@ impl Display for Scalar {
             Scalar::U16(value) => Display::fmt(value, formatter),
             Scalar::U32(value) => Display::fmt(value, formatter),
             Scalar::U64(value) => Display::fmt(value, formatter),
+            Scalar::F4E2M1FN(_)
+            | Scalar::F8E3M4(_)
+            | Scalar::F8E4M3(_)
+            | Scalar::F8E4M3FN(_)
+            | Scalar::F8E4M3FNUZ(_)
+            | Scalar::F8E4M3B11FNUZ(_)
+            | Scalar::F8E5M2(_)
+            | Scalar::F8E5M2FNUZ(_)
+            | Scalar::F8E8M0FNU(_) => unreachable!("handled before the match"),
             Scalar::BF16(value) => Display::fmt(value, formatter),
             Scalar::F16(value) => Display::fmt(value, formatter),
             Scalar::F32(value) => Display::fmt(value, formatter),
@@ -119,6 +327,7 @@ impl Typed for Scalar {
 
     fn r#type(&self) -> Cow<'_, DataType> {
         Cow::Owned(match self {
+            Scalar::Token => DataType::Token,
             Scalar::Bool(_) => DataType::Boolean,
             Scalar::I8(_) => DataType::I8,
             Scalar::I16(_) => DataType::I16,
@@ -128,6 +337,15 @@ impl Typed for Scalar {
             Scalar::U16(_) => DataType::U16,
             Scalar::U32(_) => DataType::U32,
             Scalar::U64(_) => DataType::U64,
+            Scalar::F4E2M1FN(_) => DataType::F4E2M1FN,
+            Scalar::F8E3M4(_) => DataType::F8E3M4,
+            Scalar::F8E4M3(_) => DataType::F8E4M3,
+            Scalar::F8E4M3FN(_) => DataType::F8E4M3FN,
+            Scalar::F8E4M3FNUZ(_) => DataType::F8E4M3FNUZ,
+            Scalar::F8E4M3B11FNUZ(_) => DataType::F8E4M3B11FNUZ,
+            Scalar::F8E5M2(_) => DataType::F8E5M2,
+            Scalar::F8E5M2FNUZ(_) => DataType::F8E5M2FNUZ,
+            Scalar::F8E8M0FNU(_) => DataType::F8E8M0FNU,
             Scalar::BF16(_) => DataType::BF16,
             Scalar::F16(_) => DataType::F16,
             Scalar::F32(_) => DataType::F32,
@@ -220,6 +438,9 @@ impl Scalar {
     /// Returns the exactly widened floating-point payload backing the [`approx::AbsDiffEq`] implementations below,
     /// or `None` for a variant that carries no real floating-point payload (Booleans, integers, and complex values).
     fn floating_point_payload(self) -> Option<f64> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Some(Self::decode_low_precision_float(r#type, bits));
+        }
         match self {
             Scalar::BF16(value) => Some(value.to_f64()),
             Scalar::F16(value) => Some(value.to_f64()),
@@ -287,13 +508,21 @@ impl AbsDiffEq for Scalar {
 impl BooleanLike for Scalar {
     #[inline]
     fn as_boolean(&self) -> Self {
-        // `Self::boolean` decodes every `Scalar` variant without failing, so the `unwrap` here is safe.
-        Scalar::Bool(self.boolean().unwrap())
+        match self.boolean() {
+            Ok(value) => Scalar::Bool(value),
+            Err(_) => *self,
+        }
     }
 
     #[inline]
     fn boolean(&self) -> Result<bool, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Ok(Self::decode_low_precision_float(r#type, bits) != 0.0);
+        }
         Ok(match self {
+            Scalar::Token => {
+                return Err(TypeError { message: "cannot convert a token scalar to a Boolean".to_string() }.into());
+            }
             Scalar::Bool(value) => *value,
             Scalar::I8(value) => *value != 0,
             Scalar::I16(value) => *value != 0,
@@ -303,6 +532,15 @@ impl BooleanLike for Scalar {
             Scalar::U16(value) => *value != 0,
             Scalar::U32(value) => *value != 0,
             Scalar::U64(value) => *value != 0,
+            Scalar::F4E2M1FN(_)
+            | Scalar::F8E3M4(_)
+            | Scalar::F8E4M3(_)
+            | Scalar::F8E4M3FN(_)
+            | Scalar::F8E4M3FNUZ(_)
+            | Scalar::F8E4M3B11FNUZ(_)
+            | Scalar::F8E5M2(_)
+            | Scalar::F8E5M2FNUZ(_)
+            | Scalar::F8E8M0FNU(_) => unreachable!("handled before the match"),
             Scalar::BF16(value) => *value != bf16::ZERO,
             Scalar::F16(value) => *value != f16::ZERO,
             Scalar::F32(value) => *value != 0.0,
@@ -330,6 +568,17 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
             DataType::U16 => Scalar::U16(0),
             DataType::U32 => Scalar::U32(0),
             DataType::U64 => Scalar::U64(0),
+            DataType::F4E2M1FN => Scalar::F4E2M1FN(0),
+            DataType::F8E3M4 => Scalar::F8E3M4(0),
+            DataType::F8E4M3 => Scalar::F8E4M3(0),
+            DataType::F8E4M3FN => Scalar::F8E4M3FN(0),
+            DataType::F8E4M3FNUZ => Scalar::F8E4M3FNUZ(0),
+            DataType::F8E4M3B11FNUZ => Scalar::F8E4M3B11FNUZ(0),
+            DataType::F8E5M2 => Scalar::F8E5M2(0),
+            DataType::F8E5M2FNUZ => Scalar::F8E5M2FNUZ(0),
+            DataType::F8E8M0FNU => {
+                return Err(TypeError { message: "data type f8e8m0fnu cannot represent zero".to_string() }.into());
+            }
             DataType::BF16 => Scalar::BF16(bf16::ZERO),
             DataType::F16 => Scalar::F16(f16::ZERO),
             DataType::F32 => Scalar::F32(0.0),
@@ -349,6 +598,7 @@ impl ZeroLike for Scalar {
     #[inline]
     fn zero_like(&self) -> Self {
         match self {
+            Scalar::Token => Scalar::Token,
             Scalar::Bool(_) => Scalar::Bool(false),
             Scalar::I8(_) => Scalar::I8(0),
             Scalar::I16(_) => Scalar::I16(0),
@@ -358,6 +608,15 @@ impl ZeroLike for Scalar {
             Scalar::U16(_) => Scalar::U16(0),
             Scalar::U32(_) => Scalar::U32(0),
             Scalar::U64(_) => Scalar::U64(0),
+            Scalar::F4E2M1FN(_) => Scalar::F4E2M1FN(0),
+            Scalar::F8E3M4(_) => Scalar::F8E3M4(0),
+            Scalar::F8E4M3(_) => Scalar::F8E4M3(0),
+            Scalar::F8E4M3FN(_) => Scalar::F8E4M3FN(0),
+            Scalar::F8E4M3FNUZ(_) => Scalar::F8E4M3FNUZ(0),
+            Scalar::F8E4M3B11FNUZ(_) => Scalar::F8E4M3B11FNUZ(0),
+            Scalar::F8E5M2(_) => Scalar::F8E5M2(0),
+            Scalar::F8E5M2FNUZ(_) => Scalar::F8E5M2FNUZ(0),
+            Scalar::F8E8M0FNU(_) => *self,
             Scalar::BF16(_) => Scalar::BF16(bf16::ZERO),
             Scalar::F16(_) => Scalar::F16(f16::ZERO),
             Scalar::F32(_) => Scalar::F32(0.0),
@@ -381,6 +640,15 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
             DataType::U16 => Scalar::U16(1),
             DataType::U32 => Scalar::U32(1),
             DataType::U64 => Scalar::U64(1),
+            DataType::F4E2M1FN => Scalar::F4E2M1FN(0x02),
+            DataType::F8E3M4 => Scalar::F8E3M4(0x30),
+            DataType::F8E4M3 => Scalar::F8E4M3(0x38),
+            DataType::F8E4M3FN => Scalar::F8E4M3FN(0x38),
+            DataType::F8E4M3FNUZ => Scalar::F8E4M3FNUZ(0x40),
+            DataType::F8E4M3B11FNUZ => Scalar::F8E4M3B11FNUZ(0x58),
+            DataType::F8E5M2 => Scalar::F8E5M2(0x3c),
+            DataType::F8E5M2FNUZ => Scalar::F8E5M2FNUZ(0x40),
+            DataType::F8E8M0FNU => Scalar::F8E8M0FNU(0x7f),
             DataType::BF16 => Scalar::BF16(bf16::ONE),
             DataType::F16 => Scalar::F16(f16::ONE),
             DataType::F32 => Scalar::F32(1.0),
@@ -400,6 +668,7 @@ impl OneLike for Scalar {
     #[inline]
     fn one_like(&self) -> Self {
         match self {
+            Scalar::Token => Scalar::Token,
             Scalar::Bool(_) => Scalar::Bool(true),
             Scalar::I8(_) => Scalar::I8(1),
             Scalar::I16(_) => Scalar::I16(1),
@@ -409,6 +678,15 @@ impl OneLike for Scalar {
             Scalar::U16(_) => Scalar::U16(1),
             Scalar::U32(_) => Scalar::U32(1),
             Scalar::U64(_) => Scalar::U64(1),
+            Scalar::F4E2M1FN(_) => Scalar::F4E2M1FN(0x02),
+            Scalar::F8E3M4(_) => Scalar::F8E3M4(0x30),
+            Scalar::F8E4M3(_) => Scalar::F8E4M3(0x38),
+            Scalar::F8E4M3FN(_) => Scalar::F8E4M3FN(0x38),
+            Scalar::F8E4M3FNUZ(_) => Scalar::F8E4M3FNUZ(0x40),
+            Scalar::F8E4M3B11FNUZ(_) => Scalar::F8E4M3B11FNUZ(0x58),
+            Scalar::F8E5M2(_) => Scalar::F8E5M2(0x3c),
+            Scalar::F8E5M2FNUZ(_) => Scalar::F8E5M2FNUZ(0x40),
+            Scalar::F8E8M0FNU(_) => Scalar::F8E8M0FNU(0x7f),
             Scalar::BF16(_) => Scalar::BF16(bf16::ONE),
             Scalar::F16(_) => Scalar::F16(f16::ONE),
             Scalar::F32(_) => Scalar::F32(1.0),
@@ -422,11 +700,26 @@ impl OneLike for Scalar {
 impl Neg for Scalar {
     #[inline]
     fn neg(&self) -> Result<Scalar, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            if r#type == DataType::F8E8M0FNU {
+                return Err(TypeError { message: "cannot negate a scalar of data type f8e8m0fnu".to_string() }.into());
+            }
+            return Self::encode_low_precision_float(r#type, -Self::decode_low_precision_float(r#type, bits));
+        }
         Ok(match *self {
             Scalar::I8(value) => Scalar::I8(-value),
             Scalar::I16(value) => Scalar::I16(-value),
             Scalar::I32(value) => Scalar::I32(-value),
             Scalar::I64(value) => Scalar::I64(-value),
+            Scalar::F4E2M1FN(_)
+            | Scalar::F8E3M4(_)
+            | Scalar::F8E4M3(_)
+            | Scalar::F8E4M3FN(_)
+            | Scalar::F8E4M3FNUZ(_)
+            | Scalar::F8E4M3B11FNUZ(_)
+            | Scalar::F8E5M2(_)
+            | Scalar::F8E5M2FNUZ(_)
+            | Scalar::F8E8M0FNU(_) => unreachable!("handled before the match"),
             Scalar::BF16(value) => Scalar::BF16(-value),
             Scalar::F16(value) => Scalar::F16(-value),
             Scalar::F32(value) => Scalar::F32(-value),
@@ -457,6 +750,17 @@ macro_rules! impl_binary_arithmetic_for_scalar {
         impl $trait for Scalar {
             #[inline]
             fn $method(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
+                if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+                    (self.low_precision_float_parts(), rhs.low_precision_float_parts())
+                {
+                    if left_type == right_type {
+                        return Scalar::encode_low_precision_float(
+                            left_type,
+                            Scalar::decode_low_precision_float(left_type, left_bits)
+                                $operator Scalar::decode_low_precision_float(right_type, right_bits),
+                        );
+                    }
+                }
                 Ok(match (*self, *rhs) {
                     (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
                     (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
@@ -509,6 +813,9 @@ impl Sin for Scalar {
     /// Computes the elementwise sine of this [`Scalar`]. Only the floating-point and complex variants support sine
     /// (the complex sine being the analytic continuation `sin(z)`); any other variant returns a [`TypeError`].
     fn sin(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).sin());
+        }
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sin())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sin())),
@@ -530,6 +837,9 @@ impl Cos for Scalar {
     /// Computes the elementwise cosine of this [`Scalar`]. Only the floating-point and complex variants support cosine
     /// (the complex cosine being the analytic continuation `cos(z)`); any other variant returns a [`TypeError`].
     fn cos(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).cos());
+        }
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().cos())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().cos())),
@@ -626,6 +936,9 @@ impl Exponential for Scalar {
     /// support the exponential (the complex exponential being the analytic continuation `e^z`); any other variant
     /// returns a [`TypeError`].
     fn exponential(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).exp());
+        }
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().exp())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().exp())),
@@ -648,6 +961,9 @@ impl Logarithm for Scalar {
     /// support the logarithm (the complex logarithm being the principal branch `ln(z)`); any other variant returns a
     /// [`TypeError`].
     fn logarithm(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).ln());
+        }
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().ln())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().ln())),
@@ -670,6 +986,9 @@ impl SquareRoot for Scalar {
     /// the square root (the complex square root being the principal branch `√z`); any other variant returns a
     /// [`TypeError`].
     fn square_root(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).sqrt());
+        }
         Ok(match self {
             Scalar::BF16(value) => Scalar::BF16(bf16::from_f32(value.to_f32().sqrt())),
             Scalar::F16(value) => Scalar::F16(f16::from_f32(value.to_f32().sqrt())),
@@ -691,6 +1010,16 @@ impl Atan2 for Scalar {
     /// Computes the elementwise two-argument arc tangent `atan2(self, x)` for this [`Scalar`]. Only same-variant
     /// floating-point operand pairs are supported; any other combination returns a [`TypeError`].
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (self.low_precision_float_parts(), x.low_precision_float_parts())
+            && left_type == right_type
+        {
+            return Self::encode_low_precision_float(
+                left_type,
+                Self::decode_low_precision_float(left_type, left_bits)
+                    .atan2(Self::decode_low_precision_float(right_type, right_bits)),
+            );
+        }
         Ok(match (*self, *x) {
             (Scalar::BF16(y), Scalar::BF16(x)) => Scalar::BF16(bf16::from_f32(y.to_f32().atan2(x.to_f32()))),
             (Scalar::F16(y), Scalar::F16(x)) => Scalar::F16(f16::from_f32(y.to_f32().atan2(x.to_f32()))),
@@ -715,6 +1044,9 @@ impl Abs for Scalar {
     /// complex variants, and `|x|` for the signed-integer and floating-point variants. Any other variant returns a
     /// [`TypeError`].
     fn abs(&self) -> Result<Self, ProgramError> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).abs());
+        }
         Ok(match self {
             Scalar::I8(value) => Scalar::I8(value.abs()),
             Scalar::I16(value) => Scalar::I16(value.abs()),
@@ -760,6 +1092,32 @@ impl Compare for Scalar {
     /// [`Scalar::Bool`], never a numeric variant. Mismatched variants return a [`TypeError`]. Complex scalars are
     /// unordered, so they support only the equality directions and return a [`TypeError`] for ordered ones.
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
+        if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
+            (self.low_precision_float_parts(), rhs.low_precision_float_parts())
+        {
+            if left_type != right_type {
+                return Err(TypeError {
+                    message: format!("cannot compare scalars of data types {left_type} and {right_type}"),
+                }
+                .into());
+            }
+            let ordering = Self::decode_low_precision_float(left_type, left_bits)
+                .partial_cmp(&Self::decode_low_precision_float(right_type, right_bits));
+            let result = match direction {
+                ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
+                ComparisonDirection::NotEqual => ordering != Some(Ordering::Equal),
+                ComparisonDirection::LessThan => ordering == Some(Ordering::Less),
+                ComparisonDirection::LessThanOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+                ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
+                ComparisonDirection::GreaterThanOrEqual => {
+                    matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
+                }
+            };
+            return Ok(Scalar::Bool(result));
+        }
+        if matches!(self, Scalar::Token) || matches!(rhs, Scalar::Token) {
+            return Err(TypeError { message: "cannot compare token scalars".to_string() }.into());
+        }
         if let (Scalar::C64(_), Scalar::C64(_)) | (Scalar::C128(_), Scalar::C128(_)) = (self, rhs) {
             return match direction {
                 ComparisonDirection::Equal => Ok(Scalar::Bool(self == rhs)),
@@ -855,6 +1213,12 @@ impl Scalar {
                     TypeError { message: format!("cannot promote scalar of data type {source} to {target}") }.into()
                 );
             }
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot promote scalar of data type {} to {target}", other.r#type()),
+                }
+                .into());
+            }
         };
         Ok(match target {
             DataType::I8 => Scalar::I8(value as i8),
@@ -919,6 +1283,76 @@ mod tests {
     use crate::programs::ProgramBuilder;
 
     use super::*;
+
+    #[test]
+    fn test_scalar_token() {
+        let token = Scalar::Token;
+
+        assert_eq!(token.r#type().into_owned(), DataType::Token);
+        assert_eq!(token.to_string(), "token");
+        assert_eq!(token.as_boolean(), token);
+        assert!(token.boolean().is_err());
+        assert!(token.compare(&token, ComparisonDirection::Equal).is_err());
+        assert!(Neg::neg(&token).is_err());
+        assert!(Add::add(&token, &token).is_err());
+        assert_eq!(token.zero_like(), token);
+        assert_eq!(token.one_like(), token);
+
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert!(context.zero(&DataType::Token).is_err());
+        assert!(context.one(&DataType::Token).is_err());
+        assert_eq!(token.cast(DataType::Token), Ok(token));
+    }
+
+    #[test]
+    fn test_scalar_low_precision_float_types_and_bits() {
+        let values = [
+            (DataType::F4E2M1FN, 0x02),
+            (DataType::F8E3M4, 0x30),
+            (DataType::F8E4M3, 0x38),
+            (DataType::F8E4M3FN, 0x38),
+            (DataType::F8E4M3FNUZ, 0x40),
+            (DataType::F8E4M3B11FNUZ, 0x58),
+            (DataType::F8E5M2, 0x3c),
+            (DataType::F8E5M2FNUZ, 0x40),
+            (DataType::F8E8M0FNU, 0x7f),
+        ];
+
+        for (r#type, bits) in values {
+            let scalar = Scalar::from_low_precision_float_bits(r#type, bits).unwrap();
+            assert_eq!(scalar.r#type().into_owned(), r#type);
+            assert_eq!(scalar.low_precision_float_bits(), Some(bits));
+            assert_eq!(scalar.to_string(), "1");
+            assert_eq!(scalar.boolean(), Ok(true));
+            assert_eq!(scalar.one_like(), scalar);
+            assert_eq!(scalar.cast(r#type), Ok(scalar));
+        }
+
+        assert!(Scalar::from_low_precision_float_bits(DataType::F4E2M1FN, 0x10).is_err());
+        assert!(Scalar::from_low_precision_float_bits(DataType::F32, 0).is_err());
+        assert_eq!(Scalar::F8E4M3(0), Scalar::F8E4M3(0x80));
+        assert_ne!(Scalar::F8E4M3(0x79), Scalar::F8E4M3(0x79));
+    }
+
+    #[test]
+    fn test_scalar_low_precision_float_arithmetic() {
+        let one = Scalar::F8E4M3(0x38);
+        let two = Scalar::F8E4M3(0x40);
+        let negative_one = Scalar::F8E4M3(0xb8);
+
+        assert_eq!(Add::add(&one, &one), Ok(two));
+        assert_eq!(Mul::mul(&two, &negative_one), Ok(Scalar::F8E4M3(0xc0)));
+        assert_eq!(Neg::neg(&one), Ok(negative_one));
+        assert_eq!(Abs::abs(&negative_one), Ok(one));
+        assert_eq!(one.compare(&two, ComparisonDirection::LessThan), Ok(Scalar::Bool(true)));
+        assert!(Add::add(&one, &Scalar::F8E5M2(0x3c)).is_err());
+        assert!(Neg::neg(&Scalar::F8E8M0FNU(0x7f)).is_err());
+
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert_eq!(context.zero(&DataType::F8E4M3), Ok(Scalar::F8E4M3(0)));
+        assert_eq!(context.one(&DataType::F8E4M3), Ok(one));
+        assert!(context.zero(&DataType::F8E8M0FNU).is_err());
+    }
 
     #[test]
     fn test_scalar_complex_display() {
