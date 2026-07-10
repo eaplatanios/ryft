@@ -10,7 +10,7 @@ use crate::{Api, Error, Plugin, invoke_distributed_api_error_fn, invoke_distribu
 /// Represents a key-value store that can be used by PJRT [`Client`](crate::Client)s for process-to-process coordination
 /// in distributed environments. Note that the functions of this trait are expected to be thread-safe as they may be
 /// called concurrently by [`Client`](crate::Client)s.
-pub trait KeyValueStore {
+pub trait KeyValueStore: Send + Sync {
     /// Stores the provided `value` under the provided `key`.
     fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error>;
 
