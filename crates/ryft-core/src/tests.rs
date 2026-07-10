@@ -47,6 +47,90 @@ use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
 
+/// Asserts that the reverse-mode gradient of `$function` at `$input` matches a central finite-difference estimate
+/// of its derivative within absolute tolerance `$tolerance`. This is the standard oracle for testing operation
+/// gradient rules without hand-deriving the expected derivative — and without trusting the machinery under test: the
+/// gradient side runs `$function` through [`gradient`](crate::differentiation::gradient), while the
+/// finite-difference side evaluates `$function` directly on concrete [`Scalar`](crate::scalars::Scalar) values at
+/// the perturbed points, never touching the differentiation machinery it is checking. That double instantiation is
+/// why this is a macro: `$function` must be a closure literal (or a generic function), and the expansion
+/// instantiates it once over [`LinearizationTracer`](crate::differentiation::LinearizationTracer) inputs and once
+/// over concrete [`Scalar`](crate::scalars::Scalar) inputs.
+///
+/// An `f64` input estimates the ordinary derivative `(f(x + h) - f(x - h)) / (2h)`. A `c128` input requires a
+/// ℂ → ℝ `$function` (the only shape the plain [`gradient`](crate::differentiation::gradient) entry point accepts)
+/// and estimates both real partials with central differences along the real and imaginary axes, assembling
+/// `complex(∂f/∂re, -∂f/∂im)` — the conjugate steepest-ascent gradient the bilinear transposition pairing returns
+/// (e.g., `2z̄` for `f(z) = |z|²`). Other input data types (including `c64`, whose `f32` precision cannot support a
+/// meaningful central difference) panic. Pick an `$input` away from any non-differentiable point of `$function`
+/// (e.g., the kink of `abs` at zero) and a `$tolerance` compatible with the O(`$step`²) truncation error of the
+/// central difference.
+#[macro_export]
+macro_rules! check_gradient {
+    ($function:expr, $input:expr, $step:expr, $tolerance:expr $(,)?) => {{
+        // Closure parameter types infer from an expected type, so each instantiation of `$function` flows through
+        // an identity function pinning the signature that instantiation is used at.
+        type EagerScalarContext = $crate::contexts::EagerContext<
+            $crate::scalars::Scalar,
+            $crate::operations::scalars::ScalarOperation<$crate::scalars::Scalar>,
+        >;
+        fn pin_traced<F>(function: F) -> F
+        where
+            F: Fn(
+                $crate::differentiation::LinearizationTracer<EagerScalarContext>,
+            ) -> $crate::differentiation::LinearizationTracer<EagerScalarContext>,
+        {
+            function
+        }
+        fn pin_eager<F: Fn($crate::scalars::Scalar) -> $crate::scalars::Scalar>(function: F) -> F {
+            function
+        }
+        let input: $crate::scalars::Scalar = ::core::convert::Into::into($input);
+        let step: f64 = $step;
+        let tolerance: f64 = $tolerance;
+        let gradient = $crate::differentiation::gradient(pin_traced($function), input).unwrap();
+        let evaluate = pin_eager($function);
+        let central_difference = |plus: $crate::scalars::Scalar, minus: $crate::scalars::Scalar| {
+            (evaluate(plus) - evaluate(minus)) / $crate::scalars::Scalar::from(2.0 * step)
+        };
+        match input {
+            $crate::scalars::Scalar::F64(input) => {
+                let estimate = central_difference(
+                    $crate::scalars::Scalar::from(input + step),
+                    $crate::scalars::Scalar::from(input - step),
+                );
+                ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
+            }
+            $crate::scalars::Scalar::C128(_) => {
+                // Both perturbation steps are built as `c128` values (binary `Scalar` arithmetic requires
+                // same-variant operands), and the two central differences estimate the two real partials that
+                // assemble the conjugate steepest-ascent gradient.
+                let real_step = $crate::operations::complex::Complex::complex(
+                    &$crate::scalars::Scalar::from(step),
+                    &$crate::scalars::Scalar::from(0.0),
+                )
+                .unwrap();
+                let imaginary_step = $crate::operations::complex::Complex::complex(
+                    &$crate::scalars::Scalar::from(0.0),
+                    &$crate::scalars::Scalar::from(step),
+                )
+                .unwrap();
+                let real_estimate = central_difference(input + real_step, input - real_step);
+                let imaginary_estimate = central_difference(input + imaginary_step, input - imaginary_step);
+                let estimate =
+                    $crate::operations::complex::Complex::complex(&real_estimate, &(-imaginary_estimate)).unwrap();
+                ::approx::assert_abs_diff_eq!(gradient, estimate, epsilon = tolerance);
+            }
+            other => panic!(
+                "finite-difference gradient checking requires an f64 or c128 input but got {}",
+                $crate::types::Typed::r#type(&other).into_owned(),
+            ),
+        }
+    }};
+}
+
+pub use check_gradient;
+
 // TODO(eaplatanios): Promote to a simple built-in `Array` type in `arrays.rs` parallel to `scalars.rs`.
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
 /// documentation](crate::tests) for more information.

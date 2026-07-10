@@ -1,6 +1,3 @@
-/// Elementwise absolute-value differentiation rules.
-pub mod abs;
-
 /// Elementwise addition linearization and differentiation rules.
 pub mod add;
 

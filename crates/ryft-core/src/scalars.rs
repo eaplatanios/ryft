@@ -230,6 +230,16 @@ impl Scalar {
             _ => None,
         }
     }
+
+    /// Returns the exactly widened complex payload backing the [`approx::AbsDiffEq`] implementations below, or
+    /// `None` for a non-complex variant.
+    fn complex_payload(self) -> Option<Complex<f64>> {
+        match self {
+            Scalar::C64(value) => Some(Complex::new(f64::from(value.re), f64::from(value.im))),
+            Scalar::C128(value) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 /// Approximate equality against a bare `f64`, serving the [`approx`] assertion macros in tests (e.g.,
@@ -254,8 +264,9 @@ impl AbsDiffEq<f64> for Scalar {
 
 /// Approximate equality between two [`Scalar`]s, serving the [`approx`] assertion macros in tests. Two
 /// floating-point variants compare their exactly widened payloads within `epsilon` (also across variants, e.g., a
-/// [`Scalar::F32`] against a [`Scalar::F64`]), while any other pairing falls back to exact [`PartialEq`] equality,
-/// which is the only equality Booleans, integers, and complex values define.
+/// [`Scalar::F32`] against a [`Scalar::F64`]), two complex variants compare their exactly widened payloads
+/// componentwise within `epsilon` (both the real and the imaginary parts must be close), and any other pairing falls
+/// back to exact [`PartialEq`] equality, which is the only equality Booleans and integers define.
 #[cfg(any(test, feature = "test-utilities"))]
 impl AbsDiffEq for Scalar {
     type Epsilon = f64;
@@ -267,7 +278,12 @@ impl AbsDiffEq for Scalar {
     fn abs_diff_eq(&self, other: &Self, epsilon: f64) -> bool {
         match (self.floating_point_payload(), other.floating_point_payload()) {
             (Some(left), Some(right)) => (left - right).abs() <= epsilon,
-            _ => self == other,
+            _ => match (self.complex_payload(), other.complex_payload()) {
+                (Some(left), Some(right)) => {
+                    (left.re - right.re).abs() <= epsilon && (left.im - right.im).abs() <= epsilon
+                }
+                _ => self == other,
+            },
         }
     }
 }

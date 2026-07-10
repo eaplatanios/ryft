@@ -1,12 +1,18 @@
 use std::fmt::Display;
+use std::ops::{Div, Mul};
 
 use crate::contexts::Context;
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
+use crate::operations::complex::{Conjugate, Real};
 use crate::operations::{ElementwiseOperation, Operation};
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::tracing::{Tracer, TracingContext};
+use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`AbsOperation`].
 pub const ABS_OPERATION_NAME: &'static str = "abs";
@@ -86,6 +92,60 @@ where
 
 impl<C: Context> PartiallyEvaluatableOperation<C> for AbsOperation where C::Operation: From<AbsOperation> {}
 
+// TODO(eaplatanios): Review this implementation.
+impl<C: Context<Value: Abs + Conjugate + Real + Mul<Output = C::Value> + Div<Output = C::Value>, Operation: Clone>>
+    DifferentiableOperation<C> for AbsOperation
+where
+    AbsOperation: Operation<C::Type>,
+{
+    fn jvp(
+        &self,
+        _context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        // The real derivative is `d|x| = (x / |x|) · dx` (i.e., `sign(x) · dx` and undefined at zero), and the complex
+        // magnitude is a ℂ → ℝ map with `d|z| = Re(z̄ · dz) / |z|`, so the complex branch routes the tangent through
+        // `conjugate` and `real` while the real branch reuses the primal directly. A structural zero tangent stays
+        // symbolic, retyped to the (real) output type.
+        check_count!("input", inputs, 1, ProgramError);
+        let input = &inputs[0];
+        let primal = input.primal().abs()?;
+        let tangent = match input.tangent() {
+            MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
+            MaybeZero::Value(tangent) => {
+                let numerator = if input.primal().r#type().is_complex() {
+                    (input.primal().conjugate()? * tangent.clone()).real()?
+                } else {
+                    input.primal().clone() * tangent.clone()
+                };
+                MaybeZero::Value(numerator / primal.clone())
+            }
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)])
+    }
+}
+
+impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for AbsOperation
+where
+    AbsOperation: Operation<V::Type>,
+{
+    #[inline]
+    fn transpose(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The absolute value is nonlinear in its operand and so it cannot be transposed. The reason we still implement
+        // `TransposableOperation` and return a `ProgramError::UnsupportedOperation` is because we need the whole
+        // operation family of a `Context` to implement `TransposableOperation`. Ryft used to have a separate linear
+        // operation family type but that resulted in overly complicated backend and operation implementations for very
+        // little benefit in practice, and so we ended up unifying them.
+        Err(ProgramError::UnsupportedOperation { message: format!("operation `{}` is not transposable", self.name()) }
+            .into())
+    }
+}
+
 /// Value-level elementwise absolute-value capability. [`Abs`] fills the same role for [`AbsOperation`] that
 /// [`Neg`](crate::Neg) fills for [`NegOperation`](crate::NegOperation).
 pub trait Abs: Sized {
@@ -104,16 +164,18 @@ impl<V: Value<DispatchDomain: Context<Operation: From<AbsOperation>>>> Abs for V
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::differentiation::{gradient, value_and_gradient};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::scalars::Scalar;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
-    use crate::tests::TestArray;
+    use crate::tests::{TestArray, check_gradient};
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
 
     use super::*;
@@ -233,5 +295,26 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    // TODO(eaplatanios): Review this test.
+    #[test]
+    fn test_abs_derivative() {
+        // d|x| = sign(x) away from the kink at zero is +1 above zero and -1 below zero.
+        assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(0.7f64)).unwrap(), 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient(|x| x.abs().unwrap(), Scalar::from(-0.7f64)).unwrap(), -1.0, epsilon = 1e-9);
+        check_gradient!(|x| x.abs().unwrap(), 0.7, 1e-6, 1e-6);
+        check_gradient!(|x| x.abs().unwrap(), -2.5, 1e-6, 1e-6);
+
+        // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With d|z| = Re(z̄ · dz) / |z|,
+        // the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction), the reverse-mode
+        // counterpart of `∇|z|² = 2z̄` after the chain rule through the square root.
+        let z = ComplexNumber::new(0.7f64, -0.3f64);
+        let (value, gradient_value) = value_and_gradient(|z| z.abs().unwrap(), Scalar::from(z)).unwrap();
+        assert_eq!(value, Scalar::from(z.norm()));
+        let expected = z.conj() / z.norm();
+        let Scalar::C128(actual) = gradient_value else { panic!("expected a c128 gradient") };
+        assert!((actual - expected).norm() < 1e-12, "expected {expected} but got {actual}");
+        check_gradient!(|z| z.abs().unwrap(), z, 1e-6, 1e-6);
     }
 }
