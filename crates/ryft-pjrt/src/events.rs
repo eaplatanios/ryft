@@ -575,7 +575,7 @@ mod tests {
     use futures::executor::block_on;
     use futures::task::noop_waker_ref;
 
-    use crate::tests::test_cpu_client;
+    use crate::tests::{test_cpu_client, test_for_each_platform};
     use crate::{Error, Event};
 
     fn assert_send<T: Send>() {}
@@ -699,5 +699,18 @@ mod tests {
         assert_eq!(event.ready(), Ok(true));
     }
 
-    // TODO(eaplatanios): Add tests for async tracking events.
+    #[test]
+    fn test_async_tracking_event() {
+        test_for_each_platform!(|_plugin, client, platform| {
+            let device = client.addressable_devices().unwrap().remove(0);
+            let result = device.async_tracking_event("test async tracking event");
+            match result {
+                Ok(event) => drop(event),
+                Err(Error::Unimplemented { .. }) => {}
+                Err(Error::InvalidArgument { message, .. })
+                    if message == "the provided PJRT async tracking event handle is a null pointer" => {}
+                Err(error) => panic!("unexpected async tracking event error for {platform:?}: {error}"),
+            };
+        });
+    }
 }
