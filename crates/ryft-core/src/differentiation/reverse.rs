@@ -2148,326 +2148,6 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_traced_value_and_grad_requires_input_leaves() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let empty_primals: Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>> = Vec::new();
-
-        let result = context.value_and_gradient(
-            |_inputs: Vec<_>| panic!("closure should not run without traced inputs"),
-            empty_primals,
-        );
-
-        assert!(matches!(result, Err(DifferentiationError::EmptyInput)));
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_traced_value_and_grad_rejects_mismatched_program_builders() {
-        // Mixing tracers of two different traces is rejected with `MismatchedProgramBuilders`. The closure runs on
-        // differentiation duals whose operator sugar has no deferral point of its own, so the partial-evaluation
-        // context defers the failed bind by poisoning its outputs, and the original error surfaces as a plain `Err`
-        // at the evaluation boundary.
-        let context_a = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let context_b = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal_a = context_a.input(DataType::F64);
-        let primal_b = context_b.input(DataType::F64);
-
-        let result =
-            context_a.value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal_a, primal_b]);
-
-        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_traced_value_and_grad_invokes_function_once() {
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal = context.input(DataType::F64);
-        let calls = Cell::new(0);
-
-        let (_value, gradient): (
-            DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
-            Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
-        ) = context
-            .value_and_gradient(
-                |inputs| {
-                    calls.set(calls.get() + 1);
-                    inputs[0].clone() * inputs[0].clone()
-                },
-                vec![primal],
-            )
-            .unwrap();
-
-        assert_eq!(calls.get(), 1);
-        assert_eq!(gradient.len(), 1);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_value_and_grad_with_aux_ignores_aux_cotangents() {
-        // The free `value_and_gradient_with_aux` recovers the eager scalar domain from the concrete primals; the
-        // auxiliary outputs are returned as primal values and receive zero cotangent seeds, so they do not
-        // contribute to the gradient of f(x, y) = x * y.
-        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) =
-            super::value_and_gradient_with_aux(
-                |(x, y)| {
-                    let value = x.clone() * y.clone();
-                    let aux = (x.clone() + y, x.clone() * x);
-                    (value, aux)
-                },
-                (Scalar::from(2.0), Scalar::from(3.0)),
-            )
-            .unwrap();
-
-        assert_eq!(value, 6.0);
-        assert_eq!(aux, (Scalar::from(5.0), Scalar::from(4.0)));
-        assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_grad_returns_only_the_gradient() {
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-
-        let gradient: (Scalar, Scalar) =
-            domain.gradient(|(x, y)| x.clone() * y.clone() + x, (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
-
-        assert_eq!(gradient, (Scalar::from(4.0), Scalar::from(2.0)));
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_gradient_routes_complex_outputs_through_the_holomorphic_entry_points() {
-        // The identity function flows types without executing any complex arithmetic, so the complex-output guards
-        // are exercised at the type level under a tracing context. A complex output through the plain entry point is
-        // rejected toward the holomorphic one.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let primal = context.input(DataType::C64);
-        let result = context.value_and_gradient(|inputs: Vec<_>| inputs[0].clone(), vec![primal]);
-        assert!(matches!(
-            result,
-            Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c64",
-        ));
-
-        // The holomorphic entry point accepts the complex output and seeds `one` at the complex cotangent type.
-        let primal = context.input(DataType::C64);
-        let (value, gradient) =
-            context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
-        assert_eq!(*value.r#type(), DataType::C64);
-        assert_eq!(gradient.len(), 1);
-        assert_eq!(*gradient[0].r#type(), DataType::C64);
-
-        // For real outputs the holomorphy promise changes nothing and the holomorphic entry point behaves exactly
-        // like the plain one.
-        let primal = context.input(DataType::F64);
-        let (value, gradient) =
-            context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
-        assert_eq!(*value.r#type(), DataType::F64);
-        assert_eq!(gradient.len(), 1);
-        assert_eq!(*gradient[0].r#type(), DataType::F64);
-
-        // The auxiliary-output cross variants share the same holomorphy gate: a complex output with an auxiliary
-        // output is accepted end to end.
-        type TestTracer = DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
-        let primal = context.input(DataType::C64);
-        let ((value, aux), gradient): ((TestTracer, TestTracer), Vec<TestTracer>) = context
-            .value_and_gradient_holomorphic_with_aux(
-                |inputs: Vec<_>| (inputs[0].clone(), inputs[0].clone()),
-                vec![primal],
-            )
-            .unwrap();
-        assert_eq!(*value.r#type(), DataType::C64);
-        assert_eq!(*aux.r#type(), DataType::C64);
-        assert_eq!(gradient.len(), 1);
-        assert_eq!(*gradient[0].r#type(), DataType::C64);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_grad_with_aux_returns_gradient_and_aux() {
-        let (gradient, aux): ((Scalar, Scalar), Scalar) =
-            super::gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
-                .unwrap();
-
-        assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
-        assert_eq!(aux, 5.0);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_holomorphic_gradient_computes_complex_derivatives() {
-        use Complex;
-
-        // The holomorphic entry points recover the complex derivative ∂f/∂z from the single reverse-mode seed under
-        // the holomorphy promise: d/dz z² = 2z and d/dz sin(z) = cos(z), evaluated at a genuinely complex point.
-        let z = Complex::new(0.7f64, -0.3f64);
-        let (value, gradient) = super::value_and_gradient_holomorphic(|x| x.clone() * x, Scalar::from(z)).unwrap();
-        assert_eq!(value, Scalar::from(z * z));
-        assert_eq!(gradient, Scalar::from(z + z));
-        let gradient = super::gradient_holomorphic(|x| x.sin().unwrap(), Scalar::from(z)).unwrap();
-        assert_eq!(gradient, Scalar::from(z.cos()));
-
-        // Forward mode agrees: the jvp of z² pushes the tangent ż to 2z · ż through the same rules.
-        let tangent_seed = Complex::new(1.0f64, 0.5f64);
-        let (primal, tangent) =
-            crate::differentiation::jvp(|x| Ok(x.clone() * x), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
-        assert_eq!(primal, Scalar::from(z * z));
-        assert_eq!(tangent, Scalar::from((z + z) * tangent_seed));
-
-        // The plain entry point keeps rejecting the complex output toward the holomorphic ones.
-        let result = super::value_and_gradient(|x| x.clone() * x, Scalar::from(z));
-        assert!(matches!(
-            result,
-            Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c128",
-        ));
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_free_functions_recover_the_context_from_input_leaves() {
-        // The free entry points recover their context from the inputs' `Value::ExecutionDomain` (a concrete `Scalar`
-        // names the eager scalar domain), so no explicit context is threaded. Every entry point differentiates
-        // f(x) = x * sin(x), whose derivative is f'(x) = sin(x) + x cos(x), at x = 0.7.
-        let x: f64 = 0.7;
-        let expected_value = x * x.sin();
-        let expected_gradient = x.sin() + x * x.cos();
-        let function = |input: LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| {
-            input.clone() * input.sin().unwrap()
-        };
-
-        let (value, gradient) = super::value_and_gradient(function, Scalar::from(x)).unwrap();
-        assert_abs_diff_eq!(value, expected_value, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, expected_gradient, epsilon = 1e-9);
-        let gradient = super::gradient(function, Scalar::from(x)).unwrap();
-        assert_abs_diff_eq!(gradient, expected_gradient, epsilon = 1e-9);
-
-        let (value, pushforward) =
-            crate::differentiation::linearize(|input| Ok(function(input)), Scalar::from(x)).unwrap();
-        assert_abs_diff_eq!(value, expected_value, epsilon = 1e-9);
-        assert_abs_diff_eq!(pushforward.apply(Scalar::from(2.0)).unwrap(), 2.0 * expected_gradient, epsilon = 1e-9);
-
-        let (value, pullback) = super::vjp(|input| Ok(function(input)), Scalar::from(x)).unwrap();
-        assert_abs_diff_eq!(value, expected_value, epsilon = 1e-9);
-        assert_abs_diff_eq!(pullback.apply(Scalar::from(3.0)).unwrap(), 3.0 * expected_gradient, epsilon = 1e-9);
-
-        let (value, tangent) = crate::differentiation::jvp(
-            |input| Ok(input.clone() * input.sin().unwrap()),
-            Scalar::from(x),
-            Scalar::from(2.0),
-        )
-        .unwrap();
-        assert_abs_diff_eq!(value, expected_value, epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 2.0 * expected_gradient, epsilon = 1e-9);
-
-        // With no leaf value to recover a context from, the free entry points report an invalid input count (the
-        // closure is never invoked).
-        let empty = crate::differentiation::linearize::<Scalar, _, (), ()>(|_| Ok(()), ());
-        assert_eq!(empty.map(|_| ()).unwrap_err(), DifferentiationError::EmptyInput);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_gradient_and_linearize_support_host_control_flow_on_primals() {
-        // JAX-parity marquee behavior: the closure branches on a *primal* with host control flow, which works
-        // because the duals' primal halves carry concrete known values under an eager context — exactly like
-        // branching on concrete primals under JAX's `grad`/`linearize`. For `x = 3` the predicate is true, so
-        // `f(x) = x * x` with gradient `2 x = 6`; the untaken `sin(x)` branch is never traced at all, so no `sin`
-        // (nor its `cos` derivative) can appear in the pushforward program.
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let function = |x: LinearizationTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>| {
-            if x.boolean().unwrap() { x.clone() * x } else { x.sin().unwrap() }
-        };
-        let (value, gradient) = domain.value_and_gradient(function, Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(value, 9.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 6.0, epsilon = 1e-9);
-
-        let (output, pushforward) = domain.linearize(|x| Ok(function(x)), Scalar::from(3.0)).unwrap();
-        assert_abs_diff_eq!(output, 9.0, epsilon = 1e-9);
-        let program = pushforward.program().to_string();
-        assert!(program.contains("mul"), "{program}");
-        assert!(
-            !program.contains("sin") && !program.contains("cos"),
-            "the untaken branch must never be traced: {program}"
-        );
-        let tangent = pushforward.apply(Scalar::from(1.0)).unwrap();
-        assert_abs_diff_eq!(tangent, 6.0, epsilon = 1e-9);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_nested_value_and_grad_computes_the_analytic_second_derivative() {
-        // Reverse-over-reverse through closure-level nesting: the outer transform differentiates a closure that
-        // itself calls `value_and_gradient` on the nested tracing context its tracer flows in. For f(x) = sin(x²),
-        // the outer value is f'(x) = 2x cos(x²) and the outer gradient is f''(x) = 2 cos(x²) - 4x² sin(x²).
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (value, gradient) = domain
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
-                },
-                Scalar::from(0.7),
-            )
-            .unwrap();
-        let x: f64 = 0.7;
-        assert_abs_diff_eq!(value, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_triple_nested_value_and_grad_computes_the_analytic_third_derivative() {
-        // Three levels of closure nesting exercise the recursive `NestedTracingContext<NestedTracingContext<...>>`
-        // types through the trait solver. For f(x) = sin(x²), f'''(x) = -12x sin(x²) - 8x³ cos(x²).
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (value, gradient) = domain
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    context
-                        .gradient(
-                            |y| {
-                                let context = y.context().clone();
-                                context.gradient(|z| (z.clone() * z).sin().unwrap(), y).unwrap()
-                            },
-                            x,
-                        )
-                        .unwrap()
-                },
-                Scalar::from(0.7),
-            )
-            .unwrap();
-        let x: f64 = 0.7;
-        assert_abs_diff_eq!(value, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, -12.0 * x * (x * x).sin() - 8.0 * x * x * x * (x * x).cos(), epsilon = 1e-9);
-    }
-
-    // TODO(eaplatanios): Review this function.
-    #[test]
-    fn test_jvp_over_nested_gradient_computes_a_hessian_vector_product() {
-        // Forward-over-reverse: pushing a tangent through the gradient of f computes the Hessian-vector product
-        // f''(x)·v without materializing a dense Hessian. The `jvp` closure receives `DifferentiationTracer` duals whose
-        // stamped `DifferentiationContext` is itself a `ReverseModeDifferentiate`, so the inner reverse-mode transform nests on
-        // it and differentiates through the duals. For f(x) = sin(x²) at x = 0.7 with v = 2, the primal is f'(0.7)
-        // and the tangent is 2·f''(0.7).
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (primal, tangent) = domain
-            .jvp(
-                |x| {
-                    let context = x.context().clone();
-                    Ok(context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap())
-                },
-                Scalar::from(0.7),
-                Scalar::from(2.0),
-            )
-            .unwrap();
-        let x: f64 = 0.7;
-        assert_abs_diff_eq!(primal, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
-    }
-
     #[test]
     fn test_vjp() {
         // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = sin(x)` at
@@ -2541,6 +2221,49 @@ mod tests {
         assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1], 2.0f64.cos(), epsilon = 1e-9);
 
+        // JAX-parity marquee behavior: the closure can branch on a *primal* with host control flow, because the duals'
+        // primal halves carry concrete known values under an eager context (exactly like branching on concrete primals
+        // under JAX's `grad`). For `x = 3` the predicate is true, so `f(x) = x * x` with gradient `2x = 6`, and the
+        // untaken `sin(x)` branch is never traced at all.
+        let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+            .value_and_gradient(
+                |x| if x.boolean().unwrap() { x.clone() * x } else { x.sin().unwrap() },
+                Scalar::from(3.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value, 9.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient, 6.0, epsilon = 1e-9);
+
+        // The closure is invoked exactly once: a single linearizing replay produces both the value and the gradient.
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let primal = context.input(DataType::F64);
+        let calls = Cell::new(0);
+        let (_, gradient): (
+            DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
+            Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
+        ) = context
+            .value_and_gradient(
+                |inputs| {
+                    calls.set(calls.get() + 1);
+                    inputs[0].clone() * inputs[0].clone()
+                },
+                vec![primal],
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(gradient.len(), 1);
+
+        // Mixing tracers of two different traces is rejected with `MismatchedProgramBuilders`. The closure runs on
+        // differentiation duals whose operator sugar has no deferral point of its own, so the partial-evaluation
+        // context defers the failed bind by poisoning its outputs, and the original error surfaces as a plain `Err`
+        // at the evaluation boundary.
+        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let primal = context.input(DataType::F64);
+        let foreign_primal = foreign_context.input(DataType::F64);
+        let result =
+            context.value_and_gradient(|inputs| inputs[0].clone() + inputs[1].clone(), vec![primal, foreign_primal]);
+        assert!(matches!(result, Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders))));
+
         // A complex scalar output is rejected toward the holomorphic entry points, and inputs with no leaf values
         // report an invalid input count.
         let z = Complex::new(0.7f64, -0.3f64);
@@ -2592,6 +2315,30 @@ mod tests {
         let (value, gradient) = value_and_gradient_holomorphic(|x| x.clone() * x, Scalar::from(2.0)).unwrap();
         assert_abs_diff_eq!(value, 4.0, epsilon = 1e-9);
         assert_abs_diff_eq!(gradient, 4.0, epsilon = 1e-9);
+
+        // Under an active trace the guards run at the type level (the identity closure performs no complex arithmetic).
+        // The plain entry point rejects a complex output toward the holomorphic one, which accepts it and seeds `one`
+        // at the complex cotangent type, while a real output flows through the holomorphic entry point exactly like
+        // the plain one.
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let primal = context.input(DataType::C64);
+        let result = context.value_and_gradient(|inputs: Vec<_>| inputs[0].clone(), vec![primal]);
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::ComplexGradientOutput { output_type }) if output_type == "c64",
+        ));
+        let primal = context.input(DataType::C64);
+        let (value, gradient) =
+            context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
+        assert_eq!(*value.r#type(), DataType::C64);
+        assert_eq!(gradient.len(), 1);
+        assert_eq!(*gradient[0].r#type(), DataType::C64);
+        let primal = context.input(DataType::F64);
+        let (value, gradient) =
+            context.value_and_gradient_holomorphic(|inputs: Vec<_>| inputs[0].clone(), vec![primal]).unwrap();
+        assert_eq!(*value.r#type(), DataType::F64);
+        assert_eq!(gradient.len(), 1);
+        assert_eq!(*gradient[0].r#type(), DataType::F64);
     }
 
     #[test]
@@ -2623,21 +2370,27 @@ mod tests {
         assert_abs_diff_eq!(aux, 5.0, epsilon = 1e-9);
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
 
-        // The free form recovers the eager domain from the concrete primals.
-        let ((value, aux), gradient): ((Scalar, Scalar), (Scalar, Scalar)) = value_and_gradient_with_aux(
-            |(x, y)| (x.clone() * y.clone(), x + y),
+        // The free form recovers the eager domain from the concrete primals, and the auxiliary structure can carry
+        // multiple leaves (each rides along as a primal value with a zero cotangent seed, so none contributes to the
+        // gradient of `x * y`).
+        let ((value, aux), gradient): ((Scalar, (Scalar, Scalar)), (Scalar, Scalar)) = value_and_gradient_with_aux(
+            |(x, y)| {
+                let value = x.clone() * y.clone();
+                let aux = (x.clone() + y, x.clone() * x);
+                (value, aux)
+            },
             (Scalar::from(2.0), Scalar::from(3.0)),
         )
         .unwrap();
         assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(aux, 5.0, epsilon = 1e-9);
+        assert_eq!(aux, (Scalar::from(5.0), Scalar::from(4.0)));
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
     }
 
     #[test]
     fn test_gradient_with_aux() {
-        // `ReverseModeDifferentiate::gradient_with_aux` is the gradient-only counterpart of
-        // `value_and_gradient_with_aux`, returning `(gradient, aux)`.
+        // `ReverseModeDifferentiate::gradient_with_aux` is the gradient-only counterpart
+        // of `value_and_gradient_with_aux`, returning `(gradient, aux)`.
         let (method_gradient, aux): ((Scalar, Scalar), Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .gradient_with_aux(|(x, y)| (x.clone() * y.clone(), x + y), (Scalar::from(2.0), Scalar::from(3.0)))
             .unwrap();
@@ -2671,6 +2424,22 @@ mod tests {
         assert_eq!(value, Scalar::from(z * z));
         assert_eq!(aux, Scalar::from(z));
         assert_eq!(gradient, Scalar::from(z + z));
+
+        // The holomorphy gate also runs at the type level under an active trace. A complex output with
+        // an auxiliary output is accepted end to end and seeds `one` at the complex cotangent type.
+        type TestTracer = DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>;
+        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
+        let primal = context.input(DataType::C64);
+        let ((value, aux), gradient): ((TestTracer, TestTracer), Vec<TestTracer>) = context
+            .value_and_gradient_holomorphic_with_aux(
+                |inputs: Vec<_>| (inputs[0].clone(), inputs[0].clone()),
+                vec![primal],
+            )
+            .unwrap();
+        assert_eq!(*value.r#type(), DataType::C64);
+        assert_eq!(*aux.r#type(), DataType::C64);
+        assert_eq!(gradient.len(), 1);
+        assert_eq!(*gradient[0].r#type(), DataType::C64);
     }
 
     #[test]
@@ -2689,5 +2458,66 @@ mod tests {
             gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z)).unwrap();
         assert_eq!(free_gradient, Scalar::from(z + z));
         assert_eq!(aux, Scalar::from(z));
+    }
+
+    #[test]
+    fn test_nested_differentiation() {
+        // Every nesting shape differentiates `f(x) = sin(x²)` at `x = 0.7` through closure-level nesting. The inner
+        // transform runs on the nested tracing context its tracer flows in, recovered through `x.context()`.
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let x: f64 = 0.7;
+
+        // Reverse-over-reverse: the outer value is `f'(x) = 2x cos(x²)` and the outer gradient is the analytic
+        // second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
+        let (value, gradient) = domain
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
+                },
+                Scalar::from(x),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
+
+        // Three levels of nesting exercise the recursive `NestedTracingContext<NestedTracingContext<...>>` types
+        // through the trait solver. The outer gradient is the analytic third derivative
+        // `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
+        let (value, gradient) = domain
+            .value_and_gradient(
+                |x| {
+                    let context = x.context().clone();
+                    context
+                        .gradient(
+                            |y| {
+                                let context = y.context().clone();
+                                context.gradient(|z| (z.clone() * z).sin().unwrap(), y).unwrap()
+                            },
+                            x,
+                        )
+                        .unwrap()
+                },
+                Scalar::from(x),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient, -12.0 * x * (x * x).sin() - 8.0 * x * x * x * (x * x).cos(), epsilon = 1e-9);
+
+        // Forward-over-reverse: pushing the tangent `v = 2` through the gradient computes the Hessian-vector
+        // product `f''(x) · v` without materializing a dense Hessian, because the `jvp` duals' stamped
+        // `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests on.
+        let (primal, tangent) = domain
+            .jvp(
+                |x| {
+                    let context = x.context().clone();
+                    Ok(context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap())
+                },
+                Scalar::from(x),
+                Scalar::from(2.0),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(primal, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
     }
 }

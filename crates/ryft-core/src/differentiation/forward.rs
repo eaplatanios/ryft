@@ -1345,6 +1345,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::operations::BooleanLike;
     use crate::operations::Operation;
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::differentiation::StopGradientOperation;
@@ -1528,8 +1529,16 @@ mod tests {
         assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
+        // Complex duals flow through the same rules. The jvp of z² pushes the tangent ż to `2z · ż`
+        // at a genuinely complex point.
+        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let tangent_seed = num_complex::Complex::new(1.0f64, 0.5f64);
+        let (value, tangent) = jvp(|x| Ok(x.clone() * x), Scalar::from(z), Scalar::from(tangent_seed)).unwrap();
+        assert_eq!(value, Scalar::from(z * z));
+        assert_eq!(tangent, Scalar::from((z + z) * tangent_seed));
+
         // Under an active trace, the free `jvp` recovers the staging context from its tracer inputs instead, so it
-        // composes inside traced code without threading a context: the closure stages the fused primal and tangent
+        // composes inside traced code without threading a context. The closure stages the fused primal and tangent
         // operations into the enclosing trace.
         let (_, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
             |inputs: Vec<_>| {
@@ -1598,6 +1607,22 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+
+        // The closure can branch on a *primal* with host control flow, because the duals' primal halves carry concrete
+        // known values under an eager context. For `x = 3` the predicate is true, so `f(x) = x * x` linearizes to the
+        // pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `sin(x)` branch is never traced at all. Neither `sin` nor its
+        // `cos` derivative can appear in the pushforward program.
+        let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
+            .linearize(|x| Ok(if x.boolean().unwrap() { x.clone() * x } else { x.sin().unwrap() }), Scalar::from(3.0))
+            .unwrap();
+        assert_abs_diff_eq!(value, 9.0, epsilon = 1e-9);
+        let program = pushforward.program().to_string();
+        assert!(program.contains("mul"), "{program}");
+        assert!(
+            !program.contains("sin") && !program.contains("cos"),
+            "the untaken branch must never be traced: {program}",
+        );
+        assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 6.0, epsilon = 1e-9);
 
         // With no leaf value to recover a context from, the free `linearize` reports an invalid input count.
         assert_eq!(
