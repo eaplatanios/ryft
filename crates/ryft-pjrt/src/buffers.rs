@@ -1,11 +1,12 @@
-use std::cell::{Ref, RefCell, RefMut, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::fmt::{Debug, Display};
 use std::iter::Peekable;
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::rc::Rc;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::str::Chars;
+use std::sync::Arc;
 
+use crate::clients::ClientHandle;
 use crate::{
     Api, Client, Device, Error, Event, HasDefaultMemory, Memory, NamedValue, invoke_pjrt_api_error_fn, slice_from_c_api,
 };
@@ -1008,6 +1009,19 @@ impl Debug for Layout {
     }
 }
 
+/// Raw handle for one PJRT buffer. [`xla::PjRtBuffer`](https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h)
+/// is explicitly thread-safe, including concurrent deletion and operation enqueueing, and the standard PJRT C wrapper
+/// synchronizes its mutable buffer caches internally. This private wrapper narrows those guarantees to the raw pointer
+/// so that [`Buffer`] obtains [`Send`] and [`Sync`] structurally.
+#[derive(Copy, Clone)]
+struct BufferHandle(*mut ffi::PJRT_Buffer);
+
+// The underlying `PJRT_Buffer` contract permits concurrent access, and the standard PJRT C wrapper synchronizes its
+// mutable caches. The external-reference-count APIs are the sole known wrapper exception and remain unsafe with an
+// explicit external-synchronization contract.
+unsafe impl Send for BufferHandle {}
+unsafe impl Sync for BufferHandle {}
+
 /// Buffer that resides on a specific [`Memory`] and can transitively figure out which [`Device`]s are able to access
 /// it. Buffers act as _lazy_ or _asynchronous_ references to multidimensional arrays, often also referred to as
 /// tensors, meaning that while [`Buffer`]s are returned from operations immediately, the underlying data may not be
@@ -1082,7 +1096,7 @@ impl Debug for Layout {
 /// ensuring that the owner outlives the buffer.
 pub struct Buffer<'o> {
     /// Handle that represents this [`Buffer`] in the PJRT C API.
-    handle: *mut ffi::PJRT_Buffer,
+    handle: BufferHandle,
 
     /// Underlying PJRT [`Api`].
     api: Api,
@@ -1091,7 +1105,7 @@ pub struct Buffer<'o> {
     /// the corresponding [`Client`] is guaranteed to outlive this [`Buffer`] by design. The reason we do not hold
     /// a reference to the [`Client`] itself is to avoid having to carry around an additional lifetime for the
     /// [`KeyValueStore`](crate::KeyValueStore) that is associated with that [`Client`].
-    client: *mut crate::clients::ffi::PJRT_Client,
+    client: ClientHandle,
 
     /// [`PhantomData`] used to track the lifetime of the owner of this [`Buffer`].
     owner: PhantomData<&'o ()>,
@@ -1110,19 +1124,30 @@ impl Buffer<'_> {
         } else if client.is_null() {
             Err(Error::invalid_argument("the provided PJRT client handle is a null pointer"))
         } else {
-            Ok(Self { handle, api, client, owner: PhantomData })
+            Ok(Self { handle: BufferHandle(handle), api, client: ClientHandle::from_c_api(client), owner: PhantomData })
         }
     }
 
     /// Returns the [`PJRT_Buffer`](ffi::PJRT_Buffer) that corresponds to this [`Buffer`] and which can
     /// be passed to functions in the PJRT C API.
     pub(crate) unsafe fn to_c_api(&self) -> *mut ffi::PJRT_Buffer {
-        self.handle
+        self.handle.0
     }
 
     /// Returns the underlying PJRT [`Api`].
     pub(crate) fn api(&self) -> Api {
         self.api
+    }
+
+    /// Returns `true` if this [`Buffer`] is owned by the provided [`Client`] (i.e., if the provided [`Client`] wraps
+    /// the same underlying PJRT client as the one that created this [`Buffer`]). [`Buffer`]s only store a raw handle
+    /// to their owning PJRT client (and not a reference to the [`Client`] wrapper itself), and so this identity check
+    /// is the strongest form of client recovery that a [`Buffer`] can offer. It is primarily useful for validating
+    /// that a caller-supplied [`Client`] is the one that owns a buffer (e.g., before executing a compiled program
+    /// with that buffer as an input).
+    #[inline]
+    pub fn is_owned_by(&self, client: &Client<'_>) -> bool {
+        self.client.get() == unsafe { client.to_c_api() }
     }
 
     /// Returns the [`BufferType`] of the elements stored in this [`Buffer`].
@@ -1270,7 +1295,7 @@ impl Buffer<'_> {
             },
             { out_buffer },
         )
-        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client) })
+        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client.get()) })
     }
 
     /// Copies the underlying data of this [`Buffer`] into a [`Vec`] that is allocated on host memory, with the
@@ -1305,13 +1330,19 @@ impl Buffer<'_> {
         let mut buffer = Vec::new();
         buffer.reserve_exact(size);
         unsafe { buffer.set_len(size) };
-        let buffer_slice = &mut buffer.as_mut_slice();
-        let event = self.copy_to_host_buffer(layout, buffer_slice)?;
-        let event_handle = unsafe { event.to_c_api() };
-        std::mem::forget(event);
+        let event = invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_Buffer_ToHostBuffer,
+            {
+                src = self.to_c_api(),
+                host_layout = layout_handle,
+                dst = buffer.as_mut_ptr() as *mut _,
+                dst_size = buffer.len(),
+            },
+            { event },
+        )?;
 
-        // Return an `Event` with `buffer` as its output.
-        unsafe { Event::from_c_api(event_handle, self.api(), buffer) }
+        unsafe { Event::from_c_api(event, self.api(), buffer) }
     }
 
     /// Copies the underlying data of this [`Buffer`] into a buffer that is allocated on host memory, with the
@@ -1348,16 +1379,22 @@ impl Buffer<'_> {
     /// the provided `size` instead of taking in a reference to a pre-allocated buffer. Refer to the documentation of
     /// that function for more information.
     pub fn copy_raw_to_host(&self, offset: usize, size: usize) -> Result<Event<Vec<u8>>, Error> {
-        unsafe {
-            let mut buffer = Vec::new();
-            buffer.reserve_exact(size);
-            buffer.set_len(size);
-            let buffer_slice = &mut buffer.as_mut_slice();
-            let event = self.copy_raw_to_host_buffer(buffer_slice, offset)?;
-            let event_handle = event.to_c_api();
-            std::mem::forget(event);
-            Event::from_c_api(event_handle, self.api(), buffer)
-        }
+        use ffi::PJRT_Buffer_CopyRawToHost_Args;
+        let mut buffer = Vec::new();
+        buffer.reserve_exact(size);
+        unsafe { buffer.set_len(size) };
+        let event = invoke_pjrt_api_error_fn!(
+            self.api(),
+            PJRT_Buffer_CopyRawToHost,
+            {
+                buffer = self.to_c_api(),
+                dst = buffer.as_mut_ptr() as *mut _,
+                offset = offset as i64,
+                transfer_size = size as i64,
+            },
+            { event },
+        )?;
+        unsafe { Event::from_c_api(event, self.api(), buffer) }
     }
 
     /// Copies a slice of the raw underlying data of this [`Buffer`] into a buffer that is allocated on host memory.
@@ -1456,7 +1493,7 @@ impl Buffer<'_> {
             },
             { dst_buffer },
         )
-        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client) })
+        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client.get()) })
     }
 
     /// Copies this [`Buffer`] to the provided [`Device`] within the same [`Client`].
@@ -1476,7 +1513,7 @@ impl Buffer<'_> {
             },
             { dst_buffer },
         )
-        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client) })
+        .and_then(|handle| unsafe { Self::from_c_api(handle, self.api(), self.client.get()) })
     }
 
     /// Returns an [`Event`] (which is also a [`Future`]) that is triggered when either the data in this [`Buffer`]
@@ -1495,8 +1532,12 @@ impl Buffer<'_> {
     /// DLPack, etc.). While this count is greater than `0`, this buffer should not be deleted or moved by the PJRT
     /// implementation (e.g., for memory compaction).
     ///
-    /// This function is marked as unsafe because it can result in memory leaks if it is called without calling
-    /// [`Buffer::decrease_external_reference_count`] later on on the same [`Buffer`].
+    /// # Safety
+    ///
+    /// Each successful call must be paired with a later call to [`Buffer::decrease_external_reference_count`] on the
+    /// same [`Buffer`] to avoid leaking the external reference. Calls to this function and
+    /// [`Buffer::decrease_external_reference_count`] for the same buffer must also be externally synchronized because
+    /// the PJRT C wrapper does not synchronize its external-reference bookkeeping.
     pub unsafe fn increase_external_reference_count(&self) -> Result<(), Error> {
         use ffi::PJRT_Buffer_IncreaseExternalReferenceCount_Args;
         invoke_pjrt_api_error_fn!(self.api(), PJRT_Buffer_IncreaseExternalReferenceCount, { buffer = self.to_c_api() })
@@ -1505,8 +1546,12 @@ impl Buffer<'_> {
     /// Decrements the external reference count for this [`Buffer`]. Note that this function will return an [`Error`]
     /// if the reference count is `0` and cannot be decremented further.
     ///
-    /// This function is marked as unsafe because it can result in panics if it is called without having called
-    /// [`Buffer::increase_external_reference_count`] earlier on on the same [`Buffer`].
+    /// # Safety
+    ///
+    /// This function must only be called after a successful unmatched call to
+    /// [`Buffer::increase_external_reference_count`] on the same [`Buffer`]. Calls to both methods for the same buffer
+    /// must be externally synchronized because the PJRT C wrapper does not synchronize its external-reference
+    /// bookkeeping.
     pub unsafe fn decrease_external_reference_count(&self) -> Result<(), Error> {
         use ffi::PJRT_Buffer_DecreaseExternalReferenceCount_Args;
         invoke_pjrt_api_error_fn!(self.api(), PJRT_Buffer_DecreaseExternalReferenceCount, { buffer = self.to_c_api() })
@@ -1583,7 +1628,7 @@ impl Buffer<'_> {
             }
         };
 
-        let buffer = unsafe { Self::from_c_api(buffer_handle, self.api(), self.client)? };
+        let buffer = unsafe { Self::from_c_api(buffer_handle, self.api(), self.client.get())? };
 
         Ok((buffer, callback))
     }
@@ -1828,9 +1873,11 @@ pub struct HostBufferData {
     /// and must remain valid for the duration specified by the buffer's [`HostBufferSemantics`].
     pub(crate) ptr: *const std::ffi::c_void,
 
-    /// Optional callback that will be called when PJRT is done with the host buffer to drop it
-    /// (or reduce its reference count if it wrapped in an [`Rc`]).
-    pub(crate) drop_fn: Option<Box<dyn FnOnce()>>,
+    /// Optional callback that will be called when PJRT is done with the host buffer to drop it (or reduce its
+    /// reference count if it is backed by shared ownership). Once the pointer above has been handed to a successful
+    /// PJRT call, failure paths must leak this closure (e.g., by wrapping it in [`ManuallyDrop`]) instead of dropping
+    /// it, because dropping it without invoking it releases the data while PJRT may still be reading it.
+    pub(crate) drop_fn: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl HostBufferData {
@@ -1843,84 +1890,14 @@ impl HostBufferData {
         }
     }
 
-    /// Constructs a new [`HostBufferData`] instance for the provided buffer reference. If `mutable` is `true`, then the
-    /// resulting [`HostBufferData`] will hold a mutable reference to the underlying host buffer data until its
-    /// `drop_fn` is invoked by PJRT. If `mutable` is `false`, then it will hold an immutable reference to the
-    /// underlying host buffer data.
-    pub(crate) fn from_host_buffer_rc_refcell<B: AsRef<[u8]>>(buffer: &Rc<RefCell<B>>, mutable: bool) -> Self {
-        let buffer_clone_raw = Rc::into_raw(buffer.clone()) as *const RefCell<()>;
-        let ptr = {
-            let buffer = buffer.borrow();
-            let buffer = buffer.as_ref();
-            let slice = unsafe { slice_from_c_api(buffer.as_ptr() as *const std::ffi::c_void, buffer.len()) };
-            slice.as_ptr()
-        };
-
-        // Construct the data that will be captured by the `drop_fn` closure that PJRT will invoke once it is done using
-        // the host buffer that. The data is a [`Box`]ed [`HostBufferReference`] that holds a borrow guard for the host
-        // buffer data reference (which is transmuted to a type with a `'static` lifetime so that we can [`Box`] it;
-        // this is safe in this case because the backing storage is guaranteed to be kept alive for the duration of this
-        // guard via `rc_clone_raw`) and a raw pointer representing the [`Rc`] that owns the host buffer data and which
-        // will be used to decrease its reference count once PJRT is done using the host buffer data.
-        let data = unsafe {
-            Box::into_raw(Box::new(HostBufferReference {
-                ptr: buffer_clone_raw,
-                guard: if mutable {
-                    HostBufferReferenceGuard::Mutable(std::mem::transmute::<RefMut<'_, ()>, RefMut<'_, ()>>(
-                        (*buffer_clone_raw).borrow_mut(),
-                    ))
-                } else {
-                    HostBufferReferenceGuard::Immutable(std::mem::transmute::<Ref<'_, ()>, Ref<'_, ()>>(
-                        (*buffer_clone_raw).borrow(),
-                    ))
-                },
-            })) as *const std::ffi::c_void
-        };
-
-        Self {
-            ptr,
-            drop_fn: Some(Box::new(move || unsafe {
-                // First, `drop` the reference guard to make sure that runtime borrow checking rules are followed
-                // appropriately (and that the subsequent drop of the [`Rc`] does not fail). Then, drop the [`Rc`]
-                // that owns the host buffer data, therefore decreasing its reference count. Note that we need to
-                // use `std::hint::black_box` here to prevent Dead Code Elimination (DCE) in the Rust compiler from
-                // removing these calls.
-                let data = Box::from_raw(data as *mut HostBufferReference);
-                drop(std::hint::black_box(data.guard));
-                drop(std::hint::black_box(Rc::from_raw(data.ptr)))
-            })),
-        }
+    /// Constructs a new [`HostBufferData`] instance that shares ownership of the provided buffer. The returned
+    /// [`HostBufferData`] holds a clone of the provided [`Arc`] in its `drop_fn` closure, keeping the underlying host
+    /// buffer data alive until PJRT invokes that closure once it is done reading the data.
+    pub(crate) fn from_host_buffer_arc<B: AsRef<[u8]> + Send + Sync + 'static + ?Sized>(buffer: &Arc<B>) -> Self {
+        let owned_buffer = buffer.clone();
+        let bytes = buffer.as_ref().as_ref();
+        Self { ptr: bytes.as_ptr() as *const std::ffi::c_void, drop_fn: Some(Box::new(move || drop(owned_buffer))) }
     }
-}
-
-/// Internal helper for holding a reference to a host buffer that needs to be kept alive until PJRT is done with it
-/// along with a [`HostBufferReferenceGuard`] for it. This is captured by a [`HostBufferData::drop_fn`] closure such
-/// that it can be dropped once PJRT is done using the host buffer.
-struct HostBufferReference {
-    /// Raw pointer to the [`Rc`] that owns the host buffer data and that can be used to decrease its reference count
-    /// once PJRT is done using the host buffer data.
-    ptr: *const RefCell<()>,
-
-    /// Reference guard for the host buffer data that makes sure that Rust borrow checking rules are followed
-    /// at runtime using a [`RefCell`] for the host buffer data.
-    guard: HostBufferReferenceGuard,
-}
-
-/// Internal helper guard for references to host buffer data that need to be held until PJRT is done with them.
-/// This is an enum because we need to handle immutable and mutable host buffer borrows differently
-/// (i.e., with different guards).
-enum HostBufferReferenceGuard {
-    /// Immutable reference guard. Note that the `'static` lifetime is fake but needed so that we can [`Box`] it.
-    /// We never actually use this guard other than dropping it in a [`HostBufferData::drop_fn`] implementation,
-    /// and so we need the `#[allow(dead_code)]` to disable a warning.
-    #[allow(dead_code)]
-    Immutable(Ref<'static, ()>),
-
-    /// Mutable reference guard. Note that the `'static` lifetime is fake but needed so that we can [`Box`] it.
-    /// We never actually use this guard other than dropping it in a [`HostBufferData::drop_fn`] implementation,
-    /// and so we need the `#[allow(dead_code)]` to disable a warning.
-    #[allow(dead_code)]
-    Mutable(RefMut<'static, ()>),
 }
 
 /// Represents a host buffer that can be copied to a [`Device`] via [`Client::buffer`]
@@ -1944,13 +1921,13 @@ impl HostBuffer for &[u8] {
     }
 }
 
-impl HostBuffer for Rc<RefCell<&[u8]>> {
+impl HostBuffer for Arc<[u8]> {
     fn host_buffer_semantics() -> HostBufferSemantics {
         HostBufferSemantics::ImmutableUntilTransferCompletes
     }
 
     unsafe fn data(&self) -> HostBufferData {
-        HostBufferData::from_host_buffer_rc_refcell(self, false)
+        HostBufferData::from_host_buffer_arc(self)
     }
 }
 
@@ -1964,13 +1941,13 @@ impl<const N: usize> HostBuffer for &[u8; N] {
     }
 }
 
-impl<const N: usize> HostBuffer for Rc<RefCell<&[u8; N]>> {
+impl<const N: usize> HostBuffer for Arc<[u8; N]> {
     fn host_buffer_semantics() -> HostBufferSemantics {
         HostBufferSemantics::ImmutableUntilTransferCompletes
     }
 
     unsafe fn data(&self) -> HostBufferData {
-        HostBufferData::from_host_buffer_rc_refcell(self, false)
+        HostBufferData::from_host_buffer_arc(self)
     }
 }
 
@@ -2193,18 +2170,23 @@ impl<'s> Client<'s> {
             },
             { buffer, done_with_host_buffer },
         )?;
+
+        // After a successful native call, PJRT may keep reading the host allocation until the done event fires, so
+        // every failure path below must leak the keep-alive `drop_fn` closure instead of dropping it. Dropping the
+        // closure without invoking it would release the shared host data while PJRT may still be reading it. The
+        // `ManuallyDrop` wrapper suppresses that release whenever the closure is dropped without being invoked.
+        let drop_fn = data.drop_fn.map(ManuallyDrop::new);
         let buffer = unsafe { Buffer::from_c_api(buffer_handle, self.api(), self.to_c_api())? };
         let done_event = unsafe { Event::from_c_api(done_event_handle, self.api(), ()) };
 
         // Register a callback to drop the host buffer data after the copy is completed.
         if let Ok(done_event) = done_event
-            && let Some(drop_fn) = data.drop_fn
+            && let Some(drop_fn) = drop_fn
         {
-            // Register the callback that will be invoked once the host buffer data has been copied.
-            done_event.on_ready(|_| {
+            done_event.on_ready(move |_| {
                 // We ignore the error because there is nothing we can do with it here,
                 // and if something goes wrong, it should be reflected in [`Buffer::ready`].
-                drop_fn();
+                ManuallyDrop::into_inner(drop_fn)();
             })?;
         }
 
@@ -2219,28 +2201,28 @@ impl<'s> Client<'s> {
     /// underlying data until that data is copied to the target device, creating an entirely new [`Buffer`] with no
     /// shared data. That is because it is not possible to represent shared data between the CPU and other devices
     /// in PJRT. In those other cases, this function behaves equivalently to [`Client::buffer`].
-    pub fn borrowed_buffer<'c, B: AsRef<[u8]>, D: AsRef<[u64]>, M: HasDefaultMemory>(
+    pub fn borrowed_buffer<'c, B: AsRef<[u8]> + Send + Sync + 'static, D: AsRef<[u64]>, M: HasDefaultMemory>(
         &'c self,
-        data: Rc<RefCell<B>>,
+        data: Arc<B>,
         element_type: BufferType,
         dimensions: D,
         byte_strides: Option<&'_ [i64]>,
         memory: M,
         device_layout: Option<Layout>,
     ) -> Result<Buffer<'c>, Error> {
-        /// Internal helper that wraps an `Rc<RefCell<B>>` and provides a custom [`HostBuffer`]
+        /// Internal helper that wraps an `Arc<B>` and provides a custom [`HostBuffer`]
         /// implementation for it that uses different [`HostBufferSemantics`] than its default implementation.
-        struct BorrowedHostBuffer<B: AsRef<[u8]>> {
-            data: Rc<RefCell<B>>,
+        struct BorrowedHostBuffer<B: AsRef<[u8]> + Send + Sync + 'static> {
+            data: Arc<B>,
         }
 
-        impl<B: AsRef<[u8]>> HostBuffer for BorrowedHostBuffer<B> {
+        impl<B: AsRef<[u8]> + Send + Sync + 'static> HostBuffer for BorrowedHostBuffer<B> {
             fn host_buffer_semantics() -> HostBufferSemantics {
                 HostBufferSemantics::ImmutableZeroCopy
             }
 
             unsafe fn data(&self) -> HostBufferData {
-                HostBufferData::from_host_buffer_rc_refcell(&self.data, false)
+                HostBufferData::from_host_buffer_arc(&self.data)
             }
         }
 
@@ -2255,28 +2237,38 @@ impl<'s> Client<'s> {
     /// underlying data until that data is copied to the target device, creating an entirely new [`Buffer`] with no
     /// shared data. That is because it is not possible to represent shared data between the CPU and other devices
     /// in PJRT. In those other cases, this function behaves equivalently to [`Client::buffer`].
-    pub fn borrowed_mut_buffer<'c, B: AsRef<[u8]>, D: AsRef<[u64]>, M: HasDefaultMemory>(
+    ///
+    /// # Safety
+    ///
+    /// The caller must not read, write, reallocate, or otherwise access `data` until the returned [`Buffer`] has been
+    /// dropped. PJRT may mutate the shared allocation from a runtime thread at any time during that interval.
+    pub unsafe fn borrowed_mut_buffer<
+        'c,
+        B: AsRef<[u8]> + Send + Sync + 'static,
+        D: AsRef<[u64]>,
+        M: HasDefaultMemory,
+    >(
         &'c self,
-        data: Rc<RefCell<B>>,
+        data: Arc<B>,
         element_type: BufferType,
         dimensions: D,
         byte_strides: Option<&'_ [i64]>,
         memory: M,
         device_layout: Option<Layout>,
     ) -> Result<Buffer<'c>, Error> {
-        /// Internal helper that wraps an `Rc<RefCell<B>>` and provides a custom [`HostBuffer`]
-        /// implementation for it that uses different [`HostBufferSemantics`] than its default implementation.
-        struct BorrowedMutHostBuffer<B: AsRef<[u8]>> {
-            data: Rc<RefCell<B>>,
+        /// Internal helper that wraps an `Arc<B>` and provides a custom [`HostBuffer`] implementation for it that uses
+        /// different [`HostBufferSemantics`] than its default implementation.
+        struct BorrowedMutHostBuffer<B: AsRef<[u8]> + Send + Sync + 'static> {
+            data: Arc<B>,
         }
 
-        impl<B: AsRef<[u8]>> HostBuffer for BorrowedMutHostBuffer<B> {
+        impl<B: AsRef<[u8]> + Send + Sync + 'static> HostBuffer for BorrowedMutHostBuffer<B> {
             fn host_buffer_semantics() -> HostBufferSemantics {
                 HostBufferSemantics::MutableZeroCopy
             }
 
             unsafe fn data(&self) -> HostBufferData {
-                HostBufferData::from_host_buffer_rc_refcell(&self.data, true)
+                HostBufferData::from_host_buffer_arc(&self.data)
             }
         }
 
@@ -3650,9 +3642,8 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     use crate::tests::{TestPlatform, test_cpu_client, test_for_each_platform};
     use crate::{
@@ -3661,6 +3652,8 @@ mod tests {
     };
 
     use super::ffi;
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn test_buffer_type() {
@@ -3882,6 +3875,8 @@ mod tests {
     #[allow(deprecated)]
     #[test]
     fn test_buffer() {
+        assert_send_sync::<Buffer<'static>>();
+
         let client = test_cpu_client();
         let device = client.addressable_devices().unwrap()[0].clone();
 
@@ -3960,6 +3955,25 @@ mod tests {
         assert_eq!(buffer.is_deleted(), Ok(false));
         assert!(unsafe { buffer.delete() }.is_ok());
         assert_eq!(buffer.is_deleted(), Ok(true));
+    }
+
+    #[test]
+    fn test_buffer_is_owned_by() {
+        let client = test_cpu_client();
+        let other_client = test_cpu_client();
+        let device = client.addressable_devices().unwrap()[0].clone();
+        let buffer = client.buffer(&[1u8, 2u8, 3u8, 4u8], BufferType::U8, [4u64], None, device, None).unwrap();
+
+        // A buffer is owned by the client that created it and not by any other client, even one created
+        // from the same plugin with identical options.
+        assert!(buffer.is_owned_by(&client));
+        assert!(!buffer.is_owned_by(&other_client));
+
+        // Buffers derived from an existing buffer stay owned by the original client.
+        let other_device = client.addressable_devices().unwrap()[1].clone();
+        let copied_buffer = buffer.copy_to_device(other_device).unwrap();
+        assert!(copied_buffer.is_owned_by(&client));
+        assert!(!copied_buffer.is_owned_by(&other_client));
     }
 
     #[test]
@@ -4213,25 +4227,14 @@ mod tests {
         assert_eq!(host_buffer_data.ptr, data.as_ptr() as *const std::ffi::c_void);
         assert!(host_buffer_data.drop_fn.is_none());
 
-        // Test [`HostBufferData::from_host_buffer_rc_refcell`] with `mutable = false`.
-        let data = &[7u8, 8u8, 9u8, 10u8];
-        let rc = Rc::new(RefCell::new(data));
-        assert_eq!(Rc::strong_count(&rc), 1);
-        let mut host_buffer_data = HostBufferData::from_host_buffer_rc_refcell(&rc, false);
+        // Test [`HostBufferData::from_host_buffer_arc`].
+        let data = Arc::new([7u8, 8u8, 9u8, 10u8]);
+        assert_eq!(Arc::strong_count(&data), 1);
+        let mut host_buffer_data = HostBufferData::from_host_buffer_arc(&data);
         assert_eq!(host_buffer_data.ptr, data.as_ptr() as *const std::ffi::c_void);
-        assert_eq!(Rc::strong_count(&rc), 2);
+        assert_eq!(Arc::strong_count(&data), 2);
         host_buffer_data.drop_fn.take().unwrap()();
-        assert_eq!(Rc::strong_count(&rc), 1);
-
-        // Test [`HostBufferData::from_host_buffer_rc_refcell`] with `mutable = true`.
-        let data = &[11u8, 12u8, 13u8, 14u8];
-        let rc = Rc::new(RefCell::new(data));
-        assert_eq!(Rc::strong_count(&rc), 1);
-        let mut host_buffer_data = HostBufferData::from_host_buffer_rc_refcell(&rc, true);
-        assert_eq!(host_buffer_data.ptr, data.as_ptr() as *const std::ffi::c_void);
-        assert_eq!(Rc::strong_count(&rc), 2);
-        host_buffer_data.drop_fn.take().unwrap()();
-        assert_eq!(Rc::strong_count(&rc), 1);
+        assert_eq!(Arc::strong_count(&data), 1);
     }
 
     #[test]
@@ -4243,14 +4246,13 @@ mod tests {
         assert_eq!(data.ptr, value.as_ptr() as *const std::ffi::c_void);
         assert!(data.drop_fn.is_none());
 
-        // Test using an `Rc<RefCell<&[u8]>>`.
-        let value: &[u8] = &[1u8, 2u8, 3u8, 4u8];
-        let rc = Rc::new(RefCell::new(value));
+        // Test using an `Arc<[u8]>`.
+        let value: Arc<[u8]> = Arc::from([1u8, 2u8, 3u8, 4u8]);
         assert!(matches!(
-            <Rc<RefCell<&[u8]>> as HostBuffer>::host_buffer_semantics(),
+            <Arc<[u8]> as HostBuffer>::host_buffer_semantics(),
             HostBufferSemantics::ImmutableUntilTransferCompletes,
         ));
-        let mut data = unsafe { <Rc<RefCell<&[u8]>> as HostBuffer>::data(&rc) };
+        let mut data = unsafe { <Arc<[u8]> as HostBuffer>::data(&value) };
         assert_eq!(data.ptr, value.as_ptr() as *const std::ffi::c_void);
         data.drop_fn.take().unwrap()();
 
@@ -4264,14 +4266,13 @@ mod tests {
         assert_eq!(data.ptr, value.as_ptr() as *const std::ffi::c_void);
         assert!(data.drop_fn.is_none());
 
-        // Test using an `Rc<RefCell<&[u8; 4]>>`.
-        let value = &[1u8, 2u8, 3u8, 4u8];
-        let rc = Rc::new(RefCell::new(value));
+        // Test using an `Arc<[u8; 4]>`.
+        let value = Arc::new([1u8, 2u8, 3u8, 4u8]);
         assert!(matches!(
-            <Rc<RefCell<&[u8; 4]>> as HostBuffer>::host_buffer_semantics(),
+            <Arc<[u8; 4]> as HostBuffer>::host_buffer_semantics(),
             HostBufferSemantics::ImmutableUntilTransferCompletes,
         ));
-        let mut data = unsafe { <Rc<RefCell<&[u8; 4]>> as HostBuffer>::data(&rc) };
+        let mut data = unsafe { <Arc<[u8; 4]> as HostBuffer>::data(&value) };
         assert_eq!(data.ptr, value.as_ptr() as *const std::ffi::c_void);
         data.drop_fn.take().unwrap()();
     }
@@ -4325,10 +4326,9 @@ mod tests {
     fn test_client_borrowed_buffer() {
         test_for_each_platform!(|_plugin, client, _platform| {
             let device = client.addressable_devices().unwrap().remove(0);
-            let data = vec![21u8, 22u8, 23u8, 24u8, 25u8, 26u8];
-            let rc = Rc::new(RefCell::new(data.as_slice()));
+            let data = Arc::new(vec![21u8, 22u8, 23u8, 24u8, 25u8, 26u8]);
             let buffer =
-                client.borrowed_buffer(rc.clone(), BufferType::U8, [6u64], None, device.clone(), None).unwrap();
+                client.borrowed_buffer(data.clone(), BufferType::U8, [6u64], None, device.clone(), None).unwrap();
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
@@ -4339,10 +4339,12 @@ mod tests {
     fn test_client_borrowed_mut_buffer() {
         test_for_each_platform!(|_plugin, client, _platform| {
             let device = client.addressable_devices().unwrap().remove(0);
-            let data = vec![31u8, 32u8, 33u8, 34u8];
-            let rc = Rc::new(RefCell::new(data.as_slice()));
-            let buffer =
-                client.borrowed_mut_buffer(rc.clone(), BufferType::U8, [4u64], None, device.clone(), None).unwrap();
+            let data = Arc::new(vec![31u8, 32u8, 33u8, 34u8]);
+            let buffer = unsafe {
+                client
+                    .borrowed_mut_buffer(data.clone(), BufferType::U8, [4u64], None, device.clone(), None)
+                    .unwrap()
+            };
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
