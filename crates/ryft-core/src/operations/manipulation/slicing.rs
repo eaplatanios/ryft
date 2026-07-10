@@ -3,6 +3,7 @@ use std::fmt::Display;
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -1086,7 +1087,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -1121,9 +1122,9 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         if inputs.is_empty() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
         check_count!("output", outputs, 1, ProgramError);
         // One structural zero per operand: a contribution for the linear operand and zeros for the known indices.
@@ -1241,7 +1242,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -1305,9 +1306,9 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         if inputs.len() < 2 {
-            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() });
+            return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
         check_count!("output", outputs, 1, ProgramError);
         // One structural zero per operand: contributions for the linear input and update, and zeros for the known

@@ -99,7 +99,7 @@ impl<C: StagingContext> Tracer<C> {
         match self.context.stage_operation(operation, &[self]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
-                self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
+                self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
                 Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {
@@ -118,7 +118,7 @@ impl<C: StagingContext> Tracer<C> {
         match self.context.stage_operation(operation, &[self, rhs]) {
             Ok(mut outputs) if outputs.len() == 1 => outputs.remove(0),
             Ok(outputs) => {
-                self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() }.into());
+                self.context.error(ProgramError::InvalidOutputCount { expected: 1, actual: outputs.len() });
                 Self { state: TracerState::Poison, r#type: self.r#type.clone(), context: self.context.clone() }
             }
             Err(error) => {

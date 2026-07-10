@@ -25,7 +25,9 @@ use crate::batching::BatchingError;
 use crate::batching::{BatchableOperation, BatchableProgramOperation};
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::DifferentiationDual;
-use crate::differentiation::{DifferentiableOperation, DifferentiableType, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
+};
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
@@ -248,7 +250,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.output_types().len();
         check_count!("input", inputs, self.input_types().len(), ProgramError);
 
@@ -261,7 +263,8 @@ where
                 "rematerialize forward program produced {} outputs which is fewer than its {output_count} \
                  primal output(s)",
                 forward_outputs.len(),
-            )));
+            ))
+            .into());
         }
         let forward_tail = forward_outputs.split_off(output_count);
         let primal_outputs = forward_outputs;
@@ -300,10 +303,11 @@ where
         _context: &mut TracingContext<W, OLinear>,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -539,7 +543,7 @@ where
         context: &mut TracingContext<W, OLinear>,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         let cotangent_types = if self.transposed { self.tangent_input_types() } else { self.cotangent_types() };
         check_count!("output", outputs, cotangent_types.len(), ProgramError);
         let cotangent_tracers = outputs
@@ -1464,9 +1468,9 @@ mod tests {
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::scalars::Scalar;
+    use crate::tests::AssertClose;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -1513,10 +1517,10 @@ mod tests {
             let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
                 .with_policy(policy);
             let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
-            assert_close(value.values[0], direct_value.values[0]);
+            value.values[0].assert_close(direct_value.values[0]);
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_close(gradient.values[index], *expected);
-                assert_close(direct_gradient.values[index], *expected);
+                gradient.values[index].assert_close(*expected);
+                direct_gradient.values[index].assert_close(*expected);
             }
         }
     }
@@ -1584,8 +1588,8 @@ mod tests {
             let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
                 .value_and_gradient(|carry| function.call(carry).unwrap(), TestArray::scalar(2.0))
                 .unwrap();
-            assert_close(value.values[0], 2.0 * expected_gradient);
-            assert_close(gradient.values[0], expected_gradient);
+            value.values[0].assert_close(2.0 * expected_gradient);
+            gradient.values[0].assert_close(expected_gradient);
         }
         // `DotsSaveable` saves exactly the stacked per-iteration dot outputs (one `[3]`-shaped residual) beyond the
         // `NothingSaveable` baseline of region output plus region input.
@@ -1682,7 +1686,7 @@ mod tests {
             // Every policy preserves the gradient; only the save/recompute split changes.
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_close(gradient.values[index], *expected);
+                gradient.values[index].assert_close(*expected);
             }
         }
     }
@@ -1697,8 +1701,8 @@ mod tests {
             .with_policy(policy);
             let (value, gradient) =
                 domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
-            assert_scalar_close(value, 4.0f64.sin());
-            assert_scalar_close(gradient, 4.0f64.cos() * 4.0);
+            value.assert_close(4.0f64.sin());
+            gradient.assert_close(4.0f64.cos() * 4.0);
         }
     }
 
@@ -1716,8 +1720,8 @@ mod tests {
             .unwrap();
         // f(x) = u * sin(u) with u = x · x; the tangent against seed e_0 is the first gradient component.
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
-        assert_close(primal.values[0], u * u.sin());
-        assert_close(tangent.values[0], dot_sine_gradient(&[0.5, 1.5])[0]);
+        primal.values[0].assert_close(u * u.sin());
+        tangent.values[0].assert_close(dot_sine_gradient(&[0.5, 1.5])[0]);
     }
 
     #[test]
@@ -1742,8 +1746,8 @@ mod tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (value, gradient) =
             domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
-        assert_close(value.values[0], 2.0f64.sin());
-        assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
+        value.values[0].assert_close(2.0f64.sin());
+        gradient.values[0].assert_close(3.0 * 2.0f64.cos());
 
         // The custom-VJP boundary stays opaque to the policy: the rematerialized primal program preserves the
         // custom_vjp call intact, and even `EverythingSaveable` saves only the residual the user's forward rule
@@ -1873,9 +1877,9 @@ mod tests {
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
         let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), input).unwrap();
-        assert_close(value.values[0], expected_value);
+        value.values[0].assert_close(expected_value);
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_close(gradient.values[index], *expected);
+            gradient.values[index].assert_close(*expected);
         }
     }
 
@@ -1936,8 +1940,8 @@ mod tests {
             let x = 0.5f64;
             (x * x).sin() + 2.0 * x * x * (x * x).cos()
         };
-        assert_close(primal.values[0], expected_value);
-        assert_close(tangent.values[0], expected_tangent);
+        primal.values[0].assert_close(expected_value);
+        tangent.values[0].assert_close(expected_tangent);
     }
 
     #[test]
@@ -1954,8 +1958,8 @@ mod tests {
         );
         // f(x) = sin(x²) x, so f'(x) = sin(x²) + 2 x² cos(x²).
         let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), Scalar::from(0.7)).unwrap();
-        assert_scalar_close(value, 0.49f64.sin() * 0.7);
-        assert_scalar_close(gradient, 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos());
+        value.assert_close(0.49f64.sin() * 0.7);
+        gradient.assert_close(0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos());
     }
 
     #[test]
@@ -2035,9 +2039,9 @@ mod tests {
             )
             .unwrap();
         // f(x) = Σᵢ sin(xᵢ²), so ∂f/∂xⱼ = 2 xⱼ cos(xⱼ²).
-        assert_close(value.values[0], 0.25f64.sin() + 1.0f64.sin());
-        assert_close(gradient.values[0], 2.0 * 0.5 * 0.25f64.cos());
-        assert_close(gradient.values[1], 2.0 * 1.0 * 1.0f64.cos());
+        value.values[0].assert_close(0.25f64.sin() + 1.0f64.sin());
+        gradient.values[0].assert_close(2.0 * 0.5 * 0.25f64.cos());
+        gradient.values[1].assert_close(2.0 * 1.0 * 1.0f64.cos());
     }
 
     #[test]
@@ -2088,8 +2092,8 @@ mod tests {
         let (_, second_gradient) =
             domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         assert_eq!(trace_count.get(), derivations_after_first_gradient);
-        assert_close(first_gradient.values[0], 2.0 * 0.7 * 0.49f64.cos());
-        assert_close(second_gradient.values[0], first_gradient.values[0]);
+        first_gradient.values[0].assert_close(2.0 * 0.7 * 0.49f64.cos());
+        second_gradient.values[0].assert_close(first_gradient.values[0]);
     }
 
     #[test]
@@ -2210,7 +2214,7 @@ mod tests {
             let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_close(gradient.values[index], *expected);
+                gradient.values[index].assert_close(*expected);
             }
         }
     }
@@ -2229,7 +2233,7 @@ mod tests {
         let hessian = domain.hessian(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         let (_, _, block) = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
-        assert_close(block.value().values()[0], 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+        block.value().values()[0].assert_close(2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
     }
 
     #[test]
@@ -2252,8 +2256,8 @@ mod tests {
             )
             .unwrap();
         let x: f64 = 0.7;
-        assert_scalar_close(gradient, 2.0 * x * (x * x).cos());
-        assert_scalar_close(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+        gradient.assert_close(2.0 * x * (x * x).cos());
+        second_derivative.assert_close(2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
     }
 
     #[test]
@@ -2272,7 +2276,7 @@ mod tests {
         pullback_inputs.extend(residuals);
         let output = pullback.interpret(pullback_inputs).unwrap();
         let x: f64 = 0.7;
-        assert_close(output[0].values[0], 2.0 * x * (x * x).cos());
+        output[0].values[0].assert_close(2.0 * x * (x * x).cos());
     }
 
     #[test]
@@ -2287,10 +2291,10 @@ mod tests {
         );
         let jacobian = jacrev(&domain, |x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
         let (_, _, block) = jacobian.iter_blocks().next().unwrap();
-        assert_close(block.value().values()[0], 0.25f64.cos());
-        assert_close(block.value().values()[1], 0.0);
-        assert_close(block.value().values()[2], 0.0);
-        assert_close(block.value().values()[3], 1.0f64.cos() * 2.0);
+        block.value().values()[0].assert_close(0.25f64.cos());
+        block.value().values()[1].assert_close(0.0);
+        block.value().values()[2].assert_close(0.0);
+        block.value().values()[3].assert_close(1.0f64.cos() * 2.0);
     }
 
     /// Canonical offload destination used by the offloading policy tests.
@@ -2390,7 +2394,7 @@ mod tests {
             // Offloading changes placement, never values: gradients match the direct computation.
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                assert_close(gradient.values[index], *expected);
+                gradient.values[index].assert_close(*expected);
             }
         }
     }
@@ -2415,9 +2419,9 @@ mod tests {
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
-        assert_close(value.values[0], u * u.sin());
+        value.values[0].assert_close(u * u.sin());
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_close(gradient.values[index], *expected);
+            gradient.values[index].assert_close(*expected);
         }
     }
 
@@ -2463,7 +2467,7 @@ mod tests {
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
-            assert_close(gradient.values[index], *expected);
+            gradient.values[index].assert_close(*expected);
         }
     }
 
@@ -2526,7 +2530,7 @@ mod tests {
         for (row, values) in rows.iter().enumerate() {
             let expected_row_gradient = dot_sine_gradient(values);
             for (column, expected) in expected_row_gradient.iter().enumerate() {
-                assert_close(gradient.values[row * 3 + column], *expected);
+                gradient.values[row * 3 + column].assert_close(*expected);
             }
         }
     }

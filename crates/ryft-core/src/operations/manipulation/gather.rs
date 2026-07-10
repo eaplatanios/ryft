@@ -4,6 +4,7 @@ use std::fmt::Display;
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -873,7 +874,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -922,7 +923,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -1103,12 +1104,13 @@ mod tests {
             context: &mut TracingContext<V, TestGatherOperation<V>>,
             inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
-        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>>, ProgramError> {
+        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>>, DifferentiationError> {
             match self {
                 Self::Gather(operation) => operation.transpose(context, inputs, outputs),
                 _ => Err(ProgramError::UnsupportedOperation {
                     message: format!("{} is not transposed in this test enum", self.name()),
-                }),
+                }
+                .into()),
             }
         }
     }

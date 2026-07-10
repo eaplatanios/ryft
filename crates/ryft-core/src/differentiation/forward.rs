@@ -1352,8 +1352,7 @@ mod tests {
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::ProgramBuilder;
     use crate::scalars::Scalar;
-    // TODO(eaplatanios): Move this helper somewhere else.
-    use crate::tracing_v2::test_util::assert_scalar_close;
+    use crate::tests::AssertClose;
     use crate::types::DataType;
 
     use super::*;
@@ -1520,14 +1519,14 @@ mod tests {
         let (value, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0))
             .unwrap();
-        assert_scalar_close(value, 2.0f64.sin());
-        assert_scalar_close(tangent, 3.0 * 2.0f64.cos());
+        value.assert_close(2.0f64.sin());
+        tangent.assert_close(3.0 * 2.0f64.cos());
 
         // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
         // A plain `Scalar` input recovers the eager scalar domain, so both dual halves are concrete.
         let (value, tangent): (Scalar, Scalar) = jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
-        assert_scalar_close(value, 2.0f64.sin());
-        assert_scalar_close(tangent, 3.0 * 2.0f64.cos());
+        value.assert_close(2.0f64.sin());
+        tangent.assert_close(3.0 * 2.0f64.cos());
 
         // Under an active trace, the free `jvp` recovers the staging context from its tracer inputs instead, so it
         // composes inside traced code without threading a context: the closure stages the fused primal and tangent
@@ -1542,8 +1541,8 @@ mod tests {
         .unwrap();
         let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_scalar_close(outputs[0], 2.0f64.sin());
-        assert_scalar_close(outputs[1], 3.0 * 2.0f64.cos());
+        outputs[0].assert_close(2.0f64.sin());
+        outputs[1].assert_close(3.0 * 2.0f64.cos());
 
         // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
         // structure is rejected.
@@ -1574,15 +1573,15 @@ mod tests {
         let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .linearize(|x| x.sin(), Scalar::from(2.0))
             .unwrap();
-        assert_scalar_close(value, 2.0f64.sin());
-        assert_scalar_close(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos());
-        assert_scalar_close(pushforward.apply(Scalar::from(3.0)).unwrap(), 3.0 * 2.0f64.cos());
+        value.assert_close(2.0f64.sin());
+        pushforward.apply(Scalar::from(1.0)).unwrap().assert_close(2.0f64.cos());
+        pushforward.apply(Scalar::from(3.0)).unwrap().assert_close(3.0 * 2.0f64.cos());
 
         // The free `linearize` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
         // Primal work executes eagerly at the concrete linearization point while the pushforward program accumulates.
         let (value, pushforward) = linearize(|x| x.sin(), Scalar::from(2.0)).unwrap();
-        assert_scalar_close(value, 2.0f64.sin());
-        assert_scalar_close(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos());
+        value.assert_close(2.0f64.sin());
+        pushforward.apply(Scalar::from(1.0)).unwrap().assert_close(2.0f64.cos());
 
         // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead,
         // so primal work stages into the enclosing trace and the pushforward replays there when applied.
@@ -1597,8 +1596,8 @@ mod tests {
         .unwrap();
         let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        assert_scalar_close(outputs[0], 2.0f64.sin());
-        assert_scalar_close(outputs[1], 3.0 * 2.0f64.cos());
+        outputs[0].assert_close(2.0f64.sin());
+        outputs[1].assert_close(3.0 * 2.0f64.cos());
 
         // With no leaf value to recover a context from, the free `linearize` reports an invalid input count.
         assert_eq!(

@@ -1320,7 +1320,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         for input_id in self.input_ids.iter().copied() {
             let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(_) = input else {
-                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()).into());
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
             if input_atoms[input_id.index] {
                 return Err(ProgramError::MalformedProgram(format!(
@@ -1461,7 +1461,7 @@ fn move_atom_to_program<V: Value, O: Operation<V::Type>>(
                 "atom {atom_id} was already moved while rebuilding program",
             )));
         }
-        None => return Err(ProgramError::UnboundAtomId { id: atom_id }.into()),
+        None => return Err(ProgramError::UnboundAtomId { id: atom_id }),
     };
     if is_constant {
         let Some(Atom::Constant(value)) = atoms[atom_id.index].take() else {

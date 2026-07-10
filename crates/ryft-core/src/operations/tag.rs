@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::ZeroOperation;
@@ -112,7 +112,7 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperat
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // We re-tag the input primal for downstream classification while letting the input tangent pass through
         // unchanged, matching the identity tangent of the tag. The tag binds through the context so the rule works
         // uniformly under staging and eager contexts.
@@ -130,7 +130,7 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for TagOperati
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         // `TagOperation` acts as a linear identity function (i.e., `y = x`), and so its adjoint is the identity
         // function. The single output cotangent passes straight through to the single input, staging nothing and
         // leaving the cotangent untagged. That is because the tag is meant to mark forward residuals and not adjoints.

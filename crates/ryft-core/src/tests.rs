@@ -22,6 +22,8 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::ops::{BitAnd, BitOr, BitXor, Not};
 
+use half::{bf16, f16};
+
 use crate::broadcasting::Broadcastable;
 use crate::contexts::EagerContext;
 #[cfg(test)]
@@ -46,6 +48,73 @@ use crate::tracing_v2::operations::TransferToMemory;
 use crate::tracing_v2::{ArrayOperation, CoordinateBasis};
 use crate::types::{ArrayType, DataType, Shape, Size, StaticShape, TypeError, Typed};
 use crate::{Broadcast, Compare, ComparisonDirection, Select, SelectCondition};
+
+/// Floating-point view through which [`AssertClose`] compares values. One blanket [`AssertClose`] implementation
+/// covers every pairing of [`CloseValue`] operands (primitive against primitive, [`Scalar`] against [`Scalar`], and
+/// the mixed pairings), so implementing this trait for a new operand type lights up all of that type's pairings at
+/// once. The floating-point primitives widen exactly, while [`Scalar`] reads its floating-point payload and panics
+/// on a non-floating-point variant, which in an assertion context indicates the test produced an unexpected data
+/// type. That partial, panicking read is exactly why this assertion-scoped trait exists instead of a blanket over
+/// `Into<f64>`: a general conversion surface must not panic, while an assertion helper should.
+pub trait CloseValue: Copy {
+    /// Returns the `f64` view of this value that [`AssertClose`] compares.
+    fn to_f64(self) -> f64;
+}
+
+impl CloseValue for f64 {
+    fn to_f64(self) -> f64 {
+        self
+    }
+}
+
+impl CloseValue for f32 {
+    fn to_f64(self) -> f64 {
+        f64::from(self)
+    }
+}
+
+impl CloseValue for bf16 {
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+}
+
+impl CloseValue for f16 {
+    fn to_f64(self) -> f64 {
+        self.to_f64()
+    }
+}
+
+impl CloseValue for Scalar {
+    fn to_f64(self) -> f64 {
+        match self {
+            Scalar::BF16(value) => value.to_f64(),
+            Scalar::F16(value) => value.to_f64(),
+            Scalar::F32(value) => f64::from(value),
+            Scalar::F64(value) => value,
+            other => panic!("expected a floating-point scalar but got {}", other.r#type().into_owned()),
+        }
+    }
+}
+
+/// Represents the ability to assert that a value is approximately equal to an expected value, comparing the two
+/// operands' [`CloseValue`] views within absolute tolerance `1e-9` and panicking with a message naming both values
+/// and the absolute error otherwise. The single blanket implementation serves every pairing of [`CloseValue`]
+/// operands, so tests can write `actual.assert_close(expected)` across `f64`, `f32`, [`bf16`], [`f16`], and
+/// [`Scalar`] operands in any combination.
+pub trait AssertClose<Expected = Self> {
+    /// Asserts that this value is within absolute tolerance `1e-9` of `expected`.
+    fn assert_close(&self, expected: Expected);
+}
+
+impl<Actual: CloseValue, Expected: CloseValue> AssertClose<Expected> for Actual {
+    fn assert_close(&self, expected: Expected) {
+        let actual = (*self).to_f64();
+        let expected = expected.to_f64();
+        let delta = (actual - expected).abs();
+        assert!(delta <= 1e-9, "expected {actual} ~= {expected}; absolute error {delta} exceeded tolerance");
+    }
+}
 
 // TODO(eaplatanios): Promote to a simple built-in `Array` type in `arrays.rs` parallel to `scalars.rs`.
 /// Minimal dense array value used by `ryft` tests and documentation examples. Refer to the [module
@@ -2134,7 +2203,10 @@ mod linearization_tests {
 
         let error = primal_program.jvp().unwrap_err();
         assert!(
-            matches!(error, ProgramError::UnsupportedOperation { .. }),
+            matches!(
+                error,
+                crate::differentiation::DifferentiationError::Program(ProgramError::UnsupportedOperation { .. }),
+            ),
             "expected the front end to reject a `while` loop, but got {error:?}",
         );
     }
@@ -2759,7 +2831,7 @@ mod linearization_tests {
             vec![Scalar::from(0.7)],
             vec![Scalar::from(1.5)],
         ) {
-            Err(ProgramError::Type(TypeError { message }))
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(TypeError { message })))
                 if message.starts_with("custom_vjp does not support forward-mode differentiation") => {}
             Err(other) => panic!("expected the reverse-only TypeError from the forward but got {other:?}"),
             Ok(_) => panic!("expected the forward through custom_vjp to be rejected but it succeeded"),
@@ -3001,7 +3073,7 @@ mod array_linearization_tests {
         domain: &EagerContext<TestArray, ArrayOperation<TestArray>>,
         function: Function,
         primals: Vec<TestArray>,
-    ) -> Result<Linearization<TestArray, ArrayOperation<TestArray>>, ProgramError>
+    ) -> Result<Linearization<TestArray, ArrayOperation<TestArray>>, crate::differentiation::DifferentiationError>
     where
         Function: FnOnce(
             Vec<Tracer<NestedTracingContext<EagerContext<TestArray, ArrayOperation<TestArray>>>>>,
@@ -4140,7 +4212,9 @@ mod array_linearization_tests {
             vec![TestArray::scalar(2.0)],
         );
         match result {
-            Err(ProgramError::UnsupportedOperation { .. }) => {}
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                ..
+            })) => {}
             Err(other) => panic!("expected an UnsupportedOperation error for an unbounded while but got {other:?}"),
             Ok(_) => panic!("expected an UnsupportedOperation error for an unbounded while but it linearized"),
         }
@@ -4422,7 +4496,7 @@ mod array_linearization_tests {
             vec![TestArray::scalar(0.7)],
             vec![TestArray::scalar(1.5)],
         ) {
-            Err(ProgramError::Type(TypeError { message }))
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Type(TypeError { message })))
                 if message.starts_with("custom_vjp does not support forward-mode differentiation") => {}
             Err(other) => panic!("expected the reverse-only TypeError from the forward but got {other:?}"),
             Ok(_) => panic!("expected the forward through custom_vjp to be rejected but it succeeded"),
@@ -4621,10 +4695,11 @@ mod batching_tests {
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
+    use crate::tests::AssertClose;
     use crate::tracing::DomainTracingContext;
     use crate::tracing_v2::operations::primitive::ArrayOperation;
     use crate::tracing_v2::operations::{Collective, CollectiveKind};
-    use crate::tracing_v2::test_util::{assert_close, scalar_scale_branch};
+    use crate::tracing_v2::test_util::scalar_scale_branch;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::types::{DataType, Shape};
 
@@ -4674,7 +4749,7 @@ mod batching_tests {
 
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
         for (actual, expected) in output.values.iter().zip([0.0, 1.0 + 1.0f64.sin(), 4.0 + 2.0f64.sin()]) {
-            assert_close(*actual, expected);
+            actual.assert_close(expected);
         }
     }
 
@@ -4850,7 +4925,7 @@ mod batching_tests {
                 TestArray::scalar(2.0),
             )
             .unwrap();
-        assert_close(value.values[0], 20.0);
+        value.values[0].assert_close(20.0);
         assert_eq!(gradient.values, vec![10.0]);
     }
 
@@ -4861,6 +4936,7 @@ mod batching_tests {
                 |x| {
                     let context = x.context().clone();
                     ForwardModeDifferentiate::jvp(&context, |y| Ok(y.clone() * y), x.clone(), x.one_like())
+                        .map_err(ProgramError::from)
                 },
                 TestArray::vector(vec![2.0, 3.0]),
                 BatchAxis::new(0),
@@ -5029,7 +5105,7 @@ mod batching_tests {
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)])),);
         let expected: Vec<f64> = x_data.iter().map(|value| value * value).collect();
         for (actual, expected) in output.values.iter().zip(expected.iter()) {
-            assert_close(*actual, *expected);
+            actual.assert_close(*expected);
         }
     }
 
@@ -5056,7 +5132,7 @@ mod batching_tests {
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3)])),);
         // Batch item 0: [1,2,3,4]·[1,2,3,4] = 30. Batch item 1: [5,6,7,8]·[5,6,7,8] = 174. Batch item 2: 446.
         for (actual, expected) in output.values.iter().zip([30.0_f64, 174.0, 446.0].iter()) {
-            assert_close(*actual, *expected);
+            actual.assert_close(*expected);
         }
     }
 
@@ -5214,7 +5290,7 @@ mod batching_tests {
         assert_eq!(output.r#type, ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(4)])),);
         let expected: Vec<f64> = x_data.iter().map(|value| value + 0.5).collect();
         for (actual, expected) in output.values.iter().zip(expected.iter()) {
-            assert_close(*actual, *expected);
+            actual.assert_close(*expected);
         }
     }
 

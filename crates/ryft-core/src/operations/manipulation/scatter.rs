@@ -4,6 +4,7 @@ use std::fmt::Display;
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -775,7 +776,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let dimensions = self.operation().dimensions();
         let operand_type = inputs[0].r#type();

@@ -360,8 +360,7 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
             return Err(BatchingError::MisalignedBatchAxes {
                 message: "'ArrayBatch::broadcast' expects a replicated operand but received a batched value"
                     .to_string(),
-            }
-            .into());
+            });
         }
         // The insertion position is normalized against the physical output rank (i.e., the per-item rank plus the
         // inserted batch dimension). Valid axes lie in `[-rank, rank)`, with `-1` denoting the final axis.
@@ -1075,7 +1074,7 @@ pub trait Batch: Context<Type = ArrayType, Value: Broadcast + Transpose> {
         let input_structure = input.parameter_structure();
         let inputs = input.into_parameters().collect::<Vec<_>>();
         if inputs.is_empty() && batch_axis.size().is_none() {
-            return Err(BatchingError::EmptyBatch.into());
+            return Err(BatchingError::EmptyBatch);
         }
 
         // Broadcast the caller's `input_batch_axes` into the input parameter structure. A single `BatchAxis` leaf fills

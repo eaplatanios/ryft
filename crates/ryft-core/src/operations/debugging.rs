@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::effects::{Effect, Effects};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -137,7 +137,7 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<PrintOper
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // We re-print the input primal so the effect survives differentiation, while letting the input tangent pass
         // through unchanged (printing tangents would change the observable output of the differentiated program).
         // The print binds through the context so the rule works uniformly under staging and eager contexts.
@@ -155,7 +155,7 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for PrintOpera
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         // `PrintOperation` acts as a linear identity function (i.e., `y = x`), and so its adjoint is the identity
         // function: the single output cotangent passes straight through to the single input without staging another
         // print. The `DifferentiableOperation` implementation keeps the effect on the primal side, so the reverse

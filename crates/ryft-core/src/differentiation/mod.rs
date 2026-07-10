@@ -23,17 +23,18 @@ pub use types::DifferentiableType;
 /// Represents differentiation-related errors.
 ///
 /// [`DifferentiationError`] and [`ProgramError`] form the same normalized conversion cycle as
-/// [`BatchingError`](crate::BatchingError) and [`ProgramError`] do. The differentiation entry points that are typed at
-/// [`ProgramError`] for composability (i.e., `jvp`, `linearize`, and `vjp`, whose errors must flow through enclosing
-/// traces) carry their differentiation-specific failures type-erased inside [`ProgramError::Custom`] payloads, while
-/// the gradient entry points are typed at [`DifferentiationError`] directly. The paired [`From`] implementations keep
-/// this cycle normalized instead of letting the two types nest: converting to [`ProgramError`] unwraps a
-/// [`DifferentiationError::Program`] back into the program error that it carries and wraps every other variant in
-/// [`ProgramError::Custom`], while converting to [`DifferentiationError`] unwraps a [`ProgramError::Custom`] payload
-/// holding a [`DifferentiationError`] and wraps every other program error in [`DifferentiationError::Program`]. Round
-/// trips therefore never nest one error type inside the other, and `?` re-types errors correctly at both boundaries.
-/// Outside of these conversions, a [`DifferentiationError`] carried by a [`ProgramError`] can be recovered using
-/// [`ProgramError::downcast_custom`].
+/// [`BatchingError`](crate::BatchingError) and [`ProgramError`] do. Every differentiation surface including
+/// the value-level entry points (i.e., `jvp`, `linearize`, `vjp`, etc.), the program-level transforms (i.e.,
+/// `Program::jvp`, `Program::linearize`, `Program::transpose`, etc.), and the per-operation rule traits (i.e.,
+/// [`DifferentiableOperation`] and [`TransposableOperation`]), returns [`DifferentiationError`], while the errors those
+/// rules produce *through* the kernel (i.e., binding and staging operations) are [`ProgramError`]s. The paired [`From`]
+/// implementations keep this cycle normalized instead of letting the two types nest: converting to [`ProgramError`]
+/// unwraps a [`DifferentiationError::Program`] back into the program error that it carries and wraps every other
+/// variant in [`ProgramError::Custom`], while converting to [`DifferentiationError`] unwraps a [`ProgramError::Custom`]
+/// payload holding a [`DifferentiationError`] and wraps every other program error in [`DifferentiationError::Program`].
+/// Roundtrips therefore never nest one error type inside the other, and `?` re-types errors correctly at both
+/// boundaries. Outside of these conversions, a [`DifferentiationError`] carried by a [`ProgramError`] can be recovered
+/// using [`ProgramError::downcast_custom`].
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum DifferentiationError {
     /// Error returned when a differentiation entry point is invoked on an input with no leaf values/parameters.

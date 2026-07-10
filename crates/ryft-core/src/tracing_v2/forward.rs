@@ -14,14 +14,13 @@ mod tests {
     #[test]
     fn jvp_rejects_mismatched_parameter_structures() {
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let result: Result<(Scalar, Scalar), ProgramError> =
+        let result: Result<(Scalar, Scalar), crate::differentiation::DifferentiationError> =
             domain.jvp(|xs| Ok(xs[0].clone()), vec![Scalar::from(2.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]);
         assert!(matches!(
             result,
-            Err(ProgramError::Parameter(ParameterError::MismatchedParameterStructures {
-                left_structure,
-                right_structure,
-            })) if left_structure == format!("{:?}", vec![Scalar::from(2.0)].parameter_structure())
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::Parameter(
+                ParameterError::MismatchedParameterStructures { left_structure, right_structure },
+            ))) if left_structure == format!("{:?}", vec![Scalar::from(2.0)].parameter_structure())
                 && right_structure
                     == format!("{:?}", vec![Scalar::from(1.0), Scalar::from(2.0)].parameter_structure())
         ));
@@ -38,10 +37,10 @@ mod tests {
                 Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
                 Vec<DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>>,
             ),
-            ProgramError,
+            crate::differentiation::DifferentiationError,
         > = ForwardModeDifferentiate::jvp(&context, |inputs| Ok(inputs), empty_primals, empty_tangents);
 
-        assert!(matches!(result, Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 })));
+        assert_eq!(result, Err(crate::differentiation::DifferentiationError::EmptyInput));
     }
 
     #[test]
@@ -61,7 +60,7 @@ mod tests {
                 DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
                 DomainTracer<EagerContext<Scalar, ScalarOperation<Scalar>>>,
             ),
-            ProgramError,
+            crate::differentiation::DifferentiationError,
         > = ForwardModeDifferentiate::jvp(
             &context_a,
             |inputs| inputs[0].add(&inputs[1]),
