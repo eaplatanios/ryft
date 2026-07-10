@@ -60,8 +60,8 @@ pub(crate) struct CodeGenerator {
     /// Whether `#[ryft(bounds(batching(...)))]` was already specified.
     batching_bounds_set: bool,
 
-    /// Extra bounds to attach to the generated `DifferentiableProgramOperation` witness's program constant type,
-    /// from `#[ryft(bounds(differentiation(...)))]`.
+    /// Extra bounds to attach to the generated `DifferentiableProgramOperation` and `LinearizableProgramOperation`
+    /// witnesses' program constant type, from `#[ryft(bounds(differentiation(...)))]`.
     differentiation_value_bounds: Vec<syn::TypeParamBound>,
 
     /// Whether `#[ryft(bounds(differentiation(...)))]` was already specified.
@@ -581,7 +581,7 @@ impl CodeGenerator {
             let variant_ident = &variant.ident;
             if variant.skip_conversions {
                 quote! {
-                    Self::#variant_ident(_) => evaluator.fold_or_residualize(self.clone(), inputs),
+                    Self::#variant_ident(_) => context.fold_or_residualize(self.clone(), inputs),
                 }
             } else {
                 let operation_type =
@@ -590,7 +590,7 @@ impl CodeGenerator {
                 quote! {
                     Self::#variant_ident(operation) => {
                         <#operation_type as #ryft::partial::PartiallyEvaluatableOperation<__Context>>::
-                            partially_evaluate(#receiver, evaluator, inputs)
+                            partially_evaluate(#receiver, context, inputs)
                     },
                 }
             }
@@ -761,7 +761,7 @@ impl CodeGenerator {
             {
                 fn partially_evaluate(
                     &self,
-                    evaluator: &mut #ryft::partial::PartialEvaluator<__Context>,
+                    context: &#ryft::partial::PartialEvaluationContext<__Context>,
                     inputs: &[#ryft::partial::PartialEvaluationValue<
                         <__Context as #ryft::Domain>::Value,
                     >],
@@ -795,8 +795,8 @@ impl CodeGenerator {
     /// payload's own `DifferentiableOperation` rule. Non-recursive payloads carry per-variant
     /// `DifferentiableOperation` predicates that transport each rule's own capability requirements, while recursive
     /// payloads are discharged as definition-time body obligations against the operation `From` conversions and the
-    /// `MaybeZeroOperation` / `DifferentiableProgramOperation` fixed-point witnesses (a per-variant predicate for
-    /// them would form a genuine trait-solver cycle).
+    /// `MaybeZeroOperation` / `DifferentiableProgramOperation` / `LinearizableProgramOperation` fixed-point witnesses
+    /// (a per-variant predicate for them would form a genuine trait-solver cycle).
     fn generate_differentiable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
         let variants = self.extract_variants(input);
         if self.compile_error().is_some() {
@@ -887,13 +887,19 @@ impl CodeGenerator {
                 predicate
             },
         ));
-        // The `From<ZeroOperation>` and `DifferentiableProgramOperation` fixed-point witnesses let higher-order
-        // payload rules (condition/while/scan) linearize their nested programs in this same operation family without
-        // re-entering the enum's own `DifferentiableOperation` obligation.
+        // The `From<ZeroOperation>`, `DifferentiableProgramOperation`, and `LinearizableProgramOperation` fixed-point
+        // witnesses let higher-order payload rules (condition/while/scan) forward-differentiate and linearize their
+        // nested programs in this same operation family without re-entering the enum's own `DifferentiableOperation`
+        // obligation. Both program witnesses are required because the fused rules (`scan`/`condition`) stage through
+        // `jvp_program` while the bounded `while` rule linearizes its body through `linearize_program`.
         where_clause.predicates.push(syn::parse_quote! {
             #differentiation_self_type:
                 ::std::convert::From<#ryft::ZeroOperation<#primary_type>>
                 + #ryft::DifferentiableProgramOperation<
+                    #program_constant_type,
+                    #differentiation_self_type,
+                >
+                + #ryft::LinearizableProgramOperation<
                     #program_constant_type,
                     #differentiation_self_type,
                 >
@@ -917,12 +923,13 @@ impl CodeGenerator {
         let (differentiation_impl_generics, _, differentiation_where_clause) =
             differentiation_generics.split_for_impl();
 
-        // Program-level witness backing the recursive higher-order rules: the fixed bodies discharge the enum's
+        // Program-level witnesses backing the recursive higher-order rules: the fixed bodies discharge the enum's
         // full forward-mode obligation once, as a definition-time body check over the concrete linearization trace,
         // so the where clause spells only the constant-side leaves (`#[ryft(bounds(differentiation(...)))]`) and the
-        // `From<ZeroOperation>` conversion the trait itself requires. Keeping the recursive
+        // `From<ZeroOperation>` conversion the traits themselves require. Keeping the recursive
         // `Self: DifferentiableOperation<..>` bound out of the where clause is what lets the dispatcher above
-        // require `Self: DifferentiableProgramOperation<..>` without unbounded recursion.
+        // require `Self: DifferentiableProgramOperation<..>` and `Self: LinearizableProgramOperation<..>` without
+        // unbounded recursion.
         let program_type = quote! {
             #ryft::Program<
                 #program_constant_type,
@@ -955,6 +962,20 @@ impl CodeGenerator {
                 for #differentiation_self_type
             #witness_where_clause
             {
+                fn jvp_program(program: &#program_type) -> ::std::result::Result<#program_type, #ryft::ProgramError> {
+                    program.jvp()
+                }
+            }
+
+            #[automatically_derived]
+            impl #witness_impl_generics
+                #ryft::LinearizableProgramOperation<
+                    #program_constant_type,
+                    #differentiation_self_type,
+                >
+                for #differentiation_self_type
+            #witness_where_clause
+            {
                 fn linearize_program(
                     program: &#program_type,
                 ) -> ::std::result::Result<
@@ -962,10 +983,6 @@ impl CodeGenerator {
                     #ryft::ProgramError,
                 > {
                     program.linearize()
-                }
-
-                fn jvp_program(program: &#program_type) -> ::std::result::Result<#program_type, #ryft::ProgramError> {
-                    program.jvp_program()
                 }
             }
         };
@@ -980,9 +997,13 @@ impl CodeGenerator {
                 fn jvp(
                     &self,
                     context: &__DifferentiationContext,
-                    inputs: &[#ryft::JvpTracer<__DifferentiationContext>],
+                    inputs: &[#ryft::DifferentiationDual<
+                        <__DifferentiationContext as #ryft::Domain>::Value,
+                    >],
                 ) -> ::std::result::Result<
-                    ::std::vec::Vec<#ryft::JvpTracer<__DifferentiationContext>>,
+                    ::std::vec::Vec<#ryft::DifferentiationDual<
+                        <__DifferentiationContext as #ryft::Domain>::Value,
+                    >>,
                     #ryft::ProgramError,
                 > {
                     match self {

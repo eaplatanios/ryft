@@ -21,6 +21,8 @@ use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
 use ryft_core::scalars::Scalar;
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
+#[cfg(any(test, feature = "benchmarking"))]
+use ryft_core::tests::TestArray;
 use ryft_core::tracing_v2::ArrayOperation;
 use ryft_core::tracing_v2::operations::DotOperation;
 use ryft_core::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveKind, CollectiveOperation};
@@ -2431,8 +2433,54 @@ impl MlirLowerableValue for ArrayType {
     }
 }
 
+/// Concrete test/benchmark value lowering used by MLIR snapshot tooling.
+#[cfg(any(test, feature = "benchmarking"))]
+impl MlirLowerableValue for TestArray {
+    fn to_dense_elements_attribute<'c, 't>(
+        &self,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
+        // Integer-typed payloads (e.g., dynamic slicing start indices) are stored in-band as `f64` values, so they
+        // convert through integer dense attributes matching the lowered integer tensor type.
+        let data_type = self.r#type.data_type();
+        let attribute = match data_type {
+            DataType::I32 => {
+                let values = self.values.iter().map(|value| *value as i32).collect::<Vec<_>>();
+                context
+                    .dense_i32_elements_attribute(tensor_type, values.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                    .cast::<DenseElementsAttributeRef>()
+            }
+            DataType::I64 => {
+                let values = self.values.iter().map(|value| *value as i64).collect::<Vec<_>>();
+                context
+                    .dense_i64_elements_attribute(tensor_type, values.as_slice())
+                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                    .cast::<DenseElementsAttributeRef>()
+            }
+            _ => context
+                .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
+                .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
+                .cast::<DenseElementsAttributeRef>(),
+        };
+        attribute.ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
+    }
+
+    fn to_scalar_dense_elements_attribute<'c, 't>(
+        &self,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
+    ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
+        if self.values.len() != 1 {
+            return Ok(None);
+        }
+        Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
+    }
+}
+
 /// Lowers a plain traced `tracing_v2` program to a textual StableHLO MLIR module.
-#[cfg(test)]
+#[cfg(any(test, feature = "benchmarking"))]
 pub(crate) fn to_mlir_module_for_plain_program<
     V: MlirLowerableValue + BooleanLike,
     Input: Parameterized<V>,
@@ -3782,7 +3830,7 @@ where
 }
 
 /// Lowers one plain traced program to values inside a block.
-#[cfg(test)]
+#[cfg(any(test, feature = "benchmarking"))]
 fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
     program: &Program<V, O, Input, Output>,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -5442,50 +5490,6 @@ mod tests {
 
     fn test_matrix_type(rows: usize, cols: usize) -> ArrayType {
         ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(rows), Size::Static(cols)]))
-    }
-
-    impl MlirLowerableValue for TestArray {
-        fn to_dense_elements_attribute<'c, 't>(
-            &self,
-            tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-            context: &'c MlirContext<'t>,
-        ) -> Result<DenseElementsAttributeRef<'c, 't>, LoweringError> {
-            // Integer-typed payloads (e.g., dynamic slicing start indices) are stored in-band as `f64` values, so
-            // they convert through integer dense attributes matching the lowered integer tensor type.
-            let data_type = self.r#type.data_type();
-            let attribute = match data_type {
-                DataType::I32 => {
-                    let values = self.values.iter().map(|value| *value as i32).collect::<Vec<_>>();
-                    context
-                        .dense_i32_elements_attribute(tensor_type, values.as_slice())
-                        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
-                        .cast::<DenseElementsAttributeRef>()
-                }
-                DataType::I64 => {
-                    let values = self.values.iter().map(|value| *value as i64).collect::<Vec<_>>();
-                    context
-                        .dense_i64_elements_attribute(tensor_type, values.as_slice())
-                        .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
-                        .cast::<DenseElementsAttributeRef>()
-                }
-                _ => context
-                    .dense_f64_elements_attribute(tensor_type, self.values.as_slice())
-                    .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type })?
-                    .cast::<DenseElementsAttributeRef>(),
-            };
-            attribute.ok_or(LoweringError::InvalidDenseElementsAttribute { data_type })
-        }
-
-        fn to_scalar_dense_elements_attribute<'c, 't>(
-            &self,
-            tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-            context: &'c MlirContext<'t>,
-        ) -> Result<Option<DenseElementsAttributeRef<'c, 't>>, LoweringError> {
-            if self.values.len() != 1 {
-                return Ok(None);
-            }
-            Ok(Some(self.to_dense_elements_attribute(tensor_type, context)?))
-        }
     }
 
     fn xla_identity_branch(input_type: ArrayType) -> FlatXlaProgram {

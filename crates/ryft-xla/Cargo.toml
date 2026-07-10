@@ -47,7 +47,7 @@ tempfile.workspace = true
 
 [features]
 default = []
-benchmarking = ["ryft-core/benchmarking"]
+benchmarking = ["ryft-core/benchmarking", "ryft-core/test-utilities"]
 ndarray = ["dep:ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]

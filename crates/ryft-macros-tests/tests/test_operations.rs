@@ -325,22 +325,27 @@ impl<V: Value, O: Operation<V::Type>> StagingContext for TestContext<V, O> {
     type Meta = ();
 }
 
-/// Stand-in for `ryft_core::JvpTracer`. Mirrors only what the generated forward-mode dispatcher references: the
-/// generated `jvp` signature names the type, so a label field suffices to observe payload dispatch.
-struct JvpTracer<C: Context> {
+/// Stand-in for `ryft_core::DifferentiationDual`. Mirrors only what the generated forward-mode dispatcher references:
+/// the generated `jvp` signature names the type over the context's value type, so a label field suffices to observe
+/// payload dispatch.
+struct DifferentiationDual<V> {
     label: &'static str,
-    marker: PhantomData<C>,
+    marker: PhantomData<V>,
 }
 
-impl<C: StagingContext> std::fmt::Debug for JvpTracer<C> {
+impl<V> std::fmt::Debug for DifferentiationDual<V> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("JvpTracer").field("label", &self.label).finish()
+        formatter.debug_struct("DifferentiationDual").field("label", &self.label).finish()
     }
 }
 
 /// Stand-in for `ryft_core::DifferentiableOperation`.
 trait DifferentiableOperation<C: Context>: Operation<C::Type> {
-    fn jvp(&self, context: &C, inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError>;
+    fn jvp(
+        &self,
+        context: &C,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
 }
 
 /// Stand-in for `ryft_core::Linearization`.
@@ -349,14 +354,18 @@ struct Linearization<V: Value, O> {
     marker: PhantomData<(V, O)>,
 }
 
-/// Stand-in for `ryft_core::DifferentiableProgramOperation`, mirroring the two fixed-body methods the generated
+/// Stand-in for `ryft_core::DifferentiableProgramOperation`, mirroring the fused-jvp fixed-body method the generated
 /// witness implements.
 trait DifferentiableProgramOperation<V: Value, O>: Operation<V::Type> + Sized {
-    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
-
     fn jvp_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
     ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
+}
+
+/// Stand-in for `ryft_core::LinearizableProgramOperation`, mirroring the split-linearization fixed-body method the
+/// generated witness implements.
+trait LinearizableProgramOperation<V: Value, O>: Operation<V::Type> + Sized {
+    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
 }
 
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
@@ -372,9 +381,9 @@ where
         Ok(Linearization { label: "program_linearize", marker: PhantomData })
     }
 
-    /// Stand-in for `ryft_core::Program::jvp_program`.
-    fn jvp_program(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
-        Ok(Program { label: "program_jvp_program", constant: None, operation: None, marker: PhantomData })
+    /// Stand-in for `ryft_core::Program::jvp`.
+    fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        Ok(Program { label: "program_jvp", constant: None, operation: None, marker: PhantomData })
     }
 }
 
@@ -394,12 +403,12 @@ mod partial {
         marker: PhantomData<V>,
     }
 
-    /// Stand-in for `ryft_core::partial::PartialEvaluator`.
-    pub(crate) struct PartialEvaluator<C: Context> {
+    /// Stand-in for `ryft_core::partial::PartialEvaluationContext`.
+    pub(crate) struct PartialEvaluationContext<C: Context> {
         context: C,
     }
 
-    impl<C: Context> PartialEvaluator<C> {
+    impl<C: Context> PartialEvaluationContext<C> {
         pub(crate) fn new(context: C) -> Self {
             Self { context }
         }
@@ -409,7 +418,7 @@ mod partial {
         }
 
         pub(crate) fn fold_or_residualize<P: Into<C::Operation>>(
-            &mut self,
+            &self,
             operation: P,
             inputs: &[PartialEvaluationValue<C::Value>],
         ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
@@ -422,13 +431,13 @@ mod partial {
     pub(crate) trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> {
         fn partially_evaluate(
             &self,
-            evaluator: &mut PartialEvaluator<C>,
+            context: &PartialEvaluationContext<C>,
             inputs: &[PartialEvaluationValue<C::Value>],
         ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
         where
             Self: Clone + Into<C::Operation>,
         {
-            let _ = (evaluator.context(), inputs);
+            let _ = (context.context(), inputs);
             Ok(Vec::new())
         }
     }
@@ -867,9 +876,9 @@ fn test_operation_generates_partial_evaluation_value_bounds() {
     >();
 
     let context = TestContext::<Factor, PartialEvaluationBoundOperation<Factor>> { marker: PhantomData };
-    let mut evaluator = partial::PartialEvaluator::new(context);
+    let context = partial::PartialEvaluationContext::new(context);
     let operation = PartialEvaluationBoundOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
-    let evaluation = operation.partially_evaluate(&mut evaluator, &[]).unwrap();
+    let evaluation = operation.partially_evaluate(&context, &[]).unwrap();
     assert!(evaluation.is_empty());
 }
 
@@ -1286,14 +1295,22 @@ impl SpecialCombine for ScalarFactor {
 }
 
 impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for ZeroOperation<DataType> {
-    fn jvp(&self, _context: &C, _inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
-        Ok(vec![JvpTracer { label: "zero", marker: PhantomData }])
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+        Ok(vec![DifferentiationDual { label: "zero", marker: PhantomData }])
     }
 }
 
 impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for AddOperation {
-    fn jvp(&self, _context: &C, _inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
-        Ok(vec![JvpTracer { label: "add", marker: PhantomData }])
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+        Ok(vec![DifferentiationDual { label: "add", marker: PhantomData }])
     }
 }
 
@@ -1304,8 +1321,12 @@ where
     C: StagingContext<Type = DataType>,
     C::Value: SpecialCombine<Output = C::Value>,
 {
-    fn jvp(&self, _context: &C, _inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
-        Ok(vec![JvpTracer { label: "factor", marker: PhantomData }])
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+        Ok(vec![DifferentiationDual { label: "factor", marker: PhantomData }])
     }
 }
 
@@ -1348,7 +1369,11 @@ impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V,
 }
 
 impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for NonDifferentiableOperation {
-    fn jvp(&self, _context: &C, _inputs: &[JvpTracer<C>]) -> Result<Vec<JvpTracer<C>>, ProgramError> {
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
         Err(ProgramError)
     }
 }
@@ -1402,7 +1427,7 @@ fn test_differentiable_operation_delegates_unsupported_payloads() {
 fn test_differentiable_operation_generates_program_differentiation_witness() {
     type Operation = DifferentiableScalarOperation<ScalarFactor>;
 
-    // The witness's fixed bodies forward to the program's own `linearize` / `jvp_program`; the stand-in `linearize`
+    // The witness's fixed bodies forward to the program's own `linearize` / `jvp`; the stand-in `linearize`
     // requires `SpecialTransposableValue` on the value type, supplied to the generated impl by
     // `#[ryft(bounds(differentiation(...)))]`.
     let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
@@ -1412,12 +1437,12 @@ fn test_differentiable_operation_generates_program_differentiation_witness() {
         marker: PhantomData,
     };
     let linearization =
-        <Operation as DifferentiableProgramOperation<ScalarFactor, Operation>>::linearize_program(&program).unwrap();
+        <Operation as LinearizableProgramOperation<ScalarFactor, Operation>>::linearize_program(&program).unwrap();
     assert_eq!(linearization.label, "program_linearize");
 
     let jvp_program =
         <Operation as DifferentiableProgramOperation<ScalarFactor, Operation>>::jvp_program(&program).unwrap();
-    assert_eq!(jvp_program.label, "program_jvp_program");
+    assert_eq!(jvp_program.label, "program_jvp");
 }
 
 #[test]

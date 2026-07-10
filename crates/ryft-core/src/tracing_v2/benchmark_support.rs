@@ -6,10 +6,10 @@ use crate::operations::scalars::ScalarOperation;
 use crate::operations::trigonometric::{Cos, Sin};
 use crate::programs::{Program, ProgramError, Value};
 use crate::scalars::Scalar;
+use crate::tracing_v2::ReverseModeDifferentiate;
 use crate::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, record, summarize_program,
 };
-use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use crate::types::Type;
 
 /// Returns the tracing-only IR benchmark cases.
@@ -18,10 +18,6 @@ pub(crate) fn cases() -> Vec<BenchmarkCase> {
         BenchmarkCase::new("scalar_bilinear_sin_jit", emit_scalar_bilinear_sin_jit),
         BenchmarkCase::new("scalar_bilinear_sin_vjp_pullback", emit_scalar_bilinear_sin_vjp_pullback),
         BenchmarkCase::new("scalar_quartic_plus_sin_grad", emit_scalar_quartic_plus_sin_grad),
-        BenchmarkCase::new(
-            "scalar_quartic_plus_sin_linearize_pushforward",
-            emit_scalar_quartic_plus_sin_linearize_pushforward,
-        ),
         BenchmarkCase::new("scalar_quartic_plus_sin_value_and_grad", emit_scalar_quartic_plus_sin_value_and_grad),
     ]
 }
@@ -125,14 +121,6 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<Vec<IrBenchmarkRecord>, Benchma
             Scalar::from(2.0),
         )?;
     Ok(vec![tracing_record("scalar_quartic_plus_sin_grad", "grad", &compiled)?])
-}
-
-/// Emits the stored linear pushforward of the scalar quartic-plus-sine benchmark.
-fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
-    let (_, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
-        .linearize(|x| Ok(quartic_plus_sin(x)), Scalar::from(2.0))?;
-    let (pushforward, _residuals) = pushforward.into_parts();
-    Ok(vec![tracing_record("scalar_quartic_plus_sin_linearize_pushforward", "linearize_pushforward", &pushforward)?])
 }
 
 /// Emits the staged scalar value-and-gradient benchmark.

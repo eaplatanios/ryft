@@ -1,16 +1,18 @@
+use ryft_core::contexts::{Context, EagerContext};
 use ryft_core::operations::trigonometric::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
+use ryft_core::tests::TestArray;
 use ryft_core::tracing_v2::benchmarking::{
     BenchmarkCase, BenchmarkError, IrBenchmarkRecord, IrBenchmarkSummary, IrNestedRegionSummary, nested_region, record,
     summarize_program,
 };
 use ryft_core::tracing_v2::operations::dot::DotDimensionNumbers;
-use ryft_core::tracing_v2::{Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
+use ryft_core::tracing_v2::{ArrayOperation, Dot, ForwardModeDifferentiate, ReverseModeDifferentiate};
 
 use ryft_core::types::{ArrayType, DataType, Shape, Size};
 
-use crate::experimental::lowering::to_mlir_module_for_program;
+use crate::experimental::lowering::{to_mlir_module_for_plain_program, to_mlir_module_for_program};
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram};
 use crate::experimental::shard_map::{FlatTracedShardMap, ShardMapTracer, TracedXlaProgram, shard_map, trace};
 
@@ -22,6 +24,10 @@ pub fn cases() -> Vec<BenchmarkCase> {
         BenchmarkCase::new("shard_map_grad_inside", emit_shard_map_grad_inside),
         BenchmarkCase::new("grad_around_shard_map", emit_grad_around_shard_map),
         BenchmarkCase::new("nested_shard_map", emit_nested_shard_map),
+        BenchmarkCase::new(
+            "scalar_quartic_plus_sin_linearize_pushforward",
+            emit_scalar_quartic_plus_sin_linearize_pushforward,
+        ),
     ]
 }
 
@@ -161,6 +167,34 @@ fn traced_xla_records<
     )])
 }
 
+/// Emits the directly linearized pushforward of `f(x) = x⁴ + sin(x)` through the canonical XLA MLIR lowering path.
+fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
+    let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+    let (_, pushforward) =
+        context.linearize(|x| Ok(x.clone() * x.clone() * x.clone() * x.clone() + x.sin()?), TestArray::scalar(2.0))?;
+    let (pushforward, residuals) = pushforward.into_parts();
+    let (_, closed_pushforward) = context.interpret_and_trace(
+        move |tangent| {
+            let tracing_context = tangent.context().clone();
+            let mut inputs = vec![tangent];
+            inputs.extend(
+                residuals
+                    .iter()
+                    .cloned()
+                    .map(|residual| tracing_context.lift(residual))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            let mut outputs = pushforward.interpret_in_context(&tracing_context, inputs)?;
+            Ok(outputs.remove(0))
+        },
+        TestArray::scalar(1.0),
+    )?;
+    let summary = summarize_program(&closed_pushforward, |_| Ok(Vec::new()))?;
+    let mlir = to_mlir_module_for_plain_program(&closed_pushforward, "main")
+        .map_err(|error| BenchmarkError::External(Box::new(error)))?;
+    Ok(vec![record("scalar_quartic_plus_sin_linearize_pushforward", "scalar", "linearize_pushforward", mlir, summary)])
+}
+
 /// Emits the basic traced `shard_map` benchmark.
 fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
     let mesh = benchmark_mesh();
@@ -170,7 +204,11 @@ fn emit_shard_map_basic() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
             let mesh = mesh.clone();
             move |x: ShardMapTracer| {
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
-                    |local_x: ShardMapTracer| local_x.sin(),
+                    |local_x: ShardMapTracer| {
+                        local_x
+                            .sin()
+                            .unwrap_or_else(|error| panic!("basic shard_map IR benchmark should trace sine: {error}"))
+                    },
                     x,
                     mesh.clone(),
                     sharding.clone(),
@@ -227,7 +265,11 @@ fn emit_grad_around_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
                             let sharding = sharding.clone();
                             move |y| {
                                 shard_map::<_, _, ArrayType, _>(
-                                    |local_x: ShardMapTracer| local_x.sin(),
+                                    |local_x: ShardMapTracer| {
+                                        local_x.sin().unwrap_or_else(|error| {
+                                            panic!("grad-around-shard-map IR benchmark should trace sine: {error}")
+                                        })
+                                    },
                                     y,
                                     mesh.clone(),
                                     sharding.clone(),
@@ -264,9 +306,18 @@ fn emit_shard_map_grad_inside() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError
                 shard_map::<_, ShardMapTracer, ArrayType, ShardMapTracer>(
                     |local_x: ShardMapTracer| {
                         let context = local_x.context().clone();
-                        context.gradient(|y| y.sin(), local_x).unwrap_or_else(|error| {
-                            panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
-                        })
+                        context
+                            .gradient(
+                                |y| {
+                                    y.sin().unwrap_or_else(|error| {
+                                        panic!("shard_map grad-inside IR benchmark should trace sine: {error}")
+                                    })
+                                },
+                                local_x,
+                            )
+                            .unwrap_or_else(|error| {
+                                panic!("shard_map grad-inside IR benchmark should trace the inner gradient: {error}")
+                            })
                     },
                     x,
                     mesh.clone(),
@@ -335,24 +386,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_emit_scalar_linearize_pushforward_lowers_closed_mlir() {
+        let records = emit_scalar_quartic_plus_sin_linearize_pushforward().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].raw_ir().starts_with("module {"));
+        assert!(!records[0].raw_ir().contains("lambda %"));
+        assert_eq!(records[0].summary().input_leaf_count(), 1);
+        assert_eq!(records[0].summary().constant_count(), 4);
+    }
+
+    #[test]
     fn test_emit_grad_around_shard_map_records_factorized_transpose_regions() {
         let records = emit_grad_around_shard_map().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].raw_ir().matches("sdy.manual_computation").count(), 2);
-        assert_eq!(records[0].summary().op_histogram().get("shard_map"), Some(&1));
+        assert_eq!(records[0].summary().op_histogram().get("shard_map"), Some(&2));
 
-        let nested_region = |label: &str| {
-            records[0]
-                .summary()
-                .nested_regions()
-                .iter()
-                .find(|region| region.label() == label)
-                .unwrap_or_else(|| panic!("expected nested region '{label}'"))
-        };
-        assert_eq!(nested_region("shard_map.body").op_histogram().get("sin"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.residual_body").op_histogram().get("cos"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.apply_body").op_histogram().get(MUL_OPERATION_NAME), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram().get("cos"), Some(&1));
-        assert_eq!(nested_region("linear_shard_map.transpose_body").op_histogram().get(MUL_OPERATION_NAME), Some(&1),);
+        let nested_regions = records[0].summary().nested_regions();
+        assert_eq!(nested_regions.len(), 2);
+        let residual_body = nested_regions
+            .iter()
+            .find(|region| region.op_histogram().contains_key("sin"))
+            .expect("expected the primal-and-residual shard_map body");
+        assert_eq!(residual_body.op_histogram().get("sin"), Some(&1));
+        assert_eq!(residual_body.op_histogram().get("cos"), Some(&1));
+        let apply_body = nested_regions
+            .iter()
+            .find(|region| region.op_histogram().contains_key(MUL_OPERATION_NAME))
+            .expect("expected the linear shard_map body");
+        assert_eq!(apply_body.op_histogram().get(MUL_OPERATION_NAME), Some(&1));
     }
 }

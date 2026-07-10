@@ -31,30 +31,6 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_operation_impl(input)
 }
 
-/// Generates transposition dispatchers for a linear operation enum, enabling reverse-mode differentiation for
-/// programs staged in that operation family.
-///
-/// See the `ryft-core` documentation for the `TransposableOperation` trait for the full derive contract, including
-/// operation-type inference, generated payload bounds, and when the macro can generate the
-/// `TransposableProgramOperation` witness for nested linear programs.
-#[proc_macro_derive(TransposableOperation, attributes(ryft))]
-pub fn derive_transposable_operation(input: TokenStream) -> TokenStream {
-    OperationCodeGenerator::generate_transposable_operation_impl(input)
-}
-
-/// Generates the forward-mode (JVP) differentiation dispatcher for an operation enum, together with the
-/// `DifferentiableProgramOperation` witness that backs the recursive higher-order rules (its fixed bodies forward to
-/// `Program::linearize` / `Program::jvp_program`, and extra value bounds that body check needs are supplied via
-/// `#[ryft(bounds(differentiation(...)))]`).
-///
-/// See the `ryft-core` documentation for the `Operation` trait for the full derive contract. This derive enables
-/// forward-mode differentiation only; enums that also need reverse-mode differentiation additionally derive
-/// `TransposableOperation`, whose output supplies the transposition dispatchers that reverse mode is built on.
-#[proc_macro_derive(DifferentiableOperation, attributes(ryft))]
-pub fn derive_differentiable_operation(input: TokenStream) -> TokenStream {
-    OperationCodeGenerator::generate_differentiable_operation_impl(input)
-}
-
 /// Generates the batching (vectorization) dispatchers for an operation enum: the staged tracer-level and eager
 /// value-level `BatchableOperation` impls plus the `BatchableProgramOperation` witness for nested-program batching.
 ///
@@ -71,4 +47,28 @@ pub fn derive_differentiable_operation(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(BatchableOperation, attributes(ryft))]
 pub fn derive_batchable_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_batchable_operation_impl(input)
+}
+
+/// Generates the forward-mode (JVP) differentiation dispatcher for an operation enum, together with the
+/// `DifferentiableProgramOperation` and `LinearizableProgramOperation` witnesses that back the recursive higher-order
+/// rules (their fixed bodies forward to `Program::jvp_program` / `Program::linearize`, and extra value bounds those
+/// body checks need are supplied via `#[ryft(bounds(differentiation(...)))]`).
+///
+/// See the `ryft-core` documentation for the `Operation` trait for the full derive contract. This derive enables
+/// forward-mode differentiation only; enums that also need reverse-mode differentiation additionally derive
+/// `TransposableOperation`, whose output supplies the transposition dispatchers that reverse mode is built on.
+#[proc_macro_derive(DifferentiableOperation, attributes(ryft))]
+pub fn derive_differentiable_operation(input: TokenStream) -> TokenStream {
+    OperationCodeGenerator::generate_differentiable_operation_impl(input)
+}
+
+/// Generates transposition dispatchers for a linear operation enum, enabling reverse-mode differentiation for
+/// programs staged in that operation family.
+///
+/// See the `ryft-core` documentation for the `TransposableOperation` trait for the full derive contract, including
+/// operation-type inference, generated payload bounds, and when the macro can generate the
+/// `TransposableProgramOperation` witness for nested linear programs.
+#[proc_macro_derive(TransposableOperation, attributes(ryft))]
+pub fn derive_transposable_operation(input: TokenStream) -> TokenStream {
+    OperationCodeGenerator::generate_transposable_operation_impl(input)
 }
