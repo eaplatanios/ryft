@@ -5,7 +5,7 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::differentiation::{DifferentiableType, TransposableOperation};
+use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
@@ -216,7 +216,7 @@ impl<V: Value, O: Clone + Operation<V::Type>> Linearization<V, O> {
     /// transpose rule stages), rather than folding it into a captured factor, so the returned pullback program stays
     /// over the primal operation family `O` and produces the cotangents of the linear tangent inputs only.
     #[inline]
-    pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
+    pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
         V::Type: DifferentiableType,
         O: Clone + TransposableOperation<V, O> + From<ZeroOperation<V::Type>> + From<AddOperation>,
@@ -396,7 +396,7 @@ pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Ty
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 }
 
 /// Represents closed [`Operation`] families whose captured [`Program`]s can be built into *fused* jvp programs on
@@ -433,7 +433,7 @@ pub trait DifferentiableProgramOperation<V: Value, O: Clone + Operation<V::Type>
     /// by [`LinearizableProgramOperation`].
     fn jvp_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
+    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
 }
 
 /// Represents closed [`Operation`] families whose captured [`Program`]s can be _linearized_ on behalf of an enclosing
@@ -457,7 +457,9 @@ pub trait LinearizableProgramOperation<V: Value, O: Clone + Operation<V::Type> +
 {
     /// Linearizes `program` into the primal sub-program `x ↦ (y, r)` and the linear tangent sub-program `(ẋ, r) ↦ ẏ`.
     /// Refer to [`Program::linearize`] for more information.
-    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
+    fn linearize_program(
+        program: &Program<V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Linearization<V, Self>, DifferentiationError>;
 }
 
 /// [`DifferentiationDual`] flowing through a forward-mode [`DifferentiationContext`]. The function being differentiated
@@ -699,7 +701,7 @@ impl<
     /// propagates transitively without staging or scanning [`Instruction`](crate::Instruction)s. Structural zero
     /// tangents are materialized as typed [`ZeroOperation`] instructions only at the output boundary, preserving the
     /// `(primal_outputs ++ tangent_outputs)` program contract.
-    pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+    pub fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
 
         // Hold a standalone `Rc` clone of the context's builder, and move the context itself into the block below, so
@@ -828,7 +830,9 @@ impl<
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let input_count = 2 * primal_input_count;
         let output_count = output_atoms.len();
-        builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
+        builder
+            .build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
+            .map_err(DifferentiationError::from)
     }
 }
 
@@ -862,7 +866,7 @@ impl<
     /// program, while tangent-dependent effects residualize once into the tangent program. Higher-order operations own
     /// their nested splitting through their existing differentiation and partial-evaluation rules. This function does
     /// not inspect or special-case their payloads. The final pair is validated only by [`Linearization::new`].
-    pub fn linearize(&self) -> Result<Linearization<V, O>, ProgramError> {
+    pub fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         let primal_input_count = self.input_ids().len();
 
         // Keep one standalone handle to the primal builder. Every tracer and context clone is scoped below and must
@@ -922,13 +926,15 @@ impl<
                         "linearization produced an unknown primal output but primal work depends only on the known \
                          primal inputs"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
             };
             if !Rc::ptr_eq(primal.builder(), &primal_builder) {
                 return Err(ProgramError::MalformedProgram(
                     "linearization produced a primal output owned by a foreign trace".to_string(),
-                ));
+                )
+                .into());
             }
             primal_output_atoms.push(primal.atom_id()?);
             let tangent = match tangent {
@@ -941,7 +947,8 @@ impl<
                                 "linearization produced a known tangent output; differentiation rules must represent \
                                  input-independent zero tangents structurally"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         }
                     }
                 }
@@ -962,7 +969,8 @@ impl<
             return Err(ProgramError::MalformedProgram(
                 "linearization produced a tangent output that did not residualize at its canonical output position"
                     .to_string(),
-            ));
+            )
+            .into());
         }
         let tangent_program = evaluation.program;
 
@@ -972,7 +980,8 @@ impl<
         if evaluation.inputs.len() != tangent_program.input_ids().len() {
             return Err(ProgramError::MalformedProgram(
                 "linearization produced tangent input metadata that does not match its tangent program".to_string(),
-            ));
+            )
+            .into());
         }
         let mut residual_output_atoms = Vec::with_capacity(evaluation.inputs.len().saturating_sub(primal_input_count));
         for (index, input) in evaluation.inputs.into_iter().enumerate() {
@@ -982,7 +991,8 @@ impl<
                     if !Rc::ptr_eq(feeder.builder(), &primal_builder) {
                         return Err(ProgramError::MalformedProgram(
                             "linearization produced a residual feeder owned by a foreign trace".to_string(),
-                        ));
+                        )
+                        .into());
                     }
                     residual_output_atoms.push(feeder.atom_id()?);
                 }
@@ -991,7 +1001,8 @@ impl<
                         "linearization produced a tangent program whose leading tangent inputs are not followed by \
                          its residuals"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1015,7 +1026,7 @@ impl<
 
         // Partial evaluation already gives the tangent program its flat vector boundary.
         // `Linearization::new` is the sole cross-program contract validation.
-        Linearization::new(primal_program, tangent_program, residual_count)
+        Linearization::new(primal_program, tangent_program, residual_count).map_err(DifferentiationError::from)
     }
 }
 
@@ -1054,12 +1065,12 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
         function: F,
         primals: Input,
         tangents: Input::To<Self::Value>,
-    ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), ProgramError>
+    ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
         Self: Zero<Self::Value>,
     {
         if primals.parameters().next().is_none() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+            return Err(DifferentiationError::EmptyInput);
         }
 
         let primal_structure = primals.parameter_structure();
@@ -1102,7 +1113,6 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
         Ok((primal_output, tangent_output))
     }
 
-    // TODO(eaplatanios): Review this function.
     /// Linearizes `function` at `primals`, returning the primal output and a reusable [`Pushforward`], with this
     /// [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of the [`linearize`]
     /// function for information on the linearization transform and its arguments.
@@ -1114,18 +1124,19 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
         &self,
         function: F,
         primals: Input,
-    ) -> Result<(Output::To<Self::Value>, Pushforward<Self, Input, Output::To<Self::Value>>), ProgramError>
+    ) -> Result<(Output::To<Self::Value>, Pushforward<Self, Input, Output::To<Self::Value>>), DifferentiationError>
     where
         Self::Operation: PartiallyEvaluatableOperation<Self> + From<ZeroOperation<Self::Type>>,
     {
         if primals.parameters().next().is_none() {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+            return Err(DifferentiationError::EmptyInput);
         }
+
         let input_structure = primals.parameter_structure();
         let input_values = primals.into_parameters().collect::<Vec<_>>();
         let tangent_input_count = input_values.len();
 
-        // Wrap each primal as a dual over a partial-evaluation context wrapping this context: the primal half is a
+        // Wrap each primal as a dual over a partial-evaluation context wrapping this context. The primal half is a
         // known value and the tangent half is an unknown seeded as a leading residual-program input, in primal-input
         // order.
         let evaluation_context = PartialEvaluationContext::new(self.clone());
@@ -1147,9 +1158,9 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
 
         // Split each output dual into its known primal value and its tangent. Primal work depends only on the known
         // primal inputs, so every primal half must have folded to a known value. Structural-zero tangent halves are
-        // restored as staged zeros, so the pushforward program presents the canonical one-tangent-output-per-primal-
-        // output arity (matching `Program::linearize`'s restoration). A value tangent that folded to known is
-        // malformed: a well-formed rule must preserve an input-independent zero as `MaybeZero::Zero`, while accepting
+        // restored as staged zeros, and so the pushforward program presents the canonical one-tangent-output-per-
+        // primal-output arity (matching `Program::linearize`'s restoration). A value tangent that folded to known is
+        // malformed. A well-formed rule must preserve an input-independent zero as `MaybeZero::Zero`, while accepting
         // an arbitrary known value would silently turn the pushforward into an affine map.
         let output_structure = output.parameter_structure();
         let output_duals = output.into_parameters().collect::<Vec<_>>();
@@ -1169,7 +1180,8 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
                         "linearization produced an unknown primal output but primal work depends only on the known \
                          primal inputs"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
             };
             let tangent = match tangent {
@@ -1182,7 +1194,8 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
                                 "linearization produced a known tangent output; differentiation rules must represent \
                                  input-independent zero tangents structurally"
                                     .to_string(),
-                            ));
+                            )
+                            .into());
                         }
                     }
                 }
@@ -1193,13 +1206,12 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
         }
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), primal_outputs)?;
 
-        // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be
-        // finalized.
+        // All tracer-stamped context clones are dropped here, so the accumulated pushforward program can be finalized.
         drop(differentiation_context);
         let evaluation = evaluation_context.into_evaluation(tangent_outputs)?;
 
         // The pushforward program's inputs are the leading tangent unknowns followed by the residuals materialized
-        // during the trace; collect the residual values in input order.
+        // during the trace. Collect the residual values in input order.
         let mut residuals = Vec::with_capacity(evaluation.inputs.len().saturating_sub(tangent_input_count));
         for (index, input) in evaluation.inputs.iter().enumerate() {
             match input {
@@ -1209,7 +1221,8 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
                     return Err(ProgramError::MalformedProgram(
                         "linearization produced a pushforward program whose tangent inputs do not lead its residuals"
                             .to_string(),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -1222,19 +1235,17 @@ pub trait ForwardModeDifferentiate: Context<Operation: Clone + DifferentiableOpe
 
 impl<C: Context<Operation: Clone + DifferentiableOperation<Self>>> ForwardModeDifferentiate for C {}
 
-// TODO(eaplatanios): Review this function.
+// TODO(eaplatanios): Add mathematical notation explanation.
 /// Evaluates `function` on the primal `primals` and propagates the tangent `tangents` forward by running the closure
 /// **directly on [`DifferentiationTracer`] duals** (i.e., the single forward-mode entry point, and the analogue of
-/// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html)).
-///
-/// The transform recovers a [`Context`] from the input's leaf values through
-/// [`Value::ExecutionDomain`](crate::programs::Value::ExecutionDomain), exactly like [`batch`](crate::batching::batch):
-/// staged [`Tracer`](crate::tracing::Tracer)s recover their trace, transform tracers recover their transform level,
-/// and concrete values recover the eager backend domain they name, so the transform composes uniformly across the
-/// whole stack. Each input is then paired with its tangent as a dual over a [`DifferentiationContext`] wrapping the
-/// recovered context, and `function` runs directly on those duals, with each operation the closure performs (e.g.,
-/// `x.sin()`, `x * y`, etc.) dispatching its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`].
-/// Eager-versus-staged behavior is absorbed entirely by that context:
+/// [JAX's `jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.jvp.html)). The transform recovers a [`Context`] from
+/// the input's leaf values through [`Value::ExecutionDomain`], exactly like [`batch`](crate::batching::batch):
+/// staged [`Tracer`]s recover their trace, transform tracers recover their transform level, and concrete values recover
+/// the eager backend domain they name, so the transform composes uniformly across the whole stack. Each input is then
+/// paired with its tangent as a dual over a [`DifferentiationContext`] wrapping the recovered context, and `function`
+/// runs directly on those duals, with each operation the closure performs (e.g., `x.sin()`, `x * y`, etc.) dispatching
+/// its [`jvp`](DifferentiableOperation::jvp) rule through [`Context::bind`]. Eager-versus-staged behavior is absorbed
+/// entirely by that context:
 ///
 ///   - Over an **eager** context both dual halves are concrete, so the closure sees real primal values (i.e., it can
 ///     branch on them with `if x.boolean()? { … }`, print them, or otherwise use Rust control flow driven by the
@@ -1242,26 +1253,20 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<Self>>> ForwardModeDi
 ///     primals, with no iteration bound needed.
 ///   - Over a **staging** context the same closure stages the primal and tangent operations into the enclosing trace
 ///     operation by operation (this is how a fused JVP computation is built under an outer trace), and branching on a
-///     primal errors because it is a [`Tracer`](crate::tracing::Tracer) with no concrete payload.
+///     primal errors because it is a [`Tracer`] with no concrete payload.
 ///
 /// The closure executes exactly as written: no dead code is trimmed, and observable effects fire as the closure runs.
 /// Structural zero tangents stay symbolic between operations and are materialized through the recovered context's
-/// [`Zero`] capability only at the output boundary. Transforms nest: inside the closure, an inner transform invoked
+/// [`Zero`] capability only at the output boundary. Transforms nest. Inside the closure, an inner transform invoked
 /// on a dual's [`DifferentiationContext`] (a [`Context`] carrying these transforms itself) differentiates through the
 /// duals, composing reverse-over-forward and higher-order forward modes.
 ///
-/// Inputs with no leaf values are rejected with an [`InvalidInputCount`](ProgramError::InvalidInputCount) error:
-/// there is nothing to recover a context from, and differentiating a function of no inputs is degenerate anyway.
+/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error as there is nothing to
+/// recover a context from, and differentiating a function of no inputs is degenerate anyway.
 /// [`ForwardModeDifferentiate::jvp`] is the explicit-context method form behind this function.
 #[inline]
-pub fn jvp<V, F, Input, Output>(
-    function: F,
-    primals: Input,
-    tangents: Input::To<V>,
-) -> Result<(Output::To<V>, Output::To<V>), ProgramError>
-where
-    V: Value<ExecutionDomain: Context + Zero<V>>,
-    <V::ExecutionDomain as Domain>::Operation: Clone + DifferentiableOperation<V::ExecutionDomain>,
+pub fn jvp<
+    V: Value<ExecutionDomain: Context<Operation: Clone + DifferentiableOperation<V::ExecutionDomain>> + Zero<V>>,
     F: FnOnce(Input::To<DifferentiationTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
     Input: Parameterized<
             V,
@@ -1270,9 +1275,13 @@ where
             ParameterStructure: Debug + PartialEq,
         >,
     Output: Parameterized<DifferentiationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
-{
+>(
+    function: F,
+    primals: Input,
+    tangents: Input::To<V>,
+) -> Result<(Output::To<V>, Output::To<V>), DifferentiationError> {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        return Err(DifferentiationError::EmptyInput);
     };
     context.jvp(function, primals, tangents)
 }
@@ -1304,17 +1313,18 @@ where
 /// [`Pushforward`] back up with [`Pushforward::into_parts`], and transposes its program into the pullback (and the
 /// forward-mode Jacobian transform batch-replays it the same way).
 ///
-/// Inputs with no leaf values are rejected with an [`InvalidInputCount`](ProgramError::InvalidInputCount) error:
+/// Inputs with no leaf values are rejected with a [`DifferentiationError::EmptyInput`] error:
 /// there is nothing to recover a context from, and linearizing a function of no inputs is degenerate anyway.
 /// [`ForwardModeDifferentiate::linearize`] is the explicit-context method form behind this function.
 #[inline]
 pub fn linearize<V, F, Input, Output>(
     function: F,
     primals: Input,
-) -> Result<(Output::To<V>, Pushforward<V::ExecutionDomain, Input, Output::To<V>>), ProgramError>
+) -> Result<(Output::To<V>, Pushforward<V::ExecutionDomain, Input, Output::To<V>>), DifferentiationError>
 where
     V: Value<ExecutionDomain: Context>,
     <V::ExecutionDomain as Domain>::Operation: Clone
+        + DifferentiableOperation<V::ExecutionDomain>
         + DifferentiableOperation<PartialEvaluationContext<V::ExecutionDomain>>
         + PartiallyEvaluatableOperation<V::ExecutionDomain>
         + From<ZeroOperation<V::Type>>,
@@ -1323,7 +1333,7 @@ where
     Output: Parameterized<LinearizationTracer<V::ExecutionDomain>, Family: ParameterizedFamily<V>>,
 {
     let Some(context) = primals.parameters().next().map(Value::execution_domain) else {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        return Err(DifferentiationError::EmptyInput);
     };
     context.linearize(function, primals)
 }
@@ -1540,7 +1550,12 @@ mod tests {
         // is rejected.
         let error =
             jvp(|x: Vec<_>| Ok(x), vec![Scalar::from(1.0)], vec![Scalar::from(1.0), Scalar::from(2.0)]).unwrap_err();
-        assert!(matches!(error, ProgramError::Parameter(ParameterError::MismatchedParameterStructures { .. })));
+        assert!(matches!(
+            error,
+            DifferentiationError::Program(ProgramError::Parameter(
+                ParameterError::MismatchedParameterStructures { .. }
+            ))
+        ));
 
         // With no leaf value to recover a context from, the free `jvp` reports an invalid input count.
         let error = jvp(
@@ -1549,7 +1564,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap_err();
-        assert_eq!(error, ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
     // TODO(eaplatanios): Review this function.
@@ -1594,6 +1609,6 @@ mod tests {
         )
         .map(|(outputs, _)| outputs)
         .unwrap_err();
-        assert_eq!(error, ProgramError::InvalidInputCount { expected: 1, actual: 0 });
+        assert_eq!(error, DifferentiationError::EmptyInput);
     }
 }

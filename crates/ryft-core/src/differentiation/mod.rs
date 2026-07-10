@@ -4,7 +4,9 @@ pub mod types;
 
 use thiserror::Error;
 
+use crate::parameters::ParameterError;
 use crate::programs::ProgramError;
+use crate::types::TypeError;
 
 pub use forward::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiationContext, DifferentiationDual,
@@ -19,8 +21,28 @@ pub use reverse::{
 pub use types::DifferentiableType;
 
 /// Represents differentiation-related errors.
+///
+/// [`DifferentiationError`] and [`ProgramError`] form the same normalized conversion cycle as
+/// [`BatchingError`](crate::BatchingError) and [`ProgramError`] do. The differentiation entry points that are typed at
+/// [`ProgramError`] for composability (i.e., `jvp`, `linearize`, and `vjp`, whose errors must flow through enclosing
+/// traces) carry their differentiation-specific failures type-erased inside [`ProgramError::Custom`] payloads, while
+/// the gradient entry points are typed at [`DifferentiationError`] directly. The paired [`From`] implementations keep
+/// this cycle normalized instead of letting the two types nest: converting to [`ProgramError`] unwraps a
+/// [`DifferentiationError::Program`] back into the program error that it carries and wraps every other variant in
+/// [`ProgramError::Custom`], while converting to [`DifferentiationError`] unwraps a [`ProgramError::Custom`] payload
+/// holding a [`DifferentiationError`] and wraps every other program error in [`DifferentiationError::Program`]. Round
+/// trips therefore never nest one error type inside the other, and `?` re-types errors correctly at both boundaries.
+/// Outside of these conversions, a [`DifferentiationError`] carried by a [`ProgramError`] can be recovered using
+/// [`ProgramError::downcast_custom`].
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
 pub enum DifferentiationError {
+    /// Error returned when a differentiation entry point is invoked on an input with no leaf values/parameters.
+    /// Differentiating a function of no inputs is degenerate (there is no direction to perturb, so the Jacobian has no
+    /// columns), and the free entry points additionally have no leaf value to recover a context from, so every entry
+    /// point rejects an empty input up front instead of silently returning vacuous tangents or gradients.
+    #[error("differentiation requires an input with at least one leaf value")]
+    EmptyInput,
+
     /// Error returned when reverse-mode differentiation is requested for a function whose output is not a single
     /// scalar. Reverse mode differentiation seeds the output cotangent with the multiplicative identity (i.e., a scalar
     /// value of `1`) and pulls it back to the inputs, which yields a gradient only when the output is a rank-0 scalar.
@@ -53,5 +75,40 @@ pub enum DifferentiationError {
     ComplexGradientOutput { output_type: String },
 
     #[error(transparent)]
-    Program(#[from] ProgramError),
+    Program(ProgramError),
+}
+
+impl From<TypeError> for DifferentiationError {
+    #[inline]
+    fn from(error: TypeError) -> Self {
+        DifferentiationError::Program(error.into())
+    }
+}
+
+impl From<ParameterError> for DifferentiationError {
+    #[inline]
+    fn from(error: ParameterError) -> Self {
+        DifferentiationError::Program(error.into())
+    }
+}
+
+impl From<ProgramError> for DifferentiationError {
+    #[inline]
+    fn from(error: ProgramError) -> Self {
+        if let Some(differentiation) = error.downcast_custom::<DifferentiationError>() {
+            differentiation.clone()
+        } else {
+            DifferentiationError::Program(error)
+        }
+    }
+}
+
+impl From<DifferentiationError> for ProgramError {
+    #[inline]
+    fn from(error: DifferentiationError) -> Self {
+        match error {
+            DifferentiationError::Program(error) => error,
+            error => ProgramError::custom(error),
+        }
+    }
 }
