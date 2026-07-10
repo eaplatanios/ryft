@@ -331,7 +331,13 @@ where
             y_slice_types.as_slice(),
             inputs,
             |stacked_type| context.parent().zero(stacked_type),
-            |_, iteration_inputs| context.interpret_program(self.body(), iteration_inputs),
+            |_, iteration_inputs| {
+                self.body().interpret_with(
+                    iteration_inputs,
+                    |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
+                    |instruction, inputs| instruction.operation().batch(context, inputs),
+                )
+            },
         )
     }
 }

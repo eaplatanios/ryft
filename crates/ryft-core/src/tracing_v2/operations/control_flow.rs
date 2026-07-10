@@ -934,7 +934,13 @@ where
                 self.true_branch(),
                 self.false_branch(),
                 inputs,
-                |program, program_inputs| context.interpret_program(program, program_inputs),
+                |program, program_inputs| {
+                    program.interpret_with(
+                        program_inputs,
+                        |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
+                        |instruction, inputs| instruction.operation().batch(context, inputs),
+                    )
+                },
             );
         }
 

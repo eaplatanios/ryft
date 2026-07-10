@@ -21,7 +21,6 @@ use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::Captured;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{DomainTracer, Tracer, TracingContext};
-use crate::tracing_v2::batching::batch_program_inline;
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's
@@ -214,7 +213,14 @@ where
         context: &EagerContext<V, O>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        batch_program_inline(context, &self.primal, inputs)
+        // Replay the primal program over the packed batch values, dispatching every instruction through its
+        // value-level batching rule. Eager constants are the flowing values themselves, so they replicate as-is
+        // across the batch.
+        self.primal.interpret_with(
+            inputs.to_vec(),
+            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
+            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
+        )
     }
 }
 
@@ -463,7 +469,14 @@ where
         context: &EagerContext<V, O>,
         inputs: &[ArrayBatch<V>],
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        batch_program_inline(context, &self.primal, inputs)
+        // Replay the primal program over the packed batch values, dispatching every instruction through its
+        // value-level batching rule. Eager constants are the flowing values themselves, so they replicate as-is
+        // across the batch.
+        self.primal.interpret_with(
+            inputs.to_vec(),
+            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
+            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
+        )
     }
 }
 

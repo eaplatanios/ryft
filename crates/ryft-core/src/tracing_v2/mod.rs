@@ -1,13 +1,9 @@
-/// Explicit batching and `batch` support for staged programs.
-pub mod batching;
 #[cfg(feature = "benchmarking")]
 /// Internal benchmark-case definitions that stay within the plain `tracing_v2` staged IR.
 pub(crate) mod benchmark_support;
 #[cfg(feature = "benchmarking")]
 /// IR benchmarking utilities that emit raw artifacts and normalized summaries for comparison.
 pub mod benchmarking;
-#[cfg(test)]
-mod forward;
 /// Linearization, transposition, dense Jacobians, and reverse-mode APIs over staged linear programs.
 pub mod linear;
 /// Semantic operation traits and built-in operation enums.

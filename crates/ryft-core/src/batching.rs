@@ -999,7 +999,16 @@ impl<
                     Ok(ArrayBatch::new(batched_type, value, *batch_axis)?)
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
-            let outputs = batching_context.interpret_program(self, inputs)?;
+
+            // Replay this program by binding each instruction's `BatchableOperation` rule against the batching context,
+            // threading the batch-carrying inputs through. Constants lift in the parent trace and replicate across the
+            // batch. This only requires this program's own operation family to be batchable, so staged higher-order
+            // batching rules can batch a captured sub-program without concretizing any batch-item values.
+            let outputs = self.interpret_with(
+                inputs,
+                |_, constant| Ok(ArrayBatch::replicated(batching_context.parent().lift(constant.clone())?)),
+                |instruction, instruction_inputs| instruction.operation().batch(&batching_context, instruction_inputs),
+            )?;
 
             // Resolve `output_axes_policy` into one optional alignment declaration per output. The outer `None` keeps
             // the natural axis, while `Some(mapped)` forces the output to carry its batch axis at that signed position.
