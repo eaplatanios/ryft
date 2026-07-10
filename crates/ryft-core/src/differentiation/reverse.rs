@@ -1574,6 +1574,7 @@ mod tests {
 
     use approx::assert_abs_diff_eq;
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
 
     use std::cell::Cell;
@@ -2297,7 +2298,7 @@ mod tests {
     // TODO(eaplatanios): Review this function.
     #[test]
     fn test_holomorphic_gradient_computes_complex_derivatives() {
-        use num_complex::Complex;
+        use Complex;
 
         // The holomorphic entry points recover the complex derivative ∂f/∂z from the single reverse-mode seed under
         // the holomorphy promise: d/dz z² = 2z and d/dz sin(z) = cos(z), evaluated at a genuinely complex point.
@@ -2467,7 +2468,6 @@ mod tests {
         assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_vjp() {
         // `ReverseModeDifferentiate::vjp` on an explicit context linearizes and transposes: for `f(x) = sin(x)` at
@@ -2511,7 +2511,6 @@ mod tests {
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_value_and_gradient() {
         // `ReverseModeDifferentiate::value_and_gradient` on an explicit context: `f(x, y) = x * y + x` has value `8`
@@ -2544,7 +2543,7 @@ mod tests {
 
         // A complex scalar output is rejected toward the holomorphic entry points, and inputs with no leaf values
         // report an invalid input count.
-        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let z = Complex::new(0.7f64, -0.3f64);
         let error = value_and_gradient(|x| x.clone() * x, Scalar::from(z)).unwrap_err();
         assert!(matches!(error, DifferentiationError::ComplexGradientOutput { .. }));
         let error = value_and_gradient(
@@ -2555,7 +2554,6 @@ mod tests {
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_gradient() {
         // `ReverseModeDifferentiate::gradient` is the gradient-only counterpart of `value_and_gradient`.
@@ -2578,12 +2576,11 @@ mod tests {
         assert_eq!(error, DifferentiationError::EmptyInput);
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_value_and_gradient_holomorphic() {
         // `ReverseModeDifferentiate::value_and_gradient_holomorphic` on an explicit context recovers the complex
         // derivative under the holomorphy promise: `∂z²/∂z = 2z` at a genuinely complex point.
-        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let z = Complex::new(0.7f64, -0.3f64);
         let (value, gradient) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .value_and_gradient_holomorphic(|x| x.clone() * x, Scalar::from(z))
             .unwrap();
@@ -2597,12 +2594,11 @@ mod tests {
         assert_abs_diff_eq!(gradient, 4.0, epsilon = 1e-9);
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_gradient_holomorphic() {
         // `ReverseModeDifferentiate::gradient_holomorphic` is the gradient-only counterpart of
         // `value_and_gradient_holomorphic`: `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
-        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let z = Complex::new(0.7f64, -0.3f64);
         let method_gradient = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .gradient_holomorphic(|x| x.sin().unwrap(), Scalar::from(z))
             .unwrap();
@@ -2613,7 +2609,6 @@ mod tests {
         assert_eq!(free_gradient, Scalar::from(z.cos()));
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_value_and_gradient_with_aux() {
         // `ReverseModeDifferentiate::value_and_gradient_with_aux` on an explicit context returns the auxiliary
@@ -2639,7 +2634,6 @@ mod tests {
         assert_eq!(gradient, (Scalar::from(3.0), Scalar::from(2.0)));
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_gradient_with_aux() {
         // `ReverseModeDifferentiate::gradient_with_aux` is the gradient-only counterpart of
@@ -2657,13 +2651,12 @@ mod tests {
         assert_abs_diff_eq!(aux, 5.0, epsilon = 1e-9);
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_value_and_gradient_holomorphic_with_aux() {
         // `ReverseModeDifferentiate::value_and_gradient_holomorphic_with_aux` combines the holomorphy promise with
         // auxiliary outputs: the gradient is `∂z²/∂z = 2z` while the auxiliary value rides along with a zero
         // cotangent seed.
-        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let z = Complex::new(0.7f64, -0.3f64);
         let ((value, aux), gradient): ((Scalar, Scalar), Scalar) =
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
                 .value_and_gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z))
@@ -2680,12 +2673,11 @@ mod tests {
         assert_eq!(gradient, Scalar::from(z + z));
     }
 
-    // TODO(eaplatanios): Review this function.
     #[test]
     fn test_gradient_holomorphic_with_aux() {
         // `ReverseModeDifferentiate::gradient_holomorphic_with_aux` is the gradient-only counterpart of
         // `value_and_gradient_holomorphic_with_aux`, returning `(gradient, aux)`.
-        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let z = Complex::new(0.7f64, -0.3f64);
         let (method_gradient, aux): (Scalar, Scalar) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .gradient_holomorphic_with_aux(|x| (x.clone() * x.clone(), x), Scalar::from(z))
             .unwrap();
