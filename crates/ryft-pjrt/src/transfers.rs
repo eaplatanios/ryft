@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
 use crate::{
@@ -160,15 +161,20 @@ impl<'c> HostToDeviceTransferManager<'c> {
             },
             { done_with_h2d_transfer },
         )?;
+
+        // After a successful enqueue, PJRT may keep reading the host allocation until the transfer completes, so every
+        // failure path below must leak the keep-alive `drop_fn` closure instead of dropping it. Dropping the closure
+        // without invoking it would release our clone of `data` while the transfer may still be reading it. The
+        // `ManuallyDrop` wrapper suppresses that release whenever the closure is dropped without being invoked.
+        let drop_fn = data.drop_fn.map(ManuallyDrop::new);
         let event = unsafe { Event::from_c_api(handle, self.api(), ()) }?;
 
         // Register a callback to decrease the reference count of `data` once the transfer is completed.
-        if let Some(drop_fn) = data.drop_fn {
-            // Register the callback that will be invoked once the host buffer data has been copied.
-            event.on_ready(|_| {
+        if let Some(drop_fn) = drop_fn {
+            event.on_ready(move |_| {
                 // We ignore the error because there is nothing we can do with it here,
-                // and if something goes wrong, it should be reflected in [`Buffer::ready`].
-                drop_fn();
+                // and if something goes wrong, it should be reflected in `Buffer::ready`.
+                ManuallyDrop::into_inner(drop_fn)();
             })?;
         }
 
@@ -233,15 +239,20 @@ impl<'c> HostToDeviceTransferManager<'c> {
             },
             { done_with_h2d_transfer },
         )?;
+
+        // After a successful enqueue, PJRT may keep reading the host allocation until the transfer completes, so every
+        // failure path below must leak the keep-alive `drop_fn` closure instead of dropping it. Dropping the closure
+        // without invoking it would release our clone of `data` while the transfer may still be reading it. The
+        // `ManuallyDrop` wrapper suppresses that release whenever the closure is dropped without being invoked.
+        let drop_fn = data.drop_fn.map(ManuallyDrop::new);
         let event = unsafe { Event::from_c_api(handle, self.api(), ()) }?;
 
         // Register a callback to decrease the reference count of `data` once the transfer is completed.
-        if let Some(drop_fn) = data.drop_fn {
-            // Register the callback that will be invoked once the host buffer data has been copied.
-            event.on_ready(|_| {
+        if let Some(drop_fn) = drop_fn {
+            event.on_ready(move |_| {
                 // We ignore the error because there is nothing we can do with it here,
-                // and if something goes wrong, it should be reflected in [`Buffer::ready`].
-                drop_fn();
+                // and if something goes wrong, it should be reflected in `Buffer::ready`.
+                ManuallyDrop::into_inner(drop_fn)();
             })?;
         }
 
