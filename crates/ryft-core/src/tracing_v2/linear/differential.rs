@@ -486,7 +486,16 @@ where
         <C as Domain>::Operation: Clone + InterpretableOperation<V, C> + BatchableOperation<V, BatchingContext<C>>,
     {
         let input_types = input_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
-        let input_shapes = input_types.iter().map(static_shape).collect::<Result<Vec<_>, _>>()?;
+        let input_shapes = input_types
+            .iter()
+            .map(|input_type| {
+                input_type.static_shape().ok_or_else(|| TypeError {
+                    message: format!(
+                        "differential materialization requires a fully static array shape but got {input_type}"
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let input_coordinate_counts = coordinate_counts(input_types.as_slice())?;
         let input_offsets = coordinate_offsets(&input_coordinate_counts)?;
         let batch_size = input_offsets.last().copied().unwrap_or(0);
@@ -496,7 +505,14 @@ where
         let output_parameters = output.into_parameters().collect::<Vec<_>>();
         let output_shapes = output_parameters
             .iter()
-            .map(|parameter| static_shape(parameter.r#type().as_ref()))
+            .map(|parameter| {
+                let array_type = parameter.r#type();
+                array_type.static_shape().ok_or_else(|| TypeError {
+                    message: format!(
+                        "differential materialization requires a fully static array shape but got {array_type}"
+                    ),
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         // Feed `[batched_basis_tangents..., unbatched_residuals...]` through one batched pushforward replay. The packed
@@ -519,12 +535,22 @@ where
             let output_shape = &output_shapes[output_leaf_index];
             let mut blocks = Vec::with_capacity(input_shapes.len());
             for (input_leaf_index, input_shape) in input_shapes.iter().enumerate() {
-                blocks.push(forward_differential_block(
+                // The packed replay lays each block out as `[input_coordinates] ++ output_shape`; move the input
+                // basis axes behind the output axes to obtain the public `output_shape ++ input_shape` layout.
+                let value = basis_range_value(
                     output_batch,
                     batch_size,
                     input_offsets[input_leaf_index],
-                    input_shape,
-                    output_shape,
+                    input_shape.dimensions(),
+                    output_shape.dimensions(),
+                )?;
+                let permutation = (input_shape.rank()..input_shape.rank() + output_shape.rank())
+                    .chain(0..input_shape.rank())
+                    .collect::<Vec<_>>();
+                blocks.push(DifferentialBlock::new(
+                    output_shape.dimensions().to_vec(),
+                    input_shape.dimensions().to_vec(),
+                    value.transpose(permutation)?,
                 )?);
             }
             rows_list.push(DifferentialRow::new(Partials::from_parameters(input_structure.clone(), blocks)?));
@@ -549,31 +575,15 @@ where
     }
 }
 
-/// Extracts the static shape of `array_type` as a `Vec<usize>`. Returns an error if any dimension is
-/// dynamic, since differential materialization only operates on concrete primal values.
-fn static_shape(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
-    array_type
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|size| match size {
-            Size::Static(value) => Ok(*value),
-            Size::Dynamic(_) => Err(TypeError {
-                message: format!(
-                    "differential materialization requires a fully static array shape but got {array_type}"
-                ),
-            }
-            .into()),
-        })
-        .collect()
-}
-
 /// Returns the row-major coordinate count of each statically shaped leaf type.
 fn coordinate_counts(types: &[ArrayType]) -> Result<Vec<usize>, ProgramError> {
     types
         .iter()
         .map(|r#type| {
-            static_shape(r#type)?.into_iter().try_fold(1usize, |count, size| {
+            let shape = r#type.static_shape().ok_or_else(|| TypeError {
+                message: format!("differential materialization requires a fully static array shape but got {type}"),
+            })?;
+            shape.dimensions().iter().copied().try_fold(1usize, |count, size| {
                 count.checked_mul(size).ok_or_else(|| ProgramError::InvalidArgument {
                     message: format!("differential coordinate count overflows usize for array type {type}"),
                 })
@@ -650,11 +660,15 @@ where
     V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
 {
     let aligned = batch.match_axis(0, batch_size)?;
-    let actual_item_shape = static_shape(&aligned.unbatched_type()?)?;
-    if actual_item_shape != item_shape {
+    let unbatched_type = aligned.unbatched_type()?;
+    let actual_item_shape = unbatched_type.static_shape().ok_or_else(|| TypeError {
+        message: format!("differential materialization requires a fully static array shape but got {unbatched_type}"),
+    })?;
+    if actual_item_shape.dimensions() != item_shape {
         return Err(TypeError {
             message: format!(
-                "batched differential output has per-item shape {actual_item_shape:?} but expected {item_shape:?}",
+                "batched differential output has per-item shape {:?} but expected {item_shape:?}",
+                actual_item_shape.dimensions(),
             ),
         }
         .into());
@@ -664,50 +678,18 @@ where
             message: format!("differential basis shape {basis_shape:?} overflows usize"),
         })
     })?;
-    let physical_shape = static_shape(aligned.r#type().as_ref())?;
-    let mut start_indices = vec![0; physical_shape.len()];
+    let physical_type = aligned.r#type();
+    let physical_shape = physical_type.static_shape().ok_or_else(|| TypeError {
+        message: format!("differential materialization requires a fully static array shape but got {physical_type}"),
+    })?;
+    let mut start_indices = vec![0; physical_shape.rank()];
     start_indices[0] = basis_offset;
-    let mut limit_indices = physical_shape;
+    let mut limit_indices = physical_shape.dimensions().to_vec();
     limit_indices[0] = basis_offset + basis_count;
     let strides = vec![1; limit_indices.len()];
     let sliced = aligned.value().slice(&start_indices, &limit_indices, &strides)?;
     let reshaped_shape = Shape::new(basis_shape.iter().chain(item_shape.iter()).copied().map(Size::Static).collect());
     sliced.reshape(reshaped_shape)
-}
-
-/// Builds one forward-mode block. The packed replay is `[input_coordinates] ++ output_shape`; move the input basis
-/// axes behind the output axes to obtain the public `output_shape ++ input_shape` layout.
-fn forward_differential_block<V>(
-    batch: &ArrayBatch<V>,
-    batch_size: usize,
-    input_offset: usize,
-    input_shape: &[usize],
-    output_shape: &[usize],
-) -> Result<DifferentialBlock<V>, ProgramError>
-where
-    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
-{
-    let value = basis_range_value(batch, batch_size, input_offset, input_shape, output_shape)?;
-    let input_rank = input_shape.len();
-    let output_rank = output_shape.len();
-    let permutation = (input_rank..input_rank + output_rank).chain(0..input_rank).collect::<Vec<_>>();
-    DifferentialBlock::new(output_shape.to_vec(), input_shape.to_vec(), value.transpose(permutation)?)
-}
-
-/// Builds one reverse-mode block. Pullback replay already packs the output basis rows before each input leaf's axes,
-/// so restoring the flattened output range to `output_shape` yields the public layout directly.
-fn reverse_differential_block<V>(
-    batch: &ArrayBatch<V>,
-    batch_size: usize,
-    output_offset: usize,
-    output_shape: &[usize],
-    input_shape: &[usize],
-) -> Result<DifferentialBlock<V>, ProgramError>
-where
-    V: Value<Type = ArrayType> + Broadcast + Reshape + Slice + Transpose,
-{
-    let value = basis_range_value(batch, batch_size, output_offset, output_shape, input_shape)?;
-    DifferentialBlock::new(output_shape.to_vec(), input_shape.to_vec(), value)
 }
 
 /// Batches one direct linear-program instruction for dense forward/reverse Jacobian interpretation, special-casing
@@ -794,7 +776,14 @@ where
     let input_types = input_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
     let input_shapes = input_parameters
         .iter()
-        .map(|parameter| static_shape(parameter.r#type().as_ref()))
+        .map(|parameter| {
+            let array_type = parameter.r#type();
+            array_type.static_shape().ok_or_else(|| TypeError {
+                message: format!(
+                    "differential materialization requires a fully static array shape but got {array_type}"
+                ),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let primals = Input::from_parameters(input_structure.clone(), input_parameters)?;
@@ -805,7 +794,14 @@ where
     let output_types = output_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
     let output_shapes = output_parameters
         .iter()
-        .map(|parameter| static_shape(parameter.r#type().as_ref()))
+        .map(|parameter| {
+            let array_type = parameter.r#type();
+            array_type.static_shape().ok_or_else(|| TypeError {
+                message: format!(
+                    "differential materialization requires a fully static array shape but got {array_type}"
+                ),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let output_coordinate_counts = coordinate_counts(output_types.as_slice())?;
     let output_offsets = coordinate_offsets(&output_coordinate_counts)?;
@@ -837,8 +833,21 @@ where
 
         let mut blocks = Vec::with_capacity(input_shapes.len());
         for (input_leaf_index, input_batch) in batched_inputs.iter().enumerate() {
+            // Pullback replay already packs the output basis rows before each input leaf's axes, so restoring the
+            // flattened output range to `output_shape` yields the public layout directly.
             let input_shape = &input_shapes[input_leaf_index];
-            blocks.push(reverse_differential_block(input_batch, batch_size, output_offset, output_shape, input_shape)?);
+            let value = basis_range_value(
+                input_batch,
+                batch_size,
+                output_offset,
+                output_shape.dimensions(),
+                input_shape.dimensions(),
+            )?;
+            blocks.push(DifferentialBlock::new(
+                output_shape.dimensions().to_vec(),
+                input_shape.dimensions().to_vec(),
+                value,
+            )?);
         }
 
         let partials =
