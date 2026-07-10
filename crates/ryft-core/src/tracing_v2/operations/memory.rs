@@ -7,7 +7,7 @@ use crate::batching::{ArrayBatch, BatchableOperation};
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::{Operation, OperationFormatter};
@@ -167,7 +167,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().transfer_to_memory(self.destination());
         let tangent = match inputs[0].tangent() {
@@ -190,7 +190,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -209,6 +209,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
+
     use crate::batching::ArrayBatch;
     use crate::batching::Batch;
     use crate::batching::BatchAxis;
@@ -218,7 +220,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::types::{DataType, Shape, Size, Typed};
 
     use super::*;
@@ -320,9 +321,9 @@ mod tests {
                 TestArray::vector(vec![0.5, 1.5]),
             )
             .unwrap();
-        assert_close(value.values[0], 2.5);
-        assert_close(gradient.values[0], 1.0);
-        assert_close(gradient.values[1], 3.0);
+        assert_abs_diff_eq!(value.values[0], 2.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[1], 3.0, epsilon = 1e-9);
     }
 
     #[test]

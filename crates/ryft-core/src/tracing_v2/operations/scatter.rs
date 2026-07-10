@@ -13,7 +13,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -45,7 +45,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
         let operand = &inputs[0];
         let indices = inputs[1].primal();
@@ -60,7 +60,8 @@ where
                      linear)",
                     self.kind(),
                 ),
-            });
+            }
+            .into());
         } else {
             // One of the two linear tangents may still be a structural zero; scatter-add needs both as real values,
             // so materialize the zero side before staging the tangent scatter.
@@ -92,7 +93,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         if self.kind() != ScatterReductionKind::Add {
@@ -101,7 +102,8 @@ where
                     "transposition of scatter with the {} combiner is not yet implemented (only scatter-add is linear)",
                     self.kind(),
                 ),
-            });
+            }
+            .into());
         }
         match &outputs[0] {
             MaybeZero::Zero(_) => Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect()),
@@ -189,6 +191,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::Context;
@@ -197,7 +200,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -230,7 +232,7 @@ mod tests {
                 (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![10.0, 20.0])),
             )
             .unwrap();
-        assert_close(value.values[0], 40.0);
+        assert_abs_diff_eq!(value.values[0], 40.0, epsilon = 1e-9);
         assert_eq!(operand_gradient.values, vec![1.0, 1.0, 1.0, 1.0]);
         assert_eq!(update_gradient.values, vec![1.0, 1.0]);
     }

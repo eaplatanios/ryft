@@ -2,7 +2,7 @@ use std::ops::{Add, Div, Mul, Neg};
 
 use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::DivOperation;
@@ -23,7 +23,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
@@ -67,13 +67,14 @@ where
         _context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         if inputs[1].is_unknown() {
             return Err(ProgramError::UnsupportedOperation {
                 message: "`div` with a linear denominator is nonlinear and cannot be transposed".to_string(),
-            });
+            }
+            .into());
         }
         let numerator_contribution = match &outputs[0] {
             MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
@@ -90,11 +91,12 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
+
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
     use crate::scalars::Scalar;
     use crate::tracing_v2::ForwardModeDifferentiate;
-    use crate::tracing_v2::test_util::assert_scalar_close;
 
     #[test]
     fn test_div_jvp_matches_the_quotient_rule() {
@@ -107,7 +109,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_scalar_close(primal, 3.0);
-        assert_scalar_close(tangent, -4.5);
+        assert_abs_diff_eq!(primal, 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, -4.5, epsilon = 1e-9);
     }
 }

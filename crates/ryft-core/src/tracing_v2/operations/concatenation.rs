@@ -4,7 +4,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -34,7 +34,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("output", outputs, 1, ProgramError);
         if inputs.is_empty() {
             return Err(TypeError {
@@ -107,7 +107,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let primals = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         // The concatenation needs every operand tangent as a real value, so materialize the structurally zero ones
         // (the shared all-zero fast path already handled the case where every operand tangent is zero).
@@ -158,6 +158,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
@@ -165,7 +166,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::Typed;
 
@@ -187,7 +187,7 @@ mod tests {
             )
             .unwrap();
         // f = 1 + 4 + 9 + 16 + 25 = 55.
-        assert_close(value.values[0], 55.0);
+        assert_abs_diff_eq!(value.values[0], 55.0, epsilon = 1e-9);
         assert_eq!(x_gradient.values, vec![1.0, 2.0]);
         assert_eq!(y_gradient.values, vec![3.0, 4.0, 5.0]);
     }

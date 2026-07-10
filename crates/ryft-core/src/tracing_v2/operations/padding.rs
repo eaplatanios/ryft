@@ -4,7 +4,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -14,7 +14,7 @@ use crate::operations::manipulation::{
     Broadcast, Pad, PadOperation, Reshape, Slice, SliceOperation, Transpose, UpdateSlice,
 };
 use crate::partial::PartialValue;
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
@@ -55,7 +55,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -138,7 +138,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let primal = inputs[0].primal().pad(
             inputs[1].primal(),
@@ -200,13 +200,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
 
     use super::*;
@@ -231,7 +231,7 @@ mod tests {
                 )
                 .unwrap();
         // f = 2 * 1 + 4 * 2 + 6 * 3 + 24 * 9 = 28 + 216.
-        assert_close(value.values[0], 244.0);
+        assert_abs_diff_eq!(value.values[0], 244.0, epsilon = 1e-9);
         assert_eq!(input_gradient.values, vec![2.0, 4.0, 6.0]);
         assert_eq!(padding_value_gradient.values, vec![24.0]);
     }

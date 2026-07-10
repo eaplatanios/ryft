@@ -4,7 +4,7 @@ use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -45,7 +45,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -116,7 +116,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -185,7 +185,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let (operand, start_indices) =
             inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let primal_starts = start_indices.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
@@ -211,7 +211,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -242,7 +242,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().slice(self.start_indices(), self.limit_indices(), self.strides())?;
         let tangent = match inputs[0].tangent() {
@@ -267,7 +267,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let operand = &inputs[0];
         let update = &inputs[1];
@@ -369,8 +369,7 @@ where
     let Some(accumulator) = accumulator else {
         return Err(BatchingError::UnsupportedOperation {
             message: format!("'{operation_name}' does not support per-item expansion over an empty batch axis"),
-        }
-        .into());
+        });
     };
     let stacked_type = accumulator.r#type().into_owned();
     ArrayBatch::new(stacked_type, accumulator, Some(0))
@@ -571,6 +570,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
@@ -578,7 +578,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::DataType;
 
@@ -612,7 +611,7 @@ mod tests {
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
-        assert_close(value.values[0], 5.0);
+        assert_abs_diff_eq!(value.values[0], 5.0, epsilon = 1e-9);
         assert_eq!(gradient.values, vec![0.0, 1.0, 1.0, 0.0]);
     }
 
@@ -631,7 +630,7 @@ mod tests {
             )
             .unwrap();
         // f = x[1] + 2 * x[3] + 3 * x[5] = 1 + 6 + 15.
-        assert_close(value.values[0], 22.0);
+        assert_abs_diff_eq!(value.values[0], 22.0, epsilon = 1e-9);
         assert_eq!(gradient.values, vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0]);
     }
 
@@ -657,7 +656,7 @@ mod tests {
                 (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
             )
             .unwrap();
-        assert_close(value.values[0], 20.0);
+        assert_abs_diff_eq!(value.values[0], 20.0, epsilon = 1e-9);
         assert_eq!(input_gradient.values, vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.values, vec![1.0, 1.0]);
     }
@@ -676,7 +675,7 @@ mod tests {
                 TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]),
             )
             .unwrap();
-        assert_close(value.values[0], 5.0);
+        assert_abs_diff_eq!(value.values[0], 5.0, epsilon = 1e-9);
         assert_eq!(gradient.values, vec![0.0, 1.0, 1.0, 0.0]);
     }
 
@@ -712,7 +711,7 @@ mod tests {
                 (TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), TestArray::vector(vec![7.0, 8.0])),
             )
             .unwrap();
-        assert_close(value.values[0], 20.0);
+        assert_abs_diff_eq!(value.values[0], 20.0, epsilon = 1e-9);
         assert_eq!(input_gradient.values, vec![1.0, 0.0, 0.0, 1.0]);
         assert_eq!(update_gradient.values, vec![1.0, 1.0]);
     }
@@ -976,7 +975,7 @@ mod tests {
             )
             .unwrap();
         // f = 1 * 2 + 2 * 3 + 3 * 3 + 4 * 4 = 33.
-        assert_close(value.values[0], 33.0);
+        assert_abs_diff_eq!(value.values[0], 33.0, epsilon = 1e-9);
         assert_eq!(gradient.values, vec![0.0, 1.0, 5.0, 4.0]);
     }
 }

@@ -1,7 +1,7 @@
 use crate::operations::arithmetic::MulOperation;
 use crate::parameters::Placeholder;
 use crate::programs::ProgramBuilder;
-use crate::tests::{AssertClose, TestArray};
+use crate::tests::TestArray;
 use crate::tracing_v2::ArrayOperation;
 use crate::types::{ArrayType, DataType};
 
@@ -19,6 +19,7 @@ pub(crate) fn scalar_scale_branch(
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::batching::ArrayBatch;
@@ -169,10 +170,10 @@ mod tests {
         assert_eq!(block_00.output_shape(), &[] as &[usize]);
         assert_eq!(block_00.input_shape(), &[] as &[usize]);
 
-        block_00.value().values()[0].assert_close(3.0 + 2.0f64.cos());
-        block_01.value().values()[0].assert_close(2.0);
-        block_10.value().values()[0].assert_close(1.0);
-        block_11.value().values()[0].assert_close(1.0);
+        assert_abs_diff_eq!(block_00.value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block_01.value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block_10.value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block_11.value().values()[0], 1.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -188,10 +189,10 @@ mod tests {
         let (block_00, block_01) = row_0.partials();
         let (block_10, block_11) = row_1.partials();
 
-        block_00.value().values()[0].assert_close(3.0 + 2.0f64.cos());
-        block_01.value().values()[0].assert_close(2.0);
-        block_10.value().values()[0].assert_close(1.0);
-        block_11.value().values()[0].assert_close(1.0);
+        assert_abs_diff_eq!(block_00.value().values()[0], 3.0 + 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block_01.value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block_10.value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block_11.value().values()[0], 1.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -235,16 +236,16 @@ mod tests {
         assert_eq!(triples.len(), 4);
         assert_eq!(triples[0].0, "$.0");
         assert_eq!(triples[0].1, "$.0");
-        triples[0].2.assert_close(3.0 + 2.0f64.cos());
+        assert_abs_diff_eq!(triples[0].2, 3.0 + 2.0f64.cos(), epsilon = 1e-9);
         assert_eq!(triples[1].0, "$.0");
         assert_eq!(triples[1].1, "$.1");
-        triples[1].2.assert_close(2.0);
+        assert_abs_diff_eq!(triples[1].2, 2.0, epsilon = 1e-9);
         assert_eq!(triples[2].0, "$.1");
         assert_eq!(triples[2].1, "$.0");
-        triples[2].2.assert_close(1.0);
+        assert_abs_diff_eq!(triples[2].2, 1.0, epsilon = 1e-9);
         assert_eq!(triples[3].0, "$.1");
         assert_eq!(triples[3].1, "$.1");
-        triples[3].2.assert_close(1.0);
+        assert_abs_diff_eq!(triples[3].2, 1.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -257,10 +258,10 @@ mod tests {
         let (block_00, block_01) = row_0.partials();
         let (block_10, block_11) = row_1.partials();
 
-        block_00.value().values()[0].assert_close(-2.0f64.sin());
-        block_01.value().values()[0].assert_close(1.0);
-        block_10.value().values()[0].assert_close(1.0);
-        block_11.value().values()[0].assert_close(0.0);
+        assert_abs_diff_eq!(block_00.value().values()[0], -2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block_01.value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block_10.value().values()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block_11.value().values()[0], 0.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -283,17 +284,17 @@ mod tests {
         // 3 outputs * 2 inputs = 6 blocks
         assert_eq!(triples.len(), 6);
         // d(x*y + sin(x))/dx = y + cos(x) = 3 + cos(2)
-        triples[0].2.assert_close(3.0 + 2.0f64.cos());
+        assert_abs_diff_eq!(triples[0].2, 3.0 + 2.0f64.cos(), epsilon = 1e-9);
         // d(x*y + sin(x))/dy = x = 2
-        triples[1].2.assert_close(2.0);
+        assert_abs_diff_eq!(triples[1].2, 2.0, epsilon = 1e-9);
         // dy/dx = 0  (independent of x — exercise the all-zero short-circuit downstream)
-        triples[2].2.assert_close(0.0);
+        assert_abs_diff_eq!(triples[2].2, 0.0, epsilon = 1e-9);
         // dy/dy = 1
-        triples[3].2.assert_close(1.0);
+        assert_abs_diff_eq!(triples[3].2, 1.0, epsilon = 1e-9);
         // d(x + y)/dx = 1
-        triples[4].2.assert_close(1.0);
+        assert_abs_diff_eq!(triples[4].2, 1.0, epsilon = 1e-9);
         // d(x + y)/dy = 1
-        triples[5].2.assert_close(1.0);
+        assert_abs_diff_eq!(triples[5].2, 1.0, epsilon = 1e-9);
     }
 
     /// Builds a replicated scalar Boolean predicate batch with the provided truth value.
@@ -602,7 +603,7 @@ mod tests {
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 0) / dx = 1 at the scalar point.
-        block.value().values()[0].assert_close(1.0);
+        assert_abs_diff_eq!(block.value().values()[0], 1.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -615,7 +616,7 @@ mod tests {
         let row = jacobian.rows();
         let block = row.partials();
         // d(x + 1) / dx = 1.
-        block.value().values()[0].assert_close(1.0);
+        assert_abs_diff_eq!(block.value().values()[0], 1.0, epsilon = 1e-9);
     }
 
     /// Binds `ArrayOperation::Condition` over `scalar_scale_branch(2.0)` / `scalar_scale_branch(3.0)` through the
@@ -645,12 +646,12 @@ mod tests {
             TestArray::scalar(4.0),
         )
         .unwrap();
-        jacobian.rows().partials().value().values()[0].assert_close(2.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(stage_constant_predicate_condition(x)), TestArray::scalar(4.0))
             .unwrap();
-        jacobian.rows().partials().value().values()[0].assert_close(2.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
     }
 
     /// Builds the `while (x < 8) { x = x + x }` doubling-loop fixture used by the while differentiation tests.
@@ -718,7 +719,7 @@ mod tests {
                 TestArray::scalar(1.0),
             )
             .unwrap();
-        jacobian.rows().partials().value().values()[0].assert_close(8.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 8.0, epsilon = 1e-9);
     }
 
     #[test]

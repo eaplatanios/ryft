@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use crate::contexts::Context;
 use crate::contexts::StagingContext;
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Zero, ZeroOperation};
@@ -162,7 +162,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -209,7 +209,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -250,7 +250,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
         let condition = &inputs[0];
         let on_true = &inputs[1];
@@ -281,6 +281,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
@@ -290,7 +291,6 @@ mod tests {
     use crate::operations::control_flow::Select;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
-    use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
     use crate::tracing_v2::{DifferentiableDomainExtension, jacrev};
 
     use super::LinearSelectOperation;
@@ -323,7 +323,7 @@ mod tests {
             TestArray::scalar(2.0),
         )
         .unwrap();
-        assert_close(jacobian.rows().partials().value().values()[0], 2.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = jacrev(
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
@@ -331,7 +331,7 @@ mod tests {
             TestArray::scalar(-2.0),
         )
         .unwrap();
-        assert_close(jacobian.rows().partials().value().values()[0], 3.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 3.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -347,12 +347,12 @@ mod tests {
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(2.0))
             .unwrap();
-        assert_close(jacobian.rows().partials().value().values()[0], 2.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 2.0, epsilon = 1e-9);
 
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jacfwd(|x| Ok(piecewise_select(x)), TestArray::scalar(-2.0))
             .unwrap();
-        assert_close(jacobian.rows().partials().value().values()[0], 3.0);
+        assert_abs_diff_eq!(jacobian.rows().partials().value().values()[0], 3.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -368,10 +368,10 @@ mod tests {
         let block = jacobian.rows().partials();
         assert_eq!(block.output_shape(), &[2]);
         assert_eq!(block.input_shape(), &[2]);
-        assert_close(block.value().values()[0], 2.0);
-        assert_close(block.value().values()[1], 0.0);
-        assert_close(block.value().values()[2], 0.0);
-        assert_close(block.value().values()[3], 3.0);
+        assert_abs_diff_eq!(block.value().values()[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[3], 3.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -402,8 +402,8 @@ mod tests {
                 (Scalar::from(1.0), Scalar::from(0.0)),
             )
             .unwrap();
-        assert_scalar_close(primal, 6.0);
-        assert_scalar_close(tangent, 2.0);
+        assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 2.0, epsilon = 1e-9);
         let (_, tangent) = domain
             .jvp(
                 |(x, y)| piecewise(x, y),
@@ -411,13 +411,13 @@ mod tests {
                 (Scalar::from(0.0), Scalar::from(1.0)),
             )
             .unwrap();
-        assert_scalar_close(tangent, 0.0);
+        assert_abs_diff_eq!(tangent, 0.0, epsilon = 1e-9);
         let (value, gradient) = domain
             .value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(3.0), Scalar::from(2.0)))
             .unwrap();
-        assert_scalar_close(value, 6.0);
-        assert_scalar_close(gradient.0, 2.0);
-        assert_scalar_close(gradient.1, 0.0);
+        assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.0, 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.1, 0.0, epsilon = 1e-9);
 
         // `x <= y`: the output is `3y`, so the roles flip; the gradient is `(0, 3)`.
         let (primal, tangent) = domain
@@ -427,8 +427,8 @@ mod tests {
                 (Scalar::from(1.0), Scalar::from(0.0)),
             )
             .unwrap();
-        assert_scalar_close(primal, 6.0);
-        assert_scalar_close(tangent, 0.0);
+        assert_abs_diff_eq!(primal, 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 0.0, epsilon = 1e-9);
         let (_, tangent) = domain
             .jvp(
                 |(x, y)| piecewise(x, y),
@@ -436,13 +436,13 @@ mod tests {
                 (Scalar::from(0.0), Scalar::from(1.0)),
             )
             .unwrap();
-        assert_scalar_close(tangent, 3.0);
+        assert_abs_diff_eq!(tangent, 3.0, epsilon = 1e-9);
         let (value, gradient) = domain
             .value_and_gradient(|(x, y)| piecewise(x, y).unwrap(), (Scalar::from(1.0), Scalar::from(2.0)))
             .unwrap();
-        assert_scalar_close(value, 6.0);
-        assert_scalar_close(gradient.0, 0.0);
-        assert_scalar_close(gradient.1, 3.0);
+        assert_abs_diff_eq!(value, 6.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.0, 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.1, 3.0, epsilon = 1e-9);
     }
 
     /// Minimal operation enum hosting the primal [`SelectOperation`] (used for both the forward select and its staged

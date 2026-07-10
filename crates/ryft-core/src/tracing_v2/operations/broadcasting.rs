@@ -1,11 +1,11 @@
 use crate::batching::BatchAxis;
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, ReshapeOperation, TransposeOperation};
 use crate::partial::PartialValue;
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 use crate::differentiation::DifferentiationDual;
@@ -31,7 +31,7 @@ where
         _context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         use crate::operations::manipulation::{Reshape, Transpose};
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
@@ -94,7 +94,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().broadcast(self.output_type().clone(), self.output_axes())?;
         let tangent = match inputs[0].tangent() {
@@ -171,6 +171,7 @@ impl<V: Value<Type = ArrayType> + Broadcast, C> crate::batching::BatchableOperat
 mod tests {
     use std::rc::Rc;
 
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -181,7 +182,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing::TracingContext;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
     use crate::types::{DataType, Typed};
 
@@ -256,7 +256,7 @@ mod tests {
         for input_0 in 0..2 {
             for input_1 in 0..3 {
                 let expected: f64 = (0..4).map(|reduced| cotangent_values[input_1 * 8 + reduced * 2 + input_0]).sum();
-                assert_close(contribution.values[input_0 * 3 + input_1], expected);
+                assert_abs_diff_eq!(contribution.values[input_0 * 3 + input_1], expected, epsilon = 1e-9);
             }
         }
     }
@@ -301,7 +301,7 @@ mod tests {
                 TestArray::vector(vec![1.0, 2.0, 3.0]),
             )
             .unwrap();
-        assert_close(value.values[0], 12.0);
+        assert_abs_diff_eq!(value.values[0], 12.0, epsilon = 1e-9);
         assert_eq!(gradient.values, vec![2.0, 2.0, 2.0]);
     }
 }

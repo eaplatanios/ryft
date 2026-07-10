@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 use crate::batching::{BatchAxis, BatchingError, InterpretableBatchableOperation};
 use crate::contexts::Domain;
 use crate::contexts::{Context, StagingContext};
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::manipulation::Transpose;
@@ -673,7 +673,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
@@ -722,7 +722,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> T
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
@@ -730,7 +730,8 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType> + From<DotOperation>> T
             // never appears in a valid pushforward.
             (true, true) => Err(ProgramError::UnsupportedOperation {
                 message: "bilinear `dot` with two linear operands cannot be transposed".to_string(),
-            }),
+            }
+            .into()),
             // Exactly one operand is linear: stage the adjoint dot reading the known operand's value, and emit a
             // structural zero for the known operand. A zero output cotangent stays a structural zero.
             (left_is_linear, _) => {

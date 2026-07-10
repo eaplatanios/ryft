@@ -1,7 +1,9 @@
 use std::ops::{Div, Mul};
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::{Abs, AbsOperation};
@@ -21,7 +23,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().abs()?;
@@ -56,30 +58,31 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::operations::arithmetic::Abs;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::test_util::assert_scalar_close;
     use crate::tracing_v2::{gradient, value_and_gradient};
 
     #[test]
     fn test_abs_gradient_is_the_sign_for_real_operands() {
         // d|x| = sign(x): +1 above zero and -1 below.
         let gradient_value = gradient(|x| x.abs().unwrap(), Scalar::from(0.7f64)).unwrap();
-        assert_scalar_close(gradient_value, 1.0);
+        assert_abs_diff_eq!(gradient_value, 1.0, epsilon = 1e-9);
         let gradient_value = gradient(|x| x.abs().unwrap(), Scalar::from(-0.7f64)).unwrap();
-        assert_scalar_close(gradient_value, -1.0);
+        assert_abs_diff_eq!(gradient_value, -1.0, epsilon = 1e-9);
     }
 
     #[test]

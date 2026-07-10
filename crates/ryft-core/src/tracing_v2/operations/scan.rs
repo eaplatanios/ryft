@@ -8,8 +8,8 @@ use crate::batching::BatchingError;
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::DifferentiationDual;
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, TransposableOperation,
-    TransposableProgramOperation,
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationError,
+    TransposableOperation, TransposableProgramOperation,
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
@@ -66,7 +66,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let carry_count = self.carry_count();
         let length = self.length();
         let reverse = self.reverse();
@@ -239,8 +239,7 @@ where
                                  {batch_axis:?})",
                                 accumulator.batch_axis,
                             ),
-                        }
-                        .into());
+                        });
                     }
                     accumulator
                 }
@@ -355,7 +354,7 @@ where
         context: &mut TracingContext<V, Target>,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, ProgramError>;
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError>;
 }
 
 /// Transpose rule for array scans, covering both scan forms that reach a reverse pass.
@@ -382,13 +381,13 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         // A scan with only zero output cotangents is a zero linear map, so every input cotangent is zero.
         if outputs.iter().all(MaybeZero::is_zero) {
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
         }
         if operation.captures().is_empty() {
-            return transpose_primal_scan(operation, context, inputs, outputs);
+            return transpose_primal_scan(operation, context, inputs, outputs).map_err(DifferentiationError::from);
         }
         let body = operation.body();
         let carry_count = operation.carry_count();
@@ -614,7 +613,7 @@ where
         context: &mut TracingContext<V, Target>,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         if outputs.iter().all(MaybeZero::is_zero) {
             return Ok(inputs.iter().map(|input| MaybeZero::Zero(input.r#type().into_owned())).collect());
         }
@@ -622,7 +621,8 @@ where
             return Err(ProgramError::UnsupportedOperation {
                 message: "scalar linear scan transposition with residual stacks requires a scalar stack representation"
                     .to_string(),
-            });
+            }
+            .into());
         }
         let body = operation.body();
         let output_types = body.output_types();
@@ -663,7 +663,7 @@ where
         context: &mut TracingContext<V, Target>,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         <V::Type>::transpose_scan(self, context, inputs, outputs)
     }
 }

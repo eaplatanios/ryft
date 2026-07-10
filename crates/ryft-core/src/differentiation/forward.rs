@@ -1340,6 +1340,7 @@ pub fn linearize<
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1352,7 +1353,6 @@ mod tests {
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::ProgramBuilder;
     use crate::scalars::Scalar;
-    use crate::tests::AssertClose;
     use crate::types::DataType;
 
     use super::*;
@@ -1519,14 +1519,14 @@ mod tests {
         let (value, tangent) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0))
             .unwrap();
-        value.assert_close(2.0f64.sin());
-        tangent.assert_close(3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // The free `jvp` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
         // A plain `Scalar` input recovers the eager scalar domain, so both dual halves are concrete.
         let (value, tangent): (Scalar, Scalar) = jvp(|x| x.sin(), Scalar::from(2.0), Scalar::from(3.0)).unwrap();
-        value.assert_close(2.0f64.sin());
-        tangent.assert_close(3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // Under an active trace, the free `jvp` recovers the staging context from its tracer inputs instead, so it
         // composes inside traced code without threading a context: the closure stages the fused primal and tangent
@@ -1541,8 +1541,8 @@ mod tests {
         .unwrap();
         let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        outputs[0].assert_close(2.0f64.sin());
-        outputs[1].assert_close(3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
         // structure is rejected.
@@ -1573,15 +1573,15 @@ mod tests {
         let (value, pushforward) = EagerContext::<Scalar, ScalarOperation<Scalar>>::new()
             .linearize(|x| x.sin(), Scalar::from(2.0))
             .unwrap();
-        value.assert_close(2.0f64.sin());
-        pushforward.apply(Scalar::from(1.0)).unwrap().assert_close(2.0f64.cos());
-        pushforward.apply(Scalar::from(3.0)).unwrap().assert_close(3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Scalar::from(3.0)).unwrap(), 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // The free `linearize` serves top-level concrete values through their `Value::ExecutionDomain` declarations.
         // Primal work executes eagerly at the concrete linearization point while the pushforward program accumulates.
         let (value, pushforward) = linearize(|x| x.sin(), Scalar::from(2.0)).unwrap();
-        value.assert_close(2.0f64.sin());
-        pushforward.apply(Scalar::from(1.0)).unwrap().assert_close(2.0f64.cos());
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Scalar::from(1.0)).unwrap(), 2.0f64.cos(), epsilon = 1e-9);
 
         // Under an active trace, the free `linearize` recovers the staging context from its tracer input instead,
         // so primal work stages into the enclosing trace and the pushforward replays there when applied.
@@ -1596,8 +1596,8 @@ mod tests {
         .unwrap();
         let outputs = program.interpret(vec![Scalar::from(2.0), Scalar::from(3.0)]).unwrap();
         assert_eq!(outputs.len(), 2);
-        outputs[0].assert_close(2.0f64.sin());
-        outputs[1].assert_close(3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(outputs[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // With no leaf value to recover a context from, the free `linearize` reports an invalid input count.
         assert_eq!(

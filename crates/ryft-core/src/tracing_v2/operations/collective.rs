@@ -5,7 +5,7 @@ use crate::axes::{AxisError, NamedAxes};
 use crate::batching::BatchingError;
 use crate::contexts::Domain;
 use crate::contexts::{Context, EagerContext};
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::constants::{Fill, FillOperation, IotaOperation};
@@ -228,12 +228,13 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         if matches!(self.kind, CollectiveKind::PMax) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "pmax differentiation is not yet supported".to_string(),
-            });
+            }
+            .into());
         }
         let primal = stage_collective(context, &self.axis_name, self.kind, inputs[0].primal())?;
         // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the tangent
@@ -262,13 +263,14 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         if matches!(self.kind, CollectiveKind::PMax) {
             return Err(ProgramError::UnsupportedOperation {
                 message: "pmax transpose is not yet supported".to_string(),
-            });
+            }
+            .into());
         }
         // A known (non-linear) operand contributes no cotangent.
         if inputs[0].is_known() {
@@ -340,7 +342,7 @@ where
                 .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), &[])?
                 .into_iter()
                 .next()
-                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }.into())
+                .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
         })
     }
 }
@@ -414,11 +416,8 @@ where
 fn pmean_batch_size<V: Value<Type = ArrayType>>(
     input: &crate::batching::ArrayBatch<V>,
 ) -> Result<usize, crate::batching::BatchingError> {
-    input.batch_size()?.ok_or_else(|| {
-        crate::batching::BatchingError::UnsupportedOperation {
-            message: "pmean requires a static batch size; the staged batch axis is dynamic".to_string(),
-        }
-        .into()
+    input.batch_size()?.ok_or_else(|| crate::batching::BatchingError::UnsupportedOperation {
+        message: "pmean requires a static batch size; the staged batch axis is dynamic".to_string(),
     })
 }
 
@@ -528,7 +527,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The outputs carry no tangent: replay the primal operation on the input primals and pair each output
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
@@ -547,7 +546,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("output", outputs, 1, ProgramError);
         Ok(Vec::new())
     }

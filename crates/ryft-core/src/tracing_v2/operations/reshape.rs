@@ -2,13 +2,13 @@ use crate::batching::BatchAxis;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::manipulation::{Reshape, ReshapeOperation};
 use crate::partial::PartialValue;
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, Shape, Size, Typed};
 use crate::{ArrayBatch, BatchableOperation, BatchingError, Broadcast, Transpose};
@@ -103,7 +103,7 @@ where
         _context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -127,7 +127,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let primal = inputs[0].primal().reshape(self.output_shape().clone())?;
         let tangent = match inputs[0].tangent() {
@@ -160,8 +160,7 @@ where
                     boundaries in {input_shape} -> {}",
                     self.output_shape(),
                 ),
-            }
-            .into());
+            });
         };
         let lifted_op = ReshapeOperation::new(lifted_output_shape);
         lifted_op.interpret_with_batch_axes(context, inputs, &[BatchAxis::from_position(k_out)])

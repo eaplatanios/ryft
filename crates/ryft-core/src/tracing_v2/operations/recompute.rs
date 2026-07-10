@@ -4,6 +4,7 @@ use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingError;
 use crate::contexts::Context;
+use crate::differentiation::DifferentiationError;
 use crate::differentiation::TransposableOperation;
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
@@ -109,7 +110,7 @@ where
         _context: &mut TracingContext<V, Target>,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let output_types = self.infer_output_types(input_types.as_slice())?;
         check_count!("output", outputs, output_types.len(), ProgramError);

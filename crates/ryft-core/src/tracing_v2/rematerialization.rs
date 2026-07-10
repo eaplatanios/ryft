@@ -1461,6 +1461,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
+
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
     use crate::operations::scalars::ScalarOperation;
@@ -1468,7 +1470,6 @@ mod tests {
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::scalars::Scalar;
-    use crate::tests::AssertClose;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -1517,10 +1518,10 @@ mod tests {
             let function = rematerialize::<EagerContext<TestArray, ArrayOperation<TestArray>>, _, _, _>(dot_sine_body)
                 .with_policy(policy);
             let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
-            value.values[0].assert_close(direct_value.values[0]);
+            assert_abs_diff_eq!(value.values[0], direct_value.values[0], epsilon = 1e-9);
             for (index, expected) in expected_gradient.iter().enumerate() {
-                gradient.values[index].assert_close(*expected);
-                direct_gradient.values[index].assert_close(*expected);
+                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
+                assert_abs_diff_eq!(direct_gradient.values[index], *expected, epsilon = 1e-9);
             }
         }
     }
@@ -1588,8 +1589,8 @@ mod tests {
             let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
                 .value_and_gradient(|carry| function.call(carry).unwrap(), TestArray::scalar(2.0))
                 .unwrap();
-            value.values[0].assert_close(2.0 * expected_gradient);
-            gradient.values[0].assert_close(expected_gradient);
+            assert_abs_diff_eq!(value.values[0], 2.0 * expected_gradient, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.values[0], expected_gradient, epsilon = 1e-9);
         }
         // `DotsSaveable` saves exactly the stacked per-iteration dot outputs (one `[3]`-shaped residual) beyond the
         // `NothingSaveable` baseline of region output plus region input.
@@ -1686,7 +1687,7 @@ mod tests {
             // Every policy preserves the gradient; only the save/recompute split changes.
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                gradient.values[index].assert_close(*expected);
+                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
             }
         }
     }
@@ -1701,8 +1702,8 @@ mod tests {
             .with_policy(policy);
             let (value, gradient) =
                 domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
-            value.assert_close(4.0f64.sin());
-            gradient.assert_close(4.0f64.cos() * 4.0);
+            assert_abs_diff_eq!(value, 4.0f64.sin(), epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient, 4.0f64.cos() * 4.0, epsilon = 1e-9);
         }
     }
 
@@ -1720,8 +1721,8 @@ mod tests {
             .unwrap();
         // f(x) = u * sin(u) with u = x · x; the tangent against seed e_0 is the first gradient component.
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
-        primal.values[0].assert_close(u * u.sin());
-        tangent.values[0].assert_close(dot_sine_gradient(&[0.5, 1.5])[0]);
+        assert_abs_diff_eq!(primal.values[0], u * u.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.values[0], dot_sine_gradient(&[0.5, 1.5])[0], epsilon = 1e-9);
     }
 
     #[test]
@@ -1746,8 +1747,8 @@ mod tests {
         let domain = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
         let (value, gradient) =
             domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0)).unwrap();
-        value.values[0].assert_close(2.0f64.sin());
-        gradient.values[0].assert_close(3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(value.values[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
 
         // The custom-VJP boundary stays opaque to the policy: the rematerialized primal program preserves the
         // custom_vjp call intact, and even `EverythingSaveable` saves only the residual the user's forward rule
@@ -1877,9 +1878,9 @@ mod tests {
         let expected_value: f64 = [0.5f64, 1.5].iter().map(|x| (x * x).sin() * x).sum();
         let expected_gradient = [0.5f64, 1.5].map(|x| (x * x).sin() + 2.0 * x * x * (x * x).cos());
         let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), input).unwrap();
-        value.values[0].assert_close(expected_value);
+        assert_abs_diff_eq!(value.values[0], expected_value, epsilon = 1e-9);
         for (index, expected) in expected_gradient.iter().enumerate() {
-            gradient.values[index].assert_close(*expected);
+            assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
         }
     }
 
@@ -1940,8 +1941,8 @@ mod tests {
             let x = 0.5f64;
             (x * x).sin() + 2.0 * x * x * (x * x).cos()
         };
-        primal.values[0].assert_close(expected_value);
-        tangent.values[0].assert_close(expected_tangent);
+        assert_abs_diff_eq!(primal.values[0], expected_value, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.values[0], expected_tangent, epsilon = 1e-9);
     }
 
     #[test]
@@ -1958,8 +1959,8 @@ mod tests {
         );
         // f(x) = sin(x²) x, so f'(x) = sin(x²) + 2 x² cos(x²).
         let (value, gradient) = domain.value_and_gradient(|x| outer.call(x).unwrap(), Scalar::from(0.7)).unwrap();
-        value.assert_close(0.49f64.sin() * 0.7);
-        gradient.assert_close(0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos());
+        assert_abs_diff_eq!(value, 0.49f64.sin() * 0.7, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient, 0.49f64.sin() + 2.0 * 0.49 * 0.49f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2039,9 +2040,9 @@ mod tests {
             )
             .unwrap();
         // f(x) = Σᵢ sin(xᵢ²), so ∂f/∂xⱼ = 2 xⱼ cos(xⱼ²).
-        value.values[0].assert_close(0.25f64.sin() + 1.0f64.sin());
-        gradient.values[0].assert_close(2.0 * 0.5 * 0.25f64.cos());
-        gradient.values[1].assert_close(2.0 * 1.0 * 1.0f64.cos());
+        assert_abs_diff_eq!(value.values[0], 0.25f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 2.0 * 0.5 * 0.25f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[1], 2.0 * 1.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2092,8 +2093,8 @@ mod tests {
         let (_, second_gradient) =
             domain.value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         assert_eq!(trace_count.get(), derivations_after_first_gradient);
-        first_gradient.values[0].assert_close(2.0 * 0.7 * 0.49f64.cos());
-        second_gradient.values[0].assert_close(first_gradient.values[0]);
+        assert_abs_diff_eq!(first_gradient.values[0], 2.0 * 0.7 * 0.49f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(second_gradient.values[0], first_gradient.values[0], epsilon = 1e-9);
     }
 
     #[test]
@@ -2214,7 +2215,7 @@ mod tests {
             let input = TestArray::new(vector_type(2), vec![0.5, 1.5]);
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                gradient.values[index].assert_close(*expected);
+                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
             }
         }
     }
@@ -2233,7 +2234,11 @@ mod tests {
         let hessian = domain.hessian(|x| function.call(x).unwrap(), TestArray::scalar(0.7)).unwrap();
         let (_, _, block) = hessian.iter_blocks().next().unwrap();
         let x: f64 = 0.7;
-        block.value().values()[0].assert_close(2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+        assert_abs_diff_eq!(
+            block.value().values()[0],
+            2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(),
+            epsilon = 1e-9
+        );
     }
 
     #[test]
@@ -2256,8 +2261,8 @@ mod tests {
             )
             .unwrap();
         let x: f64 = 0.7;
-        gradient.assert_close(2.0 * x * (x * x).cos());
-        second_derivative.assert_close(2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin());
+        assert_abs_diff_eq!(gradient, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2276,7 +2281,7 @@ mod tests {
         pullback_inputs.extend(residuals);
         let output = pullback.interpret(pullback_inputs).unwrap();
         let x: f64 = 0.7;
-        output[0].values[0].assert_close(2.0 * x * (x * x).cos());
+        assert_abs_diff_eq!(output[0].values[0], 2.0 * x * (x * x).cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2291,10 +2296,10 @@ mod tests {
         );
         let jacobian = jacrev(&domain, |x| function.call(x), TestArray::new(vector_type(2), vec![0.5, 1.0])).unwrap();
         let (_, _, block) = jacobian.iter_blocks().next().unwrap();
-        block.value().values()[0].assert_close(0.25f64.cos());
-        block.value().values()[1].assert_close(0.0);
-        block.value().values()[2].assert_close(0.0);
-        block.value().values()[3].assert_close(1.0f64.cos() * 2.0);
+        assert_abs_diff_eq!(block.value().values()[0], 0.25f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[3], 1.0f64.cos() * 2.0, epsilon = 1e-9);
     }
 
     /// Canonical offload destination used by the offloading policy tests.
@@ -2394,7 +2399,7 @@ mod tests {
             // Offloading changes placement, never values: gradients match the direct computation.
             let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input.clone()).unwrap();
             for (index, expected) in expected_gradient.iter().enumerate() {
-                gradient.values[index].assert_close(*expected);
+                assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
             }
         }
     }
@@ -2419,9 +2424,9 @@ mod tests {
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         let u: f64 = 0.5 * 0.5 + 1.5 * 1.5;
-        value.values[0].assert_close(u * u.sin());
+        assert_abs_diff_eq!(value.values[0], u * u.sin(), epsilon = 1e-9);
         for (index, expected) in expected_gradient.iter().enumerate() {
-            gradient.values[index].assert_close(*expected);
+            assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
         }
     }
 
@@ -2467,7 +2472,7 @@ mod tests {
         let expected_gradient = dot_sine_gradient(&[0.5, 1.5]);
         let (_, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), input).unwrap();
         for (index, expected) in expected_gradient.iter().enumerate() {
-            gradient.values[index].assert_close(*expected);
+            assert_abs_diff_eq!(gradient.values[index], *expected, epsilon = 1e-9);
         }
     }
 
@@ -2530,7 +2535,7 @@ mod tests {
         for (row, values) in rows.iter().enumerate() {
             let expected_row_gradient = dot_sine_gradient(values);
             for (column, expected) in expected_row_gradient.iter().enumerate() {
-                gradient.values[row * 3 + column].assert_close(*expected);
+                assert_abs_diff_eq!(gradient.values[row * 3 + column], *expected, epsilon = 1e-9);
             }
         }
     }

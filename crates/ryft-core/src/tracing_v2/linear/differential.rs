@@ -224,7 +224,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
         // linearization-point residuals — its trailing `residual_count` outputs, per the `Linearization` output
         // contract — and then replay every input-coordinate basis tangent through its pushforward program. The
         // already-evaluated `gradient` supplies the output shapes and structure `from_pushforward_program` needs.
-        let linearization = gradient_program.into_flat_program().linearize().map_err(DifferentiationError::from)?;
+        let linearization = gradient_program.into_flat_program().linearize()?;
         let (primal_program, pushforward_program, residual_count) = linearization.into_parts();
         let mut primal_outputs = primal_program
             .interpret_in_context(self, input_parameters.clone())

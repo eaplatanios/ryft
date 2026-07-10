@@ -5,8 +5,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, LinearizableProgramOperation,
-    TransposableOperation, TransposableProgramOperation,
+    DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationError,
+    LinearizableProgramOperation, TransposableOperation, TransposableProgramOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::check_count;
@@ -367,7 +367,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, self.true_branch().input_types().len() + 1, ProgramError);
         let predicate_primal = inputs[0].primal().clone();
         let operands = &inputs[1..];
@@ -415,7 +415,7 @@ where
         operation: &WhileOperation<C::Constant, C::Operation>,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 }
 
 /// Capture-free forward-mode (JVP) rule for the bounded [`WhileOperation`], staging an augmented primal `while`
@@ -486,7 +486,7 @@ where
         operation: &WhileOperation<C::Constant, C::Operation>,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let state_types = operation.state_types();
         let state_count = state_types.len();
         check_count!("input", inputs, state_count, ProgramError);
@@ -522,7 +522,8 @@ where
                      iteration bound; an unbounded while loop has no forward-mode rule",
                     operation.name(),
                 ),
-            });
+            }
+            .into());
         };
 
         // Linearize the body capture-free. The primal body produces `[next_state..., residuals...]` and the
@@ -660,10 +661,11 @@ where
         operation: &WhileOperation<C::Constant, C::Operation>,
         _context: &C,
         _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no capture-free forward-mode linearization rule", operation.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -769,7 +771,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         if context.is_eager()
             && let Some(outputs) = jvp_while_eagerly(self, context, inputs)?
         {
@@ -796,13 +798,14 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: "while does not support transposition (reverse-mode differentiation through staged unbounded \
                       while loops is not supported; eager differentiation unrolls the loop instead, and loops built \
                       with `with_iteration_bound` stage a transposable masked scan)"
                 .to_string(),
-        })
+        }
+        .into())
     }
 }
 
@@ -829,8 +832,7 @@ where
     let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
         return Err(BatchingError::UnsupportedOperation {
             message: "cannot batch a condition operation with no predicate input".to_string(),
-        }
-        .into());
+        });
     };
     match predicate_batch.batch_axis_position() {
         None => {
@@ -853,8 +855,7 @@ where
                                     "condition branches produced batch-varying outputs at mismatched axes \
                                     ({left} vs {right})",
                                 ),
-                            }
-                            .into());
+                            });
                         }
                         (Some(axis), _) | (_, Some(axis)) => axis,
                         (None, None) => predicate_axis,
@@ -925,8 +926,7 @@ where
         let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: "cannot batch a condition operation with no predicate input".to_string(),
-            }
-            .into());
+            });
         };
         if !predicate_batch.batch_axis().is_replicated() {
             // Batch-varying predicate: interpret both branches and merge their outputs per batch item via `Select`.
@@ -1161,8 +1161,7 @@ where
                     "while loop batching failed to stabilize the loop state batch axes within {state_count} \
                      widening passes",
                 ),
-            }
-            .into());
+            });
         };
 
         // Batch the condition at the stabilized axes; a batched predicate output means per-item termination, in
@@ -1346,8 +1345,7 @@ where
                 message: "while loop condition produced a batch-varying predicate mid-iteration after starting \
                     replicated; this is not yet supported"
                     .to_string(),
-            }
-            .into());
+            });
         }
         if !predicate_batch.value().boolean()? {
             return Ok(state);
@@ -1420,8 +1418,7 @@ where
                 message: "while loop predicate became replicated mid-iteration after starting batch-varying; \
                     this is not yet supported"
                     .to_string(),
-            }
-            .into());
+            });
         }
         active_mask = combine_active_mask(active_mask, next_predicate)?;
         remaining_iterations = remaining_iterations.map(|remaining| remaining - 1);
@@ -1530,7 +1527,7 @@ where
         context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         // A condition with no outputs (or only zero output cotangents) is a zero linear map, so every input
         // cotangent is zero. Note that `all` is trivially true for an empty cotangent slice.
         if outputs.iter().all(MaybeZero::is_zero) {
@@ -1576,8 +1573,8 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
-        transpose_primal_condition(self, context, inputs, outputs)
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_primal_condition(self, context, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 

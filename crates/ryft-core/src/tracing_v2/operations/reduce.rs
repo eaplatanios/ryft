@@ -7,7 +7,7 @@ use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
 use crate::contexts::Domain;
 use crate::contexts::StagingContext;
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::arithmetic::MulOperation;
@@ -465,7 +465,7 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         let input_type = inputs[0].r#type();
@@ -542,7 +542,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         match self.kind() {
             ReductionKind::Sum | ReductionKind::Mean => {
@@ -577,7 +577,8 @@ where
                     "array operation `reduce with kind {kind:?}` is not supported by the forward-mode \
                      linearization slice; any and all are not differentiable",
                 ),
-            }),
+            }
+            .into()),
         }
     }
 }
@@ -615,8 +616,7 @@ where
                     reduction inside the function instead of batch-collapsing the batch item",
                     self.name(),
                 ),
-            }
-            .into());
+            });
         };
         // A requested output sharding gains the mapped axis's sharding at the new output batch axis, mirroring the
         // dot batch rule.

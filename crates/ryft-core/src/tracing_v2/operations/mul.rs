@@ -1,7 +1,7 @@
 use std::ops::{Add, Mul};
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::arithmetic::MulOperation;
@@ -22,7 +22,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let left = &inputs[0];
         let right = &inputs[1];
@@ -62,7 +62,7 @@ where
         _context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         check_count!("output", outputs, 1, ProgramError);
         // `Mul` always has exactly two inputs (enforced by its type inference), so the reverse walk supplies a
         // length-two operand slice; index it directly.
@@ -71,7 +71,8 @@ where
             // jointly and therefore never appears in a valid pushforward.
             (true, true) => Err(ProgramError::UnsupportedOperation {
                 message: "bilinear `Mul` with two linear operands cannot be transposed".to_string(),
-            }),
+            }
+            .into()),
             // Exactly one operand is linear: its cotangent is the known operand's value times the output cotangent,
             // and the known operand contributes a structural zero. A zero output cotangent stays a structural zero.
             (left_is_linear, _) => {
@@ -97,6 +98,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
@@ -106,7 +108,6 @@ mod tests {
     use crate::programs::ProgramBuilder;
     use crate::scalars::Scalar;
     use crate::tests::TestArray;
-    use crate::tracing_v2::test_util::assert_scalar_close;
     use crate::tracing_v2::{ArrayOperation, ForwardModeDifferentiate};
     use crate::types::{ArrayType, DataType};
 
@@ -126,8 +127,8 @@ mod tests {
             )
             .unwrap();
 
-        assert_scalar_close(primal, 10.0);
-        assert_scalar_close(tangent, 13.0);
+        assert_abs_diff_eq!(primal, 10.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent, 13.0, epsilon = 1e-9);
     }
 
     #[test]

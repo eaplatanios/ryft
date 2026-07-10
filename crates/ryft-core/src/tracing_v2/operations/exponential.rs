@@ -1,7 +1,9 @@
 use std::ops::{Add, Div, Mul};
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::exponential::{
@@ -21,7 +23,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().exponential()?;
@@ -47,10 +49,11 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -64,7 +67,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().logarithm()?;
@@ -90,10 +93,11 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -107,7 +111,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         let input = &inputs[0];
         let primal = input.primal().square_root()?;
@@ -133,21 +137,22 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::operations::exponential::{Exponential, Logarithm, SquareRoot};
     use crate::scalars::Scalar;
-    use crate::tracing_v2::test_util::assert_scalar_close;
     use crate::tracing_v2::{ReverseModeDifferentiate, gradient, value_and_gradient_holomorphic};
 
     #[test]
@@ -155,11 +160,11 @@ mod tests {
         // Real gradients: d(eˣ) = eˣ, d(ln x) = 1/x, and d(√x) = 1/(2√x).
         let x: f64 = 0.7;
         let gradient_value = gradient(|x| x.exponential().unwrap(), Scalar::from(x)).unwrap();
-        assert_scalar_close(gradient_value, x.exp());
+        assert_abs_diff_eq!(gradient_value, x.exp(), epsilon = 1e-9);
         let gradient_value = gradient(|x| x.logarithm().unwrap(), Scalar::from(x)).unwrap();
-        assert_scalar_close(gradient_value, 1.0 / x);
+        assert_abs_diff_eq!(gradient_value, 1.0 / x, epsilon = 1e-9);
         let gradient_value = gradient(|x| x.square_root().unwrap(), Scalar::from(x)).unwrap();
-        assert_scalar_close(gradient_value, 0.5 / x.sqrt());
+        assert_abs_diff_eq!(gradient_value, 0.5 / x.sqrt(), epsilon = 1e-9);
 
         // Holomorphic gradients at a genuinely complex point: the same rules compute the analytic continuations
         // d(e^z) = e^z, d(ln z) = 1/z, and d(√z) = 1/(2√z).

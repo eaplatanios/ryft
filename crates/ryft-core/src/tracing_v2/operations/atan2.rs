@@ -1,7 +1,9 @@
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::contexts::Context;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual, TransposableOperation};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+};
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::operations::trigonometric::{Atan2, Atan2Operation};
@@ -25,7 +27,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let y = &inputs[0];
         let x = &inputs[1];
@@ -63,22 +65,23 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
     use crate::operations::complex::{Imaginary, Real};
     use crate::operations::trigonometric::Atan2;
     use crate::scalars::Scalar;
-    use crate::tracing_v2::test_util::assert_scalar_close;
     use crate::tracing_v2::{gradient, value_and_gradient};
 
     #[test]
@@ -87,10 +90,10 @@ mod tests {
         let (y, x): (f64, f64) = (0.7, -0.3);
         let (value, gradient_value) =
             value_and_gradient(|(y, x)| y.atan2(&x).unwrap(), (Scalar::from(y), Scalar::from(x))).unwrap();
-        assert_scalar_close(value, y.atan2(x));
+        assert_abs_diff_eq!(value, y.atan2(x), epsilon = 1e-9);
         let (y_gradient, x_gradient) = gradient_value;
-        assert_scalar_close(y_gradient, x / (x * x + y * y));
-        assert_scalar_close(x_gradient, -y / (x * x + y * y));
+        assert_abs_diff_eq!(y_gradient, x / (x * x + y * y), epsilon = 1e-9);
+        assert_abs_diff_eq!(x_gradient, -y / (x * x + y * y), epsilon = 1e-9);
     }
 
     #[test]

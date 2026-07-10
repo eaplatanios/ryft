@@ -1,10 +1,10 @@
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::fmt::Display;
-
+use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
 use ryft_macros::Parameter;
+use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::fmt::Display;
 
 #[cfg(test)]
 use crate::contexts::Context;
@@ -216,6 +216,61 @@ impl_partial_eq_primitive_for_scalar!(f32, F32);
 impl_partial_eq_primitive_for_scalar!(f64, F64);
 impl_partial_eq_primitive_for_scalar!(Complex<f32>, C64);
 impl_partial_eq_primitive_for_scalar!(Complex<f64>, C128);
+
+#[cfg(any(test, feature = "test-utilities"))]
+impl Scalar {
+    /// Returns the exactly widened floating-point payload backing the [`approx::AbsDiffEq`] implementations below,
+    /// or `None` for a variant that carries no real floating-point payload (Booleans, integers, and complex values).
+    fn floating_point_payload(self) -> Option<f64> {
+        match self {
+            Scalar::BF16(value) => Some(value.to_f64()),
+            Scalar::F16(value) => Some(value.to_f64()),
+            Scalar::F32(value) => Some(f64::from(value)),
+            Scalar::F64(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// Approximate equality against a bare `f64`, serving the [`approx`] assertion macros in tests (e.g.,
+/// `assert_abs_diff_eq!(gradient, expected, epsilon = 1e-9)` where `gradient` is a [`Scalar`]). A floating-point
+/// variant compares its exactly widened payload within `epsilon`, while a variant with no real floating-point
+/// payload (a Boolean, integer, or complex value) is never approximately equal to a bare `f64`.
+#[cfg(any(test, feature = "test-utilities"))]
+impl AbsDiffEq<f64> for Scalar {
+    type Epsilon = f64;
+
+    fn default_epsilon() -> f64 {
+        f64::EPSILON
+    }
+
+    fn abs_diff_eq(&self, other: &f64, epsilon: f64) -> bool {
+        match self.floating_point_payload() {
+            Some(value) => (value - other).abs() <= epsilon,
+            None => false,
+        }
+    }
+}
+
+/// Approximate equality between two [`Scalar`]s, serving the [`approx`] assertion macros in tests. Two
+/// floating-point variants compare their exactly widened payloads within `epsilon` (also across variants, e.g., a
+/// [`Scalar::F32`] against a [`Scalar::F64`]), while any other pairing falls back to exact [`PartialEq`] equality,
+/// which is the only equality Booleans, integers, and complex values define.
+#[cfg(any(test, feature = "test-utilities"))]
+impl AbsDiffEq for Scalar {
+    type Epsilon = f64;
+
+    fn default_epsilon() -> f64 {
+        f64::EPSILON
+    }
+
+    fn abs_diff_eq(&self, other: &Self, epsilon: f64) -> bool {
+        match (self.floating_point_payload(), other.floating_point_payload()) {
+            (Some(left), Some(right)) => (left - right).abs() <= epsilon,
+            _ => self == other,
+        }
+    }
+}
 
 impl BooleanLike for Scalar {
     #[inline]

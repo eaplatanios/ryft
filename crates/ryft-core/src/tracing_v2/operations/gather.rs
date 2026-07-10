@@ -15,9 +15,9 @@ use crate::macros::check_count;
 use crate::operations::manipulation::{
     Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, Reshape, Slice, Transpose, UpdateSlice,
 };
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, Value};
 
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
 use crate::types::{ArrayType, Typed};
 
@@ -33,7 +33,7 @@ where
         &self,
         _context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let indices = inputs[1].primal();
         let primal = inputs[0].primal().gather(indices, self)?;
@@ -67,6 +67,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use pretty_assertions::assert_eq;
 
     use crate::contexts::Context;
@@ -75,7 +76,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
-    use crate::tracing_v2::test_util::assert_close;
     use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType, Shape, Size};
 
@@ -105,7 +105,7 @@ mod tests {
                 TestArray::matrix(3, 2, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]),
             )
             .unwrap();
-        assert_close(value.values[0], 10.0);
+        assert_abs_diff_eq!(value.values[0], 10.0, epsilon = 1e-9);
         assert_eq!(gradient.values, vec![1.0, 1.0, 0.0, 0.0, 1.0, 1.0]);
     }
 

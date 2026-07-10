@@ -34,6 +34,7 @@ ryft-pjrt = { path = "crates/ryft-pjrt", version = "0.0.3", default-features = f
 ryft-xla = { path = "crates/ryft-xla", version = "0.0.3", default-features = false }
 ryft-xla-sys = { path = "crates/ryft-xla-sys", version = "0.0.3", default-features = false }
 anyhow = "1.0.102"
+approx = "0.5.1"
 aquamarine = "0.6.0"
 bindgen = "0.72.1"
 convert_case = "0.11.0"

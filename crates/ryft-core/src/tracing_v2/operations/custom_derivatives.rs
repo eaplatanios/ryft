@@ -8,7 +8,7 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::TransposableOperation;
-use crate::differentiation::{DifferentiableOperation, DifferentiationDual};
+use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
@@ -157,7 +157,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.output_types().len();
         check_count!("input", inputs, self.input_types().len(), ProgramError);
         // The JVP program consumes `(primals..., input_tangents...)`, so feed the dual primals followed by the dual
@@ -194,10 +194,11 @@ where
         _context: &mut TracingContext<W, OLinear>,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -723,7 +724,7 @@ where
         context: &mut TracingContext<W, OLinear>,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         if self.transposed {
             return Err(TypeError {
                 message: "transposing a custom_vjp pullback (second-order reverse mode through custom_vjp) is not \
@@ -813,7 +814,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.output_types().len();
         check_count!("input", inputs, self.input_types().len(), ProgramError);
         // Replay the forward program on the dual primals, recovering the primal outputs followed by the residuals.
@@ -824,7 +825,8 @@ where
                 "custom_vjp forward program produced {} outputs which is fewer than its {output_count} primal \
                  output(s)",
                 forward_outputs.len(),
-            )));
+            ))
+            .into());
         }
         let residuals = forward_outputs.split_off(output_count);
         let primal_outputs = forward_outputs;
@@ -866,10 +868,11 @@ where
         _context: &mut TracingContext<W, OLinear>,
         _inputs: &[PartialValue<Tracer<TracingContext<W, OLinear>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<W, OLinear>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<W, OLinear>>>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -1015,8 +1018,7 @@ where
     V: Value<Type = ArrayType>,
 {
     fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) }
-            .into())
+        Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) })
     }
 }
 
@@ -1032,10 +1034,11 @@ where
         &self,
         _context: &C,
         _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!("{} has no forward-mode (jvp) rule; custom_vjp is reverse-mode only", self.name()),
-        })
+        }
+        .into())
     }
 }
 
@@ -1180,8 +1183,8 @@ where
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
-        transpose_primal_custom_vjp(self, context, inputs, outputs)
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_primal_custom_vjp(self, context, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 
@@ -1429,6 +1432,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
+
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
@@ -1442,7 +1447,6 @@ mod tests {
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::tracing_v2::test_util::{assert_close, assert_scalar_close};
     use crate::types::{DataType, Shape, Size};
 
     use super::*;
@@ -1592,7 +1596,7 @@ mod tests {
         let outputs = custom_jvp_sin(&scalar)
             .interpret(&crate::EagerContext::<TestArray>::new(), &[TestArray::scalar(2.0)])
             .unwrap();
-        assert_close(outputs[0].values[0], 2.0f64.sin());
+        assert_abs_diff_eq!(outputs[0].values[0], 2.0f64.sin(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1609,9 +1613,9 @@ mod tests {
             )
             .unwrap();
         let _ = scalar;
-        assert_close(primal.values[0], 2.0f64.sin());
+        assert_abs_diff_eq!(primal.values[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom rule doubles the true derivative, proving it is in control.
-        assert_close(tangent.values[0], 2.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(tangent.values[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1625,9 +1629,9 @@ mod tests {
                 TestArray::scalar(3.0),
             )
             .unwrap();
-        assert_close(value.values[0], 3.0f64.sin());
+        assert_abs_diff_eq!(value.values[0], 3.0f64.sin(), epsilon = 1e-9);
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
-        assert_close(gradient.values[0], 2.0 * 3.0f64.cos());
+        assert_abs_diff_eq!(gradient.values[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1641,9 +1645,9 @@ mod tests {
                 TestArray::scalar(2.0),
             )
             .unwrap();
-        assert_close(value.values[0], 2.0f64.sin());
+        assert_abs_diff_eq!(value.values[0], 2.0f64.sin(), epsilon = 1e-9);
         // The custom backward rule triples the true gradient, proving it is in control.
-        assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(gradient.values[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1681,10 +1685,10 @@ mod tests {
         )
         .unwrap();
         let (_, _, block) = jacobian.iter_blocks().next().unwrap();
-        assert_close(block.value().values()[0], 3.0 * 0.5f64.cos());
-        assert_close(block.value().values()[1], 0.0);
-        assert_close(block.value().values()[2], 0.0);
-        assert_close(block.value().values()[3], 3.0 * 1.0f64.cos());
+        assert_abs_diff_eq!(block.value().values()[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[2], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(block.value().values()[3], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     /// Builds the scalar `f(x) = sin(x)` program.
@@ -1757,9 +1761,9 @@ mod tests {
                 Scalar::from(1.0),
             )
             .unwrap();
-        assert_scalar_close(primal, 2.0f64.sin());
+        assert_abs_diff_eq!(primal, 2.0f64.sin(), epsilon = 1e-9);
         // The custom rule doubles the true derivative, proving it is in control.
-        assert_scalar_close(tangent, 2.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(tangent, 2.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1778,7 +1782,10 @@ mod tests {
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert!(matches!(program.linearize(), Err(ProgramError::MalformedProgram(message)) if message == expected));
+        assert!(matches!(
+            program.linearize(),
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
+        ));
 
         // Value-level direct linearization enforces the same rule contract before exposing a reusable pushforward.
         let result = EagerContext::<Scalar, ScalarOperation<Scalar>>::new().linearize(
@@ -1788,7 +1795,10 @@ mod tests {
             },
             Scalar::from(2.0),
         );
-        assert!(matches!(result, Err(ProgramError::MalformedProgram(message)) if message == expected));
+        assert!(matches!(
+            result,
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
+        ));
     }
 
     #[test]
@@ -1809,9 +1819,9 @@ mod tests {
                 Scalar::from(2.0),
             )
             .unwrap();
-        assert_scalar_close(value, 2.0f64.sin());
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
         // The custom backward rule triples the true gradient, proving it is in control.
-        assert_scalar_close(gradient, 3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(gradient, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1829,14 +1839,14 @@ mod tests {
         let (primal, tangent) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(|x| function.call(x), TestArray::scalar(2.0), TestArray::scalar(1.0))
             .unwrap();
-        assert_close(primal.values[0], 2.0f64.sin());
-        assert_close(tangent.values[0], 2.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(primal.values[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.values[0], 2.0 * 2.0f64.cos(), epsilon = 1e-9);
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(3.0))
             .unwrap();
-        assert_close(value.values[0], 3.0f64.sin());
-        assert_close(gradient.values[0], 2.0 * 3.0f64.cos());
+        assert_abs_diff_eq!(value.values[0], 3.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1854,8 +1864,8 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(|x| function.call(x).unwrap(), TestArray::scalar(2.0))
             .unwrap();
-        assert_close(value.values[0], 2.0f64.sin());
-        assert_close(gradient.values[0], 3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(value.values[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1890,10 +1900,10 @@ mod tests {
                 (TestArray::scalar(2.0), TestArray::scalar(5.0)),
             )
             .unwrap();
-        assert_close(value.values[0], 10.0);
+        assert_abs_diff_eq!(value.values[0], 10.0, epsilon = 1e-9);
         // The custom rule triples the true gradients `(y, x)`.
-        assert_close(gradient_x.values[0], 3.0 * 5.0);
-        assert_close(gradient_y.values[0], 3.0 * 2.0);
+        assert_abs_diff_eq!(gradient_x.values[0], 3.0 * 5.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient_y.values[0], 3.0 * 2.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -1908,8 +1918,8 @@ mod tests {
             },
         );
         let (value, gradient) = domain.value_and_gradient(|x| function.call(x).unwrap(), Scalar::from(2.0)).unwrap();
-        assert_scalar_close(value, 2.0f64.sin());
-        assert_scalar_close(gradient, 3.0 * 2.0f64.cos());
+        assert_abs_diff_eq!(value, 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient, 3.0 * 2.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -1944,7 +1954,7 @@ mod tests {
             )
             .unwrap();
         for (actual, input) in output.values.iter().zip([0.5f64, 1.0, 1.5]) {
-            assert_close(*actual, input.sin());
+            assert_abs_diff_eq!(*actual, input.sin(), epsilon = 1e-9);
         }
     }
 
@@ -1978,9 +1988,9 @@ mod tests {
                 TestArray::vector(vec![0.5, 1.0]),
             )
             .unwrap();
-        assert_close(value.values[0], 0.5f64.sin() + 1.0f64.sin());
-        assert_close(gradient.values[0], 2.0 * 0.5f64.cos());
-        assert_close(gradient.values[1], 2.0 * 1.0f64.cos());
+        assert_abs_diff_eq!(value.values[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 2.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[1], 2.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2012,9 +2022,9 @@ mod tests {
                 TestArray::vector(vec![0.5, 1.0]),
             )
             .unwrap();
-        assert_close(value.values[0], 0.5f64.sin() + 1.0f64.sin());
-        assert_close(gradient.values[0], 3.0 * 0.5f64.cos());
-        assert_close(gradient.values[1], 3.0 * 1.0f64.cos());
+        assert_abs_diff_eq!(value.values[0], 0.5f64.sin() + 1.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[0], 3.0 * 0.5f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.values[1], 3.0 * 1.0f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
@@ -2035,7 +2045,7 @@ mod tests {
         let mut pullback_inputs = vec![TestArray::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let input_cotangents = pullback.interpret(pullback_inputs).unwrap();
-        assert_close(input_cotangents[0].values[0], 0.7f64.cos());
+        assert_abs_diff_eq!(input_cotangents[0].values[0], 0.7f64.cos(), epsilon = 1e-9);
     }
 
     #[test]
