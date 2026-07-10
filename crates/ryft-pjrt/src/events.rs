@@ -33,6 +33,12 @@ pub struct Event<O> {
     /// [`Event::await`] or [`Event::poll`].
     output: Option<O>,
 
+    /// Indicates whether a native "on-ready" callback that wakes the [`Waker`] stored in [`EventState::waker`] has
+    /// already been registered for the underlying PJRT event. This is only ever accessed by [`Event::poll`], whose
+    /// exclusive borrow of this [`Event`] already serializes it, and it is reset to `false` when a registration attempt
+    /// fails so that a later [`Event::poll`] invocation can retry the registration.
+    callback_registered: Cell<bool>,
+
     /// Marker that keeps [`Event`] [`Send`] but not [`Sync`]. Refer to the *Thread Safety* section
     /// of the [`Event`] documentation for more information.
     marker: PhantomData<Cell<()>>,
@@ -48,12 +54,9 @@ impl<O> Event<O> {
             Err(Error::invalid_argument("the provided PJRT event handle is a null pointer"))
         } else {
             Ok(Self {
-                state: Arc::new(EventState {
-                    api,
-                    handle: EventHandle(handle),
-                    future: Arc::new(Mutex::new(EventFutureState { callback_registered: false, waker: None })),
-                }),
+                state: Arc::new(EventState { api, handle: EventHandle(handle), waker: Arc::new(Mutex::new(None)) }),
                 output: Some(output),
+                callback_registered: Cell::new(false),
                 marker: PhantomData,
             })
         }
@@ -136,22 +139,17 @@ impl<O> Future for Event<O> {
                 Err(_) => unreachable!(),
             },
             Ok(false) => {
-                let should_register_callback = {
-                    let mut future = self.state.future.lock().expect("PJRT event future state mutex poisoned");
-                    future.waker = Some(cx.waker().clone());
-                    let should_register = !future.callback_registered;
-                    future.callback_registered = true;
-                    should_register
-                };
-                let callback_registration_result = should_register_callback.then(|| {
-                    // The callback must capture only the future state, never the whole `EventState`. The native event
-                    // owns the registered callback, so a callback that owned an `Arc<EventState>` would form a
+                *self.state.waker.lock().expect("PJRT event waker mutex poisoned") = Some(cx.waker().clone());
+                let callback_registration_result = (!self.callback_registered.get()).then(|| {
+                    self.callback_registered.set(true);
+                    // The callback must capture only the shared waker slot, never the whole `EventState`. The native
+                    // event owns the registered callback, so a callback that owned an `Arc<EventState>` would form a
                     // reference cycle (i.e., `EventState` -> native event -> callback -> `EventState`) that leaks the
                     // native event whenever it never completes (e.g., when a pending `Event` is canceled after its
                     // `EventPromise` was dropped without being set).
-                    let future = self.state.future.clone();
+                    let waker = self.state.waker.clone();
                     self.on_ready(move |_| {
-                        let waker = future.lock().expect("PJRT event future state mutex poisoned").waker.take();
+                        let waker = waker.lock().expect("PJRT event waker mutex poisoned").take();
                         if let Some(waker) = waker {
                             waker.wake();
                         }
@@ -169,9 +167,7 @@ impl<O> Future for Event<O> {
                         _ => Poll::Pending,
                     },
                     Some(Err(error)) => {
-                        let mut future = self.state.future.lock().expect("PJRT event future state mutex poisoned");
-                        future.callback_registered = false;
-                        drop(future);
+                        self.callback_registered.set(false);
                         Poll::Ready(Err(error))
                     }
                     None => Poll::Pending,
@@ -187,7 +183,7 @@ impl<O> Drop for Event<O> {
         // We clear any waker registered by `Future::poll` so that an outstanding native "on-ready" callback does not
         // retain a canceled executor task indefinitely if the underlying computation never completes. The native event
         // itself is destroyed by `EventState`'s `Drop` implementation once all owners have been dropped.
-        self.state.future.lock().expect("PJRT event future state mutex poisoned").waker = None;
+        *self.state.waker.lock().expect("PJRT event waker mutex poisoned") = None;
     }
 }
 
@@ -299,11 +295,11 @@ struct EventState {
     /// [`EventHandle`] for the underlying native PJRT event.
     handle: EventHandle,
 
-    /// State used to integrate the event with Rust's [`Future`] protocol. It is shared through its own [`Arc`] so that
-    /// the "on-ready" callback registered by [`Event::poll`] never owns the whole [`EventState`]. The native event owns
-    /// that callback, so a callback owning an `Arc<EventState>` would form a reference cycle that leaks the native
-    /// event whenever it never completes.
-    future: Arc<Mutex<EventFutureState>>,
+    /// [`Waker`] slot shared with the "on-ready" callback that [`Event::poll`] registers, used to integrate the event
+    /// with Rust's [`Future`] protocol. It is shared through its own [`Arc`] so that the callback never owns the whole
+    /// [`EventState`]. The native event owns that callback, so a callback owning an [`Arc<EventState>`] would form a
+    /// reference cycle that leaks the native event whenever it never completes.
+    waker: Arc<Mutex<Option<Waker>>>,
 }
 
 impl Drop for EventState {
@@ -312,19 +308,6 @@ impl Drop for EventState {
         invoke_pjrt_api_error_fn!(self.api, PJRT_Event_Destroy, { event = self.handle.0 })
             .expect("failed to destroy PJRT event");
     }
-}
-
-/// State used to track the [`Future`] polling status of an [`Event`]. Specifically, this state is used to make sure
-/// that a waker-invoking callback is registered for the corresponding PJRT event such that the event can be used as a
-/// standard [`Future`].
-struct EventFutureState {
-    /// Indicates whether a native "on-ready" callback that wakes [`EventFutureState::waker`] has already been
-    /// registered for the corresponding PJRT event. This is reset to `false` when a registration attempt fails
-    /// so that a later [`Event::poll`] invocation can retry the registration.
-    callback_registered: bool,
-
-    /// [`Waker`] provided by the most recent [`Event::poll`] invocation.
-    waker: Option<Waker>,
 }
 
 /// Event that can be used to tell PJRT [`Client`]s about asynchronous actions outside of PJRT. [`AsyncTrackingEvent`]s
@@ -583,10 +566,14 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
 
     use futures::executor::block_on;
+    use futures::task::noop_waker_ref;
 
     use crate::tests::test_cpu_client;
     use crate::{Error, Event};
@@ -669,6 +656,22 @@ mod tests {
         drop(event);
         std::thread::spawn(move || promise.set(None).unwrap()).join().unwrap();
         assert!(receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_cancelled_pending_event_releases_its_state() {
+        let client = test_cpu_client();
+        let (mut event, promise) = client.event(()).unwrap();
+        let mut context = Context::from_waker(noop_waker_ref());
+        assert!(matches!(Pin::new(&mut event).poll(&mut context), Poll::Pending));
+
+        // The "on-ready" callback registered by the poll above must retain only the shared waker slot. If it retained
+        // the whole `EventState`, the state, the native event, and the callback would form a reference cycle that leaks
+        // the native event when a pending event is cancelled without ever being fulfilled.
+        let state = Arc::downgrade(&event.state);
+        drop(promise);
+        drop(event);
+        assert!(state.upgrade().is_none());
     }
 
     #[test]
