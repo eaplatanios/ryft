@@ -962,7 +962,9 @@ impl CodeGenerator {
                 for #differentiation_self_type
             #witness_where_clause
             {
-                fn jvp_program(program: &#program_type) -> ::std::result::Result<#program_type, #ryft::ProgramError> {
+                fn jvp_program(
+                    program: &#program_type,
+                ) -> ::std::result::Result<#program_type, #ryft::DifferentiationError> {
                     program.jvp()
                 }
             }
@@ -980,7 +982,7 @@ impl CodeGenerator {
                     program: &#program_type,
                 ) -> ::std::result::Result<
                     #ryft::Linearization<#program_constant_type, Self>,
-                    #ryft::ProgramError,
+                    #ryft::DifferentiationError,
                 > {
                     program.linearize()
                 }
@@ -1004,7 +1006,7 @@ impl CodeGenerator {
                     ::std::vec::Vec<#ryft::DifferentiationDual<
                         <__DifferentiationContext as #ryft::Domain>::Value,
                     >>,
-                    #ryft::ProgramError,
+                    #ryft::DifferentiationError,
                 > {
                     match self {
                         #(#jvp_arms)*
@@ -1452,7 +1454,7 @@ impl CodeGenerator {
                         ::std::vec::Vec<#transposed_value_type>,
                         ::std::vec::Vec<#transposed_value_type>,
                     >,
-                    #ryft::ProgramError,
+                    #ryft::DifferentiationError,
                 > {
                     let with_respect_to = input_linearity
                         .iter()
@@ -1509,7 +1511,7 @@ impl CodeGenerator {
                             #operation_self_type,
                         >>,
                     >>,
-                    #ryft::ProgramError,
+                    #ryft::DifferentiationError,
                 > {
                     match self {
                         #(#transpose_arms)*

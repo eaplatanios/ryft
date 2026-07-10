@@ -25,6 +25,16 @@ struct TypeError;
 #[derive(Debug, PartialEq, Eq)]
 struct ProgramError;
 
+/// Stand-in for `ryft_core::DifferentiationError`, the error type the differentiation dispatchers return.
+#[derive(Debug, PartialEq, Eq)]
+struct DifferentiationError;
+
+impl From<ProgramError> for DifferentiationError {
+    fn from(_error: ProgramError) -> Self {
+        DifferentiationError
+    }
+}
+
 /// Stand-in for `ryft_core::BatchingError`, the error type the batching dispatchers return.
 #[derive(Debug, PartialEq, Eq)]
 struct BatchingError;
@@ -230,7 +240,7 @@ trait TransposableOperation<V: Value, O: Operation<V::Type>>: Operation<V::Type>
         context: &mut TracingContext<V, O>,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>;
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
 }
 
 /// Stand-in for `ryft_core::Program`.
@@ -289,7 +299,7 @@ where
     fn transpose_with_respect_to(
         &self,
         input_indices: &[usize],
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         let _ = input_indices;
         Ok(Program { label: "program_transpose_with_respect_to", constant: None, operation: None, marker: PhantomData })
     }
@@ -312,7 +322,7 @@ where
     fn transpose_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
         input_linearity: &[bool],
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
+    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
 }
 
 /// Stand-in for `ryft_core::StagingContext`. Mirrors the real trait's `Meta` associated type, which the generated
@@ -345,7 +355,7 @@ trait DifferentiableOperation<C: Context>: Operation<C::Type> {
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError>;
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
 }
 
 /// Stand-in for `ryft_core::Linearization`.
@@ -359,13 +369,15 @@ struct Linearization<V: Value, O> {
 trait DifferentiableProgramOperation<V: Value, O>: Operation<V::Type> + Sized {
     fn jvp_program(
         program: &Program<V, Self, Vec<V>, Vec<V>>,
-    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, ProgramError>;
+    ) -> Result<Program<V, Self, Vec<V>, Vec<V>>, DifferentiationError>;
 }
 
 /// Stand-in for `ryft_core::LinearizableProgramOperation`, mirroring the split-linearization fixed-body method the
 /// generated witness implements.
 trait LinearizableProgramOperation<V: Value, O>: Operation<V::Type> + Sized {
-    fn linearize_program(program: &Program<V, Self, Vec<V>, Vec<V>>) -> Result<Linearization<V, Self>, ProgramError>;
+    fn linearize_program(
+        program: &Program<V, Self, Vec<V>, Vec<V>>,
+    ) -> Result<Linearization<V, Self>, DifferentiationError>;
 }
 
 impl<T, V, O, Input, Output> Program<V, O, Input, Output>
@@ -377,12 +389,12 @@ where
     /// Stand-in for `ryft_core::Program::linearize`. The `SpecialTransposableValue` bound on the value type stands
     /// in for the extra value leaves the real linearization needs, verifying that the generated witness transports
     /// the `#[ryft(bounds(differentiation(...)))]` list to this body check.
-    fn linearize(&self) -> Result<Linearization<V, O>, ProgramError> {
+    fn linearize(&self) -> Result<Linearization<V, O>, DifferentiationError> {
         Ok(Linearization { label: "program_linearize", marker: PhantomData })
     }
 
     /// Stand-in for `ryft_core::Program::jvp`.
-    fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+    fn jvp(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         Ok(Program { label: "program_jvp", constant: None, operation: None, marker: PhantomData })
     }
 }
@@ -542,7 +554,7 @@ impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("zero")])
     }
 }
@@ -577,7 +589,7 @@ impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V,
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("add")])
     }
 }
@@ -647,7 +659,7 @@ impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, F> TransposableOperat
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("factor")])
     }
 }
@@ -687,7 +699,7 @@ impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, F> TransposableOperat
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("constant")])
     }
 }
@@ -970,7 +982,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         match *self {}
     }
 }
@@ -1009,7 +1021,7 @@ where
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("special")])
     }
 }
@@ -1125,7 +1137,7 @@ impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, W, P> TransposableOpe
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("while")])
     }
 }
@@ -1169,7 +1181,7 @@ where
         _context: &mut TracingContext<TranspositionValue, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
         Ok(vec![transposed("recursive")])
     }
 }
@@ -1227,7 +1239,7 @@ where
         _context: &mut TracingContext<TranspositionValue, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
         Ok(vec![transposed("program_recursive")])
     }
 }
@@ -1299,7 +1311,7 @@ impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for ZeroOper
         &self,
         _context: &C,
         _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Ok(vec![DifferentiationDual { label: "zero", marker: PhantomData }])
     }
 }
@@ -1309,7 +1321,7 @@ impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for AddOpera
         &self,
         _context: &C,
         _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Ok(vec![DifferentiationDual { label: "add", marker: PhantomData }])
     }
 }
@@ -1325,7 +1337,7 @@ where
         &self,
         _context: &C,
         _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         Ok(vec![DifferentiationDual { label: "factor", marker: PhantomData }])
     }
 }
@@ -1363,7 +1375,7 @@ impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V,
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("non_differentiable")])
     }
 }
@@ -1373,8 +1385,8 @@ impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for NonDiffe
         &self,
         _context: &C,
         _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
-        Err(ProgramError)
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(DifferentiationError)
     }
 }
 
@@ -1420,7 +1432,7 @@ fn test_differentiable_operation_delegates_unsupported_payloads() {
     // failure rather than an enum-level dispatch arm.
     let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
     let operation = Operation::from(NonDifferentiableOperation);
-    assert_eq!(operation.jvp(&context, &[]).unwrap_err(), ProgramError);
+    assert_eq!(operation.jvp(&context, &[]).unwrap_err(), DifferentiationError);
 }
 
 #[test]
@@ -1505,7 +1517,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>, P: Operation<ArrayType
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("recompute")])
     }
 }
@@ -1548,7 +1560,7 @@ impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, C, P, F> Transposable
         _context: &mut TracingContext<V, O>,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError> {
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("custom_vjp_call")])
     }
 }

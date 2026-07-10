@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingError};
 use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::{DifferentiableOperation, TransposableOperation};
+use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use ryft_core::effects::Effects;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
@@ -438,7 +438,8 @@ fn shard_map_bodies(
     body: &FlatTracedShardMap,
 ) -> Result<(FlatTracedShardMap, FlatTracedShardMap, usize), ShardMapTraceError> {
     let output_count = body.global_output_types().len();
-    let (primal_program, tangent_program, residual_count) = body.program().linearize()?.into_parts();
+    let (primal_program, tangent_program, residual_count) =
+        body.program().linearize().map_err(ProgramError::from)?.into_parts();
 
     let mesh = body.shard_map().mesh();
     let manual_axes = body.shard_map().manual_axes();
@@ -525,7 +526,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.output_types.len();
         check_count!("input", inputs, self.input_types.len(), ProgramError);
 
@@ -541,7 +542,8 @@ where
                 "shard_map primal body produced {} outputs which is fewer than its {output_count} primal \
                  output(s)",
                 primal_outputs.len(),
-            )));
+            ))
+            .into());
         }
         let residuals = primal_outputs.split_off(output_count);
 
@@ -678,8 +680,8 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for S
         context: &mut TracingContext<V, XlaOperation<V>>,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
-        transpose_primal_shard_map(self, context, inputs, outputs)
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
+        transpose_primal_shard_map(self, context, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 

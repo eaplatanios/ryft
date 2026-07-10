@@ -11,7 +11,7 @@ use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
 use ryft_core::compilation::CaptureReference;
 use ryft_core::compilation::function::CompiledProgramOperation;
 use ryft_core::contexts::{Context, StagingContext};
-use ryft_core::differentiation::{DifferentiableOperation, TransposableOperation};
+use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use ryft_core::effects::Effects;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
@@ -733,7 +733,7 @@ where
         &self,
         context: &C,
         inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, ProgramError> {
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         let output_count = self.program().output_types().len();
         check_count!("input", inputs, self.program().input_types().len(), ProgramError);
 
@@ -752,7 +752,8 @@ where
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
                  output(s)",
                 primal_call_outputs.len(),
-            )));
+            ))
+            .into());
         }
         let residuals = primal_call_outputs.split_off(output_count);
         let primal_outputs = primal_call_outputs;
@@ -895,8 +896,8 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for J
         context: &mut TracingContext<V, XlaOperation<V>>,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
-        transpose_primal_jit_call(self, context, inputs, outputs)
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
+        transpose_primal_jit_call(self, context, inputs, outputs).map_err(DifferentiationError::from)
     }
 }
 
