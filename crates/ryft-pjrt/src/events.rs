@@ -1,5 +1,8 @@
+use std::cell::Cell;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -15,47 +18,70 @@ use crate::{Api, Client, Device, Error, Plugin, invoke_pjrt_api_error_fn};
 /// [`Event`]s implement [`Future`] so that they can be seamlessly integrated with asynchronous Rust code.
 /// However, while in Rust [`Future`]s typically do not start executing until they are invoked, [`Event`]s
 /// represent computations that have already started executing.
+///
+/// # Thread Safety
+///
+/// [`Event`]s are [`Send`] but intentionally not [`Sync`]. The PJRT C API only requires event implementations to
+/// support queries, awaits, and callback registrations that overlap the event's completion, not consumer calls that
+/// overlap each other. An [`Event`] can therefore be moved freely across threads but is consumed from one thread at
+/// a time, while an [`EventPromise`] can set/trigger it from any other thread.
 pub struct Event<O> {
-    /// Handle that represents this [`Event`] in the PJRT C API.
-    handle: *mut ffi::PJRT_Event,
-
-    /// State used to track the [`Future`] polling status of this [`Event`]. Specifically, this state is used to make
-    /// sure that a callback is registered for this PJRT event such that it can be used as a standard [`Future`].
+    /// Shared ownership and synchronization [`EventState`] for the underlying PJRT event.
     state: Arc<EventState>,
 
     /// "Payload" that this [`Event`] carries. Specifically, this payload will be [`Some`] throughout the lifetime of
     /// this [`Event`] and will be returned when it completes (i.e., when its underlying computation completes) via
     /// [`Event::await`] or [`Event::poll`].
     output: Option<O>,
+
+    /// Marker that keeps [`Event`] [`Send`] but not [`Sync`]. Refer to the *Thread Safety* section
+    /// of the [`Event`] documentation for more information.
+    marker: PhantomData<Cell<()>>,
 }
 
 impl<O> Event<O> {
     /// Constructs a new [`Event`] from the provided [`PJRT_Event`] handle that came from a function in the PJRT C API.
     /// The provided `output` represents a "payload" for the resulting [`Event`], that is returned when the underlying
     /// computation finishes executing (e.g., it could be a buffer that is being populated asynchronously and the event
-    /// represents the completion of the buffer population).
+    /// represents the completion of the buffer population). Events constructed through this function are not settable
+    /// because the PJRT C API only supports setting events created through `PJRT_Event_Create`. Refer to
+    /// [`Client::event`] and [`Plugin::event`] for creating settable events.
     pub(crate) unsafe fn from_c_api(handle: *mut ffi::PJRT_Event, api: Api, output: O) -> Result<Self, Error> {
+        unsafe { Self::new(handle, api, output, false) }
+    }
+
+    /// Constructs a new [`Event`] from the provided [`PJRT_Event`] handle, with `settable` indicating whether the
+    /// event was created through `PJRT_Event_Create` and can therefore be set/triggered by its owners.
+    unsafe fn new(handle: *mut ffi::PJRT_Event, api: Api, output: O, settable: bool) -> Result<Self, Error> {
         if handle.is_null() {
             Err(Error::invalid_argument("the provided PJRT event handle is a null pointer"))
         } else {
-            Ok(Self { handle, state: Arc::new(EventState { api, waker: Mutex::new(None) }), output: Some(output) })
+            Ok(Self {
+                state: Arc::new(EventState {
+                    api,
+                    handle: EventHandle(handle),
+                    settable,
+                    fulfilled: AtomicBool::new(false),
+                    future: Mutex::new(EventFutureState { callback_registered: false, waker: None }),
+                }),
+                output: Some(output),
+                marker: PhantomData,
+            })
         }
     }
 
-    /// Returns the [`PJRT_Event`](ffi::PJRT_Event) that corresponds to this [`Event`] and which can
-    /// be passed to functions in the PJRT C API.
-    pub(crate) unsafe fn to_c_api(&self) -> *mut ffi::PJRT_Event {
-        self.handle
-    }
-
-    /// Returns an [`EventHandle`] that can be used to set/trigger this [`Event`] from another thread.
-    ///
-    /// # Safety
-    ///
-    /// This function is marked as unsafe because this [`Event`] must remain alive for the lifetime of the returned
-    /// [`EventHandle`] (otherwise the latter can become invalid), but there is currently no way to enforce that.
-    pub unsafe fn handle(&self) -> EventHandle {
-        EventHandle { handle: unsafe { self.to_c_api() }, api: self.state.api }
+    /// Returns an [`EventPromise`] that can be used to set/trigger this [`Event`] from another thread. Only events
+    /// created through [`Client::event`] or [`Plugin::event`] can be set because the PJRT C API restricts
+    /// `PJRT_Event_Set` to events created through `PJRT_Event_Create`, and so this function returns an [`Error`] for
+    /// completion events returned by other PJRT APIs (e.g., buffer, execution, and transfer completion events).
+    pub fn promise(&self) -> Result<EventPromise, Error> {
+        if self.state.settable {
+            Ok(EventPromise { state: self.state.clone() })
+        } else {
+            Err(Error::invalid_argument(
+                "only events created through `Client::event` or `Plugin::event` can be set/triggered",
+            ))
+        }
     }
 
     /// Sets/triggers this [`Event`] to indicate that the work it represents has completed successfully. If an [`Error`]
@@ -63,24 +89,14 @@ impl<O> Event<O> {
     /// representing that something went wrong while executing the underlying work. Otherwise, the work will be
     /// considered successful.
     ///
-    /// # Panic
-    ///
-    /// Note that if this function is called more than once for a single [`Event`] (or if it is called for an already
-    /// fulfilled [`Event`] more generally), it may panic instead of returning an [`Error`]. This behavior, while
-    /// undesirable, unfortunately depends on the underlying PJRT [`Plugin`] implementation.
+    /// Only events created through [`Client::event`] or [`Plugin::event`] can be set (refer to the documentation of
+    /// [`Event::promise`] for more information), and each event can be set at most once because the `xla::Promise`
+    /// that backs it must be fulfilled at most once. This function returns an [`Error`] in both of these cases,
+    /// without ever reaching the underlying PJRT [`Plugin`]. Note that the single permitted set attempt is consumed
+    /// even if the underlying PJRT call reports an error, because the PJRT C API does not guarantee that a failed
+    /// `PJRT_Event_Set` left the event unfulfilled.
     pub fn set(&mut self, error: Option<Error>) -> Result<(), Error> {
-        use ffi::PJRT_Event_Set_Args;
-        let error_message = error.as_ref().map(|error| error.message());
-        invoke_pjrt_api_error_fn!(
-            self.state.api,
-            PJRT_Event_Set,
-            {
-                client = self.to_c_api(),
-                error_code = error.as_ref().map(|error| error.code()).unwrap_or(crate::errors::ffi::PJRT_Error_Code_OK),
-                error_message = error_message.as_ref().map(|message| message.as_ptr()).unwrap_or(std::ptr::null()),
-                error_message_size = error_message.as_ref().map(|message| message.count_bytes()).unwrap_or(0),
-            },
-        )
+        self.state.set(error)
     }
 
     /// Checks if the underlying computation of this [`Event`] has finished executing and returns `true` if it has and
@@ -88,13 +104,14 @@ impl<O> Event<O> {
     /// [`Event`]'s status.
     pub fn ready(&self) -> Result<bool, Error> {
         use ffi::PJRT_Event_IsReady_Args;
-        invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_IsReady, { event = self.to_c_api() }, { is_ready })
+        invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_IsReady, { event = self.state.handle.0 }, { is_ready })
     }
 
     /// Registers the provided callback to be invoked when the underlying computation of this [`Event`] finishes
     /// executing. The callback takes an optional [`Error`] as its sole argument whose value depends on whether the
-    /// underlying computation produced an error or not.
-    pub fn on_ready<F: FnOnce(Option<Error>)>(&self, callback: F) -> Result<(), Error> {
+    /// underlying computation produced an error or not. PJRT may invoke the callback on a runtime-owned thread, so
+    /// callback state must be safe to send between threads and owned for the full asynchronous lifetime.
+    pub fn on_ready<F: FnOnce(Option<Error>) + Send + 'static>(&self, callback: F) -> Result<(), Error> {
         use ffi::PJRT_Event_OnReady_Args;
 
         extern "C" fn callback_fn<F: FnOnce(Option<Error>)>(
@@ -111,7 +128,7 @@ impl<O> Event<O> {
         invoke_pjrt_api_error_fn!(
             self.state.api,
             PJRT_Event_OnReady,
-            { event = self.to_c_api(), callback = callback_fn::<F>, user_arg = callback_fn_arg as *mut _ },
+            { event = self.state.handle.0, callback = callback_fn::<F>, user_arg = callback_fn_arg as *mut _ },
         )
         .inspect_err(|_| drop(unsafe { Box::from_raw(callback_fn_arg) }))
     }
@@ -123,7 +140,7 @@ impl<O> Event<O> {
         // It is safe to force-unwrap the output option because it is always going to be `Some` unless
         // this function has been called, and this function consumes `self`.
         let mut event = self;
-        invoke_pjrt_api_error_fn!(event.state.api, PJRT_Event_Await, { event = event.handle })
+        invoke_pjrt_api_error_fn!(event.state.api, PJRT_Event_Await, { event = event.state.handle.0 })
             .map(|_| event.output.take().unwrap())
     }
 
@@ -138,7 +155,7 @@ impl<O> Event<O> {
             Err(Error::failed_precondition("`Event::ready` must return `true` for `Event::error` to be meaningful"))
         } else {
             use ffi::PJRT_Event_Error_Args;
-            Ok(invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_Error, { event = self.to_c_api() }).err())
+            Ok(invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_Error, { event = self.state.handle.0 }).err())
         }
     }
 }
@@ -159,24 +176,25 @@ impl<O> Future for Event<O> {
                 Err(_) => unreachable!(),
             },
             Ok(false) => {
-                let callback_registration_result = {
-                    let mut waker = self.state.waker.lock().unwrap();
-                    let has_registered_callback = waker.is_some();
-                    *waker = Some(cx.waker().clone());
-                    if !has_registered_callback {
-                        let data = Arc::into_raw(self.state.clone()) as *mut std::ffi::c_void;
-                        Some(self.on_ready(|_| {
-                            // We ignore the error because there is nothing we can do with it here,
-                            // and if something goes wrong, it should be reflected in [`Event::error`].
-                            let state = unsafe { Arc::from_raw(data as *const EventState) };
-                            if let Some(waker) = state.waker.lock().unwrap().take() {
-                                waker.wake();
-                            }
-                        }))
-                    } else {
-                        None
-                    }
+                let should_register_callback = {
+                    let mut future = self.state.future.lock().expect("PJRT event future state mutex poisoned");
+                    future.waker = Some(cx.waker().clone());
+                    let should_register = !future.callback_registered;
+                    future.callback_registered = true;
+                    should_register
                 };
+                let callback_registration_result = should_register_callback.then(|| {
+                    // The callback deliberately captures the whole event state: the PJRT C API does not state that
+                    // destroying an event with a registered callback that has not fired yet is legal, and so the
+                    // native event must be kept alive until the callback has been invoked.
+                    let state = self.state.clone();
+                    self.on_ready(move |_| {
+                        let waker = state.future.lock().expect("PJRT event future state mutex poisoned").waker.take();
+                        if let Some(waker) = waker {
+                            waker.wake();
+                        }
+                    })
+                });
                 match callback_registration_result {
                     Some(Ok(())) => match self.ready() {
                         Ok(true) => match self.error() {
@@ -188,7 +206,12 @@ impl<O> Future for Event<O> {
                         },
                         _ => Poll::Pending,
                     },
-                    Some(Err(error)) => Poll::Ready(Err(error)),
+                    Some(Err(error)) => {
+                        let mut future = self.state.future.lock().expect("PJRT event future state mutex poisoned");
+                        future.callback_registered = false;
+                        drop(future);
+                        Poll::Ready(Err(error))
+                    }
                     None => Poll::Pending,
                 }
             }
@@ -199,72 +222,45 @@ impl<O> Future for Event<O> {
 
 impl<O> Drop for Event<O> {
     fn drop(&mut self) {
-        use ffi::PJRT_Event_Destroy_Args;
-
-        *self.state.waker.lock().unwrap() = None;
-        invoke_pjrt_api_error_fn!(self.state.api, PJRT_Event_Destroy, { event = self.to_c_api() })
-            .expect("failed to destroy PJRT event");
-
-        // Make sure that we do not leak `self.state` if an "on-ready" callback
-        // has been registered but has not been invoked yet.
-        while Arc::strong_count(&self.state) > 1 {
-            unsafe { Arc::decrement_strong_count(&self.state) };
-        }
+        // We clear any waker registered by [`Future::poll`] so that an outstanding native "on-ready" callback does
+        // not retain a cancelled executor task indefinitely if the underlying computation never completes. The native
+        // event itself is destroyed by [`EventState`]'s [`Drop`] implementation once all owners have been dropped.
+        self.state.future.lock().expect("PJRT event future state mutex poisoned").waker = None;
     }
 }
 
-/// Handle associated with an [`Event`] that can be used to set/trigger that event from another thread, but which is
-/// inherently unsafe. Refer to the documentation of [`Event::handle`] for a comment on safety. The main feature of this
-/// struct is that it is [`Send`] and [`Sync`] while [`Event`] itself is not.
+/// Promise half of an [`Event`] that can be used to set/trigger that event from another thread (mirroring the
+/// `xla::Promise` that backs each event in the standard PJRT C API implementation). An [`EventPromise`] shares
+/// ownership of the underlying PJRT event, keeping it alive until both the [`Event`] and all of its promises have
+/// been dropped. [`EventPromise`]s can only be obtained for settable events via [`Event::promise`].
 #[derive(Clone)]
-pub struct EventHandle {
-    /// Handle that represents this [`EventHandle`] in the PJRT C API.
-    handle: *mut ffi::PJRT_Event,
-
-    /// Underlying PJRT [`Api`].
-    api: Api,
+pub struct EventPromise {
+    /// Shared ownership and synchronization state for the underlying PJRT event.
+    state: Arc<EventState>,
 }
 
-impl EventHandle {
-    /// Sets/triggers the [`Event`] associated with this [`EventHandle`] to indicate that the work it represents has
+impl EventPromise {
+    /// Sets/triggers the [`Event`] associated with this [`EventPromise`] to indicate that the work it represents has
     /// completed successfully. If an [`Error`] is provided, it will be returned when the associated [`Event`] is polled
     /// via [`Event::await`] or [`Event::poll`], representing that something went wrong while executing the underlying
     /// work. Otherwise, the work will be considered successful.
     ///
-    /// # Safety
-    ///
-    /// This function is marked as unsafe because it requires that the associated [`Event`] has not been dropped by the
-    /// time it is called, and there is no way to enforce that currently.
-    ///
-    /// # Panic
-    ///
-    /// Note that if this function is called more than once for a single [`Event`] (or if it is called for an already
-    /// fulfilled [`Event`] more generally), it may panic instead of returning an [`Error`]. This behavior, while
-    /// undesirable, unfortunately depends on the underlying PJRT [`Plugin`] implementation.
-    pub unsafe fn set(&mut self, error: Option<Error>) -> Result<(), Error> {
-        use ffi::PJRT_Event_Set_Args;
-        let error_message = error.as_ref().map(|error| error.message());
-        invoke_pjrt_api_error_fn!(
-            self.api,
-            PJRT_Event_Set,
-            {
-                client = self.handle,
-                error_code = error.as_ref().map(|error| error.code()).unwrap_or(crate::errors::ffi::PJRT_Error_Code_OK),
-                error_message = error_message.as_ref().map(|message| message.as_ptr()).unwrap_or(std::ptr::null()),
-                error_message_size = error_message.as_ref().map(|message| message.count_bytes()).unwrap_or(0),
-            },
-        )
+    /// Each event can be set at most once (across the owning [`Event`] and all of its promises) because the
+    /// `xla::Promise` that backs it must be fulfilled at most once. This function returns an [`Error`] for all
+    /// subsequent attempts, without ever reaching the underlying PJRT [`Plugin`]. Note that the single permitted set
+    /// attempt is consumed even if the underlying PJRT call reports an error, because the PJRT C API does not
+    /// guarantee that a failed `PJRT_Event_Set` left the event unfulfilled.
+    pub fn set(&mut self, error: Option<Error>) -> Result<(), Error> {
+        self.state.set(error)
     }
 }
-
-unsafe impl Send for EventHandle {}
-unsafe impl Sync for EventHandle {}
 
 impl Client<'_> {
     /// Creates a new [`Event`] that carries with it the provided `output` and can be used to track the completion of
     /// an asynchronous computation. `output` will be returned when the underlying computation completes. For example,
     /// `output` could be a buffer and the [`Event`] could be used to track when the work done to populate that buffer
-    /// is complete.
+    /// is complete. Events created through this function are the only settable events (i.e., events that can be
+    /// set/triggered via [`Event::set`] or an [`EventPromise`] obtained via [`Event::promise`]).
     pub fn event<O>(&self, output: O) -> Result<Event<O>, Error> {
         self.api().event(output)
     }
@@ -274,7 +270,8 @@ impl Plugin {
     /// Creates a new [`Event`] that carries with it the provided `output` and can be used to track the completion of
     /// an asynchronous computation. `output` will be returned when the underlying computation completes. For example,
     /// `output` could be a buffer and the [`Event`] could be used to track when the work done to populate that buffer
-    /// is complete.
+    /// is complete. Events created through this function are the only settable events (i.e., events that can be
+    /// set/triggered via [`Event::set`] or an [`EventPromise`] obtained via [`Event::promise`]).
     pub fn event<O>(&self, output: O) -> Result<Event<O>, Error> {
         self.api().event(output)
     }
@@ -284,22 +281,106 @@ impl Api {
     /// Creates a new [`Event`] that carries with it the provided `output` and can be used to track the completion of
     /// an asynchronous computation. `output` will be returned when the underlying computation completes. For example,
     /// `output` could be a buffer and the [`Event`] could be used to track when the work done to populate that buffer
-    /// is complete.
+    /// is complete. Events created through this function are the only settable events (i.e., events that can be
+    /// set/triggered via [`Event::set`] or an [`EventPromise`] obtained via [`Event::promise`]).
     pub(crate) fn event<O>(&self, output: O) -> Result<Event<O>, Error> {
         use ffi::PJRT_Event_Create_Args;
+        // Events created through `PJRT_Event_Create` are the only events that the PJRT C API allows to be
+        // set/triggered, and so this is the only settable [`Event`] construction site.
         invoke_pjrt_api_error_fn!(*self, PJRT_Event_Create, {}, { event })
-            .and_then(|handle| unsafe { Event::from_c_api(handle, *self, output) })
+            .and_then(|handle| unsafe { Event::new(handle, *self, output, true) })
     }
 }
 
-/// State used to track the [`Future`] polling status of an [`Event`]. Specifically, this state is used to make sure
-/// that a callback is registered for the corresponding PJRT event such that it can be used as a standard [`Future`].
+/// Raw PJRT event handle whose ownership is managed by [`EventState`]. This private wrapper narrows the concurrency
+/// requirements described in the safety comment below to the raw pointer so that [`Event`] and [`EventPromise`]
+/// obtain [`Send`] and [`Sync`] structurally.
+#[derive(Copy, Clone)]
+struct EventHandle(*mut ffi::PJRT_Event);
+
+// SAFETY: The PJRT C API does not state a blanket thread-safety guarantee for events, but its event semantics require
+// queries, awaits, and callback registrations to tolerate overlapping the event's completion: `PJRT_Event_Await`
+// blocks the calling thread until the event is made ready by work completing elsewhere (a PJRT runtime thread, or a
+// `PJRT_Event_Set` call from another thread), and `PJRT_Event_OnReady` callbacks are invoked from whichever thread
+// completes the event. These implementations expose exactly that concurrency and nothing more: consumer-side native
+// calls are serialized because [`Event`] is deliberately [`Send`] but not [`Sync`], the sole caller-driven completion
+// (`PJRT_Event_Set`) is limited to at most one native call through [`EventState::fulfilled`], and destruction is
+// exclusive because it only happens once all owners have been dropped.
+unsafe impl Send for EventHandle {}
+unsafe impl Sync for EventHandle {}
+
+/// Shared state that owns the native PJRT event on behalf of an [`Event`] and all of its [`EventPromise`]s, destroying
+/// that native event when the last owner is dropped.
 struct EventState {
     /// Underlying PJRT [`Api`].
     api: Api,
 
-    /// [`Waker`] registered for the corresponding [`Event`] in its last [`Event::poll`] invocation.
-    waker: Mutex<Option<Waker>>,
+    /// Raw handle for the underlying native PJRT event.
+    handle: EventHandle,
+
+    /// Indicates whether this event can be set/triggered by its owners. The PJRT C API restricts `PJRT_Event_Set` to
+    /// events created through `PJRT_Event_Create`; completion events adopted from other PJRT APIs are completed by
+    /// the PJRT runtime and must never be set by the caller.
+    settable: bool,
+
+    /// Indicates whether a set/trigger attempt has already been made through [`EventState::set`]. The `xla::Promise`
+    /// backing a created event must be fulfilled at most once and its check-then-fulfill sequence is not atomic, so
+    /// this flag rejects concurrent and repeated set attempts before they reach the PJRT C API. It is never cleared
+    /// once claimed — not even when the native call reports an error — because the PJRT C API does not guarantee
+    /// that a failed `PJRT_Event_Set` left the event unfulfilled.
+    fulfilled: AtomicBool,
+
+    /// State used to integrate the event with Rust's [`Future`] protocol.
+    future: Mutex<EventFutureState>,
+}
+
+impl EventState {
+    fn set(&self, error: Option<Error>) -> Result<(), Error> {
+        use ffi::PJRT_Event_Set_Args;
+        if !self.settable {
+            return Err(Error::invalid_argument(
+                "only events created through `Client::event` or `Plugin::event` can be set/triggered",
+            ));
+        }
+        // The first set attempt consumes this flag permanently, even if the native call below reports an error,
+        // because the PJRT C API does not guarantee that a failed `PJRT_Event_Set` left the event unfulfilled and a
+        // retry could then fulfill the backing `xla::Promise` twice.
+        if self.fulfilled.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return Err(Error::failed_precondition("the event has already been set"));
+        }
+        let error_message = error.as_ref().map(|error| error.message());
+        invoke_pjrt_api_error_fn!(
+            self.api,
+            PJRT_Event_Set,
+            {
+                client = self.handle.0,
+                error_code = error.as_ref().map(|error| error.code()).unwrap_or(crate::errors::ffi::PJRT_Error_Code_OK),
+                error_message = error_message.as_ref().map(|message| message.as_ptr()).unwrap_or(std::ptr::null()),
+                error_message_size = error_message.as_ref().map(|message| message.count_bytes()).unwrap_or(0),
+            },
+        )
+    }
+}
+
+impl Drop for EventState {
+    fn drop(&mut self) {
+        use ffi::PJRT_Event_Destroy_Args;
+        invoke_pjrt_api_error_fn!(self.api, PJRT_Event_Destroy, { event = self.handle.0 })
+            .expect("failed to destroy PJRT event");
+    }
+}
+
+/// State used to track the [`Future`] polling status of an [`Event`]. Specifically, this state is used to make sure
+/// that a waker-invoking callback is registered for the corresponding PJRT event such that the event can be used as a
+/// standard [`Future`].
+struct EventFutureState {
+    /// Indicates whether a native "on-ready" callback that wakes [`EventFutureState::waker`] has already been
+    /// registered for the corresponding PJRT event. This is reset to `false` when a registration attempt fails so
+    /// that a later [`Event::poll`] invocation can retry the registration.
+    callback_registered: bool,
+
+    /// [`Waker`] provided by the most recent [`Event::poll`] invocation.
+    waker: Option<Waker>,
 }
 
 /// Event that can be used to tell PJRT [`Client`]s about asynchronous actions outside of PJRT. [`AsyncTrackingEvent`]s
@@ -558,13 +639,24 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use futures::executor::block_on;
 
     use crate::tests::test_cpu_client;
     use crate::{Error, Event};
 
+    fn assert_send<T: Send>() {}
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
     #[test]
     fn test_event() {
+        // [`Event`] is deliberately [`Send`] but not [`Sync`] (refer to its *Thread Safety* documentation section).
+        assert_send::<Event<()>>();
+        assert_send_sync::<super::EventPromise>();
+
         // Test [`Client::event`].
         let client = test_cpu_client();
         assert!(client.event(42i64).is_ok());
@@ -574,23 +666,29 @@ mod tests {
 
         // Test [`Event::set`], [`Event::ready`], [`Event::on_ready`], and [`Event::error`].
         let error = Error::aborted("Test");
-        let mut has_error = false;
+        let has_error = Arc::new(AtomicBool::new(false));
         let mut event = client.event(42i64).unwrap();
-        assert!(event.on_ready(|error| { has_error = error.is_some() }).is_ok());
+        let callback_has_error = has_error.clone();
+        assert!(event.on_ready(move |error| callback_has_error.store(error.is_some(), Ordering::Relaxed)).is_ok());
         assert_eq!(event.ready(), Ok(false));
-        assert_eq!(has_error, false);
+        assert!(!has_error.load(Ordering::Relaxed));
         assert!(event.set(None).is_ok());
         assert_eq!(event.ready(), Ok(true));
-        assert_eq!(has_error, false);
+        assert!(!has_error.load(Ordering::Relaxed));
+
+        // Test that events can be set at most once, across the event itself and all of its promises.
+        assert!(matches!(event.set(None), Err(Error::FailedPrecondition { .. })));
+        assert!(matches!(event.promise().unwrap().set(None), Err(Error::FailedPrecondition { .. })));
 
         // Test [`Event::set`], [`Event::ready`], [`Event::on_ready`], and [`Event::error`] with an error.
         let mut event = client.event("test").unwrap();
-        assert!(event.on_ready(|error| { has_error = error.is_some() }).is_ok());
+        let callback_has_error = has_error.clone();
+        assert!(event.on_ready(move |error| callback_has_error.store(error.is_some(), Ordering::Relaxed)).is_ok());
         assert_eq!(event.ready(), Ok(false));
-        assert_eq!(has_error, false);
+        assert!(!has_error.load(Ordering::Relaxed));
         assert!(event.set(Some(error.clone())).is_ok());
         assert_eq!(event.ready(), Ok(true));
-        assert_eq!(has_error, true);
+        assert!(has_error.load(Ordering::Relaxed));
         let event_error = event.error().unwrap();
         assert!(event_error.is_some());
         let event_error = event_error.unwrap();
@@ -598,21 +696,22 @@ mod tests {
         assert_eq!(event_error.message(), error.message());
 
         // Test [`Event::await`].
-        let mut has_invoked_callback = false;
+        let has_invoked_callback = Arc::new(AtomicBool::new(false));
         let event = client.event(42i64).unwrap();
-        assert!(event.on_ready(|_| has_invoked_callback = true).is_ok());
-        assert_eq!(has_invoked_callback, false);
+        let callback_invoked = has_invoked_callback.clone();
+        assert!(event.on_ready(move |_| callback_invoked.store(true, Ordering::Relaxed)).is_ok());
+        assert!(!has_invoked_callback.load(Ordering::Relaxed));
         assert_eq!(event.ready(), Ok(false));
 
-        let mut event_handle = unsafe { event.handle() };
+        let mut event_promise = event.promise().unwrap();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(unsafe { event_handle.set(None) }.is_ok());
+            assert!(event_promise.set(None).is_ok());
         });
 
-        assert_eq!(has_invoked_callback, false);
+        assert!(!has_invoked_callback.load(Ordering::Relaxed));
         assert_eq!(event.r#await(), Ok(42i64));
-        assert_eq!(has_invoked_callback, true);
+        assert!(has_invoked_callback.load(Ordering::Relaxed));
 
         // Test creating an [`Event`] from a null pointer.
         assert!(matches!(
@@ -623,27 +722,41 @@ mod tests {
     }
 
     #[test]
+    fn test_event_promise_keeps_event_and_callback_alive_across_threads() {
+        let client = test_cpu_client();
+        let event = client.event(()).unwrap();
+        let mut promise = event.promise().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        event.on_ready(move |error| sender.send(error).unwrap()).unwrap();
+        drop(event);
+
+        std::thread::spawn(move || promise.set(None).unwrap()).join().unwrap();
+        assert!(receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap().is_none());
+    }
+
+    #[test]
     fn test_event_future() {
         let client = test_cpu_client();
-        let mut has_invoked_callback = false;
+        let has_invoked_callback = Arc::new(AtomicBool::new(false));
         let mut event = client.event(42i64).unwrap();
-        assert!(event.on_ready(|_| has_invoked_callback = true).is_ok());
-        assert_eq!(has_invoked_callback, false);
+        let callback_invoked = has_invoked_callback.clone();
+        assert!(event.on_ready(move |_| callback_invoked.store(true, Ordering::Relaxed)).is_ok());
+        assert!(!has_invoked_callback.load(Ordering::Relaxed));
         assert_eq!(event.ready(), Ok(false));
 
-        let mut event_handle = unsafe { event.handle() };
+        let mut event_promise = event.promise().unwrap();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            assert!(unsafe { event_handle.set(None) }.is_ok());
+            assert!(event_promise.set(None).is_ok());
         });
 
-        assert_eq!(has_invoked_callback, false);
+        assert!(!has_invoked_callback.load(Ordering::Relaxed));
         assert_eq!(block_on(&mut event), Ok(42i64));
 
         // Adding a short "sleep" to make sure that the "on-ready" callback is invoked before the next check.
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        assert_eq!(has_invoked_callback, true);
+        assert!(has_invoked_callback.load(Ordering::Relaxed));
         assert_eq!(event.ready(), Ok(true));
     }
 

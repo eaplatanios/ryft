@@ -12,10 +12,8 @@
 //! every operation is implemented with straightforward index arithmetic. Do not use them outside of tests and
 //! documentation examples.
 //!
-//! This module is compiled only for `ryft-core`'s own tests and behind the `test-utilities` feature. Downstream
-//! crates should enable that feature from their dev-dependencies (e.g.,
-//! `ryft-core = { workspace = true, features = ["test-utilities"] }`) so that the module is available to their tests
-//! without entering production builds.
+//! The module is part of `ryft-core`'s public API so downstream tests and documentation examples can use it without
+//! feature configuration.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;

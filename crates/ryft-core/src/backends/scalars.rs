@@ -2,14 +2,11 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt::Display;
 
-#[cfg(any(test, feature = "test-utilities"))]
 use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
 use ryft_macros::Parameter;
 
-#[cfg(test)]
-use crate::contexts::Context;
 use crate::contexts::EagerContext;
 use crate::operations::arithmetic::{Abs, Add, Div, Mul, Neg, Sub};
 use crate::operations::compare::{Compare, ComparisonDirection};
@@ -219,7 +216,6 @@ impl_partial_eq_primitive_for_scalar!(f64, F64);
 impl_partial_eq_primitive_for_scalar!(Complex<f32>, C64);
 impl_partial_eq_primitive_for_scalar!(Complex<f64>, C128);
 
-#[cfg(any(test, feature = "test-utilities"))]
 impl Scalar {
     /// Returns the exactly widened floating-point payload backing the [`approx::AbsDiffEq`] implementations below,
     /// or `None` for a variant that carries no real floating-point payload (Booleans, integers, and complex values).
@@ -248,7 +244,6 @@ impl Scalar {
 /// `assert_abs_diff_eq!(gradient, expected, epsilon = 1e-9)` where `gradient` is a [`Scalar`]). A floating-point
 /// variant compares its exactly widened payload within `epsilon`, while a variant with no real floating-point
 /// payload (a Boolean, integer, or complex value) is never approximately equal to a bare `f64`.
-#[cfg(any(test, feature = "test-utilities"))]
 impl AbsDiffEq<f64> for Scalar {
     type Epsilon = f64;
 
@@ -269,7 +264,6 @@ impl AbsDiffEq<f64> for Scalar {
 /// [`Scalar::F32`] against a [`Scalar::F64`]), two complex variants compare their exactly widened payloads
 /// componentwise within `epsilon` (both the real and the imaginary parts must be close), and any other pairing falls
 /// back to exact [`PartialEq`] equality, which is the only equality Booleans and integers define.
-#[cfg(any(test, feature = "test-utilities"))]
 impl AbsDiffEq for Scalar {
     type Epsilon = f64;
 
@@ -919,6 +913,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::contexts::Context;
     use crate::operations::constants::{OneOperation, ZeroOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;

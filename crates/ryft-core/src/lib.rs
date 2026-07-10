@@ -18,13 +18,11 @@ pub mod parameters;
 pub mod partial;
 pub mod programs;
 pub mod sharding;
+pub mod tests;
 pub mod tracing;
 pub mod tracing_v2;
 pub mod types;
 pub mod utilities;
-
-#[cfg(any(test, feature = "test-utilities"))]
-pub mod tests;
 
 // TODO(eaplatanios): Make all of the following more specific.
 pub use axes::{AxisError, AxisIndex, NamedAxes, NamedAxis};
