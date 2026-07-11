@@ -12,7 +12,7 @@ use lru::LruCache;
 
 use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
-use crate::macros::check_builders;
+use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::constants::Constant;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
@@ -547,8 +547,6 @@ impl<
             .cloned()
             .map(|capture| context.capture(capture))
             .collect::<Result<Vec<_>, _>>()?;
-        self.state.source_program.validate_capture_inputs(capture_references.as_slice())?;
-
         let mut flat_inputs = capture_references
             .into_iter()
             .map(|capture| context.constant(capture))
@@ -593,7 +591,21 @@ impl<
         C: Context<Type = D::Type, Value = V, Constant = D::Constant, Operation = D::Operation>
             + Constant<V, D::Constant>,
     {
-        self.state.source_program.validate_capture_inputs(capture_references)?;
+        // Capture-reference indices belong to the caller's capture table and may differ from the source program's
+        // local indices, and so only positional arity and types can be validated against the source program's
+        // encapsulated capture table.
+        let captures = self.state.source_program.captures();
+        check_count!("input", capture_references, captures.len(), ProgramError);
+        for (index, (expected, actual)) in captures.iter().zip(capture_references).enumerate() {
+            let expected_type = expected.r#type();
+            let actual_type = actual.r#type();
+            if expected_type.as_ref() != actual_type.as_ref() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "capture input #{index} has type {}, but capture #{index} has type {}",
+                    actual_type, expected_type,
+                )));
+            }
+        }
         let mut flat_inputs = capture_references
             .iter()
             .cloned()

@@ -21,7 +21,7 @@ use crate::operations::Operation;
 use crate::operations::constants::Zero;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{Atom, AtomId, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::{ArrayType, Type, Typed};
 
@@ -241,8 +241,6 @@ impl<
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<
     V: Value,
     O: Clone,
@@ -268,55 +266,7 @@ impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Param
     }
 }
 
-impl<
-    V: Value,
-    O: Operation<V::Type>,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> ClosedProgram<V, O, Input, Output>
-{
-    /// Validates capture references that will be supplied as the leading inputs of an opened captured program.
-    ///
-    /// Capture input indices belong to the caller's capture table and may differ from this program's local capture
-    /// indices. This validates the positional arity and types that matter after captures are opened as leading flat
-    /// inputs.
-    pub fn validate_capture_inputs(&self, capture_inputs: &[CaptureReference<V::Type>]) -> Result<(), ProgramError> {
-        check_count!("input", capture_inputs, self.captures.len(), ProgramError);
-        for (index, (expected, actual)) in self.captures.iter().zip(capture_inputs).enumerate() {
-            let expected_type = expected.r#type();
-            let actual_type = actual.r#type();
-            if expected_type.as_ref() != actual_type.as_ref() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "capture input #{index} has type {}, but capture #{index} has type {}",
-                    actual_type, expected_type,
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Interprets this captured program by resolving captured constants through its capture table.
-    pub fn interpret_with_captures<
-        RuntimeValue: Clone,
-        Error: From<ProgramError>,
-        LiftCapture: FnMut(usize, &V) -> Result<RuntimeValue, Error>,
-        InterpretInstruction: FnMut(&Instruction<O>, &[RuntimeValue]) -> Result<Vec<RuntimeValue>, Error>,
-    >(
-        &self,
-        inputs: Vec<RuntimeValue>,
-        mut lift_capture: LiftCapture,
-        interpret_instruction: InterpretInstruction,
-    ) -> Result<Vec<RuntimeValue>, Error> {
-        self.program.interpret_with(
-            inputs,
-            |_, capture_reference| {
-                let capture = &self.captures[capture_reference.index()];
-                lift_capture(capture_reference.index(), capture)
-            },
-            interpret_instruction,
-        )
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value,
@@ -406,24 +356,39 @@ impl<
     Output: Parameterized<CaptureReference<V::Type>>,
 > ClosedProgram<V, O, Input, Output>
 {
-    /// Rebuilds this program with its capture table replaced by `rebuilt_captures` and every
-    /// [`CaptureReference`] reindexed through `capture_index_map`.
+    /// Removes captures that no atom references and reindexes the survivors into a contiguous capture table.
     ///
-    /// The program structure (inputs, instructions, and outputs) is preserved; only constant atoms are rewritten. A
-    /// surviving [`CaptureReference`] at source index `source` becomes a reference to `capture_index_map[source]`.
-    /// Callers must supply a map that assigns a rebuilt index to every capture still referenced by the program, and
-    /// order `rebuilt_captures` to match those indices. Constant atoms whose source index maps to [`None`] must be
-    /// unreachable (no atom may reference a dropped capture); reaching one is a malformed-program error.
-    fn reindex_captures(
-        &self,
-        capture_index_map: &[Option<usize>],
-        rebuilt_captures: Vec<V>,
-    ) -> Result<Self, ProgramError> {
+    /// This is dead-capture elimination: any capture whose index never appears in an [`Atom::Constant`] is dropped,
+    /// and the remaining captures are renumbered to occupy `0..captures().len()` in their original relative order.
+    /// The program structure (i.e., inputs, instructions, and outputs) is preserved and only constant atoms are
+    /// rewritten to carry their new indices, so the returned program upholds the construction-time capture-table
+    /// invariant of [`new`](Self::new) with a contiguous capture table.
+    pub fn prune_unused_captures(&self) -> Result<Self, ProgramError> {
+        // First pass: assign each *referenced* capture a slot in the rebuilt capture table, in first-reference order.
+        // Captures whose index never appears in a constant atom get no slot and are thereby dropped. Indexing into
+        // `self.captures` cannot fail because `new` validated every capture reference at construction time.
+        let mut capture_index_map = vec![None; self.captures.len()];
+        let mut rebuilt_captures = Vec::new();
+        for atom in self.program.atoms() {
+            let Atom::Constant(capture_reference) = atom else {
+                continue;
+            };
+            let source_index = capture_reference.index();
+            if capture_index_map[source_index].is_none() {
+                capture_index_map[source_index] = Some(rebuilt_captures.len());
+                rebuilt_captures.push(self.captures[source_index].clone());
+            }
+        }
+
+        // Second pass: rebuild the program with the same structure, rewriting only the constant atoms. `mapped_atoms`
+        // tracks the rebuilt [`AtomId`] of every source atom so that an atom shared across instructions maps to a
+        // single rebuilt atom instead of being duplicated.
         let mut builder = ProgramBuilder::new();
         let mut mapped_atoms = vec![None; self.program.atoms().len()];
 
         // Materializes the rebuilt atom identifier for `atom_id`, lazily re-adding referenced capture constants with
-        // their reindexed reference so atoms shared across instructions map to a single rebuilt constant.
+        // their reindexed references. The slot lookup cannot fail because the first pass assigned a slot to every
+        // capture referenced by any constant atom in the table.
         let map_atom = |builder: &mut ProgramBuilder<CaptureReference<V::Type>, O>,
                         mapped_atoms: &mut [Option<AtomId>],
                         atom_id: AtomId|
@@ -433,26 +398,7 @@ impl<
             }
             match self.program.atoms().get(atom_id.index()) {
                 Some(Atom::Constant(capture_reference)) => {
-                    let rebuilt_index =
-                        capture_index_map.get(capture_reference.index()).copied().flatten().ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "captured constant atom {atom_id} references capture #{} that has no reindexed slot",
-                                capture_reference.index(),
-                            ))
-                        })?;
-                    let rebuilt_capture = rebuilt_captures.get(rebuilt_index).ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!(
-                            "captured constant atom {atom_id} maps to missing capture #{rebuilt_index}",
-                        ))
-                    })?;
-                    if capture_reference.r#type().as_ref() != rebuilt_capture.r#type().as_ref() {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "captured constant atom {atom_id} has type {}, \
-                             but its reindexed capture #{rebuilt_index} has type {}",
-                            capture_reference.r#type(),
-                            rebuilt_capture.r#type(),
-                        )));
-                    }
+                    let rebuilt_index = capture_index_map[capture_reference.index()].unwrap();
                     let mapped = builder
                         .add_constant(CaptureReference::new(rebuilt_index, capture_reference.r#type().into_owned()));
                     mapped_atoms[atom_id.index()] = Some(mapped);
@@ -465,6 +411,8 @@ impl<
             }
         };
 
+        // Program inputs must be re-added before any instruction is replayed so that instruction operands referencing
+        // them resolve through `mapped_atoms` instead of being treated as unmapped atoms.
         for input_id in self.program.input_ids().iter().copied() {
             let input =
                 self.program.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
@@ -474,6 +422,8 @@ impl<
             mapped_atoms[input_id.index()] = Some(builder.add_input(input_type.clone()));
         }
 
+        // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so later
+        // instructions (and the program outputs) can resolve them.
         for instruction in self.program.instructions() {
             let inputs = instruction
                 .inputs()
@@ -491,6 +441,8 @@ impl<
             }
         }
 
+        // Program outputs may be inputs, instruction outputs, or captured constants, and so they are resolved through
+        // the same atom mapping as instruction operands.
         let output_ids = self
             .program
             .output_ids()
@@ -503,101 +455,15 @@ impl<
             self.program.input_structure().clone(),
             self.program.output_structure().clone(),
         )?;
+
+        // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, rebuilt_captures)
-    }
-
-    /// Removes captures that no atom references and reindexes the survivors into a contiguous capture table.
-    ///
-    /// This is dead-capture elimination: any capture whose index never appears in an [`Atom::Constant`] is dropped, and
-    /// the remaining captures are renumbered to occupy `0..captures().len()` in their original relative order. Every
-    /// surviving [`CaptureReference`] is rewritten to its new index, so the returned program upholds the
-    /// construction-time capture-table invariant of [`new`](Self::new) with a contiguous capture table. The pass is
-    /// unconditional: it needs only `V: Clone` and `O: Clone`, never an equality comparison on capture values.
-    pub fn prune_unused_captures(&self) -> Result<Self, ProgramError> {
-        let mut capture_index_map = vec![None; self.captures.len()];
-        let mut rebuilt_captures = Vec::new();
-        for atom in self.program.atoms() {
-            let Atom::Constant(capture_reference) = atom else {
-                continue;
-            };
-            let source_index = capture_reference.index();
-            if capture_index_map.get(source_index).copied().flatten().is_some() {
-                continue;
-            }
-            let capture = self.captures.get(source_index).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "captured constant atom references missing capture #{source_index}",
-                ))
-            })?;
-            capture_index_map[source_index] = Some(rebuilt_captures.len());
-            rebuilt_captures.push(capture.clone());
-        }
-        self.reindex_captures(capture_index_map.as_slice(), rebuilt_captures)
-    }
-
-    /// Merges captures that hold equal values into a single capture and reindexes the survivors contiguously.
-    ///
-    /// Captures comparing equal under [`PartialEq`] are collapsed to one entry: every [`CaptureReference`] to a
-    /// duplicate is rewritten to the first (canonical) capture that holds that value, and the surviving captures are
-    /// renumbered to `0..captures().len()`. The meaningful case is the *same runtime value captured more than once* —
-    /// for example, a closed-over buffer referenced by several operations — which this pass deduplicates so the
-    /// compiled function carries and transfers it only once. Captures that are never referenced are also dropped (a
-    /// duplicate of an unused value still collapses to its first occurrence, which itself survives only if referenced),
-    /// and the returned program upholds the construction-time capture-table invariant of [`new`](Self::new).
-    ///
-    /// # Capture-value equality
-    ///
-    /// Deduplication is only as correct and cheap as the value type's [`PartialEq`]. It is intended for value types
-    /// whose equality is a cheap identity/handle comparison; types whose equality forces an expensive materialization
-    /// (for example, reading a device buffer back to the host to compare element data) should not be deduplicated this
-    /// way. The bound is therefore opt-in: value types that do not implement [`PartialEq`] simply cannot call this
-    /// pass, whereas [`prune_unused_captures`](Self::prune_unused_captures) stays available unconditionally.
-    pub fn deduplicate_captures(&self) -> Result<Self, ProgramError>
-    where
-        V: PartialEq,
-    {
-        let mut capture_index_map = vec![None; self.captures.len()];
-        let mut rebuilt_captures: Vec<V> = Vec::new();
-        for atom in self.program.atoms() {
-            let Atom::Constant(capture_reference) = atom else {
-                continue;
-            };
-            let source_index = capture_reference.index();
-            if capture_index_map.get(source_index).copied().flatten().is_some() {
-                continue;
-            }
-            let capture = self.captures.get(source_index).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "captured constant atom references missing capture #{source_index}",
-                ))
-            })?;
-            // Value equality alone is insufficient: a value representation may deliberately compare equal across
-            // distinct runtime types. Only captures with equal values *and* equal types are interchangeable.
-            let capture_type = capture.r#type();
-            let rebuilt_index = match rebuilt_captures
-                .iter()
-                .position(|existing| existing.r#type().as_ref() == capture_type.as_ref() && existing == capture)
-            {
-                Some(existing_index) => existing_index,
-                None => {
-                    rebuilt_captures.push(capture.clone());
-                    rebuilt_captures.len() - 1
-                }
-            };
-            capture_index_map[source_index] = Some(rebuilt_index);
-        }
-        self.reindex_captures(capture_index_map.as_slice(), rebuilt_captures)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
-    use std::fmt::{Display, Formatter};
-
     use pretty_assertions::assert_eq;
-
-    use ryft_macros::Parameter;
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
@@ -609,52 +475,6 @@ mod tests {
     use crate::types::{DataType, TypeError};
 
     use super::*;
-
-    /// Test value whose equality deliberately ignores its runtime type. It verifies that capture deduplication treats
-    /// type equality as a separate part of capture interchangeability instead of trusting value equality alone.
-    #[derive(Clone, Debug, Parameter)]
-    struct TypeBlindCapture {
-        identity: usize,
-        r#type: DataType,
-    }
-
-    impl PartialEq for TypeBlindCapture {
-        #[inline]
-        fn eq(&self, other: &Self) -> bool {
-            self.identity == other.identity
-        }
-    }
-
-    impl Display for TypeBlindCapture {
-        #[inline]
-        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "capture({})", self.identity)
-        }
-    }
-
-    impl Typed for TypeBlindCapture {
-        type Type = DataType;
-
-        #[inline]
-        fn r#type(&self) -> Cow<'_, DataType> {
-            Cow::Borrowed(&self.r#type)
-        }
-    }
-
-    impl Value for TypeBlindCapture {
-        type DispatchDomain = EagerContext<Self>;
-        type ExecutionDomain = EagerContext<Self>;
-
-        #[inline]
-        fn dispatch_domain(&self) -> EagerContext<Self> {
-            EagerContext::new()
-        }
-
-        #[inline]
-        fn execution_domain(&self) -> EagerContext<Self> {
-            EagerContext::new()
-        }
-    }
 
     #[derive(Clone, Debug)]
     struct TestAddOperation;
@@ -691,21 +511,6 @@ mod tests {
             )
             .unwrap();
         ClosedProgram::new(program, vec![Scalar::from(3.0)]).unwrap()
-    }
-
-    #[test]
-    fn test_closed_program_interprets_through_capture_table() {
-        let program = closed_add_program();
-
-        let output = program
-            .interpret_with_captures(
-                vec![Scalar::from(2.0)],
-                |_, capture| Ok::<_, ProgramError>(*capture),
-                |instruction, inputs| instruction.operation().interpret(&EagerContext::<Scalar>::new(), inputs),
-            )
-            .unwrap();
-
-        assert_eq!(output, vec![5.0]);
     }
 
     #[test]
@@ -790,70 +595,13 @@ mod tests {
         assert_eq!(capture_indices, vec![0]);
 
         let output = pruned
-            .interpret_with_captures(
+            .program()
+            .interpret_with(
                 vec![Scalar::from(2.0)],
-                |_, capture| Ok::<_, ProgramError>(*capture),
+                |_, reference| Ok::<_, ProgramError>(pruned.captures()[reference.index()]),
                 |instruction, inputs| instruction.operation().interpret(&EagerContext::<Scalar>::new(), inputs),
             )
             .unwrap();
         assert_eq!(output, vec![101.0]);
-    }
-
-    #[test]
-    fn test_deduplicate_captures_merges_equal_captures() {
-        // Both captures hold the same value (7) and are referenced by two distinct constant atoms.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
-        let first = builder.add_constant(CaptureReference::new(0, DataType::I64));
-        let second = builder.add_constant(CaptureReference::new(1, DataType::I64));
-        let output = builder.add_instruction(TestAddOperation, vec![first, second]).unwrap()[0];
-        let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
-                vec![output],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder],
-            )
-            .unwrap();
-        let program = ClosedProgram::new(program, vec![Scalar::from(7_i64), Scalar::from(7_i64)]).unwrap();
-
-        let deduplicated = program.deduplicate_captures().unwrap();
-
-        // The two equal captures collapse to one entry and both atoms reference the canonical index 0.
-        assert_eq!(deduplicated.captures(), &[7_i64]);
-        let capture_indices = deduplicated
-            .program()
-            .atoms()
-            .iter()
-            .filter_map(|atom| atom.as_constant().map(|reference| reference.index()))
-            .collect::<Vec<_>>();
-        assert_eq!(capture_indices, vec![0, 0]);
-
-        // Equal values of different types are not interchangeable and therefore remain separate captures.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
-        let floating = builder.add_constant(CaptureReference::new(0, DataType::F64));
-        let integer = builder.add_constant(CaptureReference::new(1, DataType::I64));
-        let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
-                vec![floating, integer],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder, Placeholder],
-            )
-            .unwrap();
-        let closed_program = ClosedProgram::new(
-            program,
-            vec![
-                TypeBlindCapture { identity: 7, r#type: DataType::F64 },
-                TypeBlindCapture { identity: 7, r#type: DataType::I64 },
-            ],
-        )
-        .unwrap();
-        let deduplicated = closed_program.deduplicate_captures().unwrap();
-        assert_eq!(deduplicated.captures().len(), 2);
-        let capture_indices = deduplicated
-            .program()
-            .atoms()
-            .iter()
-            .filter_map(|atom| atom.as_constant().map(CaptureReference::index))
-            .collect::<Vec<_>>();
-        assert_eq!(capture_indices, vec![0, 1]);
     }
 }
