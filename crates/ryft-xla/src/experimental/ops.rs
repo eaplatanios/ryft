@@ -45,10 +45,10 @@ use ryft_core::partial::{
 use ryft_core::programs::{MaybeZero, Program, ProgramBuilder, ProgramError, Value};
 use ryft_core::tracing::{Tracer, TracingContext};
 
+use ryft_core::backends::scalars::Scalar;
 use ryft_core::differentiation::DifferentiationDual;
 use ryft_core::operations::debugging::PrintOperation;
 use ryft_core::operations::tag::TagOperation;
-use ryft_core::scalars::Scalar;
 use ryft_core::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };

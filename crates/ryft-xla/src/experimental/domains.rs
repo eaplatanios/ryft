@@ -1,12 +1,19 @@
+use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::path::PathBuf;
-use std::sync::{Arc, LazyLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::{Duration, Instant};
 
+use prost::Message;
 use ryft_pjrt::protos::CompilationOptions;
-use ryft_pjrt::{Buffer, Client, LoadedExecutable, Program as PjrtProgram};
+use ryft_pjrt::{Buffer, Client, Execution, LoadOptions, LoadedExecutable, Program as PjrtProgram, Value as PjrtValue};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use ryft_core::compilation::{CompilationContext, CompilationDomain};
+use ryft_core::backends::scalars::Scalar;
+use ryft_core::compilation::{AnalyzableCompilationDomain, CompilationContext, CompilationDomain, DiskCache};
 use ryft_core::contexts::{Context, Domain};
 use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
@@ -21,11 +28,15 @@ use ryft_core::operations::constants::{
 use ryft_core::operations::control_flow::SelectOperation;
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
-use ryft_core::scalars::Scalar;
-use ryft_core::sharding::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
+use ryft_core::sharding::{
+    Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+};
 use ryft_core::tracing::DomainTracer;
 use ryft_core::tracing_v2::CoordinateBasis;
-use ryft_core::types::{ArrayType, DataType, Shape, Type, TypeError, Typed};
+use ryft_core::types::{
+    ArrayType, DataType, Layout, Memory, Shape, Size, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError,
+    Typed,
+};
 
 use super::operations::ShardMapOperation;
 use super::ops::{FlatXlaProgram, JitCallOperation, XlaConstant, XlaOperation, XlaProgramBuilder};
@@ -66,6 +77,14 @@ pub enum XlaDomainError {
     /// doesn't match the number of flat inputs.
     #[error("invalid compilation options: {reason}")]
     InvalidCompilationOptions { reason: String },
+
+    /// Error surfaced while encoding or decoding persistent compilation metadata.
+    #[error("invalid persistent XLA executable: {reason}")]
+    InvalidPersistentExecutable { reason: String },
+
+    /// Error surfaced while normalizing backend analysis data.
+    #[error("invalid XLA compilation analysis: {reason}")]
+    InvalidCompilationAnalysis { reason: String },
 }
 
 /// Stateful backend that materializes, lowers, compiles, and executes traced XLA programs
@@ -168,6 +187,19 @@ impl<'c> XlaDomain<'c> {
             cache: Arc::new(cache),
             marker: PhantomData,
         })
+    }
+
+    /// Creates a new [`XlaDomain`] using an already configured persistent [`DiskCache`]. This is the constructor to
+    /// use when callers need explicit capacity or write thresholds rather than [`Self::with_disk_cache`]'s defaults.
+    #[inline]
+    pub fn with_configured_disk_cache(client: &'c Client<'c>, disk_cache: DiskCache) -> Self {
+        Self {
+            client: Some(client),
+            mesh: None,
+            compilation_options: CompilationOptions::default(),
+            cache: Arc::new(CompilationContext::new().with_configured_disk_cache(disk_cache)),
+            marker: PhantomData,
+        }
     }
 
     /// Creates a new [`XlaDomain`] whose compile cache also writes through to a
@@ -884,6 +916,61 @@ fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<Shar
 // CompilationDomain implementation
 // ---------------------------------------------------------------------------
 
+/// Opaque XLA feedback-directed optimization profile used for profile-guided latency estimation.
+///
+/// XLA defines the binary payload consumed by `ExecutableCompilationOptions::fdo_profile`; Ryft intentionally does
+/// not reinterpret it. Profiles are compiler- and program-specific. Supplying one changes exact, persistent, and
+/// distributed compilation identity because its bytes are encoded in the canonical compilation options.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct XlaFeedbackDirectedProfile {
+    bytes: Arc<[u8]>,
+    version: i64,
+}
+
+impl XlaFeedbackDirectedProfile {
+    /// Creates a profile with XLA profile version zero.
+    #[inline]
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self { bytes: bytes.into().into(), version: 0 }
+    }
+
+    /// Loads opaque profile bytes from `path`.
+    pub fn from_file(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        std::fs::read(path).map(Self::new)
+    }
+
+    /// Sets the XLA compilation profile version associated with these bytes.
+    #[inline]
+    pub fn with_version(mut self, version: i64) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Returns the opaque profile bytes passed to XLA.
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the XLA compilation profile version.
+    #[inline]
+    pub fn version(&self) -> i64 {
+        self.version
+    }
+
+    /// Returns a stable SHA-256 digest suitable for diagnostics and provenance.
+    #[inline]
+    pub fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.bytes()).into()
+    }
+
+    /// Writes the opaque profile bytes to `path`.
+    #[inline]
+    pub fn write_to_file(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        std::fs::write(path, self.bytes())
+    }
+}
+
 /// Backend-specific per-call options for the [`CompilationDomain`] implementation on
 /// [`XlaDomain`]. Carries the device mesh, optional sharding overrides for inputs/outputs,
 /// and the donation flags computed at jit time.
@@ -904,13 +991,22 @@ pub struct XlaOptions {
 
     /// Flat per-input donation flags. Length must match the program's flat input arity.
     pub donation_flags: Vec<bool>,
+
+    /// Optional opaque feedback-directed optimization profile forwarded to XLA.
+    pub feedback_directed_profile: Option<XlaFeedbackDirectedProfile>,
 }
 
 impl XlaOptions {
     /// Constructs default options for `mesh` with no shardings overrides and no donation.
     #[inline]
     pub fn new(mesh: DeviceMesh) -> Self {
-        Self { mesh, in_shardings: None, out_shardings: None, donation_flags: Vec::new() }
+        Self {
+            mesh,
+            in_shardings: None,
+            out_shardings: None,
+            donation_flags: Vec::new(),
+            feedback_directed_profile: None,
+        }
     }
 
     /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
@@ -946,6 +1042,16 @@ impl XlaOptions {
         self.donation_flags = donate.into_parameters().collect();
         self
     }
+
+    /// Supplies an opaque feedback-directed optimization profile for manual profile-guided recompilation.
+    ///
+    /// The profile must have been produced for compatible StableHLO, topology, and compiler settings. XLA performs
+    /// backend-specific validation according to its debug options; Ryft includes the exact bytes in every cache key.
+    #[inline]
+    pub fn with_feedback_directed_profile(mut self, profile: XlaFeedbackDirectedProfile) -> Self {
+        self.feedback_directed_profile = Some(profile);
+        self
+    }
 }
 
 impl std::hash::Hash for XlaOptions {
@@ -957,6 +1063,7 @@ impl std::hash::Hash for XlaOptions {
         self.in_shardings.hash(state);
         self.out_shardings.hash(state);
         self.donation_flags.hash(state);
+        self.feedback_directed_profile.hash(state);
     }
 }
 
@@ -1003,6 +1110,543 @@ impl XlaLoweredProgram {
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
     }
+
+    /// Returns this lowering with an opaque feedback-directed profile installed in its exact PJRT compilation
+    /// options.
+    ///
+    /// The StableHLO and runtime signature are unchanged. Because canonical compilation identity includes the
+    /// complete PJRT options, the returned lowering receives a distinct in-memory, persistent, and distributed cache
+    /// key from the baseline executable.
+    pub fn with_feedback_directed_profile(mut self, profile: XlaFeedbackDirectedProfile) -> Self {
+        use ryft_pjrt::protos::ExecutableCompilationOptions;
+
+        self.compilation_options
+            .executable_build_options
+            .get_or_insert_with(ExecutableCompilationOptions::default)
+            .fdo_profile = profile.bytes().to_vec();
+        self.compilation_options.profile_version = profile.version();
+        self
+    }
+}
+
+const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA1";
+const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 1;
+const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 0;
+const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 1;
+const XLA_COMPILER_IDENTITY: &str = concat!("ryft-xla/", env!("CARGO_PKG_VERSION"));
+
+/// Typed value returned for a plugin-specific PJRT cost-analysis property.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum XlaAnalysisValue {
+    /// Boolean property.
+    Boolean(bool),
+    /// Signed integer property.
+    Integer(i64),
+    /// Signed integer-list property.
+    IntegerList(Vec<i64>),
+    /// Floating-point property.
+    Float(f64),
+    /// String property.
+    String(String),
+}
+
+/// Normalized memory requirements reported by PJRT for one XLA executable.
+#[derive(Copy, Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct XlaMemoryAnalysis {
+    pub device_generated_code_size_in_bytes: usize,
+    pub device_input_size_in_bytes: usize,
+    pub device_output_size_in_bytes: usize,
+    pub device_alias_size_in_bytes: usize,
+    pub device_temporary_size_in_bytes: usize,
+    pub device_peak_memory_in_bytes: usize,
+    pub device_total_memory_in_bytes: usize,
+    pub device_total_allocation_bytes: usize,
+    pub device_indefinite_allocations: usize,
+    pub device_peak_unpadded_heap_bytes: usize,
+    pub host_generated_code_size_in_bytes: usize,
+    pub host_input_size_in_bytes: usize,
+    pub host_output_size_in_bytes: usize,
+    pub host_alias_size_in_bytes: usize,
+    pub host_temporary_size_in_bytes: usize,
+}
+
+/// Backend-neutral-facing, typed analysis of one compiled XLA executable.
+///
+/// PJRT plugins expose different property sets. Common properties are normalized into optional fields and every raw
+/// property is retained in [`Self::properties`]. Unsupported optional queries remain `None`.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+pub struct XlaCompilationAnalysis {
+    pub floating_point_operations: Option<f64>,
+    pub transcendental_operations: Option<f64>,
+    pub bytes_accessed: Option<f64>,
+    pub memory: Option<XlaMemoryAnalysis>,
+    pub generated_code_size_in_bytes: Option<usize>,
+    pub replica_count: Option<usize>,
+    pub partition_count: Option<usize>,
+    pub executable_fingerprint: Option<String>,
+    pub compilation_duration: Option<Duration>,
+    pub properties: BTreeMap<String, XlaAnalysisValue>,
+}
+
+impl XlaCompilationAnalysis {
+    /// Returns a deterministic JSON representation suitable for machine-readable diagnostics.
+    pub fn to_json(&self) -> Result<String, XlaDomainError> {
+        serde_json::to_string(self)
+            .map_err(|error| XlaDomainError::InvalidCompilationAnalysis { reason: error.to_string() })
+    }
+}
+
+impl Display for XlaCompilationAnalysis {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "XLA compilation analysis [flops={}, bytes accessed={}, generated code={} bytes, replicas={}, partitions={}]",
+            self.floating_point_operations
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unsupported".into()),
+            self.bytes_accessed.map(|value| value.to_string()).unwrap_or_else(|| "unsupported".into()),
+            self.generated_code_size_in_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unsupported".into()),
+            self.replica_count.map(|value| value.to_string()).unwrap_or_else(|| "unsupported".into()),
+            self.partition_count.map(|value| value.to_string()).unwrap_or_else(|| "unsupported".into()),
+        )
+    }
+}
+
+/// Optimized compiler program returned on explicit inspection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XlaOptimizedProgram {
+    /// PJRT program format (`mlir`, `hlo`, or `hlo_with_config`).
+    pub format: &'static str,
+    /// Backend-owned optimized program bytes.
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Serialize)]
+struct XlaPersistentKeyV1<'a> {
+    schema_version: u32,
+    stable_hlo: &'a str,
+    compilation_options: &'a [u8],
+    output_types: Vec<PersistentArrayTypeV1>,
+    donation_flags: &'a [bool],
+    capture_count: u64,
+    expected_argument_shardings: Vec<PersistentShardingV1>,
+    mesh: PersistentDeviceMeshV1,
+    device_kinds: &'a [String],
+    platform_name: &'a str,
+    platform_version: &'a str,
+    compiler_identity: &'static str,
+    xla_flags: &'a str,
+}
+
+#[derive(Serialize, Deserialize)]
+struct XlaPersistentExecutableMetadataV1 {
+    schema_version: u32,
+    feature_flags: u64,
+    compilation_options: Vec<u8>,
+    output_types: Vec<PersistentArrayTypeV1>,
+    donation_flags: Vec<bool>,
+    capture_count: u64,
+    expected_argument_shardings: Vec<PersistentShardingV1>,
+    mesh: PersistentDeviceMeshV1,
+    device_kinds: Vec<String>,
+    replica_count: u64,
+    partition_count: u64,
+    device_assignment: Vec<u64>,
+    platform_name: String,
+    platform_version: String,
+    compiler_identity: String,
+    xla_flags: String,
+    compilation_duration_nanoseconds: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentArrayTypeV1 {
+    data_type: u8,
+    shape: Vec<PersistentSizeV1>,
+    layout: Option<PersistentLayoutV1>,
+    sharding: Option<PersistentShardingV1>,
+    memory: PersistentMemoryV1,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum PersistentSizeV1 {
+    Static(u64),
+    Dynamic(Option<u64>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PersistentLayoutV1 {
+    Tiled { minor_to_major: Vec<u64>, tiles: Vec<Vec<PersistentTileDimensionV1>> },
+    Strided { strides: Vec<i64> },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum PersistentTileDimensionV1 {
+    Sized(u64),
+    Combined,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "pinned", rename_all = "snake_case")]
+enum PersistentMemoryV1 {
+    Device,
+    Host(bool),
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentShardingV1 {
+    mesh: PersistentLogicalMeshV1,
+    dimensions: Vec<PersistentShardingDimensionV1>,
+    unreduced_axes: Vec<String>,
+    reduced_axes: Vec<String>,
+    varying_manual_axes: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", content = "axes", rename_all = "snake_case")]
+enum PersistentShardingDimensionV1 {
+    Replicated,
+    Sharded(Vec<String>),
+    Unconstrained,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentLogicalMeshV1 {
+    axes: Vec<PersistentMeshAxisV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentMeshAxisV1 {
+    name: String,
+    size: u64,
+    r#type: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentDeviceMeshV1 {
+    logical_mesh: PersistentLogicalMeshV1,
+    devices: Vec<PersistentDeviceV1>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistentDeviceV1 {
+    id: u64,
+    process_index: u64,
+}
+
+impl From<&ArrayType> for PersistentArrayTypeV1 {
+    fn from(value: &ArrayType) -> Self {
+        Self {
+            data_type: encode_data_type(value.data_type()),
+            shape: value
+                .shape()
+                .dimensions()
+                .iter()
+                .map(|size| match size {
+                    Size::Static(size) => PersistentSizeV1::Static(*size as u64),
+                    Size::Dynamic(bound) => PersistentSizeV1::Dynamic(bound.map(|bound| bound as u64)),
+                })
+                .collect(),
+            layout: value.layout().map(PersistentLayoutV1::from),
+            sharding: value.sharding().map(PersistentShardingV1::from),
+            memory: match value.memory() {
+                Memory::Device => PersistentMemoryV1::Device,
+                Memory::Host { pinned } => PersistentMemoryV1::Host(pinned),
+            },
+        }
+    }
+}
+
+impl TryFrom<PersistentArrayTypeV1> for ArrayType {
+    type Error = XlaDomainError;
+
+    fn try_from(value: PersistentArrayTypeV1) -> Result<Self, Self::Error> {
+        let shape = Shape::new(
+            value
+                .shape
+                .into_iter()
+                .map(|size| match size {
+                    PersistentSizeV1::Static(size) => checked_usize(size).map(Size::Static),
+                    PersistentSizeV1::Dynamic(bound) => bound.map(checked_usize).transpose().map(Size::Dynamic),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let memory = match value.memory {
+            PersistentMemoryV1::Device => Memory::Device,
+            PersistentMemoryV1::Host(pinned) => Memory::Host { pinned },
+        };
+        ArrayType::new(decode_data_type(value.data_type)?, shape)
+            .with_layout(value.layout.map(Layout::try_from).transpose()?)
+            .with_sharding(value.sharding.map(Sharding::try_from).transpose()?)
+            .map(|r#type| r#type.with_memory(memory))
+            .map_err(|error| persistent_error(error.to_string()))
+    }
+}
+
+impl From<&Layout> for PersistentLayoutV1 {
+    fn from(value: &Layout) -> Self {
+        match value {
+            Layout::Tiled(layout) => Self::Tiled {
+                minor_to_major: layout.minor_to_major().iter().map(|dimension| *dimension as u64).collect(),
+                tiles: layout
+                    .tiles()
+                    .iter()
+                    .map(|tile| {
+                        tile.dimensions()
+                            .iter()
+                            .map(|dimension| match dimension {
+                                TileDimension::Sized(size) => PersistentTileDimensionV1::Sized(*size as u64),
+                                TileDimension::Combined => PersistentTileDimensionV1::Combined,
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+            Layout::Strided(layout) => {
+                Self::Strided { strides: layout.strides().iter().map(|stride| *stride as i64).collect() }
+            }
+        }
+    }
+}
+
+impl TryFrom<PersistentLayoutV1> for Layout {
+    type Error = XlaDomainError;
+
+    fn try_from(value: PersistentLayoutV1) -> Result<Self, Self::Error> {
+        Ok(match value {
+            PersistentLayoutV1::Tiled { minor_to_major, tiles } => TiledLayout::new(
+                minor_to_major.into_iter().map(checked_usize).collect::<Result<Vec<_>, _>>()?,
+                tiles
+                    .into_iter()
+                    .map(|tile| {
+                        tile.into_iter()
+                            .map(|dimension| match dimension {
+                                PersistentTileDimensionV1::Sized(size) => checked_usize(size).map(TileDimension::Sized),
+                                PersistentTileDimensionV1::Combined => Ok(TileDimension::Combined),
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(Tile::new)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into(),
+            PersistentLayoutV1::Strided { strides } => StridedLayout::new(
+                strides
+                    .into_iter()
+                    .map(|stride| {
+                        isize::try_from(stride).map_err(|_| persistent_error("layout stride does not fit in isize"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .into(),
+        })
+    }
+}
+
+impl From<&Sharding> for PersistentShardingV1 {
+    fn from(value: &Sharding) -> Self {
+        Self {
+            mesh: PersistentLogicalMeshV1::from(value.mesh()),
+            dimensions: value
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    ShardingDimension::Replicated => PersistentShardingDimensionV1::Replicated,
+                    ShardingDimension::Sharded(axes) => PersistentShardingDimensionV1::Sharded(axes.clone()),
+                    ShardingDimension::Unconstrained => PersistentShardingDimensionV1::Unconstrained,
+                })
+                .collect(),
+            unreduced_axes: value.unreduced_axes().iter().cloned().collect(),
+            reduced_axes: value.reduced_axes().iter().cloned().collect(),
+            varying_manual_axes: value.varying_manual_axes().iter().cloned().collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistentShardingV1> for Sharding {
+    type Error = XlaDomainError;
+
+    fn try_from(value: PersistentShardingV1) -> Result<Self, Self::Error> {
+        Sharding::with_manual_axes(
+            LogicalMesh::try_from(value.mesh)?,
+            value
+                .dimensions
+                .into_iter()
+                .map(|dimension| match dimension {
+                    PersistentShardingDimensionV1::Replicated => ShardingDimension::Replicated,
+                    PersistentShardingDimensionV1::Sharded(axes) => ShardingDimension::Sharded(axes),
+                    PersistentShardingDimensionV1::Unconstrained => ShardingDimension::Unconstrained,
+                })
+                .collect(),
+            value.unreduced_axes,
+            value.reduced_axes,
+            value.varying_manual_axes,
+        )
+        .map_err(|error| persistent_error(error.to_string()))
+    }
+}
+
+impl From<&LogicalMesh> for PersistentLogicalMeshV1 {
+    fn from(value: &LogicalMesh) -> Self {
+        Self {
+            axes: value
+                .axes()
+                .iter()
+                .map(|axis| PersistentMeshAxisV1 {
+                    name: axis.name().into(),
+                    size: axis.size() as u64,
+                    r#type: match axis.r#type() {
+                        MeshAxisType::Auto => 0,
+                        MeshAxisType::Explicit => 1,
+                        MeshAxisType::Manual => 2,
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistentLogicalMeshV1> for LogicalMesh {
+    type Error = XlaDomainError;
+
+    fn try_from(value: PersistentLogicalMeshV1) -> Result<Self, Self::Error> {
+        LogicalMesh::new(
+            value
+                .axes
+                .into_iter()
+                .map(|axis| {
+                    let r#type = match axis.r#type {
+                        0 => MeshAxisType::Auto,
+                        1 => MeshAxisType::Explicit,
+                        2 => MeshAxisType::Manual,
+                        value => return Err(persistent_error(format!("unknown mesh axis type {value}"))),
+                    };
+                    MeshAxis::new(axis.name, checked_usize(axis.size)?, r#type)
+                        .map_err(|error| persistent_error(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(|error| persistent_error(error.to_string()))
+    }
+}
+
+impl From<&DeviceMesh> for PersistentDeviceMeshV1 {
+    fn from(value: &DeviceMesh) -> Self {
+        Self {
+            logical_mesh: PersistentLogicalMeshV1::from(value.logical_mesh()),
+            devices: value
+                .devices()
+                .iter()
+                .map(|device| PersistentDeviceV1 {
+                    id: device.id() as u64,
+                    process_index: device.process_index() as u64,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TryFrom<PersistentDeviceMeshV1> for DeviceMesh {
+    type Error = XlaDomainError;
+
+    fn try_from(value: PersistentDeviceMeshV1) -> Result<Self, Self::Error> {
+        DeviceMesh::new(
+            LogicalMesh::try_from(value.logical_mesh)?,
+            value
+                .devices
+                .into_iter()
+                .map(|device| Ok(Device::new(checked_usize(device.id)?, checked_usize(device.process_index)?)))
+                .collect::<Result<Vec<_>, XlaDomainError>>()?,
+        )
+        .map_err(|error| persistent_error(error.to_string()))
+    }
+}
+
+fn persistent_error(reason: impl Into<String>) -> XlaDomainError {
+    XlaDomainError::InvalidPersistentExecutable { reason: reason.into() }
+}
+
+fn checked_usize(value: u64) -> Result<usize, XlaDomainError> {
+    usize::try_from(value).map_err(|_| persistent_error(format!("value {value} does not fit in usize")))
+}
+
+fn encode_data_type(data_type: DataType) -> u8 {
+    match data_type {
+        DataType::Token => 0,
+        DataType::Boolean => 1,
+        DataType::I1 => 2,
+        DataType::I2 => 3,
+        DataType::I4 => 4,
+        DataType::I8 => 5,
+        DataType::I16 => 6,
+        DataType::I32 => 7,
+        DataType::I64 => 8,
+        DataType::U1 => 9,
+        DataType::U2 => 10,
+        DataType::U4 => 11,
+        DataType::U8 => 12,
+        DataType::U16 => 13,
+        DataType::U32 => 14,
+        DataType::U64 => 15,
+        DataType::F4E2M1FN => 16,
+        DataType::F8E3M4 => 17,
+        DataType::F8E4M3 => 18,
+        DataType::F8E4M3FN => 19,
+        DataType::F8E4M3FNUZ => 20,
+        DataType::F8E4M3B11FNUZ => 21,
+        DataType::F8E5M2 => 22,
+        DataType::F8E5M2FNUZ => 23,
+        DataType::F8E8M0FNU => 24,
+        DataType::BF16 => 25,
+        DataType::F16 => 26,
+        DataType::F32 => 27,
+        DataType::F64 => 28,
+        DataType::C64 => 29,
+        DataType::C128 => 30,
+    }
+}
+
+fn decode_data_type(value: u8) -> Result<DataType, XlaDomainError> {
+    Ok(match value {
+        0 => DataType::Token,
+        1 => DataType::Boolean,
+        2 => DataType::I1,
+        3 => DataType::I2,
+        4 => DataType::I4,
+        5 => DataType::I8,
+        6 => DataType::I16,
+        7 => DataType::I32,
+        8 => DataType::I64,
+        9 => DataType::U1,
+        10 => DataType::U2,
+        11 => DataType::U4,
+        12 => DataType::U8,
+        13 => DataType::U16,
+        14 => DataType::U32,
+        15 => DataType::U64,
+        16 => DataType::F4E2M1FN,
+        17 => DataType::F8E3M4,
+        18 => DataType::F8E4M3,
+        19 => DataType::F8E4M3FN,
+        20 => DataType::F8E4M3FNUZ,
+        21 => DataType::F8E4M3B11FNUZ,
+        22 => DataType::F8E5M2,
+        23 => DataType::F8E5M2FNUZ,
+        24 => DataType::F8E8M0FNU,
+        25 => DataType::BF16,
+        26 => DataType::F16,
+        27 => DataType::F32,
+        28 => DataType::F64,
+        29 => DataType::C64,
+        30 => DataType::C128,
+        value => return Err(persistent_error(format!("unknown data type tag {value}"))),
+    })
 }
 
 /// Exact process-local compilation key for an XLA lowering.
@@ -1012,15 +1656,7 @@ impl XlaLoweredProgram {
 /// artifacts are interchangeable, even when unrelated call sites happen to share the same input signature.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct XlaCompilationKey {
-    stable_hlo: Arc<str>,
-    compilation_options_debug: String,
-    output_types: Arc<[ArrayType]>,
-    donation_flags: Arc<[bool]>,
-    capture_count: usize,
-    expected_argument_shardings: Arc<[Sharding]>,
-    options: XlaOptions,
-    platform_name: Option<String>,
-    platform_version: Option<String>,
+    canonical_bytes: Arc<[u8]>,
 }
 
 /// Loaded PJRT executable plus the metadata required to invoke it safely.
@@ -1032,6 +1668,55 @@ pub struct XlaCompiledProgram<'c> {
     capture_count: usize,
     expected_argument_shardings: Arc<[Sharding]>,
     mesh: DeviceMesh,
+    compilation_options: CompilationOptions,
+    compilation_duration: Option<Duration>,
+    analysis: Arc<OnceLock<Result<XlaCompilationAnalysis, String>>>,
+}
+
+#[derive(Copy, Clone)]
+struct XlaInvocationMetadata<'a> {
+    output_types: &'a [ArrayType],
+    donation_flags: &'a [bool],
+    capture_count: usize,
+    expected_argument_shardings: &'a [Sharding],
+    mesh: &'a DeviceMesh,
+}
+
+impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
+    fn from(program: &'a XlaCompiledProgram<'c>) -> Self {
+        Self {
+            output_types: &program.output_types,
+            donation_flags: &program.donation_flags,
+            capture_count: program.capture_count,
+            expected_argument_shardings: &program.expected_argument_shardings,
+            mesh: &program.mesh,
+        }
+    }
+}
+
+fn validate_xla_replacement_metadata(
+    current: XlaInvocationMetadata<'_>,
+    replacement: XlaInvocationMetadata<'_>,
+) -> Result<(), XlaDomainError> {
+    let incompatible_field = if current.output_types != replacement.output_types {
+        Some("output types")
+    } else if current.donation_flags != replacement.donation_flags {
+        Some("donation flags")
+    } else if current.capture_count != replacement.capture_count {
+        Some("capture count")
+    } else if current.expected_argument_shardings != replacement.expected_argument_shardings {
+        Some("argument shardings")
+    } else if current.mesh != replacement.mesh {
+        Some("device mesh")
+    } else {
+        None
+    };
+    match incompatible_field {
+        Some(field) => Err(XlaDomainError::InvalidCompilationOptions {
+            reason: format!("replacement executable has incompatible {field}"),
+        }),
+        None => Ok(()),
+    }
 }
 
 impl<'c> XlaCompiledProgram<'c> {
@@ -1052,6 +1737,51 @@ impl<'c> XlaCompiledProgram<'c> {
     pub fn mesh(&self) -> &DeviceMesh {
         &self.mesh
     }
+
+    /// Returns the backend's optimized program only when explicitly requested.
+    pub fn optimized_program(&self) -> Result<XlaOptimizedProgram, XlaDomainError> {
+        match self.executable.executable()?.optimized_program()? {
+            PjrtProgram::Mlir { bytecode } => Ok(XlaOptimizedProgram { format: "mlir", bytes: bytecode }),
+            PjrtProgram::Hlo { proto } => Ok(XlaOptimizedProgram { format: "hlo", bytes: proto }),
+            PjrtProgram::HloWithConfig { proto } => Ok(XlaOptimizedProgram { format: "hlo_with_config", bytes: proto }),
+        }
+    }
+}
+
+impl<'c> XlaDomain<'c> {
+    /// Enqueues `program` and returns its possibly still pending flat outputs together with a whole-execution fence.
+    pub(crate) fn execute_compiled_async(
+        &self,
+        program: &XlaCompiledProgram<'c>,
+        inputs: Vec<Array<'c>>,
+    ) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
+        if inputs.len() != program.expected_argument_shardings.len() {
+            return Err(XlaDomainError::InvalidCompilationOptions {
+                reason: format!(
+                    "compiled program expects {} flat argument(s), including {} capture(s), but got {}",
+                    program.expected_argument_shardings.len(),
+                    program.capture_count,
+                    inputs.len(),
+                ),
+            });
+        }
+        let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
+        let donation_flags = if program.donation_flags.is_empty() {
+            vec![false; inputs.len()]
+        } else {
+            std::iter::repeat_n(false, program.capture_count)
+                .chain(program.donation_flags.iter().copied())
+                .collect::<Vec<_>>()
+        };
+        execute_pjrt(
+            self.client,
+            &program.executable,
+            &program.mesh,
+            inputs,
+            donation_flags.as_slice(),
+            &program.output_types,
+        )
+    }
 }
 
 impl<'c> CompilationDomain for XlaDomain<'c> {
@@ -1059,7 +1789,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;
-    type CompilationKey = XlaCompilationKey;
+    type CacheKey = XlaCompilationKey;
 
     fn prepare_input_types<Input: Parameterized<ArrayType>>(
         &self,
@@ -1144,7 +1874,11 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             .collect::<Vec<_>>();
         let result_shardings =
             output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>();
-        let compilation_options = jit_compilation_options(&self.compilation_options, options.mesh.devices().len());
+        let compilation_options = jit_compilation_options(
+            &self.compilation_options,
+            options.mesh.devices().len(),
+            options.feedback_directed_profile.as_ref(),
+        );
         let stable_hlo = crate::experimental::lowering::to_mlir_module_for_program(
             program,
             &[],
@@ -1175,23 +1909,40 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     fn compilation_key(
         &self,
         program: &XlaLoweredProgram,
-        options: &XlaOptions,
+        _options: &XlaOptions,
     ) -> Result<XlaCompilationKey, XlaDomainError> {
         let (platform_name, platform_version) = match self.client {
-            Some(client) => (Some(client.platform_name()?.into_owned()), Some(client.platform_version()?.into_owned())),
-            None => (None, None),
+            Some(client) => (client.platform_name()?.into_owned(), client.platform_version()?.into_owned()),
+            None => (String::new(), String::new()),
         };
-        Ok(XlaCompilationKey {
-            stable_hlo: Arc::clone(&program.stable_hlo),
-            compilation_options_debug: format!("{:?}", program.compilation_options),
-            output_types: Arc::clone(&program.output_types),
-            donation_flags: Arc::clone(&program.donation_flags),
-            capture_count: program.capture_count,
-            expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
-            options: options.clone(),
-            platform_name,
-            platform_version,
-        })
+        let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
+        let xla_flags = std::env::var("XLA_FLAGS").unwrap_or_default();
+        let device_kinds = match self.client {
+            Some(client) => ordered_device_kinds(client, &program.mesh)?,
+            None => Vec::new(),
+        };
+        let key = XlaPersistentKeyV1 {
+            schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
+            stable_hlo: &program.stable_hlo,
+            compilation_options: compilation_options.as_slice(),
+            output_types: program.output_types.iter().map(PersistentArrayTypeV1::from).collect(),
+            donation_flags: &program.donation_flags,
+            capture_count: program.capture_count as u64,
+            expected_argument_shardings: program
+                .expected_argument_shardings
+                .iter()
+                .map(PersistentShardingV1::from)
+                .collect(),
+            mesh: PersistentDeviceMeshV1::from(&program.mesh),
+            device_kinds: device_kinds.as_slice(),
+            platform_name: platform_name.as_str(),
+            platform_version: platform_version.as_str(),
+            compiler_identity: XLA_COMPILER_IDENTITY,
+            xla_flags: xla_flags.as_str(),
+        };
+        let canonical_bytes = serde_json::to_vec(&key)
+            .map_err(|error| persistent_error(format!("failed to encode persistent key: {error}")))?;
+        Ok(XlaCompilationKey { canonical_bytes: canonical_bytes.into() })
     }
 
     fn compile(
@@ -1200,7 +1951,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         _options: &XlaOptions,
     ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
+        let compilation_start = Instant::now();
         let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
+        let compilation_duration = compilation_start.elapsed();
         Ok(XlaCompiledProgram {
             executable: Arc::new(executable),
             output_types: Arc::clone(&program.output_types),
@@ -1208,12 +1961,23 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             capture_count: program.capture_count,
             expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
             mesh: program.mesh.clone(),
+            compilation_options: program.compilation_options.clone(),
+            compilation_duration: Some(compilation_duration),
+            analysis: Arc::new(OnceLock::new()),
         })
     }
 
     #[inline]
     fn compiled_output_types<'a>(&self, program: &'a XlaCompiledProgram<'c>) -> &'a [ArrayType] {
         program.output_types()
+    }
+
+    fn validate_replacement(
+        &self,
+        current: &XlaCompiledProgram<'c>,
+        replacement: &XlaCompiledProgram<'c>,
+    ) -> Result<(), XlaDomainError> {
+        validate_xla_replacement_metadata(current.into(), replacement.into())
     }
 
     fn validate_input_type(&self, declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
@@ -1236,54 +2000,286 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Vec<Array<'c>>, XlaDomainError> {
-        if inputs.len() != program.expected_argument_shardings.len() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "compiled program expects {} flat argument(s), including {} capture(s), but got {}",
-                    program.expected_argument_shardings.len(),
-                    program.capture_count,
-                    inputs.len(),
-                ),
-            });
-        }
-        let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
-        let donation_flags = if program.donation_flags.is_empty() {
-            vec![false; inputs.len()]
-        } else {
-            std::iter::repeat_n(false, program.capture_count)
-                .chain(program.donation_flags.iter().copied())
-                .collect::<Vec<_>>()
+        self.execute_compiled_async(program, inputs).map(Execution::into_output)
+    }
+
+    /// Returns the canonical, versioned identity of this XLA compilation. Persistent cache directories are trusted
+    /// executable sources and must not be writable by untrusted users.
+    #[inline]
+    fn persistent_cache_key(&self, key: &XlaCompilationKey) -> Option<Vec<u8>> {
+        Some(key.canonical_bytes.to_vec())
+    }
+
+    fn serialize_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
+        let executable = match program.executable.executable() {
+            Ok(executable) => executable,
+            Err(ryft_pjrt::Error::Unimplemented { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
         };
-        execute_pjrt(
-            self.client,
-            &program.executable,
-            &program.mesh,
-            inputs,
-            donation_flags.as_slice(),
-            &program.output_types,
-        )
+        let serialized = match executable.serialize() {
+            Ok(serialized) => serialized,
+            Err(ryft_pjrt::Error::Unimplemented { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let device_assignment = program.executable.device_assignment()?;
+        let metadata = XlaPersistentExecutableMetadataV1 {
+            schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION,
+            feature_flags: XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS,
+            compilation_options: program.compilation_options.encode_to_vec(),
+            output_types: program.output_types.iter().map(PersistentArrayTypeV1::from).collect(),
+            donation_flags: program.donation_flags.to_vec(),
+            capture_count: program.capture_count as u64,
+            expected_argument_shardings: program
+                .expected_argument_shardings
+                .iter()
+                .map(PersistentShardingV1::from)
+                .collect(),
+            mesh: PersistentDeviceMeshV1::from(&program.mesh),
+            device_kinds: ordered_device_kinds(self.client(), &program.mesh)?,
+            replica_count: device_assignment.replica_count() as u64,
+            partition_count: device_assignment.computation_count() as u64,
+            device_assignment: flatten_device_assignment(&device_assignment)?,
+            platform_name: self.client().platform_name()?.into_owned(),
+            platform_version: self.client().platform_version()?.into_owned(),
+            compiler_identity: XLA_COMPILER_IDENTITY.into(),
+            xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default(),
+            compilation_duration_nanoseconds: program
+                .compilation_duration
+                .map(|duration| duration.as_nanos())
+                .map(|nanoseconds| u64::try_from(nanoseconds).unwrap_or(u64::MAX)),
+        };
+        let metadata = serde_json::to_vec(&metadata)
+            .map_err(|error| persistent_error(format!("failed to encode metadata: {error}")))?;
+        let mut bytes = Vec::with_capacity(
+            XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>() + metadata.len() + serialized.data().len(),
+        );
+        bytes.extend_from_slice(XLA_PERSISTENT_EXECUTABLE_MAGIC);
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(metadata.as_slice());
+        bytes.extend_from_slice(serialized.data());
+        Ok(Some(bytes))
     }
 
-    /// Persistent XLA caching remains disabled until the executable payload carries and validates all metadata needed
-    /// to reconstruct an [`XlaCompiledProgram`] safely.
-    #[inline]
-    fn persistent_cache_key(&self, _key: &XlaCompilationKey) -> Option<Vec<u8>> {
-        None
-    }
+    fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
+        let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
+        if bytes.len() < header_size
+            || &bytes[..XLA_PERSISTENT_EXECUTABLE_MAGIC.len()] != XLA_PERSISTENT_EXECUTABLE_MAGIC
+        {
+            return Err(persistent_error("missing persistent executable header"));
+        }
+        let metadata_size = u64::from_le_bytes(
+            bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size]
+                .try_into()
+                .expect("metadata size has an exact fixed width"),
+        );
+        let metadata_size = checked_usize(metadata_size)?;
+        let metadata_end = header_size
+            .checked_add(metadata_size)
+            .filter(|metadata_end| *metadata_end <= bytes.len())
+            .ok_or_else(|| persistent_error("persistent executable metadata is truncated"))?;
+        let metadata: XlaPersistentExecutableMetadataV1 = serde_json::from_slice(&bytes[header_size..metadata_end])
+            .map_err(|error| persistent_error(format!("failed to decode metadata: {error}")))?;
+        if metadata.schema_version != XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION
+            || metadata.feature_flags != XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS
+        {
+            return Ok(None);
+        }
+        if metadata.platform_name != self.client().platform_name()?.as_ref()
+            || metadata.platform_version != self.client().platform_version()?.as_ref()
+            || metadata.compiler_identity != XLA_COMPILER_IDENTITY
+            || metadata.xla_flags != std::env::var("XLA_FLAGS").unwrap_or_default()
+        {
+            return Ok(None);
+        }
 
-    #[inline]
-    fn serialize_program(&self, _program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
-        Ok(None)
-    }
-
-    #[inline]
-    fn deserialize_program(&self, _bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
-        Ok(None)
+        let mesh = DeviceMesh::try_from(metadata.mesh)?;
+        if metadata.device_kinds != ordered_device_kinds(self.client(), &mesh)? {
+            return Ok(None);
+        }
+        let live_devices =
+            self.client().devices()?.into_iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
+        if mesh.devices().iter().any(|device| !live_devices.contains(device)) {
+            return Ok(None);
+        }
+        let output_types = metadata.output_types.into_iter().map(ArrayType::try_from).collect::<Result<Vec<_>, _>>()?;
+        if output_types
+            .iter()
+            .filter_map(ArrayType::sharding)
+            .any(|sharding| sharding.mesh() != mesh.logical_mesh())
+        {
+            return Err(persistent_error("output sharding mesh does not match executable mesh"));
+        }
+        let expected_argument_shardings = metadata
+            .expected_argument_shardings
+            .into_iter()
+            .map(Sharding::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        if expected_argument_shardings.iter().any(|sharding| sharding.mesh() != mesh.logical_mesh()) {
+            return Err(persistent_error("argument sharding mesh does not match executable mesh"));
+        }
+        let capture_count = checked_usize(metadata.capture_count)?;
+        let replica_count = checked_usize(metadata.replica_count)?;
+        let partition_count = checked_usize(metadata.partition_count)?;
+        if replica_count.checked_mul(partition_count) != Some(mesh.device_count())
+            || metadata.device_assignment.len() != mesh.device_count()
+        {
+            return Err(persistent_error("device assignment does not match executable mesh"));
+        }
+        if capture_count > expected_argument_shardings.len()
+            || (!metadata.donation_flags.is_empty()
+                && metadata.donation_flags.len() != expected_argument_shardings.len() - capture_count)
+        {
+            return Err(persistent_error("capture or donation metadata has an invalid arity"));
+        }
+        let compilation_options = CompilationOptions::decode(metadata.compilation_options.as_slice())
+            .map_err(|error| persistent_error(format!("failed to decode compilation options: {error}")))?;
+        let executable = self.client().deserialize_and_load_executable(
+            &bytes[metadata_end..],
+            Some(&compilation_options),
+            &LoadOptions::default(),
+        )?;
+        let device_assignment = executable.device_assignment()?;
+        if device_assignment.replica_count() != replica_count
+            || device_assignment.computation_count() != partition_count
+            || flatten_device_assignment(&device_assignment)? != metadata.device_assignment
+        {
+            return Ok(None);
+        }
+        let compilation_duration = metadata.compilation_duration_nanoseconds.map(Duration::from_nanos);
+        Ok(Some(XlaCompiledProgram {
+            executable: Arc::new(executable),
+            output_types: output_types.into(),
+            donation_flags: metadata.donation_flags.into(),
+            capture_count,
+            expected_argument_shardings: expected_argument_shardings.into(),
+            mesh,
+            compilation_options,
+            compilation_duration,
+            analysis: Arc::new(OnceLock::new()),
+        }))
     }
 
     #[inline]
     fn cache(&self) -> Option<&CompilationContext<Self>> {
         Some(&self.cache)
+    }
+}
+
+impl<'c> AnalyzableCompilationDomain for XlaDomain<'c> {
+    type Analysis = XlaCompilationAnalysis;
+
+    fn analyze(&self, program: &XlaCompiledProgram<'c>) -> Result<Self::Analysis, Self::Error> {
+        program
+            .analysis
+            .get_or_init(|| analyze_xla_program(program).map_err(|error| error.to_string()))
+            .clone()
+            .map_err(|reason| XlaDomainError::InvalidCompilationAnalysis { reason })
+    }
+}
+
+fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result<Vec<u64>, XlaDomainError> {
+    let mut devices = Vec::with_capacity(assignment.replica_count() * assignment.computation_count());
+    for replica in 0..assignment.replica_count() {
+        for partition in 0..assignment.computation_count() {
+            devices.push(assignment.device_id(replica, partition)? as u64);
+        }
+    }
+    Ok(devices)
+}
+
+fn ordered_device_kinds(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<String>, XlaDomainError> {
+    let devices = client.devices()?;
+    mesh.devices()
+        .iter()
+        .map(|mesh_device| {
+            let device =
+                devices.iter().find(|device| device.id().is_ok_and(|id| id == mesh_device.id())).ok_or_else(|| {
+                    persistent_error(format!("device {} is not visible to the live client", mesh_device.id()))
+                })?;
+            device.kind().map(|kind| kind.into_owned()).map_err(Into::into)
+        })
+        .collect()
+}
+
+fn analyze_xla_program(program: &XlaCompiledProgram<'_>) -> Result<XlaCompilationAnalysis, XlaDomainError> {
+    let executable = program.executable.executable()?;
+    let properties = match executable.cost_analysis() {
+        Ok(properties) => properties
+            .iter()
+            .map(|(name, value)| (name.clone(), XlaAnalysisValue::from(value)))
+            .collect::<BTreeMap<_, _>>(),
+        Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => BTreeMap::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let memory = match executable.memory_statistics() {
+        Ok(statistics) => Some(XlaMemoryAnalysis {
+            device_generated_code_size_in_bytes: statistics.device_generated_code_size_in_bytes,
+            device_input_size_in_bytes: statistics.device_input_size_in_bytes,
+            device_output_size_in_bytes: statistics.device_output_size_in_bytes,
+            device_alias_size_in_bytes: statistics.device_alias_size_in_bytes,
+            device_temporary_size_in_bytes: statistics.device_temporary_size_in_bytes,
+            device_peak_memory_in_bytes: statistics.device_peak_memory_in_bytes,
+            device_total_memory_in_bytes: statistics.device_total_memory_in_bytes,
+            device_total_allocation_bytes: statistics.device_total_allocation_bytes,
+            device_indefinite_allocations: statistics.device_indefinite_allocations,
+            device_peak_unpadded_heap_bytes: statistics.device_peak_unpadded_heap_bytes,
+            host_generated_code_size_in_bytes: statistics.host_generated_code_size_in_bytes,
+            host_input_size_in_bytes: statistics.host_input_size_in_bytes,
+            host_output_size_in_bytes: statistics.host_output_size_in_bytes,
+            host_alias_size_in_bytes: statistics.host_alias_size_in_bytes,
+            host_temporary_size_in_bytes: statistics.host_temporary_size_in_bytes,
+        }),
+        Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    Ok(XlaCompilationAnalysis {
+        floating_point_operations: numeric_analysis_property(&properties, &["flops", "floating_point_operations"])?,
+        transcendental_operations: numeric_analysis_property(
+            &properties,
+            &["transcendentals", "transcendental_operations"],
+        )?,
+        bytes_accessed: numeric_analysis_property(&properties, &["bytes accessed", "bytes_accessed"])?,
+        memory,
+        generated_code_size_in_bytes: optional_pjrt_analysis(executable.generated_code_size_in_bytes())?,
+        replica_count: optional_pjrt_analysis(executable.replica_count())?,
+        partition_count: optional_pjrt_analysis(executable.computation_count())?,
+        executable_fingerprint: optional_pjrt_analysis(executable.fingerprint().map(|value| value.into_owned()))?,
+        compilation_duration: program.compilation_duration,
+        properties,
+    })
+}
+
+impl From<&PjrtValue> for XlaAnalysisValue {
+    fn from(value: &PjrtValue) -> Self {
+        match value {
+            PjrtValue::Bool(value) => Self::Boolean(*value),
+            PjrtValue::I64(value) => Self::Integer(*value),
+            PjrtValue::I64List(value) => Self::IntegerList(value.clone()),
+            PjrtValue::F32(value) => Self::Float(*value as f64),
+            PjrtValue::String(value) => Self::String(value.clone()),
+        }
+    }
+}
+
+fn numeric_analysis_property(
+    properties: &BTreeMap<String, XlaAnalysisValue>,
+    names: &[&str],
+) -> Result<Option<f64>, XlaDomainError> {
+    let Some((name, value)) = names.iter().find_map(|name| properties.get(*name).map(|value| (*name, value))) else {
+        return Ok(None);
+    };
+    match value {
+        XlaAnalysisValue::Integer(value) => Ok(Some(*value as f64)),
+        XlaAnalysisValue::Float(value) => Ok(Some(*value)),
+        _ => Err(XlaDomainError::InvalidCompilationAnalysis { reason: format!("property '{name}' is not numeric") }),
+    }
+}
+
+fn optional_pjrt_analysis<T>(result: Result<T, ryft_pjrt::Error>) -> Result<Option<T>, XlaDomainError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(ryft_pjrt::Error::Unimplemented { .. } | ryft_pjrt::Error::Unavailable { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -1317,7 +2313,11 @@ fn apply_signature_shardings(
 
 /// Overlays SPMD partitioning fields on the base [`CompilationOptions`] template. Mirrors
 /// `crate::jit::jit_compilation_options`.
-fn jit_compilation_options(base: &CompilationOptions, partition_count: usize) -> CompilationOptions {
+fn jit_compilation_options(
+    base: &CompilationOptions,
+    partition_count: usize,
+    feedback_directed_profile: Option<&XlaFeedbackDirectedProfile>,
+) -> CompilationOptions {
     use ryft_pjrt::protos::ExecutableCompilationOptions;
     let mut options = base.clone();
     let exec_options = options.executable_build_options.get_or_insert_with(ExecutableCompilationOptions::default);
@@ -1328,7 +2328,126 @@ fn jit_compilation_options(base: &CompilationOptions, partition_count: usize) ->
     exec_options.partition_count = partition_count as i64;
     exec_options.use_spmd_partitioning = true;
     exec_options.use_shardy_partitioner = true;
+    if let Some(profile) = feedback_directed_profile {
+        exec_options.fdo_profile = profile.bytes().to_vec();
+        options.profile_version = profile.version();
+    }
     options
+}
+
+/// Encodes compilation options deterministically even though Prost represents protobuf maps as randomly seeded
+/// `HashMap`s. Map entries are removed from a clone before normal protobuf encoding and appended as length-delimited,
+/// path-qualified records sorted by their encoded keys and values.
+fn canonical_compilation_options_bytes(options: &CompilationOptions) -> Vec<u8> {
+    use ryft_pjrt::protos::{AutoTuneReferenceKey, AutoTuneResultKey};
+
+    fn append_record(output: &mut Vec<u8>, path: &[u8], mut entries: Vec<(Vec<u8>, Vec<u8>)>) {
+        entries.sort_unstable();
+        output.extend_from_slice(&(path.len() as u64).to_le_bytes());
+        output.extend_from_slice(path);
+        output.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, value) in entries {
+            output.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            output.extend_from_slice(key.as_slice());
+            output.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            output.extend_from_slice(value.as_slice());
+        }
+    }
+
+    fn drain_algorithm_map(output: &mut Vec<u8>, path: &[u8], algorithm: &mut ryft_pjrt::protos::AutoTuneAlgorithmKey) {
+        append_record(
+            output,
+            path,
+            std::mem::take(&mut algorithm.tuning_knobs)
+                .into_iter()
+                .map(|(key, value)| (key.to_le_bytes().to_vec(), value.to_le_bytes().to_vec()))
+                .collect(),
+        );
+    }
+
+    let mut options = options.clone();
+    let mut maps = Vec::new();
+    append_record(
+        &mut maps,
+        b"compilation.environment_option_overrides",
+        std::mem::take(&mut options.environment_option_overrides)
+            .into_iter()
+            .map(|(key, value)| (key.into_bytes(), value.encode_to_vec()))
+            .collect(),
+    );
+    if let Some(debug_options) =
+        options.executable_build_options.as_mut().and_then(|options| options.debug_options.as_mut())
+    {
+        append_record(
+            &mut maps,
+            b"executable.debug.analytical_latency_estimator",
+            std::mem::take(&mut debug_options.xla_gpu_analytical_latency_estimator_options)
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        );
+        append_record(
+            &mut maps,
+            b"executable.debug.experimental_cost_model_gemm_tiling",
+            std::mem::take(&mut debug_options.xla_gpu_experimental_cost_model_gemm_tiling_options)
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        );
+        append_record(
+            &mut maps,
+            b"executable.debug.backend_extra_options",
+            std::mem::take(&mut debug_options.xla_backend_extra_options)
+                .into_iter()
+                .map(|(key, value)| (key.into_bytes(), value.into_bytes()))
+                .collect(),
+        );
+    }
+    if let Some(target) = options.target_config.as_mut() {
+        if let Some(device) = target.gpu_device_information.as_mut() {
+            for (name, description) in [
+                (b"target.device.scalar_rates".as_slice(), device.scalar_unit_description.as_mut()),
+                (b"target.device.matrix_rates".as_slice(), device.matrix_unit_description.as_mut()),
+            ] {
+                if let Some(description) = description {
+                    append_record(
+                        &mut maps,
+                        name,
+                        std::mem::take(&mut description.rate_information)
+                            .into_iter()
+                            .map(|(key, value)| (key.to_le_bytes().to_vec(), value.encode_to_vec()))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        if let Some(autotune_results) = target.autotune_results.as_mut() {
+            for (index, entry) in autotune_results.results.iter_mut().enumerate() {
+                let Some(result) = entry.result.as_mut() else {
+                    continue;
+                };
+                if let Some(AutoTuneResultKey::Algorithm(algorithm)) = result.key.as_mut() {
+                    drain_algorithm_map(&mut maps, format!("target.autotune.{index}.algorithm").as_bytes(), algorithm);
+                }
+                if let Some(AutoTuneReferenceKey::ReferenceAlgorithm(algorithm)) =
+                    result.failure.as_mut().and_then(|failure| failure.key.as_mut())
+                {
+                    drain_algorithm_map(
+                        &mut maps,
+                        format!("target.autotune.{index}.reference_algorithm").as_bytes(),
+                        algorithm,
+                    );
+                }
+            }
+        }
+    }
+
+    let protobuf = options.encode_to_vec();
+    let mut bytes = b"RYFT_XLA_COMPILATION_OPTIONS_V1".to_vec();
+    bytes.extend_from_slice(&(protobuf.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(protobuf.as_slice());
+    bytes.extend_from_slice(maps.as_slice());
+    bytes
 }
 
 /// Reshards `inputs` to match `expected_shardings` at the call boundary. Inputs that already
@@ -1368,7 +2487,7 @@ fn execute_pjrt<'c>(
     inputs: Vec<Array<'c>>,
     donation_flags: &[bool],
     output_types: &[ArrayType],
-) -> Result<Vec<Array<'c>>, XlaDomainError> {
+) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
     let addressable_device_ids = executable
         .addressable_devices()?
         .iter()
@@ -1376,8 +2495,9 @@ fn execute_pjrt<'c>(
         .collect::<Result<Vec<_>, _>>()?;
     let arguments =
         Array::into_execute_arguments_with_donation(inputs, addressable_device_ids.as_slice(), donation_flags)?;
-    let device_outputs =
-        executable.execute(arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)?;
+    let (device_outputs, fence) = executable
+        .execute(arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)?
+        .into_parts();
 
     let output_count = output_types.len();
     for outputs in &device_outputs {
@@ -1404,9 +2524,12 @@ fn execute_pjrt<'c>(
             Some(_) => output_type,
             None => output_type.replicated(mesh).map_err(ArrayError::from)?,
         };
-        outputs.push(Array::from_addressable_buffers(client, resolved_type, mesh.clone(), addressable_buffers)?);
+        outputs.push(
+            Array::from_addressable_buffers(client, resolved_type, mesh.clone(), addressable_buffers)?
+                .with_execution_fence(fence.clone()),
+        );
     }
-    Ok(outputs)
+    Ok(Execution::new(outputs, fence))
 }
 
 #[cfg(test)]
@@ -1476,6 +2599,72 @@ mod tests {
             .r#await()
             .unwrap();
         values_from_bytes::<f32>(bytes.as_slice())
+    }
+
+    #[test]
+    fn test_feedback_directed_profile_round_trips_and_changes_compilation_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.pb");
+        let profile = XlaFeedbackDirectedProfile::new(vec![1, 2, 3, 4]).with_version(7);
+        profile.write_to_file(&path).unwrap();
+        let restored = XlaFeedbackDirectedProfile::from_file(&path).unwrap().with_version(7);
+        assert_eq!(restored, profile);
+        assert_eq!(restored.digest(), profile.digest());
+
+        let baseline = jit_compilation_options(&CompilationOptions::default(), 2, None);
+        let profiled = jit_compilation_options(&CompilationOptions::default(), 2, Some(&profile));
+        assert!(baseline.executable_build_options.unwrap().fdo_profile.is_empty());
+        assert_eq!(profiled.executable_build_options.unwrap().fdo_profile, vec![1, 2, 3, 4]);
+        assert_eq!(profiled.profile_version, 7);
+    }
+
+    #[test]
+    fn test_replacement_metadata_rejects_changed_invocation_contract() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let current = XlaInvocationMetadata {
+            output_types: &[],
+            donation_flags: &[false],
+            capture_count: 0,
+            expected_argument_shardings: &[],
+            mesh: &mesh,
+        };
+        let replacement = XlaInvocationMetadata { donation_flags: &[true], ..current };
+
+        assert!(matches!(
+            validate_xla_replacement_metadata(current, replacement),
+            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason.contains("donation flags"),
+        ));
+    }
+
+    #[test]
+    fn test_canonical_compilation_options_sorts_protobuf_maps() {
+        use ryft_pjrt::protos::{DebugOptions, ExecutableCompilationOptions, OptionOverride};
+
+        let mut left = CompilationOptions::default();
+        left.environment_option_overrides.insert("z".into(), OptionOverride::default());
+        left.environment_option_overrides.insert("a".into(), OptionOverride::default());
+        left.executable_build_options = Some(ExecutableCompilationOptions {
+            debug_options: Some(DebugOptions {
+                xla_backend_extra_options: [("z".into(), "2".into()), ("a".into(), "1".into())].into_iter().collect(),
+                ..DebugOptions::default()
+            }),
+            ..ExecutableCompilationOptions::default()
+        });
+        let mut right = CompilationOptions::default();
+        right.environment_option_overrides.insert("a".into(), OptionOverride::default());
+        right.environment_option_overrides.insert("z".into(), OptionOverride::default());
+        right.executable_build_options = Some(ExecutableCompilationOptions {
+            debug_options: Some(DebugOptions {
+                xla_backend_extra_options: [("a".into(), "1".into()), ("z".into(), "2".into())].into_iter().collect(),
+                ..DebugOptions::default()
+            }),
+            ..ExecutableCompilationOptions::default()
+        });
+
+        assert_eq!(left, right);
+        assert_eq!(canonical_compilation_options_bytes(&left), canonical_compilation_options_bytes(&right));
     }
 
     #[test]
@@ -1574,6 +2763,7 @@ mod tests {
         )
         .unwrap();
         let array = compiled.call(source).unwrap();
+        array.block_until_ready().unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
         let shard_bytes = array
@@ -1607,6 +2797,198 @@ mod tests {
             cache_size_before,
             "equivalent repeat compilations should reuse the existing cache entry",
         );
+    }
+
+    #[test]
+    fn test_xla_compilation_key_is_canonical_and_stable() {
+        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, compile_with_options};
+        use ryft_core::operations::trigonometric::Sin;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
+            compile_with_options(
+                &domain,
+                |x| x.sin().unwrap(),
+                input_type,
+                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
+            )
+            .unwrap();
+        let key = domain.compilation_key(compiled.lowered().lowered_program(), compiled.lowered().options()).unwrap();
+        let repeated =
+            domain.compilation_key(compiled.lowered().lowered_program(), compiled.lowered().options()).unwrap();
+
+        assert_eq!(key, repeated);
+        assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
+        let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
+        assert_eq!(decoded["schema_version"], XLA_PERSISTENT_KEY_SCHEMA_VERSION);
+        assert_eq!(decoded["compiler_identity"], XLA_COMPILER_IDENTITY);
+        assert_eq!(decoded["platform_name"], client.platform_name().unwrap().as_ref());
+        assert!(decoded["compilation_options"].as_array().is_some_and(|bytes| !bytes.is_empty()));
+        assert!(decoded["stable_hlo"].as_str().is_some_and(|module| module.contains("stablehlo.sine")));
+    }
+
+    #[test]
+    fn test_xla_persistent_executable_round_trip_preserves_invocation_and_analysis() {
+        use ryft_core::compilation::{
+            CompilationOptions as CoreCompilationOptions, StagedFunction, stage_with_captures,
+        };
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::with_mesh(&client, mesh.clone());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let capture = Array::from_host_buffer(
+            &client,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+        let staged: StagedFunction<XlaDomain<'_>, ArrayType, ArrayType> = stage_with_captures(
+            &domain,
+            |mut captures, input| captures.remove(0) + input,
+            vec![capture.clone()],
+            input_type.clone(),
+        )
+        .unwrap();
+        let compiled = staged
+            .compile(CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()).with_donate(true)))
+            .unwrap();
+        let compiled_analysis = compiled.analysis().unwrap();
+        assert_eq!(compiled.analysis().unwrap(), compiled_analysis);
+
+        let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
+        let restored = domain.deserialize_program(bytes.as_slice()).unwrap().unwrap();
+        assert_eq!(restored.output_types, compiled.compiled_program().output_types);
+        assert_eq!(restored.donation_flags, compiled.compiled_program().donation_flags);
+        assert_eq!(restored.capture_count, compiled.compiled_program().capture_count);
+        assert_eq!(restored.expected_argument_shardings, compiled.compiled_program().expected_argument_shardings);
+        assert_eq!(restored.mesh, compiled.compiled_program().mesh);
+
+        let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
+        let metadata_size =
+            u64::from_le_bytes(bytes[XLA_PERSISTENT_EXECUTABLE_MAGIC.len()..header_size].try_into().unwrap()) as usize;
+        let metadata_end = header_size + metadata_size;
+        let mut incompatible_metadata: XlaPersistentExecutableMetadataV1 =
+            serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
+        incompatible_metadata.platform_version.push_str("-incompatible");
+        let incompatible_metadata = serde_json::to_vec(&incompatible_metadata).unwrap();
+        let mut incompatible = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+        incompatible.extend_from_slice(&(incompatible_metadata.len() as u64).to_le_bytes());
+        incompatible.extend_from_slice(incompatible_metadata.as_slice());
+        incompatible.extend_from_slice(&bytes[metadata_end..]);
+        assert!(domain.deserialize_program(incompatible.as_slice()).unwrap().is_none());
+
+        let input = Array::from_host_buffer(
+            &client,
+            input_type,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.execute(&restored, vec![capture, input]).unwrap();
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
+
+        let analysis = domain.analyze(&restored).unwrap();
+        assert_eq!(domain.analyze(&restored).unwrap(), analysis);
+        assert!(analysis.to_json().unwrap().contains("\"properties\""));
+        assert!(!analysis.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_xla_disk_cache_restores_into_a_fresh_compilation_context() {
+        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, DiskCache, compile_with_options};
+        use ryft_core::operations::trigonometric::Sin;
+        use tempfile::tempdir;
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_domain_mesh(&client, "x", 1);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let directory = tempdir().unwrap();
+
+        let first_domain = XlaDomain::with_configured_disk_cache(
+            &client,
+            DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
+        );
+        let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
+            compile_with_options(
+                &first_domain,
+                |x| x.sin().unwrap(),
+                input_type.clone(),
+                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
+            )
+            .unwrap();
+        assert_eq!(first_domain.cache.statistics().compilations, 1);
+        drop(first);
+        drop(first_domain);
+
+        let second_domain = XlaDomain::with_configured_disk_cache(
+            &client,
+            DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
+        );
+        let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
+            compile_with_options(
+                &second_domain,
+                |x| x.sin().unwrap(),
+                input_type,
+                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
+            )
+            .unwrap();
+        let statistics = second_domain.cache.statistics();
+        assert_eq!(statistics.persistent_hits, 1);
+        assert_eq!(statistics.compilations, 0, "restoration must not invoke backend compilation");
+    }
+
+    #[test]
+    fn test_xla_persistent_executable_rejects_malformed_and_incompatible_metadata() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let domain = XlaDomain::new(&client);
+
+        assert!(matches!(
+            domain.deserialize_program(b"truncated"),
+            Err(XlaDomainError::InvalidPersistentExecutable { .. }),
+        ));
+
+        let metadata = XlaPersistentExecutableMetadataV1 {
+            schema_version: XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION + 1,
+            feature_flags: 0,
+            compilation_options: CompilationOptions::default().encode_to_vec(),
+            output_types: Vec::new(),
+            donation_flags: Vec::new(),
+            capture_count: 0,
+            expected_argument_shardings: Vec::new(),
+            mesh: PersistentDeviceMeshV1 {
+                logical_mesh: PersistentLogicalMeshV1 { axes: Vec::new() },
+                devices: Vec::new(),
+            },
+            device_kinds: Vec::new(),
+            replica_count: 0,
+            partition_count: 0,
+            device_assignment: Vec::new(),
+            platform_name: client.platform_name().unwrap().into_owned(),
+            platform_version: client.platform_version().unwrap().into_owned(),
+            compiler_identity: XLA_COMPILER_IDENTITY.into(),
+            xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default(),
+            compilation_duration_nanoseconds: None,
+        };
+        let metadata = serde_json::to_vec(&metadata).unwrap();
+        let mut bytes = XLA_PERSISTENT_EXECUTABLE_MAGIC.to_vec();
+        bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(metadata.as_slice());
+        assert!(domain.deserialize_program(bytes.as_slice()).unwrap().is_none());
     }
 
     #[test]

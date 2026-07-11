@@ -404,8 +404,8 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap().remove(0);
-            assert!(outputs.done.r#await().is_ok());
+            let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let mut outputs = execution.block_until_ready().unwrap().remove(0);
             assert_eq!(outputs.outputs.len(), 1);
             let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), input_values.to_vec());

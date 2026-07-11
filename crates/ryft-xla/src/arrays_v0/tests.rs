@@ -800,12 +800,13 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
         Array::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
     let outputs = executable
         .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+        .unwrap()
+        .block_until_ready()
         .unwrap();
 
     // Validate each output shard: row r should be [4r + 8, 4r + 4].
     assert_eq!(outputs.len(), execution_device_ids.len());
     for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
-        output.done.r#await().unwrap();
         assert_eq!(output.outputs.len(), 1);
         let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
         let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();

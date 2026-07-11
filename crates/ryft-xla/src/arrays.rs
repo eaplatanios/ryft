@@ -2,18 +2,18 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display};
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use ryft_core::EagerContext;
+use ryft_core::compilation::CompilationContext;
 use ryft_core::programs::Value;
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Sharding, ShardingDimension, ShardingError,
-    StaticShape, Typed, check_sharding,
+    ArrayType, DataType, Device, DeviceId, DeviceMesh, Layout, Parameter, Parameterized, Sharding, ShardingDimension,
+    ShardingError, StaticShape, Typed, check_sharding,
 };
 use ryft_macros::Parameter;
-use ryft_pjrt::{Buffer, Client};
+use ryft_pjrt::{Buffer, Client, Error as PjrtError, ExecutionFence};
 
-use crate::{ArrayError, Error, FromPjrt, ToPjrt};
+use crate::{ArrayError, Error, FromPjrt, ToPjrt, XlaDomain};
 
 // TODO(eaplatanios): Is `ArrayType::memory` being set, handled, and propagated correctly throughout this crate?
 
@@ -41,6 +41,45 @@ pub struct Array<'o> {
 
     /// Lookup table mapping [`DeviceId`]s to their corresponding [`ShardIndex`]es (indexing into [`Self::shards`]).
     shard_index_by_device: HashMap<DeviceId, ShardIndex>,
+
+    /// Whole-execution completion fence for arrays produced by an asynchronous PJRT launch. This is separate from
+    /// each shard buffer's ready event because it also retains errors from zero-output effects and other device work
+    /// associated with the launch. Cloned output arrays share the same fence.
+    execution_fence: Option<ExecutionFence>,
+
+    /// Refer to the documentation of [`Self::client`] for information on this field.
+    client: Option<&'o Client<'o>>,
+
+    /// Process-local compile cache of the eager [`XlaDomain`] associated with this [`Array`], shared across array
+    /// clones and eager outputs via an [`Arc`]. Eager execution (see [`XlaDomain::bind`](ryft_core::Context::bind))
+    /// attaches the executing domain's cache to its outputs, and [`Value::execution_domain`] lazily initializes the
+    /// cache for arrays that were constructed outside any domain, so that every [`XlaDomain`] recovered from this
+    /// array (or from values derived from it) keeps hitting one shared dispatch cache instead of recompiling
+    /// repeated operation signatures.
+    compilation_cache: OnceLock<Arc<CompilationContext<XlaDomain<'o>>>>,
+}
+
+// `Array` equality is *buffer identity*, not element-wise value equality: two arrays are equal if and only if they
+// have the same type and every shard references the same underlying `Buffer` (by `Arc` pointer identity), i.e., when
+// they are clones of one logical array. Arrays holding equal data in distinct buffers deliberately compare unequal —
+// the conservative answer that consumers such as the scan/while loop-invariance fixed points of partial evaluation
+// need when they compare known values across replay rounds to detect passthrough (mirroring `Tracer`'s
+// staging-identity `PartialEq`). Element-wise equality would require device-to-host transfers and is deliberately
+// not what this implements.
+impl PartialEq for Array<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.r#type == other.r#type
+            && self.shards.len() == other.shards.len()
+            && self
+                .shards
+                .iter()
+                .zip(other.shards.iter())
+                .all(|(left, right)| match (left.buffer(), right.buffer()) {
+                    (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                    (None, None) => true,
+                    _ => false,
+                })
+    }
 }
 
 // TODO(eaplatanios): Review this.
@@ -51,6 +90,9 @@ impl<'o> Clone for Array<'o> {
             r#type: self.r#type.clone(),
             shards: self.shards.clone(),
             shard_index_by_device: self.shard_index_by_device.clone(),
+            execution_fence: self.execution_fence.clone(),
+            client: self.client,
+            compilation_cache: self.compilation_cache.clone(),
         }
     }
 }
@@ -80,10 +122,16 @@ impl<'o> Array<'o> {
     ///
     /// # Parameters
     ///
+    ///   - `client`: PJRT [`Client`] the new [`Array`] lives on, recoverable later via [`Self::client`] (which is
+    ///     what lets eager execution and free transforms recover the array's execution domain without a manual
+    ///     [`Self::with_client`] call). The client is attached through [`Self::with_client`], which validates that
+    ///     it owns every addressable shard buffer. Callers assembling metadata-only arrays with no local client
+    ///     (e.g., arrays whose shards all live on other processes) may pass `None` to build a client-less array.
     ///   - `r#type`: Global [`ArrayType`] for the new [`Array`].
     ///   - `mesh`: [`DeviceMesh`] that is used to determine the [`ArrayShard`] placement.
     ///   - `buffers`: [`Buffer`]s for the [`ArrayShard`]s that are addressable from the current process.
-    pub fn from_addressable_buffers(
+    pub fn from_addressable_buffers<C: Into<Option<&'o Client<'o>>>>(
+        client: C,
         r#type: ArrayType,
         mesh: DeviceMesh,
         buffers: Vec<Buffer<'o>>,
@@ -162,7 +210,18 @@ impl<'o> Array<'o> {
 
         // TODO(eaplatanios): Review this.
         crate::telemetry::array_constructed();
-        Ok(Self { r#type, shards, shard_index_by_device })
+        let array = Self {
+            r#type,
+            shards,
+            shard_index_by_device,
+            execution_fence: None,
+            client: None,
+            compilation_cache: OnceLock::new(),
+        };
+        match client.into() {
+            Some(client) => array.with_client(client),
+            None => Ok(array),
+        }
     }
 
     /// Creates an [`Array`] by transferring a dense row-major host buffer to the local shards implied by `r#type`
@@ -317,8 +376,78 @@ impl<'o> Array<'o> {
             }
         }
 
-        // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly.
-        Ok(Self::from_addressable_buffers(r#type, mesh, addressable_buffers)?)
+        // Reuse the buffer-based constructor for final buffer validation and global sharding metadata assembly; it
+        // also attaches the client that transferred the local shard buffers so that it can be recovered later via
+        // [`Self::client`].
+        Ok(Self::from_addressable_buffers(client, r#type, mesh, addressable_buffers)?)
+    }
+
+    /// Attaches the provided PJRT [`Client`] to this [`Array`] so that it can be recovered later via [`Self::client`],
+    /// after validating that every addressable [`ArrayShard`]'s [`Buffer`] is owned by that [`Client`] (via
+    /// [`Buffer::is_owned_by`]). Arrays constructed through [`Self::from_host_buffer`] and
+    /// [`Self::from_addressable_buffers`] already carry the client they were constructed with; this builder is how
+    /// arrays assembled without one (i.e., with a `None` client) get a client attached after the fact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::PjrtError`] (wrapping an [`InvalidArgument`](ryft_pjrt::Error::InvalidArgument) error) if any
+    /// addressable shard's buffer is owned by a different PJRT client than the provided one.
+    pub fn with_client(mut self, client: &'o Client<'o>) -> Result<Self, Error> {
+        for shard in self.shards.iter().filter(|shard| shard.is_addressable()) {
+            let buffer = shard.buffer().unwrap();
+            if !buffer.is_owned_by(client) {
+                return Err(PjrtError::invalid_argument(format!(
+                    "the provided client does not own the addressable shard buffer for device {}",
+                    shard.device().id(),
+                ))
+                .into());
+            }
+        }
+        self.client = Some(client);
+        Ok(self)
+    }
+
+    /// Test-only helper that detaches the attached client so that client-less code paths (e.g., the device-set
+    /// fallback of eager placement validation) can be exercised on arrays built through client-attaching
+    /// constructors.
+    #[cfg(test)]
+    pub(crate) fn detach_client_for_tests(&mut self) {
+        self.client = None;
+    }
+
+    /// Attaches the provided [`XlaDomain`] compile cache to this [`Array`], replacing any cache attached earlier.
+    /// Eager execution calls this on its outputs so that domains recovered from them via
+    /// [`Value::execution_domain`] share the producing domain's dispatch cache. Refer to the documentation of the
+    /// [`Self::compilation_cache`] field for more information.
+    pub(crate) fn with_compilation_cache(mut self, cache: Arc<CompilationContext<XlaDomain<'o>>>) -> Self {
+        self.compilation_cache = OnceLock::from(cache);
+        self
+    }
+
+    /// Attaches the whole-execution completion fence that produced this array. This never waits and is used by the
+    /// XLA executor when reassembling pending PJRT output buffers.
+    #[inline]
+    pub(crate) fn with_execution_fence(mut self, fence: ExecutionFence) -> Self {
+        self.execution_fence = Some(fence);
+        self
+    }
+
+    /// Returns the PJRT [`Client`] that this [`Array`] lives on, if one is attached. Arrays constructed through
+    /// [`Self::from_host_buffer`] carry the client that transferred their addressable shard buffers, arrays
+    /// constructed through [`Self::from_addressable_buffers`] carry the client passed at construction, and
+    /// [`Self::with_client`] attaches a client after the fact. This returns [`None`] for arrays constructed with a
+    /// `None` client and no subsequent [`Self::with_client`] call (e.g., metadata-only arrays with no addressable
+    /// shards, which are not tied to any local client).
+    ///
+    /// Note that the client cannot be recovered from the addressable shard buffers themselves: [`Buffer`]s only store
+    /// a raw handle to their owning PJRT client (by design, to avoid carrying the
+    /// [`KeyValueStore`](ryft_pjrt::KeyValueStore) lifetime), and [`Client`] is an owning wrapper whose [`Drop`]
+    /// implementation destroys the underlying PJRT client, so no `&Client` can be materialized from that raw handle.
+    /// The client is therefore threaded through explicitly at array construction time instead, and
+    /// [`Buffer::is_owned_by`] validates that the attached client matches the buffers' owning PJRT client.
+    #[inline]
+    pub fn client(&self) -> Option<&'o Client<'o>> {
+        self.client
     }
 
     /// Returns the [`DataType`] of the elements stored in this [`Array`].
@@ -387,6 +516,49 @@ impl<'o> Array<'o> {
     pub fn size_in_bytes(&self) -> Result<usize, Error> {
         self.r#type.size_in_bytes()
     }
+
+    /// Waits asynchronously for every addressable shard buffer to become ready, then checks the whole-execution
+    /// fence so errors not tied to an individual output buffer are surfaced as well. Calling this method does not copy
+    /// data to the host.
+    pub async fn ready(&self) -> Result<(), Error> {
+        for shard in self.addressable_shards() {
+            shard.buffer().unwrap().ready()?.await?;
+        }
+        if let Some(fence) = &self.execution_fence {
+            // Once all output buffers are ready the launch completion event should also be immediately consumable;
+            // checking it here preserves whole-execution errors without introducing a wait into device pipelines.
+            fence.block_until_ready()?;
+        }
+        Ok(())
+    }
+
+    /// Blocks the current thread until this array and the whole execution that produced it are ready. This is an
+    /// explicit synchronization boundary and does not copy data to the host.
+    pub fn block_until_ready(&self) -> Result<(), Error> {
+        if let Some(fence) = &self.execution_fence {
+            fence.block_until_ready()?;
+        }
+        for shard in self.addressable_shards() {
+            shard.buffer().unwrap().ready()?.r#await()?;
+        }
+        Ok(())
+    }
+}
+
+/// Waits asynchronously for every [`Array`] leaf in `values` to become ready without copying data to the host.
+pub async fn ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Result<(), Error> {
+    for array in values.parameters() {
+        array.ready().await?;
+    }
+    Ok(())
+}
+
+/// Blocks until every [`Array`] leaf in `values` is ready without copying data to the host.
+pub fn block_until_ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) -> Result<(), Error> {
+    for array in values.parameters() {
+        array.block_until_ready()?;
+    }
+    Ok(())
 }
 
 impl Debug for Array<'_> {
@@ -409,16 +581,39 @@ impl Typed for Array<'_> {
     }
 }
 
-impl Value for Array<'_> {
-    type DispatchDomain = EagerContext<Self>;
-    type ExecutionDomain = EagerContext<Self>;
+impl<'o> Value for Array<'o> {
+    // A concrete `Array` dispatches AND executes through the rich, PJRT-backed `XlaDomain`: the blanket value
+    // capabilities in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...) bind their
+    // operations through `dispatch_domain()`, which is what makes every operation on concrete arrays execute
+    // eagerly, op by op, through the domain recovered below, while free transform entry points (e.g.,
+    // `ryft_core::batching::batch`) recover the same domain through `execution_domain()`. `ryft-core`'s own
+    // `TestArray` instead keeps the constant-only `EagerContext` dispatch domain and provides direct host kernels
+    // for each capability, relying on in-crate coherence between those direct impls and the blankets; a downstream
+    // backend crate cannot take that route because the coherence check cannot rule out future
+    // `ConstantOperation: From<...>` impls upstream (E0119), so for XLA the rich dispatch domain *is* the eager
+    // capability surface and only capabilities without operation-binding blankets (`BooleanLike`,
+    // `WhilePredicate`, and the foreign `std::ops` sugar) get direct implementations in [`crate::eager`].
+    type DispatchDomain = XlaDomain<'o>;
+    type ExecutionDomain = XlaDomain<'o>;
 
-    fn dispatch_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
+    fn dispatch_domain(&self) -> XlaDomain<'o> {
+        self.execution_domain()
     }
 
-    fn execution_domain(&self) -> EagerContext<Self> {
-        EagerContext::new()
+    /// Recovers the eager [`XlaDomain`] this [`Array`] executes in. When the array carries an attached client (see
+    /// [`Array::client`]), the returned domain is backed by that client and shares this array's compile cache
+    /// (lazily initialized on first recovery, so repeated recoveries from the same array — and from eager outputs
+    /// derived from it — keep hitting one dispatch cache). Arrays without an attached client recover a clientless
+    /// domain that carries the XLA staged operation universe but rejects eager binds with a clear
+    /// "requires a PJRT client" error; attach a client via [`Array::with_client`] to make such arrays executable.
+    fn execution_domain(&self) -> XlaDomain<'o> {
+        match self.client {
+            Some(client) => {
+                let cache = Arc::clone(self.compilation_cache.get_or_init(|| Arc::new(CompilationContext::new())));
+                XlaDomain::with_shared_cache(client, cache)
+            }
+            None => XlaDomain::clientless(),
+        }
     }
 }
 
@@ -801,12 +996,19 @@ mod tests {
         ArrayType, DataType, Device, DeviceMesh, Error as CoreError, Layout, LogicalMesh, MeshAxis, MeshAxisType,
         Shape, Sharding, ShardingDimension, ShardingError, Size, StaticShape, TiledLayout, Typed,
     };
-    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, load_cpu_plugin};
 
     use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};
     use crate::{Error, FromPjrt};
 
-    use super::{Array, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout};
+    use super::{Array, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout, block_until_ready};
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn test_array_is_send_and_sync() {
+        assert_send_sync::<Array<'static>>();
+    }
 
     // TODO(eaplatanios): Review this test.
     #[test]
@@ -835,7 +1037,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         // Construct via [`Array::from_addressable_buffers`] and exercise every canonical [`Array`] accessor.
-        let array = Array::from_addressable_buffers(array_type.clone(), mesh.clone(), shard_buffers).unwrap();
+        let array = Array::from_addressable_buffers(&client, array_type.clone(), mesh.clone(), shard_buffers).unwrap();
 
         assert_eq!(array.r#type().as_ref(), &array_type);
         assert_eq!(array.data_type(), DataType::F32);
@@ -847,6 +1049,8 @@ mod tests {
         assert_eq!(array.addressable_shards().count(), 4);
         assert!(array.shards().iter().all(|shard| shard.shape() == StaticShape::new(vec![2, 2])));
         assert_eq!(array.size_in_bytes(), Ok(64));
+        array.block_until_ready().unwrap();
+        block_until_ready(&vec![array.clone()]).unwrap();
 
         // Every device in the mesh has a corresponding addressable shard, while device ids absent from the mesh
         // resolve to no shard at all.
@@ -866,7 +1070,7 @@ mod tests {
             .with_layout(layout.clone())
             .with_sharding(sharding)
             .unwrap();
-        let layout_array = Array::from_addressable_buffers(layout_type, mesh.clone(), Vec::new()).unwrap();
+        let layout_array = Array::from_addressable_buffers(None, layout_type, mesh.clone(), Vec::new()).unwrap();
         assert_eq!(layout_array.layout(), Some(&layout));
         assert_eq!(layout_array.addressable_shards().count(), 0);
         assert!(layout_array.shards().iter().all(|shard| shard.buffer().is_none()));
@@ -895,13 +1099,81 @@ mod tests {
     }
 
     #[test]
+    fn test_array_client() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
+        let sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4), Size::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
+
+        // Arrays constructed via [`Array::from_host_buffer`] carry the client that transferred their shard buffers,
+        // and cloning an array preserves the attached client.
+        let values = (0..16).map(|value| value as f32).collect::<Vec<_>>();
+        let bytes = values_to_bytes::<f32>(values.as_slice());
+        let array = Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), bytes.as_slice()).unwrap();
+        let recovered_client = array.client().unwrap();
+        assert!(std::ptr::eq(recovered_client, &client));
+        assert_eq!(recovered_client.process_index().unwrap(), client.process_index().unwrap());
+        assert_eq!(recovered_client.addressable_devices().unwrap().len(), client_devices.len());
+        assert!(std::ptr::eq(array.clone().client().unwrap(), &client));
+
+        // Arrays constructed via [`Array::from_addressable_buffers`] carry the client passed at construction, which
+        // is validated to own every addressable shard buffer.
+        let shard_buffers = || {
+            client_devices
+                .iter()
+                .map(|device| {
+                    let bytes = values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0]);
+                    client.buffer(bytes.as_slice(), BufferType::F32, [2u64, 2u64], None, device.clone(), None).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let array =
+            Array::from_addressable_buffers(&client, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+        assert!(std::ptr::eq(array.client().unwrap(), &client));
+
+        // A `None` client builds a client-less array, and [`Array::with_client`] attaches one after the fact with
+        // the same buffer-ownership validation.
+        let array = Array::from_addressable_buffers(None, array_type.clone(), mesh.clone(), shard_buffers()).unwrap();
+        assert!(array.client().is_none());
+        let array = array.with_client(&client).unwrap();
+        assert!(std::ptr::eq(array.client().unwrap(), &client));
+
+        // A client that does not own the addressable shard buffers is rejected — both at construction time and
+        // through [`Array::with_client`] — even when that client was created from the same plugin with identical
+        // options.
+        let other_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let error = array.with_client(&other_client).unwrap_err();
+        assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
+        assert!(error.to_string().starts_with("the provided client does not own the addressable shard buffer"));
+        let error = Array::from_addressable_buffers(&other_client, array_type.clone(), mesh.clone(), shard_buffers())
+            .unwrap_err();
+        assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
+        assert!(error.to_string().starts_with("the provided client does not own the addressable shard buffer"));
+
+        // Arrays with no addressable shards constructed with a `None` client carry no client and accept any client
+        // trivially.
+        let array = Array::from_addressable_buffers(None, array_type, mesh, Vec::new()).unwrap();
+        assert!(array.client().is_none());
+        assert!(std::ptr::eq(array.with_client(&other_client).unwrap().client().unwrap(), &other_client));
+    }
+
+    #[test]
     fn test_array_debug() {
         let shape = Shape::new(vec![Size::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(logical_mesh, vec![Device::new(0, 1)]).unwrap();
         let sharding = Sharding::replicated(device_mesh.logical_mesh().clone(), 1);
         let array_type = ArrayType::new(DataType::F32, shape).with_sharding(sharding).unwrap();
-        let array = Array::from_addressable_buffers(array_type, device_mesh, Vec::new()).unwrap();
+        let array = Array::from_addressable_buffers(None, array_type, device_mesh, Vec::new()).unwrap();
         assert_eq!(
             format!("{array:?}"),
             concat!(

@@ -2933,11 +2933,12 @@ mod tests {
             Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
             .unwrap();
 
         assert_eq!(outputs.len(), execution_device_ids.len());
         for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
-            output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
@@ -3068,11 +3069,12 @@ mod tests {
             Array::into_execute_arguments(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
             .unwrap();
 
         assert_eq!(outputs.len(), execution_device_ids.len());
         for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
-            output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
@@ -3209,11 +3211,12 @@ mod tests {
             Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
             .unwrap();
 
         assert_eq!(outputs.len(), execution_device_ids.len());
         for output in outputs {
-            output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let actual_values = values_from_bytes::<f32>(output_bytes.as_slice());
@@ -3325,11 +3328,12 @@ mod tests {
             Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
             .unwrap();
 
         assert_eq!(outputs.len(), execution_device_ids.len());
         for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
-            output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
@@ -3435,12 +3439,13 @@ mod tests {
             Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
             .unwrap();
 
         // Shards are [1, 2], [3, 4], [5, 6], [7, 8], so every device receives [1+3+5+7, 2+4+6+8] = [16, 20].
         assert_eq!(outputs.len(), execution_device_ids.len());
         for output in outputs {
-            output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
@@ -3823,12 +3828,13 @@ mod tests {
             Array::into_execute_arguments(vec![input_array], execution_device_ids.as_slice()).unwrap();
         let outputs = executable
             .execute(execute_arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)
+            .unwrap()
+            .block_until_ready()
             .unwrap();
 
         // Each device d holds shard [10] and adds its coordinate d, so device d outputs [10 + d].
         assert_eq!(outputs.len(), execution_device_ids.len());
         for (device_index, output) in outputs.into_iter().enumerate() {
-            output.done.r#await().unwrap();
             assert_eq!(output.outputs.len(), 1);
             let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             let values: [u64; 1] = values_from_bytes::<u64>(output_bytes.as_slice()).try_into().unwrap();

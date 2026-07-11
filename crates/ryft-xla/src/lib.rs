@@ -7,22 +7,31 @@ pub mod experimental;
 pub mod jit;
 pub mod mlir;
 pub mod pjrt;
+pub mod profile_guided;
 pub mod sharding;
 pub mod telemetry;
 pub mod types;
 
-pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
+pub use arrays::{Array, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout, block_until_ready, ready};
 pub use arrays_v0::ArrayError;
 pub use distributed::DistributedRuntime;
 pub use errors::Error;
-pub use experimental::domains::XlaDomain;
+pub use experimental::domains::{
+    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
+    XlaOptimizedProgram, XlaOptions,
+};
 pub use experimental::shard_map::{reshard, sharding_constraint};
 pub use jit::{
-    CompiledXlaFunction, StagedXlaFunction, compile, compile_with_captures, compile_with_options, infer_output_types,
-    stage, stage_with_captures,
+    CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
+    compile_with_captures, compile_with_options, infer_output_types, jitted, jitted_with_options, stage,
+    stage_with_captures, try_jitted_with_options,
 };
 pub use mlir::ToMlir;
 pub use pjrt::{FromPjrt, ToPjrt};
+pub use profile_guided::{
+    AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState, AdaptiveProfileGuidedStatistics,
+    AdaptiveProfileGuidedXlaFunction,
+};
 pub use telemetry::live_array_count;
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use ryft_core::compilation::CompilationDomain;
-use ryft_core::contexts::Domain;
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
+use ryft_core::tracing::Trace;
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
@@ -136,6 +136,7 @@ fn try_same_mesh<'o>(
         in_shardings: Some(vec![src_sharding.clone()]),
         out_shardings: Some(vec![dst_sharding.clone()]),
         donation_flags: vec![donate],
+        feedback_directed_profile: None,
     };
 
     let (_output_types_tree, program): (ArrayType, _) =

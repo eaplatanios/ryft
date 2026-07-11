@@ -14,7 +14,10 @@ pub mod ops;
 /// Tracing-backed `shard_map` surface and the supporting manual-computation metadata model.
 pub mod shard_map;
 
-pub use domains::{XlaDomain, XlaDomainError};
+pub use domains::{
+    XlaAnalysisValue, XlaCompilationAnalysis, XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaMemoryAnalysis,
+    XlaOptimizedProgram,
+};
 
 pub use shard_map::{
     ShardMapTraceError, TracedShardMap, TracedXlaProgram, reshard, shard_map, shard_map_with_options,

@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
 use ryft_core::operations::arithmetic::{
     AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
@@ -19,7 +20,6 @@ use ryft_core::operations::trigonometric::{Atan2Operation, CosOperation, SinOper
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
-use ryft_core::scalars::Scalar;
 use ryft_core::sharding::{LogicalMesh, Sharding, ShardingError};
 #[cfg(any(test, feature = "benchmarking"))]
 use ryft_core::tests::TestArray;
@@ -5462,7 +5462,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::EagerContext;
-    use ryft_core::contexts::{Context, Domain};
+    use ryft_core::contexts::Context;
     use ryft_core::operations::constants::{OneLike, OneOperation, ZeroLike};
     use ryft_core::operations::manipulation::{
         ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, PadOperation, SliceOperation,
@@ -5478,6 +5478,8 @@ mod tests {
     use ryft_core::types::{Shape, Size};
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
+    use ryft_core::tracing::Trace;
+
     use super::*;
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -6452,8 +6454,8 @@ mod tests {
                 ],
                 ..Default::default()
             };
-            let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap().remove(0);
-            assert!(outputs.done.r#await().is_ok());
+            let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let mut outputs = execution.block_until_ready().unwrap().remove(0);
             assert_eq!(outputs.outputs.len(), 1);
             let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![7.0]);
@@ -6547,8 +6549,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap().remove(0);
-        assert!(outputs.done.r#await().is_ok());
+        let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap().remove(0);
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(values_from_bytes::<f64>(output_bytes.as_slice()), vec![0.0, 0.0, 0.0]);

@@ -15,10 +15,12 @@
 
 use ryft_core::Batch;
 use ryft_core::LinearizationTracer;
+use ryft_core::Typed;
 use ryft_core::batching::BatchAxis;
 use ryft_core::compilation::{
-    CapturingContext, ClosedProgram, CompilationOptions, CompiledFunction, StagedFunction,
-    stage_with_capture_references,
+    CapturingContext, ClosedProgram, CompilationDomain, CompilationOptions, CompiledFunction, ExecutableFunction,
+    JittedFunction as CoreJittedFunction, Specialization, StagedFunction, jit_with_options as core_jit_with_options,
+    stage_with_capture_references, try_jit_with_options as core_try_jit_with_options,
 };
 use ryft_core::contexts::Context;
 use ryft_core::operations::constants::Constant;
@@ -28,13 +30,80 @@ use ryft_core::sharding::{DeviceMesh, Sharding};
 use ryft_core::tracing::{DomainTracingContext, Tracer};
 use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 use ryft_core::types::ArrayType;
+use ryft_pjrt::Execution;
 
 use crate::Array;
-use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
+use crate::experimental::domains::{XlaCompiledProgram, XlaDomain, XlaDomainError, XlaOptions};
 use crate::experimental::ops::{XlaConstant, XlaOperation};
+use crate::profile_guided::{AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedXlaFunction};
 
 /// Tracer leaf used while tracing an XLA compilation.
-type XlaCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, Array<'c>>>;
+pub type XlaCompileTracer<'c> = Tracer<DomainTracingContext<XlaDomain<'c>, Array<'c>>>;
+
+/// Retained XLA JIT dispatcher with explicit host-side static parameters.
+///
+/// A first call for each `(static parameters, dynamic parameter structure, dynamic abstract types)` specialization
+/// traces, lowers, and requests compilation. Warm calls dispatch directly to the retained executable. Static values
+/// should be low-cardinality configuration such as axes, shapes, or Boolean branch choices; arrays remain dynamic.
+pub type JittedXlaFunction<'c, F, Static, In, Out> = CoreJittedFunction<XlaDomain<'c>, F, Static, In, Out>;
+
+/// Constructs a retained dispatcher for a fallible XLA closure using explicit options.
+pub fn try_jitted_with_options<'c, F, Static, In, Out>(
+    function: F,
+    domain: &XlaDomain<'c>,
+    options: CompilationOptions<XlaDomain<'c>>,
+) -> JittedXlaFunction<'c, F, Static, In, Out>
+where
+    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    Static: Specialization,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+{
+    core_try_jit_with_options(domain, function, options)
+}
+
+/// Constructs a retained dispatcher for an infallible XLA closure using explicit options.
+pub fn jitted_with_options<'c, F, Static, In, Out>(
+    function: F,
+    domain: &XlaDomain<'c>,
+    options: CompilationOptions<XlaDomain<'c>>,
+) -> JittedXlaFunction<
+    'c,
+    impl Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    Static,
+    In,
+    Out,
+>
+where
+    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    Static: Specialization,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+{
+    core_jit_with_options(domain, function, options)
+}
+
+/// Constructs a retained dispatcher for an infallible XLA closure on `mesh`.
+#[inline]
+pub fn jitted<'c, F, Static, In, Out>(
+    function: F,
+    domain: &XlaDomain<'c>,
+    mesh: DeviceMesh,
+) -> JittedXlaFunction<
+    'c,
+    impl Fn(Static, In::To<XlaCompileTracer<'c>>) -> Result<Out::To<XlaCompileTracer<'c>>, XlaDomainError>,
+    Static,
+    In,
+    Out,
+>
+where
+    F: Fn(Static, In::To<XlaCompileTracer<'c>>) -> Out::To<XlaCompileTracer<'c>>,
+    Static: Specialization,
+    In: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+    Out: Parameterized<ArrayType, Family: ParameterizedFamily<XlaConstant> + ParameterizedFamily<XlaCompileTracer<'c>>>,
+{
+    jitted_with_options(function, domain, CompilationOptions::new(XlaOptions::new(mesh)))
+}
 
 /// Captured-constant output tree produced by tracing an XLA closure.
 type XlaSourceProgramOutput<Out> = <Out as Parameterized<ArrayType>>::To<XlaConstant>;
@@ -179,6 +248,102 @@ impl<
     }
 }
 
+/// Runtime-only XLA executable handle.
+///
+/// Unlike [`CompiledXlaFunction`], this type does not retain the `Rc`-backed staged program or lowering metadata used
+/// by transforms. It can only execute and inspect its runtime signature. Its thread-safety is derived from its
+/// backend state; no unsafe blanket implementation is used.
+pub struct ExecutableXlaFunction<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> {
+    function: ExecutableFunction<XlaDomain<'c>, In, Out>,
+}
+
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone for ExecutableXlaFunction<'c, In, Out> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { function: self.function.clone() }
+    }
+}
+
+impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> ExecutableXlaFunction<'c, In, Out> {
+    /// Returns the flat output [`ArrayType`]s in executor order.
+    #[inline]
+    pub fn output_types(&self) -> &[ArrayType] {
+        self.function.output_types()
+    }
+
+    /// Returns the device mesh this executable runs against.
+    #[inline]
+    pub fn mesh(&self) -> &DeviceMesh {
+        self.function.compiled_program().mesh()
+    }
+
+    #[inline]
+    pub(crate) fn domain(&self) -> &XlaDomain<'c> {
+        self.function.domain()
+    }
+
+    pub(crate) fn with_compiled_program(
+        &self,
+        program: std::sync::Arc<XlaCompiledProgram<'c>>,
+    ) -> Result<Self, XlaDomainError> {
+        Ok(Self { function: self.function.with_compiled_program(program)? })
+    }
+
+    /// Executes this runtime handle on concrete [`Array`] inputs.
+    #[inline]
+    pub fn interpret(&self, inputs: In::To<Array<'c>>) -> Result<Out::To<Array<'c>>, XlaDomainError>
+    where
+        In::Family: ParameterizedFamily<Array<'c>>,
+        In::To<Array<'c>>: Parameterized<Array<'c>>,
+        Out::Family: ParameterizedFamily<Array<'c>>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    {
+        self.function.call(inputs)
+    }
+
+    /// Enqueues this runtime handle and retains whole-execution completion, including for zero-output calls.
+    pub fn interpret_async(&self, inputs: In::To<Array<'c>>) -> Result<Execution<Out::To<Array<'c>>>, XlaDomainError>
+    where
+        In::Family: ParameterizedFamily<Array<'c>>,
+        In::To<Array<'c>>: Parameterized<Array<'c>>,
+        Out::Family: ParameterizedFamily<Array<'c>>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    {
+        let flat_inputs = inputs.into_parameters().collect::<Vec<_>>();
+        if flat_inputs.len() != self.function.input_types().len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: self.function.input_types().len(),
+                actual: flat_inputs.len(),
+            }
+            .into());
+        }
+        let domain = self.function.domain();
+        for (expected, actual) in self.function.input_types().iter().zip(flat_inputs.iter().map(Typed::r#type)) {
+            domain.validate_input_type(expected, actual.as_ref())?;
+        }
+
+        let mut arguments = self.function.captures().to_vec();
+        arguments.extend(flat_inputs);
+        let execution = domain.execute_compiled_async(self.function.compiled_program(), arguments)?;
+        let (flat_outputs, fence) = execution.into_parts();
+        if flat_outputs.len() != self.function.output_types().len() {
+            return Err(ProgramError::InvalidOutputCount {
+                expected: self.function.output_types().len(),
+                actual: flat_outputs.len(),
+            }
+            .into());
+        }
+        for (expected, actual) in self.function.output_types().iter().zip(flat_outputs.iter().map(Typed::r#type)) {
+            domain.validate_output_type(expected, actual.as_ref())?;
+        }
+        let outputs = Out::To::<Array<'c>>::from_parameters(self.function.output_structure().clone(), flat_outputs)
+            .map_err(|error| XlaDomainError::from(ProgramError::from(error)))?;
+        Ok(Execution::new(outputs, fence))
+    }
+}
+
 /// Just-in-time compiled function handle. Returned by [`compile`], [`compile_with_options`], and
 /// [`StagedXlaFunction::compile`].
 ///
@@ -226,6 +391,36 @@ impl<
         self.function.output_types()
     }
 
+    /// Returns a runtime-only handle that omits staged and lowered transform metadata.
+    #[inline]
+    pub fn executable(&self) -> ExecutableXlaFunction<'c, In, Out> {
+        ExecutableXlaFunction { function: self.function.executable().clone() }
+    }
+
+    /// Consumes this transformable handle and returns its runtime-only executable state.
+    #[inline]
+    pub fn into_executable(self) -> ExecutableXlaFunction<'c, In, Out> {
+        ExecutableXlaFunction { function: self.function.into_executable() }
+    }
+
+    /// Wraps this compiled function in an adaptive profile-guided dispatcher.
+    ///
+    /// The returned runtime-only handle samples a bounded number of baseline executions, recompiles the already
+    /// lowered StableHLO through the domain's ordinary compilation cache with the aggregated XLA profile, and then
+    /// atomically directs subsequent calls to the compatible optimized executable. This compiled function remains
+    /// available for transforms and continues dispatching to its original executable.
+    pub fn with_adaptive_profile_guided_recompilation(
+        &self,
+        options: AdaptiveProfileGuidedOptions,
+    ) -> Result<AdaptiveProfileGuidedXlaFunction<'c, In, Out>, XlaDomainError> {
+        AdaptiveProfileGuidedXlaFunction::new(
+            self.executable(),
+            self.function.lowered().lowered_program().clone(),
+            self.function.lowered().options().clone(),
+            options,
+        )
+    }
+
     /// Returns the staged function this executable was compiled from.
     #[inline]
     pub fn staged(&self) -> &StagedXlaFunction<'c, In, Out> {
@@ -263,6 +458,20 @@ impl<
             Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
     {
         self.function.call(inputs)
+    }
+
+    /// Enqueues this compiled function and returns its possibly still pending structured outputs together with a
+    /// whole-execution completion fence. Unlike [`Self::interpret`], the returned [`Execution`] retains completion
+    /// state even for functions with no array outputs, allowing effect-only asynchronous errors to be observed.
+    pub fn interpret_async(&self, inputs: In::To<Array<'c>>) -> Result<Execution<Out::To<Array<'c>>>, XlaDomainError>
+    where
+        In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Array<'c>>>,
+        In::To<Array<'c>>: Parameterized<Array<'c>>,
+        Out: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<Array<'c>>>,
+        Out::To<Array<'c>>:
+            Parameterized<Array<'c>, Family = Out::Family, ParameterStructure = Out::ParameterStructure>,
+    {
+        self.executable().interpret_async(inputs)
     }
 
     /// Stages a call to this compiled function into an active trace as a `jit_call` operation.
@@ -875,9 +1084,12 @@ mod tests {
     use crate::experimental::ops::XlaOperation;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledXlaFunction, FromPjrt, StagedXlaFunction, compile, compile_with_captures, compile_with_options,
-        infer_output_types, stage, stage_with_captures,
+        AdaptiveProfileGuidedOptions, Array, CompiledXlaFunction, ExecutableXlaFunction, FromPjrt, JittedXlaFunction,
+        StagedXlaFunction, XlaCompileTracer, compile, compile_with_captures, compile_with_options, infer_output_types,
+        jitted, stage, stage_with_captures,
     };
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
@@ -947,6 +1159,104 @@ mod tests {
         for (got, &input) in observed.iter().zip(values.iter()) {
             assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
         }
+    }
+
+    #[test]
+    fn test_executable_xla_function_runs_without_transform_metadata() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
+                .unwrap()
+                .into_executable();
+        let input =
+            Array::from_host_buffer(&client, input_type.clone(), mesh, values_to_bytes::<f32>(&[0.5]).as_slice())
+                .unwrap();
+
+        let output = executable.interpret(input).unwrap();
+
+        assert_eq!(executable.output_types(), &[input_type]);
+        assert!((read_f32_array(&client, &output)[0] - 0.5_f32.sin()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_executable_xla_function_executes_across_threads() {
+        assert_send_sync::<ExecutableXlaFunction<'static, ArrayType, ArrayType>>();
+
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let executable: ExecutableXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
+                .unwrap()
+                .into_executable();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+
+        let output =
+            std::thread::scope(|scope| scope.spawn(move || executable.interpret(input)).join().unwrap()).unwrap();
+        assert!((read_f32_array(&client, &output)[0] - 0.5_f32.sin()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_adaptive_profile_guided_recompilation_rejects_cpu_at_construction() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
+            compile(|input| input.sin().unwrap(), input_type, &domain, mesh).unwrap();
+
+        assert!(matches!(
+            compiled.with_adaptive_profile_guided_recompilation(AdaptiveProfileGuidedOptions::default()),
+            Err(XlaDomainError::InvalidCompilationOptions { reason }) if reason.contains("CUDA or ROCm"),
+        ));
+    }
+
+    #[test]
+    fn test_retained_jit_reuses_static_specializations() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let function: JittedXlaFunction<'_, _, bool, ArrayType, ArrayType> = jitted(
+            |apply_sine, input: XlaCompileTracer<'_>| if apply_sine { input.sin().unwrap() } else { input },
+            &domain,
+            mesh.clone(),
+        );
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let source =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+
+        let sine = function.call(true, source.clone()).unwrap();
+        let warm_sine = function.call(true, source.clone()).unwrap();
+        let identity = function.call(false, source).unwrap();
+        assert!((read_f32_array(&client, &sine)[0] - 0.5_f32.sin()).abs() < 1e-5);
+        assert!((read_f32_array(&client, &warm_sine)[0] - 0.5_f32.sin()).abs() < 1e-5);
+        assert!((read_f32_array(&client, &identity)[0] - 0.5).abs() < 1e-5);
+
+        let statistics = function.statistics();
+        assert_eq!(statistics.dispatch_hits, 1);
+        assert_eq!(statistics.dispatch_misses, 2);
+        assert_eq!(statistics.traces, 2);
+        assert_eq!(statistics.lowerings, 2);
+        assert_eq!(statistics.compilation_requests, 2);
     }
 
     #[test]
@@ -1069,6 +1379,27 @@ mod tests {
             !source.instructions().is_empty(),
             "traced program should carry at least one instruction (the body of x.sin())",
         );
+    }
+
+    #[test]
+    fn test_interpret_async_retains_zero_output_completion() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let engine = XlaDomain::new(&client);
+
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledXlaFunction<'_, ArrayType, ()> =
+            compile(|_| (), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0]).as_slice()).unwrap();
+
+        let execution = compiled.interpret_async(input).unwrap();
+        assert_eq!(execution.output(), &());
+        execution.fence().block_until_ready().unwrap();
+        assert_eq!(execution.block_until_ready(), Ok(()));
     }
 
     /// Inner-composition smoke test: a compiled function can be staged into another

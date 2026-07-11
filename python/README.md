@@ -52,6 +52,19 @@ The runtime comparison uses JAX's eager transform APIs and the release-mode Rust
 `crates/ryft-xla/src/bin/transform_benchmark.rs`. It reports the Ryft/JAX median runtime ratio for each case and exits
 with a non-zero status if any selected case exceeds the configured `--max-ratio`.
 
+Run the matched compilation lifecycle and asynchronous-execution comparison with:
+
+```bash
+uv run python scripts/compare_compilation_performance_with_jax.py --iterations 100 --size 1048576 \
+    --output /tmp/ryft-jax-compilation.json
+```
+
+Add `--smoke` for the CI-suitable counter/invariant mode. Add `--cache-dir PATH` to give each framework an isolated
+persistent-cache subdirectory. The report times trace, lower, backend compile, warm dispatch, enqueue-only execution,
+and explicitly synchronized execution separately; it never interprets enqueue latency as device execution latency.
+Persistent-cache benchmark mode uses zero compile-duration and entry-size write thresholds in both frameworks so the
+second fresh compilation context actually measures executable restoration rather than silently recompiling.
+
 Run the following command to verify the curated preserved historical dump corpus against the committed `syrupy`
 snapshots:
 
