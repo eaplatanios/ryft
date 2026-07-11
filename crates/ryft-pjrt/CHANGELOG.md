@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added shared `ExecutionFence` and `Execution<Output>` wrappers for explicit whole-execution readiness and
+  asynchronous error observation. `LoadedExecutable::execute` now returns an `Execution<Vec<ExecutionDeviceOutputs>>`
+  whose fence joins the per-device completion events of the launch, and `ExecutionDeviceOutputs` no longer exposes a
+  per-device `done` event.
 - Added support for the new `PJRT_Buffer_Bitcast` C API function.
 - Added support for the new `PJRT_Device_ClearMemoryStats` C API function.
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
@@ -22,10 +26,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_HostMemoryAllocator` extension and its owned host-memory allocation wrapper.
 - Added support for the new `PJRT_Xla_Transform` extension through a safe `XlaTransform` trait API.
 - Added the `mps` feature and `load_mps_plugin()` for loading the `jax-mps` PJRT plugin.
+- Added `BufferType::element_size_in_bytes`.
+- Added the `FeedbackDirectedProfile` wrapper for OpenXLA's XProf-to-feedback-directed-profile conversion and
+  deterministic multi-profile aggregation used by profile-guided latency estimation, owning the profile bytes
+  produced by the native profiler bridge.
+- Added `MemoryStatistics::peak_allocated_bytes` for the new `peak_allocated_bytes` device memory statistics fields.
+- Added support for PJRT HLO output callbacks through the new `HloOutputCallback` and `HloOutputOperand` wrappers
+  and a new `hlo_output_callbacks` parameter on `LoadedExecutable::execute`. In contrast to send and receive
+  callbacks, HLO output callbacks are provided as a single flat list that handles invocations across all replicas
+  and partitions of an execution.
+- Added `XlaTransformExtension::clear_transform` together with `Client::clear_xla_transform` and
+  `Plugin::clear_xla_transform` for the new `PJRT_Clear_Xla_Transform` extension function.
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.111`.
+- Updated our PJRT C API bindings for version `0.113`.
+- Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
+  handle wrappers that reflect PJRT's thread-safety contracts. Event callbacks now require `Send + 'static`, the
+  unsafe `EventHandle` was replaced by the safe shared-ownership `EventPromise`, and asynchronous host-buffer
+  ownership uses `Arc` instead of `Rc<RefCell<_>>`. `Client::event` and `Plugin::event` now return an
+  `(Event, EventPromise)` pair in which the non-clonable `EventPromise` is the only way to set/trigger the event and
+  is consumed by `set`, structurally enforcing the PJRT C API's `PJRT_Event_Set` contract (only events created through
+  `PJRT_Event_Create` may be set, at most once). `Event` is `Send` but deliberately not `Sync` because the PJRT C API
+  does not guarantee that overlapping consumer calls are thread-safe, and dropping a pending `Event` releases the task
+  waker registered through its `Future` implementation. `Client::borrowed_mut_buffer` is now explicitly `unsafe` because
+  callers must prevent safe access to the shared host allocation while PJRT may mutate it. Buffer external
+  reference-count operations now document their exceptional external-synchronization requirement.
+- Changed host-buffer and host-to-device-transfer keep-alive closures to be leaked instead of released when a failure
+  occurs after the data pointer has been handed to a successful PJRT call, so that the shared host data can never be
+  freed while an in-flight transfer may still be reading it.
+- Required `KeyValueStore` implementations to be `Send + Sync` because PJRT may invoke their callbacks concurrently.
+  `Client` now obtains its thread-safety structurally through a narrow native-handle wrapper instead of whole-type
+  unsafe `Send` and `Sync` implementations.
 - Changed `Buffer::copy_to_host` to fall back to the buffer's reported on-device byte size when a PJRT plugin
   returns a successful host-copy size query without populating `dst_size`.
 - Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and

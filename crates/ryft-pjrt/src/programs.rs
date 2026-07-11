@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use prost::Message;
 
@@ -796,8 +796,10 @@ impl<'c> LoadedExecutable<'c> {
 
     /// Executes this [`LoadedExecutable`] on its _addressable_ devices (or on a single _addressable_ device if `device`
     /// is provided) using the provided inputs. Note that the execution of PJRT programs is asynchronous and so the
-    /// runtime may not have completed execution by the time this function returns. You can use [`Buffer::ready`] on the
-    /// returned [`Buffer`]s of [`Event::await`] on the returned [`Event`]s to wait for the execution to complete.
+    /// runtime may not have completed execution by the time this function returns. The returned [`Execution`] pairs the
+    /// per-device output [`Buffer`]s with the whole-execution [`ExecutionFence`] that joins every device's completion
+    /// event. Use [`Execution::block_until_ready`] (or the fence directly) to wait for the launch to complete and
+    /// observe asynchronous execution errors, or [`Buffer::ready`] to wait for individual outputs.
     ///
     /// # Parameters
     ///
@@ -805,6 +807,10 @@ impl<'c> LoadedExecutable<'c> {
     ///     If `device` is not [`None`], this must contain exactly one entry corresponding to that [`Device`].
     ///     Otherwise, the length of this slice must match the length of [`LoadedExecutable::addressable_devices`]
     ///     for this [`LoadedExecutable`].
+    ///   - `hlo_output_callbacks`: [`HloOutputCallback`]s to use for HLO output callback custom calls in the
+    ///     corresponding [`Program`]. In contrast to the [`SendCallback`]s and [`ReceiveCallback`]s provided
+    ///     through `inputs`, each [`HloOutputCallback`] handles invocations across all replicas and partitions
+    ///     of the execution and so this is a single flat list for the whole execution.
     ///   - `launch_id`: Identifier for this execution/launch as part of a potentially multi-device launch. This can be
     ///     used to detect scheduling errors (e.g. if multi-host programs are launched in different orders on different
     ///     hosts, the launch IDs may be used by the runtime to detect the mismatch).
@@ -828,12 +834,13 @@ impl<'c> LoadedExecutable<'c> {
     pub fn execute<'l>(
         &self,
         inputs: Vec<ExecutionDeviceInputs<'c, 'l>>,
+        hlo_output_callbacks: Vec<HloOutputCallback>,
         launch_id: usize,
         context: Option<ExecutionContext>,
         call_location: Option<&str>,
         incarnation_ids: Option<HashMap<usize, usize>>,
         device: Option<&Device<'c>>,
-    ) -> Result<Vec<ExecutionDeviceOutputs<'c>>, Error> {
+    ) -> Result<Execution<Vec<ExecutionDeviceOutputs<'c>>>, Error> {
         use ffi::PJRT_LoadedExecutable_Execute_Args;
 
         let mut inputs = inputs;
@@ -921,6 +928,20 @@ impl<'c> LoadedExecutable<'c> {
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut ReceiveCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
+        // We handle HLO output callbacks in the same way as send and receive callbacks, except that they are flat
+        // (i.e., not per-device) and so their owned state must be freed only after execution completes on _all_
+        // participating devices. We achieve that by moving the owned callbacks behind an [`Arc`] whose clones are
+        // dropped by the per-device completion events.
+        let hlo_output_callback_count = hlo_output_callbacks.len();
+        let mut hlo_output_callback_infos =
+            hlo_output_callbacks.into_iter().map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>();
+        let hlo_output_callbacks = Arc::new(Mutex::new(
+            hlo_output_callback_infos
+                .iter()
+                .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
+                .collect::<Vec<_>>(),
+        ));
+
         let non_donatable_input_indices = input_is_donatable
             .into_iter()
             .enumerate()
@@ -957,13 +978,15 @@ impl<'c> LoadedExecutable<'c> {
             incarnation_ids_list.as_mut_ptr(),
             // TODO(eaplatanios): Add support for multi-slice configurations along with the relevant PJRT extension.
             std::ptr::null_mut(),
+            hlo_output_callback_infos.as_mut_ptr(),
+            hlo_output_callback_count,
         );
 
         // We prepare the input buffer handles array. This is an array of [`Buffer`] handle arrays where the outer
         // dimension corresponds to devices and the inner dimension corresponds to program inputs.
         let inputs = inputs
             .iter()
-            .map(|i| i.inputs.iter().map(|i| unsafe { i.buffer.to_c_api() }).collect::<Vec<_>>())
+            .map(|inputs| inputs.inputs.iter().map(|input| unsafe { input.buffer.to_c_api() }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         let input_pointers = inputs.iter().map(|inputs| inputs.as_ptr()).collect::<Vec<_>>();
 
@@ -996,16 +1019,21 @@ impl<'c> LoadedExecutable<'c> {
 
         // Process the outputs and the completion events.
         let mut execution_outputs = Vec::with_capacity(device_count);
+        let mut completion_events = Vec::with_capacity(device_count);
         for device_index in 0..device_count {
             let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
             let send_callbacks = std::mem::take(&mut send_callbacks[device_index]);
             let receive_callbacks = std::mem::take(&mut receive_callbacks[device_index]);
-            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() {
+            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callback_count > 0 {
                 // Move the owned callback allocations into the event completion handler so that they
-                // are released *only after* the runtime signals the device execution is done.
+                // are released *only after* the runtime signals the device execution is done. HLO output
+                // callbacks are shared across all devices and so each device holds one clone of the [`Arc`],
+                // releasing the callbacks only after the last device execution is done.
+                let hlo_output_callbacks = Arc::clone(&hlo_output_callbacks);
                 done_event.on_ready(move |_| {
                     drop(send_callbacks);
                     drop(receive_callbacks);
+                    drop(hlo_output_callbacks);
                 })?
             }
 
@@ -1015,13 +1043,19 @@ impl<'c> LoadedExecutable<'c> {
                 outputs.push(unsafe { Buffer::from_c_api(output_handle, self.api(), self.client)? });
             }
 
-            execution_outputs.push(ExecutionDeviceOutputs { outputs, done: done_event })
+            execution_outputs.push(ExecutionDeviceOutputs { outputs });
+            completion_events.push(done_event);
         }
 
-        Ok(execution_outputs)
+        Ok(Execution::new(execution_outputs, ExecutionFence::new(completion_events)))
     }
 
     /// Returns `true` if and only if this [`LoadedExecutable`] has been deleted using [`LoadedExecutable::delete`].
+    ///
+    /// Note that the reference PJRT plugin implementations of this query are currently unreliable. The `StreamExecutor`
+    /// GPU implementation reports inverted results (i.e., fresh executables report `true` and deleted executables
+    /// report `false` because their `IsDeleted` returns `executable_ != nullptr`), and the CPU implementation always
+    /// reports `false` because its `Delete` is a no-op and its `IsDeleted` is hardcoded to `false`.
     pub fn is_deleted(&self) -> Result<bool, Error> {
         use ffi::PJRT_LoadedExecutable_IsDeleted_Args;
         invoke_pjrt_api_error_fn!(self.api(), PJRT_LoadedExecutable_IsDeleted, { executable = self.to_c_api() }, {
@@ -1045,6 +1079,12 @@ impl<'c> LoadedExecutable<'c> {
         invoke_pjrt_api_error_fn!(self.api(), PJRT_LoadedExecutable_Delete, { executable = self.to_c_api() })
     }
 }
+
+// PJRT loaded executables are designed to be shared across threads. The plugin is responsible for making the underlying
+// `PJRT_LoadedExecutable` thread-safe. Multiple threads can invoke `Execute` on the same loaded executable concurrently
+// per the PJRT API contract (compiled artifacts are immutable).
+unsafe impl Send for LoadedExecutable<'_> {}
+unsafe impl Sync for LoadedExecutable<'_> {}
 
 impl Drop for LoadedExecutable<'_> {
     fn drop(&mut self) {
@@ -1122,16 +1162,161 @@ impl<'o, 'l> From<&'l [ExecutionInput<'o>]> for ExecutionDeviceInputs<'o, 'l> {
     }
 }
 
-/// Represents the output [`Buffer`]s on a single [`Device`] of a call to [`LoadedExecutable::execute`], paired with
-/// an [`Event`] that can be used to track when the computation for this program ηασ completed on that [`Device`].
+/// Represents the output [`Buffer`]s on a single [`Device`] of a call to [`LoadedExecutable::execute`]. Whole-launch
+/// completion (including work with no corresponding output buffer, such as effects) is tracked by the
+/// [`ExecutionFence`] of the [`Execution`] returned by [`LoadedExecutable::execute`], which joins the per-device
+/// completion events of the launch.
 pub struct ExecutionDeviceOutputs<'o> {
     /// [`Vec`] that contains the output [`Buffer`] that corresponds to each output of the [`LoadedExecutable`]
     /// that was executed.
     pub outputs: Vec<Buffer<'o>>,
+}
 
-    /// [`Event`] that can be used to track when all computation pending on a single [`Device`] for the execution of
-    /// a [`LoadedExecutable`] is completed.
-    pub done: Event<()>,
+/// State of an [`ExecutionFence`], transitioning from [`ExecutionFenceState::Pending`] to
+/// [`ExecutionFenceState::Complete`] the first time a [`ExecutionFence`] owner observes completion.
+enum ExecutionFenceState {
+    /// The execution has not been observed as complete yet, and the per-device completion [`Event`]s
+    /// returned by the PJRT launch have not been consumed yet.
+    Pending(Vec<Event<()>>),
+
+    /// The execution has completed and its per-device completion [`Event`]s have been consumed, with the recorded
+    /// result carrying the first observed asynchronous execution [`Error`], if any.
+    Complete(Result<(), Error>),
+}
+
+/// Shared completion state for one asynchronous PJRT execution across all participating addressable devices. PJRT
+/// execution is enqueued before this value is constructed. Creating or cloning an [`ExecutionFence`] never waits.
+/// Call [`Self::block_until_ready`] only at an explicit host synchronization boundary. The first waiter owns the
+/// underlying PJRT events and records their result, while later waiters observe that same result without waiting
+/// on an event twice. This fence plays the role that [`tsl::JoinFutures`](
+/// https://github.com/openxla/xla/blob/main/xla/tsl/concurrency/future.h) plays for JAX. XLA joins the per-device
+/// completion futures returned by [`PjRtLoadedExecutable::Execute`](
+/// https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h) into a single all-of/first-error future that is
+/// then shared by every output array of the launch. XLA futures are multi-consumer values backed by shared state, so
+/// that join needs no locking, whereas PJRT C API events (and the [`Event`]s wrapping them) are single-consumer, and
+/// so this fence recreates the shared observation on top of them.
+#[derive(Clone)]
+pub struct ExecutionFence {
+    /// Shared per-execution completion state. The first waiter consumes the per-device completion [`Event`]s stored
+    /// inside and records their joined result for every later (or cloned) observer.
+    state: Arc<Mutex<ExecutionFenceState>>,
+}
+
+impl ExecutionFence {
+    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s.
+    #[inline]
+    pub fn new(events: Vec<Event<()>>) -> Self {
+        Self { state: Arc::new(Mutex::new(ExecutionFenceState::Pending(events))) }
+    }
+
+    /// Returns `true` once every participating [`Event`] is completed, while preserving any asynchronous execution
+    /// error for [`Self::block_until_ready`]. This function only polls and never blocks. If another owner of this
+    /// fence is concurrently observing it (e.g., it is blocked inside [`Self::block_until_ready`]), then this
+    /// function conservatively returns `false` for this poll instead of waiting for that observation to finish.
+    pub fn is_ready(&self) -> Result<bool, Error> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            // Another owner of this fence is concurrently observing it. If it is blocked inside `block_until_ready`,
+            // then waiting for the lock would block this poll until the whole execution completes, so we conservatively
+            // report that completion has not been observed yet, mirroring how XLA future readiness queries never block
+            // on concurrent waiters of the same shared state.
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("execution fence state mutex poisoned"),
+        };
+        match &mut *state {
+            ExecutionFenceState::Pending(events) => {
+                for event in events.iter() {
+                    if !event.ready()? {
+                        return Ok(false);
+                    }
+                }
+                let events = std::mem::take(events);
+                let result = Self::await_events(events);
+                *state = ExecutionFenceState::Complete(result.clone());
+                result.map(|_| true)
+            }
+            ExecutionFenceState::Complete(result) => result.clone().map(|_| true),
+        }
+    }
+
+    /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
+    pub fn block_until_ready(&self) -> Result<(), Error> {
+        let mut state = self.state.lock().expect("execution fence state mutex poisoned");
+        match &mut *state {
+            ExecutionFenceState::Pending(events) => {
+                let result = Self::await_events(std::mem::take(events));
+                *state = ExecutionFenceState::Complete(result.clone());
+                result
+            }
+            ExecutionFenceState::Complete(result) => result.clone(),
+        }
+    }
+
+    /// Blocks until every provided [`Event`] is ready and returns the first observed asynchronous execution [`Error`],
+    /// if any. All events are consumed (i.e., awaited) even after an error is observed, so that no completion event is
+    /// left pending when the joined result is recorded.
+    fn await_events(events: Vec<Event<()>>) -> Result<(), Error> {
+        let mut result = Ok(());
+        for event in events {
+            if let Err(error) = event.r#await()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+}
+
+/// Output of an asynchronously enqueued PJRT execution together with its whole-execution completion fence,
+/// as returned by [`LoadedExecutable::execute`].
+pub struct Execution<Output> {
+    /// Output of the execution, which may still be pending (i.e., its underlying buffers may not be ready yet).
+    output: Output,
+
+    /// Whole-execution completion [`ExecutionFence`] shared by all consumers of this execution's outputs.
+    fence: ExecutionFence,
+}
+
+impl<Output> Execution<Output> {
+    /// Creates a new [`Execution`].
+    #[inline]
+    pub fn new(output: Output, fence: ExecutionFence) -> Self {
+        Self { output, fence }
+    }
+
+    /// Returns the output of this [`Execution`] without waiting for it to complete. The returned output may still be
+    /// pending (i.e., its underlying buffers may not be ready yet), but it is immediately usable (e.g., it can be
+    /// fed into further executions, which the PJRT runtime will order after this execution on the devices).
+    #[inline]
+    pub fn output(&self) -> &Output {
+        &self.output
+    }
+
+    /// Returns the whole-execution completion [`ExecutionFence`] of this [`Execution`].
+    #[inline]
+    pub fn fence(&self) -> &ExecutionFence {
+        &self.fence
+    }
+
+    /// Consumes this [`Execution`] and returns its possibly still pending output without waiting.
+    #[inline]
+    pub fn into_output(self) -> Output {
+        self.output
+    }
+
+    /// Consumes this [`Execution`] and returns its possibly still pending output and whole-execution fence
+    /// without waiting.
+    #[inline]
+    pub fn into_parts(self) -> (Output, ExecutionFence) {
+        (self.output, self.fence)
+    }
+
+    /// Blocks until this entire [`Execution`] completes, returning its output or the first execution error.
+    pub fn block_until_ready(self) -> Result<Output, Error> {
+        self.fence.block_until_ready()?;
+        Ok(self.output)
+    }
 }
 
 /// Callback function that is invoked from the runtime when executing _send_ operations in [`Program`]s. The channel ID
@@ -1160,7 +1345,7 @@ pub struct SendCallback {
     /// If this function returns an [`Error`], then PJRT might propagate that error properly, though not all
     /// implementations will do that; there may be cases where an implementation continues executing the program with
     /// _undefined_ data being sent downstream which can be _unsafe_.
-    pub function: Box<dyn FnMut(Chunk, usize, bool) -> Result<(), Error>>,
+    pub function: Box<dyn FnMut(Chunk, usize, bool) -> Result<(), Error> + Send>,
 }
 
 impl SendCallback {
@@ -1218,7 +1403,7 @@ pub struct ReceiveCallback {
     /// is executed. This function will be invoked once for each _receive_ operation. It receives as input a
     /// [`CopyToDeviceStream`] which must be used to _stream_ data to the PJRT runtime. Specifically, the data
     /// will be sent in [`Chunk`]s.
-    pub function: Box<dyn FnMut(CopyToDeviceStream<'_>)>,
+    pub function: Box<dyn FnMut(CopyToDeviceStream<'_>) + Send>,
 
     /// Underlying PJRT [`Api`].
     api: Api,
@@ -1251,6 +1436,108 @@ impl ReceiveCallback {
             channel_id: self.channel_id as i64,
             user_arg: Box::into_raw(Box::new(self)) as *mut _,
             recv_callback: callback,
+        }
+    }
+}
+
+/// Single operand value passed to an [`HloOutputCallback`] invocation. The runtime invokes the callback function once
+/// per operand of the corresponding callback custom call, for each replica and partition of the execution, and each
+/// invocation receives one [`HloOutputOperand`].
+pub struct HloOutputOperand<'a> {
+    /// ID of the replica that produced this operand value.
+    pub replica_id: ReplicaId,
+
+    /// ID of the computation (i.e., partition) that produced this operand value.
+    pub computation_id: ComputationId,
+
+    /// Index of this operand among the operands of the corresponding callback custom call.
+    pub operand_index: usize,
+
+    /// [`BufferType`] of the elements of this operand value. This is set to [`BufferType::Invalid`] when the runtime
+    /// did not produce a value for this operand (in which case [`HloOutputOperand::data`] is [`None`]).
+    pub element_type: BufferType,
+
+    /// Dimensions of this operand value.
+    pub dimensions: &'a [i64],
+
+    /// Dense row-major bytes of this operand value, or [`None`] if the runtime did not produce a value for this
+    /// operand. The data is only valid for the duration of the callback invocation and must be copied if it needs
+    /// to be retained.
+    pub data: Option<&'a [u8]>,
+}
+
+/// Callback function that is invoked from the runtime when executing HLO output callback custom calls in [`Program`]s.
+/// The callback ID used in the [`Program`] must match [`HloOutputCallback::callback_id`] for the callback. In contrast
+/// to [`SendCallback`]s and [`ReceiveCallback`]s which are provided per [`Device`], a single [`HloOutputCallback`]
+/// handles invocations across all replicas and partitions of an execution.
+pub struct HloOutputCallback {
+    /// Callback ID that is used to identify the [`Program`] callback custom call for which this callback will
+    /// be invoked.
+    pub callback_id: usize,
+
+    /// Number of operands that the corresponding [`Program`] callback custom call passes to this callback.
+    pub operand_count: usize,
+
+    /// Callback function that is invoked once per operand of the corresponding callback custom call, for each replica
+    /// and partition of the execution. Note that there is no guarantee on the order of the invocations across replicas
+    /// and partitions, and the provided [`HloOutputOperand::data`] is only valid for the duration of each invocation.
+    pub function: Box<dyn FnMut(HloOutputOperand<'_>) + Send>,
+}
+
+impl HloOutputCallback {
+    /// Returns the [`PJRT_HloOutputCallbackInfo`](ffi::PJRT_HloOutputCallbackInfo) that corresponds to this
+    /// [`HloOutputCallback`] and which can be passed to functions in the PJRT C API.
+    ///
+    /// # Safety
+    ///
+    /// This function consumes this callback returning a [`PJRT_HloOutputCallbackInfo`](ffi::PJRT_HloOutputCallbackInfo)
+    /// that owns the underlying callback state. The returned [`PJRT_HloOutputCallbackInfo::user_arg`] must be freed
+    /// after the execution that uses this callback completes. The [`LoadedExecutable::execute`] implementation handles
+    /// this by tying cleanup to the execution completion events.
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) unsafe fn to_c_api(self) -> ffi::PJRT_HloOutputCallbackInfo {
+        unsafe extern "C" fn callback(
+            replica_id: i64,
+            partition_id: i64,
+            data: *const std::ffi::c_void,
+            shape_dims: *const i64,
+            shape_num_dims: usize,
+            shape_element_type: crate::buffers::ffi::PJRT_Buffer_Type,
+            operand_index: i64,
+            user_arg: *mut std::ffi::c_void,
+        ) {
+            unsafe {
+                let user_arg = &mut *(user_arg as *mut HloOutputCallback);
+                let element_type = BufferType::from_c_api(shape_element_type);
+                let dimensions = slice_from_c_api(shape_dims, shape_num_dims);
+                let data = if data.is_null() {
+                    None
+                } else {
+                    // The runtime only provides non-null data pointers together with valid element types.
+                    let element_size = element_type
+                        .element_size_in_bytes()
+                        .expect("PJRT provided HLO output callback data with an invalid element type");
+                    let element_count = dimensions.iter().product::<i64>() as usize;
+                    Some(std::slice::from_raw_parts(data as *const u8, element_size * element_count))
+                };
+                (user_arg.function)(HloOutputOperand {
+                    replica_id: replica_id as ReplicaId,
+                    computation_id: partition_id as ComputationId,
+                    operand_index: operand_index as usize,
+                    element_type,
+                    dimensions,
+                    data,
+                });
+            }
+        }
+
+        let callback_id = self.callback_id as i64;
+        let num_operands = self.operand_count;
+        ffi::PJRT_HloOutputCallbackInfo {
+            user_arg: Box::into_raw(Box::new(self)) as *mut _,
+            callback,
+            callback_id,
+            num_operands,
         }
     }
 }
@@ -1406,7 +1693,7 @@ impl<'s> Client<'s> {
     /// Creates a new [`SendCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _send_ operation in the
     /// [`Program`] that will be executed.
-    pub fn send_callback<F: 'static + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
+    pub fn send_callback<F: 'static + Send + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
         &self,
         channel_id: usize,
         function: F,
@@ -1417,7 +1704,7 @@ impl<'s> Client<'s> {
     /// Creates a new [`ReceiveCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _receive_ operation in the
     /// [`Program`] that will be executed.
-    pub fn receive_callback<F: 'static + FnMut(CopyToDeviceStream<'_>)>(
+    pub fn receive_callback<F: 'static + Send + FnMut(CopyToDeviceStream<'_>)>(
         &self,
         channel_id: usize,
         function: F,
@@ -1459,7 +1746,7 @@ impl Plugin {
     /// Creates a new [`SendCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _send_ operation in the
     /// [`Program`] that will be executed.
-    pub fn send_callback<F: 'static + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
+    pub fn send_callback<F: 'static + Send + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
         &self,
         channel_id: usize,
         function: F,
@@ -1470,7 +1757,7 @@ impl Plugin {
     /// Creates a new [`ReceiveCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _receive_ operation in the
     /// [`Program`] that will be executed.
-    pub fn receive_callback<F: 'static + FnMut(CopyToDeviceStream<'_>)>(
+    pub fn receive_callback<F: 'static + Send + FnMut(CopyToDeviceStream<'_>)>(
         &self,
         channel_id: usize,
         function: F,
@@ -1529,7 +1816,7 @@ impl Api {
     /// Creates a new [`SendCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _send_ operation in the
     /// [`Program`] that will be executed.
-    pub(crate) fn send_callback<F: 'static + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
+    pub(crate) fn send_callback<F: 'static + Send + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
         &self,
         channel_id: usize,
         function: F,
@@ -1540,7 +1827,7 @@ impl Api {
     /// Creates a new [`ReceiveCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _receive_ operation in the
     /// [`Program`] that will be executed.
-    pub(crate) fn receive_callback<F: 'static + FnMut(CopyToDeviceStream<'_>)>(
+    pub(crate) fn receive_callback<F: 'static + Send + FnMut(CopyToDeviceStream<'_>)>(
         &self,
         channel_id: usize,
         function: F,
@@ -2389,6 +2676,25 @@ pub(crate) mod ffi {
         pub recv_callback: PJRT_RecvCallback,
     }
 
+    pub type PJRT_HloOutputCallback = unsafe extern "C" fn(
+        replica_id: i64,
+        partition_id: i64,
+        data: *const std::ffi::c_void,
+        shape_dims: *const i64,
+        shape_num_dims: usize,
+        shape_element_type: crate::buffers::ffi::PJRT_Buffer_Type,
+        operand_index: i64,
+        user_arg: *mut std::ffi::c_void,
+    );
+
+    #[repr(C)]
+    pub struct PJRT_HloOutputCallbackInfo {
+        pub user_arg: *mut std::ffi::c_void,
+        pub callback: PJRT_HloOutputCallback,
+        pub callback_id: i64,
+        pub num_operands: usize,
+    }
+
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
     #[repr(C)]
@@ -2459,6 +2765,8 @@ pub(crate) mod ffi {
         pub incarnation_ids: *mut i64,
         pub multi_slice_config: *mut PJRT_MultiSlice_Config,
         pub use_major_to_minor_data_layout_for_callbacks: bool,
+        pub hlo_output_callbacks: *mut PJRT_HloOutputCallbackInfo,
+        pub num_hlo_output_callbacks: usize,
     }
 
     impl PJRT_ExecuteOptions {
@@ -2477,6 +2785,8 @@ pub(crate) mod ffi {
             task_ids: *mut std::ffi::c_int,
             incarnation_ids: *mut i64,
             multi_slice_config: *mut PJRT_MultiSlice_Config,
+            hlo_output_callbacks: *mut PJRT_HloOutputCallbackInfo,
+            num_hlo_output_callbacks: usize,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -2495,6 +2805,8 @@ pub(crate) mod ffi {
                 incarnation_ids,
                 multi_slice_config,
                 use_major_to_minor_data_layout_for_callbacks: false,
+                hlo_output_callbacks,
+                num_hlo_output_callbacks,
             }
         }
     }
@@ -2554,13 +2866,12 @@ mod tests {
 
     use crate::extensions::multi_slice::{self, MultiSliceConfig, MultiSliceExtension};
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-    use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
-    use crate::{
-        BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, Executable, ExecutionContext,
-        ExecutionDeviceInputs, ExecutionInput, LoadOptions, LoadedExecutable, Program, slice_from_c_api,
-    };
+    use crate::tests::{TestPlatform, test_cpu_client, test_cpu_plugin, test_for_each_platform};
+    use crate::{BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, slice_from_c_api};
 
-    use super::ffi;
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     fn test_program(include_send_operation: bool, include_receive_operation: bool) -> Program {
         let module = match (include_send_operation, include_receive_operation) {
@@ -2978,9 +3289,13 @@ mod tests {
             let options = test_compilation_options();
             let loaded_executable = client.compile(&program, &options).unwrap();
 
-            // TODO(eaplatanios): Is this just broken or are we doing something wrong here?
-
-            // [`LoadedExecutable::is_deleted`] does not appear to work correctly for the GPU plugins.
+            // The assertions below encode known upstream bugs in the reference PJRT plugin implementations
+            // of `PJRT_LoadedExecutable_IsDeleted`, rather than the intended semantics:
+            //   - The StreamExecutor GPU implementation has inverted polarity (i.e., `return executable_ != nullptr;`
+            //     in `PjRtStreamExecutorLoadedExecutable::IsDeleted`), and so fresh executables report `true` and
+            //     deleted executables report `false`.
+            //   - The CPU implementation is a stub: `PjRtCpuLoadedExecutable::Delete` is a no-op and its `IsDeleted`
+            //     always returns `false`.
             match platform {
                 TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
                     assert_eq!(loaded_executable.is_deleted(), Ok(true));
@@ -2989,8 +3304,6 @@ mod tests {
             };
 
             assert!(unsafe { loaded_executable.delete() }.is_ok());
-
-            // [`LoadedExecutable::is_deleted`] does not appear to work correctly for any plugin.
             assert_eq!(loaded_executable.is_deleted(), Ok(false));
         });
     }
@@ -3027,12 +3340,16 @@ mod tests {
             };
 
             // Execute the test program using our two input tensors.
-            let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
+
+            // Wait for the asynchronous execution to complete through its shared fence. Clones observe the
+            // recorded completion result without attempting to consume the PJRT events a second time.
+            let cloned_fence = execution.fence().clone();
+            let mut outputs = execution.block_until_ready().unwrap();
             assert_eq!(outputs.len(), 1);
             let mut outputs = outputs.remove(0);
-
-            // Wait for the asynchronous execution to complete.
-            outputs.done.r#await().unwrap();
+            assert_eq!(cloned_fence.is_ready(), Ok(true));
+            cloned_fence.block_until_ready().unwrap();
             let output = outputs.outputs.remove(0);
 
             // Copy the contents of the output buffer to the host.
@@ -3044,6 +3361,103 @@ mod tests {
             expected_output_bytes.extend_from_slice(&(-42i32).to_ne_bytes());
             assert_eq!(output_bytes, expected_output_bytes);
         });
+    }
+
+    #[test]
+    fn test_execution_fence_records_asynchronous_error() {
+        let client = test_cpu_client();
+        let expected = Error::aborted("asynchronous execution failed");
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(expected.clone())).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let cloned_fence = fence.clone();
+        let error = fence.block_until_ready().unwrap_err();
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.message(), expected.message());
+        let cloned_error = cloned_fence.block_until_ready().unwrap_err();
+        assert_eq!(cloned_error.code(), expected.code());
+        assert_eq!(cloned_error.message(), expected.message());
+    }
+
+    #[test]
+    fn test_execution_fence_waits_across_threads() {
+        assert_send_sync::<ExecutionFence>();
+        assert_send_sync::<Execution<()>>();
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let waiting_fence = fence.clone();
+        let waiter = std::thread::spawn(move || waiting_fence.block_until_ready());
+        promise.set(None).unwrap();
+        waiter.join().unwrap().unwrap();
+        assert_eq!(fence.is_ready(), Ok(true));
+    }
+
+    #[test]
+    fn test_hlo_output_callback_to_c_api() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let callback = HloOutputCallback {
+            callback_id: 42,
+            operand_count: 2,
+            function: Box::new(move |operand: HloOutputOperand<'_>| {
+                received_clone.lock().unwrap().push((
+                    operand.replica_id,
+                    operand.computation_id,
+                    operand.operand_index,
+                    operand.element_type,
+                    operand.dimensions.to_vec(),
+                    operand.data.map(|data| data.to_vec()),
+                ));
+            }),
+        };
+        let callback_info = unsafe { callback.to_c_api() };
+        assert_eq!(callback_info.callback_id, 42);
+        assert_eq!(callback_info.num_operands, 2);
+
+        // Invoke the C callback directly, simulating a runtime invocation with data for the first operand and
+        // a missing value for the second operand.
+        let data = [1i32, 2, 3, 4, 5, 6];
+        let dimensions = [2i64, 3];
+        unsafe {
+            (callback_info.callback)(
+                0,
+                1,
+                data.as_ptr() as *const _,
+                dimensions.as_ptr(),
+                dimensions.len(),
+                crate::buffers::ffi::PJRT_Buffer_Type_S32,
+                0,
+                callback_info.user_arg,
+            );
+            (callback_info.callback)(
+                0,
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                crate::buffers::ffi::PJRT_Buffer_Type_INVALID,
+                1,
+                callback_info.user_arg,
+            );
+        }
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].0, 0);
+        assert_eq!(received[0].1, 1);
+        assert_eq!(received[0].2, 0);
+        assert_eq!(received[0].3, BufferType::I32);
+        assert_eq!(received[0].4, vec![2, 3]);
+        let expected_data = data.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+        assert_eq!(received[0].5, Some(expected_data));
+        assert_eq!(received[1].2, 1);
+        assert_eq!(received[1].3, BufferType::Invalid);
+        assert!(received[1].4.is_empty());
+        assert_eq!(received[1].5, None);
+
+        // Free the callback state that `to_c_api` leaked into `user_arg`.
+        drop(unsafe { Box::from_raw(callback_info.user_arg as *mut HloOutputCallback) });
     }
 
     #[test]
@@ -3066,7 +3480,7 @@ mod tests {
 
         // [`LoadedExecutable::execute`] expects a [`Vec`] of inputs per device.
         assert!(matches!(
-            executable.execute(Vec::new(), 0, None, None, None, None),
+            executable.execute(Vec::new(), vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected inputs for 2 device(s) but got inputs for 0 device(s)",
         ));
@@ -3087,7 +3501,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs[..1], ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 2 input(s) for each device but got 1 for device 1",
         ));
@@ -3103,7 +3517,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 1 send callback(s) for each device but got 0 for device 1",
         ));
@@ -3119,7 +3533,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 1 receive callback(s) for each device but got 0 for device 1",
         ));
@@ -3130,7 +3544,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, Some("invalid\0location"), None, None),
+            executable.execute(inputs, vec![], 0, None, Some("invalid\0location"), None, None),
             Err(Error::InvalidArgument { message, .. }) if message == "nul byte found in provided data at position: 7",
         ));
 
@@ -3150,7 +3564,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "input 0 is not marked consistently across all devices as donatable or non-donatable",
         ));
@@ -3224,12 +3638,12 @@ mod tests {
                     };
 
                     // Execute the test program using our two input tensors.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.
@@ -3326,12 +3740,12 @@ mod tests {
                     };
 
                     // Execute the test program using our input tensor.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.
@@ -3442,12 +3856,12 @@ mod tests {
                     };
 
                     // Execute the test program.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.

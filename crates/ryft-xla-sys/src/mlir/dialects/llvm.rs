@@ -127,9 +127,6 @@ unsafe extern "C" {
 
     pub fn mlirTypeIsALlvmVoidType(r#type: MlirType) -> bool;
 
-    pub fn mlirTypeIsALlvmTokenType(r#type: MlirType) -> bool;
-    pub fn mlirLlvmTokenTypeGet(context: MlirContext) -> MlirType;
-
     pub fn mlirTypeIsALlvmLabelType(r#type: MlirType) -> bool;
     pub fn mlirLlvmLabelTypeGet(context: MlirContext) -> MlirType;
 

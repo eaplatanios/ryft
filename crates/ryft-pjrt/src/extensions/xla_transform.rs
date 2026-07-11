@@ -72,6 +72,25 @@ impl XlaTransformExtension {
         }
         result
     }
+
+    /// Clears the XLA transform registered under `name` for the specified compilation pipeline `stage`. Returns
+    /// `true` if a matching transform was cleared and `false` if no transform was registered under `name` for
+    /// `stage`. Note that the Rust state owned by the corresponding registration is not freed because successful
+    /// registrations are retained for the process lifetime (the upstream callback ABI has no destructor path).
+    pub fn clear_transform<N: AsRef<str>>(&self, name: N, stage: XlaTransformPipelineStage) -> Result<bool, Error> {
+        use ffi::PJRT_Clear_Xla_Transform_Args;
+        let name = name.as_ref();
+        invoke_pjrt_api_error_fn!(
+            @extension ffi::PJRT_Xla_Transform_Extension => self,
+            PJRT_Clear_Xla_Transform,
+            {
+                stage = stage.to_c_api(),
+                name = name.as_ptr() as *const _,
+                name_size = name.len(),
+            },
+            { cleared },
+        )
+    }
 }
 
 impl Client<'_> {
@@ -91,6 +110,12 @@ impl Client<'_> {
     ) -> Result<(), Error> {
         self.xla_transform_extension()?.register_transform(name, stage, transform)
     }
+
+    /// Clears the XLA transform registered under `name` for the specified compilation pipeline `stage`. Refer to
+    /// the documentation of [`XlaTransformExtension::clear_transform`] for more information.
+    pub fn clear_xla_transform<N: AsRef<str>>(&self, name: N, stage: XlaTransformPipelineStage) -> Result<bool, Error> {
+        self.xla_transform_extension()?.clear_transform(name, stage)
+    }
 }
 
 impl Plugin {
@@ -109,6 +134,12 @@ impl Plugin {
         transform: T,
     ) -> Result<(), Error> {
         self.xla_transform_extension()?.register_transform(name, stage, transform)
+    }
+
+    /// Clears the XLA transform registered under `name` for the specified compilation pipeline `stage`. Refer to
+    /// the documentation of [`XlaTransformExtension::clear_transform`] for more information.
+    pub fn clear_xla_transform<N: AsRef<str>>(&self, name: N, stage: XlaTransformPipelineStage) -> Result<bool, Error> {
+        self.xla_transform_extension()?.clear_transform(name, stage)
     }
 }
 
@@ -429,9 +460,36 @@ pub(crate) mod ffi {
         unsafe extern "C" fn(args: *mut PJRT_Register_Xla_Transform_Args) -> *mut PJRT_Error;
 
     #[repr(C)]
+    pub struct PJRT_Clear_Xla_Transform_Args {
+        pub struct_size: usize,
+        pub stage: PJRT_XlaTransform_PipelineStage,
+        pub name: *const std::ffi::c_char,
+        pub name_size: usize,
+        pub callbacks: *mut PJRT_XlaTransform_Callbacks,
+        pub cleared: bool,
+    }
+
+    impl PJRT_Clear_Xla_Transform_Args {
+        pub fn new(stage: PJRT_XlaTransform_PipelineStage, name: *const std::ffi::c_char, name_size: usize) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                stage,
+                name,
+                name_size,
+                callbacks: std::ptr::null_mut(),
+                cleared: false,
+            }
+        }
+    }
+
+    pub type PJRT_Clear_Xla_Transform =
+        unsafe extern "C" fn(args: *mut PJRT_Clear_Xla_Transform_Args) -> *mut PJRT_Error;
+
+    #[repr(C)]
     pub struct PJRT_Xla_Transform_Extension {
         pub base: PJRT_Extension_Base,
         pub PJRT_Register_Xla_Transform: Option<PJRT_Register_Xla_Transform>,
+        pub PJRT_Clear_Xla_Transform: Option<PJRT_Clear_Xla_Transform>,
     }
 }
 

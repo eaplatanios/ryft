@@ -517,6 +517,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
+    use crate::dialects::llvm::operations::values;
     use crate::{Block, Context, DialectHandle, Operation, Type};
 
     use super::*;
@@ -570,17 +571,21 @@ mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
             .append_operation({
-                let mut block = context.block(&[(token_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+                // Note that token values cannot cross function boundaries (i.e., `func.func` does not have the
+                // `TokenProducerTrait` and `func.return` does not have the `TokenConsumerTrait`), and so we produce
+                // the token inside the function body using an `llvm.mlir.none` operation.
+                let mut block = context.block(&[(pointer_type.as_ref(), location)]);
                 let arg_0 = block.argument(0).unwrap();
-                let arg_1 = block.argument(1).unwrap();
-                let op = intr_coro_begin(arg_0, arg_1, pointer_type, location).unwrap();
-                assert_eq!(op.token().unwrap(), arg_0);
-                assert_eq!(op.memory().unwrap(), arg_1);
+                let token = block.append_operation(values::none(token_type.as_ref(), location).unwrap()).unwrap();
+                let token = token.result(0).unwrap();
+                let op = intr_coro_begin(token, arg_0, pointer_type, location).unwrap();
+                assert_eq!(op.token().unwrap(), token);
+                assert_eq!(op.memory().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.begin");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
@@ -590,7 +595,7 @@ mod tests {
                 func::func(
                     "llvm_intr_coro_begin_test",
                     func::FuncAttributes {
-                        arguments: vec![token_type.into(), pointer_type.into()],
+                        arguments: vec![pointer_type.into()],
                         results: vec![pointer_type.into()],
                         ..Default::default()
                     },
@@ -605,9 +610,10 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_begin_test(%arg0: !llvm.token, %arg1: !llvm.ptr) -> !llvm.ptr {
-                    %0 = llvm.intr.coro.begin %arg0, %arg1 : (!llvm.token, !llvm.ptr) -> !llvm.ptr
-                    return %0 : !llvm.ptr
+                  func.func @llvm_intr_coro_begin_test(%arg0: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.mlir.none : token
+                    %1 = llvm.intr.coro.begin %0, %arg0 : (token, !llvm.ptr) -> !llvm.ptr
+                    return %1 : !llvm.ptr
                   }
                 }
             "},
@@ -622,23 +628,23 @@ mod tests {
         let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
             .append_operation({
-                let mut block = context.block(&[
-                    (pointer_type.as_ref(), location),
-                    (i1_type.as_ref(), location),
-                    (token_type.as_ref(), location),
-                ]);
+                // Note that token values cannot cross function boundaries (i.e., `func.func` does not have the
+                // `TokenProducerTrait` and `func.return` does not have the `TokenConsumerTrait`), and so we produce
+                // the token inside the function body using an `llvm.mlir.none` operation.
+                let mut block = context.block(&[(pointer_type.as_ref(), location), (i1_type.as_ref(), location)]);
                 let arg_0 = block.argument(0).unwrap();
                 let arg_1 = block.argument(1).unwrap();
-                let arg_2 = block.argument(2).unwrap();
-                let op = intr_coro_end(arg_0, arg_1, arg_2, i1_type, location).unwrap();
+                let token = block.append_operation(values::none(token_type.as_ref(), location).unwrap()).unwrap();
+                let token = token.result(0).unwrap();
+                let op = intr_coro_end(arg_0, arg_1, token, i1_type, location).unwrap();
                 assert_eq!(op.handle().unwrap(), arg_0);
                 assert_eq!(op.unwind().unwrap(), arg_1);
-                assert_eq!(op.return_values().unwrap(), arg_2);
+                assert_eq!(op.return_values().unwrap(), token);
                 assert_eq!(op.output_type().unwrap(), i1_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.end");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 3);
@@ -648,7 +654,7 @@ mod tests {
                 func::func(
                     "llvm_intr_coro_end_test",
                     func::FuncAttributes {
-                        arguments: vec![pointer_type.into(), i1_type.into(), token_type.into()],
+                        arguments: vec![pointer_type.into(), i1_type.into()],
                         results: vec![i1_type.into()],
                         ..Default::default()
                     },
@@ -663,9 +669,10 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_end_test(%arg0: !llvm.ptr, %arg1: i1, %arg2: !llvm.token) -> i1 {
-                    %0 = llvm.intr.coro.end %arg0, %arg1, %arg2 : (!llvm.ptr, i1, !llvm.token) -> i1
-                    return %0 : i1
+                  func.func @llvm_intr_coro_end_test(%arg0: !llvm.ptr, %arg1: i1) -> i1 {
+                    %0 = llvm.mlir.none : token
+                    %1 = llvm.intr.coro.end %arg0, %arg1, %0 : (!llvm.ptr, i1, token) -> i1
+                    return %1 : i1
                   }
                 }
             "},
@@ -679,17 +686,21 @@ mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
             .append_operation({
-                let mut block = context.block(&[(token_type.as_ref(), location), (pointer_type.as_ref(), location)]);
+                // Note that token values cannot cross function boundaries (i.e., `func.func` does not have the
+                // `TokenProducerTrait` and `func.return` does not have the `TokenConsumerTrait`), and so we produce
+                // the token inside the function body using an `llvm.mlir.none` operation.
+                let mut block = context.block(&[(pointer_type.as_ref(), location)]);
                 let arg_0 = block.argument(0).unwrap();
-                let arg_1 = block.argument(1).unwrap();
-                let op = intr_coro_free(arg_0, arg_1, pointer_type, location).unwrap();
-                assert_eq!(op.id().unwrap(), arg_0);
-                assert_eq!(op.handle().unwrap(), arg_1);
+                let token = block.append_operation(values::none(token_type.as_ref(), location).unwrap()).unwrap();
+                let token = token.result(0).unwrap();
+                let op = intr_coro_free(token, arg_0, pointer_type, location).unwrap();
+                assert_eq!(op.id().unwrap(), token);
+                assert_eq!(op.handle().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), pointer_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.free");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
@@ -699,7 +710,7 @@ mod tests {
                 func::func(
                     "llvm_intr_coro_free_test",
                     func::FuncAttributes {
-                        arguments: vec![token_type.into(), pointer_type.into()],
+                        arguments: vec![pointer_type.into()],
                         results: vec![pointer_type.into()],
                         ..Default::default()
                     },
@@ -714,9 +725,10 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_free_test(%arg0: !llvm.token, %arg1: !llvm.ptr) -> !llvm.ptr {
-                    %0 = llvm.intr.coro.free %arg0, %arg1 : (!llvm.token, !llvm.ptr) -> !llvm.ptr
-                    return %0 : !llvm.ptr
+                  func.func @llvm_intr_coro_free_test(%arg0: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.mlir.none : token
+                    %1 = llvm.intr.coro.free %0, %arg0 : (token, !llvm.ptr) -> !llvm.ptr
+                    return %1 : !llvm.ptr
                   }
                 }
             "},
@@ -731,7 +743,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -755,13 +767,15 @@ mod tests {
                 assert_eq!(op.operation_name(), "llvm.intr.coro.id");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 4);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                let op = block.append_operation(op).unwrap();
-                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                // Note that token values cannot cross function boundaries (i.e., `func.return` does not have the
+                // `TokenConsumerTrait`), and so the produced token is not returned from the function.
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[] as &[ValueRef], location).unwrap()).unwrap();
                 func::func(
                     "llvm_intr_coro_id_test",
                     func::FuncAttributes {
                         arguments: vec![i32_type.into(), pointer_type.into(), pointer_type.into(), pointer_type.into()],
-                        results: vec![token_type.into()],
+                        results: vec![],
                         ..Default::default()
                     },
                     block.try_into().unwrap(),
@@ -775,9 +789,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_id_test(%arg0: i32, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr) -> !llvm.token {
-                    %0 = llvm.intr.coro.id %arg0, %arg1, %arg2, %arg3 : (i32, !llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.token
-                    return %0 : !llvm.token
+                  func.func @llvm_intr_coro_id_test(%arg0: i32, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr) {
+                    %0 = llvm.intr.coro.id %arg0, %arg1, %arg2, %arg3 : (i32, !llvm.ptr, !llvm.ptr, !llvm.ptr) -> token
+                    return
                   }
                 }
             "},
@@ -898,7 +912,7 @@ mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -911,13 +925,15 @@ mod tests {
                 assert_eq!(op.operation_name(), "llvm.intr.coro.save");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                let op = block.append_operation(op).unwrap();
-                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                // Note that token values cannot cross function boundaries (i.e., `func.return` does not have the
+                // `TokenConsumerTrait`), and so the produced token is not returned from the function.
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[] as &[ValueRef], location).unwrap()).unwrap();
                 func::func(
                     "llvm_intr_coro_save_test",
                     func::FuncAttributes {
                         arguments: vec![pointer_type.into()],
-                        results: vec![token_type.into()],
+                        results: vec![],
                         ..Default::default()
                     },
                     block.try_into().unwrap(),
@@ -931,9 +947,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_save_test(%arg0: !llvm.ptr) -> !llvm.token {
-                    %0 = llvm.intr.coro.save %arg0 : (!llvm.ptr) -> !llvm.token
-                    return %0 : !llvm.token
+                  func.func @llvm_intr_coro_save_test(%arg0: !llvm.ptr) {
+                    %0 = llvm.intr.coro.save %arg0 : (!llvm.ptr) -> token
+                    return
                   }
                 }
             "},
@@ -990,17 +1006,21 @@ mod tests {
         let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i8_type = context.signless_integer_type(8);
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
             .append_operation({
-                let mut block = context.block(&[(token_type.as_ref(), location), (i1_type.as_ref(), location)]);
+                // Note that token values cannot cross function boundaries (i.e., `func.func` does not have the
+                // `TokenProducerTrait` and `func.return` does not have the `TokenConsumerTrait`), and so we produce
+                // the token inside the function body using an `llvm.mlir.none` operation.
+                let mut block = context.block(&[(i1_type.as_ref(), location)]);
                 let arg_0 = block.argument(0).unwrap();
-                let arg_1 = block.argument(1).unwrap();
-                let op = intr_coro_suspend(arg_0, arg_1, i8_type, location).unwrap();
-                assert_eq!(op.save().unwrap(), arg_0);
-                assert_eq!(op.final_suspend().unwrap(), arg_1);
+                let token = block.append_operation(values::none(token_type.as_ref(), location).unwrap()).unwrap();
+                let token = token.result(0).unwrap();
+                let op = intr_coro_suspend(token, arg_0, i8_type, location).unwrap();
+                assert_eq!(op.save().unwrap(), token);
+                assert_eq!(op.final_suspend().unwrap(), arg_0);
                 assert_eq!(op.output_type().unwrap(), i8_type);
                 assert_eq!(op.operation_name(), "llvm.intr.coro.suspend");
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
@@ -1010,7 +1030,7 @@ mod tests {
                 func::func(
                     "llvm_intr_coro_suspend_test",
                     func::FuncAttributes {
-                        arguments: vec![token_type.into(), i1_type.into()],
+                        arguments: vec![i1_type.into()],
                         results: vec![i8_type.into()],
                         ..Default::default()
                     },
@@ -1025,9 +1045,10 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_suspend_test(%arg0: !llvm.token, %arg1: i1) -> i8 {
-                    %0 = llvm.intr.coro.suspend %arg0, %arg1 : i8
-                    return %0 : i8
+                  func.func @llvm_intr_coro_suspend_test(%arg0: i1) -> i8 {
+                    %0 = llvm.mlir.none : token
+                    %1 = llvm.intr.coro.suspend %0, %arg0 : i8
+                    return %1 : i8
                   }
                 }
             "},

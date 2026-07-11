@@ -3,9 +3,6 @@ pub use {ryft_core as core, ryft_macros as macros};
 #[cfg(feature = "ryft-mlir")]
 pub use ryft_mlir as mlir;
 
-#[cfg(feature = "ndarray")]
-pub use ryft_ndarray as ndarray;
-
 #[cfg(feature = "ryft-pjrt")]
 pub use ryft_pjrt as pjrt;
 

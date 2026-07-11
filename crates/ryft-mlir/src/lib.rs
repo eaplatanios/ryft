@@ -48,8 +48,8 @@ pub use self::dialects::builtin::{
     IntegerAttributeRef, IntegerSetAttributeRef, IntegerTypeRef, LocationAttributeRef, MemRefTypeRef, ModuleOperation,
     ModuleOperationRef, NamedLocationRef, NoneTypeRef, OpaqueAttributeRef, OpaqueTypeRef, ShapedType, ShapedTypeRef,
     Size, SparseElementsAttributeRef, StridedLayoutAttributeRef, StringAttributeRef, SymbolRefAttributeRef,
-    SymbolVisibilityAttributeRef, TensorTypeRef, TupleTypeRef, TypeAttributeRef, UnitAttributeRef, UnknownLocationRef,
-    UnrankedMemRefTypeRef, UnrankedTensorTypeRef, UnrealizedConversionCastOperation,
+    SymbolVisibilityAttributeRef, TensorTypeRef, TokenTypeRef, TupleTypeRef, TypeAttributeRef, UnitAttributeRef,
+    UnknownLocationRef, UnrankedMemRefTypeRef, UnrankedTensorTypeRef, UnrealizedConversionCastOperation,
     UnrealizedConversionCastOperationRef, VectorTypeDimension, VectorTypeRef,
 };
 pub use self::dialects::{Dialect, DialectHandle, DialectRegistry};

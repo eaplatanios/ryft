@@ -13,6 +13,26 @@ use crate::{
 /// destruction race during backend registration and/or teardown.
 static PJRT_CLIENT_LIFECYCLE_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+/// Raw PJRT client handle whose pointee is safe to access concurrently for the lifetime of its owning [`Client`].
+#[derive(Copy, Clone)]
+pub(crate) struct ClientHandle(*mut ffi::PJRT_Client);
+
+impl ClientHandle {
+    pub(crate) fn from_c_api(handle: *mut ffi::PJRT_Client) -> Self {
+        Self(handle)
+    }
+
+    pub(crate) fn get(self) -> *mut ffi::PJRT_Client {
+        self.0
+    }
+}
+
+// PJRT clients support concurrent API calls. This type remains crate-private and is only stored by wrappers whose
+// ownership or lifetime contracts keep the single owning `Client` alive. Client creation and destruction are
+// additionally serialized by `PJRT_CLIENT_LIFECYCLE_GUARD`.
+unsafe impl Send for ClientHandle {}
+unsafe impl Sync for ClientHandle {}
+
 /// PJRT [`Client`]s represent a connection to an accelerator platform. They hold the topology of the system,
 /// managing a list of [`Device`]s and their associated [`Memory`]s (a single device may have multiple memory spaces
 /// like _High Bandwidth Memory_ and slower _Capacity Memory_, for example). Furthermore, while
@@ -24,7 +44,7 @@ static PJRT_CLIENT_LIFECYCLE_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex
 /// client).
 pub struct Client<'s> {
     /// Handle that represents this [`Client`] in the PJRT C API.
-    handle: *mut ffi::PJRT_Client,
+    handle: ClientHandle,
 
     /// Underlying PJRT [`Api`].
     api: Api,
@@ -48,14 +68,14 @@ impl<'s> Client<'s> {
         if handle.is_null() {
             Err(Error::invalid_argument("the provided PJRT client handle is a null pointer"))
         } else {
-            Ok(Self { handle, api, attributes: OnceLock::new(), key_value_store })
+            Ok(Self { handle: ClientHandle::from_c_api(handle), api, attributes: OnceLock::new(), key_value_store })
         }
     }
 
     /// Returns the [`PJRT_Client`](ffi::PJRT_Client) that corresponds to this [`Client`] and which can
     /// be passed to functions in the PJRT C API.
     pub(crate) unsafe fn to_c_api(&self) -> *mut ffi::PJRT_Client {
-        self.handle
+        self.handle.get()
     }
 
     /// Returns the underlying PJRT [`Api`].
@@ -272,9 +292,6 @@ impl<'s> Client<'s> {
         Ok(DeviceAssignment { replica_count, computation_count, assignment })
     }
 }
-
-unsafe impl Send for Client<'_> {}
-unsafe impl Sync for Client<'_> {}
 
 impl Drop for Client<'_> {
     fn drop(&mut self) {
@@ -1296,6 +1313,8 @@ mod tests {
         GpuPlatform, KeyValueStore, MockGpuTopology, NamedValue, ProcessInformation, ProcessState, Value,
     };
 
+    fn assert_send_sync<T: Send + Sync>() {}
+
     #[derive(Default)]
     struct TestKeyValueStore {
         values: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
@@ -1323,16 +1342,19 @@ mod tests {
 
     #[test]
     fn test_client() {
+        assert_send_sync::<Client<'static>>();
+        assert_send_sync::<TestKeyValueStore>();
+
         let plugin = test_cpu_plugin();
         let client = test_cpu_client();
-        assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 17, 0])));
+        assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 18, 0])));
         assert_eq!(client.attribute("stablehlo_minimum_version"), Ok(Value::i64_list([0, 9, 0])));
         assert_eq!(client.attribute("xla_version"), Ok(Value::i64(2)));
         assert!(matches!(
             client.attribute("__missing__"),
             Err(Error::NotFound { message, .. }) if message.contains("__missing__")));
         let attributes = client.attributes().unwrap();
-        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 17, 0])));
+        assert_eq!(attributes.get("stablehlo_current_version"), Some(&Value::i64_list([1, 18, 0])));
         assert_eq!(attributes.get("stablehlo_minimum_version"), Some(&Value::i64_list([0, 9, 0])));
         assert_eq!(attributes.get("xla_version"), Some(&Value::i64(2)));
         assert_eq!(attributes.get("__missing__"), None);

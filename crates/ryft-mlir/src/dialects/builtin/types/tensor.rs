@@ -1,10 +1,10 @@
 use ryft_xla_sys::bindings::{
     MlirType, mlirRankedTensorTypeGetChecked, mlirRankedTensorTypeGetEncoding, mlirRankedTensorTypeGetTypeID,
-    mlirShapedTypeGetDimSize, mlirShapedTypeGetRank, mlirShapedTypeIsStaticDim, mlirUnrankedTensorTypeGetChecked,
-    mlirUnrankedTensorTypeGetTypeID,
+    mlirShapedTypeGetDimSize, mlirShapedTypeGetElementType, mlirShapedTypeGetRank, mlirShapedTypeIsStaticDim,
+    mlirUnrankedTensorTypeGetChecked, mlirUnrankedTensorTypeGetTypeID,
 };
 
-use crate::{Attribute, AttributeRef, Context, Error, Location, Type, TypeId, mlir_subtype_trait_impls};
+use crate::{Attribute, AttributeRef, Context, Error, Location, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
 
 use super::{ShapedType, Size};
 
@@ -54,6 +54,11 @@ impl<'c, 't> TensorTypeRef<'c, 't> {
     /// Gets the [`TypeId`] that corresponds to [`TensorTypeRef`].
     pub fn type_id() -> Result<TypeId<'static>, Error> {
         unsafe { TypeId::from_c_api(mlirRankedTensorTypeGetTypeID()) }
+    }
+
+    /// Returns the element [`Type`] of this [`TensorTypeRef`].
+    pub fn element_type(&self) -> Result<TypeRef<'c, 't>, Error> {
+        unsafe { TypeRef::from_c_api(mlirShapedTypeGetElementType(self.handle), self.context) }
     }
 
     /// Returns the rank of this [`TensorTypeRef`] (i.e., the number of dimensions it has).
@@ -235,6 +240,7 @@ mod tests {
         let shape = vec![Size::Static(32), Size::Dynamic, Size::Dynamic, Size::Static(2)];
         let r#type = context.tensor_type(element_type, &shape, None, location).unwrap();
         assert_eq!(&context, r#type.context());
+        assert_eq!(r#type.element_type().unwrap(), element_type);
         assert_eq!(r#type.rank(), 4);
         assert_eq!(r#type.dimensions().collect::<Vec<_>>(), shape);
         assert_eq!(r#type.dimension(0).unwrap(), Size::Static(32));
@@ -243,7 +249,6 @@ mod tests {
         assert_eq!(r#type.dimension(3).unwrap(), Size::Static(2));
         assert!(r#type.dimension(4).is_err());
         assert!(!r#type.has_static_shape());
-        assert_eq!(r#type.element_type().unwrap(), element_type);
         assert!(r#type.encoding().unwrap().is_none());
 
         // Invalid element type.

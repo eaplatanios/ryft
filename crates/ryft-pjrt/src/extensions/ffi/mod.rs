@@ -542,8 +542,8 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        let outputs = executable.execute(vec![inputs], 0, Some(execution_context), None, None, None).unwrap().remove(0);
-        assert!(outputs.done.r#await().is_ok());
+        let execution = executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None).unwrap();
+        assert!(execution.fence().block_until_ready().is_ok());
         assert!(handler.is_none(), "test call-frame handler was never invoked");
         if let Some(panic_payload) = panic_payload {
             std::panic::resume_unwind(panic_payload);
@@ -747,14 +747,13 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let mut outputs = executable.execute(vec![inputs], 0, Some(execution_context), None, None, None).unwrap();
+        let execution = executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None).unwrap();
+        let mut outputs = execution.block_until_ready().unwrap();
         assert_eq!(outputs.len(), 1);
         let mut outputs = outputs.remove(0);
-        assert!(outputs.done.r#await().is_ok());
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         assert_eq!(output_bytes, 53i32.to_ne_bytes().to_vec());
-
         assert_eq!(user_data.invocation_count.load(Ordering::SeqCst), 1);
     }
 }
