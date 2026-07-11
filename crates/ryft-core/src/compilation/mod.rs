@@ -9,29 +9,52 @@
 //! every backend follows the same lifecycle. The following diagram illustrates that lifecycle:
 //!
 //! ```text
-//! ┌───────────────────┐
-//! │    Rust Closure   │
-//! └─────────┬─────────┘
-//!           │ trace
-//!           ▼
-//! ┌───────────────────┐   embed in an outer trace   ┌───────────────────────┐
-//! │  Staged Function  │ ──────────────────────────▶ │ Nested Call Operation │
-//! └─────────┬─────────┘                             └───────────────────────┘
-//!           │ lower
-//!           ▼
-//! ┌───────────────────┐
-//! │  Lowered Function │
-//! └─────────┬─────────┘
-//!           │ compile
-//!           ▼
-//! ┌───────────────────┐   discard transform metadata   ┌─────────────────────┐
-//! │ Compiled Function │ ─────────────────────────────▶ │ Executable Function │
-//! └─────────┬─────────┘                                └─────────────────────┘
-//!           │ call
-//!           ▼
-//! ┌───────────────────┐
-//! │   Runtime Values  │
-//! └───────────────────┘
+//!                                                  Per-Jitted-Function Caches
+//!                            specialization key = static parameters + input paths + prepared abstract types
+//!
+//! ┌──────────────────────────────┐
+//! │         Rust Closure         │
+//! └──────────────┬───────────────┘
+//!                │ trace
+//!                ▼
+//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
+//! │ Program                      │ ◀────── store / reuse ───▶ │ Trace Cache                  │
+//! │ Staged Function handle       │                           │ retains Programs             │
+//! └──────────────┬───────────────┘                           └──────────────────────────────┘
+//!                │ lower
+//!                ▼
+//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
+//! │ Lowered Program              │ ◀────── store / reuse ───▶ │ Lowering Cache               │
+//! │ Lowered Function handle      │                           │ retains Lowered Programs     │
+//! └──────────────┬───────────────┘                           └──────────────────────────────┘
+//!                │ derive the domain cache key
+//!                ▼
+//! ┌──────────────────────────────┐
+//! │ Compilation Context          │
+//! │ resolves shared cache tiers  │
+//! └──────────────┬───────────────┘
+//!                │ restore or compile, then attach metadata
+//!                ▼
+//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
+//! │ Compiled Program             │ ◀────── store / reuse ───▶ │ Dispatch Cache               │
+//! │ Compiled Function handle     │                           │ retains Compiled Programs    │
+//! │ shared through an Arc        │                           │                              │
+//! └──────────────┬───────────────┘                           └──────────────────────────────┘
+//!                │ call
+//!                ▼
+//! ┌──────────────────────────────┐
+//! │ Runtime Values               │
+//! └──────────────────────────────┘
+//!
+//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
+//! │ Program                      │ ─── embed in outer trace ▶ │ Nested Call Operation        │
+//! │ Staged Function handle       │                           │                              │
+//! └──────────────────────────────┘                           └──────────────────────────────┘
+//!
+//! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
+//! │ Compiled Program             │ ── discard metadata ────▶ │ Executable Function          │
+//! │ Compiled Function handle     │                           │                              │
+//! └──────────────────────────────┘                           └──────────────────────────────┘
 //! ```
 //!
 //! # Entry Points
@@ -77,16 +100,31 @@
 //!
 //! [`JittedFunction`] has separate bounded LRU caches for traced, lowered, and compiled specializations. This
 //! frontend cache avoids repeating lifecycle stages for one closure. [`CompilationContext`] is the backend-artifact
-//! cache below it and is shared by every compilation using the same domain handle:
+//! cache below it and is shared by every compilation using the same domain handle. A JIT call checks the dispatch
+//! cache first, then the lowering cache, and finally the trace cache; a hit resumes the lifecycle from the retained
+//! artifact shown above, while a miss produces and inserts that artifact. The shared context then resolves the
+//! domain's [`CompilationDomain::CacheKey`] through these tiers:
 //!
 //! ```text
-//! Compilation Request
+//! Compilation Context lookup (keyed by CompilationDomain::CacheKey)
 //!          │
-//!          ├── in-memory LRU hit ───────────────────────────────────────────────────────────────▶ executable
-//!          ├── same key in flight ──────────────▶ wait for producer ────────────────────────────▶ executable
-//!          ├── persistent executable hit ───────▶ deserialize ──────────────────────────────────▶ executable
-//!          ├── distributed artifact available ──▶ deserialize ──────────────────────────────────▶ executable
-//!          └── backend compile ─────────────────▶ persist / publish, then insert into the LRU ──▶ executable
+//!          ├── 1. Memory LRU hit ───────────────────────────────▶ shared Compiled Program
+//!          │      stores Arc<CompiledProgram>
+//!          │
+//!          ├── 2. Same key in flight ──▶ wait for producer ─────▶ shared Compiled Program
+//!          │      coordinates one producer; different keys remain concurrent
+//!          │
+//!          ├── 3. Persistent Disk Cache hit ──▶ deserialize ─────▶ shared Compiled Program
+//!          │      stores a serialized Compiled Program
+//!          │
+//!          ├── 4. Distributed Artifact Exchange ─▶ deserialize ─▶ shared Compiled Program
+//!          │      shares the serialized Compiled Program between processes
+//!          │
+//!          └── 5. Backend compilation ──────────────────────────▶ shared Compiled Program
+//!                 │
+//!                 ├── always insert into the Memory LRU
+//!                 ├── optionally serialize into the Persistent Disk Cache
+//!                 └── optionally publish through the Distributed Artifact Exchange
 //! ```
 //!
 //! Same-key misses are single-flight while different keys may compile concurrently. [`DiskCache`] provides optional

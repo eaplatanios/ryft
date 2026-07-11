@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
+use crate::compilation::disk_cache::{CacheDigest, DiskCache};
+use crate::compilation::exchange::{
+    CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
+};
 use crate::contexts::Domain;
 use crate::parameters::Parameterized;
 use crate::programs::{Program, ProgramError};
 use crate::types::Type;
-
-use super::disk_cache::{CacheDigest, DiskCache};
-use super::exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged [`Program`]s.
 /// Compilation is deliberately split into three semantic stages:
