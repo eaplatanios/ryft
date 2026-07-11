@@ -1341,12 +1341,6 @@ mod tests {
     }
 
     #[test]
-    fn test_client_and_key_value_store_are_send_and_sync() {
-        assert_send_sync::<Client<'static>>();
-        assert_send_sync::<TestKeyValueStore>();
-    }
-
-    #[test]
     fn test_client() {
         assert_send_sync::<Client<'static>>();
         assert_send_sync::<TestKeyValueStore>();
