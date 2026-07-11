@@ -1,92 +1,20 @@
-use std::fmt::Display;
-
-use crate::broadcasting::Broadcastable;
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_count, implement_tracer_operator};
-use crate::operations::{ElementwiseOperation, Operation};
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::macros::{define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`DivOperation`].
 pub const DIV_OPERATION_NAME: &'static str = "div";
 
-/// [`Operation`] that divides two values and typically supports broadcasting semantics for arrays.
-#[derive(Clone, Debug, Default)]
-pub struct DivOperation;
+// TODO(eaplatanios): Review this macro invocation.
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`](crate::Operation) that divides two values and typically supports broadcasting semantics for arrays.
+    DivOperation, DIV_OPERATION_NAME, Div, div,
+    /// Value-level elementwise division capability. [`Div`] is the fallible Ryft counterpart to [`std::ops::Div`]
+    /// that [`DivOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
+    /// goes wrong, instead of panicking. Value types additionally provide [`std::ops::Div`] as ergonomic (albeit
+    /// panicking) sugar layered on top of this capability.
+);
 
-impl Display for DivOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(DIV_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for DivOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        DIV_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("'{DIV_OPERATION_NAME}' input types are not broadcast-compatible"),
-        })
-    }
-}
-
-impl Operation<ArrayType> for DivOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        DIV_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for DivOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        2
-    }
-}
-
-impl<V: Clone + Value + Div, C> InterpretableOperation<V, C> for DivOperation
-where
-    Self: Operation<V::Type>,
-{
-    #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].div(&inputs[1])?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for DivOperation where C::Operation: From<DivOperation> {}
-
-/// Value-level elementwise division capability. [`Div`] is the fallible Ryft counterpart to [`std::ops::Div`]
-/// that [`DivOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of
-/// panicking. Value types additionally provide [`std::ops::Div`] as ergonomic (albeit panicking) sugar layered on top
-/// of this capability.
-pub trait Div: Sized {
-    /// Divides `self` by `rhs`, returning a [`ProgramError`] if something goes wrong.
-    fn div(&self, rhs: &Self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<DivOperation>>>> Div for V {
-    #[inline]
-    fn div(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(DivOperation, &[self.clone(), rhs.clone()])?.remove(0))
-    }
-}
-
-implement_tracer_operator!(@binary std::ops::Div, div, DivOperation, "`div` operation failed");
+define_tracer_operator!(@binary std::ops::Div, div, DivOperation, "`div` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +30,10 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
+
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
+    use crate::types::{DataType, TypeError};
 
     use super::*;
 

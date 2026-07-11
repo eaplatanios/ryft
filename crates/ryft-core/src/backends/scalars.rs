@@ -20,12 +20,12 @@ use crate::operations::control_flow::{
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{StopGradient, StopGradientOperation};
-use crate::operations::exponential::{
-    Exponential, ExponentialOperation, Logarithm, LogarithmOperation, SquareRoot, SquareRootOperation,
-};
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Mul,
     MulOperation, Neg, NegOperation, Sin, SinOperation, Sub, SubOperation,
+};
+use crate::operations::math::{
+    Exponential, ExponentialOperation, Logarithm, LogarithmOperation, SquareRoot, SquareRootOperation,
 };
 use crate::operations::tag::{MaybeTag, Tag, TagOperation};
 use crate::operations::{BooleanLike, Operation};

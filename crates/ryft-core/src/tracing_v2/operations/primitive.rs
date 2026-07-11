@@ -16,15 +16,17 @@ use crate::operations::control_flow::{
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
-use crate::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
-use crate::operations::math::{AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
-use crate::operations::math::{Atan2Operation, CosOperation, SinOperation};
+use crate::operations::math::{
+    AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
+    SubOperation,
+};
+use crate::operations::math::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::tag::{MaybeTag, TagOperation};
 use crate::programs::Value;

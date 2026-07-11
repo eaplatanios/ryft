@@ -4,7 +4,7 @@ use std::fmt::Display;
 use crate::broadcasting::Broadcastable;
 use crate::contexts::Context;
 use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_count, implement_tracer_operator};
+use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
@@ -170,7 +170,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<MulOperation>>>> Mul for V
     }
 }
 
-implement_tracer_operator!(@binary std::ops::Mul, mul, MulOperation, "`mul` operation failed");
+define_tracer_operator!(@binary std::ops::Mul, mul, MulOperation, "`mul` operation failed");
 
 #[cfg(test)]
 mod tests {

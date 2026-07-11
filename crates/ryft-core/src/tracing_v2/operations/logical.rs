@@ -22,7 +22,12 @@ macro_rules! logical_unsupported_transpose {
                 _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
             ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
                 Err(ProgramError::UnsupportedOperation {
-                    message: format!("operation `{}` has no partition-aware transpose rule", self.name()),
+                    // A fully qualified call is required here because logical operations implement `Operation` for
+                    // both the `DataType` and the `ArrayType` type universes.
+                    message: format!(
+                        "operation `{}` has no partition-aware transpose rule",
+                        Operation::<ArrayType>::name(self),
+                    ),
                 }
                 .into())
             }

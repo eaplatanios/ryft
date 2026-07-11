@@ -34,9 +34,6 @@ pub mod debugging;
 /// Differentiation-control operations and capability traits.
 pub mod differentiation;
 
-/// Elementwise exponential, logarithm, and square-root operations and capability traits.
-pub mod exponential;
-
 /// Elementwise logical operations and capability traits.
 pub mod logical;
 

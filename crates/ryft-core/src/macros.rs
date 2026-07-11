@@ -111,6 +111,221 @@ macro_rules! check_builders {
     }};
 }
 
+// TODO(eaplatanios): Review this macro.
+/// Defines one elementwise [`Operation`](crate::Operation) together with the structural implementations that every
+/// elementwise operation shares: the unit operation struct with a [`Display`](std::fmt::Display) implementation that
+/// writes the operation name, type-preserving [`Operation`](crate::Operation) implementations over both
+/// [`DataType`](crate::DataType) and [`ArrayType`](crate::ArrayType) metadata, the
+/// [`ElementwiseOperation`](crate::ElementwiseOperation) implementation, eager
+/// [`InterpretableOperation`](crate::InterpretableOperation) dispatch through the paired value-level capability trait,
+/// the [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) fold-or-residualize default, and the
+/// capability trait itself with its dispatch-domain staging blanket. The operation's actual semantics stay with its
+/// module: concrete value capability implementations, derivative rules, and tests are written by hand next to the
+/// macro invocation.
+///
+/// # Parameters
+///
+///   - `@unary` / `@binary`: Selects the operation arity to stamp out. `@unary` produces a one-input,
+///     type-preserving operation whose generated capability method has the shape
+///     `fn(&self) -> Result<Self, ProgramError>`, while `@binary` produces a two-input operation whose
+///     [`DataType`](crate::DataType) inference broadcasts/promotes the two operand types and whose generated
+///     capability method has the shape `fn(&self, rhs: &Self) -> Result<Self, ProgramError>`.
+///   - `$(#[$documentation])*`: Documentation attributes attached to the generated operation struct.
+///   - `$operation`: Identifier of the generated unit-struct operation (e.g., `SinOperation`).
+///   - `$name`: Identifier of an existing operation-name constant (e.g., `SIN_OPERATION_NAME`).
+///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `Sin`).
+///   - `$method`: Identifier of the generated capability trait method (e.g., `sin`).
+///   - `$(#[$capability_documentation])*`: Documentation attributes attached to the generated capability trait.
+#[macro_export]
+macro_rules! define_elementwise_operation {
+    (
+        @unary
+        $(#[$documentation:meta])*
+        $operation:ident, $name:ident, $capability:ident, $method:ident,
+        $(#[$capability_documentation:meta])* $(,)?
+    ) => {
+        $(#[$documentation])*
+        #[derive(Clone, Debug, Default)]
+        pub struct $operation;
+
+        impl ::std::fmt::Display for $operation {
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                formatter.write_str($name)
+            }
+        }
+
+        impl $crate::Operation<$crate::DataType> for $operation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::DataType],
+            ) -> Result<Vec<$crate::DataType>, $crate::types::TypeError> {
+                $crate::check_count!("input", input_types, 1, TypeError);
+                Ok(vec![input_types[0].clone()])
+            }
+        }
+
+        impl $crate::Operation<$crate::ArrayType> for $operation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            #[inline]
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::ArrayType],
+            ) -> Result<Vec<$crate::ArrayType>, $crate::types::TypeError> {
+                $crate::ElementwiseOperation::infer_output_types(self, input_types)
+            }
+        }
+
+        impl $crate::ElementwiseOperation for $operation {
+            #[inline]
+            fn input_count(&self) -> usize {
+                1
+            }
+        }
+
+        impl<V: ::std::clone::Clone + $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
+            for $operation
+        where
+            Self: $crate::Operation<V::Type>,
+        {
+            #[inline]
+            fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, $crate::ProgramError> {
+                $crate::check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].$method()?])
+            }
+        }
+
+        impl<C: $crate::Context> $crate::PartiallyEvaluatableOperation<C> for $operation where
+            C::Operation: ::std::convert::From<$operation>
+        {
+        }
+
+        $(#[$capability_documentation])*
+        pub trait $capability: Sized {
+            /// Computes this operation elementwise for this value, returning a
+            /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
+            /// support the value's data type).
+            fn $method(&self) -> Result<Self, $crate::ProgramError>;
+        }
+
+        impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
+            $capability for V
+        {
+            #[inline]
+            fn $method(&self) -> Result<Self, $crate::ProgramError> {
+                // Fully qualified calls are required here because the `Value` and `Context` traits are not
+                // necessarily imported at the macro expansion site.
+                let domain = $crate::Value::dispatch_domain(self);
+                Ok($crate::Context::bind(&domain, $operation, &[self.clone()])?.remove(0))
+            }
+        }
+    };
+    (
+        @binary
+        $(#[$documentation:meta])*
+        $operation:ident, $name:ident, $capability:ident, $method:ident,
+        $(#[$capability_documentation:meta])* $(,)?
+    ) => {
+        $(#[$documentation])*
+        #[derive(Clone, Debug, Default)]
+        pub struct $operation;
+
+        impl ::std::fmt::Display for $operation {
+            fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                formatter.write_str($name)
+            }
+        }
+
+        impl $crate::Operation<$crate::DataType> for $operation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::DataType],
+            ) -> Result<Vec<$crate::DataType>, $crate::types::TypeError> {
+                $crate::check_count!("input", input_types, 2, TypeError);
+                // The fully qualified call is required here because the `Broadcastable` trait is not necessarily
+                // imported at the macro expansion site.
+                $crate::Broadcastable::broadcast(&input_types[0], &input_types[1])
+                    .map(|output| vec![output])
+                    .map_err(|_| $crate::types::TypeError {
+                        message: format!("'{}' input types are not broadcast-compatible", $name),
+                    })
+            }
+        }
+
+        impl $crate::Operation<$crate::ArrayType> for $operation {
+            #[inline]
+            fn name(&self) -> &'static str {
+                $name
+            }
+
+            #[inline]
+            fn infer_output_types(
+                &self,
+                input_types: &[$crate::ArrayType],
+            ) -> Result<Vec<$crate::ArrayType>, $crate::types::TypeError> {
+                $crate::ElementwiseOperation::infer_output_types(self, input_types)
+            }
+        }
+
+        impl $crate::ElementwiseOperation for $operation {
+            #[inline]
+            fn input_count(&self) -> usize {
+                2
+            }
+        }
+
+        impl<V: ::std::clone::Clone + $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
+            for $operation
+        where
+            Self: $crate::Operation<V::Type>,
+        {
+            #[inline]
+            fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, $crate::ProgramError> {
+                $crate::check_count!("input", inputs, 2, ProgramError);
+                Ok(vec![inputs[0].$method(&inputs[1])?])
+            }
+        }
+
+        impl<C: $crate::Context> $crate::PartiallyEvaluatableOperation<C> for $operation where
+            C::Operation: ::std::convert::From<$operation>
+        {
+        }
+
+        $(#[$capability_documentation])*
+        pub trait $capability: Sized {
+            /// Computes this operation elementwise for this value and `rhs`, returning a
+            /// [`ProgramError`](crate::ProgramError) if something goes wrong (e.g., when this operation does not
+            /// support the values' data types).
+            fn $method(&self, rhs: &Self) -> Result<Self, $crate::ProgramError>;
+        }
+
+        impl<V: $crate::Value<DispatchDomain: $crate::Context<Operation: ::std::convert::From<$operation>>>>
+            $capability for V
+        {
+            #[inline]
+            fn $method(&self, rhs: &Self) -> Result<Self, $crate::ProgramError> {
+                // Fully qualified calls are required here because the `Value` and `Context` traits are not
+                // necessarily imported at the macro expansion site.
+                let domain = $crate::Value::dispatch_domain(self);
+                Ok($crate::Context::bind(&domain, $operation, &[self.clone(), rhs.clone()])?.remove(0))
+            }
+        }
+    };
+}
+
 /// Implements a foreign `std::ops` operator trait as panicking sugar for the four core transform tracer types (i.e.,
 /// [`Tracer`](crate::Tracer), [`PartialTracer`](crate::PartialTracer), [`BatchingTracer`](crate::BatchingTracer), and
 /// [`DifferentiationTracer`](crate::DifferentiationTracer)) by binding the operation through each tracer's own context.
@@ -137,7 +352,7 @@ macro_rules! check_builders {
 ///     through each tracer's context (e.g., `AddOperation`).
 ///   - `$message`: Panic message used when an eager tracer's bind fails.
 #[macro_export]
-macro_rules! implement_tracer_operator {
+macro_rules! define_tracer_operator {
     (@unary $trait:path, $method:ident, $operation:path, $message:literal $(,)?) => {
         impl<C: $crate::StagingContext<Operation: ::std::convert::From<$operation>>> $trait for $crate::Tracer<C> {
             type Output = Self;
@@ -157,7 +372,7 @@ macro_rules! implement_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                self.context().bind($operation, &[self.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[self.clone()]).expect($message).remove(0)
             }
         }
 
@@ -170,7 +385,7 @@ macro_rules! implement_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                self.context().bind($operation, &[self.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[self.clone()]).expect($message).remove(0)
             }
         }
 
@@ -183,7 +398,7 @@ macro_rules! implement_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                self.context().bind($operation, &[self.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[self.clone()]).expect($message).remove(0)
             }
         }
     };
@@ -206,7 +421,9 @@ macro_rules! implement_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                self.context().bind($operation, &[self.clone(), rhs.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[self.clone(), rhs.clone()])
+                    .expect($message)
+                    .remove(0)
             }
         }
 
@@ -219,7 +436,9 @@ macro_rules! implement_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                self.context().bind($operation, &[self.clone(), rhs.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[self.clone(), rhs.clone()])
+                    .expect($message)
+                    .remove(0)
             }
         }
 
@@ -232,10 +451,14 @@ macro_rules! implement_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                self.context().bind($operation, &[self.clone(), rhs.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[self.clone(), rhs.clone()])
+                    .expect($message)
+                    .remove(0)
             }
         }
     };
 }
 
-pub use crate::{check_builders, check_count, check_sharding, check_types, implement_tracer_operator};
+pub use crate::{
+    check_builders, check_count, check_sharding, check_types, define_elementwise_operation, define_tracer_operator,
+};

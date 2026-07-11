@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::contexts::Context;
 use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_count, implement_tracer_operator};
+use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{ProgramError, Value};
@@ -83,7 +83,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<NegOperation>>>> Neg for V
     }
 }
 
-implement_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
+define_tracer_operator!(@unary std::ops::Neg, neg, NegOperation, "`neg` operation failed");
 
 #[cfg(test)]
 mod tests {

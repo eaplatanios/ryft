@@ -1,84 +1,18 @@
-use std::fmt::Display;
-
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
-use crate::macros::check_count;
-use crate::operations::{ElementwiseOperation, Operation};
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::macros::define_elementwise_operation;
 
 /// Canonical operation name for [`SinOperation`].
 pub const SIN_OPERATION_NAME: &'static str = "sin";
 
-/// [`Operation`] that computes the elementwise sine of one value while preserving its type metadata.
-#[derive(Clone, Debug, Default)]
-pub struct SinOperation;
-
-impl Display for SinOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(SIN_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for SinOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        SIN_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 1, TypeError);
-        Ok(vec![input_types[0].clone()])
-    }
-}
-
-impl Operation<ArrayType> for SinOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        SIN_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for SinOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-}
-
-impl<V: Clone + Value + Sin, C> InterpretableOperation<V, C> for SinOperation
-where
-    Self: Operation<V::Type>,
-{
-    #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].sin()?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for SinOperation where C::Operation: From<SinOperation> {}
-
-/// Value-level elementwise sine capability. [`Sin`] fills the same role for [`SinOperation`] that
-/// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
-pub trait Sin: Sized {
-    /// Computes the elementwise sine of this value, returning a [`ProgramError`] if something goes wrong.
-    fn sin(&self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<SinOperation>>>> Sin for V {
-    #[inline]
-    fn sin(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(SinOperation, &[self.clone()])?.remove(0))
-    }
-}
+// TODO(eaplatanios): Review this macro invocation.
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`](crate::Operation) that computes the elementwise sine of one value while preserving its type
+    /// metadata.
+    SinOperation, SIN_OPERATION_NAME, Sin, sin,
+    /// Value-level elementwise sine capability. [`Sin`] fills the same role for [`SinOperation`] that
+    /// [`std::ops::Add`] and [`std::ops::Neg`] fill for their corresponding arithmetic
+    /// [`Operation`](crate::Operation)s.
+);
 
 #[cfg(test)]
 mod tests {
@@ -88,11 +22,13 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
-    use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
+    use crate::types::{ArrayType, DataType, Layout, Shape, Size, StridedLayout, TypeError};
 
     use super::*;
 

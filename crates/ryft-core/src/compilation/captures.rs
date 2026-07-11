@@ -36,21 +36,21 @@ use crate::types::{ArrayType, Type, Typed};
 ///   - **Compact IR.** Large captured arrays never bloat the program IR or the serialized executable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct CaptureReference<T: Type> {
-    /// Index into the surrounding capture table.
+    /// Index of this [`CaptureReference`] into the surrounding capture table.
     index: usize,
 
-    /// Abstract type metadata for the captured value.
+    /// [`Type`] of the underlying captured value.
     r#type: T,
 }
 
 impl<T: Type> CaptureReference<T> {
-    /// Creates a captured-constant reference.
+    /// Creates a new [`CaptureReference`].
     #[inline]
     pub fn new(index: usize, r#type: T) -> Self {
         Self { index, r#type }
     }
 
-    /// Returns the index into the surrounding capture table.
+    /// Returns the index of this [`CaptureReference`] into the surrounding capture table.
     #[inline]
     pub fn index(&self) -> usize {
         self.index

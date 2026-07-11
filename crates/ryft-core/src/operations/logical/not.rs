@@ -1,60 +1,24 @@
-use std::fmt::Display;
-use std::ops::Not;
-
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_count, implement_tracer_operator};
-use crate::operations::{ElementwiseOperation, Operation};
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::types::{ArrayType, TypeError};
+use crate::macros::{define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`NotOperation`].
 pub const NOT_OPERATION_NAME: &'static str = "not";
 
-/// [`Operation`] that computes the elementwise negation (i.e., `!input`) of one value. This operation covers both
-/// logical (i.e., Boolean) and bitwise negation: the two semantics coincide on Boolean element types, and StableHLO's
-/// [`not`](https://openxla.org/stablehlo/spec#not) operation likewise serves both. Value types provide the
-/// elementwise behavior through the standard [`Not`] operator trait.
-#[derive(Clone, Debug, Default)]
-pub struct NotOperation;
+// TODO(eaplatanios): Review this macro invocation.
+define_elementwise_operation!(
+    @unary
+    /// [`Operation`](crate::Operation) that computes the elementwise negation (i.e., `!input`) of one value while
+    /// preserving its type metadata. This operation covers both logical (i.e., Boolean) and bitwise negation: the
+    /// two semantics coincide on Boolean element types, and StableHLO's
+    /// [`not`](https://openxla.org/stablehlo/spec#not) operation likewise serves both.
+    NotOperation, NOT_OPERATION_NAME, Not, not,
+    /// Value-level elementwise negation capability. [`Not`] is the fallible Ryft counterpart to [`std::ops::Not`]
+    /// that [`NotOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
+    /// goes wrong (e.g., when a value's data type does not support negation), instead of panicking. Value types
+    /// additionally provide [`std::ops::Not`] as ergonomic (albeit panicking) sugar layered on top of this
+    /// capability.
+);
 
-impl Display for NotOperation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Operation::<ArrayType>::render(self, formatter, 0)
-    }
-}
-
-impl Operation<ArrayType> for NotOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        NOT_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for NotOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        1
-    }
-}
-
-impl<V: Value<Type = ArrayType> + Not<Output = V>, C> InterpretableOperation<V, C> for NotOperation {
-    #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![!inputs[0].clone()])
-    }
-}
-
-impl<C: Context<Type = ArrayType, Operation: From<NotOperation>>> PartiallyEvaluatableOperation<C> for NotOperation {}
-
-implement_tracer_operator!(@unary Not, not, NotOperation, "`not` operation failed");
+define_tracer_operator!(@unary std::ops::Not, not, NotOperation, "`not` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -62,10 +26,12 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::tests::TestArray;
-    use crate::types::{DataType, Shape, Size, TypeError};
+    use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 
     use super::*;
 

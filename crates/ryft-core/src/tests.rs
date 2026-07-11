@@ -18,7 +18,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
-use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
@@ -28,15 +27,15 @@ use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
 use crate::operations::complex::{Conjugate, Imaginary, Real};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
-use crate::operations::exponential::{Exponential, Logarithm, SquareRoot};
+use crate::operations::logical::{And, Not, Or, Xor};
 use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
 use crate::operations::math::Abs;
 use crate::operations::math::Atan2;
-use crate::operations::math::{Add, Div, Mul, Neg, Sub};
-use crate::operations::math::{Cos, Sin};
+use crate::operations::math::{Add, Cos, Div, Mul, Neg, Sin, Sub};
+use crate::operations::math::{Exponential, Logarithm, SquareRoot};
 use crate::operations::tag::Tag;
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
@@ -1106,7 +1105,7 @@ impl TestArray {
     }
 }
 
-impl BitAnd for TestArray {
+impl std::ops::BitAnd for TestArray {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self::Output {
@@ -1114,7 +1113,7 @@ impl BitAnd for TestArray {
     }
 }
 
-impl BitOr for TestArray {
+impl std::ops::BitOr for TestArray {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self::Output {
@@ -1122,7 +1121,7 @@ impl BitOr for TestArray {
     }
 }
 
-impl BitXor for TestArray {
+impl std::ops::BitXor for TestArray {
     type Output = Self;
 
     fn bitxor(self, rhs: Self) -> Self::Output {
@@ -1130,12 +1129,39 @@ impl BitXor for TestArray {
     }
 }
 
-impl Not for TestArray {
+impl std::ops::Not for TestArray {
     type Output = Self;
 
     fn not(self) -> Self::Output {
         let values: Vec<f64> = self.values.into_iter().map(|value| if value != 0.0 { 0.0 } else { 1.0 }).collect();
         Self { r#type: self.r#type, values }
+    }
+}
+
+// Fallible Ryft logical capabilities used by operation interpretation. A `TestArray` is always `f64`-backed with
+// non-zero values treated as `true`, so these never fail; they delegate to the ergonomic `std::ops` operators and
+// wrap the result.
+impl And for TestArray {
+    fn and(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() & rhs.clone())
+    }
+}
+
+impl Or for TestArray {
+    fn or(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() | rhs.clone())
+    }
+}
+
+impl Xor for TestArray {
+    fn xor(&self, rhs: &Self) -> Result<Self, ProgramError> {
+        Ok(self.clone() ^ rhs.clone())
+    }
+}
+
+impl Not for TestArray {
+    fn not(&self) -> Result<Self, ProgramError> {
+        Ok(!self.clone())
     }
 }
 
@@ -2279,8 +2305,7 @@ mod linearization_tests {
 
     #[test]
     fn test_jvp_zero_tangent_flows_the_all_zero_fast_path() {
-        use crate::operations::math::Mul;
-        use crate::operations::math::Sin;
+        use crate::operations::math::{Mul, Sin};
 
         // A zero input tangent flows through the all-zero fast path of `DifferentiationContext::bind` (the rule is skipped and
         // the primal operation binds directly): the derivative is zero and the value matches the primal evaluation.
@@ -2294,8 +2319,7 @@ mod linearization_tests {
     #[test]
     fn test_jvp_branches_on_concrete_primal() {
         use crate::operations::BooleanLike;
-        use crate::operations::math::Sin;
-        use crate::operations::math::{Mul, Neg};
+        use crate::operations::math::{Mul, Neg, Sin};
 
         // Over an eager receiver `jvp` runs the closure directly on concrete duals, so ordinary Rust control flow can
         // branch on the primal — impossible under a staging receiver, whose duals carry tracers.
@@ -2570,8 +2594,7 @@ mod linearization_tests {
     /// different from the true `cos(x) * dx`, so a passing equivalence proves the spliced rule governs both forward and
     /// reverse mode.
     fn scalar_custom_jvp_sin_doubled_rule() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        use crate::operations::math::MulOperation;
-        use crate::operations::math::{CosOperation, SinOperation};
+        use crate::operations::math::{CosOperation, MulOperation, SinOperation};
         use crate::programs::ProgramBuilder;
 
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -2690,8 +2713,7 @@ mod linearization_tests {
         crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation<Scalar, ScalarOperation<Scalar>>,
         ProgramError,
     > {
-        use crate::operations::math::MulOperation;
-        use crate::operations::math::{CosOperation, SinOperation};
+        use crate::operations::math::{CosOperation, MulOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
@@ -4251,8 +4273,7 @@ mod array_linearization_tests {
     /// different from the true `cos(x) * dx`, so a passing equivalence proves the spliced rule (and not the primal
     /// body) governs both forward and reverse mode. Shared in shape with the `custom_derivatives` tests.
     fn custom_jvp_sin_doubled_rule() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::math::MulOperation;
-        use crate::operations::math::{CosOperation, SinOperation};
+        use crate::operations::math::{CosOperation, MulOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4703,8 +4724,7 @@ mod batching_tests {
     use crate::operations::constants::OneLike;
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::Transpose;
-    use crate::operations::math::Sin;
-    use crate::operations::math::{AddOperation, NegOperation};
+    use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;

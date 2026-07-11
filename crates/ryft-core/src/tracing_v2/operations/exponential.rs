@@ -6,7 +6,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::exponential::{
+use crate::operations::math::{
     Exponential, ExponentialOperation, Logarithm, LogarithmOperation, SquareRoot, SquareRootOperation,
 };
 use crate::partial::PartialValue;
@@ -152,7 +152,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
-    use crate::operations::exponential::{Exponential, Logarithm, SquareRoot};
+    use crate::operations::math::{Exponential, Logarithm, SquareRoot};
     use crate::tracing_v2::{ReverseModeDifferentiate, gradient, value_and_gradient_holomorphic};
 
     #[test]

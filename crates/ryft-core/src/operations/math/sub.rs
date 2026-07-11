@@ -1,92 +1,20 @@
-use std::fmt::Display;
-
-use crate::broadcasting::Broadcastable;
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
-use crate::macros::{check_count, implement_tracer_operator};
-use crate::operations::{ElementwiseOperation, Operation};
-use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
-use crate::types::{ArrayType, DataType, TypeError};
+use crate::macros::{define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`SubOperation`].
 pub const SUB_OPERATION_NAME: &'static str = "sub";
 
-/// [`Operation`] that subtracts two values and typically supports broadcasting semantics for arrays.
-#[derive(Clone, Debug, Default)]
-pub struct SubOperation;
+// TODO(eaplatanios): Review this macro invocation.
+define_elementwise_operation!(
+    @binary
+    /// [`Operation`](crate::Operation) that subtracts two values and typically supports broadcasting semantics for arrays.
+    SubOperation, SUB_OPERATION_NAME, Sub, sub,
+    /// Value-level elementwise subtraction capability. [`Sub`] is the fallible Ryft counterpart to [`std::ops::Sub`]
+    /// that [`SubOperation`] interprets through, surfacing a [`ProgramError`](crate::ProgramError) when something
+    /// goes wrong, instead of panicking. Value types additionally provide [`std::ops::Sub`] as ergonomic (albeit
+    /// panicking) sugar layered on top of this capability.
+);
 
-impl Display for SubOperation {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(SUB_OPERATION_NAME)
-    }
-}
-
-impl Operation<DataType> for SubOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        SUB_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        check_count!("input", input_types, 2, TypeError);
-        input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
-            message: format!("'{SUB_OPERATION_NAME}' input types are not broadcast-compatible"),
-        })
-    }
-}
-
-impl Operation<ArrayType> for SubOperation {
-    #[inline]
-    fn name(&self) -> &'static str {
-        SUB_OPERATION_NAME
-    }
-
-    #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        ElementwiseOperation::infer_output_types(self, input_types)
-    }
-}
-
-impl ElementwiseOperation for SubOperation {
-    #[inline]
-    fn input_count(&self) -> usize {
-        2
-    }
-}
-
-impl<V: Clone + Value + Sub, C> InterpretableOperation<V, C> for SubOperation
-where
-    Self: Operation<V::Type>,
-{
-    #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].sub(&inputs[1])?])
-    }
-}
-
-impl<C: Context> PartiallyEvaluatableOperation<C> for SubOperation where C::Operation: From<SubOperation> {}
-
-/// Value-level elementwise subtraction capability. [`Sub`] is the fallible Ryft counterpart to [`std::ops::Sub`] that
-/// [`SubOperation`] interprets through, surfacing a [`ProgramError`] when something goes wrong, instead of panicking.
-/// Value types additionally provide [`std::ops::Sub`] as ergonomic (albeit panicking) sugar layered on top of this
-/// capability.
-pub trait Sub: Sized {
-    /// Subtracts `rhs` from `self`, returning a [`ProgramError`] if something goes wrong.
-    fn sub(&self, rhs: &Self) -> Result<Self, ProgramError>;
-}
-
-impl<V: Value<DispatchDomain: Context<Operation: From<SubOperation>>>> Sub for V {
-    #[inline]
-    fn sub(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(SubOperation, &[self.clone(), rhs.clone()])?.remove(0))
-    }
-}
-
-implement_tracer_operator!(@binary std::ops::Sub, sub, SubOperation, "`sub` operation failed");
+define_tracer_operator!(@binary std::ops::Sub, sub, SubOperation, "`sub` operation failed");
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +30,10 @@ mod tests {
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
+
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::Operation;
+    use crate::types::{DataType, TypeError};
 
     use super::*;
 
