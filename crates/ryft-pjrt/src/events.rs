@@ -97,6 +97,11 @@ impl<O> Event<O> {
     }
 
     /// Blocks the current thread until this [`Event`] is _ready_, returning an [`Error`] if something went wrong.
+    ///
+    /// Note that this function returning does not imply that callbacks registered via [`Event::on_ready`] have already
+    /// been invoked. The PJRT runtime may release threads blocked in an await before, after, or concurrently with
+    /// invoking "on-ready" callbacks (which typically run on the thread that completed the event), so callers must not
+    /// rely on any ordering between the two.
     pub fn r#await(self) -> Result<O, Error> {
         use ffi::PJRT_Event_Await_Args;
 
@@ -623,11 +628,10 @@ mod tests {
         assert_eq!(event_error.message(), error.message());
 
         // Test `Event::await`.
-        let has_invoked_callback = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = std::sync::mpsc::channel();
         let (event, event_promise) = client.event(42i64).unwrap();
-        let callback_invoked = has_invoked_callback.clone();
-        assert!(event.on_ready(move |_| callback_invoked.store(true, Ordering::Relaxed)).is_ok());
-        assert!(!has_invoked_callback.load(Ordering::Relaxed));
+        assert!(event.on_ready(move |error| sender.send(error).unwrap()).is_ok());
+        assert!(receiver.try_recv().is_err());
         assert_eq!(event.ready(), Ok(false));
 
         std::thread::spawn(move || {
@@ -635,9 +639,13 @@ mod tests {
             assert!(event_promise.set(None).is_ok());
         });
 
-        assert!(!has_invoked_callback.load(Ordering::Relaxed));
+        assert!(receiver.try_recv().is_err());
         assert_eq!(event.r#await(), Ok(42i64));
-        assert!(has_invoked_callback.load(Ordering::Relaxed));
+
+        // `PJRT_Event_Await` may return before the PJRT runtime finishes invoking "on-ready" callbacks on the thread
+        // that set the promise, so the callback invocation is awaited with a bounded timeout instead of being asserted
+        // to have already happened.
+        assert!(receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap().is_none());
 
         // Test creating an `Event` from a null pointer.
         assert!(matches!(

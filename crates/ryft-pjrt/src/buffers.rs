@@ -395,7 +395,7 @@ impl BufferType {
             | Self::U8
             | Self::F4E2M1FN
             | Self::F6E3M2FN
-            | Self::F6E2M3FN 
+            | Self::F6E2M3FN
             | Self::F8E3M4
             | Self::F8E4M3
             | Self::F8E4M3FN
@@ -403,7 +403,7 @@ impl BufferType {
             | Self::F8E4M3B11FNUZ
             | Self::F8E5M2
             | Self::F8E5M2FNUZ
-            | Self::F8E8M0FNU=> size_of::<u8>(),
+            | Self::F8E8M0FNU => size_of::<u8>(),
             Self::I16 => size_of::<i16>(),
             Self::I32 => size_of::<i32>(),
             Self::I64 => size_of::<i64>(),
