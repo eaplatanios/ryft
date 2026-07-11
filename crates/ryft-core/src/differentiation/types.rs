@@ -45,6 +45,8 @@ impl DifferentiableType for DataType {
             | Self::U32
             | Self::U64 => None,
             Self::F4E2M1FN
+            | Self::F6E2M3FN
+            | Self::F6E3M2FN
             | Self::F8E3M4
             | Self::F8E4M3
             | Self::F8E4M3FN

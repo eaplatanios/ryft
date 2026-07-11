@@ -761,23 +761,6 @@ pub enum DataType {
     /// [`DataType`] that represents 6-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
     ///
-    ///   - Bit Encoding: S1E3M2 (1 bit for the sign, 3 bits for the exponent, and 2 bits for the mantissa).
-    ///   - Exponent Bias: 3.
-    ///   - Infinity Values: Not supported.
-    ///   - Not-a-Number (NaN) Values: Not supported.
-    ///   - Denormalized: When the exponent is all zeros, the number is interpreted as denormalized, meaning that the
-    ///     implied leading bit of the mantissa is considered to be a `0` instead of a `1`.
-    ///
-    /// The value of a number in this representation can be computed as:
-    /// `(-1)^S * 2^(E - 3) * (1 * [E == 0] + M_1 * 2^-1 + M_0 * 2^-2)`.
-    ///
-    /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
-    /// only represent finite values.
-    F6E3M2FN,
-
-    /// [`DataType`] that represents 6-bit floating-point values. This is not a standard type as defined by the
-    /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
-    ///
     ///   - Bit Encoding: S1E2M3 (1 bit for the sign, 2 bits for the exponent, and 3 bits for the mantissa).
     ///   - Exponent Bias: 1.
     ///   - Infinity Values: Not supported.
@@ -791,6 +774,23 @@ pub enum DataType {
     /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
     /// only represent finite values.
     F6E2M3FN,
+
+    /// [`DataType`] that represents 6-bit floating-point values. This is not a standard type as defined by the
+    /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
+    ///
+    ///   - Bit Encoding: S1E3M2 (1 bit for the sign, 3 bits for the exponent, and 2 bits for the mantissa).
+    ///   - Exponent Bias: 3.
+    ///   - Infinity Values: Not supported.
+    ///   - Not-a-Number (NaN) Values: Not supported.
+    ///   - Denormalized: When the exponent is all zeros, the number is interpreted as denormalized, meaning that the
+    ///     implied leading bit of the mantissa is considered to be a `0` instead of a `1`.
+    ///
+    /// The value of a number in this representation can be computed as:
+    /// `(-1)^S * 2^(E - 3) * (1 * [E == 0] + M_1 * 2^-1 + M_0 * 2^-2)`.
+    ///
+    /// The `FN` name suffix is for consistency with the corresponding LLVM/MLIR type, signaling that this type can
+    /// only represent finite values.
+    F6E3M2FN,
 
     /// [`DataType`] that represents 8-bit floating-point values. This is not a standard type as defined by the
     /// IEEE 754 standard, but it follows similar conventions with the following characteristics:
@@ -1029,8 +1029,8 @@ impl DataType {
         Self::U32,
         Self::U64,
         Self::F4E2M1FN,
-        Self::F6E3M2FN,
         Self::F6E2M3FN,
+        Self::F6E3M2FN,
         Self::F8E3M4,
         Self::F8E4M3,
         Self::F8E4M3FN,
@@ -1070,8 +1070,8 @@ impl DataType {
             Self::U32 => 14,
             Self::U64 => 15,
             Self::F4E2M1FN => 16,
-            Self::F6E3M2FN => 17,
-            Self::F6E2M3FN => 18,
+            Self::F6E2M3FN => 17,
+            Self::F6E3M2FN => 18,
             Self::F8E3M4 => 19,
             Self::F8E4M3 => 20,
             Self::F8E4M3FN => 21,
@@ -1122,8 +1122,8 @@ impl DataTypePromotionNode {
         Self::DataType(DataType::U32),
         Self::DataType(DataType::U64),
         Self::DataType(DataType::F4E2M1FN),
-        Self::DataType(DataType::F6E3M2FN),
         Self::DataType(DataType::F6E2M3FN),
+        Self::DataType(DataType::F6E3M2FN),
         Self::DataType(DataType::F8E3M4),
         Self::DataType(DataType::F8E4M3),
         Self::DataType(DataType::F8E4M3FN),
@@ -1222,8 +1222,8 @@ static DATA_TYPE_PROMOTION_UPPER_BOUNDS_BITMASKS: [u64; DataTypePromotionNode::C
                     DataTypePromotionNode::FloatingPointDataType.bitmask()
                 }
                 DataTypePromotionNode::DataType(DataType::F4E2M1FN) => 0,
-                DataTypePromotionNode::DataType(DataType::F6E3M2FN) => 0,
                 DataTypePromotionNode::DataType(DataType::F6E2M3FN) => 0,
+                DataTypePromotionNode::DataType(DataType::F6E3M2FN) => 0,
                 DataTypePromotionNode::DataType(DataType::F8E3M4) => 0,
                 DataTypePromotionNode::DataType(DataType::F8E4M3) => 0,
                 DataTypePromotionNode::DataType(DataType::F8E4M3FN) => 0,
@@ -1548,17 +1548,17 @@ mod tests {
             Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f4e2m1fn` and `f8e3m4` to a common type",
         ));
-        assert_eq!(DataType::promoted(&[DataType::F6E3M2FN]), Ok(DataType::F6E3M2FN));
         assert_eq!(DataType::promoted(&[DataType::F6E2M3FN, DataType::F6E2M3FN]), Ok(DataType::F6E2M3FN));
-        assert!(matches!(
-            DataType::promoted(&[DataType::F6E3M2FN, DataType::F6E2M3FN]),
-            Err(DataTypeError::InvalidPromotion { message, .. })
-                if message == "cannot promote types `f6e3m2fn` and `f6e2m3fn` to a common type",
-        ));
         assert!(matches!(
             DataType::promoted(&[DataType::F6E2M3FN, DataType::F32]),
             Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote types `f6e2m3fn` and `f32` to a common type",
+        ));
+        assert_eq!(DataType::promoted(&[DataType::F6E3M2FN]), Ok(DataType::F6E3M2FN));
+        assert!(matches!(
+            DataType::promoted(&[DataType::F6E3M2FN, DataType::F6E2M3FN]),
+            Err(DataTypeError::InvalidPromotion { message, .. })
+                if message == "cannot promote types `f6e3m2fn` and `f6e2m3fn` to a common type",
         ));
     }
 
@@ -1601,16 +1601,16 @@ mod tests {
             Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `f8e3m4` to type `f4e2m1fn`",
         ));
+        assert!(matches!(
+            DataType::F6E2M3FN.promote_to(DataType::F16),
+            Err(DataTypeError::InvalidPromotion { message, .. })
+                if message == "cannot promote type `f6e2m3fn` to type `f16`",
+        ));
         assert_eq!(DataType::F6E3M2FN.promote_to(DataType::F6E3M2FN), Ok(DataType::F6E3M2FN));
         assert!(matches!(
             DataType::F6E3M2FN.promote_to(DataType::F6E2M3FN),
             Err(DataTypeError::InvalidPromotion { message, .. })
                 if message == "cannot promote type `f6e3m2fn` to type `f6e2m3fn`",
-        ));
-        assert!(matches!(
-            DataType::F6E2M3FN.promote_to(DataType::F16),
-            Err(DataTypeError::InvalidPromotion { message, .. })
-                if message == "cannot promote type `f6e2m3fn` to type `f16`",
         ));
         assert!(matches!(
             DataType::F8E3M4.promote_to(DataType::F8E4M3FN),
@@ -1639,8 +1639,8 @@ mod tests {
         assert!(DataType::U8.is_promotable_to(DataType::I16));
         assert!(DataType::U16.is_promotable_to(DataType::I32));
         assert!(DataType::F4E2M1FN.is_promotable_to(DataType::F4E2M1FN));
-        assert!(DataType::F6E3M2FN.is_promotable_to(DataType::F6E3M2FN));
         assert!(DataType::F6E2M3FN.is_promotable_to(DataType::F6E2M3FN));
+        assert!(DataType::F6E3M2FN.is_promotable_to(DataType::F6E3M2FN));
         assert!(DataType::F16.is_promotable_to(DataType::F32));
         assert!(DataType::F32.is_promotable_to(DataType::C64));
         assert!(!DataType::Boolean.is_promotable_to(DataType::I1));
@@ -1649,8 +1649,8 @@ mod tests {
         assert!(!DataType::U4.is_promotable_to(DataType::F8E3M4));
         assert!(!DataType::I64.is_promotable_to(DataType::F8E3M4));
         assert!(!DataType::F4E2M1FN.is_promotable_to(DataType::BF16));
-        assert!(!DataType::F6E3M2FN.is_promotable_to(DataType::F6E2M3FN));
         assert!(!DataType::F6E2M3FN.is_promotable_to(DataType::BF16));
+        assert!(!DataType::F6E3M2FN.is_promotable_to(DataType::F6E2M3FN));
         assert!(!DataType::F8E3M4.is_promotable_to(DataType::F8E4M3FN));
         assert!(!DataType::F8E4M3B11FNUZ.is_promotable_to(DataType::BF16));
     }
