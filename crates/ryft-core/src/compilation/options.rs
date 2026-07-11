@@ -85,7 +85,7 @@ mod tests {
         type CompiledProgram = Vec<DataType>;
         type Options = TestOptions;
         type Error = ProgramError;
-        type CompilationKey = ();
+        type CacheKey = ();
 
         fn lower(
             &self,

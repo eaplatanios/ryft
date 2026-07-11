@@ -1,11 +1,3 @@
-//! Compilation backend contracts and process-local compilation coordination.
-//!
-//! [`CompilationDomain`] defines the backend-owned lowering, executable, cache identity, serialization, and execution
-//! contract. [`CompilationContext`] is the optional process-local coordinator returned by a domain: it provides
-//! single-flight compilation, in-memory LRU reuse, persistent executable restoration, distributed artifact exchange,
-//! statistics, and structured lifecycle events. Keeping both abstractions together makes their ownership boundary
-//! explicit without splitting their mutually-referential contracts across modules.
-
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -25,41 +17,42 @@ use crate::types::Type;
 use super::disk_cache::{CacheDigest, DiskCache};
 use super::exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 
-/// Backend contract for lowering, compiling, and executing staged [`Program`]s.
-///
+/// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged [`Program`]s.
 /// Compilation is deliberately split into three semantic stages:
 ///
-/// 1. Ryft traces a Rust closure into a backend-independent [`Program`] expressed in this domain's constant and
-///    operation universe.
-/// 2. [`Self::lower`] translates the flat program into [`Self::LoweredProgram`], the backend's compiler input.
-/// 3. [`Self::compile`] turns that lowering into [`Self::CompiledProgram`], which [`Self::execute`] can invoke.
+///   1. Trace a closure into a backend-independent [`Program`] expressed in this domain's operation universe.
+///   2. [`Self::lower`] the traced program into [`Self::LoweredProgram`], the backend-specific compiler input.
+///   3. [`Self::compile`] the lowered program into a [`Self::CompiledProgram`], which [`Self::execute`] can invoke.
 ///
-/// Keeping lowered and compiled artifacts backend-owned lets `ryft-core` provide a common lifecycle without exposing
-/// StableHLO, PJRT, XLA, or any other compiler-specific representation. It also makes cache identity precise:
-/// [`Self::compilation_key`] receives the complete lowering and must account for every option and piece of backend
-/// state that can change the executable.
+/// Keeping lowered and compiled artifacts backend-owned lets [`CompilationDomain`] provide support for a common
+/// lifecycle without exposing StableHLO, PJRT, XLA, or any other compiler-specific representation. It also makes
+/// cache identity precise via [`Self::compilation_key`] which receives the complete lowering and must account for
+/// every option and piece of backend state that can change the executable.
 pub trait CompilationDomain: Domain + Clone {
-    /// Backend-owned compiler input produced by [`Self::lower`].
+    /// Backend-specific lowered [`Program`] representation produced by [`Self::lower`].
     type LoweredProgram;
 
-    /// Backend-owned executable produced by [`Self::compile`]. Core stores this artifact behind an [`Arc`] so cache
-    /// hits and compiled-function clones do not require a potentially expensive backend clone.
+    /// Backend-specific compiled [`Program`] representation produced by [`Self::compile`].
     type CompiledProgram;
 
-    /// Backend-specific compilation options. Meshes, sharding and layout overrides, donation declarations, compiler
-    /// flags, and similar target-specific state belong here rather than in `ryft-core`.
+    /// Backend-specific compilation options type. Meshes, sharding and layout overrides, donation declarations,
+    /// compiler flags, etc., are all represented as part of this type.
     type Options;
 
-    /// Backend error channel. Staging and call-boundary errors flow through it as [`ProgramError`]s.
+    /// Backend-specific error type. Staging and call-boundary errors flow through it as [`ProgramError`]s and
+    /// that is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Exact in-memory cache key for one lowered compilation.
-    ///
-    /// Equality must mean that the corresponding compiled artifacts are interchangeable for execution. In
-    /// particular, the key must include the complete computation represented by [`Self::LoweredProgram`] as well as
-    /// every compile-relevant option, target property, compiler version, and backend setting. A source location or a
-    /// hash of input types is not a sufficient computation identity.
-    type CompilationKey: Clone + Eq + Hash + Send + Sync + 'static;
+    /// Backend-specific cache key type used for caching [`Self::CompiledProgram`]s. Equality means that the
+    /// corresponding compiled artifacts are interchangeable for execution. In particular, the key must include the
+    /// complete computation represented by [`Self::LoweredProgram`] as well as every compile-relevant option, target
+    /// property, compiler version, backend setting, etc. A source location or a hash of input types is not a sufficient
+    /// computation identity. The `'static` bound ensures that a key retained by a long-lived [`CompilationContext`]
+    /// owns its identity data rather than borrowing from the lowered program, compilation options, or other transient
+    /// request state.
+    type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Applies options that affect abstract input types before tracing.
     ///
@@ -107,7 +100,7 @@ pub trait CompilationDomain: Domain + Clone {
         &self,
         program: &Self::LoweredProgram,
         options: &Self::Options,
-    ) -> Result<Self::CompilationKey, Self::Error>;
+    ) -> Result<Self::CacheKey, Self::Error>;
 
     /// Compiles one lowered program into a backend executable.
     fn compile(
@@ -188,7 +181,7 @@ pub trait CompilationDomain: Domain + Clone {
     /// computation, options, compiler/backend versions, and target topology. Core hashes them only for filename-safe
     /// addressing; it does not add missing semantic state.
     #[inline]
-    fn persistent_cache_key(&self, _key: &Self::CompilationKey) -> Option<Vec<u8>> {
+    fn persistent_cache_key(&self, _key: &Self::CacheKey) -> Option<Vec<u8>> {
         None
     }
 
@@ -477,7 +470,7 @@ impl<P> InFlightCompilation<P> {
 /// calls to [`compile_with_options`](super::compile_with_options) and any backend-specific
 /// helpers that look up entries in the cache.
 ///
-/// The cache is keyed by the domain's structurally-typed [`CompilationDomain::CompilationKey`] — `Eq` on the key
+/// The cache is keyed by the domain's structurally-typed [`CompilationDomain::CacheKey`] — `Eq` on the key
 /// guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the cached program is returned
 /// without invoking the producer closure. On miss the producer runs and the result is inserted.
 ///
@@ -489,12 +482,12 @@ impl<P> InFlightCompilation<P> {
 /// [`CompilationDomain::serialize_program`] and [`CompilationDomain::deserialize_program`] to round-trip programs; any
 /// error from either method is treated as a cache miss for that entry.
 pub struct CompilationContext<D: CompilationDomain> {
-    /// In-memory LRU keyed by the domain's structural [`CompilationKey`].
-    programs: Mutex<LruCache<D::CompilationKey, Arc<D::CompiledProgram>>>,
+    /// In-memory LRU keyed by the domain's structural [`CompilationDomain::CacheKey`].
+    programs: Mutex<LruCache<D::CacheKey, Arc<D::CompiledProgram>>>,
 
     /// Per-key producer coordination. Entries exist only while a cache miss is being restored or
     /// compiled, so unrelated keys never wait on one another's backend work.
-    in_flight: Mutex<HashMap<D::CompilationKey, Arc<InFlightCompilation<D::CompiledProgram>>>>,
+    in_flight: Mutex<HashMap<D::CacheKey, Arc<InFlightCompilation<D::CompiledProgram>>>>,
 
     /// Optional disk-backed second-tier cache.
     disk_cache: Option<DiskCache>,
@@ -520,20 +513,20 @@ pub struct CompilationContext<D: CompilationDomain> {
 
 struct InFlightProducer<'a, D: CompilationDomain> {
     context: &'a CompilationContext<D>,
-    cache_key: Option<D::CompilationKey>,
+    cache_key: Option<D::CacheKey>,
     in_flight: Option<Arc<InFlightCompilation<D::CompiledProgram>>>,
 }
 
 impl<'a, D: CompilationDomain> InFlightProducer<'a, D> {
     fn new(
         context: &'a CompilationContext<D>,
-        cache_key: D::CompilationKey,
+        cache_key: D::CacheKey,
         in_flight: Arc<InFlightCompilation<D::CompiledProgram>>,
     ) -> Self {
         Self { context, cache_key: Some(cache_key), in_flight: Some(in_flight) }
     }
 
-    fn cache_key(&self) -> &D::CompilationKey {
+    fn cache_key(&self) -> &D::CacheKey {
         self.cache_key.as_ref().expect("active producer owns its cache key")
     }
 
@@ -714,7 +707,7 @@ impl<D: CompilationDomain> CompilationContext<D> {
     pub fn get_or_compile<F: FnOnce() -> Result<D::CompiledProgram, D::Error>>(
         &self,
         domain: &D,
-        cache_key: D::CompilationKey,
+        cache_key: D::CacheKey,
         produce: F,
     ) -> Result<Arc<D::CompiledProgram>, D::Error> {
         let mut produce = Some(produce);
@@ -809,7 +802,7 @@ impl<D: CompilationDomain> CompilationContext<D> {
     fn restore_or_compile<F: FnOnce() -> Result<D::CompiledProgram, D::Error>>(
         &self,
         domain: &D,
-        cache_key: D::CompilationKey,
+        cache_key: D::CacheKey,
         in_flight: Arc<InFlightCompilation<D::CompiledProgram>>,
         produce: F,
     ) -> Result<Arc<D::CompiledProgram>, D::Error> {
@@ -1236,7 +1229,7 @@ impl<D: CompilationDomain> CompilationContext<D> {
 
     fn finish_success(
         &self,
-        cache_key: D::CompilationKey,
+        cache_key: D::CacheKey,
         in_flight: Arc<InFlightCompilation<D::CompiledProgram>>,
         program: D::CompiledProgram,
     ) -> Arc<D::CompiledProgram> {
@@ -1250,7 +1243,7 @@ impl<D: CompilationDomain> CompilationContext<D> {
         program
     }
 
-    fn finish_failure(&self, cache_key: &D::CompilationKey, in_flight: Arc<InFlightCompilation<D::CompiledProgram>>) {
+    fn finish_failure(&self, cache_key: &D::CacheKey, in_flight: Arc<InFlightCompilation<D::CompiledProgram>>) {
         self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(cache_key);
         in_flight.finish(InFlightState::Failed);
     }
@@ -1307,7 +1300,7 @@ mod tests {
         type CompiledProgram = TestCompiledProgram;
         type Options = ();
         type Error = ProgramError;
-        type CompilationKey = u8;
+        type CacheKey = u8;
 
         fn lower(
             &self,
@@ -1326,7 +1319,7 @@ mod tests {
             &self,
             _program: &Self::LoweredProgram,
             _options: &(),
-        ) -> Result<Self::CompilationKey, Self::Error> {
+        ) -> Result<Self::CacheKey, Self::Error> {
             Ok(0)
         }
 

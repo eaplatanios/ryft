@@ -1621,7 +1621,7 @@ mod tests {
         type CompiledProgram = TestCompiledProgram;
         type Options = TestOptions;
         type Error = ProgramError;
-        type CompilationKey = Vec<String>;
+        type CacheKey = Vec<String>;
 
         fn lower(
             &self,

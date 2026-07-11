@@ -1516,6 +1516,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
+    use crate::differentiation::jvp;
     use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::BooleanLike;
@@ -2396,29 +2397,23 @@ mod tests {
 
     #[test]
     fn test_nested_differentiation() {
-        // Every nesting shape differentiates `f(x) = sin(x²)` at `x = 0.7` through closure-level nesting. The inner
-        // transform runs on the nested tracing context its tracer flows in, recovered through `x.context()`.
+        // Every nesting shape differentiates `f(x) = sin(x²)` at `x = 0.7` through closure-level nesting. Inner
+        // transforms run on the nested tracing context their tracers flow in, recovered either implicitly by the
+        // free differentiation functions from their tracer inputs or explicitly through `x.context()`.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let x: f64 = 0.7;
 
-        // Reverse-over-reverse: the outer value is `f'(x) = 2x cos(x²)` and the outer gradient is the analytic
-        // second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
-        let (value, gradient) = domain
-            .value_and_gradient(
-                |x| {
-                    let context = x.context().clone();
-                    context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()
-                },
-                Scalar::from(x),
-            )
-            .unwrap();
+        // Reverse-over-reverse through the free functions alone: the outer value is `f'(x) = 2x cos(x²)` and the
+        // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
+        let (value, second_derivative) =
+            value_and_gradient(|x| gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap(), Scalar::from(x)).unwrap();
         assert_abs_diff_eq!(value, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
 
         // Three levels of nesting exercise the recursive `NestedTracingContext<NestedTracingContext<...>>` types
-        // through the trait solver. The outer gradient is the analytic third derivative
-        // `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
-        let (value, gradient) = domain
+        // through the trait solver, with every inner transform run through an explicitly recovered context receiver.
+        // The outer gradient is the analytic third derivative `f'''(x) = -12x sin(x²) - 8x³ cos(x²)`.
+        let (value, third_derivative) = domain
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
@@ -2436,21 +2431,19 @@ mod tests {
             )
             .unwrap();
         assert_abs_diff_eq!(value, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient, -12.0 * x * (x * x).sin() - 8.0 * x * x * x * (x * x).cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            third_derivative,
+            -12.0 * x * (x * x).sin() - 8.0 * x * x * x * (x * x).cos(),
+            epsilon = 1e-9,
+        );
 
-        // Forward-over-reverse: pushing the tangent `v = 2` through the gradient computes the Hessian-vector
-        // product `f''(x) · v` without materializing a dense Hessian, because the `jvp` duals' stamped
-        // `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests on.
-        let (primal, tangent) = domain
-            .jvp(
-                |x| {
-                    let context = x.context().clone();
-                    Ok(context.gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap())
-                },
-                Scalar::from(x),
-                Scalar::from(2.0),
-            )
-            .unwrap();
+        // Forward-over-reverse through the free functions alone: pushing the tangent `v = 2` through the gradient
+        // computes the Hessian-vector product `f''(x) · v` without materializing a dense Hessian, because the `jvp`
+        // duals' stamped `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests
+        // on.
+        let (primal, tangent) =
+            jvp(|x| Ok(gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()), Scalar::from(x), Scalar::from(2.0))
+                .unwrap();
         assert_abs_diff_eq!(primal, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
     }
