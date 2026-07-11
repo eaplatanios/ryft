@@ -588,7 +588,7 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
             DataType::C128 => Scalar::C128(Complex::new(0.0, 0.0)),
             other => {
                 return Err(TypeError { message: format!("data type {other} cannot represent zero") }.into());
-            },
+            }
         })
     }
 }
@@ -656,7 +656,7 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
             DataType::C128 => Scalar::C128(Complex::new(1.0, 0.0)),
             other => {
                 return Err(TypeError { message: format!("data type {other} cannot represent one") }.into());
-            },
+            }
         })
     }
 }
