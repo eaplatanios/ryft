@@ -169,26 +169,25 @@ impl<C: CapturingContext<Operation: Clone + DifferentiableOperation<C>> + Zero<C
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// A staged [`Program`] paired with the concrete runtime values referenced by its captured constants.
-///
-/// The [`Program`] remains independent of the concrete capture data: values of type `V` live only in
-/// [`captures`](Self::captures), while its constant atoms carry lifetime-free [`CaptureReference`]s into that table.
-/// [`new`](Self::new) validates that every reference names an existing capture with the same type, so all public
-/// construction paths establish the capture-table invariant before a closed program can be interpreted or rewritten.
+/// A [`Program`] paired with the concrete runtime values referenced by its captured constants. The [`Program`] remains
+/// independent of the concrete capture data: values of type `V` live only in [`captures`](Self::captures), while its
+/// constant atoms carry lifetime-free [`CaptureReference`]s into that table. [`new`](Self::new) validates that every
+/// reference names an existing capture with the same type, and so all public construction paths establish the capture
+/// table invariant before a [`ClosedProgram`] can be interpreted or transformed.
 pub struct ClosedProgram<
     V: Value,
     O,
     Input: Parameterized<CaptureReference<V::Type>>,
     Output: Parameterized<CaptureReference<V::Type>>,
 > {
-    /// Staged program whose constants are capture references.
+    /// [`Program`] whose constants are [`CaptureReference`]s.
     program: Program<CaptureReference<V::Type>, O, Input, Output>,
 
-    /// Concrete captured values referenced by [`CaptureReference`] indices in [`Self::program`].
+    /// Captured values referenced by [`CaptureReference`] indices in [`Self::program`].
     captures: Vec<V>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value,
