@@ -1341,13 +1341,10 @@ mod tests {
     }
 
     #[test]
-    fn test_client_and_key_value_store_are_send_and_sync() {
+    fn test_client() {
         assert_send_sync::<Client<'static>>();
         assert_send_sync::<TestKeyValueStore>();
-    }
 
-    #[test]
-    fn test_client() {
         let plugin = test_cpu_plugin();
         let client = test_cpu_client();
         assert_eq!(client.attribute("stablehlo_current_version"), Ok(Value::i64_list([1, 18, 0])));
