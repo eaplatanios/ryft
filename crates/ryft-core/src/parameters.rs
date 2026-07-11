@@ -1,3 +1,92 @@
+//! Structured parameter trees and type-preserving reparameterization.
+//!
+//! Ryft APIs accept nested Rust structures (i.e., tuples, arrays, vectors, maps, options, and derived enums and
+//! structs) while compiler and transform kernels operate on flat leaf sequences. This module is the lossless bridge
+//! between those two views: a parameterized value can be flattened into ordered leaves with stable paths, reduced to a
+//! structure-only skeleton, and later rebuilt from that skeleton and a new leaf sequence, with every leaf type replaced
+//! while its container family is preserved. The following diagram illustrates some of those relationships:
+//!
+//! ```text
+//! ┌────────────────┐           flatten leaves          ┌────────────────┐
+//! │ (x, Vec[y, z]) │ ────────────────────────────────▶ │   [x, y, z]    │
+//! └────────┬───────┘                                   └────────────────┘
+//!          │ extract structure
+//!          ▼
+//! ┌────────────────┐   rebuild with leaves [a, b, c]   ┌────────────────┐
+//! │ (_, Vec[_, _]) │ ────────────────────────────────▶ │ (a, Vec[b, c]) │
+//! └────────────────┘                                   └────────────────┘
+//! ```
+//!
+//! # Entry Points
+//!
+//! [`Parameterized`] carries the primary API, and generic algorithms normally follow one pattern:
+//!
+//! 1. Save `value.parameter_structure()`.
+//! 2. Consume or iterate the leaves with `into_parameters()` or `parameters()`.
+//! 3. Process the flat leaves.
+//! 4. Rebuild the corresponding `To<Q>` form with `from_parameters(structure, leaves)`.
+//!
+//! Prefer [`Parameterized::map_parameters`] when the operation is a simple one-to-one leaf mapping as it preserves
+//! the structure and reports cardinality mismatches through the same contract. New leaf types implement or derive
+//! [`Parameter`], and new product types derive [`Parameterized`].
+//!
+//! # Leaves, Containers, and Families
+//!
+//! [`Parameter`] marks an indivisible leaf. Primitive scalars and many core metadata types implement it directly, and
+//! custom leaf types can derive it with `#[derive(Parameter)]`. The marker is what distinguishes one leaf from a
+//! container whose elements are leaves without overlapping blanket implementations.
+//!
+//! [`Parameterized<P>`] describes a concrete structure containing leaves of type `P`. It provides:
+//!
+//! - ordered leaf iteration and consuming flattening,
+//! - stable [`ParameterPath`] iteration for diagnostics and specialization identity,
+//! - a structure-only representation using [`Placeholder`],
+//! - reconstruction from a structure and a leaf iterator, and
+//! - associated `To<Q>` forms that replace every `P` leaf with `Q`.
+//!
+//! [`ParameterizedFamily<P>`] names the container shape independently of one concrete leaf type. It is the witness that
+//! the same family can be instantiated for types, constants, runtime values, or tracers, and most generic Ryft APIs use
+//! the family equality carried by `Parameterized` to guarantee that those views have identical structure.
+//!
+//! # Reparameterization
+//!
+//! One function signature can appear in several synchronized forms:
+//!
+//! ```text
+//! ┌────────────────────┬─────────────────────┐
+//! │ Abstract Signature │ Input::To<Type>     │
+//! ├────────────────────┼─────────────────────┤
+//! │ Traced Arguments   │ Input::To<Tracer>   │
+//! ├────────────────────┼─────────────────────┤
+//! │ Stored Constants   │ Input::To<Constant> │
+//! ├────────────────────┼─────────────────────┤
+//! │ Runtime Arguments  │ Input::To<Value>    │
+//! └────────────────────┴─────────────────────┘
+//! ```
+//!
+//! Tracing replaces abstract type leaves with [`Tracer`](crate::Tracer)s. [`Program`](crate::Program)s retain input and
+//! output parameter structures beside flat [`AtomId`](crate::AtomId)s. Interpretation and compiled calls validate flat
+//! leaves and rebuild the original output shape, and batching, differentiation, and partial evaluation replace leaves
+//! with transform-specific wrappers while preserving the caller-visible container.
+//!
+//! # Paths and Structures
+//!
+//! [`ParameterPath`] is a sequence of [`ParameterPathSegment`] values describing fields, variants, sequence indices,
+//! tuple positions, or map keys from the root to a leaf. Paths make flattening observable and stable enough for error
+//! messages and Just-In-Time (JIT) compilation specialization keys. They describe _location_. They do not own or
+//! identify the leaf value itself.
+//!
+//! [`Placeholder`] represents one leaf in a structure-only value. A parameter structure preserves all container choices
+//! and cardinalities needed by [`Parameterized::from_parameters`] while discarding leaf data. Reconstruction rejects
+//! missing, unused, ambiguous, or structurally incompatible parameters with [`ParameterError`].
+//!
+//! # Extending Parameterization
+//!
+//! For a new indivisible leaf, implement or derive [`Parameter`]. For a new container or product type, implement
+//! [`Parameterized`] together with its [`ParameterizedFamily`] witness, defining deterministic leaf order, matching
+//! paths, a structure representation, reparameterized `To<Q>` forms, and exact reconstruction. Prefer the derived
+//! implementations for ordinary structs and enums when available.
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Display};
 use std::hash::{BuildHasher, Hash};
