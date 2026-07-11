@@ -131,6 +131,31 @@ pub trait CompilationDomain: Domain + Clone {
         }
     }
 
+    /// Validates that `replacement` can be installed behind the same runtime call boundary as `current`.
+    ///
+    /// The default checks the output contract available to every compilation domain. Backends whose executable owns
+    /// additional invocation metadata (for example donation, capture, placement, or sharding declarations) must
+    /// override this hook and reject changes to that metadata.
+    fn validate_replacement(
+        &self,
+        current: &Self::CompiledProgram,
+        replacement: &Self::CompiledProgram,
+    ) -> Result<(), Self::Error> {
+        let current_outputs = self.compiled_output_types(current);
+        let replacement_outputs = self.compiled_output_types(replacement);
+        if current_outputs.len() != replacement_outputs.len() {
+            return Err(ProgramError::InvalidOutputCount {
+                expected: current_outputs.len(),
+                actual: replacement_outputs.len(),
+            }
+            .into());
+        }
+        for (declared, actual) in current_outputs.iter().zip(replacement_outputs) {
+            self.validate_output_type(declared, actual)?;
+        }
+        Ok(())
+    }
+
     /// Executes `program` against flat runtime inputs and returns flat runtime outputs.
     fn execute(
         &self,
@@ -166,4 +191,17 @@ pub trait CompilationDomain: Domain + Clone {
     fn cache(&self) -> Option<&CompilationContext<Self>> {
         None
     }
+}
+
+/// Optional capability for inspecting a compiled program without recompiling it.
+///
+/// Analysis is deliberately separate from [`CompilationDomain`] because not every backend or runtime plugin can
+/// expose compiler cost and memory information. Implementations should cache immutable backend results when querying
+/// them is non-trivial. Calling this method must never trigger compilation.
+pub trait AnalyzableCompilationDomain: CompilationDomain {
+    /// Backend-owned, typed analysis report.
+    type Analysis;
+
+    /// Analyzes `program` without recompiling it.
+    fn analyze(&self, program: &Self::CompiledProgram) -> Result<Self::Analysis, Self::Error>;
 }

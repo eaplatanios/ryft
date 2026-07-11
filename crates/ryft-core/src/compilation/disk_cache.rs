@@ -37,6 +37,7 @@ const ENTRY_MAGIC: &[u8; 8] = b"RYFTCACH";
 const ENTRY_FORMAT_VERSION: u32 = 1;
 const SHA256_LENGTH: usize = 32;
 const ENTRY_HEADER_LENGTH: usize = ENTRY_MAGIC.len() + 4 + SHA256_LENGTH + 8 + SHA256_LENGTH;
+const MAXIMUM_AUXILIARY_ENTRY_SIZE: usize = 64 * 1024 * 1024;
 const DEFAULT_MINIMUM_COMPILE_DURATION: Duration = Duration::from_secs(1);
 const DEFAULT_MINIMUM_ENTRY_SIZE: usize = 0;
 
@@ -152,6 +153,78 @@ impl DiskCache {
         self.directory.join(format!("{}.executable", digest.as_hex()))
     }
 
+    fn auxiliary_entry_path(&self, digest: &CacheDigest) -> PathBuf {
+        self.directory.join(format!("{}.metadata", digest.as_hex()))
+    }
+
+    fn auxiliary_digest(namespace: &str, key: &[u8]) -> CacheDigest {
+        let namespace_digest = Sha256::digest(namespace.as_bytes());
+        let key_digest = Sha256::digest(key);
+        let mut hasher = Sha256::new();
+        hasher.update(b"RYFT-AUXILIARY\0");
+        hasher.update(namespace_digest);
+        hasher.update(key_digest);
+        CacheDigest { bytes: hasher.finalize().into() }
+    }
+
+    /// Reads a checksummed backend-owned auxiliary payload associated with `key`.
+    ///
+    /// Auxiliary entries share this cache's directory but use a separate filename extension from executables. Reads
+    /// are bounded to 64 MiB of uncompressed envelope data so corrupted compressed inputs cannot grow memory without
+    /// limit. Missing entries return `Ok(None)`; validation and I/O failures remain explicit.
+    pub fn get_auxiliary(&self, namespace: &str, key: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+        let digest = Self::auxiliary_digest(namespace, key);
+        let path = self.auxiliary_entry_path(&digest);
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let decoder = GzDecoder::new(file);
+        let mut envelope = Vec::new();
+        decoder
+            .take((ENTRY_HEADER_LENGTH + MAXIMUM_AUXILIARY_ENTRY_SIZE + 1) as u64)
+            .read_to_end(&mut envelope)?;
+        if envelope.len() > ENTRY_HEADER_LENGTH + MAXIMUM_AUXILIARY_ENTRY_SIZE {
+            return Err(Self::invalid_data("persistent auxiliary payload exceeds the 64 MiB limit"));
+        }
+        Self::decode_envelope(&digest, envelope.as_slice()).map(Some)
+    }
+
+    /// Atomically writes a checksummed backend-owned auxiliary payload associated with `key`.
+    ///
+    /// Payloads larger than 64 MiB are rejected. The temp-file-plus-rename protocol gives readers either the prior
+    /// complete entry or the new complete entry across crashes and concurrent processes.
+    pub fn put_auxiliary(&self, namespace: &str, key: &[u8], data: &[u8]) -> std::io::Result<()> {
+        if data.len() > MAXIMUM_AUXILIARY_ENTRY_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "persistent auxiliary payload exceeds the 64 MiB limit",
+            ));
+        }
+        let digest = Self::auxiliary_digest(namespace, key);
+        let final_path = self.auxiliary_entry_path(&digest);
+        let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
+        let temp_path = self.directory.join(format!("{}.metadata.tmp.{}.{}", digest.as_hex(), process::id(), counter,));
+        let write_result = (|| -> std::io::Result<()> {
+            let temporary_file = File::create(&temp_path)?;
+            let mut encoder = GzEncoder::new(temporary_file, Compression::fast());
+            Self::write_envelope(&mut encoder, &digest, data)?;
+            let temporary_file = encoder.finish()?;
+            temporary_file.sync_all()
+        })();
+        if let Err(error) = write_result {
+            return Self::remove_temporary_entry(&temp_path, error);
+        }
+        if let Err(error) = fs::rename(&temp_path, &final_path) {
+            return Self::remove_temporary_entry(&temp_path, error);
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            self.evict_to_fit(&final_path, max_bytes)?;
+        }
+        Ok(())
+    }
+
     /// Reads and validates the cached serialized payload for `digest`. A missing entry is a cache
     /// miss; filesystem, decompression, envelope, and checksum failures are returned explicitly.
     pub(crate) fn get(&self, digest: &CacheDigest) -> std::io::Result<Option<Vec<u8>>> {
@@ -195,7 +268,7 @@ impl DiskCache {
             return Self::remove_temporary_entry(&temp_path, error);
         }
         if let Some(max_bytes) = self.max_bytes {
-            self.evict_to_fit(digest, max_bytes)?;
+            self.evict_to_fit(&final_path, max_bytes)?;
         }
         Ok(())
     }
@@ -302,7 +375,7 @@ impl DiskCache {
         self.max_bytes
     }
 
-    /// Sums the byte size of every `.executable` entry in the cache directory. Returns `Ok(0)`
+    /// Sums the byte size of every `.executable` and `.metadata` entry in the cache directory. Returns `Ok(0)`
     /// on a missing or empty directory.
     pub fn cache_size_bytes(&self) -> std::io::Result<u64> {
         let mut total: u64 = 0;
@@ -314,7 +387,7 @@ impl DiskCache {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "executable") {
+            if path.extension().is_some_and(|extension| extension == "executable" || extension == "metadata") {
                 total = total.saturating_add(entry.metadata()?.len());
             }
         }
@@ -322,22 +395,21 @@ impl DiskCache {
     }
 
     /// Evicts oldest entries by file modification time until the on-disk footprint is at or
-    /// below `max_bytes`. Never evicts the entry under `keep_digest`. Returns the number of
+    /// below `max_bytes`. Never evicts the entry at `keep_path`. Returns the number of
     /// entries deleted.
-    fn evict_to_fit(&self, keep_digest: &CacheDigest, max_bytes: u64) -> std::io::Result<usize> {
-        let keep_filename = format!("{}.executable", keep_digest.as_hex());
+    fn evict_to_fit(&self, keep_path: &Path, max_bytes: u64) -> std::io::Result<usize> {
         let mut total_bytes: u64 = 0;
         let mut candidates: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().is_none_or(|ext| ext != "executable") {
+            if path.extension().is_none_or(|extension| extension != "executable" && extension != "metadata") {
                 continue;
             }
             let metadata = entry.metadata()?;
             let size = metadata.len();
             total_bytes = total_bytes.saturating_add(size);
-            if path.file_name().is_some_and(|name| name == keep_filename.as_str()) {
+            if path == keep_path {
                 continue;
             }
             let modified = metadata.modified()?;
@@ -495,7 +567,7 @@ mod tests {
             .map(|digest| std::fs::metadata(cache.entry_path(digest)).unwrap().len())
             .collect::<Vec<_>>();
         let capacity = sizes[1] + sizes[2];
-        assert_eq!(cache.evict_to_fit(&digests[2], capacity).unwrap(), 1);
+        assert_eq!(cache.evict_to_fit(&cache.entry_path(&digests[2]), capacity).unwrap(), 1);
         assert!(cache.get(&digests[0]).unwrap().is_none());
         assert_eq!(cache.get(&digests[1]).unwrap().as_deref(), Some(payloads[1].as_slice()));
         assert_eq!(cache.get(&digests[2]).unwrap().as_deref(), Some(payloads[2].as_slice()));
@@ -520,5 +592,53 @@ mod tests {
         assert!(!cache.should_persist(Duration::from_secs(1), 256));
         assert!(!cache.should_persist(Duration::from_secs(3), 64));
         assert!(cache.should_persist(Duration::from_secs(2), 128));
+    }
+
+    #[test]
+    fn test_disk_cache_auxiliary_payload_survives_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        DiskCache::open(directory.path())
+            .unwrap()
+            .put_auxiliary("adaptive-profile", b"baseline-and-policy", b"aggregated-profile")
+            .unwrap();
+
+        let reopened = DiskCache::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.get_auxiliary("adaptive-profile", b"baseline-and-policy").unwrap().as_deref(),
+            Some(b"aggregated-profile".as_slice()),
+        );
+        assert!(reopened.get_auxiliary("different-namespace", b"baseline-and-policy").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_disk_cache_auxiliary_payload_rejects_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(directory.path()).unwrap();
+        let key = b"baseline-and-policy";
+        cache.put_auxiliary("adaptive-profile", key, b"aggregated-profile").unwrap();
+        let digest = DiskCache::auxiliary_digest("adaptive-profile", key);
+        let path = cache.auxiliary_entry_path(&digest);
+        let mut bytes = std::fs::read(&path).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(path, bytes).unwrap();
+
+        assert!(cache.get_auxiliary("adaptive-profile", key).is_err());
+    }
+
+    #[test]
+    fn test_disk_cache_capacity_counts_auxiliary_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let uncapped = DiskCache::open(directory.path()).unwrap();
+        uncapped.put_auxiliary("adaptive-profile", b"first", &[1; 256]).unwrap();
+        let first_path = uncapped.auxiliary_entry_path(&DiskCache::auxiliary_digest("adaptive-profile", b"first"));
+        let first_size = std::fs::metadata(&first_path).unwrap().len();
+
+        let cache = DiskCache::with_capacity(directory.path(), first_size).unwrap();
+        cache.put_auxiliary("adaptive-profile", b"second", &[2; 256]).unwrap();
+
+        assert!(cache.get_auxiliary("adaptive-profile", b"first").unwrap().is_none());
+        assert_eq!(cache.get_auxiliary("adaptive-profile", b"second").unwrap().as_deref(), Some([2; 256].as_slice()));
+        let second_path = cache.auxiliary_entry_path(&DiskCache::auxiliary_digest("adaptive-profile", b"second"));
+        assert_eq!(cache.cache_size_bytes().unwrap(), std::fs::metadata(second_path).unwrap().len());
     }
 }

@@ -57,10 +57,10 @@ impl<D: CompilationDomain<Options: Default>> Default for CompilationOptions<D> {
 
 #[cfg(test)]
 mod tests {
+    use crate::backends::scalars::Scalar;
     use crate::contexts::Domain;
     use crate::operations::scalars::ScalarOperation;
     use crate::programs::{Program, ProgramError};
-    use crate::scalars::Scalar;
     use crate::types::DataType;
 
     use super::*;

@@ -41,7 +41,6 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-ryft-core = { workspace = true, features = ["test-utilities"] }
 indoc.workspace = true
 num-complex.workspace = true
 pretty_assertions.workspace = true
@@ -49,7 +48,7 @@ tempfile.workspace = true
 
 [features]
 default = []
-benchmarking = ["ryft-core/benchmarking", "ryft-core/test-utilities"]
+benchmarking = ["ryft-core/benchmarking"]
 ndarray = ["dep:ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]
@@ -62,4 +61,9 @@ mps = ["ryft-pjrt/mps"]
 [[bin]]
 name = "ir_benchmark"
 path = "src/bin/ir_benchmark.rs"
+required-features = ["benchmarking"]
+
+[[bin]]
+name = "compilation_benchmark"
+path = "src/bin/compilation_benchmark.rs"
 required-features = ["benchmarking"]
