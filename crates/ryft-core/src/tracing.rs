@@ -41,6 +41,10 @@
 //! trace, and [`NestedTracingContext::trace`] creates a fresh inner builder while retaining a parent context for
 //! lifting, captures, and composition inside higher-order transforms.
 //!
+//! The free [`trace`] and [`infer_output_type`] functions expose the same entry points for callers holding example
+//! values rather than abstract types: the values contribute only their types, and the trace runs in their statically
+//! known execution domain.
+//!
 //! # Tracers and Errors
 //!
 //! A [`Tracer`] stores its context, abstract type, and [`TracerState`]. A live tracer names one [`AtomId`] in its
@@ -704,6 +708,71 @@ pub type DomainTracer<D> = Tracer<DomainTracingContext<D>>;
 /// this alias at call sites that trace a closure into a nested program over an enclosing context `C`.
 pub type NestedTracer<C> = Tracer<NestedTracingContext<C>>;
 
+/// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
+/// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
+/// contribute only their abstract [`Type`]s. No runtime computation is performed on them and they are not captured by
+/// the resulting program. The trace runs in the input value type's statically known
+/// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batching::batch) and the
+/// differentiation entry points, no context instance needs to be recovered from the input leaves and inputs with no
+/// leaf values are still traceable. Refer to the documentation of [`Domain::trace`] for information on the trace and
+/// its arguments.
+#[inline]
+pub fn trace<
+    V: Value,
+    F: FnOnce(InputType::To<DomainTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
+    Input: Parameterized<V, To<V::Type> = InputType, Family: ParameterizedFamily<V::Type>>,
+    InputType: Parameterized<
+            V::Type,
+            Family: ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>
+                        + ParameterizedFamily<DomainTracer<V::ExecutionDomain>>,
+        >,
+    Output: Parameterized<
+            DomainTracer<V::ExecutionDomain>,
+            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>,
+        >,
+>(
+    function: F,
+    input: Input,
+) -> Result<
+    (
+        Output::To<V::Type>,
+        Program<
+            <V::ExecutionDomain as Domain>::Constant,
+            <V::ExecutionDomain as Domain>::Operation,
+            InputType::To<<V::ExecutionDomain as Domain>::Constant>,
+            Output::To<<V::ExecutionDomain as Domain>::Constant>,
+        >,
+    ),
+    ProgramError,
+> {
+    V::ExecutionDomain::trace(function, input.map_parameters(|value| value.r#type().into_owned())?)
+}
+
+/// Traces `function` at the abstract signature of the provided `input` values and returns only the inferred
+/// output types, without retaining the traced [`Program`] (i.e., the analogue of [JAX's `eval_shape`](
+/// https://docs.jax.dev/en/latest/_autosummary/jax.eval_shape.html)). This is the output-type-only counterpart
+/// of [`trace`]. Refer to the documentation of [`Domain::infer_output_type`] for more information.
+#[inline]
+pub fn infer_output_type<
+    V: Value,
+    F: FnOnce(InputType::To<DomainTracer<V::ExecutionDomain>>) -> Result<Output, ProgramError>,
+    Input: Parameterized<V, To<V::Type> = InputType, Family: ParameterizedFamily<V::Type>>,
+    InputType: Parameterized<
+            V::Type,
+            Family: ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>
+                        + ParameterizedFamily<DomainTracer<V::ExecutionDomain>>,
+        >,
+    Output: Parameterized<
+            DomainTracer<V::ExecutionDomain>,
+            Family: ParameterizedFamily<V::Type> + ParameterizedFamily<<V::ExecutionDomain as Domain>::Constant>,
+        >,
+>(
+    function: F,
+    input: Input,
+) -> Result<Output::To<V::Type>, ProgramError> {
+    V::ExecutionDomain::infer_output_type(function, input.map_parameters(|value| value.r#type().into_owned())?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -734,6 +803,17 @@ mod tests {
             EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(|x| Ok(x.clone() * x), DataType::F64).unwrap();
         assert_eq!(output_type, DataType::F64);
         assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(9.0)));
+
+        // The free function traces at the abstract signature of example values, which contribute only their types
+        // (i.e., the resulting program neither captures nor depends on the example values themselves).
+        let (output_type, program) = trace(|x| Ok(x.clone() * x), Scalar::from(2.0)).unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(9.0)));
+
+        // Structured inputs trace at the structured signature of the example values.
+        let (output_type, program) = trace(|(x, y)| Ok(x * y), (Scalar::from(2.0), Scalar::from(3.0))).unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(program.interpret((Scalar::from(4.0), Scalar::from(5.0))), Ok(Scalar::from(20.0)));
     }
 
     #[test]
@@ -750,6 +830,10 @@ mod tests {
         let output_type =
             EagerContext::<Scalar, ScalarOperation<Scalar>>::infer_output_type(|x| Ok(x.sin()?), DataType::F64)
                 .unwrap();
+        assert_eq!(output_type, DataType::F64);
+
+        // The free function infers output types at the abstract signature of example values.
+        let output_type = infer_output_type(|x| Ok(x.sin()?), Scalar::from(1.5)).unwrap();
         assert_eq!(output_type, DataType::F64);
     }
 

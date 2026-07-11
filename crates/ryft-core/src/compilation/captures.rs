@@ -3,8 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::BatchableOperation;
-use crate::batching::BatchingContext;
+use crate::batching::{BatchableOperation, BatchingContext};
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::{DifferentiableOperation, DifferentiationContext};
 use crate::macros::check_count;
