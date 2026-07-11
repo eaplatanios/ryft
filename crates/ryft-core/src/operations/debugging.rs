@@ -169,9 +169,9 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for PrintOpera
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::contexts::{Domain, EagerContext};
+    use crate::contexts::EagerContext;
     use crate::tests::TestArray;
-    use crate::tracing::DomainTracer;
+    use crate::tracing::{DomainTracer, Trace};
     use crate::tracing_v2::{ArrayOperation, ReverseModeDifferentiate};
     use crate::types::{ArrayType, DataType};
 

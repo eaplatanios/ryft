@@ -1354,6 +1354,7 @@ mod tests {
     use crate::operations::trigonometric::{Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::ProgramBuilder;
+    use crate::tracing::Trace;
     use crate::types::DataType;
 
     use super::*;

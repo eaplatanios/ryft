@@ -581,6 +581,8 @@ mod tests {
     use crate::tracing_v2::{DifferentiableDomainExtension, ReverseModeDifferentiate};
     use crate::types::DataType;
 
+    use crate::tracing::Trace;
+
     use super::*;
     use crate::batching::BatchAxis;
 
@@ -755,7 +757,6 @@ mod tests {
     #[test]
     fn test_slice_batching_carries_batch_extended_sharding() {
         use crate::batching::Batch;
-        use crate::contexts::Domain;
         use crate::operations::manipulation::Slice;
         use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 

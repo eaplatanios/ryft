@@ -110,13 +110,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
-    use crate::contexts::{Context, Domain, StagingContext};
+    use crate::contexts::{Context, StagingContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::control_flow::Select;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
+    use crate::tracing::Trace;
     use crate::tracing_v2::ForwardModeDifferentiate;
     use crate::types::TypeError;
 

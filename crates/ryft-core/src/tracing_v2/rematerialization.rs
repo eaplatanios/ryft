@@ -41,7 +41,7 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::Captured;
 use crate::programs::{AtomId, MaybeZero, Program, ProgramError, Value};
-use crate::tracing::{DomainTracer, Tracer, TracingContext};
+use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
 };

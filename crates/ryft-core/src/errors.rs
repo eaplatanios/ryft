@@ -76,3 +76,36 @@ impl<T: 'static + std::error::Error + Send + Sync + Eq + Hash> CustomError for T
 
 dyn_eq::eq_trait_object!(CustomError);
 dyn_hash::hash_trait_object!(CustomError);
+
+/// Adapter that lets closure-taking entry points accept both plain and fallible closures. An entry point that expects
+/// a closure producing `T` and reports errors as `E` can instead accept any closure output implementing
+/// `MaybeFallible<T, E>`. Returning `T` directly requires no wrapping, while returning `Result<T, SourceError>`
+/// for any `SourceError` that converts into `E` enables using `?` inside the closure.
+///
+/// This dual-mode contract is only sound where the expected closure output `T` has a concrete outer type
+/// constructor at the entry point (e.g., the reverse-mode gradient entry points, whose closures produce a
+/// [`LinearizationTracer`](crate::LinearizationTracer) or a tracer/auxiliary tuple). A plain output can then never
+/// unify with [`Result`], which is what lets type inference select between the two implementations unambiguously.
+/// When `T` is itself a fully generic parameter inferred from the closure (e.g., the traced output structures of
+/// [`trace`](crate::trace), [`batch`](crate::batch), [`vjp`](crate::vjp), etc.), a [`Result`]-returning closure
+/// would make both implementations applicable and inference ambiguous, and so those entry points accept fallible
+/// closures only.
+pub trait MaybeFallible<T, E> {
+    /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and converting the error type
+    /// of already fallible outputs into `E`.
+    fn into_result(self) -> Result<T, E>;
+}
+
+impl<T, E> MaybeFallible<T, E> for T {
+    #[inline]
+    fn into_result(self) -> Result<T, E> {
+        Ok(self)
+    }
+}
+
+impl<T, E, SourceError: Into<E>> MaybeFallible<T, E> for Result<T, SourceError> {
+    #[inline]
+    fn into_result(self) -> Result<T, E> {
+        self.map_err(Into::into)
+    }
+}

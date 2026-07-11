@@ -215,12 +215,14 @@ mod tests {
     use crate::batching::Batch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
-    use crate::contexts::{Domain, EagerContext};
+    use crate::contexts::EagerContext;
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
     use crate::types::{DataType, Shape, Size, Typed};
+
+    use crate::tracing::Trace;
 
     use super::*;
 

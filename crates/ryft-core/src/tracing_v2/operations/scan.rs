@@ -688,6 +688,8 @@ mod tests {
     use crate::tracing_v2::ArrayOperation;
     use crate::types::DataType;
 
+    use crate::tracing::Trace;
+
     use super::*;
 
     type TestOperation = ArrayOperation<TestArray>;
@@ -739,7 +741,6 @@ mod tests {
     /// known→unknown edges), which the trailing assertion pins.
     #[test]
     fn test_scan_jvp_stages_one_fused_scan_with_no_residual_stacks() {
-        use crate::contexts::Domain;
         use crate::tracing::DomainTracer;
         use crate::types::{Shape, Size};
 

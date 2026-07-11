@@ -197,3 +197,33 @@ impl From<DifferentiationError> for ProgramError {
         }
     }
 }
+
+/// Adapter that lets the reverse-mode gradient entry points accept both plain and fallible closures. The gradient
+/// family (i.e., [`value_and_gradient`], [`gradient`], and their holomorphic and auxiliary-output variants) accepts
+/// any closure output implementing `MaybeFallible<T>`, where `T` is the expected traced output shape. Returning `T`
+/// directly requires no wrapping, while returning `Result<T, E>` for any `E` that converts into
+/// [`DifferentiationError`] (e.g., [`ProgramError`]) enables using `?` inside the closure.
+///
+/// This dual-mode contract is only offered where the expected traced output shape has a concrete outer constructor
+/// (i.e., a [`LinearizationTracer`] or a tracer/auxiliary tuple), which is what lets type inference select between
+/// the two implementations unambiguously. Entry points with fully generic traced outputs (i.e., [`jvp`], [`linearize`],
+/// and [`vjp`]) accept fallible closures only.
+pub trait MaybeFallible<T> {
+    /// Converts this closure output into a [`Result`], wrapping plain outputs in [`Ok`] and converting the error type
+    /// of already fallible outputs into [`DifferentiationError`].
+    fn into_result(self) -> Result<T, DifferentiationError>;
+}
+
+impl<T> MaybeFallible<T> for T {
+    #[inline]
+    fn into_result(self) -> Result<T, DifferentiationError> {
+        Ok(self)
+    }
+}
+
+impl<T, E: Into<DifferentiationError>> MaybeFallible<T> for Result<T, E> {
+    #[inline]
+    fn into_result(self) -> Result<T, DifferentiationError> {
+        self.map_err(Into::into)
+    }
+}

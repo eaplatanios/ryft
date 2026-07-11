@@ -6,6 +6,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, ForwardModeDifferentiate, LinearizationTracer,
 };
+use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
 use crate::operations::arithmetic::AddOperation;
@@ -841,8 +842,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// [`Context`] executing (or staging) the primal-side operations and the pullback replay. Refer to the
     /// documentation of the [`value_and_gradient`] function for information on the transform and its arguments.
     fn value_and_gradient<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<LinearizationTracer<Self>, DifferentiationError>,
     >(
         &self,
         function: F,
@@ -860,7 +862,8 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     {
         // Seed the single output cotangent with the multiplicative identity of the scalar output and pull it back
         // to the input cotangents, reshaped against the closure's input structure.
-        let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
+        let (output, pullback) =
+            self.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
         let seed = self.gradient_seed(&output, false)?;
         let gradient = pullback.apply(seed)?;
         Ok((output, gradient))
@@ -872,8 +875,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// the [`gradient`] function for information on the transform and its arguments.
     #[inline]
     fn gradient<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<LinearizationTracer<Self>, DifferentiationError>,
     >(
         &self,
         function: F,
@@ -897,8 +901,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// documentation of the [`value_and_gradient_holomorphic`] function for information on the transform,
     /// its arguments, and the holomorphy promise it relies on.
     fn value_and_gradient_holomorphic<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<LinearizationTracer<Self>, DifferentiationError>,
     >(
         &self,
         function: F,
@@ -917,7 +922,8 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         // This function implementation is identical to `value_and_gradient` except that the seed is gated on
         // holomorphy. the output must be complex, and under the caller's holomorphy promise the single seed recovers
         // the complex derivative ∂f/∂z.
-        let (output, pullback) = self.vjp(|input| Ok(function(input)), primals)?;
+        let (output, pullback) =
+            self.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
         let seed = self.gradient_seed(&output, true)?;
         let gradient = pullback.apply(seed)?;
         Ok((output, gradient))
@@ -930,8 +936,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// and the holomorphy promise it relies on.
     #[inline]
     fn gradient_holomorphic<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> LinearizationTracer<Self>,
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<LinearizationTracer<Self>, DifferentiationError>,
     >(
         &self,
         function: F,
@@ -955,8 +962,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// documentation of the [`value_and_gradient_with_aux`] function for information on the transform and its
     /// arguments.
     fn value_and_gradient_with_aux<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<(LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>), DifferentiationError>,
         Aux: Parameterized<
                 Self::Value,
                 To<Self::Value> = Aux,
@@ -984,7 +992,8 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
             >,
     {
         let input_structure = primals.parameter_structure();
-        let ((output, aux), pullback): ((Self::Value, Aux), _) = self.vjp(|input| Ok(function(input)), primals)?;
+        let ((output, aux), pullback): ((Self::Value, Aux), _) =
+            self.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
         let (pullback, residuals) = pullback.into_parts();
         // The flat pullback consumes `[output_cotangents ++ residuals]`. The traced output flattens as the scalar
         // output leaf followed by the auxiliary leaves, so seed the output leaf with a one cotangent and every
@@ -1009,8 +1018,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// arguments.
     #[inline]
     fn gradient_with_aux<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<(LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>), DifferentiationError>,
         Aux: Parameterized<
                 Self::Value,
                 To<Self::Value> = Aux,
@@ -1045,8 +1055,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// Refer to the documentation of the [`value_and_gradient_holomorphic_with_aux`] function for information on
     /// the transform, its arguments, and the holomorphy promise it relies on.
     fn value_and_gradient_holomorphic_with_aux<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<(LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>), DifferentiationError>,
         Aux: Parameterized<
                 Self::Value,
                 To<Self::Value> = Aux,
@@ -1077,7 +1088,8 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         // holomorphy. The output must be complex, and under the caller's holomorphy promise the single seed recovers
         // the complex derivative ∂f/∂z.
         let input_structure = primals.parameter_structure();
-        let ((output, aux), pullback): ((Self::Value, Aux), _) = self.vjp(|input| Ok(function(input)), primals)?;
+        let ((output, aux), pullback): ((Self::Value, Aux), _) =
+            self.vjp(|input| function(input).into_result().map_err(ProgramError::from), primals)?;
         let (pullback, residuals) = pullback.into_parts();
         let mut pullback_inputs = vec![self.gradient_seed(&output, true)?];
         for value in Parameterized::<Self::Value>::parameters(&aux) {
@@ -1097,8 +1109,9 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
     /// function for information on the transform, its arguments, and the holomorphy promise it relies on.
     #[inline]
     fn gradient_holomorphic_with_aux<
-        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> (LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>),
+        F: FnOnce(Input::To<LinearizationTracer<Self>>) -> Output,
         Input: Parameterized<Self::Value, To<Self::Value> = Input, Family: ParameterizedFamily<LinearizationTracer<Self>>>,
+        Output: MaybeFallible<(LinearizationTracer<Self>, Aux::To<LinearizationTracer<Self>>), DifferentiationError>,
         Aux: Parameterized<
                 Self::Value,
                 To<Self::Value> = Aux,
@@ -1207,7 +1220,9 @@ pub fn vjp<
 
 /// Computes both the primal scalar output of `function` at `primals` and its reverse-mode gradient. For `f` computing
 /// a real scalar `y = f(x)`, this computes `(f(x), ∇f(x))`, where `∇f(x) = (∂f/∂x)(x)ᵀ · 1` is the pullback of the
-/// multiplicative-identity seed.
+/// multiplicative-identity seed. The provided `function` may return its traced output either directly or wrapped in a
+/// [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be used inside the closure. Refer to
+/// [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn value_and_gradient<
     V: Value<
@@ -1224,8 +1239,9 @@ pub fn value_and_gradient<
                                + From<AddOperation>,
             >,
         >,
-    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> LinearizationTracer<V::ExecutionDomain>,
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<LinearizationTracer<V::ExecutionDomain>, DifferentiationError>,
 >(
     function: F,
     primals: Input,
@@ -1239,7 +1255,9 @@ pub fn value_and_gradient<
 /// Computes the reverse-mode gradient of `function` at `primals` (i.e., the analogue of
 /// [JAX's `grad`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html)). For `f` computing a real
 /// scalar `y = f(x)`, this computes `∇f(x) = (∂f/∂x)(x)ᵀ · 1`. This is the gradient-only counterpart of
-/// [`value_and_gradient`], discarding the primal output.
+/// [`value_and_gradient`], discarding the primal output. The provided `function` may return its traced output either
+/// directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be used
+/// inside the closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn gradient<
     V: Value<
@@ -1256,8 +1274,9 @@ pub fn gradient<
                                + From<AddOperation>,
             >,
         >,
-    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> LinearizationTracer<V::ExecutionDomain>,
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<LinearizationTracer<V::ExecutionDomain>, DifferentiationError>,
 >(
     function: F,
     primals: Input,
@@ -1268,7 +1287,9 @@ pub fn gradient<
 /// Computes both the primal scalar output of `function` at `primals` and its holomorphic reverse-mode gradient (i.e.,
 /// the analogue of [JAX's `grad(f, holomorphic=True)`](https://docs.jax.dev/en/latest/_autosummary/jax.grad.html)).
 /// For a holomorphic function `f` computing a complex scalar `y = f(z)`, this function computes `(f(z), ∂f/∂z)`
-/// (i.e., the complex derivative itself rather than a conjugate steepest-ascent direction).
+/// (i.e., the complex derivative itself rather than a conjugate steepest-ascent direction). The provided `function`
+/// may return its traced output either directly or wrapped in a [`Result`] whose error type converts into
+/// [`DifferentiationError`], so `?` can be used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn value_and_gradient_holomorphic<
     V: Value<
@@ -1285,8 +1306,9 @@ pub fn value_and_gradient_holomorphic<
                                + From<AddOperation>,
             >,
         >,
-    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> LinearizationTracer<V::ExecutionDomain>,
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<LinearizationTracer<V::ExecutionDomain>, DifferentiationError>,
 >(
     function: F,
     primals: Input,
@@ -1299,7 +1321,9 @@ pub fn value_and_gradient_holomorphic<
 
 /// Computes the holomorphic reverse-mode gradient of `function` at `primals`. For a holomorphic function `f` computing
 /// a complex scalar `y = f(z)`, this function computes `∂f/∂z`. This is the gradient-only counterpart of
-/// [`value_and_gradient_holomorphic`], discarding the primal output.
+/// [`value_and_gradient_holomorphic`], discarding the primal output. The provided `function` may return its traced
+/// output either directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?`
+/// can be used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn gradient_holomorphic<
     V: Value<
@@ -1316,8 +1340,9 @@ pub fn gradient_holomorphic<
                                + From<AddOperation>,
             >,
         >,
-    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> LinearizationTracer<V::ExecutionDomain>,
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<LinearizationTracer<V::ExecutionDomain>, DifferentiationError>,
 >(
     function: F,
     primals: Input,
@@ -1328,7 +1353,9 @@ pub fn gradient_holomorphic<
 /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its reverse-mode
 /// gradient. For a function `f` computing `(y, aux) = f(x)` with a real scalar `y`, this function computes
 /// `((y, aux), (∂y/∂x)(x)ᵀ · 1)` where only `y` is differentiated, while the auxiliary outputs ride
-/// along as primal values with zero cotangent seeds.
+/// along as primal values with zero cotangent seeds. The provided `function` may return its traced output either
+/// directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be used
+/// inside the closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn value_and_gradient_with_aux<
     V: Value<
@@ -1345,10 +1372,12 @@ pub fn value_and_gradient_with_aux<
                                + From<AddOperation>,
             > + Zero<V>,
         >,
-    F: FnOnce(
-        Input::To<LinearizationTracer<V::ExecutionDomain>>,
-    ) -> (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<
+            (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+            DifferentiationError,
+        >,
     Aux: Parameterized<
             V,
             To<V> = Aux,
@@ -1373,7 +1402,9 @@ where
 
 /// Computes the reverse-mode gradient of `function` at `primals` and its auxiliary outputs. For a function `f`
 /// computing `(y, aux) = f(x)` with a real scalar `y`, this computes `((∂y/∂x)(x)ᵀ · 1, aux)`. This is the
-/// gradient-only counterpart of [`value_and_gradient_with_aux`], discarding the primal scalar output.
+/// gradient-only counterpart of [`value_and_gradient_with_aux`], discarding the primal scalar output. The provided
+/// `function` may return its traced output either directly or wrapped in a [`Result`] whose error type converts into
+/// [`DifferentiationError`], so `?` can be used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn gradient_with_aux<
     V: Value<
@@ -1390,10 +1421,12 @@ pub fn gradient_with_aux<
                                + From<AddOperation>,
             > + Zero<V>,
         >,
-    F: FnOnce(
-        Input::To<LinearizationTracer<V::ExecutionDomain>>,
-    ) -> (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<
+            (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+            DifferentiationError,
+        >,
     Aux: Parameterized<
             V,
             To<V> = Aux,
@@ -1416,7 +1449,9 @@ where
 /// Computes the scalar output of `function` at `primals`, its auxiliary outputs, and its holomorphic reverse-mode
 /// gradient. For a holomorphic function `f` computing `(y, aux) = f(z)` with a complex scalar `y`, this function
 /// computes `((y, aux), ∂y/∂z)`. This is [`value_and_gradient_with_aux`] with the complex-output guard lifted, exactly
-/// as [`value_and_gradient_holomorphic`] lifts it for [`value_and_gradient`].
+/// as [`value_and_gradient_holomorphic`] lifts it for [`value_and_gradient`]. The provided `function` may return its
+/// traced output either directly or wrapped in a [`Result`] whose error type converts into [`DifferentiationError`],
+/// so `?` can be used inside the closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn value_and_gradient_holomorphic_with_aux<
     V: Value<
@@ -1433,10 +1468,12 @@ pub fn value_and_gradient_holomorphic_with_aux<
                                + From<AddOperation>,
             > + Zero<V>,
         >,
-    F: FnOnce(
-        Input::To<LinearizationTracer<V::ExecutionDomain>>,
-    ) -> (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<
+            (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+            DifferentiationError,
+        >,
     Aux: Parameterized<
             V,
             To<V> = Aux,
@@ -1462,7 +1499,9 @@ where
 /// Computes the holomorphic reverse-mode gradient of `function` at `primals` and its auxiliary outputs. For
 /// a holomorphic function `f` computing `(y, aux) = f(z)` with a complex scalar `y`, this function computes
 /// `(∂y/∂z, aux)`. This is the gradient-only counterpart of [`value_and_gradient_holomorphic_with_aux`],
-/// discarding the primal scalar output.
+/// discarding the primal scalar output. The provided `function` may return its traced output either directly or
+/// wrapped in a [`Result`] whose error type converts into [`DifferentiationError`], so `?` can be used inside the
+/// closure. Refer to [`MaybeFallible`] for the exact contract.
 #[inline]
 pub fn gradient_holomorphic_with_aux<
     V: Value<
@@ -1479,10 +1518,12 @@ pub fn gradient_holomorphic_with_aux<
                                + From<AddOperation>,
             > + Zero<V>,
         >,
-    F: FnOnce(
-        Input::To<LinearizationTracer<V::ExecutionDomain>>,
-    ) -> (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+    F: FnOnce(Input::To<LinearizationTracer<V::ExecutionDomain>>) -> Output,
     Input: Parameterized<V, To<V> = Input, Family: ParameterizedFamily<LinearizationTracer<V::ExecutionDomain>>>,
+    Output: MaybeFallible<
+            (LinearizationTracer<V::ExecutionDomain>, Aux::To<LinearizationTracer<V::ExecutionDomain>>),
+            DifferentiationError,
+        >,
     Aux: Parameterized<
             V,
             To<V> = Aux,
@@ -1528,7 +1569,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
-    use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext};
+    use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
@@ -2399,14 +2440,16 @@ mod tests {
     fn test_nested_differentiation() {
         // Every nesting shape differentiates `f(x) = sin(x²)` at `x = 0.7` through closure-level nesting. Inner
         // transforms run on the nested tracing context their tracers flow in, recovered either implicitly by the
-        // free differentiation functions from their tracer inputs or explicitly through `x.context()`.
+        // free differentiation functions from their tracer inputs or explicitly through `x.context()`. Every closure
+        // is fallible, propagating staging failures outward through `?` (or by returning the inner transform's
+        // `Result` directly) instead of unwrapping.
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
         let x: f64 = 0.7;
 
         // Reverse-over-reverse through the free functions alone: the outer value is `f'(x) = 2x cos(x²)` and the
         // outer gradient is the analytic second derivative `f''(x) = 2 cos(x²) - 4x² sin(x²)`.
         let (value, second_derivative) =
-            value_and_gradient(|x| gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap(), Scalar::from(x)).unwrap();
+            value_and_gradient(|x| gradient(|y| (y.clone() * y).sin(), x), Scalar::from(x)).unwrap();
         assert_abs_diff_eq!(value, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(second_derivative, 2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin(), epsilon = 1e-9);
 
@@ -2417,15 +2460,13 @@ mod tests {
             .value_and_gradient(
                 |x| {
                     let context = x.context().clone();
-                    context
-                        .gradient(
-                            |y| {
-                                let context = y.context().clone();
-                                context.gradient(|z| (z.clone() * z).sin().unwrap(), y).unwrap()
-                            },
-                            x,
-                        )
-                        .unwrap()
+                    context.gradient(
+                        |y| {
+                            let context = y.context().clone();
+                            context.gradient(|z| (z.clone() * z).sin(), y)
+                        },
+                        x,
+                    )
                 },
                 Scalar::from(x),
             )
@@ -2442,8 +2483,7 @@ mod tests {
         // duals' stamped `DifferentiationContext` is itself a `ReverseModeDifferentiate` the inner transform nests
         // on.
         let (primal, tangent) =
-            jvp(|x| Ok(gradient(|y| (y.clone() * y).sin().unwrap(), x).unwrap()), Scalar::from(x), Scalar::from(2.0))
-                .unwrap();
+            jvp(|x| Ok(gradient(|y| (y.clone() * y).sin(), x)?), Scalar::from(x), Scalar::from(2.0)).unwrap();
         assert_abs_diff_eq!(primal, 2.0 * x * (x * x).cos(), epsilon = 1e-9);
         assert_abs_diff_eq!(tangent, 2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()), epsilon = 1e-9);
     }

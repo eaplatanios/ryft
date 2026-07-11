@@ -20,7 +20,7 @@ use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::Captured;
 use crate::programs::{MaybeZero, Program, ProgramError, Value};
-use crate::tracing::{DomainTracer, Tracer, TracingContext};
+use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::types::{ArrayType, TypeError, Typed};
 
 /// Higher-order operation pairing a primal program with a user-supplied JVP program — the direct analogue of JAX's

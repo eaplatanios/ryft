@@ -37,7 +37,7 @@ pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 pub use differentiation::*;
 pub use effects::{Effect, Effects};
-pub use errors::{CustomError, Error};
+pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{InterpretableOperation, InterpretableProgramOperation};
 pub use operations::*;
 pub use parameters::{
