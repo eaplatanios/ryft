@@ -118,20 +118,18 @@
 //! 6. Continue with a backend crate such as `ryft-xla` for a concrete [`CompilationDomain`] implementation.
 
 pub mod captures;
-pub mod context;
+pub mod contexts;
 pub mod disk_cache;
-pub mod domain;
 pub mod exchange;
 pub mod function;
 pub mod options;
 
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
-pub use context::{
-    CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics, CompilationContext, CompilationEvent,
-    CompilationMissReason,
+pub use contexts::{
+    AnalyzableCompilationDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
+    CompilationContext, CompilationDomain, CompilationEvent, CompilationMissReason,
 };
 pub use disk_cache::DiskCache;
-pub use domain::{AnalyzableCompilationDomain, CompilationDomain};
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
     CompilationTracer, CompiledFunction, CompiledProgramOperation, ExecutableFunction, FlatCompilationProgram,

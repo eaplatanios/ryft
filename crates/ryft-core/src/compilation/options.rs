@@ -2,7 +2,7 @@
 
 use std::fmt::Debug;
 
-use super::domain::CompilationDomain;
+use super::contexts::CompilationDomain;
 
 /// Backend-specific options passed through the common compilation lifecycle.
 ///

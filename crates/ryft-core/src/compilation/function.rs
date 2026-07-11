@@ -21,8 +21,10 @@ use crate::tracing::{DomainTracingContext, Tracer};
 use crate::types::Typed;
 
 use super::captures::{CaptureReference, ClosedProgram};
-use super::context::{CompilationCacheLevel, CompilationCacheOutcome, CompilationEvent, CompilationMissReason};
-use super::domain::{AnalyzableCompilationDomain, CompilationDomain};
+use super::contexts::{
+    AnalyzableCompilationDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationDomain, CompilationEvent,
+    CompilationMissReason,
+};
 use super::options::CompilationOptions;
 
 /// Flat source-program representation stored by nested compiled-call operations.
