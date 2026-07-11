@@ -494,8 +494,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap().remove(0);
-        assert!(outputs.done.r#await().is_ok());
+        let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+        let outputs = execution.block_until_ready().unwrap().remove(0);
         assert_eq!(outputs.outputs.len(), 1);
     }
 
