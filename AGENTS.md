@@ -31,15 +31,22 @@ When asked to implement a change or add a new feature, you must always follow th
 2. **Subagents:** Use subagents liberally to keep the main context clean. Offload research, exploration, and parallel
    analysis to subagents. Always use subagents for complex programs and stick to one task per subagent for focused
    execution.
-3. **Self-Improvement:** After ANY correction from the user, update the `AGENTS.md` file such that you do not require
-   the same correction in the future. Write rules for yourself that will prevent you from making the same mistake in the
-   future. You must ruthlessly iterate on these rules until your rate of making mistakes drops based on those rules.
+3. **Self-Improvement:** After important corrections from the user, update the `AGENTS.md` file such that you do not
+   require the same corrections in the future. Write rules for yourself that will prevent you from making the same
+   mistake in the future. You must ruthlessly iterate on these rules until your rate of making mistakes drops based
+   on those rules.
 4. **Verification:** Never consider a task as completed without first proving that it is. Look at the diff between the
    code before and after your changes to determine what changed and needs testing. Then, ask yourself "Would a staff
    engineer approve this? Also, what tests would they want me to run or even add to do so?". Run tests, check the logs,
    demonstrate correctness, and iterate if you are not there yet. When running potentially expensive verification
    commands locally, start with an explicit timeout of 300 seconds per command unless the user asks for a longer run.
-   Do not let test or benchmark commands sit for many minutes by default.
+   Do not let test or benchmark commands sit for many minutes by default. If a Rust verification command causes
+   `rustc` to be killed or to grow to extreme memory use, stop rerunning broad checks and first reduce the generic
+   type surface or trait-solver obligation graph introduced by the change. Never run `git stash` (or any command that
+   mutates unrelated working-tree files) to work around a build broken by concurrent edits in another crate. Those
+   uncommitted changes may belong to a concurrently running agent and a partial `stash pop` can silently drop them. If
+   a crate you depend on is transiently broken by such edits, verify your own change in isolation instead (e.g., a
+   throwaway crate outside the workspace that depends only on the crates you changed).
 5. **Elegance:** For non-trivial changes pause and ask yourself "Is there a more elegant way to do this?". If a change
    feels hacky, implement an elegent solution knowing everything that you know by this point. For non-trivial changes,
    always challenge your work before presenting it.
@@ -62,6 +69,10 @@ update this file so that they do not need to remind you again in the future.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
+- In transform replay code, prefer the established `InterpretableOperation` path for tracer-valued staging unless the
+  user explicitly asks for a different abstraction. If an experimental staging hook or lowering path is removed or
+  superseded, delete its public trait methods, helper functions, and test-only scaffolding instead of leaving unused
+  compatibility layers behind.
 - Prefer normal method-call syntax for receiver-based calls (for example, `self.name()`, `operation.result(0)`, or
   `attribute.cast::<TypeAttributeRef>()`), and avoid UFCS/static-like syntax such as
   `crate::Operation::name(self)` or `crate::Attribute::cast::<TypeAttributeRef>(&attribute)` unless disambiguation is
@@ -70,6 +81,9 @@ update this file so that they do not need to remind you again in the future.
   higher-order helper function when the call sites need one reusable semantic contract (for example, broadcasting).
 - When centering a capability on a trait, move the whole API surface onto that trait instead of keeping a split between
   inherent methods and trait methods, to the extent possible.
+- For simple capability/provider impls, keep bounds to the minimum needed for the impl target to be well-formed and for
+  the method body to type-check. Do not copy broader bounds from neighboring trait impls unless the provider method
+  itself uses the capability.
 - In capability-focused modules, prefer inlining small single-use local helper functions back into the owning trait
   impls when that makes the implementation easier to read.
 - For module moves and path migrations, do not introduce compatibility shims or re-export bridges unless the user
@@ -82,13 +96,21 @@ update this file so that they do not need to remind you again in the future.
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
 - Prefer putting short and simple type bounds directly in generic type declarations typically including the primary
-  identifying bound for each parameter (e.g., `T: Type`, `V: Value<T>`, `O: Operation<T>`, etc.). Move long or
+  identifying bound for each parameter (e.g., `T: Type`, `V: Value<Type = T>`, `O: Operation<T>`, etc.). Move long or
   structurally complex bounds, especially associated type constraints and bounds that wrap poorly under `rustfmt`,
   into `where` clauses.
+- Declare the type-descriptor parameter before the value parameter in generic parameter lists (e.g.,
+  `<T: Type, V: Value<Type = T>>`, not `<V, T>`).
+- Use `C` for generic parameters whose semantic role is a context (i.e., `Context`, `StagingContext`, `BatchingContext`,
+  `DifferentiationContext`, etc.) and `D` for generic parameters whose semantic role is a domain (i.e., `Domain`,
+  `CompilationDomain`, etc.). If `C` or `D` would collide with an existing payload, constant, or capture parameter,
+  rename that non-context/non-domain parameter to a specific name such as `Constant`, `Capture`, or `Payload`.
 - Order type bounds preferably as follows: `Clone`, `Debug`, `Display`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`,
-  `Type`, `Value`, `Typed`, `Traceable`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
+  `Type`, `Value`, `Typed`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
   `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
   `SupportsMul`, `SupportsDiv`, etc.
+- `Type` requires `Clone + Debug + Display + PartialEq + Parameter`, so a `T: Type` bound already implies all of those.
+  Never write `T: Parameter + PartialEq + Type` (or any subset). Just write `T: Type`.
 - When a helper semantically belongs to an existing core type such as `Program`, prefer an associated function in the
   relevant `impl` block over a free function unless there is a clear reuse reason that truly spans multiple owners.
 - When a generic API is centered on a parameterized input or output family, prefer using that family's canonical
@@ -103,7 +125,9 @@ update this file so that they do not need to remind you again in the future.
   - third-party crate imports
   - `crate::...` imports
   - `super::...` imports
-- Use full words for variable names and avoid abbreviations or shortened versions of words.
+- Use full words for variable names and avoid abbreviations or shortened versions of words. Canonical mathematical
+  function names that Rust's own standard library uses (e.g., `abs` as in `f64::abs`) count as full names and are
+  preferred over spelled-out variants such as `absolute_value`.
 - When a function-like call or macro invocation argument list spans multiple lines, include a trailing comma after the
   final argument.
 - For canonical conversion helpers in `ryft`, prefer `from_*` naming even when the conversion is fallible and returns
@@ -135,6 +159,9 @@ update this file so that they do not need to remind you again in the future.
 - `unwrap()`/`expect()` are allowed only:
   - in tests, or
   - when enforcing internal invariants that were already validated or are contractually guaranteed.
+- For invariants that can never fail by design (e.g., extraction right after a `check_count!`, a `NonZeroUsize` built
+  from a clamped value, or lookups guaranteed by construction), use bare `unwrap()`. Reserve `expect(...)` with a
+  message for conditions that are possible but unrecoverable (e.g., mutex poisoning).
 - `Drop` implementations may use `expect(...)` when a cleanup failure is unrecoverable.
 
 ### Ownership & Lifetimes
@@ -207,6 +234,9 @@ update this file so that they do not need to remind you again in the future.
   of the function itself.
 - Do not end function or method rustdoc blocks with an empty `///` line immediately before the item or its attributes.
   Keep empty rustdoc lines only for internal paragraph, list, table, or code-block separation.
+- Do not add documentation strings to `From` implementations or their `from` functions. Document the conversion
+  semantics, including paired conversions that form a normalizing cycle between two types, in the documentation string
+  of the more domain-specific type (for example, a transform-owned error enum rather than the core `ProgramError`).
 - For public `unsafe` APIs, include:
   - what handle/representation is being exposed,
   - why it is unsafe, and
@@ -228,10 +258,37 @@ update this file so that they do not need to remind you again in the future.
   allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
   readability-driven sentence breaks.
 
+### Where Documentation Lives
+
+The `ryft` documentation surface has three layers, each with its own tool and source location. All three are bundled
+into a single GitHub Pages deployment by `.github/workflows/docs.yaml`.
+
+- **API Reference (`rustdoc` on docs.rs):** the source of truth for type-level documentation. Every struct, enum, trait,
+  module, and function defined in the workspace should be documented in its rustdoc block, following the rest of this
+  section's conventions. Hosted automatically at <https://docs.rs/ryft>.
+- **User Guide (mdBook under `docs/book/`):** the source of truth for installation guides, conceptual explanations, and
+  deep dives into each crate. Pages live under `docs/book/src/` and are wired into `docs/book/src/SUMMARY.md`. Deployed
+  at <https://ryft.dev/book/>.
+- **Marketing Surface (Astro, Tailwind, and Solid.js under `docs/src/`):** the landing page, the one-page Get Started,
+  the examples list, and example detail pages. Built with hand-authored Astro components and Tailwind v4 utility
+  classes. Deployed at <https://ryft.dev/>.
+- **Runnable Examples:** Cargo examples whose Rust source is embedded into the Astro example pages via Vite's `?raw`
+  import suffix. Do not paste example bodies into Markdown by hand — always import the `.rs` source so the rendered page
+  and `cargo build` stay in sync. The flow for adding a new example is documented in `CONTRIBUTING.md`.
+
+The `docs/` directory is a self-contained Node + mdBook project. Astro / Tailwind / Solid / mdBook upgrades stay local
+to `docs/`; the rest of the repository remains Rust-only.
+
 ## Testing Guidelines
 
 - All ryft unit-testing conventions live in `.agents/unit-testing-guidelines.md`.
   Consult that file before writing or revising unit tests.
+- When changing what `ryft-core` transforms (batching, differentiation, tracing) stage into programs — operand
+  shapes, inserted or elided operations — also run the backend crate test suites (at least
+  `cargo test -p ryft-xla --lib`), not just `ryft-core`. Backend lowerings impose stricter contracts than
+  `ryft-core` type inference; for example, StableHLO elementwise operations require shape-congruent operands with no
+  implicit broadcasting, so an "optimization" that elides a staged `BroadcastInDim` can pass every `ryft-core` test
+  and still break XLA lowering.
 
 ## Crate-Specific Conventions
 
