@@ -47,4 +47,5 @@ pub fn pjrt_mps_plugin_path() -> PathBuf {
 pub mod bindings;
 pub mod distributed;
 pub mod mlir;
+pub mod profiler;
 pub mod protos;

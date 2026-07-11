@@ -102,6 +102,8 @@ XLA_DEPENDENCIES = [
     "@xla//xla/pjrt/extensions/host_allocator:host_allocator_extension",
     "@xla//xla/mlir_hlo:CAPI",
     "@xla//xla/pjrt/distributed",
+    "@xla//xla/python:aggregate_profile",
+    "@xla//xla/python:xplane_to_profile_instructions",
     "@xla//xla/service/spmd/shardy/integrations/c:xla_sdy_capi",
 ]
 
@@ -179,6 +181,21 @@ cc_library(
 
 cc_library(
     name = "ryft-xla-sys-library",
+    srcs = [
+        "src/c++/distributed.cc",
+        "src/c++/mlir/dialects/affine.cc",
+        "src/c++/mlir/dialects/arith.cc",
+        "src/c++/mlir/dialects/gpu.cc",
+        "src/c++/mlir/dialects/llvm.cc",
+        "src/c++/mlir/dialects/mosaic_gpu.cc",
+        "src/c++/mlir/dialects/mosaic_tpu.cc",
+        "src/c++/mlir/dialects/nvgpu.cc",
+        "src/c++/mlir/dialects/shape.cc",
+        "src/c++/mlir/dialects/sparse_tensor.cc",
+        "src/c++/mlir/dialects/transform.cc",
+        "src/c++/mlir/dialects/triton.cc",
+        "src/c++/profiler.cc",
+    ],
     hdrs = [
         "src/c++/common.h",
         "src/c++/distributed.h",
@@ -193,20 +210,7 @@ cc_library(
         "src/c++/mlir/dialects/sparse_tensor.h",
         "src/c++/mlir/dialects/transform.h",
         "src/c++/mlir/dialects/triton.h",
-    ],
-    srcs = [
-        "src/c++/distributed.cc",
-        "src/c++/mlir/dialects/affine.cc",
-        "src/c++/mlir/dialects/arith.cc",
-        "src/c++/mlir/dialects/gpu.cc",
-        "src/c++/mlir/dialects/llvm.cc",
-        "src/c++/mlir/dialects/mosaic_gpu.cc",
-        "src/c++/mlir/dialects/mosaic_tpu.cc",
-        "src/c++/mlir/dialects/nvgpu.cc",
-        "src/c++/mlir/dialects/shape.cc",
-        "src/c++/mlir/dialects/sparse_tensor.cc",
-        "src/c++/mlir/dialects/transform.cc",
-        "src/c++/mlir/dialects/triton.cc",
+        "src/c++/profiler.h",
     ],
     copts = tsl_copts() + [
         "-Iexternal/triton/include",
@@ -285,11 +289,11 @@ proto_library(
     name = "ryft-xla-sys-protos",
     deps = [
         "@xla//xla/pjrt/proto:compile_options_proto",
-        "@xla//xla/pjrt/proto:execute_options_proto",
         "@xla//xla/pjrt/proto:executable_metadata_proto",
+        "@xla//xla/pjrt/proto:execute_options_proto",
         "@xla//xla/pjrt/proto:pjrt_device_dimensions_proto",
-        "@xla//xla/pjrt/proto:pjrt_value_type_proto",
         "@xla//xla/pjrt/proto:pjrt_partial_program_proto",
+        "@xla//xla/pjrt/proto:pjrt_value_type_proto",
         "@xla//xla/pjrt/proto:topology_description_proto",
     ],
 )

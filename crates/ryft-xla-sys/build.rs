@@ -742,6 +742,8 @@ impl BuildConfiguration {
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.h"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
             PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
+            PathBuf::from("src").join("c++").join("profiler.cc"),
+            PathBuf::from("src").join("c++").join("profiler.h"),
             PathBuf::from("WORKSPACE"),
         ];
 

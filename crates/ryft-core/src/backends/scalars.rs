@@ -24,6 +24,8 @@ use crate::programs::{ProgramError, Value};
 use crate::tracing::TracingContext;
 use crate::types::{DataType, TypeError, Typed};
 
+// TODO(eaplatanios): Move `ScalarOperation` and its implementations here.
+
 /// [`TracingContext`] over the scalar universe, pairing [`DataType`] types and [`Scalar`] staged constants with the
 /// [`ScalarOperation`] family.
 pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
@@ -434,6 +436,7 @@ impl_partial_eq_primitive_for_scalar!(f64, F64);
 impl_partial_eq_primitive_for_scalar!(Complex<f32>, C64);
 impl_partial_eq_primitive_for_scalar!(Complex<f64>, C128);
 
+// TODO(eaplatanios): Move to the earlier `impl Scalar` block.
 impl Scalar {
     /// Returns the exactly widened floating-point payload backing the [`approx::AbsDiffEq`] implementations below,
     /// or `None` for a variant that carries no real floating-point payload (Booleans, integers, and complex values).
@@ -532,6 +535,7 @@ impl BooleanLike for Scalar {
             Scalar::U16(value) => *value != 0,
             Scalar::U32(value) => *value != 0,
             Scalar::U64(value) => *value != 0,
+            // TODO(eaplatanios): What's the deal with the `unreachable!` here?
             Scalar::F4E2M1FN(_)
             | Scalar::F8E3M4(_)
             | Scalar::F8E4M3(_)
@@ -576,9 +580,6 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
             DataType::F8E4M3B11FNUZ => Scalar::F8E4M3B11FNUZ(0),
             DataType::F8E5M2 => Scalar::F8E5M2(0),
             DataType::F8E5M2FNUZ => Scalar::F8E5M2FNUZ(0),
-            DataType::F8E8M0FNU => {
-                return Err(TypeError { message: "data type f8e8m0fnu cannot represent zero".to_string() }.into());
-            }
             DataType::BF16 => Scalar::BF16(bf16::ZERO),
             DataType::F16 => Scalar::F16(f16::ZERO),
             DataType::F32 => Scalar::F32(0.0),
@@ -586,10 +587,8 @@ impl<O: Operation<DataType>> Zero<Scalar> for EagerContext<Scalar, O> {
             DataType::C64 => Scalar::C64(Complex::new(0.0, 0.0)),
             DataType::C128 => Scalar::C128(Complex::new(0.0, 0.0)),
             other => {
-                return Err(
-                    TypeError { message: format!("data type {other} is not supported in the scalar domain") }.into()
-                );
-            }
+                return Err(TypeError { message: format!("data type {other} cannot represent zero") }.into());
+            },
         })
     }
 }
@@ -656,10 +655,8 @@ impl<O: Operation<DataType>> One<Scalar> for EagerContext<Scalar, O> {
             DataType::C64 => Scalar::C64(Complex::new(1.0, 0.0)),
             DataType::C128 => Scalar::C128(Complex::new(1.0, 0.0)),
             other => {
-                return Err(
-                    TypeError { message: format!("data type {other} is not supported in the scalar domain") }.into()
-                );
-            }
+                return Err(TypeError { message: format!("data type {other} cannot represent one") }.into());
+            },
         })
     }
 }
@@ -711,6 +708,7 @@ impl Neg for Scalar {
             Scalar::I16(value) => Scalar::I16(-value),
             Scalar::I32(value) => Scalar::I32(-value),
             Scalar::I64(value) => Scalar::I64(-value),
+            // TODO(eaplatanios): What's the deal with the `unreachable!` here?
             Scalar::F4E2M1FN(_)
             | Scalar::F8E3M4(_)
             | Scalar::F8E4M3(_)
