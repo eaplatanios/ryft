@@ -1604,14 +1604,13 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::debugging::PrintOperation;
-    use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::types::{DataType, TypeError};
 

@@ -1448,11 +1448,11 @@ mod tests {
     use approx::assert_abs_diff_eq;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};

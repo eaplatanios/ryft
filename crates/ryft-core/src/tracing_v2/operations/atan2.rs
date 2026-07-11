@@ -103,7 +103,7 @@ mod tests {
         // entry point with the same conjugate convention as `∇|z|² = 2z̄`.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let angle = |z: crate::differentiation::LinearizationTracer<
-            crate::contexts::EagerContext<Scalar, crate::operations::scalars::ScalarOperation<Scalar>>,
+            crate::contexts::EagerContext<Scalar, crate::backends::scalars::ScalarOperation<Scalar>>,
         >| { z.imaginary().unwrap().atan2(&z.real().unwrap()).unwrap() };
         let (value, gradient_value) = value_and_gradient(angle, Scalar::from(z)).unwrap();
         assert_eq!(value, Scalar::from(z.im.atan2(z.re)));

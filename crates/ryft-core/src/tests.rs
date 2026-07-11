@@ -70,7 +70,7 @@ macro_rules! check_gradient {
         // an identity function pinning the signature that instantiation is used at.
         type EagerScalarContext = $crate::contexts::EagerContext<
             $crate::backends::scalars::Scalar,
-            $crate::operations::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
+            $crate::backends::scalars::ScalarOperation<$crate::backends::scalars::Scalar>,
         >;
         fn pin_traced<F>(function: F) -> F
         where
@@ -1216,11 +1216,10 @@ mod differentiation_tests {
     use half::{bf16, f16};
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::DifferentiationTracer;
     use crate::differentiation::LinearizationTracer;
-    use crate::operations::scalars::ScalarOperation;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]
@@ -1272,8 +1271,8 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_scalar_straight_line_matches_jvp() {
+        use crate::backends::scalars::ScalarOperation;
         use crate::contexts::EagerContext;
-        use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
         // `f(x) = x * sin(x)`: the linearized map's primal output equals `jvp`'s primal output, and applying it to two
@@ -1296,8 +1295,8 @@ mod differentiation_tests {
 
     #[test]
     fn test_linearize_scalar_multi_input_matches_jvp() {
+        use crate::backends::scalars::ScalarOperation;
         use crate::contexts::EagerContext;
-        use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
         // `f(a, b) = a * b + sin(a)`: a two-input function whose linearization is applied at two distinct tangent
@@ -1504,8 +1503,8 @@ mod differentiation_tests {
 
     #[test]
     fn test_vjp_pullback_apply_scalar_matches_raw_parts() {
+        use crate::backends::scalars::ScalarOperation;
         use crate::contexts::EagerContext;
-        use crate::operations::scalars::ScalarOperation;
         use crate::operations::trigonometric::Sin;
 
         // The `Pullback::apply` callable surface must reproduce the raw opened parts: interpreting the raw pullback manually at
@@ -1635,6 +1634,7 @@ mod differentiation_tests {
 #[cfg(test)]
 mod linearization_tests {
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiationTracer, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
@@ -1642,7 +1642,6 @@ mod linearization_tests {
     use crate::operations::compare::Compare;
     use crate::operations::control_flow::{MaybeWhile, Select, WhileOperation};
     use crate::operations::differentiation::StopGradient;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

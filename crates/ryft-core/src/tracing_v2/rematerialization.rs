@@ -1470,9 +1470,9 @@ mod tests {
     use approx::assert_abs_diff_eq;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::tag::Tag;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
@@ -2249,7 +2249,7 @@ mod tests {
 
     #[test]
     fn test_scalar_second_order_through_rematerialization_matches_the_analytic_second_derivative() {
-        use crate::operations::scalars::ScalarOperation;
+        use crate::backends::scalars::ScalarOperation;
 
         // The scalar counterpart of the test above, composed through nested transforms: the outer reverse pass
         // differentiates a closure that takes the rematerialized gradient on its nested tracing context.

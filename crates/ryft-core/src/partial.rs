@@ -1492,13 +1492,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::{Scalar, ScalarTracingContext};
+    use crate::backends::scalars::{Scalar, ScalarOperation, ScalarTracingContext};
     use crate::contexts::{Context, StagingContext};
     use crate::operations::BooleanLike;
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use crate::operations::constants::{ConstantOperation, Zero};
     use crate::operations::debugging::PrintOperation;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::SinOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};

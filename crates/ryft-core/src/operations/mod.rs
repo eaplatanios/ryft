@@ -5,10 +5,12 @@ use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::broadcasting::Broadcastable;
 use crate::compilation::CaptureReference;
 use crate::contexts::Context;
+use crate::differentiation::{DifferentiationDual, DifferentiationTracer};
 use crate::effects::Effects;
 use crate::macros::check_count;
 use crate::parameters::Parameterized;
-use crate::programs::{Program, ProgramError, Value};
+use crate::partial::{PartialEvaluationValue, PartialTracer, PartialValue};
+use crate::programs::{MaybeZero, Program, ProgramError, Value};
 use crate::tracing::Tracer;
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
@@ -48,7 +50,6 @@ pub mod manipulation;
 pub mod payloads;
 
 /// Scalar operation types built from the core primitive operation traits.
-pub mod scalars;
 
 /// Sharding-related operations (e.g., resharding and propagation hints) and capability traits.
 pub mod sharding;
@@ -62,8 +63,6 @@ pub mod trigonometric;
 // TODO(eaplatanios): We should be importing specific symbols here.
 // The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
 // they do not shadow their `std::ops` counterparts; reach them through `crate::operations::arithmetic` instead.
-use crate::partial::{PartialEvaluationValue, PartialTracer, PartialValue};
-use crate::{DifferentiationDual, DifferentiationTracer, MaybeZero};
 pub use arithmetic::*;
 pub use compare::*;
 pub use constants::*;
@@ -72,7 +71,6 @@ pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::*;
 pub use logical::*;
 pub use manipulation::*;
-pub use scalars::*;
 pub use sharding::*;
 pub use tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
 pub use trigonometric::*;

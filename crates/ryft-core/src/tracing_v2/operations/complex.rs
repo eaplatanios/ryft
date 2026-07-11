@@ -227,9 +227,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::contexts::{Context, EagerContext};
     use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
-    use crate::operations::scalars::ScalarOperation;
     use crate::tracing_v2::ForwardModeDifferentiate;
 
     #[test]

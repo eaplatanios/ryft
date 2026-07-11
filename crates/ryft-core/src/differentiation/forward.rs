@@ -1344,13 +1344,12 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::operations::BooleanLike;
     use crate::operations::Operation;
     use crate::operations::arithmetic::MulOperation;
     use crate::operations::differentiation::StopGradientOperation;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::ProgramBuilder;

@@ -50,7 +50,7 @@ where
 /// than from a closed-over constant.
 ///
 /// The rule is generic over the type descriptor `T`, so it transposes both scalar [`Mul`]
-/// ([`ScalarOperation`](crate::operations::scalars::ScalarOperation)) and array [`Mul`]
+/// ([`ScalarOperation`](crate::backends::scalars::ScalarOperation)) and array [`Mul`]
 /// ([`ArrayOperation`](crate::tracing_v2::ArrayOperation)) tangent programs reached through their enums' partition-
 /// aware transpose dispatch.
 impl<V: Value, O: Operation<V::Type> + From<MulOperation>> TransposableOperation<V, O> for MulOperation
@@ -102,9 +102,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::contexts::EagerContext;
     use crate::operations::arithmetic::MulOperation;
-    use crate::operations::scalars::ScalarOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;

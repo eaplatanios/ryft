@@ -351,9 +351,9 @@ mod tests {
     use indoc::indoc;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::contexts::Context;
     use crate::contexts::EagerContext;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::programs::Program;
 

@@ -198,7 +198,7 @@ where
 /// The rule is generic over the primary type `V::Type` because it only reaches the branch type (`input_types[1]`), the
 /// known condition operand value, and the primal `select`; it carries no rank- or shape-specific logic. It therefore
 /// applies to both the array [`ArrayOperation::Select`](crate::tracing_v2::ArrayOperation) and the scalar
-/// [`ScalarOperation::Select`](crate::operations::scalars::ScalarOperation) enum dispatch.
+/// [`ScalarOperation::Select`](crate::backends::scalars::ScalarOperation) enum dispatch.
 impl<V: Value, O> TransposableOperation<V, O> for SelectOperation
 where
     SelectOperation: Operation<V::Type>,
@@ -380,7 +380,7 @@ mod tests {
         // forward mode routes each branch tangent through the selected branch, and reverse mode routes the cotangent
         // there, so the derivative reaches only the selected branch's input.
         use crate::backends::scalars::Scalar;
-        use crate::operations::scalars::ScalarOperation;
+        use crate::backends::scalars::ScalarOperation;
         use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
         fn piecewise<V>(x: V, y: V) -> Result<V, crate::programs::ProgramError>

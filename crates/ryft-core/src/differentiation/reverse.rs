@@ -1554,7 +1554,7 @@ mod tests {
 
     use std::cell::Cell;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
     use crate::differentiation::jvp;
@@ -1564,7 +1564,6 @@ mod tests {
     use crate::operations::Operation;
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::constants::ZeroOperation;
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

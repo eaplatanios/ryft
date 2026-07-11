@@ -520,8 +520,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::operations::scalars::ScalarOperation;
     use crate::operations::trigonometric::Sin;
     use crate::programs::Program;
 

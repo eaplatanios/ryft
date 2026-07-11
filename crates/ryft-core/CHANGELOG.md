@@ -10,11 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- Added `Parameterized::broadcast_to_parameter_structure`.
-- Added `ryft_core::batching`, `ryft_core::broadcasting`, `ryft_core::partial`, `ryft_core::sharding`,
-  `ryft_core::tracing`, `ryft_core::types`, and `ryft_core::utilities`.
+- Added `Parameterized::try_map_parameters`, `Parameterized::try_map_named_parameters`, and
+  `Parameterized::broadcast_to_parameter_structure`.
+- Added support for modeling program effects with `ryft_core::effects`.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `LayoutError`, `BroadcastingError`,
-  `ShardingError`, and `TracingError`.
+  and `ShardingError`.
+- Added support for the `DataType::F6E3M2FN` and `DataType::F6E2M3FN` 6-bit microscaling floating-point data types.
 
 ## [0.0.2] - 2026-03-02
 

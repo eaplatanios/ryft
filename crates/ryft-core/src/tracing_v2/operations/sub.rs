@@ -64,9 +64,8 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::operations::scalars::ScalarOperation;
     use crate::tracing_v2::ForwardModeDifferentiate;
 
     #[test]

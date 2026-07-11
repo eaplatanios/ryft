@@ -182,8 +182,7 @@ mod tests {
 
         // The composition log(exp(z)) has unit derivative, exercising the chain rule through both rules under an
         // explicit context (up to the rounding of the pullback's `e/e` complex division).
-        let domain =
-            crate::contexts::EagerContext::<Scalar, crate::operations::scalars::ScalarOperation<Scalar>>::new();
+        let domain = crate::contexts::EagerContext::<Scalar, crate::backends::scalars::ScalarOperation<Scalar>>::new();
         let gradient_value = domain
             .gradient_holomorphic(|x| x.exponential().unwrap().logarithm().unwrap(), Scalar::from(z))
             .unwrap();
