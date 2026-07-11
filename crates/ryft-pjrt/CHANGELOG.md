@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_Xla_Transform` extension through a safe `XlaTransform` trait API.
 - Added the `mps` feature and `load_mps_plugin()` for loading the `jax-mps` PJRT plugin.
 - Added `BufferType::element_size_in_bytes`.
+- Added the `BufferType::F6E3M2FN` and `BufferType::F6E2M3FN` 6-bit microscaling floating-point buffer types. Note
+  that the PJRT C API cannot represent these types yet and so they are only supported in Protobuf-backed APIs.
 - Added the `FeedbackDirectedProfile` wrapper for OpenXLA's XProf-to-feedback-directed-profile conversion and
   deterministic multi-profile aggregation used by profile-guided latency estimation, owning the profile bytes
   produced by the native profiler bridge.
