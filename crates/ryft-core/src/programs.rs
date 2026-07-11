@@ -399,6 +399,7 @@ impl<O> Instruction<O> {
     }
 }
 
+// TODO(eaplatanios): Remove the type bounds for `V` here and wherever else we included them just because of this requirement.
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend. It
 /// consists of a sequence of [`Instruction`]s paired with [`Parameterized`] input and output types. This is the primary
 /// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like

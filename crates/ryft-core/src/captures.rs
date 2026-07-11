@@ -189,58 +189,8 @@ pub struct ClosedProgram<
 
 // TODO(eaplatanios): Review from here onwards.
 
-impl<
-    V: Value,
-    O: Clone,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> Clone for ClosedProgram<V, O, Input, Output>
-{
-    fn clone(&self) -> Self {
-        Self { program: self.program.clone(), captures: self.captures.clone() }
-    }
-}
-
-impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
-    Debug for ClosedProgram<V, O, Input, Output>
-{
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ClosedProgram")
-            .field("captures", &self.captures.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
+impl<V: Value, O: Operation<V::Type>, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
     ClosedProgram<V, O, Input, Output>
-{
-    /// Returns the staged program.
-    #[inline]
-    pub fn program(&self) -> &Program<CaptureReference<V::Type>, O, Input, Output> {
-        &self.program
-    }
-
-    /// Returns the captured runtime values.
-    #[inline]
-    pub fn captures(&self) -> &[V] {
-        self.captures.as_slice()
-    }
-
-    /// Consumes this [`ClosedProgram`] and returns its staged program and capture table, in that order.
-    #[inline]
-    pub fn into_parts(self) -> (Program<CaptureReference<V::Type>, O, Input, Output>, Vec<V>) {
-        (self.program, self.captures)
-    }
-}
-
-impl<
-    V: Value,
-    O: Operation<V::Type>,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> ClosedProgram<V, O, Input, Output>
 {
     /// Creates a [`ClosedProgram`] from a capture-referenced `program` and its concrete `captures`, validating that
     /// every constant atom references an existing capture whose type matches the type stored in the reference.
@@ -280,6 +230,57 @@ impl<
         Ok(())
     }
 
+    /// Returns the staged program.
+    #[inline]
+    pub fn program(&self) -> &Program<CaptureReference<V::Type>, O, Input, Output> {
+        &self.program
+    }
+
+    /// Returns the captured runtime values.
+    #[inline]
+    pub fn captures(&self) -> &[V] {
+        self.captures.as_slice()
+    }
+
+    /// Consumes this [`ClosedProgram`] and returns its staged program and capture table, in that order.
+    #[inline]
+    pub fn into_parts(self) -> (Program<CaptureReference<V::Type>, O, Input, Output>, Vec<V>) {
+        (self.program, self.captures)
+    }
+}
+
+impl<
+    V: Value,
+    O: Clone,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> Clone for ClosedProgram<V, O, Input, Output>
+{
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { program: self.program.clone(), captures: self.captures.clone() }
+    }
+}
+
+impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
+    Debug for ClosedProgram<V, O, Input, Output>
+{
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClosedProgram")
+            .field("captures", &self.captures.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<
+    V: Value,
+    O: Operation<V::Type>,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> ClosedProgram<V, O, Input, Output>
+{
     /// Validates capture references that will be supplied as the leading inputs of an opened captured program.
     ///
     /// Capture input indices belong to the caller's capture table and may differ from this program's local capture
