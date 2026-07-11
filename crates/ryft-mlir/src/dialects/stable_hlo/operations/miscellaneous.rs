@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use ryft_xla_sys::bindings::{MlirAttribute, stablehloOutputOperandAliasGet};
 
 use crate::{
-    Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle,
-    DictionaryAttributeRef, ElementsAttribute, ElementsAttributeRef, Error, FlatSymbolRefAttributeRef, IndexTypeRef,
-    IntegerAttributeRef, Location, OneRegion, Operation, OperationBuilder, RegionRef, ShapedType, ShapedTypeRef,
-    StringAttributeRef, StringRef, TryFromWithContext, TryIntoWithContext, Type, Value, ValueRef, mlir_attribute_field,
-    mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+    ArrayAttributeRef, Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion,
+    DialectHandle, DictionaryAttributeRef, ElementsAttribute, ElementsAttributeRef, Error, FlatSymbolRefAttributeRef,
+    IndexTypeRef, IntegerAttributeRef, Location, OneRegion, Operation, OperationBuilder, RegionRef, ShapedType,
+    ShapedTypeRef, StringAttributeRef, StringRef, TryFromWithContext, TryIntoWithContext, Type, Value, ValueRef,
+    mlir_attribute_field, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
 };
 
 /// Name of the [`Attribute`] that is used to store [`ConstantOperation::value`].
@@ -779,6 +779,9 @@ pub const CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE: &str = "result_layouts";
 /// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_output_operand_aliases`].
 pub const CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE: &str = "output_operand_aliases";
 
+/// Name of the [`Attribute`] that is used to store [`CustomCallOperation::custom_call_result_tilings`].
+pub const CUSTOM_CALL_RESULT_TILINGS_ATTRIBUTE: &str = "result_tilings";
+
 /// [`CustomCallOperation::custom_call_target_name`] for the XLA GPU custom call that creates an uninitialized `memref`.
 pub const XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME: &str = "CreateBuffer";
 
@@ -801,7 +804,8 @@ pub const XLA_GPU_UNPIN_CUSTOM_CALL_TARGET_NAME: &str = "Unpin";
 /// implementations as determined by [`CustomCallOperation::custom_call_has_side_effect`].
 ///
 /// Optionally, a [`CustomCallOperation`] may also specify the memory layout of its operands/inputs and results/outputs
-/// via [`CustomCallOperation::custom_call_memory_layouts`].
+/// via [`CustomCallOperation::custom_call_memory_layouts`], as well as tiling information for its results/outputs via
+/// [`CustomCallOperation::custom_call_result_tilings`].
 ///
 /// ## Special XLA GPU Target Names
 ///
@@ -956,6 +960,43 @@ pub trait CustomCallOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             })
             .collect()
     }
+
+    /// Returns the optional tiling information for the results/outputs of this [`CustomCallOperation`]. When present,
+    /// the returned vector contains one tiling per result of this operation, where each tiling is a sequence of tiles
+    /// and each tile is a sequence of tile dimension sizes (represented as a 1-D tensor of index type in the
+    /// underlying [`Attribute`]).
+    fn custom_call_result_tilings(&self) -> Result<Option<Vec<Vec<Vec<usize>>>>, Error> {
+        if !self.has_attribute(CUSTOM_CALL_RESULT_TILINGS_ATTRIBUTE) {
+            return Ok(None);
+        }
+        self.array_attribute(CUSTOM_CALL_RESULT_TILINGS_ATTRIBUTE)?
+            .elements()
+            .map(|tiling| {
+                tiling?
+                    .cast::<ArrayAttributeRef<'c, 't>>()
+                    .ok_or_else(|| {
+                        Error::invalid_argument("invalid `result_tilings` attribute in `stablehlo.custom_call`")
+                    })?
+                    .elements()
+                    .map(|tile| {
+                        let tile = tile?.cast::<DenseIntegerElementsAttributeRef<'c, 't>>().ok_or_else(|| {
+                            Error::invalid_argument("invalid `result_tilings` attribute in `stablehlo.custom_call`")
+                        })?;
+                        let r#type = tile.r#type()?.cast::<ShapedTypeRef>().ok_or_else(|| {
+                            Error::invalid_argument("invalid `result_tilings` attribute in `stablehlo.custom_call`")
+                        })?;
+                        if !r#type.element_type()?.is::<IndexTypeRef>() {
+                            return Err(Error::invalid_argument(
+                                "invalid `result_tilings` attribute in `stablehlo.custom_call`",
+                            ));
+                        }
+                        unsafe { tile.usize_elements().collect() }
+                    })
+                    .collect::<Result<Vec<_>, Error>>()
+            })
+            .collect::<Result<Vec<_>, Error>>()
+            .map(Some)
+    }
 }
 
 mlir_op!(CustomCall);
@@ -966,8 +1007,9 @@ mlir_op_trait!(CustomCall, ZeroSuccessors);
 /// of [`CustomCallOperation`], [`CustomCallOperation::custom_call_target_name`],
 /// [`CustomCallOperation::custom_call_has_side_effect`], [`CustomCallOperation::custom_call_backend_config`],
 /// [`CustomCallOperation::custom_call_api_version`], [`CustomCallOperation::custom_call_called_computations`],
-/// [`CustomCallOperation::custom_call_memory_layouts`], and [`CustomCallOperation::custom_call_output_operand_aliases`]
-/// for more information on the operation semantics and the arguments of this function.
+/// [`CustomCallOperation::custom_call_memory_layouts`], [`CustomCallOperation::custom_call_output_operand_aliases`],
+/// and [`CustomCallOperation::custom_call_result_tilings`] for more information on the operation semantics and the
+/// arguments of this function.
 ///
 /// Note that if any of the inputs to this function are invalid, the function may panic!
 #[allow(clippy::too_many_arguments)]
@@ -988,6 +1030,7 @@ pub fn custom_call<
     called_computations: &[FlatSymbolRefAttributeRef<'c, 't>],
     memory_layouts: Option<CustomCallMemoryLayouts>,
     output_operand_aliases: &[OutputOperandAliasAttributeRef<'c, 't>],
+    result_tilings: Option<Vec<Vec<Vec<usize>>>>,
     output_types: &[T],
     location: L,
 ) -> Result<DetachedCustomCallOperation<'c, 't>, Error> {
@@ -1030,6 +1073,27 @@ pub fn custom_call<
             );
     }
 
+    if let Some(result_tilings) = result_tilings {
+        builder = builder.add_attribute(
+            CUSTOM_CALL_RESULT_TILINGS_ATTRIBUTE,
+            context.array_attribute(
+                &result_tilings
+                    .iter()
+                    .map(|tiling| {
+                        Ok(context.array_attribute(
+                            &tiling
+                                .iter()
+                                .map(|tile| {
+                                    DenseIntegerElementsAttributeRef::try_from_with_context(tile.as_slice(), context)
+                                })
+                                .collect::<Result<Vec<_>, _>>()?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?,
+            ),
+        );
+    }
+
     builder
         .add_attribute(
             CUSTOM_CALL_API_VERSION_ATTRIBUTE,
@@ -1065,6 +1129,7 @@ pub fn gpu_create_buffer_custom_call<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c
         &[],
         None,
         &[],
+        None,
         &[output_type],
         location,
     )
@@ -1090,6 +1155,7 @@ pub fn gpu_pin_custom_call<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c,
         &[],
         None,
         &[],
+        None,
         &[output_type],
         location,
     )
@@ -1115,6 +1181,7 @@ pub fn gpu_unpin_custom_call<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'
         &[],
         None,
         &[],
+        None,
         &[output_type],
         location,
     )
@@ -1715,6 +1782,7 @@ mod tests {
                         context.stable_hlo_output_operand_alias(&[], 1, &[]).unwrap(),
                         context.stable_hlo_output_operand_alias(&[], 0, &[]).unwrap(),
                     ],
+                    Some(vec![vec![vec![2, 4], vec![1, 2]]]),
                     &[tensor_type],
                     location,
                 )
@@ -1736,6 +1804,7 @@ mod tests {
                     Some(CustomCallMemoryLayouts { operands: vec![vec![0, 1], vec![1, 0]], results: vec![vec![1, 0]] })
                 );
                 assert_eq!(op.custom_call_output_operand_aliases().unwrap().len(), 2);
+                assert_eq!(op.custom_call_result_tilings().unwrap(), Some(vec![vec![vec![2, 4], vec![1, 2]]]));
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 2);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
                 assert_eq!(op.regions().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
@@ -1748,6 +1817,7 @@ mod tests {
                     XLA_GPU_CREATE_BUFFER_CUSTOM_CALL_TARGET_NAME,
                 );
                 assert_eq!(create_buffer_op.custom_call_api_version().unwrap(), CustomCallApiVersion::TypedFfi);
+                assert_eq!(create_buffer_op.custom_call_result_tilings().unwrap(), None);
                 block.append_operation(create_buffer_op).unwrap();
 
                 let pin_op = gpu_pin_custom_call(op.result(0).unwrap(), memref_type, location).unwrap();
@@ -1804,7 +1874,8 @@ mod tests {
                           operand_tuple_indices = []\
                         >\
                       ], \
-                      result_layouts = [dense<[1, 0]> : vector<2xindex>]\
+                      result_layouts = [dense<[1, 0]> : vector<2xindex>], \
+                      result_tilings = [[dense<[2, 4]> : vector<2xindex>, dense<[1, 2]> : vector<2xindex>]]\
                     } : (tensor<4x2xf32>, tensor<4x2xf32>) -> tensor<4x2xf32>
                     %1 = stablehlo.custom_call @CreateBuffer() {api_version = 4 : i32} : () -> memref<4x2xf32>
                     %2 = stablehlo.custom_call @Pin(%0) {api_version = 4 : i32} : (tensor<4x2xf32>) -> memref<4x2xf32>

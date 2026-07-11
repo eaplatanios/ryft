@@ -3394,6 +3394,73 @@ mod tests {
     }
 
     #[test]
+    fn test_hlo_output_callback_to_c_api() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let callback = HloOutputCallback {
+            callback_id: 42,
+            operand_count: 2,
+            function: Box::new(move |operand: HloOutputOperand<'_>| {
+                received_clone.lock().unwrap().push((
+                    operand.replica_id,
+                    operand.computation_id,
+                    operand.operand_index,
+                    operand.element_type,
+                    operand.dimensions.to_vec(),
+                    operand.data.map(|data| data.to_vec()),
+                ));
+            }),
+        };
+        let callback_info = unsafe { callback.to_c_api() };
+        assert_eq!(callback_info.callback_id, 42);
+        assert_eq!(callback_info.num_operands, 2);
+
+        // Invoke the C callback directly, simulating a runtime invocation with data for the first operand and
+        // a missing value for the second operand.
+        let data = [1i32, 2, 3, 4, 5, 6];
+        let dimensions = [2i64, 3];
+        unsafe {
+            (callback_info.callback)(
+                0,
+                1,
+                data.as_ptr() as *const _,
+                dimensions.as_ptr(),
+                dimensions.len(),
+                crate::buffers::ffi::PJRT_Buffer_Type_S32,
+                0,
+                callback_info.user_arg,
+            );
+            (callback_info.callback)(
+                0,
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                crate::buffers::ffi::PJRT_Buffer_Type_INVALID,
+                1,
+                callback_info.user_arg,
+            );
+        }
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].0, 0);
+        assert_eq!(received[0].1, 1);
+        assert_eq!(received[0].2, 0);
+        assert_eq!(received[0].3, BufferType::I32);
+        assert_eq!(received[0].4, vec![2, 3]);
+        let expected_data = data.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+        assert_eq!(received[0].5, Some(expected_data));
+        assert_eq!(received[1].2, 1);
+        assert_eq!(received[1].3, BufferType::Invalid);
+        assert!(received[1].4.is_empty());
+        assert_eq!(received[1].5, None);
+
+        // Free the callback state that `to_c_api` leaked into `user_arg`.
+        drop(unsafe { Box::from_raw(callback_info.user_arg as *mut HloOutputCallback) });
+    }
+
+    #[test]
     fn test_loaded_executable_execute_validation_errors() {
         let plugin = test_cpu_plugin();
         let client = plugin.api().client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();

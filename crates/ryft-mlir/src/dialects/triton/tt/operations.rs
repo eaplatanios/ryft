@@ -618,14 +618,96 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     })
 }
 
-/// Name of the [`Attribute`] that stores a Triton `tt` atomic read-modify-write operation.
-pub const ATOMIC_RMW_OP_ATTRIBUTE: &str = "atomic_rmw_op";
-
 /// Name of the [`Attribute`] that stores a Triton `tt` memory semantic.
 pub const SEM_ATTRIBUTE: &str = "sem";
 
 /// Name of the [`Attribute`] that stores a Triton `tt` memory synchronization scope.
 pub const SCOPE_ATTRIBUTE: &str = "scope";
+
+/// Triton `tt` [`Operation`] that repeatedly loads from a pointer until the loaded value equals an expected value.
+///
+/// The load is performed with relaxed semantics on a single thread. For acquire semantics, an acquire fence is
+/// issued only after a successful poll. Other threads wait for the polling thread to finish.
+///
+/// Refer to the [official Triton operation documentation](https://triton-lang.org/main/dialects/TritonOps.html)
+/// for more information.
+pub trait AtomicPollOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
+    /// Returns the pointer operand.
+    fn ptr(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(0)
+    }
+
+    /// Returns the expected value.
+    fn expected(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+        self.operand_value(1)
+    }
+
+    /// Returns the optional timeout operand.
+    fn timeout(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.operand_count() <= 2 { Ok(None) } else { self.operand_value(2).map(Some) }
+    }
+
+    /// Returns the memory semantic.
+    fn sem(&self) -> Result<MemSemanticAttributeRef<'c, 't>, Error> {
+        self.attribute(SEM_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SEM_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns the memory synchronization scope.
+    fn scope(&self) -> Result<MemSyncScopeAttributeRef<'c, 't>, Error> {
+        self.attribute(SCOPE_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "missing or invalid `{}` attribute in `{}`",
+                SCOPE_ATTRIBUTE,
+                self.name().as_str().unwrap_or("<unknown>"),
+            ))
+        })
+    }
+
+    /// Returns whether the poll succeeded.
+    fn result(&self) -> Result<OperationResultRef<'o, 'c, 't>, Error> {
+        self.as_ref().result(0)
+    }
+}
+
+mlir_op!(AtomicPoll);
+mlir_op_trait!(AtomicPoll, OneResult);
+mlir_op_trait!(AtomicPoll, ZeroRegions);
+mlir_op_trait!(AtomicPoll, ZeroSuccessors);
+
+/// Constructs a new detached/owned [`AtomicPollOperation`] at the specified [`Location`].
+pub fn atomic_poll<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
+    ptr: ValueRef<'v, 'c, 't>,
+    expected: ValueRef<'v, 'c, 't>,
+    timeout: Option<ValueRef<'v, 'c, 't>>,
+    sem: MemSemantic,
+    scope: MemSyncScope,
+    result_type: TypeRef<'c, 't>,
+    location: L,
+) -> Result<DetachedAtomicPollOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::triton_tt()?)?;
+    let mut builder = OperationBuilder::new("tt.atomic_poll", location).add_operand(ptr).add_operand(expected);
+    if let Some(timeout) = timeout {
+        builder = builder.add_operand(timeout);
+    }
+    builder
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)
+        .add_result(result_type)
+        .build()
+        .and_then(|operation| unsafe {
+            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_poll`"))
+        })
+}
+
+/// Name of the [`Attribute`] that stores a Triton `tt` atomic read-modify-write operation.
+pub const ATOMIC_RMW_OP_ATTRIBUTE: &str = "atomic_rmw_op";
 
 /// Triton `tt` [`Operation`] that performs an atomic read-modify-write operation.
 ///
@@ -2967,6 +3049,28 @@ mod tests {
         assert_eq!(operation.cache().unwrap().value().unwrap(), CacheModifier::WriteBack);
         assert_eq!(operation.evict().unwrap().value().unwrap(), EvictionPolicy::EvictLast);
         assert!(operation.ignore_cta());
+    });
+
+    tt_operation_test!(test_atomic_poll_operation, |_context, location, values, types| {
+        let operation = atomic_poll(
+            values[1],
+            values[15],
+            Some(values[0]),
+            MemSemantic::Relaxed,
+            MemSyncScope::Gpu,
+            types.i1,
+            location,
+        )
+        .unwrap();
+
+        assert_eq!(operation.name().as_str(), Ok("tt.atomic_poll"));
+        assert_eq!(operation.ptr().unwrap(), values[1]);
+        assert_eq!(operation.expected().unwrap(), values[15]);
+        assert_eq!(operation.timeout().unwrap(), Some(values[0]));
+        assert_eq!(operation.sem().unwrap().value().unwrap(), MemSemantic::Relaxed);
+        assert_eq!(operation.scope().unwrap().value().unwrap(), MemSyncScope::Gpu);
+        assert_eq!(operation.as_ref().result(0).unwrap().r#type().unwrap(), types.i1);
+        assert_eq!(operation.ptr().unwrap(), values[1]);
     });
 
     tt_operation_test!(test_atomic_rmw_operation, |_context, location, values, types| {

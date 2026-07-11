@@ -13,14 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added native bindings for converting XProf `XSpace` traces into XLA feedback-directed optimization profiles and
   aggregating multiple instruction profiles at a configurable percentile.
 - Added support for Linux AArch64.
-- Added C++ bindings for the `affine`, `arith`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
+- Added C++ bindings for the `affine`, `arith`, `builtin`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
   `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
 - Added the `mps` feature for loading the `jax-mps` PJRT plugin on macOS AArch64.
 
 ### Changed
 
-- Upgraded the OpenXLA dependency pin to commit `1c884c1b85f81728c6391ccb961a1c25d12cbe71`.
-- Updated CUDA 12 and ROCm 7 Bazel build configuration for the new OpenXLA toolchain dependencies.
+- Upgraded the OpenXLA dependency pin to commit `f16a4aeb435b2896ab96b605f004f982f6c97eb8`, which also upgraded the
+  LLVM, StableHLO (v1.18.0), Shardy, and Triton pins.
+- Replaced the LLVM dialect token type C++ bindings (`mlirTypeIsALlvmTokenType` and `mlirLlvmTokenTypeGet`) with
+  builtin dialect token type bindings (`mlirTypeIsAToken` and `mlirTokenTypeGet`) following the upstream MLIR
+  replacement of `!llvm.token` with the builtin `token` type.
+- Updated the `sdyTensorShardingAttrGet` binding for the new trailing reduction operation argument and added the
+  `sdyTensorShardingAttrGetReductionOp` binding.
+- Synchronized mirrored XLA protobuf definitions with the new OpenXLA pin: added the `F6E3M2FN` and `F6E2M3FN` buffer
+  types, the mesh iota transform, the named sharding reduction operation, new GPU topology and GPU device information
+  fields, new `DebugOptions` fields and support types, and the `OpMetadata` payload message, and removed fields whose
+  tags are now reserved upstream.
+- Updated CUDA 12 and ROCm 7 Bazel build configuration for the new OpenXLA toolchain dependencies, including bumping
+  `rules_ml_toolchain` and the hermetic ROCm distribution to `rocm_7.13.0_gfx908`.
 - Updated the PJRT TPU plugin to `libtpu` version `0.0.41`.
 - Updated the PJRT Neuron plugin to `libneuronxla` version `3.0.2891.0+e2a4b1f5`.
 - Synchronized mirrored XLA protobuf definitions for command buffer command types, autotune backends, debug options,
