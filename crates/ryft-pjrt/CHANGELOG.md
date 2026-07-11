@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Updated our PJRT C API bindings for version `0.113`.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
   handle wrappers that reflect PJRT's thread-safety contracts. Event callbacks now require `Send + 'static`, the
   unsafe `EventHandle` was replaced by the safe shared-ownership `EventPromise`, and asynchronous host-buffer
@@ -57,7 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Required `KeyValueStore` implementations to be `Send + Sync` because PJRT may invoke their callbacks concurrently.
   `Client` now obtains its thread-safety structurally through a narrow native-handle wrapper instead of whole-type
   unsafe `Send` and `Sync` implementations.
-- Updated our PJRT C API bindings for version `0.113`.
 - Changed `Buffer::copy_to_host` to fall back to the buffer's reported on-device byte size when a PJRT plugin
   returns a successful host-copy size query without populating `dst_size`.
 - Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and
