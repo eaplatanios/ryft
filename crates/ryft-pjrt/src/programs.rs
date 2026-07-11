@@ -1026,6 +1026,11 @@ impl<'c> LoadedExecutable<'c> {
     }
 
     /// Returns `true` if and only if this [`LoadedExecutable`] has been deleted using [`LoadedExecutable::delete`].
+    ///
+    /// Note that the reference PJRT plugin implementations of this query are currently unreliable. The `StreamExecutor`
+    /// GPU implementation reports inverted results (i.e., fresh executables report `true` and deleted executables
+    /// report `false` because their `IsDeleted` returns `executable_ != nullptr`), and the CPU implementation always
+    /// reports `false` because its `Delete` is a no-op and its `IsDeleted` is hardcoded to `false`.
     pub fn is_deleted(&self) -> Result<bool, Error> {
         use ffi::PJRT_LoadedExecutable_IsDeleted_Args;
         invoke_pjrt_api_error_fn!(self.api(), PJRT_LoadedExecutable_IsDeleted, { executable = self.to_c_api() }, {
@@ -3132,9 +3137,13 @@ mod tests {
             let options = test_compilation_options();
             let loaded_executable = client.compile(&program, &options).unwrap();
 
-            // TODO(eaplatanios): Is this just broken or are we doing something wrong here?
-
-            // [`LoadedExecutable::is_deleted`] does not appear to work correctly for the GPU plugins.
+            // The assertions below encode known upstream bugs in the reference PJRT plugin implementations
+            // of `PJRT_LoadedExecutable_IsDeleted`, rather than the intended semantics:
+            //   - The StreamExecutor GPU implementation has inverted polarity (i.e., `return executable_ != nullptr;`
+            //     in `PjRtStreamExecutorLoadedExecutable::IsDeleted`), and so fresh executables report `true` and
+            //     deleted executables report `false`.
+            //   - The CPU implementation is a stub: `PjRtCpuLoadedExecutable::Delete` is a no-op and its `IsDeleted`
+            //     always returns `false`.
             match platform {
                 TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
                     assert_eq!(loaded_executable.is_deleted(), Ok(true));
@@ -3143,8 +3152,6 @@ mod tests {
             };
 
             assert!(unsafe { loaded_executable.delete() }.is_ok());
-
-            // [`LoadedExecutable::is_deleted`] does not appear to work correctly for any plugin.
             assert_eq!(loaded_executable.is_deleted(), Ok(false));
         });
     }
