@@ -1,3 +1,109 @@
+//! Contains types for representing _domains_ and operation-binding _contexts_.
+//!
+//! A [`Domain`] names a type/value universe. A [`Context`] gives operations meaning within that universe. Keeping these
+//! roles separate lets the same domain participate in eager execution, ordinary tracing, batching, differentiation,
+//! partial evaluation, and nested transforms without changing its type, value, constant, or operation families.
+//!
+//! ```text
+//! ┌─────────┐
+//! │ Domain  │
+//! └────┬────┘
+//!      ├── Type ──────── abstract type metadata
+//!      ├── Value ─────── values flowing through the domain
+//!      ├── Constant ──── payloads stored in staged programs
+//!      └── Operation ─── the closed operation family
+//!           │
+//!           │ adds binding semantics
+//!           ▼
+//!      ┌─────────┐
+//!      │ Context │
+//!      └────┬────┘
+//!           ├── Eager Context ────── interpret each operation now
+//!           ├── Staging Context ──── append each operation as an instruction
+//!           └── Transform Context ── apply an operation rule, then delegate to the parent
+//! ```
+//!
+//! # Entry Points
+//!
+//! Use [`Domain::trace`] for ordinary symbolic tracing in a named domain and [`Domain::infer_output_type`] when only
+//! abstract outputs are needed. Use [`Program::interpret`] for eager replay or [`Program::interpret_in_context`] to
+//! replay through a chosen context. Most transform modules also expose a free value-level entry point and a context
+//! capability built on this same bind protocol.
+//!
+//! # Domains versus Contexts
+//!
+//! [`Domain`] is _descriptive_. It associates one [`Type`], runtime [`Value`], staged constant type, and [`Operation`]
+//! family and provides ordinary tracing conveniences. It does not represent an active trace and does not decide how an
+//! operation is evaluated.
+//!
+//! [`Context`] is _behavioral_. Its [`Context::bind`] method accepts an operation and flowing values and returns
+//! result values. [`Context::lift`] materializes a staged constant into the flowing value semantics, while
+//! [`Context::resolve`] reports whether a flowing value is concrete, staged, or opaque. Contexts are cloneable
+//! handles. Mutable tracing state is shared behind their internal handles rather than passed as `&mut self`.
+//!
+//! # Eager, Staging, and Transform Contexts
+//!
+//! [`EagerContext`] is the no-state eager implementation. Binding immediately calls the operation's
+//! [`InterpretableOperation`] implementation, and lifting is the identity when constants and values coincide.
+//! It is the context used by [`Program::interpret`] and by transforms over concrete values.
+//!
+//! [`StagingContext`] refines [`Context`] for contexts whose flowing value is [`Tracer`]. It exposes a
+//! [`ProgramBuilder`], records operations as instructions, and can stage or splice complete programs.
+//! Ordinary [`TracingContext`] and nested tracing contexts implement this trait.
+//!
+//! Transform contexts wrap another context and change bind semantics locally. Batching maps an operation over logical
+//! batch axes, differentiation propagates primal/tangent duals, and partial evaluation folds known work or emits
+//! residual work. Each delegates primitive work to its parent, so contexts compose into a stack. For example, this is
+//! what a staged forward-mode differentiation context stack might look like:
+//!
+//! ```text
+//!       ┌─────────────────┐
+//!       │ User Operation  │
+//!       └────────┬────────┘
+//!                │ bind
+//!                ▼
+//!   ┌─────────────────────────┐
+//!   │ Differentiation Context │
+//!   └────────────┬────────────┘
+//!                │ delegate primitive work
+//!                ▼
+//! ┌─────────────────────────────┐
+//! │ Partial Evaluation Context  │
+//! └──────────────┬──────────────┘
+//!                │ delegate primitive work
+//!                ▼
+//!       ┌─────────────────┐
+//!       │ Tracing Context │
+//!       └────────┬────────┘
+//!                │ record instructions
+//!                ▼
+//!     ┌─────────────────────┐
+//!     │ Transformed Program │
+//!     └─────────────────────┘
+//! ```
+//!
+//! # Value Resolution
+//!
+//! [`ValueResolution`] is the single conservative query used when a rule needs to inspect a flowing value:
+//!
+//! - [`ValueResolution::Concrete`] carries a materialized constant and permits host-side decisions.
+//! - [`ValueResolution::Staged`] carries the corresponding [`AtomId`] in the active builder.
+//! - [`ValueResolution::Opaque`] means the context cannot safely prove either fact.
+//!
+//! Rules must treat `Opaque` conservatively. In particular, they must not assume that an arbitrary tracer
+//! is concrete or belongs to the current builder.
+//!
+//! # Extending Contexts
+//!
+//! To define a new backend or value universe, implement [`Domain`] first. Define one closed operation family rather
+//! than coupling operation payload modules to a concrete wrapper enum, and implement [`Context`] only when that
+//! universe has a specific binding semantics.
+//!
+//! To add a staging context, implement [`Context`] with `Value = Tracer<Self>` and then [`StagingContext`], keeping the
+//! builder and error state in shared handles. To add a transform, wrap the narrowest parent context needed, define the
+//! transform's flowing value or tracer, apply operation-owned rules in `bind`, and delegate capture registration and
+//! context capabilities to the parent where appropriate.
+
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::marker::PhantomData;

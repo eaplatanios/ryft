@@ -1,3 +1,73 @@
+//! Contains machinery for _batching_ (i.e., _vectorizing_) computations.
+//!
+//! Batching turns a function written for individual array values into one that processes a logical batch. It does not
+//! mechanically add an outer dimension to every intermediate value. Instead, each flowing value carries the physical
+//! position of its logical batch axis, and each operation decides how to propagate, align, introduce, or remove that
+//! axis. Replicated values carry no batch axis and are broadcast only when an operation needs alignment.
+//!
+//! ```text
+//!  ┌───────────────────────────────────┐
+//!  │ Values + Input Axis Specification │
+//!  └─────────────────┬─────────────────┘
+//!                    │ wrap each leaf as an array batch
+//!                    ▼
+//!          ┌───────────────────┐
+//!          │ Batching Tracers  │
+//!          └─────────┬─────────┘
+//!                    │ bind each operation through its batching rule
+//!                    ▼
+//! ┌─────────────────────────────────────┐
+//! │ Values + Output Axis Specification  │
+//! └─────────────────────────────────────┘
+//! ```
+//!
+//! # Entry Points
+//!
+//! Use the free [`batch`] function for ordinary value-level vectorization. It recovers the input values' execution
+//! context, wraps leaves according to the requested input axes, runs the closure through a [`BatchingContext`], and
+//! returns values aligned to the requested output axes. The [`Batch`] context capability exposes the same transform
+//! when generic code already owns a context. For an already traced program, use [`Program::batched`]. Program-level
+//! batching rewrites the program while retaining explicit input and output axis metadata, which is useful for
+//! compilation and higher-order operation rules.
+//!
+//! [`BatchAxis`] describes a leaf as either batched at a signed physical axis or replicated, and a
+//! [`BatchAxisSpecification`] supplies the logical axis size and optional name. Negative axes are normalized against
+//! each array's rank, and every batched input must agree on the logical size.
+//!
+//! # Core Abstractions
+//!
+//! [`ArrayBatch`] pairs an underlying array value with its logical batch-axis position. Its alignment helpers can
+//! broadcast a replicated value, move an existing axis, or align several operands to a common position. The wrapper's
+//! type is the logical unbatched type (the underlying value retains the physical batch dimension).
+//!
+//! [`BatchingContext`] wraps a parent [`Context`] and records the active axis size and optional axis name.
+//! [`BatchingTracer`] is the value flowing through a batched closure. It carries an [`ArrayBatch`] and delegates each
+//! bind to the bound operation's [`BatchableOperation`] rule. Because the parent may be eager or staging, the same rule
+//! can execute concrete arrays or build a transformed program.
+//!
+//! [`ElementwiseOperation`]s infer a common batch size, align operands to a common physical axis, bind the underlying
+//! operation once, and propagate that axis to every result. Shape-changing, reducing, control-flow, and higher-order
+//! operations provide explicit rules because their output axes cannot be inferred from elementwise semantics.
+//!
+//! # Nested Programs
+//!
+//! [`BatchableProgramOperation`] is the operation-family fixed point for recursively batching flat nested programs.
+//! [`ProgramBatchingOutputAxesPolicy`] controls whether nested results keep their inferred axes or are forced to
+//! explicit positions, and [`InterpretableBatchableOperation`] connects batching rules to eager interpretation when
+//! an operation needs both capabilities.
+//!
+//! # Extending Batching
+//!
+//! Implement [`BatchableOperation`] for each primitive operation payload that can appear under batching. A rule
+//! receives batched inputs and the active batching context and returns batched outputs. Prefer the shared elementwise
+//! implementation for genuinely elementwise operations, and write a dedicated rule when dimensions are reordered,
+//! reduced, created, indexed, or controlled by nested programs.
+//!
+//! For an operation that owns a nested program, keep the recursive batching logic with that operation and implement
+//! [`BatchableProgramOperation`] for the enclosing operation family. Preserve named-axis and sharding semantics when
+//! moving or introducing the logical axis, and return [`BatchingError`] for invalid axis contracts rather than
+//! panicking.
+
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
