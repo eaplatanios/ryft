@@ -2,9 +2,10 @@
 //!
 //! This module supplies the common JIT lifecycle shared by compiler backends. Core traces typed Ryft programs, manages
 //! runtime captures and structured signatures, coordinates specialization and executable caches, and validates calls.
-//! A backend supplies lowering, executable compilation, target-specific options, exact cache identity, serialization,
-//! and execution through [`CompilationDomain`]. Backend representations therefore remain outside `ryft-core` while
-//! every backend follows the same lifecycle. The following diagram illustrates that lifecycle:
+//! A backend supplies target-specific options, lowering, executable compilation, and execution through
+//! [`CompilationDomain`]. Backends opt into exact cache identity and serialization through
+//! [`CompilationCacheDomain`]. Backend representations therefore remain outside `ryft-core` while every backend
+//! follows the same lifecycle. The following diagram illustrates that lifecycle:
 //!
 //! ```text
 //!                                                  Per-Jitted-Function Caches
@@ -144,11 +145,18 @@
 //! memory analysis without recompilation, and implement [`CompiledProgramOperation`] on the operation family when
 //! staged functions must compose inside other traces.
 //!
+//! The generic [`CompilationDomain`] methods use [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and
+//! [`CallRequest`] as typed backend-extension witnesses. These traits keep the structured input/output bounds in one
+//! place and expose only the transition-specific artifact operations a backend needs. Ordinary callers construct a
+//! [`CompilationStagingRequest`] or use [`stage_function`]; backend implementations name the witness traits in their
+//! method bounds and complete each transition through their `trace`, `into_lowered`, `into_compiled`, or `reconstruct`
+//! methods.
+//!
 //! # Reading order
 //!
 //! 1. Start with [`CompilationDomain`] for the core/backend ownership boundary.
-//! 2. Read [`JittedFunction`], [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and
-//!    [`ExecutableProgram`] for the public lifecycle.
+//! 2. Read [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and [`CallRequest`] alongside
+//!    [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableProgram`] for the typed lifecycle.
 //! 3. Read [`ClosedProgram`] and [`CaptureReference`] for capture handling.
 //! 4. Read [`CompilationContext`] for single-flight compilation and cache tiers.
 //! 5. Read [`DiskCache`] and [`CompilationArtifactExchange`] only when adding persistence or distributed sharing.
@@ -168,8 +176,9 @@ pub use contexts::{
 pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
-    CompilationCall, CompilationStagingRequest, CompilationTracer, CompiledFunction, CompiledProgramOperation,
-    ExecutableProgram, FlatCompilationProgram, JitCacheCapacities, JitCacheStatistics, JittedFunction, LoweredFunction,
-    Specialization, StagedFunction, call_function, jit, jit_with_options, stage_function, try_jit,
-    try_jit_with_options, try_jit_with_options_and_capacities, try_jit_with_options_and_capacity,
+    CallRequest, CompilationCall, CompilationStagingRequest, CompilationTracer, CompileRequest, CompiledFunction,
+    CompiledProgramOperation, ExecutableProgram, FlatCompilationProgram, JitCacheCapacities, JitCacheStatistics,
+    JittedFunction, LoweredFunction, LoweringRequest, Specialization, StageRequest, StagedFunction, call_function, jit,
+    jit_with_options, stage_function, try_jit, try_jit_with_options, try_jit_with_options_and_capacities,
+    try_jit_with_options_and_capacity,
 };

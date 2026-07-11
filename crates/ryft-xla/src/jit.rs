@@ -1,13 +1,13 @@
 //! User-facing XLA compile-and-execute API.
 //!
-//! This module wraps the backend-neutral lifecycle from [`ryft_core::compilation`] with XLA-flavored handles and
-//! entry points. [`compile`] is the `ryft` analogue of `jax.jit`: it traces a closure over staged tracers into an
-//! XLA program, compiles it via PJRT, and returns a runtime handle that executes the compiled program against
-//! [`Array`] inputs. [`stage`] is the trace-only counterpart: it returns a [`StagedXlaFunction`] that can be
-//! embedded into outer traces via [`StagedXlaFunction::call`] and compiled later, so functions that are only ever
-//! composed into larger programs never pay for their own executable. Staged functions register runtime captures in
-//! their retained capture table instead of embedding runtime arrays in the IR, and every compilation shares the
-//! domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
+//! This module wraps the backend-neutral lifecycle from [`ryft_core::compilation`] with XLA-flavored handles and entry
+//! points. [`jitted`] is the retained `jax.jit` analogue: it specializes on runtime-derived abstract signatures and
+//! dispatches warm calls through cached compiled functions. [`compile`] instead traces and compiles exactly one explicit
+//! abstract signature into a [`CompiledXlaFunction`]. [`stage`] is the trace-only counterpart: it returns a
+//! [`StagedXlaFunction`] that can be embedded into outer traces via [`StagedXlaFunction::call`] and compiled later, so
+//! functions that are only ever composed into larger programs never pay for their own executable. Staged functions
+//! register runtime captures in their retained capture table instead of embedding runtime arrays in the IR, and every
+//! compilation shares the domain's [`CompilationContext`](ryft_core::compilation::CompilationContext) cache.
 
 use ryft_core::Batch;
 use ryft_core::LinearizationTracer;
@@ -670,15 +670,16 @@ fn add_leading_batch_dim(array_type: ArrayType, size: usize) -> Result<ArrayType
         .map_err(|error| XlaDomainError::Array(error.into()))
 }
 
-/// Compiles `function` once and returns a [`CompiledXlaFunction`] that executes it on subsequent
-/// calls. Mirrors `jax.jit`.
+/// Compiles one explicit abstract signature of `function` and returns a [`CompiledXlaFunction`] that executes that
+/// specialization on subsequent calls. Use [`jitted`] when runtime calls should select and retain specializations in
+/// the style of `jax.jit`.
 ///
 /// Equivalent to [`compile_with_options`] called with [`XlaOptions::new(mesh)`](XlaOptions::new).
 ///
 /// The function is traced against the supplied `domain`, which lets nested compiled functions register runtime
-/// captures in the same active trace. The resulting program is then compiled and executed against `domain`, sharing its
-/// [`CompilationContext`](ryft_core::compilation::CompilationContext) cache across repeat
-/// invocations at the same source line.
+/// captures in the same active trace. The resulting program is then compiled and executed against `domain`. Its
+/// [`CompilationContext`](ryft_core::compilation::CompilationContext) structurally shares equivalent lowerings even
+/// when they originate at different Rust call sites.
 #[track_caller]
 pub fn compile<
     'domain,
@@ -1089,6 +1090,56 @@ mod tests {
 
         assert_eq!(executable.output_types(), &[input_type]);
         assert!((read_f32_array(&client, &output)[0] - 0.5_f32.sin()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_executable_xla_program_rejects_foreign_client_before_enqueue() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let other_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let other_mesh = single_device_mesh(&other_client);
+        let domain = XlaDomain::new(&client);
+        let other_domain = XlaDomain::new(&other_client);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let executable: ExecutableXlaProgram<'_, ArrayType, ArrayType> =
+            compile(|input| input.sin().unwrap(), input_type.clone(), &domain, mesh.clone())
+                .unwrap()
+                .into_executable_program();
+        let other_input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(1)]))
+            .with_sharding(Sharding::replicated(other_mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let other_executable: ExecutableXlaProgram<'_, ArrayType, ArrayType> =
+            compile(|input| input.sin().unwrap(), other_input_type, &other_domain, other_mesh)
+                .unwrap()
+                .into_executable_program();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[0.5]).as_slice()).unwrap();
+
+        assert!(matches!(
+            other_domain.interpret(&executable, input.clone()),
+            Err(XlaDomainError::ExecutableClientMismatch),
+        ));
+        assert!(matches!(
+            other_domain.interpret_async(&executable, input),
+            Err(XlaDomainError::ExecutableClientMismatch),
+        ));
+        assert!(matches!(
+            domain.validate_xla_replacement(
+                executable.function.compiled_program(),
+                other_executable.function.compiled_program(),
+            ),
+            Err(XlaDomainError::ExecutableClientMismatch),
+        ));
+        assert!(matches!(
+            other_domain.validate_xla_replacement(
+                executable.function.compiled_program(),
+                other_executable.function.compiled_program(),
+            ),
+            Err(XlaDomainError::ExecutableClientMismatch),
+        ));
     }
 
     #[test]
@@ -2329,7 +2380,7 @@ mod tests {
             let _: CompiledXlaFunction<'_, ArrayType, ArrayType> =
                 compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
         }
-        assert_eq!(engine.cache_size(), 1, "repeat compile at the same call site should hit the cache");
+        assert_eq!(engine.cache_size(), 1, "an equivalent repeated lowering should hit the cache");
     }
 
     #[test]

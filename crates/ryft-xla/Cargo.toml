@@ -32,6 +32,7 @@ ryft-core.workspace = true
 ryft-macros.workspace = true
 ryft-mlir.workspace = true
 ryft-pjrt.workspace = true
+ryft-xla-sys.workspace = true
 half.workspace = true
 ndarray = { workspace = true, optional = true }
 prost.workspace = true

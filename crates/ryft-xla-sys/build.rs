@@ -946,6 +946,9 @@ impl Display for BuildConfiguration {
 }
 
 fn main() {
+    println!("cargo::rustc-env=RYFT_XLA_COMMIT={}", *XLA_COMMIT);
+    println!("cargo::rustc-env=RYFT_JAX_COMMIT={}", *JAX_COMMIT);
+
     // Skip linking to our XLA dependencies if this is executed from within a `docs.rs` pipeline.
     if env::var("DOCS_RS").is_ok() {
         return;

@@ -14,10 +14,9 @@ use sha2::{Digest, Sha256};
 
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::batching::BatchingError;
-use ryft_core::compilation::function::{CallRequest, CompileRequest, LoweringRequest, StageRequest};
 use ryft_core::compilation::{
-    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationContext, CompilationDomain, DiskCache,
-    StagedFunction,
+    AnalyzableCompilationDomain, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain,
+    CompileRequest, DiskCache, LoweringRequest, StageRequest, StagedFunction,
 };
 use ryft_core::contexts::{Context, Domain};
 use ryft_core::differentiation::DifferentiationError;
@@ -86,6 +85,10 @@ pub enum XlaDomainError {
     /// doesn't match the number of flat inputs.
     #[error("invalid compilation options: {reason}")]
     InvalidCompilationOptions { reason: String },
+
+    /// The runtime domain does not own the PJRT executable it was asked to invoke or install.
+    #[error("xla executable belongs to a different PJRT client")]
+    ExecutableClientMismatch,
 
     /// Error surfaced while encoding or decoding persistent compilation metadata.
     #[error("invalid persistent XLA executable: {reason}")]
@@ -1015,13 +1018,7 @@ impl XlaOptions {
     /// Constructs default options for `mesh` with no shardings overrides and no donation.
     #[inline]
     pub fn new(mesh: DeviceMesh) -> Self {
-        Self {
-            mesh,
-            in_shardings: None,
-            out_shardings: None,
-            donation_flags: None,
-            feedback_directed_profile: None,
-        }
+        Self { mesh, in_shardings: None, out_shardings: None, donation_flags: None, feedback_directed_profile: None }
     }
 
     /// Sets the per-input sharding overrides that the SPMD partitioner reads at lowering time.
@@ -1105,6 +1102,21 @@ pub struct XlaLoweredProgram {
 
     /// Concrete mesh against which the module was lowered.
     mesh: DeviceMesh,
+
+    /// PJRT platform name of the client against which this program was lowered.
+    platform_name: Arc<str>,
+
+    /// PJRT platform version of the client against which this program was lowered.
+    platform_version: Arc<str>,
+
+    /// Device kinds in the exact mesh order used by this lowering.
+    device_kinds: Arc<[String]>,
+
+    /// Exact Ryft, OpenXLA, and JAX build identity used by this lowering.
+    compiler_identity: Arc<str>,
+
+    /// Process-level XLA flags in effect when this program was lowered.
+    xla_flags: Arc<str>,
 }
 
 impl XlaLoweredProgram {
@@ -1148,7 +1160,14 @@ const XLA_PERSISTENT_EXECUTABLE_MAGIC: &[u8; 8] = b"RYFTXLA1";
 const XLA_PERSISTENT_EXECUTABLE_SCHEMA_VERSION: u32 = 1;
 const XLA_PERSISTENT_EXECUTABLE_FEATURE_FLAGS: u64 = 0;
 const XLA_PERSISTENT_KEY_SCHEMA_VERSION: u32 = 1;
-const XLA_COMPILER_IDENTITY: &str = concat!("ryft-xla/", env!("CARGO_PKG_VERSION"));
+static XLA_COMPILER_IDENTITY: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "ryft-xla/{}/openxla/{}/jax/{}",
+        env!("CARGO_PKG_VERSION"),
+        ryft_xla_sys::XLA_COMMIT,
+        ryft_xla_sys::JAX_COMMIT,
+    )
+});
 
 /// Typed value returned for a plugin-specific PJRT cost-analysis property.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -1252,7 +1271,7 @@ struct XlaPersistentKeyV1<'a> {
     device_kinds: &'a [String],
     platform_name: &'a str,
     platform_version: &'a str,
-    compiler_identity: &'static str,
+    compiler_identity: &'a str,
     xla_flags: &'a str,
 }
 
@@ -1690,6 +1709,11 @@ pub struct XlaCompiledProgram<'c> {
     expected_argument_shardings: Arc<[Sharding]>,
     mesh: DeviceMesh,
     compilation_options: CompilationOptions,
+    platform_name: Arc<str>,
+    platform_version: Arc<str>,
+    device_kinds: Arc<[String]>,
+    compiler_identity: Arc<str>,
+    xla_flags: Arc<str>,
     compilation_duration: Option<Duration>,
     analysis: Arc<OnceLock<Result<XlaCompilationAnalysis, String>>>,
 }
@@ -1770,12 +1794,22 @@ impl<'c> XlaCompiledProgram<'c> {
 }
 
 impl<'c> XlaDomain<'c> {
+    /// Validates that this domain's PJRT client owns `program`.
+    fn validate_xla_program_owner(&self, program: &XlaCompiledProgram<'c>) -> Result<(), XlaDomainError> {
+        if program.executable.is_owned_by(self.client()?) {
+            Ok(())
+        } else {
+            Err(XlaDomainError::ExecutableClientMismatch)
+        }
+    }
+
     /// Enqueues `program` and returns its possibly still pending flat outputs together with a whole-execution fence.
     pub(crate) fn execute_compiled_async(
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Execution<Vec<Array<'c>>>, XlaDomainError> {
+        self.validate_xla_program_owner(program)?;
         if inputs.len() != program.expected_argument_shardings.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
@@ -1909,8 +1943,7 @@ impl<'c> XlaDomain<'c> {
                 ),
             });
         }
-        let donation_flags =
-            options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
+        let donation_flags = options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
 
         let effective_input_types =
             capture_types.iter().cloned().chain(public_input_types.iter().cloned()).collect::<Vec<_>>();
@@ -1940,6 +1973,7 @@ impl<'c> XlaDomain<'c> {
             result_shardings.as_deref(),
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
+        let client = self.client()?;
 
         Ok(XlaLoweredProgram {
             stable_hlo: stable_hlo.into(),
@@ -1949,20 +1983,16 @@ impl<'c> XlaDomain<'c> {
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
             mesh: options.mesh.clone(),
+            platform_name: client.platform_name()?.into_owned().into(),
+            platform_version: client.platform_version()?.into_owned().into(),
+            device_kinds: ordered_device_kinds(client, &options.mesh)?.into(),
+            compiler_identity: XLA_COMPILER_IDENTITY.as_str().into(),
+            xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default().into(),
         })
     }
 
-    fn xla_compilation_key(&self, program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
-        let (platform_name, platform_version) = match self.client {
-            Some(client) => (client.platform_name()?.into_owned(), client.platform_version()?.into_owned()),
-            None => (String::new(), String::new()),
-        };
+    fn xla_compilation_key(program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let compilation_options = canonical_compilation_options_bytes(&program.compilation_options);
-        let xla_flags = std::env::var("XLA_FLAGS").unwrap_or_default();
-        let device_kinds = match self.client {
-            Some(client) => ordered_device_kinds(client, &program.mesh)?,
-            None => Vec::new(),
-        };
         let key = XlaPersistentKeyV1 {
             schema_version: XLA_PERSISTENT_KEY_SCHEMA_VERSION,
             stable_hlo: &program.stable_hlo,
@@ -1976,18 +2006,21 @@ impl<'c> XlaDomain<'c> {
                 .map(PersistentShardingV1::from)
                 .collect(),
             mesh: PersistentDeviceMeshV1::from(&program.mesh),
-            device_kinds: device_kinds.as_slice(),
-            platform_name: platform_name.as_str(),
-            platform_version: platform_version.as_str(),
-            compiler_identity: XLA_COMPILER_IDENTITY,
-            xla_flags: xla_flags.as_str(),
+            device_kinds: &program.device_kinds,
+            platform_name: &program.platform_name,
+            platform_version: &program.platform_version,
+            compiler_identity: &program.compiler_identity,
+            xla_flags: &program.xla_flags,
         };
         let canonical_bytes = serde_json::to_vec(&key)
             .map_err(|error| persistent_error(format!("failed to encode persistent key: {error}")))?;
         Ok(XlaCompilationKey { canonical_bytes: canonical_bytes.into() })
     }
 
-    pub(crate) fn compile_xla_program(&self, program: &XlaLoweredProgram) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
+    pub(crate) fn compile_xla_program(
+        &self,
+        program: &XlaLoweredProgram,
+    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
         let executable = self.client()?.compile(&pjrt_program, &program.compilation_options)?;
@@ -2000,6 +2033,11 @@ impl<'c> XlaDomain<'c> {
             expected_argument_shardings: Arc::clone(&program.expected_argument_shardings),
             mesh: program.mesh.clone(),
             compilation_options: program.compilation_options.clone(),
+            platform_name: Arc::clone(&program.platform_name),
+            platform_version: Arc::clone(&program.platform_version),
+            device_kinds: Arc::clone(&program.device_kinds),
+            compiler_identity: Arc::clone(&program.compiler_identity),
+            xla_flags: Arc::clone(&program.xla_flags),
             compilation_duration: Some(compilation_duration),
             analysis: Arc::new(OnceLock::new()),
         })
@@ -2010,6 +2048,8 @@ impl<'c> XlaDomain<'c> {
         current: &XlaCompiledProgram<'c>,
         replacement: &XlaCompiledProgram<'c>,
     ) -> Result<(), XlaDomainError> {
+        self.validate_xla_program_owner(current)?;
+        self.validate_xla_program_owner(replacement)?;
         validate_xla_replacement_metadata(current.into(), replacement.into())
     }
 
@@ -2053,14 +2093,14 @@ impl<'c> XlaDomain<'c> {
                 .map(PersistentShardingV1::from)
                 .collect(),
             mesh: PersistentDeviceMeshV1::from(&program.mesh),
-            device_kinds: ordered_device_kinds(self.client()?, &program.mesh)?,
+            device_kinds: program.device_kinds.to_vec(),
             replica_count: device_assignment.replica_count() as u64,
             partition_count: device_assignment.computation_count() as u64,
             device_assignment: flatten_device_assignment(&device_assignment)?,
-            platform_name: self.client()?.platform_name()?.into_owned(),
-            platform_version: self.client()?.platform_version()?.into_owned(),
-            compiler_identity: XLA_COMPILER_IDENTITY.into(),
-            xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default(),
+            platform_name: program.platform_name.to_string(),
+            platform_version: program.platform_version.to_string(),
+            compiler_identity: program.compiler_identity.to_string(),
+            xla_flags: program.xla_flags.to_string(),
             compilation_duration_nanoseconds: program
                 .compilation_duration
                 .map(|duration| duration.as_nanos())
@@ -2104,7 +2144,7 @@ impl<'c> XlaDomain<'c> {
         }
         if metadata.platform_name != self.client()?.platform_name()?.as_ref()
             || metadata.platform_version != self.client()?.platform_version()?.as_ref()
-            || metadata.compiler_identity != XLA_COMPILER_IDENTITY
+            || metadata.compiler_identity != XLA_COMPILER_IDENTITY.as_str()
             || metadata.xla_flags != std::env::var("XLA_FLAGS").unwrap_or_default()
         {
             return Ok(None);
@@ -2179,6 +2219,11 @@ impl<'c> XlaDomain<'c> {
             expected_argument_shardings: expected_argument_shardings.into(),
             mesh,
             compilation_options,
+            platform_name: metadata.platform_name.into(),
+            platform_version: metadata.platform_version.into(),
+            device_kinds: metadata.device_kinds.into(),
+            compiler_identity: metadata.compiler_identity.into(),
+            xla_flags: metadata.xla_flags.into(),
             compilation_duration,
             analysis: Arc::new(OnceLock::new()),
         }))
@@ -2190,7 +2235,7 @@ impl<'c> CompilationCacheDomain for XlaDomain<'c> {
 
     #[inline]
     fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error> {
-        self.xla_compilation_key(program)
+        Self::xla_compilation_key(program)
     }
 
     #[inline]
@@ -2876,13 +2921,9 @@ mod tests {
         // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
         let cache_size_before = engine.cache_size();
         for _ in 0..3 {
-            let staged = stage_function(
-                &engine,
-                |x| x.sin().unwrap(),
-                input_type.clone(),
-                XlaOptions::new(mesh.clone()),
-            )
-            .unwrap();
+            let staged =
+                stage_function(&engine, |x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone()))
+                    .unwrap();
             let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
                 engine.compile(engine.lower(staged).unwrap()).unwrap();
         }
@@ -2904,24 +2945,20 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let staged = stage_function(
-            &domain,
-            |x| x.sin().unwrap(),
-            input_type,
-            XlaOptions::new(mesh),
-        )
-        .unwrap();
+        let staged = stage_function(&domain, |x| x.sin().unwrap(), input_type, XlaOptions::new(mesh)).unwrap();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
         let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
-        let repeated =
-            domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
+        let clientless_domain = XlaDomain::clientless();
+        let repeated = clientless_domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
 
         assert_eq!(key, repeated);
         assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
         let decoded: serde_json::Value = serde_json::from_slice(&key.canonical_bytes).unwrap();
         assert_eq!(decoded["schema_version"], XLA_PERSISTENT_KEY_SCHEMA_VERSION);
-        assert_eq!(decoded["compiler_identity"], XLA_COMPILER_IDENTITY);
+        assert_eq!(decoded["compiler_identity"], XLA_COMPILER_IDENTITY.as_str());
+        assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::XLA_COMMIT));
+        assert!(decoded["compiler_identity"].as_str().unwrap().contains(ryft_xla_sys::JAX_COMMIT));
         assert_eq!(decoded["platform_name"], client.platform_name().unwrap().as_ref());
         assert!(decoded["compilation_options"].as_array().is_some_and(|bytes| !bytes.is_empty()));
         assert!(decoded["stable_hlo"].as_str().is_some_and(|module| module.contains("stablehlo.sine")));
@@ -3020,13 +3057,9 @@ mod tests {
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         );
-        let staged = stage_function(
-            &first_domain,
-            |x| x.sin().unwrap(),
-            input_type.clone(),
-            XlaOptions::new(mesh.clone()),
-        )
-        .unwrap();
+        let staged =
+            stage_function(&first_domain, |x| x.sin().unwrap(), input_type.clone(), XlaOptions::new(mesh.clone()))
+                .unwrap();
         let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             first_domain.compile(first_domain.lower(staged).unwrap()).unwrap();
         assert_eq!(first_domain.cache.statistics().compilations, 1);
@@ -3037,13 +3070,7 @@ mod tests {
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         );
-        let staged = stage_function(
-            &second_domain,
-            |x| x.sin().unwrap(),
-            input_type,
-            XlaOptions::new(mesh),
-        )
-        .unwrap();
+        let staged = stage_function(&second_domain, |x| x.sin().unwrap(), input_type, XlaOptions::new(mesh)).unwrap();
         let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             second_domain.compile(second_domain.lower(staged).unwrap()).unwrap();
         let statistics = second_domain.cache.statistics();
@@ -3080,7 +3107,7 @@ mod tests {
             device_assignment: Vec::new(),
             platform_name: client.platform_name().unwrap().into_owned(),
             platform_version: client.platform_version().unwrap().into_owned(),
-            compiler_identity: XLA_COMPILER_IDENTITY.into(),
+            compiler_identity: XLA_COMPILER_IDENTITY.to_string(),
             xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default(),
             compilation_duration_nanoseconds: None,
         };

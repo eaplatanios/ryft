@@ -1900,6 +1900,7 @@ dependencies = [
  "ryft-macros",
  "ryft-mlir",
  "ryft-pjrt",
+ "ryft-xla-sys",
  "serde",
  "serde_json",
  "sha2",

@@ -64,7 +64,6 @@ impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Inp
 ///
 /// This trait encapsulates the structured generic bounds so concrete domains can implement staging without refining
 /// the trait method's requirements. Construct requests with [`CompilationStagingRequest::new`].
-#[doc(hidden)]
 pub trait StageRequest<D: CompilationDomain>: Sized {
     /// Structured abstract input type.
     type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>;
@@ -100,7 +99,6 @@ pub trait StageRequest<D: CompilationDomain>: Sized {
 }
 
 /// Typed staged-artifact behavior used by [`CompilationDomain::lower`].
-#[doc(hidden)]
 pub trait LoweringRequest<D: CompilationDomain>: Sized {
     /// Structured abstract input type.
     type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>;
@@ -125,7 +123,6 @@ pub trait LoweringRequest<D: CompilationDomain>: Sized {
 }
 
 /// Typed lowered-artifact behavior used by [`CompilationDomain::compile`].
-#[doc(hidden)]
 pub trait CompileRequest<D: CompilationDomain>: Sized {
     /// Structured abstract input type.
     type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>;
@@ -167,7 +164,6 @@ where
 }
 
 /// Typed execution-request behavior used by [`CompilationDomain::call`].
-#[doc(hidden)]
 pub trait CallRequest<D: CompilationDomain>: Sized {
     /// Structured abstract input type.
     type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>;

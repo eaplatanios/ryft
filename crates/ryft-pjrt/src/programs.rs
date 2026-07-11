@@ -713,6 +713,14 @@ impl<'c> LoadedExecutable<'c> {
         self.api
     }
 
+    /// Returns `true` if this [`LoadedExecutable`] is owned by the provided [`Client`] (i.e., if the provided
+    /// [`Client`] wraps the same underlying PJRT client as the one that created this executable). This check lets
+    /// higher-level runtimes reject a caller-supplied foreign client before enqueueing execution or donating inputs.
+    #[inline]
+    pub fn is_owned_by(&self, client: &Client<'_>) -> bool {
+        self.client == unsafe { client.to_c_api() }
+    }
+
     /// Returns the [`Executable`] that corresponds to this [`LoadedExecutable`].
     pub fn executable(&self) -> Result<Executable, Error> {
         use ffi::PJRT_LoadedExecutable_GetExecutable_Args;
@@ -3280,6 +3288,15 @@ mod tests {
                 }
             };
         });
+    }
+
+    #[test]
+    fn test_loaded_executable_is_owned_by() {
+        let client = test_cpu_client();
+        let other_client = test_cpu_client();
+        let executable = client.compile(&test_program(false, false), &test_compilation_options()).unwrap();
+        assert!(executable.is_owned_by(&client));
+        assert!(!executable.is_owned_by(&other_client));
     }
 
     #[test]
