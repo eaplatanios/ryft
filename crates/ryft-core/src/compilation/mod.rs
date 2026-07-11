@@ -70,7 +70,7 @@
 //!
 //! # Lifecycle Handles
 //!
-//! 1. [`StagedFunction`] owns a typed [`ClosedProgram`], concrete runtime captures, public input and output
+//! 1. [`StagedFunction`] owns a typed [`ClosedProgram`](crate::captures::ClosedProgram), concrete runtime captures, public input and output
 //!    signatures, output structure, and compilation options. It contains no backend lowering or executable, and its
 //!    [`StagedFunction::call`] method stages a nested call into an active context rather than executing at runtime.
 //! 2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
@@ -83,13 +83,15 @@
 //!
 //! # Captures and Nested Calls
 //!
-//! Runtime values closed over by a traced closure are not embedded as literal data. A [`ClosedProgram`] keeps them in
-//! a side table while the source IR stores typed [`CaptureReference`] indices. Before lowering, captures are opened
+//! Runtime values closed over by a traced closure are not embedded as literal data. A
+//! [`ClosedProgram`](crate::captures::ClosedProgram) keeps them in a side table while the source IR stores typed
+//! [`CaptureReference`](crate::captures::CaptureReference) indices. Before lowering, captures are opened
 //! as leading flat inputs, and execution supplies arguments in the same `[captures..., public inputs...]` order. This
 //! keeps IR compact, preserves device-resident buffers, and lets compilation depend on capture types rather than
 //! data.
 //!
-//! [`CapturingContext`] lets ordinary and transform contexts register captures through their parent. To embed a
+//! [`CapturingContext`](crate::captures::CapturingContext) lets ordinary and transform contexts register captures
+//! through their parent. To embed a
 //! staged function in a larger trace, an operation family implements [`CompiledProgramOperation`]; that operation
 //! then owns how the nested call behaves under lowering, batching, differentiation, partial evaluation, and
 //! interpretation.
@@ -157,18 +159,17 @@
 //! 1. Start with [`CompilationDomain`] for the core/backend ownership boundary.
 //! 2. Read [`StageRequest`], [`LoweringRequest`], [`CompileRequest`], and [`CallRequest`] alongside
 //!    [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and [`ExecutableProgram`] for the typed lifecycle.
-//! 3. Read [`ClosedProgram`] and [`CaptureReference`] for capture handling.
+//! 3. Read [`ClosedProgram`](crate::captures::ClosedProgram) and
+//!    [`CaptureReference`](crate::captures::CaptureReference) in [`crate::captures`] for capture handling.
 //! 4. Read [`CompilationContext`] for single-flight compilation and cache tiers.
 //! 5. Read [`DiskCache`] and [`CompilationArtifactExchange`] only when adding persistence or distributed sharing.
 //! 6. Continue with a backend crate such as `ryft-xla` for a concrete [`CompilationDomain`] implementation.
 
-pub mod captures;
 pub mod contexts;
 pub mod disk_cache;
 pub mod exchange;
 pub mod function;
 
-pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use contexts::{
     AnalyzableCompilationDomain, CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome,
     CompilationCacheStatistics, CompilationContext, CompilationDomain, CompilationEvent, CompilationMissReason,

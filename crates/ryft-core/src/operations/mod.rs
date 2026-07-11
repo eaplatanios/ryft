@@ -3,7 +3,7 @@ use std::fmt::Display;
 
 use crate::batching::{ArrayBatch, BatchingTracer};
 use crate::broadcasting::Broadcastable;
-use crate::compilation::CaptureReference;
+use crate::captures::CaptureReference;
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiationDual, DifferentiationTracer};
 use crate::effects::Effects;

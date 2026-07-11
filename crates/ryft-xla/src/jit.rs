@@ -13,8 +13,9 @@ use ryft_core::Batch;
 use ryft_core::LinearizationTracer;
 use ryft_core::Typed;
 use ryft_core::batching::BatchAxis;
+use ryft_core::captures::{CapturingContext, ClosedProgram};
 use ryft_core::compilation::{
-    CapturingContext, ClosedProgram, CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram,
+    CompilationDomain, CompilationStagingRequest, CompiledFunction, ExecutableProgram,
     JittedFunction as CoreJittedFunction, Specialization, StagedFunction, call_function,
     jit_with_options as core_jit_with_options, try_jit_with_options as core_try_jit_with_options,
 };

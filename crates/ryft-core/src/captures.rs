@@ -1,3 +1,13 @@
+//! Contains machinery for representing runtime _captures_ for staged [`Program`]s.
+//!
+//! Runtime values closed over by a traced closure (e.g., the device buffers a just-in-time-compiled function reads) are
+//! not embedded in staged programs as literal constants. Instead, a [`ClosedProgram`] keeps them in a side table while
+//! the program's constant atoms store lifetime-free, typed [`CaptureReference`] indices into that table. This keeps the
+//! IR compact, preserves device-resident buffers, and lets compilation depend only on capture *types* rather than
+//! concrete data, so one compiled executable serves any captured value of a given type.
+//!
+//! The compilation lifecycle built on top of these types lives in [`crate::compilation`].
+
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
@@ -15,25 +25,24 @@ use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, Progra
 use crate::tracing::NestedTracingContext;
 use crate::types::{ArrayType, Type, Typed};
 
-/// Reference to a value captured outside a staged [`Program`].
+/// Reference to a value captured outside a staged [`Program`]. A program stores only this lifetime-free reference
+/// in its [`Atom`] table. The corresponding runtime value lives at [`index`](Self::index) in the surrounding
+/// [`ClosedProgram`]'s capture table. This keeps concrete runtime values in the closed program's side environment
+/// instead of embedding them in reusable staged IR.
 ///
-/// A program stores only this lifetime-free reference in its atom table. The corresponding runtime value lives at
-/// [`index`](Self::index) in the surrounding [`ClosedProgram`]'s capture table. This keeps concrete runtime values in
-/// the closed program's side environment instead of embedding them in reusable staged IR.
+/// # Why capture by reference instead of baking in a literal?
 ///
-/// # Why capture by reference instead of baking in a literal
+/// Closed-over runtime values (e.g., the arrays a just-in-time-compiled function closes over) are recorded as captures
+/// and handed to the compiled program as runtime arguments, rather than embedded as literal constants in its IR. The
+/// compiled program therefore depends only on the captured values' abstract types and never on their concrete data,
+/// which buys three things:
 ///
-/// Closed-over runtime values — for example, the arrays a just-in-time-compiled function closes over — are recorded
-/// as captures and handed to the compiled program as runtime arguments, rather than embedded as literal constants in
-/// its IR. The compiled program therefore depends only on the captured values' abstract types, never on their
-/// concrete data, which buys three things:
-///
-///   - **Executable reuse.** Compiled executables are cached by operand type and shape, not by value, so a single
-///     compilation serves any captured value of a given type. Baking a value in as a literal would make the
-///     executable value-specific and force a recompile whenever the captured data changed.
-///   - **On-device buffers.** Captured values are typically device buffers; passing them as arguments keeps them
-///     resident on-device, whereas embedding them as literals would require reading them back to the host first.
-///   - **Compact IR.** Large captured arrays never bloat the program IR or the serialized executable.
+///   - **Executable Reuse:** Compiled executables are cached by operand type and shape, not by value, so a single
+///     compilation serves any captured value of a given type. Baking a value in as a literal would make the executable
+///     value-specific and force a recompilation whenever the captured data changes.
+///   - **On-Device Buffers:** Captured values are typically device (e.g., GPU) buffers. Passing them as arguments keeps
+///     them resident on-device, whereas embedding them as literals would require copying them back to the host first.
+///   - **Compact IR:** Large captured arrays never bloat the program IR or the serialized executables.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct CaptureReference<T: Type> {
     /// Index of this [`CaptureReference`] into the surrounding capture table.
@@ -88,15 +97,14 @@ impl<T: Type> Value for CaptureReference<T> {
     }
 }
 
-/// Active tracing [`Context`] that can register runtime values as captures of the program being built. The returned
+/// [`Context`] that can register runtime values as captures (e.g., for a [`Program`] that is being built). The returned
 /// value is the context's staged constant payload. For captured-program backends this is usually a lifetime-free
 /// [`CaptureReference`] into a side table owned by the surrounding compiled function. Stackable transform contexts
 /// delegate registration to their parent so captures follow the same nesting path as ordinary staged operations.
-///
 /// Capturing a closed-over value instead of staging it as a literal keeps the program independent of concrete data,
 /// enabling executable reuse across captured values, retaining device buffers on-device, and keeping the IR compact.
 pub trait CapturingContext<Capture: Value<Type = Self::Type>>: Context {
-    /// Appends `value` to the active capture table and returns the constant payload that refers to it.
+    /// Appends `value` to the current captures table and returns the constant payload that refers to it.
     fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError>;
 }
 

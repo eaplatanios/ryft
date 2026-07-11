@@ -6,6 +6,7 @@ pub mod axes;
 pub mod backends;
 pub mod batching;
 pub mod broadcasting;
+pub mod captures;
 pub mod compilation;
 pub mod contexts;
 pub mod differentiation;
@@ -33,6 +34,7 @@ pub use batching::{
     batch,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
+pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use compilation::*;
 pub use contexts::{Context, Domain, EagerContext, StagingContext, ValueResolution};
 pub use differentiation::*;

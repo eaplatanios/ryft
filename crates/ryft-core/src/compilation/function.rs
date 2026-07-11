@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
-use crate::compilation::captures::CapturingContext;
+use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::check_builders;
 use crate::operations::Operation;
@@ -20,7 +20,6 @@ use crate::programs::{Program, ProgramError, Value};
 use crate::tracing::{DomainTracingContext, Tracer};
 use crate::types::Typed;
 
-use super::captures::{CaptureReference, ClosedProgram};
 use super::contexts::CompilationDomain;
 
 /// Flat source-program representation stored by nested compiled-call operations.

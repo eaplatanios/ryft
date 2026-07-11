@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
+use crate::captures::CaptureReference;
 use crate::compilation::disk_cache::{CacheDigest, DiskCache};
 use crate::compilation::exchange::{
     CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError,
@@ -18,7 +19,6 @@ use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::types::Type;
 
-use super::captures::CaptureReference;
 use super::function::{
     CallRequest, CompileRequest, CompiledFunction, ExecutableProgram, LoweredFunction, LoweringRequest, StageRequest,
     StagedFunction,

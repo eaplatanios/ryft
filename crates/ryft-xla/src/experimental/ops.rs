@@ -8,7 +8,7 @@ use ryft_core::batching::BatchAxis;
 use ryft_core::batching::BatchableOperation;
 use ryft_core::batching::BatchingError;
 use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
-use ryft_core::compilation::CaptureReference;
+use ryft_core::captures::CaptureReference;
 use ryft_core::compilation::function::CompiledProgramOperation;
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};

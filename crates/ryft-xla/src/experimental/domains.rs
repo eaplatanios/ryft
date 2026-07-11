@@ -343,7 +343,7 @@ impl<'c> Domain for XlaDomain<'c> {
 }
 
 impl<'c> Context for XlaDomain<'c> {
-    /// [`XlaConstant`] is a [`CaptureReference`](ryft_core::compilation::CaptureReference) — a symbolic index into a
+    /// [`XlaConstant`] is a [`CaptureReference`](ryft_core::captures::CaptureReference) — a symbolic index into a
     /// compiled function's capture table carrying only a type and no data — so there is nothing to materialize
     /// without the surrounding capture table and lifting is always rejected.
     fn lift(&self, constant: XlaConstant) -> Result<Array<'c>, ProgramError> {
@@ -535,7 +535,7 @@ impl<'c> CoordinateBasis<Array<'c>> for XlaDomain<'c> {
     }
 }
 
-/// [`XlaConstant`] is a [`CaptureReference`](ryft_core::compilation::CaptureReference) carrying only a type and no
+/// [`XlaConstant`] is a [`CaptureReference`](ryft_core::captures::CaptureReference) carrying only a type and no
 /// data, so — exactly like [`Context::lift`], to which this delegates — captured-constant materialization is always
 /// rejected outside a surrounding capture table. The implementation exists because interpretation- and
 /// batching-capable operation families require a [`Constant`] leaf on their contexts; programs whose constants were
