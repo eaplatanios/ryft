@@ -7,6 +7,7 @@ pub mod none;
 pub mod opaque;
 pub mod shaped;
 pub mod tensor;
+pub mod token;
 pub mod tuple;
 pub mod vector;
 
@@ -19,5 +20,6 @@ pub use none::*;
 pub use opaque::*;
 pub use shaped::*;
 pub use tensor::*;
+pub use token::*;
 pub use tuple::*;
 pub use vector::*;

@@ -570,7 +570,7 @@ mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -605,8 +605,8 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_begin_test(%arg0: !llvm.token, %arg1: !llvm.ptr) -> !llvm.ptr {
-                    %0 = llvm.intr.coro.begin %arg0, %arg1 : (!llvm.token, !llvm.ptr) -> !llvm.ptr
+                  func.func @llvm_intr_coro_begin_test(%arg0: token, %arg1: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.coro.begin %arg0, %arg1 : (token, !llvm.ptr) -> !llvm.ptr
                     return %0 : !llvm.ptr
                   }
                 }
@@ -622,7 +622,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -663,8 +663,8 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_end_test(%arg0: !llvm.ptr, %arg1: i1, %arg2: !llvm.token) -> i1 {
-                    %0 = llvm.intr.coro.end %arg0, %arg1, %arg2 : (!llvm.ptr, i1, !llvm.token) -> i1
+                  func.func @llvm_intr_coro_end_test(%arg0: !llvm.ptr, %arg1: i1, %arg2: token) -> i1 {
+                    %0 = llvm.intr.coro.end %arg0, %arg1, %arg2 : (!llvm.ptr, i1, token) -> i1
                     return %0 : i1
                   }
                 }
@@ -679,7 +679,7 @@ mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -714,8 +714,8 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_free_test(%arg0: !llvm.token, %arg1: !llvm.ptr) -> !llvm.ptr {
-                    %0 = llvm.intr.coro.free %arg0, %arg1 : (!llvm.token, !llvm.ptr) -> !llvm.ptr
+                  func.func @llvm_intr_coro_free_test(%arg0: token, %arg1: !llvm.ptr) -> !llvm.ptr {
+                    %0 = llvm.intr.coro.free %arg0, %arg1 : (token, !llvm.ptr) -> !llvm.ptr
                     return %0 : !llvm.ptr
                   }
                 }
@@ -731,7 +731,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let i32_type = context.signless_integer_type(32);
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -775,9 +775,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_id_test(%arg0: i32, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr) -> !llvm.token {
-                    %0 = llvm.intr.coro.id %arg0, %arg1, %arg2, %arg3 : (i32, !llvm.ptr, !llvm.ptr, !llvm.ptr) -> !llvm.token
-                    return %0 : !llvm.token
+                  func.func @llvm_intr_coro_id_test(%arg0: i32, %arg1: !llvm.ptr, %arg2: !llvm.ptr, %arg3: !llvm.ptr) -> token {
+                    %0 = llvm.intr.coro.id %arg0, %arg1, %arg2, %arg3 : (i32, !llvm.ptr, !llvm.ptr, !llvm.ptr) -> token
+                    return %0 : token
                   }
                 }
             "},
@@ -898,7 +898,7 @@ mod tests {
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
         let pointer_type = context.llvm_pointer_type(0).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -931,9 +931,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_save_test(%arg0: !llvm.ptr) -> !llvm.token {
-                    %0 = llvm.intr.coro.save %arg0 : (!llvm.ptr) -> !llvm.token
-                    return %0 : !llvm.token
+                  func.func @llvm_intr_coro_save_test(%arg0: !llvm.ptr) -> token {
+                    %0 = llvm.intr.coro.save %arg0 : (!llvm.ptr) -> token
+                    return %0 : token
                   }
                 }
             "},
@@ -990,7 +990,7 @@ mod tests {
         let module = context.module(location).unwrap();
         let i1_type = context.signless_integer_type(1);
         let i8_type = context.signless_integer_type(8);
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -1025,7 +1025,7 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_intr_coro_suspend_test(%arg0: !llvm.token, %arg1: i1) -> i8 {
+                  func.func @llvm_intr_coro_suspend_test(%arg0: token, %arg1: i1) -> i8 {
                     %0 = llvm.intr.coro.suspend %arg0, %arg1 : i8
                     return %0 : i8
                   }

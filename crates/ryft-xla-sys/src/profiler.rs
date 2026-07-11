@@ -24,7 +24,9 @@ impl RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions_Args {
 }
 
 unsafe extern "C" {
-    pub fn RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions(args: *mut RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions_Args);
+    pub fn RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions(
+        args: *mut RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions_Args,
+    );
 }
 
 #[repr(C)]
@@ -55,7 +57,9 @@ impl RYFT_XLA_Profiler_Aggregate_Profiled_Instructions_Args {
 }
 
 unsafe extern "C" {
-    pub fn RYFT_XLA_Profiler_Aggregate_Profiled_Instructions(args: *mut RYFT_XLA_Profiler_Aggregate_Profiled_Instructions_Args);
+    pub fn RYFT_XLA_Profiler_Aggregate_Profiled_Instructions(
+        args: *mut RYFT_XLA_Profiler_Aggregate_Profiled_Instructions_Args,
+    );
 
     pub fn RYFT_XLA_Profiler_Byte_Buffer_Destroy(buffer: *mut u8);
 }

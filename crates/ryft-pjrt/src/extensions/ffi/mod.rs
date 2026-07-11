@@ -542,7 +542,7 @@ pub(crate) mod tests {
             }],
             ..Default::default()
         };
-        let execution = executable.execute(vec![inputs], 0, Some(execution_context), None, None, None).unwrap();
+        let execution = executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None).unwrap();
         assert!(execution.fence().block_until_ready().is_ok());
         assert!(handler.is_none(), "test call-frame handler was never invoked");
         if let Some(panic_payload) = panic_payload {
@@ -747,7 +747,7 @@ pub(crate) mod tests {
             ..Default::default()
         };
 
-        let execution = executable.execute(vec![inputs], 0, Some(execution_context), None, None, None).unwrap();
+        let execution = executable.execute(vec![inputs], vec![], 0, Some(execution_context), None, None, None).unwrap();
         let mut outputs = execution.block_until_ready().unwrap();
         assert_eq!(outputs.len(), 1);
         let mut outputs = outputs.remove(0);

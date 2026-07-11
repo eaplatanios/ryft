@@ -85,6 +85,7 @@ impl ToMlir for Sharding {
             dimensions.as_slice(),
             replicated_axes.as_slice(),
             unreduced_axes.as_slice(),
+            shardy::ReductionOperation::Sum,
         )
     }
 }

@@ -19,7 +19,7 @@ use ryft_xla_sys::bindings::{
     sdySubAxisInfoAttrGetPreSize, sdySubAxisInfoAttrGetSize, sdyTensorMappingAttrGet,
     sdyTensorMappingAttrGetDimMappingsElem, sdyTensorMappingAttrGetDimMappingsSize, sdyTensorMappingAttrGetRank,
     sdyTensorShardingAttrGet, sdyTensorShardingAttrGetDimShardingsElem, sdyTensorShardingAttrGetDimShardingsSize,
-    sdyTensorShardingAttrGetMeshOrRef, sdyTensorShardingAttrGetReplicatedAxesElem,
+    sdyTensorShardingAttrGetMeshOrRef, sdyTensorShardingAttrGetReductionOp, sdyTensorShardingAttrGetReplicatedAxesElem,
     sdyTensorShardingAttrGetReplicatedAxesSize, sdyTensorShardingAttrGetUnreducedAxesElem,
     sdyTensorShardingAttrGetUnreducedAxesSize, sdyTensorShardingPerValueAttrGet,
     sdyTensorShardingPerValueAttrGetShardingsElem, sdyTensorShardingPerValueAttrGetShardingsSize,
@@ -962,6 +962,35 @@ impl<'t> Context<'t> {
     }
 }
 
+/// Reduction operation applied along the unreduced axes of a [`TensorShardingAttributeRef`].
+///
+/// Refer to the [official Shardy documentation](https://openxla.org/shardy/sdy_dialect#tensorshardingattr)
+/// for more information.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ReductionOperation {
+    /// Sum reduction.
+    Sum = 0,
+
+    /// Maximum reduction.
+    Max = 1,
+
+    /// Minimum reduction.
+    Min = 2,
+}
+
+impl ReductionOperation {
+    /// Constructs a [`ReductionOperation`] from the integer value used by the MLIR C API.
+    pub fn from_c_api(value: u32) -> Result<Self, Error> {
+        match value {
+            0 => Ok(Self::Sum),
+            1 => Ok(Self::Max),
+            2 => Ok(Self::Min),
+            _ => Err(Error::invalid_argument("invalid Shardy reduction operation value")),
+        }
+    }
+}
+
 /// Shardy [`Attribute`] encoding complete tensor sharding metadata.
 ///
 /// Refer to the [official Shardy documentation](https://openxla.org/shardy/sdy_dialect#tensorshardingattr)
@@ -1022,6 +1051,11 @@ impl<'c, 't> TensorShardingAttributeRef<'c, 't> {
             axes
         }
     }
+
+    /// Returns the [`ReductionOperation`] applied along the unreduced axes.
+    pub fn reduction_operation(&self) -> Result<ReductionOperation, Error> {
+        ReductionOperation::from_c_api(unsafe { sdyTensorShardingAttrGetReductionOp(self.handle) })
+    }
 }
 
 impl<'c, 't> Attribute<'c, 't> for TensorShardingAttributeRef<'c, 't> {
@@ -1053,12 +1087,14 @@ impl<'t> Context<'t> {
     ///   - `dim_shardings`: Per-dimension sharding descriptors.
     ///   - `replicated_axes`: Axes explicitly marked replicated.
     ///   - `unreduced_axes`: Axes explicitly marked unreduced.
+    ///   - `reduction_operation`: [`ReductionOperation`] applied along the unreduced axes.
     pub fn shardy_tensor_sharding<'c, M: Attribute<'c, 't>>(
         &'c self,
         mesh_or_ref: M,
         dim_shardings: &[DimensionShardingAttributeRef<'c, 't>],
         replicated_axes: &[AxisRefAttributeRef<'c, 't>],
         unreduced_axes: &[AxisRefAttributeRef<'c, 't>],
+        reduction_operation: ReductionOperation,
     ) -> Result<TensorShardingAttributeRef<'c, 't>, Error> {
         self.load_dialect(DialectHandle::shardy()?)?;
         unsafe {
@@ -1075,6 +1111,7 @@ impl<'t> Context<'t> {
                     replicated_axes.as_ptr(),
                     unreduced_axes.len().cast_signed(),
                     unreduced_axes.as_ptr(),
+                    reduction_operation as u32,
                 ),
                 self,
             )
@@ -1359,7 +1396,9 @@ mod tests {
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let axis_ref = context.shardy_axis_ref("x", None).unwrap();
         let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
-        let attribute = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[]).unwrap();
+        let attribute = context
+            .shardy_tensor_sharding(mesh, &[dim_sharding], &[axis_ref], &[], ReductionOperation::Sum)
+            .unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.mesh_or_ref().unwrap(), mesh.as_ref());
         assert_eq!(attribute.dim_shardings(), vec![dim_sharding]);
@@ -1375,7 +1414,8 @@ mod tests {
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let axis_ref = context.shardy_axis_ref("x", None).unwrap();
         let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
-        let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]).unwrap();
+        let tensor_sharding =
+            context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[], ReductionOperation::Sum).unwrap();
         let attribute = context.shardy_tensor_sharding_per_value(&[tensor_sharding]).unwrap();
         assert_eq!(&context, attribute.context());
         assert_eq!(attribute.shardings(), vec![tensor_sharding]);

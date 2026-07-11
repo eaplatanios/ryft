@@ -203,6 +203,10 @@ pub struct MemoryStatistics {
 
     /// Peak number of bytes held by the allocator.
     pub peak_pool_bytes: Option<u64>,
+
+    /// Peak number of bytes allocated from the underlying system by the allocator (i.e., actual memory usage,
+    /// as opposed to bytes handed out to users which are tracked by [`MemoryStatistics::peak_bytes_in_use`]).
+    pub peak_allocated_bytes: Option<u64>,
 }
 
 #[allow(dead_code, non_camel_case_types, non_snake_case, non_upper_case_globals)]

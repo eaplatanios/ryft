@@ -35,6 +35,6 @@ pub use types::{
     Float8E4M3B11FNUZTypeRef, Float8E4M3FNTypeRef, Float8E4M3FNUZTypeRef, Float8E4M3TypeRef, Float8E5M2FNUZTypeRef,
     Float8E5M2TypeRef, Float8E8M0FNUTypeRef, Float8Type, Float8TypeRef, Float16TypeRef, Float32TypeRef, Float64TypeRef,
     FloatTF32TypeRef, FloatType, FloatTypeRef, FunctionTypeRef, IndexTypeRef, IntegerTypeRef, MemRefTypeRef,
-    NoneTypeRef, OpaqueTypeRef, ShapedType, ShapedTypeRef, Size, TensorTypeRef, TupleTypeRef, UnrankedMemRefTypeRef,
-    UnrankedTensorTypeRef, VectorTypeDimension, VectorTypeRef,
+    NoneTypeRef, OpaqueTypeRef, ShapedType, ShapedTypeRef, Size, TensorTypeRef, TokenTypeRef, TupleTypeRef,
+    UnrankedMemRefTypeRef, UnrankedTensorTypeRef, VectorTypeDimension, VectorTypeRef,
 };

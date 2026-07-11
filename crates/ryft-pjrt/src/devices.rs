@@ -213,6 +213,8 @@ impl Device<'_> {
             pool_bytes_is_set,
             peak_pool_bytes,
             peak_pool_bytes_is_set,
+            peak_allocated_bytes,
+            peak_allocated_bytes_is_set,
         })
         .map(
             |(
@@ -237,6 +239,8 @@ impl Device<'_> {
                 pool_bytes_is_set,
                 peak_pool_bytes,
                 peak_pool_bytes_is_set,
+                peak_allocated_bytes,
+                peak_allocated_bytes_is_set,
             )| MemoryStatistics {
                 bytes_in_use: bytes_in_use.cast_unsigned(),
                 peak_bytes_in_use: peak_bytes_in_use_is_set.then_some(peak_bytes_in_use.cast_unsigned()),
@@ -250,6 +254,7 @@ impl Device<'_> {
                     .then_some(largest_free_block_bytes.cast_unsigned()),
                 pool_bytes: pool_bytes_is_set.then_some(pool_bytes.cast_unsigned()),
                 peak_pool_bytes: peak_pool_bytes_is_set.then_some(peak_pool_bytes.cast_unsigned()),
+                peak_allocated_bytes: peak_allocated_bytes_is_set.then_some(peak_allocated_bytes.cast_unsigned()),
             },
         )
     }
@@ -955,6 +960,8 @@ pub(crate) mod ffi {
         pub pool_bytes_is_set: bool,
         pub peak_pool_bytes: i64,
         pub peak_pool_bytes_is_set: bool,
+        pub peak_allocated_bytes: i64,
+        pub peak_allocated_bytes_is_set: bool,
     }
 
     impl PJRT_Device_MemoryStats_Args {
@@ -984,6 +991,8 @@ pub(crate) mod ffi {
                 pool_bytes_is_set: false,
                 peak_pool_bytes: 0,
                 peak_pool_bytes_is_set: false,
+                peak_allocated_bytes: 0,
+                peak_allocated_bytes_is_set: false,
             }
         }
     }
@@ -1366,6 +1375,7 @@ mod tests {
                     ],
                     ..Default::default()
                 }],
+                vec![],
                 launch_id,
                 None,
                 None,

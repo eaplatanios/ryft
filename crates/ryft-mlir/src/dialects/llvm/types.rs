@@ -13,9 +13,9 @@ use ryft_xla_sys::mlir::dialects::llvm::{
     mlirLLVMFunctionTypeIsVarArg, mlirLlvmLabelTypeGet, mlirLlvmMetadataTypeGet, mlirLlvmPpcFp128TypeGet,
     mlirLlvmTargetExtTypeGet, mlirLlvmTargetExtTypeGetIntParam, mlirLlvmTargetExtTypeGetName,
     mlirLlvmTargetExtTypeGetNumIntParams, mlirLlvmTargetExtTypeGetNumTypeParams, mlirLlvmTargetExtTypeGetTypeParam,
-    mlirLlvmTokenTypeGet, mlirLlvmX86AmxTypeGet, mlirTypeIsALLVMArrayType, mlirTypeIsALLVMFunctionType,
-    mlirTypeIsALlvmLabelType, mlirTypeIsALlvmMetadataType, mlirTypeIsALlvmPpcFp128Type, mlirTypeIsALlvmTargetExtType,
-    mlirTypeIsALlvmTokenType, mlirTypeIsALlvmVoidType, mlirTypeIsALlvmX86AmxType,
+    mlirLlvmX86AmxTypeGet, mlirTypeIsALLVMArrayType, mlirTypeIsALLVMFunctionType, mlirTypeIsALlvmLabelType,
+    mlirTypeIsALlvmMetadataType, mlirTypeIsALlvmPpcFp128Type, mlirTypeIsALlvmTargetExtType, mlirTypeIsALlvmVoidType,
+    mlirTypeIsALlvmX86AmxType,
 };
 
 use crate::{Context, DialectHandle, Error, LogicalResult, StringRef, Type, TypeId, TypeRef, mlir_subtype_trait_impls};
@@ -121,7 +121,6 @@ impl<'c, 't> Type<'c, 't> for PointerTypeRef<'c, 't> {
 mlir_subtype_trait_impls!(PointerTypeRef<'c, 't> as Type, mlir_type = Type);
 
 llvm_trivial_type!(VoidTypeRef, llvm_void_type, mlirTypeIsALlvmVoidType, mlirLLVMVoidTypeGet, "void");
-llvm_trivial_type!(TokenTypeRef, llvm_token_type, mlirTypeIsALlvmTokenType, mlirLlvmTokenTypeGet, "token");
 llvm_trivial_type!(LabelTypeRef, llvm_label_type, mlirTypeIsALlvmLabelType, mlirLlvmLabelTypeGet, "label");
 llvm_trivial_type!(
     MetadataTypeRef,
@@ -747,45 +746,6 @@ mod tests {
     fn test_void_type_casting() {
         let context = Context::new();
         test_type_casting(context.llvm_void_type().unwrap());
-    }
-
-    #[test]
-    fn test_token_type() {
-        let context = Context::new();
-        let token_type = context.llvm_token_type().unwrap();
-        assert_eq!(&context, token_type.context());
-        assert_eq!(token_type.dialect().unwrap().namespace().unwrap(), "llvm");
-    }
-
-    #[test]
-    fn test_token_type_equality() {
-        let context = Context::new();
-        let token_type_1 = context.llvm_token_type().unwrap();
-        let token_type_2 = context.llvm_token_type().unwrap();
-        assert_eq!(token_type_1, token_type_2);
-
-        let context = Context::new();
-        let token_type_2 = context.llvm_token_type().unwrap();
-        assert_ne!(token_type_1, token_type_2);
-    }
-
-    #[test]
-    fn test_token_type_display_and_debug() {
-        let context = Context::new();
-        test_type_display_and_debug(context.llvm_token_type().unwrap(), "!llvm.token");
-    }
-
-    #[test]
-    fn test_token_type_parsing() {
-        let context = Context::new();
-        context.load_dialect(DialectHandle::llvm().unwrap()).unwrap();
-        assert_eq!(context.parse_type("!llvm.token").unwrap(), context.llvm_token_type().unwrap());
-    }
-
-    #[test]
-    fn test_token_type_casting() {
-        let context = Context::new();
-        test_type_casting(context.llvm_token_type().unwrap());
     }
 
     #[test]

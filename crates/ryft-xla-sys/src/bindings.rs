@@ -3469,7 +3469,11 @@ unsafe extern "C" {
         replicatedAxes: *const MlirAttribute,
         nUnreducedAxes: isize,
         unreducedAxes: *const MlirAttribute,
+        reductionOp: u32,
     ) -> MlirAttribute;
+}
+unsafe extern "C" {
+    pub fn sdyTensorShardingAttrGetReductionOp(attr: MlirAttribute) -> u32;
 }
 unsafe extern "C" {
     pub fn sdyTensorShardingAttrGetMeshOrRef(attr: MlirAttribute) -> MlirAttribute;

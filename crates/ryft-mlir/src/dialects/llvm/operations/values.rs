@@ -135,7 +135,7 @@ mod tests {
         let context = Context::new();
         let location = context.unknown_location();
         let module = context.module(location).unwrap();
-        let token_type = context.llvm_token_type().unwrap();
+        let token_type = context.token_type();
         module
             .body()
             .unwrap()
@@ -162,9 +162,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_none_test() -> !llvm.token {
-                    %0 = llvm.mlir.none : !llvm.token
-                    return %0 : !llvm.token
+                  func.func @llvm_none_test() -> token {
+                    %0 = llvm.mlir.none : token
+                    return %0 : token
                   }
                 }
             "},

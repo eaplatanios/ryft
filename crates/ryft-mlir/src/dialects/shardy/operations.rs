@@ -815,6 +815,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
+    use crate::dialects::shardy::ReductionOperation;
     use crate::{
         Attribute, Block, Context, DialectHandle, Operation, Region, Size, StringRef, Type, TypeAndAttributes,
     };
@@ -830,7 +831,8 @@ mod tests {
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let axis_ref = context.shardy_axis_ref("a", None).unwrap();
         let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
-        let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]).unwrap();
+        let tensor_sharding =
+            context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[], ReductionOperation::Sum).unwrap();
         let tensor_sharding_per_value = context.shardy_tensor_sharding_per_value(&[tensor_sharding]).unwrap();
         let manual_axes = context.shardy_manual_axes(&["a"]).unwrap();
         (tensor_sharding, tensor_sharding_per_value, manual_axes)
@@ -947,7 +949,9 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("a", 2).unwrap();
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
-        let out_sharding = context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[]).unwrap();
+        let out_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[], ReductionOperation::Sum)
+            .unwrap();
         let reduction_axes = test_operation_attribute(
             &context,
             indoc! {r#"
@@ -1093,10 +1097,22 @@ mod tests {
         let dimension_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
         let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
         let input_sharding = context
-            .shardy_tensor_sharding(mesh, &[dimension_sharding, empty_dimension_sharding], &[], &[])
+            .shardy_tensor_sharding(
+                mesh,
+                &[dimension_sharding, empty_dimension_sharding],
+                &[],
+                &[],
+                ReductionOperation::Sum,
+            )
             .unwrap();
         let output_sharding = context
-            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding, dimension_sharding], &[], &[])
+            .shardy_tensor_sharding(
+                mesh,
+                &[empty_dimension_sharding, dimension_sharding],
+                &[],
+                &[],
+                ReductionOperation::Sum,
+            )
             .unwrap();
         let params = test_operation_attribute(
             &context,
@@ -1417,10 +1433,12 @@ mod tests {
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let axis_ref = context.shardy_axis_ref("a", None).unwrap();
         let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
-        let input_sharding =
-            context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[axis_ref], &[]).unwrap();
-        let output_sharding =
-            context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[axis_ref]).unwrap();
+        let input_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[axis_ref], &[], ReductionOperation::Sum)
+            .unwrap();
+        let output_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[axis_ref], ReductionOperation::Sum)
+            .unwrap();
         let axes = test_operation_attribute(
             &context,
             indoc! {r#"
