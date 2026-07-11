@@ -270,34 +270,40 @@ impl<
                 filtered_captures.push(capture);
             }
         }
-        
-        /// Materializes the rebuilt atom identifier for `atom_id` in `builder`, memoizing the result in `mapped_atoms`
-        /// and lazily re-adding referenced capture constants with their re-indexed references. The `capture_index_map`
-        /// slot lookup cannot fail because the marking pass in [`ClosedProgram::without_unused_captures`] assigns a
-        /// slot to every capture referenced by any constant atom.
-        fn map_atom<T: Type, O: Operation<T>>(
+
+        /// Materializes the rebuilt atom identifiers for `atom_ids` in `builder`, memoizing the results in
+        /// `mapped_atoms` and lazily re-adding referenced capture constants with their re-indexed references.
+        /// The `capture_index_map` slot lookups cannot fail because the marking pass in
+        /// [`ClosedProgram::without_unused_captures`] assigns a slot to every capture
+        /// referenced by any constant atom.
+        fn map_atoms<T: Type, O: Operation<T>>(
             atoms: &[Atom<CaptureReference<T>>],
             capture_index_map: &[Option<usize>],
             builder: &mut ProgramBuilder<CaptureReference<T>, O>,
             mapped_atoms: &mut [Option<AtomId>],
-            atom_id: AtomId,
-        ) -> Result<AtomId, ProgramError> {
-            if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
-                return Ok(mapped);
-            }
-            match atoms.get(atom_id.index()) {
-                Some(Atom::Constant(capture_reference)) => {
-                    let rebuilt_index = capture_index_map[capture_reference.index()].unwrap();
-                    let mapped = builder
-                        .add_constant(CaptureReference::new(rebuilt_index, capture_reference.r#type().into_owned()));
-                    mapped_atoms[atom_id.index()] = Some(mapped);
-                    Ok(mapped)
-                }
-                Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
-                    "variable atom {atom_id} has no mapped input or instruction output",
-                ))),
-                None => Err(ProgramError::UnboundAtomId { id: atom_id }),
-            }
+            atom_ids: Vec<AtomId>,
+        ) -> Result<Vec<AtomId>, ProgramError> {
+            atom_ids
+                .into_iter()
+                .map(|atom_id| {
+                    if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
+                        return Ok(mapped);
+                    }
+                    match atoms.get(atom_id.index()) {
+                        Some(Atom::Constant(capture_reference)) => {
+                            let index = capture_index_map[capture_reference.index()].unwrap();
+                            let mapped = builder
+                                .add_constant(CaptureReference::new(index, capture_reference.r#type().into_owned()));
+                            mapped_atoms[atom_id.index()] = Some(mapped);
+                            Ok(mapped)
+                        }
+                        Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
+                            "variable atom {atom_id} has no mapped input or instruction output",
+                        ))),
+                        None => Err(ProgramError::UnboundAtomId { id: atom_id }),
+                    }
+                })
+                .collect()
         }
 
         // Rebuild the underlying program with the same structure, rewriting only the constant atoms. `mapped_atoms`
@@ -321,18 +327,13 @@ impl<
         // instructions (and the program outputs) can resolve them. The operations are moved into the rebuilt program.
         for instruction in instructions {
             let (operation, instruction_inputs, instruction_outputs) = instruction.into_parts();
-            let inputs = instruction_inputs
-                .into_iter()
-                .map(|input| {
-                    map_atom(
-                        atoms.as_slice(),
-                        capture_index_map.as_slice(),
-                        &mut builder,
-                        mapped_atoms.as_mut_slice(),
-                        input,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let inputs = map_atoms(
+                atoms.as_slice(),
+                capture_index_map.as_slice(),
+                &mut builder,
+                mapped_atoms.as_mut_slice(),
+                instruction_inputs,
+            )?;
             let outputs = builder.add_instruction(operation, inputs)?.to_vec();
             check_count!("output", outputs, instruction_outputs.len(), ProgramError);
             for (output, rebuilt_output) in instruction_outputs.into_iter().zip(outputs) {
@@ -342,22 +343,17 @@ impl<
             }
         }
 
-        // Program outputs may be inputs, instruction outputs, or captured constants, and so they are resolved through
-        // the same atom mapping as instruction operands.
-        let output_ids = output_ids
-            .into_iter()
-            .map(|output| {
-                map_atom(
-                    atoms.as_slice(),
-                    capture_index_map.as_slice(),
-                    &mut builder,
-                    mapped_atoms.as_mut_slice(),
-                    output,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // Program outputs may be inputs, instruction outputs, or captured constants, and so they are resolved
+        // through the same atom mapping as instruction operands.
+        let output_ids = map_atoms(
+            atoms.as_slice(),
+            capture_index_map.as_slice(),
+            &mut builder,
+            mapped_atoms.as_mut_slice(),
+            output_ids,
+        )?;
 
-        let program = builder.build::<Input, Output>(output_ids, input_structure, output_structure)?;
+        let program = builder.build(output_ids, input_structure, output_structure)?;
 
         // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, filtered_captures)
@@ -486,6 +482,8 @@ mod tests {
     use crate::types::{DataType, TypeError};
 
     use super::*;
+    
+    // TODO(eaplatanios): `test_closed_program_without_unused_captures`.
 
     #[derive(Clone, Debug)]
     struct TestAddOperation;
