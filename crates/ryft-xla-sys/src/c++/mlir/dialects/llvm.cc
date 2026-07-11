@@ -190,17 +190,6 @@ bool mlirTypeIsALlvmVoidType(MlirType type) {
   return isType<mlir::LLVM::LLVMVoidType>(type);
 }
 
-bool mlirTypeIsALlvmTokenType(MlirType type) {
-  return isType<mlir::LLVM::LLVMTokenType>(type);
-}
-
-MlirType mlirLlvmTokenTypeGet(MlirContext context) {
-  if (context.ptr == nullptr) {
-    return {nullptr};
-  }
-  return wrap(mlir::LLVM::LLVMTokenType::get(unwrap(context)));
-}
-
 bool mlirTypeIsALlvmLabelType(MlirType type) {
   return isType<mlir::LLVM::LLVMLabelType>(type);
 }

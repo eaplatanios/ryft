@@ -30,9 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added the `FeedbackDirectedProfile` wrapper for OpenXLA's XProf-to-feedback-directed-profile conversion and
   deterministic multi-profile aggregation used by profile-guided latency estimation, owning the profile bytes
   produced by the native profiler bridge.
+- Added `MemoryStatistics::peak_allocated_bytes` for the new `peak_allocated_bytes` device memory statistics fields.
+- Added support for PJRT HLO output callbacks through the new `HloOutputCallback` and `HloOutputOperand` wrappers
+  and a new `hlo_output_callbacks` parameter on `LoadedExecutable::execute`. In contrast to send and receive
+  callbacks, HLO output callbacks are provided as a single flat list that handles invocations across all replicas
+  and partitions of an execution.
+- Added `XlaTransformExtension::clear_transform` together with `Client::clear_xla_transform` and
+  `Plugin::clear_xla_transform` for the new `PJRT_Clear_Xla_Transform` extension function.
 
 ### Changed
 
+- Updated our PJRT C API bindings for version `0.113`.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
   handle wrappers that reflect PJRT's thread-safety contracts. Event callbacks now require `Send + 'static`, the
   unsafe `EventHandle` was replaced by the safe shared-ownership `EventPromise`, and asynchronous host-buffer
@@ -50,7 +58,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Required `KeyValueStore` implementations to be `Send + Sync` because PJRT may invoke their callbacks concurrently.
   `Client` now obtains its thread-safety structurally through a narrow native-handle wrapper instead of whole-type
   unsafe `Send` and `Sync` implementations.
-- Updated our PJRT C API bindings for version `0.111`.
 - Changed `Buffer::copy_to_host` to fall back to the buffer's reported on-device byte size when a PJRT plugin
   returns a successful host-copy size query without populating `dst_size`.
 - Changed `BufferSpecification` to carry a concrete `Layout`, materializing dense defaults during construction and

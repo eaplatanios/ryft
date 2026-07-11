@@ -143,4 +143,4 @@ build:rocm --linkopt=-Wl,--no-relax
 build:rocm --host_linkopt="-fuse-ld=lld"
 build:rocm --@local_config_rocm//rocm:rocm_path_type=hermetic
 build:rocm-7 --config=rocm
-build:rocm-7 --repo_env=ROCM_DISTRO_VERSION="rocm_7.12.0_gfx908"
+build:rocm-7 --repo_env=ROCM_DISTRO_VERSION="rocm_7.13.0_gfx908"

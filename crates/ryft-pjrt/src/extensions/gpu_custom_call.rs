@@ -494,7 +494,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+        let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
         let outputs = execution.block_until_ready().unwrap().remove(0);
         assert_eq!(outputs.outputs.len(), 1);
     }

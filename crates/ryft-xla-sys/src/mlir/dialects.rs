@@ -1,5 +1,6 @@
 pub mod affine;
 pub mod arith;
+pub mod builtin;
 pub mod gpu;
 pub mod llvm;
 pub mod mosaic;

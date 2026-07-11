@@ -84,6 +84,11 @@ pub struct GpuTopology {
     /// GPU target configuration.
     #[prost(message, optional, tag = "8")]
     pub gpu_target_config: Option<GpuTargetConfiguration>,
+
+    /// Number of devices per process. This can be smaller than the number of devices per host (e.g., when a host
+    /// contains multiple processes). If not set, it defaults to the number of devices per host.
+    #[prost(int32, optional, tag = "10")]
+    pub num_devices_per_process: Option<i32>,
 }
 
 /// Represents the type of data that can be stored in PJRT buffers. Specifically, this represents the type
@@ -207,6 +212,18 @@ pub enum BufferType {
     /// format with 8 exponent bits and no mantissa or sign bits. Only unsigned finite values are supported
     /// (thus the `FNU` suffix). Unlike IEEE floating-point types, infinity and NaN values are not supported.
     F8E8M0FNU = 33,
+
+    /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
+    /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+    /// format with 3 exponent bits and 2 mantissa bits. Only finite values are supported (thus the `FN` suffix).
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported.
+    F6E3M2FN = 35,
+
+    /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
+    /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+    /// format with 2 exponent bits and 3 mantissa bits. Only finite values are supported (thus the `FN` suffix).
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported.
+    F6E2M3FN = 36,
 
     /// [`BufferType`] that represents 16-bit floating-point values with 8 exponent bits, 7 mantissa bits, and 1 sign
     /// bit. This type offers a larger dynamic range than [`BufferType::F16`] at the cost of lower precision.
@@ -538,6 +555,31 @@ pub struct OpMetadataProfileInfo {
     pub profile_generation_strategy: i32,
 }
 
+/// Source of the data carried by a [`Payload`].
+///
+/// This type corresponds to `Payload.payload_source` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Oneof)]
+pub enum PayloadSource {
+    /// Inlined payload value.
+    #[prost(bytes, tag = "1")]
+    Value(Vec<u8>),
+
+    /// Reference to an entry in the `HloModuleProto.payloads` list.
+    #[prost(int64, tag = "2")]
+    Id(i64),
+}
+
+/// String payload that can be either stored inline (when small) or interned in the owning module's payloads list
+/// (when large).
+///
+/// This type corresponds to `Payload` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct Payload {
+    /// Source of the data carried by this payload.
+    #[prost(oneof = "PayloadSource", tags = "1, 2")]
+    pub payload_source: Option<PayloadSource>,
+}
+
 /// Symbolization metadata attached to an HLO operation.
 ///
 /// This type corresponds to `OpMetadata` in [XLA](https://github.com/openxla/xla).
@@ -600,6 +642,11 @@ pub struct OpMetadata {
     /// Scheduled instruction name for this operation.
     #[prost(string, tag = "16")]
     pub scheduling_name: String,
+
+    /// Metadata payload that may be stored inline as a value or by ID into the `HloModuleProto.payloads` list
+    /// during module serialization.
+    #[prost(message, optional, tag = "20")]
+    pub metadata_payload: Option<Payload>,
 }
 
 /// Axis in a device [`Mesh`].
@@ -616,6 +663,20 @@ pub struct MeshAxis {
     pub size: i64,
 }
 
+/// Transform applied to iota-generated device IDs to produce the device ordering of a [`Mesh`].
+///
+/// This type corresponds to `MeshProto.IotaTransform` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Eq, Hash, Message)]
+pub struct MeshIotaTransform {
+    /// Dimensions used to reshape the iota-generated device IDs.
+    #[prost(int64, repeated, tag = "1")]
+    pub reshape_dims: Vec<i64>,
+
+    /// Permutation applied after reshaping the iota-generated device IDs.
+    #[prost(int64, repeated, tag = "2")]
+    pub transpose_perm: Vec<i64>,
+}
+
 /// Logical mesh used by named shardings.
 ///
 /// This type corresponds to `MeshProto` in [XLA](https://github.com/openxla/xla).
@@ -628,6 +689,10 @@ pub struct Mesh {
     /// Optional explicit device ordering for the mesh.
     #[prost(int64, repeated, tag = "2")]
     pub device_ids: Vec<i64>,
+
+    /// Optional transform applied to iota-generated device IDs to produce the device ordering of the mesh.
+    #[prost(message, optional, tag = "3")]
+    pub iota_transform: Option<MeshIotaTransform>,
 }
 
 /// Sub-axis reference for a split mesh axis.
@@ -672,6 +737,22 @@ pub struct NamedShardingDimension {
     pub is_closed: bool,
 }
 
+/// Reduction operation applied along the unreduced axes of a [`NamedSharding`].
+///
+/// This type corresponds to `NamedShardingProto.ReductionOpProto` in [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum ReductionOperation {
+    /// Sum reduction.
+    Sum = 0,
+
+    /// Maximum reduction.
+    Max = 1,
+
+    /// Minimum reduction.
+    Min = 2,
+}
+
 /// Named sharding representation bound to a specific [`Mesh`].
 ///
 /// This type corresponds to `NamedShardingProto` in [XLA](https://github.com/openxla/xla).
@@ -693,6 +774,10 @@ pub struct NamedSharding {
     /// Mesh axes along which values are unreduced.
     #[prost(message, repeated, tag = "5")]
     pub unreduced_axes: Vec<AxisReference>,
+
+    /// Reduction operation applied along the unreduced axes.
+    #[prost(enumeration = "ReductionOperation", tag = "8")]
+    pub reduction_op: i32,
 
     /// Metadata that records the origin of this sharding.
     #[prost(message, repeated, tag = "6")]
@@ -858,6 +943,25 @@ pub struct ThunkBufferDebugFilter {
     pub profile_annotation_regexes: Vec<String>,
 }
 
+/// Filter that allows enabling NCCL symmetric buffers for a subset of collective operations based on their type,
+/// size, and operand type.
+///
+/// This type corresponds to `DebugOptions.CollectiveFilter` in [XLA](https://github.com/openxla/xla).
+#[derive(Clone, PartialEq, Message)]
+pub struct CollectiveFilter {
+    /// Type of collective operation to which this filter applies.
+    #[prost(enumeration = "CollectiveOperationType", tag = "1")]
+    pub collective: i32,
+
+    /// If set, only collective operations with size less than or equal to this value in bytes will be enabled.
+    #[prost(int64, optional, tag = "2")]
+    pub max_size_bytes: Option<i64>,
+
+    /// If set, only collective operations with this operand type will be enabled.
+    #[prost(enumeration = "BufferType", optional, tag = "3")]
+    pub op_type: Option<i32>,
+}
+
 /// Specifies which backends to enable auto-tuning for during compilation. Auto-tuning is the process of empirically
 /// testing different algorithm implementations to find the fastest one for a given operation on specific hardware.
 /// This enum controls which library backends are eligible for auto-tuning.
@@ -987,9 +1091,6 @@ pub enum CommandBufferCommandType {
     /// Dynamic slice fusion (i.e., fusion with dynamic indexing) operation.
     DynamicSliceFusion = 9,
 
-    /// Dynamic slice fusion operation with copy operations.
-    DynamicSliceCopyFusion = 10,
-
     /// Convolution operation.
     Convolution = 11,
 }
@@ -1036,6 +1137,29 @@ pub enum CommandBufferSchedulingMode {
     ConcurrentRegions = 3,
 }
 
+/// Controls when cuDNN fusions are compiled in "deviceless" mode, meaning driven purely by the device description
+/// without a live cuDNN handle. Deviceless compilation requires cuDNN version 9.8 or newer.
+///
+/// This type corresponds to `DebugOptions.CudnnDevicelessCompilationMode` in
+/// [XLA](https://github.com/openxla/xla).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Enumeration)]
+#[repr(i32)]
+pub enum CudnnDevicelessCompilationMode {
+    /// Deviceless cuDNN compilation behavior is unspecified.
+    Unset = 0,
+
+    /// Never use deviceless compilation; always require a live device.
+    Disabled = 1,
+
+    /// Use deviceless compilation only when no live device is available (e.g., ahead-of-time compilation);
+    /// use the device-dependent path otherwise.
+    Auto = 2,
+
+    /// Always use deviceless compilation, even when a live device is available. This provides a testing path
+    /// toward deprecating the device-dependent path.
+    Always = 3,
+}
+
 /// Controls how runtime verification checks behave when issues are detected. This enum is used by various detection
 /// mechanisms to specify whether to ignore issues, warn about them, or fail compilation/execution.
 ///
@@ -1051,6 +1175,9 @@ pub enum DetectionMode {
 
     /// Halt compilation or execution when issues are detected.
     Fail = 2,
+
+    /// Dump information about detected issues, while continuing execution.
+    Dump = 3,
 }
 
 /// Controls the usage of the `libnvjitlink` library for PTX linking on NVIDIA GPUs. `libnvjitlink` is NVIDIA's library
@@ -1207,6 +1334,9 @@ pub enum WhileLoopUnrolling {
     /// Automatically decide whether to unroll based on the presence of collective operations (i.e., loop unrolling
     /// is enabled if we have at least one collective operation in the loop body).
     AutoUnroll = 3,
+
+    /// Unroll only loops that are annotated with the `_xla_loop_unroll_strategy` attribute.
+    ManualUnroll = 4,
 }
 
 /// Controls XNNPACK graph fusion strategies for the XLA CPU backend. [XNNPACK](https://github.com/google/XNNPACK) is
@@ -1254,6 +1384,10 @@ pub struct DebugOptions {
     /// offloaded some computation to the host.
     #[prost(bool, optional, tag = "408")]
     pub xla_disable_automatic_host_compute_offload: Option<bool>,
+
+    /// If `true`, get-tuple-element instructions will be compacted when printing HLO.
+    #[prost(bool, optional, tag = "495")]
+    pub xla_dump_compact_gte: Option<bool>,
 
     /// If `false` some timers will be disabled. This is useful during auto-tuning to avoid timer overhead.
     #[prost(bool, optional, tag = "436")]
@@ -1359,6 +1493,11 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "120")]
     pub xla_cpu_fast_math_honor_nans: Option<bool>,
 
+    /// If `true`, flush-to-zero semantics will be enabled in the CPU backend, meaning that denormal floating-point
+    /// values will be flushed to zero. Defaults to `true` for backwards compatibility.
+    #[prost(bool, optional, tag = "493")]
+    pub xla_cpu_ftz: Option<bool>,
+
     /// If `true`, LLVM kernel entry points will be prefixed with the module name and converted to C-style names.
     /// This is useful for AOT compilation to avoid symbol collisions.
     #[prost(bool, optional, tag = "372")]
@@ -1393,9 +1532,17 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "479")]
     pub xla_enable_rgv3_materialization: Option<bool>,
 
+    /// Controls when cuDNN fusions are compiled in "deviceless" mode (i.e., without a live cuDNN handle).
+    #[prost(enumeration = "CudnnDevicelessCompilationMode", optional, tag = "505")]
+    pub xla_gpu_cudnn_deviceless_compilation_mode: Option<i32>,
+
     /// Filter limiting thunk buffer debug instrumentation to specific thunks.
     #[prost(message, optional, tag = "424")]
     pub xla_gpu_experimental_thunk_buffer_debug_filter: Option<ThunkBufferDebugFilter>,
+
+    /// Filters that enable NCCL symmetric buffers for specific collective operation types and sizes.
+    #[prost(message, repeated, tag = "503")]
+    pub xla_enable_nccl_symmetric_buffers_for_collectives: Vec<CollectiveFilter>,
 
     /// If `true`, an `HloUnoptimizedSnapshot` (serialized unoptimized module plus inputs) will be dumped for each
     /// HLO module run.
@@ -1485,11 +1632,6 @@ pub struct DebugOptions {
     #[prost(enumeration = "CollectivesMode", optional, tag = "473")]
     pub xla_gpu_collective_permute_mode: Option<i32>,
 
-    /// If `true`, collective cliques will not be locked for each XLA GPU execution, using permanent cliques instead.
-    /// This disables deadlock prevention.
-    #[prost(bool, optional, tag = "354")]
-    pub xla_gpu_collectives_use_persistent_cliques: Option<bool>,
-
     /// Command buffer scheduling mode.
     #[prost(enumeration = "CommandBufferSchedulingMode", optional, tag = "404")]
     pub xla_gpu_command_buffer_scheduling_mode: Option<i32>,
@@ -1571,6 +1713,11 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "254")]
     pub xla_gpu_enable_all_gather_combine_by_dim: Option<bool>,
 
+    /// If `true`, spatial partitioning of the GPU BFC allocator will be enabled so that default and collective
+    /// allocations share one fixed address range. This requires BFC preallocation.
+    #[prost(bool, optional, tag = "494")]
+    pub xla_gpu_enable_allocator_spatial_partitioning: Option<bool>,
+
     /// If `true`, the analytical latency cost model will be enabled.
     #[prost(bool, optional, tag = "255")]
     pub xla_gpu_enable_analytical_latency_estimator: Option<bool>,
@@ -1583,13 +1730,14 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "305")]
     pub xla_gpu_enable_approx_costly_collectives: Option<bool>,
 
+    /// Types of collective operations that are executed in command buffers. Only collective operations specified in
+    /// this filter will be executed in a command buffer. Defaults to [`CollectiveOperationType::AllCollectives`].
+    #[prost(enumeration = "CollectiveOperationType", repeated, tag = "497")]
+    pub xla_gpu_enable_collectives_command_buffer_filter: Vec<i32>,
+
     /// Types of commands that are recorded into command buffers.
     #[prost(enumeration = "CommandBufferCommandType", repeated, tag = "258")]
     pub xla_gpu_enable_command_buffer: Vec<i32>,
-
-    /// If `true`, command buffer thunks will use fixed virtual addresses across executions.
-    #[prost(bool, optional, tag = "464")]
-    pub xla_gpu_enable_command_buffer_va_remapping: Option<bool>,
 
     /// If `true`, radix sort using CUB will be enabled.
     #[prost(bool, optional, tag = "259")]
@@ -1606,6 +1754,11 @@ pub struct DebugOptions {
     /// If `true`, layer norm patterns will be rewritten into cuDNN library calls.
     #[prost(bool, optional, tag = "262")]
     pub xla_gpu_enable_cudnn_layer_norm: Option<bool>,
+
+    /// If `true`, `broadcast(0)` scan-accumulator initializers will be replaced with `AllocateBuffer` when the loop
+    /// body's dynamic-update-slice covers every slot.
+    #[prost(bool, optional, tag = "490")]
+    pub xla_gpu_enable_dus_accumulator_zero_init_elimination: Option<bool>,
 
     /// If `true`, address computation fusion will be enabled to optimize dynamic-slice and dynamic-update-slice
     /// operations around library calls.
@@ -1633,10 +1786,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "269")]
     pub xla_gpu_enable_libnvptxcompiler: Option<bool>,
 
-    /// If `true`, LLVM module compilation will be parallelized.
-    #[prost(bool, optional, tag = "268")]
-    pub xla_gpu_enable_llvm_module_compilation_parallelism: Option<bool>,
-
     /// If `true`, NCCL communicator splitting will be enabled.
     #[prost(bool, optional, tag = "272")]
     pub xla_gpu_enable_nccl_comm_splitting: Option<bool>,
@@ -1645,9 +1794,18 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "267")]
     pub xla_gpu_enable_nccl_user_buffers: Option<bool>,
 
+    /// If `true`, NCCL user buffers will be registered without moving buffers to the collective memory space.
+    #[prost(bool, optional, tag = "506")]
+    pub xla_gpu_enable_nccl_user_buffers_in_default_space: Option<bool>,
+
     /// If `true`, programmatic dependent launch (PDL) will be enabled on supported GPUs.
     #[prost(bool, optional, tag = "460")]
     pub xla_gpu_enable_pdl: Option<bool>,
+
+    /// If `true`, selective insertion of PDL launch instructions will be enabled, on top of the basic use of PDL
+    /// enabled by [`Self::xla_gpu_enable_pdl`].
+    #[prost(bool, optional, tag = "504")]
+    pub xla_gpu_enable_pdl_launch: Option<bool>,
 
     /// If `true`, pipelined all-gather operations will be enabled.
     #[prost(bool, optional, tag = "227")]
@@ -1753,7 +1911,9 @@ pub struct DebugOptions {
     #[prost(string, optional, tag = "407")]
     pub xla_gpu_experimental_autotuner_cache_dir: Option<String>,
 
-    /// If `true`, GEMM and convolution autotuning will run after fusion passes.
+    /// Deprecated option that used to consolidate all autotuning after fusion passes.
+    /// Autotuning after fusion is now always enabled.
+    #[deprecated]
     #[prost(bool, optional, tag = "481")]
     pub xla_gpu_experimental_autotune_post_fusion: Option<bool>,
 
@@ -1818,11 +1978,6 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "406")]
     pub xla_gpu_experimental_enable_nccl_symmetric_buffers: Option<bool>,
 
-    /// If `true`, NVSHMEM will be enabled. This must be set via the `XLA_FLAGS` environment variable before the XLA
-    /// client is initialized.
-    #[prost(bool, optional, tag = "388")]
-    pub xla_gpu_experimental_enable_nvshmem: Option<bool>,
-
     /// If `true`, fusion for subchannel dequantization sequences will be enabled.
     #[prost(bool, optional, tag = "368")]
     pub xla_gpu_experimental_enable_subchannel_dequantisation_fusion: Option<bool>,
@@ -1851,9 +2006,18 @@ pub struct DebugOptions {
     #[prost(bool, optional, tag = "362")]
     pub xla_gpu_experimental_pack_dot_operands_along_k_dimension: Option<bool>,
 
-    /// If `true`, experimental zero-copy ragged all-to-all will be enabled.
+    /// Deprecated option that used to enable experimental zero-copy ragged all-to-all and is now a no-op.
+    #[deprecated]
     #[prost(bool, optional, tag = "480")]
     pub xla_gpu_experimental_ragged_all_to_all_zero_copy: Option<bool>,
+
+    /// If `true`, the GXL (GPU Collective Library) backend will be enabled for collective operations.
+    #[prost(bool, optional, tag = "513")]
+    pub xla_gpu_enable_gxl_ragged_all_to_all: Option<bool>,
+
+    /// Scratch buffer size in bytes for GXL collective operations.
+    #[prost(int64, optional, tag = "514")]
+    pub xla_gpu_gxl_scratch_size_bytes: Option<i64>,
 
     /// Maximum amount of async-compute overlap that the GPU runtime should try to exploit.
     #[prost(int32, optional, tag = "465")]
@@ -1870,10 +2034,6 @@ pub struct DebugOptions {
     /// If `true`, stream annotation will be enabled.
     #[prost(bool, optional, tag = "342")]
     pub xla_gpu_experimental_stream_annotation: Option<bool>,
-
-    /// If `true`, the auto-tuner pass will be used to autotune fusions instead of the `gemm_fusion_autotuner`.
-    #[prost(bool, optional, tag = "396")]
-    pub xla_gpu_experimental_use_autotuner_pass: Option<bool>,
 
     /// If `true`, the ragged dot fusion emitter will be used rather than expanding to a regular dot.
     #[prost(bool, optional, tag = "401")]
@@ -2029,6 +2189,10 @@ pub struct DebugOptions {
     #[prost(string, optional, tag = "210")]
     pub xla_gpu_pgle_profile_file_or_directory_path: Option<String>,
 
+    /// Extra flags to pass to the `ptxas` compiler (e.g., `"--maxregcount=32"`).
+    #[prost(string, repeated, tag = "491")]
+    pub xla_gpu_ptx_compiler_extra_flags: Vec<String>,
+
     /// Paths to files containing PTX code.
     #[prost(string, repeated, tag = "127")]
     pub xla_gpu_ptx_file: Vec<String>,
@@ -2063,10 +2227,6 @@ pub struct DebugOptions {
     /// If `true`, auto-tuning work will be sharded across participating compiler processes.
     #[prost(bool, optional, tag = "304")]
     pub xla_gpu_shard_autotuning: Option<bool>,
-
-    /// If `true`, compilation will abort immediately when the convolution algorithm picker fails.
-    #[prost(bool, optional, tag = "156")]
-    pub xla_gpu_strict_conv_algorithm_picker: Option<bool>,
 
     /// Path to a file containing target platform description in `GpuTargetConfigProto` format for deviceless
     /// compilation.
@@ -2129,6 +2289,11 @@ pub struct DebugOptions {
     /// If `true`, all HLO passes will be disabled. **Warning:** This may break compiler invariants.
     #[prost(bool, optional, tag = "104")]
     pub xla_disable_all_hlo_passes: Option<bool>,
+
+    /// HLO passes will be run starting from the pass with this name, and all prior passes in the pipeline will be
+    /// skipped. If empty, no passes are skipped.
+    #[prost(string, optional, tag = "496")]
+    pub xla_run_hlo_passes_starting_from: Option<String>,
 
     /// Numerical backend optimization level (similar to `-O` flags in compilers).
     #[prost(int32, optional, tag = "31")]
@@ -2235,6 +2400,10 @@ pub struct DebugOptions {
     /// If `true`, HLO will be dumped as a URL (for visualization services).
     #[prost(bool, optional, tag = "115")]
     pub xla_dump_hlo_as_url: Option<bool>,
+
+    /// If `true`, HLO will be dumped in [Riegeli](https://github.com/google/riegeli) format.
+    #[prost(bool, optional, tag = "498")]
+    pub xla_dump_hlo_as_riegeli: Option<bool>,
 
     /// If `true`, HLO will be dumped as HTML (DOT rendered to SVG and inlined).
     #[prost(bool, optional, tag = "116")]
@@ -2351,6 +2520,11 @@ pub struct DebugOptions {
     /// Detection mode for infinity values on GPU.
     #[prost(enumeration = "DetectionMode", optional, tag = "428")]
     pub xla_gpu_detect_inf: Option<i32>,
+
+    /// If `true`, runtime instrumentation (float checks, checksums, and buffer saving) will be enabled on all output
+    /// buffers of an XLA module after all computation has finished.
+    #[prost(bool, optional, tag = "492")]
+    pub xla_gpu_experimental_thunk_buffer_debug_module_outputs: Option<bool>,
 
     /// If `true`, large constants will be printed in HLO dumps.
     #[prost(bool, optional, tag = "290")]
@@ -3318,6 +3492,22 @@ pub struct GpuDeviceInformation {
     /// If `true`, error-correcting code (ECC) is enabled on this GPU.
     #[prost(bool, tag = "42")]
     pub ecc_enabled: bool,
+
+    /// Device memory clock rate in GHz.
+    #[prost(float, tag = "43")]
+    pub memory_clock_rate_ghz: f32,
+
+    /// Amount of shared memory per block reserved by the driver in bytes.
+    #[prost(int64, tag = "44")]
+    pub reserved_shared_memory_per_block_in_bytes: i64,
+
+    /// Maximum number of blocks that can reside concurrently on a single streaming multiprocessor/compute unit.
+    #[prost(int64, tag = "45")]
+    pub max_blocks_per_multiprocessor: i64,
+
+    /// Allocation granularity for collective memory in bytes.
+    #[prost(int64, tag = "46")]
+    pub collective_memory_granularity_in_bytes: i64,
 
     /// Compute capability of the device specifying the GPU architecture and its supported features.
     #[prost(oneof = "GpuComputeCapability", tags = "16, 17")]

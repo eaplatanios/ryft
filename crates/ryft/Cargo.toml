@@ -37,9 +37,8 @@ ryft-pjrt = { workspace = true, optional = true }
 ryft-xla = { workspace = true, optional = true }
 
 [features]
-default = ["ndarray", "xla"]
+default = ["xla"]
 xla = ["ryft-mlir", "ryft-pjrt", "ryft-xla"]
-ndarray = ["ryft-xla/ndarray"]
 cuda-12 = ["ryft-xla/cuda-12"]
 cuda-13 = ["ryft-xla/cuda-13"]
 rocm-7 = ["ryft-xla/rocm-7"]

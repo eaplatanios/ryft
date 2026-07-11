@@ -769,7 +769,7 @@ mod tests {
                         ],
                         ..Default::default()
                     };
-                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
                     let mut outputs = execution.block_until_ready().unwrap();
                     assert_eq!(outputs.len(), 1);
                     let mut outputs = outputs.remove(0);

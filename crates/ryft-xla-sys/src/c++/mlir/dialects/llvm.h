@@ -110,9 +110,6 @@ RYFT_XLA_SYS_EXPORT MlirAttribute mlirLlvmZeroAttrGet(MlirContext context);
 
 RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmVoidType(MlirType type);
 
-RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmTokenType(MlirType type);
-RYFT_XLA_SYS_EXPORT MlirType mlirLlvmTokenTypeGet(MlirContext context);
-
 RYFT_XLA_SYS_EXPORT bool mlirTypeIsALlvmLabelType(MlirType type);
 RYFT_XLA_SYS_EXPORT MlirType mlirLlvmLabelTypeGet(MlirContext context);
 

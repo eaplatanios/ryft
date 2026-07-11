@@ -807,6 +807,10 @@ impl<'c> LoadedExecutable<'c> {
     ///     If `device` is not [`None`], this must contain exactly one entry corresponding to that [`Device`].
     ///     Otherwise, the length of this slice must match the length of [`LoadedExecutable::addressable_devices`]
     ///     for this [`LoadedExecutable`].
+    ///   - `hlo_output_callbacks`: [`HloOutputCallback`]s to use for HLO output callback custom calls in the
+    ///     corresponding [`Program`]. In contrast to the [`SendCallback`]s and [`ReceiveCallback`]s provided
+    ///     through `inputs`, each [`HloOutputCallback`] handles invocations across all replicas and partitions
+    ///     of the execution and so this is a single flat list for the whole execution.
     ///   - `launch_id`: Identifier for this execution/launch as part of a potentially multi-device launch. This can be
     ///     used to detect scheduling errors (e.g. if multi-host programs are launched in different orders on different
     ///     hosts, the launch IDs may be used by the runtime to detect the mismatch).
@@ -830,6 +834,7 @@ impl<'c> LoadedExecutable<'c> {
     pub fn execute<'l>(
         &self,
         inputs: Vec<ExecutionDeviceInputs<'c, 'l>>,
+        hlo_output_callbacks: Vec<HloOutputCallback>,
         launch_id: usize,
         context: Option<ExecutionContext>,
         call_location: Option<&str>,
@@ -923,6 +928,20 @@ impl<'c> LoadedExecutable<'c> {
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut ReceiveCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
+        // We handle HLO output callbacks in the same way as send and receive callbacks, except that they are flat
+        // (i.e., not per-device) and so their owned state must be freed only after execution completes on _all_
+        // participating devices. We achieve that by moving the owned callbacks behind an [`Arc`] whose clones are
+        // dropped by the per-device completion events.
+        let hlo_output_callback_count = hlo_output_callbacks.len();
+        let mut hlo_output_callback_infos =
+            hlo_output_callbacks.into_iter().map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>();
+        let hlo_output_callbacks = Arc::new(Mutex::new(
+            hlo_output_callback_infos
+                .iter()
+                .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
+                .collect::<Vec<_>>(),
+        ));
+
         let non_donatable_input_indices = input_is_donatable
             .into_iter()
             .enumerate()
@@ -959,6 +978,8 @@ impl<'c> LoadedExecutable<'c> {
             incarnation_ids_list.as_mut_ptr(),
             // TODO(eaplatanios): Add support for multi-slice configurations along with the relevant PJRT extension.
             std::ptr::null_mut(),
+            hlo_output_callback_infos.as_mut_ptr(),
+            hlo_output_callback_count,
         );
 
         // We prepare the input buffer handles array. This is an array of [`Buffer`] handle arrays where the outer
@@ -1003,12 +1024,16 @@ impl<'c> LoadedExecutable<'c> {
             let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
             let send_callbacks = std::mem::take(&mut send_callbacks[device_index]);
             let receive_callbacks = std::mem::take(&mut receive_callbacks[device_index]);
-            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() {
+            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callback_count > 0 {
                 // Move the owned callback allocations into the event completion handler so that they
-                // are released *only after* the runtime signals the device execution is done.
+                // are released *only after* the runtime signals the device execution is done. HLO output
+                // callbacks are shared across all devices and so each device holds one clone of the [`Arc`],
+                // releasing the callbacks only after the last device execution is done.
+                let hlo_output_callbacks = Arc::clone(&hlo_output_callbacks);
                 done_event.on_ready(move |_| {
                     drop(send_callbacks);
                     drop(receive_callbacks);
+                    drop(hlo_output_callbacks);
                 })?
             }
 
@@ -1411,6 +1436,108 @@ impl ReceiveCallback {
             channel_id: self.channel_id as i64,
             user_arg: Box::into_raw(Box::new(self)) as *mut _,
             recv_callback: callback,
+        }
+    }
+}
+
+/// Single operand value passed to an [`HloOutputCallback`] invocation. The runtime invokes the callback function once
+/// per operand of the corresponding callback custom call, for each replica and partition of the execution, and each
+/// invocation receives one [`HloOutputOperand`].
+pub struct HloOutputOperand<'a> {
+    /// ID of the replica that produced this operand value.
+    pub replica_id: ReplicaId,
+
+    /// ID of the computation (i.e., partition) that produced this operand value.
+    pub computation_id: ComputationId,
+
+    /// Index of this operand among the operands of the corresponding callback custom call.
+    pub operand_index: usize,
+
+    /// [`BufferType`] of the elements of this operand value. This is set to [`BufferType::Invalid`] when the runtime
+    /// did not produce a value for this operand (in which case [`HloOutputOperand::data`] is [`None`]).
+    pub element_type: BufferType,
+
+    /// Dimensions of this operand value.
+    pub dimensions: &'a [i64],
+
+    /// Dense row-major bytes of this operand value, or [`None`] if the runtime did not produce a value for this
+    /// operand. The data is only valid for the duration of the callback invocation and must be copied if it needs
+    /// to be retained.
+    pub data: Option<&'a [u8]>,
+}
+
+/// Callback function that is invoked from the runtime when executing HLO output callback custom calls in [`Program`]s.
+/// The callback ID used in the [`Program`] must match [`HloOutputCallback::callback_id`] for the callback. In contrast
+/// to [`SendCallback`]s and [`ReceiveCallback`]s which are provided per [`Device`], a single [`HloOutputCallback`]
+/// handles invocations across all replicas and partitions of an execution.
+pub struct HloOutputCallback {
+    /// Callback ID that is used to identify the [`Program`] callback custom call for which this callback will
+    /// be invoked.
+    pub callback_id: usize,
+
+    /// Number of operands that the corresponding [`Program`] callback custom call passes to this callback.
+    pub operand_count: usize,
+
+    /// Callback function that is invoked once per operand of the corresponding callback custom call, for each replica
+    /// and partition of the execution. Note that there is no guarantee on the order of the invocations across replicas
+    /// and partitions, and the provided [`HloOutputOperand::data`] is only valid for the duration of each invocation.
+    pub function: Box<dyn FnMut(HloOutputOperand<'_>) + Send>,
+}
+
+impl HloOutputCallback {
+    /// Returns the [`PJRT_HloOutputCallbackInfo`](ffi::PJRT_HloOutputCallbackInfo) that corresponds to this
+    /// [`HloOutputCallback`] and which can be passed to functions in the PJRT C API.
+    ///
+    /// # Safety
+    ///
+    /// This function consumes this callback returning a [`PJRT_HloOutputCallbackInfo`](ffi::PJRT_HloOutputCallbackInfo)
+    /// that owns the underlying callback state. The returned [`PJRT_HloOutputCallbackInfo::user_arg`] must be freed
+    /// after the execution that uses this callback completes. The [`LoadedExecutable::execute`] implementation handles
+    /// this by tying cleanup to the execution completion events.
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) unsafe fn to_c_api(self) -> ffi::PJRT_HloOutputCallbackInfo {
+        unsafe extern "C" fn callback(
+            replica_id: i64,
+            partition_id: i64,
+            data: *const std::ffi::c_void,
+            shape_dims: *const i64,
+            shape_num_dims: usize,
+            shape_element_type: crate::buffers::ffi::PJRT_Buffer_Type,
+            operand_index: i64,
+            user_arg: *mut std::ffi::c_void,
+        ) {
+            unsafe {
+                let user_arg = &mut *(user_arg as *mut HloOutputCallback);
+                let element_type = BufferType::from_c_api(shape_element_type);
+                let dimensions = slice_from_c_api(shape_dims, shape_num_dims);
+                let data = if data.is_null() {
+                    None
+                } else {
+                    // The runtime only provides non-null data pointers together with valid element types.
+                    let element_size = element_type
+                        .element_size_in_bytes()
+                        .expect("PJRT provided HLO output callback data with an invalid element type");
+                    let element_count = dimensions.iter().product::<i64>() as usize;
+                    Some(std::slice::from_raw_parts(data as *const u8, element_size * element_count))
+                };
+                (user_arg.function)(HloOutputOperand {
+                    replica_id: replica_id as ReplicaId,
+                    computation_id: partition_id as ComputationId,
+                    operand_index: operand_index as usize,
+                    element_type,
+                    dimensions,
+                    data,
+                });
+            }
+        }
+
+        let callback_id = self.callback_id as i64;
+        let num_operands = self.operand_count;
+        ffi::PJRT_HloOutputCallbackInfo {
+            user_arg: Box::into_raw(Box::new(self)) as *mut _,
+            callback,
+            callback_id,
+            num_operands,
         }
     }
 }
@@ -2549,6 +2676,25 @@ pub(crate) mod ffi {
         pub recv_callback: PJRT_RecvCallback,
     }
 
+    pub type PJRT_HloOutputCallback = unsafe extern "C" fn(
+        replica_id: i64,
+        partition_id: i64,
+        data: *const std::ffi::c_void,
+        shape_dims: *const i64,
+        shape_num_dims: usize,
+        shape_element_type: crate::buffers::ffi::PJRT_Buffer_Type,
+        operand_index: i64,
+        user_arg: *mut std::ffi::c_void,
+    );
+
+    #[repr(C)]
+    pub struct PJRT_HloOutputCallbackInfo {
+        pub user_arg: *mut std::ffi::c_void,
+        pub callback: PJRT_HloOutputCallback,
+        pub callback_id: i64,
+        pub num_operands: usize,
+    }
+
     // We represent opaque C types as structs with a particular structure that is following the convention
     // suggested in [the Rustonomicon](https://doc.rust-lang.org/nomicon/ffi.html#representing-opaque-structs).
     #[repr(C)]
@@ -2619,6 +2765,8 @@ pub(crate) mod ffi {
         pub incarnation_ids: *mut i64,
         pub multi_slice_config: *mut PJRT_MultiSlice_Config,
         pub use_major_to_minor_data_layout_for_callbacks: bool,
+        pub hlo_output_callbacks: *mut PJRT_HloOutputCallbackInfo,
+        pub num_hlo_output_callbacks: usize,
     }
 
     impl PJRT_ExecuteOptions {
@@ -2637,6 +2785,8 @@ pub(crate) mod ffi {
             task_ids: *mut std::ffi::c_int,
             incarnation_ids: *mut i64,
             multi_slice_config: *mut PJRT_MultiSlice_Config,
+            hlo_output_callbacks: *mut PJRT_HloOutputCallbackInfo,
+            num_hlo_output_callbacks: usize,
         ) -> Self {
             Self {
                 struct_size: size_of::<Self>(),
@@ -2655,6 +2805,8 @@ pub(crate) mod ffi {
                 incarnation_ids,
                 multi_slice_config,
                 use_major_to_minor_data_layout_for_callbacks: false,
+                hlo_output_callbacks,
+                num_hlo_output_callbacks,
             }
         }
     }
@@ -3188,7 +3340,7 @@ mod tests {
             };
 
             // Execute the test program using our two input tensors.
-            let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
             // Wait for the asynchronous execution to complete through its shared fence. Clones observe the
             // recorded completion result without attempting to consume the PJRT events a second time.
@@ -3242,6 +3394,73 @@ mod tests {
     }
 
     #[test]
+    fn test_hlo_output_callback_to_c_api() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+        let callback = HloOutputCallback {
+            callback_id: 42,
+            operand_count: 2,
+            function: Box::new(move |operand: HloOutputOperand<'_>| {
+                received_clone.lock().unwrap().push((
+                    operand.replica_id,
+                    operand.computation_id,
+                    operand.operand_index,
+                    operand.element_type,
+                    operand.dimensions.to_vec(),
+                    operand.data.map(|data| data.to_vec()),
+                ));
+            }),
+        };
+        let callback_info = unsafe { callback.to_c_api() };
+        assert_eq!(callback_info.callback_id, 42);
+        assert_eq!(callback_info.num_operands, 2);
+
+        // Invoke the C callback directly, simulating a runtime invocation with data for the first operand and
+        // a missing value for the second operand.
+        let data = [1i32, 2, 3, 4, 5, 6];
+        let dimensions = [2i64, 3];
+        unsafe {
+            (callback_info.callback)(
+                0,
+                1,
+                data.as_ptr() as *const _,
+                dimensions.as_ptr(),
+                dimensions.len(),
+                crate::buffers::ffi::PJRT_Buffer_Type_S32,
+                0,
+                callback_info.user_arg,
+            );
+            (callback_info.callback)(
+                0,
+                1,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                crate::buffers::ffi::PJRT_Buffer_Type_INVALID,
+                1,
+                callback_info.user_arg,
+            );
+        }
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(received[0].0, 0);
+        assert_eq!(received[0].1, 1);
+        assert_eq!(received[0].2, 0);
+        assert_eq!(received[0].3, BufferType::I32);
+        assert_eq!(received[0].4, vec![2, 3]);
+        let expected_data = data.iter().flat_map(|value| value.to_ne_bytes()).collect::<Vec<_>>();
+        assert_eq!(received[0].5, Some(expected_data));
+        assert_eq!(received[1].2, 1);
+        assert_eq!(received[1].3, BufferType::Invalid);
+        assert!(received[1].4.is_empty());
+        assert_eq!(received[1].5, None);
+
+        // Free the callback state that `to_c_api` leaked into `user_arg`.
+        drop(unsafe { Box::from_raw(callback_info.user_arg as *mut HloOutputCallback) });
+    }
+
+    #[test]
     fn test_loaded_executable_execute_validation_errors() {
         let plugin = test_cpu_plugin();
         let client = plugin.api().client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
@@ -3261,7 +3480,7 @@ mod tests {
 
         // [`LoadedExecutable::execute`] expects a [`Vec`] of inputs per device.
         assert!(matches!(
-            executable.execute(Vec::new(), 0, None, None, None, None),
+            executable.execute(Vec::new(), vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected inputs for 2 device(s) but got inputs for 0 device(s)",
         ));
@@ -3282,7 +3501,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs[..1], ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 2 input(s) for each device but got 1 for device 1",
         ));
@@ -3298,7 +3517,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 1 send callback(s) for each device but got 0 for device 1",
         ));
@@ -3314,7 +3533,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "expected 1 receive callback(s) for each device but got 0 for device 1",
         ));
@@ -3325,7 +3544,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, Some("invalid\0location"), None, None),
+            executable.execute(inputs, vec![], 0, None, Some("invalid\0location"), None, None),
             Err(Error::InvalidArgument { message, .. }) if message == "nul byte found in provided data at position: 7",
         ));
 
@@ -3345,7 +3564,7 @@ mod tests {
             ExecutionDeviceInputs { inputs: &device_1_inputs, ..Default::default() },
         ];
         assert!(matches!(
-            executable.execute(inputs, 0, None, None, None, None),
+            executable.execute(inputs, vec![], 0, None, None, None, None),
             Err(Error::InvalidArgument { message, .. })
                 if message == "input 0 is not marked consistently across all devices as donatable or non-donatable",
         ));
@@ -3419,7 +3638,7 @@ mod tests {
                     };
 
                     // Execute the test program using our two input tensors.
-                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
                     let mut outputs = execution.block_until_ready().unwrap();
@@ -3521,7 +3740,7 @@ mod tests {
                     };
 
                     // Execute the test program using our input tensor.
-                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
                     let mut outputs = execution.block_until_ready().unwrap();
@@ -3637,7 +3856,7 @@ mod tests {
                     };
 
                     // Execute the test program.
-                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], vec![], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
                     let mut outputs = execution.block_until_ready().unwrap();

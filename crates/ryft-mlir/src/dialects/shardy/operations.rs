@@ -1,10 +1,11 @@
 use crate::{
-    Attribute, AttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error, Location, Operation, OperationBuilder,
-    StringRef, Type, Value, ValueRef, mlir_op, mlir_op_trait,
+    Attribute, AttributeRef, DetachedOp, DetachedRegion, DialectHandle, Error, IntegerAttributeRef, Location,
+    Operation, OperationBuilder, StringRef, Type, Value, ValueRef, mlir_op, mlir_op_trait,
 };
 
 use super::attributes::{
-    ManualAxesAttributeRef, MeshAttributeRef, TensorShardingAttributeRef, TensorShardingPerValueAttributeRef,
+    ManualAxesAttributeRef, MeshAttributeRef, ReductionOperation, TensorShardingAttributeRef,
+    TensorShardingPerValueAttributeRef,
 };
 
 /// Name of the [`Attribute`] that is used to store [`AllGatherOperation::gathering_axes`].
@@ -86,6 +87,10 @@ pub fn all_gather<
 /// Name of the [`Attribute`] that is used to store [`AllReduceOperation::reduction_axes`].
 pub const REDUCTION_AXES_ATTRIBUTE: &str = "reduction_axes";
 
+/// Name of the [`Attribute`] that is used to store [`AllReduceOperation::reduction_operation`] and
+/// [`ReduceScatterOperation::reduction_operation`].
+pub const REDUCTION_OP_ATTRIBUTE: &str = "reduction_op";
+
 /// Shardy [`Operation`] that reduces a tensor across axes and keeps the same sharding rank.
 ///
 /// Refer to the [official Shardy documentation](https://openxla.org/shardy/sdy_dialect#sdyall_reduce_sdyallreduceop)
@@ -105,6 +110,24 @@ pub trait AllReduceOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
                 self.name().as_str().unwrap_or("<unknown>"),
             ))
         })
+    }
+
+    /// Returns the [`ReductionOperation`] of this [`AllReduceOperation`]. The underlying `reduction_op` attribute is
+    /// optional and this function returns [`ReductionOperation::Sum`] when that attribute is not set.
+    fn reduction_operation(&self) -> Result<ReductionOperation, Error> {
+        match self.attribute(REDUCTION_OP_ATTRIBUTE)? {
+            None => Ok(ReductionOperation::Sum),
+            Some(attribute) => {
+                let attribute = attribute.cast::<IntegerAttributeRef>().ok_or_else(|| {
+                    Error::invalid_argument(format!(
+                        "invalid `{}` attribute in `{}`",
+                        REDUCTION_OP_ATTRIBUTE,
+                        self.name().as_str().unwrap_or("<unknown>"),
+                    ))
+                })?;
+                ReductionOperation::from_c_api(attribute.signless_value() as u32)
+            }
+        }
     }
 
     /// Returns the output sharding payload of this [`AllReduceOperation`].
@@ -137,14 +160,23 @@ pub fn all_reduce<
 >(
     input: V,
     reduction_axes: A,
+    reduction_operation: ReductionOperation,
     out_sharding: TensorShardingAttributeRef<'c, 't>,
     output_type: T,
     location: L,
 ) -> Result<DetachedAllReduceOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::shardy()?)?;
-    OperationBuilder::new("sdy.all_reduce", location)
+    let context = location.context();
+    context.load_dialect(DialectHandle::shardy()?)?;
+    let mut builder = OperationBuilder::new("sdy.all_reduce", location)
         .add_operand(input)
-        .add_attribute(REDUCTION_AXES_ATTRIBUTE, reduction_axes)
+        .add_attribute(REDUCTION_AXES_ATTRIBUTE, reduction_axes);
+    if reduction_operation != ReductionOperation::Sum {
+        builder = builder.add_attribute(
+            REDUCTION_OP_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), reduction_operation as i64),
+        );
+    }
+    builder
         .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
         .add_result(output_type)
         .build()
@@ -503,6 +535,24 @@ pub trait ReduceScatterOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         })
     }
 
+    /// Returns the [`ReductionOperation`] of this [`ReduceScatterOperation`]. The underlying `reduction_op` attribute
+    /// is optional and this function returns [`ReductionOperation::Sum`] when that attribute is not set.
+    fn reduction_operation(&self) -> Result<ReductionOperation, Error> {
+        match self.attribute(REDUCTION_OP_ATTRIBUTE)? {
+            None => Ok(ReductionOperation::Sum),
+            Some(attribute) => {
+                let attribute = attribute.cast::<IntegerAttributeRef>().ok_or_else(|| {
+                    Error::invalid_argument(format!(
+                        "invalid `{}` attribute in `{}`",
+                        REDUCTION_OP_ATTRIBUTE,
+                        self.name().as_str().unwrap_or("<unknown>"),
+                    ))
+                })?;
+                ReductionOperation::from_c_api(attribute.signless_value() as u32)
+            }
+        }
+    }
+
     /// Returns output sharding metadata.
     fn out_sharding(&self) -> Result<TensorShardingAttributeRef<'c, 't>, Error> {
         self.attribute(OUT_SHARDING_ATTRIBUTE)?.and_then(|attribute| attribute.cast()).ok_or_else(|| {
@@ -533,14 +583,23 @@ pub fn reduce_scatter<
 >(
     input: V,
     reduce_scatter_axes: A,
+    reduction_operation: ReductionOperation,
     out_sharding: TensorShardingAttributeRef<'c, 't>,
     output_type: T,
     location: L,
 ) -> Result<DetachedReduceScatterOperation<'c, 't>, Error> {
-    location.context().load_dialect(DialectHandle::shardy()?)?;
-    OperationBuilder::new("sdy.reduce_scatter", location)
+    let context = location.context();
+    context.load_dialect(DialectHandle::shardy()?)?;
+    let mut builder = OperationBuilder::new("sdy.reduce_scatter", location)
         .add_operand(input)
-        .add_attribute(REDUCE_SCATTER_AXES_ATTRIBUTE, reduce_scatter_axes)
+        .add_attribute(REDUCE_SCATTER_AXES_ATTRIBUTE, reduce_scatter_axes);
+    if reduction_operation != ReductionOperation::Sum {
+        builder = builder.add_attribute(
+            REDUCTION_OP_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), reduction_operation as i64),
+        );
+    }
+    builder
         .add_attribute(OUT_SHARDING_ATTRIBUTE, out_sharding)
         .add_result(output_type)
         .build()
@@ -815,6 +874,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
+    use crate::dialects::shardy::ReductionOperation;
     use crate::{
         Attribute, Block, Context, DialectHandle, Operation, Region, Size, StringRef, Type, TypeAndAttributes,
     };
@@ -830,7 +890,8 @@ mod tests {
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let axis_ref = context.shardy_axis_ref("a", None).unwrap();
         let dim_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
-        let tensor_sharding = context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[]).unwrap();
+        let tensor_sharding =
+            context.shardy_tensor_sharding(mesh, &[dim_sharding], &[], &[], ReductionOperation::Sum).unwrap();
         let tensor_sharding_per_value = context.shardy_tensor_sharding_per_value(&[tensor_sharding]).unwrap();
         let manual_axes = context.shardy_manual_axes(&["a"]).unwrap();
         (tensor_sharding, tensor_sharding_per_value, manual_axes)
@@ -947,7 +1008,9 @@ mod tests {
         let mesh_axis = context.shardy_mesh_axis("a", 2).unwrap();
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
-        let out_sharding = context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[]).unwrap();
+        let out_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[], ReductionOperation::Sum)
+            .unwrap();
         let reduction_axes = test_operation_attribute(
             &context,
             indoc! {r#"
@@ -967,11 +1030,14 @@ mod tests {
             .append_operation({
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
-                let all_reduce_op = all_reduce(input, reduction_axes, out_sharding, tensor_type, location).unwrap();
+                let all_reduce_op =
+                    all_reduce(input, reduction_axes, ReductionOperation::Sum, out_sharding, tensor_type, location)
+                        .unwrap();
                 assert_eq!(all_reduce_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
                 assert_eq!(all_reduce_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
                 assert_eq!(all_reduce_op.input().unwrap(), input);
                 assert_eq!(all_reduce_op.reduction_axes().unwrap(), reduction_axes);
+                assert_eq!(all_reduce_op.reduction_operation().unwrap(), ReductionOperation::Sum);
                 assert_eq!(all_reduce_op.out_sharding().unwrap(), out_sharding);
                 assert_eq!(all_reduce_op.input().unwrap(), input);
                 let all_reduce_block = block.append_operation(all_reduce_op).unwrap();
@@ -998,6 +1064,76 @@ mod tests {
                 module {
                   func.func @all_reduce_test(%arg0: tensor<8xf32>) -> tensor<8xf32> {
                     %0 = sdy.all_reduce {\"a\"} %arg0 out_sharding=<mesh<[\"a\"=2]>, [{}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_all_reduce_max() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::shardy().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(8)], None, location).unwrap();
+        let mesh_axis = context.shardy_mesh_axis("a", 2).unwrap();
+        let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
+        let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
+        let out_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[], ReductionOperation::Sum)
+            .unwrap();
+        let reduction_axes = test_operation_attribute(
+            &context,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["a"=2]>
+                  func.func @test(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.all_reduce max {"a"} %arg0 out_sharding=<@mesh, [{}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#},
+            REDUCTION_AXES_ATTRIBUTE,
+        );
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let all_reduce_op =
+                    all_reduce(input, reduction_axes, ReductionOperation::Max, out_sharding, tensor_type, location)
+                        .unwrap();
+                assert_eq!(all_reduce_op.input().unwrap(), input);
+                assert_eq!(all_reduce_op.reduction_axes().unwrap(), reduction_axes);
+                assert_eq!(all_reduce_op.reduction_operation().unwrap(), ReductionOperation::Max);
+                assert_eq!(all_reduce_op.out_sharding().unwrap(), out_sharding);
+                let all_reduce_block = block.append_operation(all_reduce_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[all_reduce_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "all_reduce_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @all_reduce_max_test(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+                    %0 = sdy.all_reduce max {\"a\"} %arg0 out_sharding=<mesh<[\"a\"=2]>, [{}]> : tensor<8xf32>
                     return %0 : tensor<8xf32>
                   }
                 }
@@ -1093,10 +1229,22 @@ mod tests {
         let dimension_sharding = context.shardy_dimension_sharding([axis_ref], true, None).unwrap();
         let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
         let input_sharding = context
-            .shardy_tensor_sharding(mesh, &[dimension_sharding, empty_dimension_sharding], &[], &[])
+            .shardy_tensor_sharding(
+                mesh,
+                &[dimension_sharding, empty_dimension_sharding],
+                &[],
+                &[],
+                ReductionOperation::Sum,
+            )
             .unwrap();
         let output_sharding = context
-            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding, dimension_sharding], &[], &[])
+            .shardy_tensor_sharding(
+                mesh,
+                &[empty_dimension_sharding, dimension_sharding],
+                &[],
+                &[],
+                ReductionOperation::Sum,
+            )
             .unwrap();
         let params = test_operation_attribute(
             &context,
@@ -1361,12 +1509,20 @@ mod tests {
             .append_operation({
                 let mut block = context.block(&[(tensor_type, location)]);
                 let input = block.argument(0).unwrap();
-                let reduce_scatter_op =
-                    reduce_scatter(input, reduce_scatter_axes, tensor_sharding, tensor_type, location).unwrap();
+                let reduce_scatter_op = reduce_scatter(
+                    input,
+                    reduce_scatter_axes,
+                    ReductionOperation::Sum,
+                    tensor_sharding,
+                    tensor_type,
+                    location,
+                )
+                .unwrap();
                 assert_eq!(reduce_scatter_op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
                 assert_eq!(reduce_scatter_op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
                 assert_eq!(reduce_scatter_op.input().unwrap(), input);
                 assert_eq!(reduce_scatter_op.reduce_scatter_axes().unwrap(), reduce_scatter_axes);
+                assert_eq!(reduce_scatter_op.reduction_operation().unwrap(), ReductionOperation::Sum);
                 assert_eq!(reduce_scatter_op.out_sharding().unwrap(), tensor_sharding);
                 assert_eq!(reduce_scatter_op.input().unwrap(), input);
                 let reduce_scatter_block = block.append_operation(reduce_scatter_op).unwrap();
@@ -1407,6 +1563,85 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_scatter_max() {
+        let context = Context::new();
+        context.load_dialect(DialectHandle::shardy().unwrap()).unwrap();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let tensor_type = context.tensor_type(context.float32_type(), &[Size::Static(8)], None, location).unwrap();
+        let (tensor_sharding, _, _) = test_sharding_attributes(&context);
+        let reduce_scatter_axes = test_operation_attribute(
+            &context,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["a"=2]>
+                  func.func @test(
+                    %arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"a"}]>}
+                  ) -> tensor<8xf32> {
+                    %0 = sdy.reduce_scatter max [{}] %arg0 out_sharding=<@mesh, [{"a"}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "#},
+            REDUCE_SCATTER_AXES_ATTRIBUTE,
+        );
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let input = block.argument(0).unwrap();
+                let reduce_scatter_op = reduce_scatter(
+                    input,
+                    reduce_scatter_axes,
+                    ReductionOperation::Max,
+                    tensor_sharding,
+                    tensor_type,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(reduce_scatter_op.input().unwrap(), input);
+                assert_eq!(reduce_scatter_op.reduce_scatter_axes().unwrap(), reduce_scatter_axes);
+                assert_eq!(reduce_scatter_op.reduction_operation().unwrap(), ReductionOperation::Max);
+                assert_eq!(reduce_scatter_op.out_sharding().unwrap(), tensor_sharding);
+                let reduce_scatter_block = block.append_operation(reduce_scatter_op).unwrap();
+                block
+                    .append_operation(func::r#return(&[reduce_scatter_block.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                func::func(
+                    "reduce_scatter_max_test",
+                    func::FuncAttributes {
+                        arguments: vec![TypeAndAttributes {
+                            r#type: tensor_type.as_ref(),
+                            attributes: Some(HashMap::from([(
+                                StringRef::from("sdy.sharding"),
+                                tensor_sharding.as_ref(),
+                            )])),
+                        }],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @reduce_scatter_max_test(%arg0: tensor<8xf32> {sdy.sharding = #sdy.sharding<mesh<[\"a\"=2]>, [{\"a\"}]>}) -> tensor<8xf32> {
+                    %0 = sdy.reduce_scatter max [{}] %arg0 out_sharding=<mesh<[\"a\"=2]>, [{\"a\"}]> : tensor<8xf32>
+                    return %0 : tensor<8xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
     fn test_replicated_to_unreduced() {
         let context = Context::new();
         context.load_dialect(DialectHandle::shardy().unwrap()).unwrap();
@@ -1417,10 +1652,12 @@ mod tests {
         let mesh = context.shardy_mesh([mesh_axis], &[]).unwrap();
         let axis_ref = context.shardy_axis_ref("a", None).unwrap();
         let empty_dimension_sharding = context.shardy_dimension_sharding([], true, None).unwrap();
-        let input_sharding =
-            context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[axis_ref], &[]).unwrap();
-        let output_sharding =
-            context.shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[axis_ref]).unwrap();
+        let input_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[axis_ref], &[], ReductionOperation::Sum)
+            .unwrap();
+        let output_sharding = context
+            .shardy_tensor_sharding(mesh, &[empty_dimension_sharding], &[], &[axis_ref], ReductionOperation::Sum)
+            .unwrap();
         let axes = test_operation_attribute(
             &context,
             indoc! {r#"

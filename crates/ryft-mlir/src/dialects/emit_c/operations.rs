@@ -147,51 +147,6 @@ pub fn add<
         })
 }
 
-/// Name of the `emitc.apply` operator attribute.
-pub const APPLICABLE_OPERATOR_ATTRIBUTE: &str = "applicableOperator";
-
-/// Operation trait for `emitc.apply`.
-pub trait ApplyOperation<'o, 'c: 'o, 't: 'c>: UnaryExpressionOperation<'o, 'c, 't> {
-    /// Returns the operator applied by this deprecated operation.
-    fn applicable_operator(&self) -> Result<StringRef<'c>, Error> {
-        Ok(self.string_attribute(APPLICABLE_OPERATOR_ATTRIBUTE)?.string())
-    }
-}
-
-mlir_op!(Apply);
-mlir_op_trait!(Apply, OneOperand);
-mlir_op_trait!(Apply, OneResult);
-mlir_op_trait!(Apply, ZeroRegions);
-mlir_op_trait!(Apply, ZeroSuccessors);
-mlir_op_trait!(Apply, @local UnaryExpressionOperation);
-
-/// Constructs a new detached [`ApplyOperation`].
-pub fn apply<
-    'operand,
-    'c: 'operand,
-    't: 'c,
-    Operand: Value<'operand, 'c, 't>,
-    ResultType: Type<'c, 't>,
-    O: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>>,
-    L: Location<'c, 't>,
->(
-    applicable_operator: O,
-    operand: Operand,
-    result_type: ResultType,
-    location: L,
-) -> Result<DetachedApplyOperation<'c, 't>, Error> {
-    let context = location.context();
-    context.load_dialect(DialectHandle::emit_c()?)?;
-    OperationBuilder::new("emitc.apply", location)
-        .add_attribute(APPLICABLE_OPERATOR_ATTRIBUTE, applicable_operator.try_into_with_context(context)?)
-        .add_operand(operand)
-        .add_result(result_type)
-        .build()
-        .and_then(|operation| unsafe {
-            operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::apply`"))
-        })
-}
-
 /// Operation trait for `emitc.bitwise_and`.
 pub trait BitwiseAndOperation<'o, 'c: 'o, 't: 'c>: BinaryExpressionOperation<'o, 'c, 't> {}
 
@@ -2278,52 +2233,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply() {
-        let context = Context::new();
-        let location = context.unknown_location();
-        let module = context.module(location).unwrap();
-        let i32_type = context.signless_integer_type(32);
-        let lvalue_i32_type = context.emit_c_lvalue_type(i32_type).unwrap();
-        let pointer_i32_type = context.emit_c_pointer_type(i32_type).unwrap();
-        let function_type = context.function_type::<TypeRef, TypeRef>(&[], &[pointer_i32_type.as_ref()]);
-        module
-            .body()
-            .unwrap()
-            .append_operation({
-                let mut block = context.block_with_no_arguments();
-                let variable_op = block
-                    .append_operation(
-                        variable(context.integer_attribute(i32_type, 0), lvalue_i32_type, location).unwrap(),
-                    )
-                    .unwrap();
-                let variable_value = variable_op.as_ref().result(0).unwrap().as_ref();
-                let op = apply("&", variable_value, pointer_i32_type, location).unwrap();
-                assert_eq!(op.applicable_operator().unwrap().as_str().unwrap(), "&");
-                assert_eq!(op.operand_value(0).unwrap(), variable_value);
-                assert_eq!(op.applicable_operator().unwrap().as_str().unwrap(), "&");
-                let op = block.append_operation(op).unwrap();
-                block
-                    .append_operation(r#return(Some(op.as_ref().result(0).unwrap().as_ref()), location).unwrap())
-                    .unwrap();
-                func("apply", function_type, block.try_into().unwrap(), None, None, None, location).unwrap()
-            })
-            .unwrap();
-        assert!(module.verify().unwrap());
-        assert_eq!(
-            module.to_string(),
-            indoc! {r#"
-                module {
-                  emitc.func @apply() -> !emitc.ptr<i32> {
-                    %0 = "emitc.variable"() <{value = 0 : i32}> : () -> !emitc.lvalue<i32>
-                    %1 = apply "&"(%0) : (!emitc.lvalue<i32>) -> !emitc.ptr<i32>
-                    return %1 : !emitc.ptr<i32>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
     fn test_bitwise_and() {
         let context = Context::new();
         let location = context.unknown_location();
@@ -2597,7 +2506,7 @@ mod tests {
             indoc! {r#"
                 module {
                   emitc.func @call_opaque(%arg0: i32) -> i32 {
-                    %0 = call_opaque "opaque"(%arg0) : (i32) -> i32
+                    %0 = call_opaque "opaque"(%arg0)  : (i32) -> i32
                     return %0 : i32
                   }
                 }
