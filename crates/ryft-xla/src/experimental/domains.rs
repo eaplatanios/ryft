@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use ryft_core::backends::scalars::Scalar;
-use ryft_core::compilation::{AnalyzableCompilationDomain, CompilationContext, CompilationDomain, DiskCache};
+use ryft_core::compilation::function::{CallRequest, CompileRequest, LoweringRequest, StageRequest};
+use ryft_core::compilation::{
+    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationContext, CompilationDomain, DiskCache,
+    StagedFunction,
+};
 use ryft_core::contexts::{Context, Domain};
 use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
@@ -294,6 +298,12 @@ impl<'c> XlaDomain<'c> {
         self.cache.cache_size()
     }
 
+    /// Returns this domain's shared compilation context.
+    #[inline]
+    pub fn compilation_context(&self) -> &CompilationContext<Self> {
+        &self.cache
+    }
+
     /// Removes every entry from the in-memory cache. Mirrors JAX's
     /// `clear_in_memory_compilation_cache()`.
     #[inline]
@@ -499,17 +509,17 @@ impl<'c> CoordinateBasis<Array<'c>> for XlaDomain<'c> {
         let mesh = self.eager_mesh(client, &[], program.output_types().as_slice())?;
         let options = XlaOptions::new(mesh);
         let lowered = self
-            .lower(&program, 0, &options)
+            .lower_xla_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let cache_key = self
             .compilation_key(&lowered, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
             .cache
-            .get_or_compile(self, cache_key, || self.compile(&lowered, &options))
+            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered, &options))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let mut outputs = self
-            .execute(&compiled, Vec::new())
+            .execute_xla_program(&compiled, Vec::new())
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0).with_compilation_cache(Arc::clone(&self.cache)))
@@ -616,17 +626,17 @@ impl<'c> XlaDomain<'c> {
         let mesh = self.eager_mesh(client, inputs, program.output_types().as_slice())?;
         let options = XlaOptions::new(mesh);
         let lowered = self
-            .lower(&program, 0, &options)
+            .lower_xla_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let cache_key = self
             .compilation_key(&lowered, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
             .cache
-            .get_or_compile(self, cache_key, || self.compile(&lowered, &options))
+            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered, &options))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let outputs = self
-            .execute(&compiled, inputs.to_vec())
+            .execute_xla_program(&compiled, inputs.to_vec())
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
 
         // Execution already attached this domain's client to every output, so attaching the compile cache is all
@@ -867,8 +877,8 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
             bytes.extend_from_slice(&0.0f64.to_ne_bytes());
             bytes
         }
-        // 8-bit floating-point types do not have a canonical Rust representation; encoding `1.0`
-        // as a raw byte pattern would depend on the exact FP8 variant.
+        // Low-precision (4-, 6-, and 8-bit) floating-point types do not have a canonical Rust representation;
+        // encoding `1.0` as a raw byte pattern would depend on the exact variant.
         DataType::F8E3M4
         | DataType::F8E4M3
         | DataType::F8E4M3FN
@@ -884,7 +894,9 @@ fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
         | DataType::U1
         | DataType::U2
         | DataType::U4
-        | DataType::F4E2M1FN => {
+        | DataType::F4E2M1FN
+        | DataType::F6E2M3FN
+        | DataType::F6E3M2FN => {
             panic!("XlaDomain::one does not support element type {data_type}")
         }
     }
@@ -1576,6 +1588,8 @@ fn checked_usize(value: u64) -> Result<usize, XlaDomainError> {
     usize::try_from(value).map_err(|_| persistent_error(format!("value {value} does not fit in usize")))
 }
 
+/// Encodes `data_type` as a stable one-byte code for persistent executables. These codes are persisted, so new data
+/// types must be appended with fresh codes and existing codes must never be renumbered.
 fn encode_data_type(data_type: DataType) -> u8 {
     match data_type {
         DataType::Token => 0,
@@ -1609,6 +1623,8 @@ fn encode_data_type(data_type: DataType) -> u8 {
         DataType::F64 => 28,
         DataType::C64 => 29,
         DataType::C128 => 30,
+        DataType::F6E2M3FN => 31,
+        DataType::F6E3M2FN => 32,
     }
 }
 
@@ -1645,6 +1661,8 @@ fn decode_data_type(value: u8) -> Result<DataType, XlaDomainError> {
         28 => DataType::F64,
         29 => DataType::C64,
         30 => DataType::C128,
+        31 => DataType::F6E2M3FN,
+        32 => DataType::F6E3M2FN,
         value => return Err(persistent_error(format!("unknown data type tag {value}"))),
     })
 }
@@ -1789,52 +1807,84 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     type CompiledProgram = XlaCompiledProgram<'c>;
     type Options = XlaOptions;
     type Error = XlaDomainError;
-    type CacheKey = XlaCompilationKey;
-
-    fn prepare_input_types<Input: Parameterized<ArrayType>>(
+    fn stage<Request>(
         &self,
-        input_types: Input,
-        options: &XlaOptions,
-    ) -> Result<Input, XlaDomainError> {
-        let Some(in_shardings) = options.in_shardings.as_deref() else {
-            return Ok(input_types);
-        };
-        let structure = input_types.parameter_structure();
-        let input_types = apply_signature_shardings(input_types.into_parameters().collect(), Some(in_shardings), "in")?;
-        Input::from_parameters(structure, input_types).map_err(|error| XlaDomainError::Array(error.into()))
+        mut request: Request,
+    ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
+    where
+        Request: StageRequest<Self>,
+    {
+        if let Some(in_shardings) = request.options().in_shardings.clone() {
+            let input_types = apply_signature_shardings(
+                request.input_types().parameters().cloned().collect(),
+                Some(in_shardings.as_slice()),
+                "in",
+            )?;
+            request.replace_input_types(input_types)?;
+        }
+        request.trace(|options, output_types| {
+            apply_signature_shardings(output_types, options.out_shardings.as_deref(), "out")
+        })
     }
 
-    fn validate_staged_input_types(
+    fn lower<Request>(
         &self,
-        input_types: &[ArrayType],
-        options: &XlaOptions,
-    ) -> Result<(), XlaDomainError> {
-        let Some(in_shardings) = options.in_shardings.as_deref() else {
-            return Ok(());
-        };
-        if input_types.len() != in_shardings.len() {
-            return Err(XlaDomainError::InvalidCompilationOptions {
-                reason: format!(
-                    "in_shardings has {} entries but the staged signature has {} flat input(s)",
-                    in_shardings.len(),
-                    input_types.len(),
-                ),
-            });
-        }
-        for (index, (input_type, sharding)) in input_types.iter().zip(in_shardings).enumerate() {
-            if input_type.sharding() != Some(sharding) {
-                return Err(XlaDomainError::InvalidCompilationOptions {
-                    reason: format!(
-                        "in_shardings[{index}] is not represented by staged input type {input_type}; apply options \
-                         before staging",
-                    ),
-                });
+        staged: Request,
+    ) -> Result<ryft_core::compilation::LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
+    where
+        Request: LoweringRequest<Self>,
+    {
+        let opened_program = staged.opened_program()?;
+        let program = self.lower_xla_program(
+            &opened_program,
+            staged.staged().source_program().captures().len(),
+            staged.staged().options(),
+        )?;
+        let output_types = program.output_types().to_vec();
+        validate_output_types(staged.staged().output_types(), &output_types)?;
+        Ok(staged.into_lowered(program, output_types))
+    }
+
+    fn compile<Request>(
+        &self,
+        lowered: Request,
+    ) -> Result<ryft_core::compilation::CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
+    where
+        Request: CompileRequest<Self>,
+    {
+        let key = self.compilation_key(lowered.lowered().lowered_program(), lowered.lowered().options())?;
+        let program = self.cache.get_or_compile(self, key, || {
+            self.compile_xla_program(lowered.lowered().lowered_program(), lowered.lowered().options())
+        })?;
+        let output_types = program.output_types().to_vec();
+        validate_output_types(lowered.lowered().output_types(), &output_types)?;
+        Ok(lowered.into_compiled(program, output_types))
+    }
+
+    fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
+    where
+        Request: CallRequest<Self>,
+    {
+        let executable = request.executable().clone();
+        if request.inputs().len() != executable.input_types().len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: executable.input_types().len(),
+                actual: request.inputs().len(),
             }
+            .into());
         }
-        Ok(())
+        for (declared, actual) in executable.input_types().iter().zip(request.inputs().iter().map(Typed::r#type)) {
+            validate_xla_input_type(declared, actual.as_ref())?;
+        }
+        let output_types = executable.output_types().to_vec();
+        let outputs = self.execute_xla_program(executable.compiled_program(), request.into_arguments())?;
+        validate_runtime_outputs(&output_types, &outputs)?;
+        Request::reconstruct(&executable, outputs)
     }
+}
 
-    fn lower(
+impl<'c> XlaDomain<'c> {
+    fn lower_xla_program(
         &self,
         program: &FlatXlaProgram,
         capture_count: usize,
@@ -1850,8 +1900,6 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             });
         }
         let (capture_types, public_input_types) = input_types.split_at(capture_count);
-        let public_input_types =
-            apply_signature_shardings(public_input_types.to_vec(), options.in_shardings.as_deref(), "in")?;
         if !options.donation_flags.is_empty() && options.donation_flags.len() != public_input_types.len() {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
@@ -1862,7 +1910,8 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             });
         }
 
-        let effective_input_types = capture_types.iter().cloned().chain(public_input_types).collect::<Vec<_>>();
+        let effective_input_types =
+            capture_types.iter().cloned().chain(public_input_types.iter().cloned()).collect::<Vec<_>>();
         let output_types = apply_signature_shardings(program.output_types(), options.out_shardings.as_deref(), "out")?;
         let expected_argument_shardings = effective_input_types
             .iter()
@@ -1901,12 +1950,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         })
     }
 
-    #[inline]
-    fn lowered_output_types<'a>(&self, program: &'a XlaLoweredProgram) -> &'a [ArrayType] {
-        program.output_types()
-    }
-
-    fn compilation_key(
+    fn xla_compilation_key(
         &self,
         program: &XlaLoweredProgram,
         _options: &XlaOptions,
@@ -1945,7 +1989,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok(XlaCompilationKey { canonical_bytes: canonical_bytes.into() })
     }
 
-    fn compile(
+    pub(crate) fn compile_xla_program(
         &self,
         program: &XlaLoweredProgram,
         _options: &XlaOptions,
@@ -1967,12 +2011,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         })
     }
 
-    #[inline]
-    fn compiled_output_types<'a>(&self, program: &'a XlaCompiledProgram<'c>) -> &'a [ArrayType] {
-        program.output_types()
-    }
-
-    fn validate_replacement(
+    pub(crate) fn validate_xla_replacement(
         &self,
         current: &XlaCompiledProgram<'c>,
         replacement: &XlaCompiledProgram<'c>,
@@ -1980,22 +2019,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         validate_xla_replacement_metadata(current.into(), replacement.into())
     }
 
-    fn validate_input_type(&self, declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
-        let declared_without_sharding =
-            declared.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
-        let actual_without_sharding =
-            actual.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
-        if declared_without_sharding.is_refined_by(&actual_without_sharding) {
-            Ok(())
-        } else {
-            Err(ProgramError::InvalidArgument {
-                message: format!("runtime input type {actual} does not refine declared type {declared}"),
-            }
-            .into())
-        }
-    }
-
-    fn execute(
+    fn execute_xla_program(
         &self,
         program: &XlaCompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
@@ -2006,11 +2030,11 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     /// Returns the canonical, versioned identity of this XLA compilation. Persistent cache directories are trusted
     /// executable sources and must not be writable by untrusted users.
     #[inline]
-    fn persistent_cache_key(&self, key: &XlaCompilationKey) -> Option<Vec<u8>> {
+    fn xla_persistent_cache_key(&self, key: &XlaCompilationKey) -> Option<Vec<u8>> {
         Some(key.canonical_bytes.to_vec())
     }
 
-    fn serialize_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
+    fn serialize_xla_program(&self, program: &XlaCompiledProgram<'c>) -> Result<Option<Vec<u8>>, XlaDomainError> {
         let executable = match program.executable.executable() {
             Ok(executable) => executable,
             Err(ryft_pjrt::Error::Unimplemented { .. }) => return Ok(None),
@@ -2060,7 +2084,7 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
         Ok(Some(bytes))
     }
 
-    fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
+    fn deserialize_xla_program(&self, bytes: &[u8]) -> Result<Option<XlaCompiledProgram<'c>>, XlaDomainError> {
         let header_size = XLA_PERSISTENT_EXECUTABLE_MAGIC.len() + size_of::<u64>();
         if bytes.len() < header_size
             || &bytes[..XLA_PERSISTENT_EXECUTABLE_MAGIC.len()] != XLA_PERSISTENT_EXECUTABLE_MAGIC
@@ -2158,17 +2182,44 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             analysis: Arc::new(OnceLock::new()),
         }))
     }
+}
+
+impl<'c> CompilationCacheDomain for XlaDomain<'c> {
+    type CacheKey = XlaCompilationKey;
 
     #[inline]
-    fn cache(&self) -> Option<&CompilationContext<Self>> {
-        Some(&self.cache)
+    fn compilation_key(
+        &self,
+        program: &Self::LoweredProgram,
+        options: &Self::Options,
+    ) -> Result<Self::CacheKey, Self::Error> {
+        self.xla_compilation_key(program, options)
+    }
+
+    #[inline]
+    fn persistent_cache_key(&self, key: &Self::CacheKey) -> Option<Vec<u8>> {
+        self.xla_persistent_cache_key(key)
+    }
+
+    #[inline]
+    fn serialize_program(&self, program: &Self::CompiledProgram) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.serialize_xla_program(program)
+    }
+
+    #[inline]
+    fn deserialize_program(&self, bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
+        self.deserialize_xla_program(bytes)
     }
 }
 
 impl<'c> AnalyzableCompilationDomain for XlaDomain<'c> {
     type Analysis = XlaCompilationAnalysis;
 
-    fn analyze(&self, program: &XlaCompiledProgram<'c>) -> Result<Self::Analysis, Self::Error> {
+    fn analyze<Input: Parameterized<ArrayType>, Output: Parameterized<ArrayType>>(
+        &self,
+        executable_program: &ryft_core::compilation::ExecutableProgram<Self, Input, Output>,
+    ) -> Result<Self::Analysis, Self::Error> {
+        let program = executable_program.compiled_program();
         program
             .analysis
             .get_or_init(|| analyze_xla_program(program).map_err(|error| error.to_string()))
@@ -2199,6 +2250,51 @@ fn ordered_device_kinds(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<St
             device.kind().map(|kind| kind.into_owned()).map_err(Into::into)
         })
         .collect()
+}
+
+pub(crate) fn validate_xla_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), XlaDomainError> {
+    let declared_without_sharding =
+        declared.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
+    let actual_without_sharding =
+        actual.clone().with_sharding(None).map_err(|error| XlaDomainError::Array(error.into()))?;
+    if declared_without_sharding.is_refined_by(&actual_without_sharding) {
+        Ok(())
+    } else {
+        Err(ProgramError::InvalidArgument {
+            message: format!("runtime input type {actual} does not refine declared type {declared}"),
+        }
+        .into())
+    }
+}
+
+fn validate_output_types(declared: &[ArrayType], actual: &[ArrayType]) -> Result<(), XlaDomainError> {
+    if declared.len() != actual.len() {
+        return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: actual.len() }.into());
+    }
+    for (declared, actual) in declared.iter().zip(actual) {
+        if !declared.is_refined_by(actual) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("backend output type {actual} does not refine declared type {declared}"),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), XlaDomainError> {
+    if declared.len() != outputs.len() {
+        return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
+    }
+    for (declared, actual) in declared.iter().zip(outputs.iter().map(Typed::r#type)) {
+        if !declared.is_refined_by(actual.as_ref()) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("runtime output type {actual} does not refine declared type {declared}"),
+            }
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn analyze_xla_program(program: &XlaCompiledProgram<'_>) -> Result<XlaCompilationAnalysis, XlaDomainError> {
@@ -2496,7 +2592,7 @@ fn execute_pjrt<'c>(
     let arguments =
         Array::into_execute_arguments_with_donation(inputs, addressable_device_ids.as_slice(), donation_flags)?;
     let (device_outputs, fence) = executable
-        .execute(arguments.as_execution_device_inputs(), 0, None, Some(file!()), None, None)?
+        .execute(arguments.as_execution_device_inputs(), Vec::new(), 0, None, Some(file!()), None, None)?
         .into_parts();
 
     let output_count = output_types.len();
@@ -2537,6 +2633,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::Sharding;
+    use ryft_core::compilation::stage_function;
     use ryft_core::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
     use ryft_core::operations::constants::{FillOperation, OneOperation};
@@ -2738,7 +2835,7 @@ mod tests {
     #[test]
     fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, compile_with_options};
+        use ryft_core::compilation::CompilationOptions as CoreCompilationOptions;
         use ryft_core::operations::trigonometric::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -2750,8 +2847,9 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
         let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
+        let staged = stage_function(&engine, |x| x.sin().unwrap(), input_type.clone(), options).unwrap();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
-            compile_with_options(&engine, |x| x.sin().unwrap(), input_type.clone(), options).unwrap();
+            engine.compile(engine.lower(staged).unwrap()).unwrap();
 
         // Round-trip a small input through the new CompilationDomain-driven pipeline.
         let values = [0.0f32, 0.5, 1.0, 1.5];
@@ -2762,7 +2860,7 @@ mod tests {
             values_to_bytes::<f32>(&values).as_slice(),
         )
         .unwrap();
-        let array = compiled.call(source).unwrap();
+        let array = ryft_core::compilation::call_function(&engine, compiled.executable_program(), source).unwrap();
         array.block_until_ready().unwrap();
 
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -2783,14 +2881,15 @@ mod tests {
         // Equivalent lowerings share the entry populated by the first compilation, independent of source location.
         let cache_size_before = engine.cache_size();
         for _ in 0..3 {
+            let staged = stage_function(
+                &engine,
+                |x| x.sin().unwrap(),
+                input_type.clone(),
+                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
+            )
+            .unwrap();
             let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
-                compile_with_options(
-                    &engine,
-                    |x| x.sin().unwrap(),
-                    input_type.clone(),
-                    CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
-                )
-                .unwrap();
+                engine.compile(engine.lower(staged).unwrap()).unwrap();
         }
         assert_eq!(
             engine.cache_size(),
@@ -2801,7 +2900,7 @@ mod tests {
 
     #[test]
     fn test_xla_compilation_key_is_canonical_and_stable() {
-        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, compile_with_options};
+        use ryft_core::compilation::CompilationOptions as CoreCompilationOptions;
         use ryft_core::operations::trigonometric::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -2811,14 +2910,15 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
+        let staged = stage_function(
+            &domain,
+            |x| x.sin().unwrap(),
+            input_type,
+            CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
+        )
+        .unwrap();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
-            compile_with_options(
-                &domain,
-                |x| x.sin().unwrap(),
-                input_type,
-                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
-            )
-            .unwrap();
+            domain.compile(domain.lower(staged).unwrap()).unwrap();
         let key = domain.compilation_key(compiled.lowered().lowered_program(), compiled.lowered().options()).unwrap();
         let repeated =
             domain.compilation_key(compiled.lowered().lowered_program(), compiled.lowered().options()).unwrap();
@@ -2835,9 +2935,7 @@ mod tests {
 
     #[test]
     fn test_xla_persistent_executable_round_trip_preserves_invocation_and_analysis() {
-        use ryft_core::compilation::{
-            CompilationOptions as CoreCompilationOptions, StagedFunction, stage_with_captures,
-        };
+        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, StagedFunction};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2853,18 +2951,24 @@ mod tests {
             values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
         )
         .unwrap();
-        let staged: StagedFunction<XlaDomain<'_>, ArrayType, ArrayType> = stage_with_captures(
-            &domain,
-            |mut captures, input| captures.remove(0) + input,
-            vec![capture.clone()],
-            input_type.clone(),
-        )
-        .unwrap();
-        let compiled = staged
-            .compile(CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()).with_donate(true)))
+        fn add_capture<'c>(
+            _: Vec<XlaConstant>,
+            captures: Vec<ryft_core::compilation::CompilationTracer<XlaDomain<'c>>>,
+            input: ryft_core::compilation::CompilationTracer<XlaDomain<'c>>,
+        ) -> Result<ryft_core::compilation::CompilationTracer<XlaDomain<'c>>, XlaDomainError> {
+            Ok(captures.into_iter().next().unwrap() + input)
+        }
+        let staged: StagedFunction<XlaDomain<'_>, ArrayType, ArrayType> = domain
+            .stage(ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayType, ArrayType>::new(
+                add_capture,
+                vec![capture.clone()],
+                input_type.clone(),
+                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()).with_donate(true)),
+            ))
             .unwrap();
-        let compiled_analysis = compiled.analysis().unwrap();
-        assert_eq!(compiled.analysis().unwrap(), compiled_analysis);
+        let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
+        let compiled_analysis = domain.analyze(compiled.executable_program()).unwrap();
+        assert_eq!(domain.analyze(compiled.executable_program()).unwrap(), compiled_analysis);
 
         let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
         let restored = domain.deserialize_program(bytes.as_slice()).unwrap().unwrap();
@@ -2895,18 +2999,18 @@ mod tests {
             values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
         )
         .unwrap();
-        let outputs = domain.execute(&restored, vec![capture, input]).unwrap();
+        let outputs = domain.execute_xla_program(&restored, vec![capture, input]).unwrap();
         assert_eq!(read_f32s(&client, &outputs[0]), vec![11.0, 22.0, 33.0, 44.0]);
 
-        let analysis = domain.analyze(&restored).unwrap();
-        assert_eq!(domain.analyze(&restored).unwrap(), analysis);
+        let analysis = analyze_xla_program(&restored).unwrap();
+        assert_eq!(analyze_xla_program(&restored).unwrap(), analysis);
         assert!(analysis.to_json().unwrap().contains("\"properties\""));
         assert!(!analysis.to_string().is_empty());
     }
 
     #[test]
     fn test_xla_disk_cache_restores_into_a_fresh_compilation_context() {
-        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, DiskCache, compile_with_options};
+        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, DiskCache};
         use ryft_core::operations::trigonometric::Sin;
         use tempfile::tempdir;
 
@@ -2922,14 +3026,15 @@ mod tests {
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         );
+        let staged = stage_function(
+            &first_domain,
+            |x| x.sin().unwrap(),
+            input_type.clone(),
+            CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
+        )
+        .unwrap();
         let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
-            compile_with_options(
-                &first_domain,
-                |x| x.sin().unwrap(),
-                input_type.clone(),
-                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
-            )
-            .unwrap();
+            first_domain.compile(first_domain.lower(staged).unwrap()).unwrap();
         assert_eq!(first_domain.cache.statistics().compilations, 1);
         drop(first);
         drop(first_domain);
@@ -2938,14 +3043,15 @@ mod tests {
             &client,
             DiskCache::open(directory.path()).unwrap().with_write_thresholds(Duration::ZERO, 0),
         );
+        let staged = stage_function(
+            &second_domain,
+            |x| x.sin().unwrap(),
+            input_type,
+            CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
+        )
+        .unwrap();
         let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
-            compile_with_options(
-                &second_domain,
-                |x| x.sin().unwrap(),
-                input_type,
-                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
-            )
-            .unwrap();
+            second_domain.compile(second_domain.lower(staged).unwrap()).unwrap();
         let statistics = second_domain.cache.statistics();
         assert_eq!(statistics.persistent_hits, 1);
         assert_eq!(statistics.compilations, 0, "restoration must not invoke backend compilation");
@@ -3500,5 +3606,52 @@ mod tests {
             domain.bind(AddOperation, &[left, right]),
             Err(ProgramError::Type(error)) if error.message == "'add' input types are not broadcast-compatible",
         ));
+    }
+
+    #[test]
+    fn test_persistent_data_type_codes() {
+        // The persistent executable encoding assigns each data type a stable one-byte code, and so this test pins
+        // every assignment: new data types must be appended with fresh codes and existing codes must never be
+        // renumbered, because persisted executables would otherwise decode to the wrong types.
+        let data_types = [
+            (DataType::Token, 0),
+            (DataType::Boolean, 1),
+            (DataType::I1, 2),
+            (DataType::I2, 3),
+            (DataType::I4, 4),
+            (DataType::I8, 5),
+            (DataType::I16, 6),
+            (DataType::I32, 7),
+            (DataType::I64, 8),
+            (DataType::U1, 9),
+            (DataType::U2, 10),
+            (DataType::U4, 11),
+            (DataType::U8, 12),
+            (DataType::U16, 13),
+            (DataType::U32, 14),
+            (DataType::U64, 15),
+            (DataType::F4E2M1FN, 16),
+            (DataType::F8E3M4, 17),
+            (DataType::F8E4M3, 18),
+            (DataType::F8E4M3FN, 19),
+            (DataType::F8E4M3FNUZ, 20),
+            (DataType::F8E4M3B11FNUZ, 21),
+            (DataType::F8E5M2, 22),
+            (DataType::F8E5M2FNUZ, 23),
+            (DataType::F8E8M0FNU, 24),
+            (DataType::BF16, 25),
+            (DataType::F16, 26),
+            (DataType::F32, 27),
+            (DataType::F64, 28),
+            (DataType::C64, 29),
+            (DataType::C128, 30),
+            (DataType::F6E2M3FN, 31),
+            (DataType::F6E3M2FN, 32),
+        ];
+        for (data_type, code) in data_types {
+            assert_eq!(encode_data_type(data_type), code);
+            assert_eq!(decode_data_type(code).unwrap(), data_type);
+        }
+        assert!(decode_data_type(33).is_err());
     }
 }

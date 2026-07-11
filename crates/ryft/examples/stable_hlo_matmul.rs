@@ -94,8 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inputs = vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }];
 
     // The expected output of this matrix multiplication is [[58.0, 64.0], [139.0, 154.0]].
-    let mut outputs = executable.execute(inputs, 0, None, None, None, None)?.remove(0);
-    outputs.done.r#await()?;
+    let execution = executable.execute(inputs, Vec::new(), 0, None, None, None, None)?;
+    let mut outputs = execution.block_until_ready()?.remove(0);
     let output = outputs
         .outputs
         .remove(0)

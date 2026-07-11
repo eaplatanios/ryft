@@ -812,7 +812,7 @@ mod tests {
     use crate::sharding::{
         Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, ShardingError,
     };
-    use crate::types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
+    use crate::types::data_types::DataType::{BF16, Boolean, C64, F8E3M4, F8E4M3FN, F16, F32, F64};
     use crate::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;

@@ -6,7 +6,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ryft_core::compilation::{
-    CompilationDomain, CompilationOptions, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction, stage,
+    CompilationDomain, CompilationOptions, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction,
+    stage_function,
 };
 use ryft_core::operations::trigonometric::Sin;
 use ryft_core::{ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Size};
@@ -130,7 +131,7 @@ fn jit_statistics(statistics: JitCacheStatistics) -> Value {
 }
 
 fn compilation_statistics(domain: &XlaDomain<'_>) -> Value {
-    let statistics = domain.cache().expect("XLA domains always provide a compilation cache").statistics();
+    let statistics = domain.compilation_context().statistics();
     json!({
         "memory_hits": statistics.memory_hits,
         "persistent_hits": statistics.persistent_hits,
@@ -170,9 +171,15 @@ fn input_array<'c>(
 
 fn stage_workload<'c>(
     domain: &XlaDomain<'c>,
+    mesh: &DeviceMesh,
     r#type: ArrayType,
 ) -> Result<StagedFunction<XlaDomain<'c>, ArrayType, ArrayType>, Box<dyn std::error::Error>> {
-    Ok(stage(domain, |input| (input.clone() * input.clone() + input).sin().unwrap(), r#type)?)
+    Ok(stage_function(
+        domain,
+        |input| (input.clone() * input.clone() + input).sin().unwrap(),
+        r#type,
+        CompilationOptions::new(XlaOptions::new(mesh.clone())),
+    )?)
 }
 
 fn persistent_restore(
@@ -185,20 +192,20 @@ fn persistent_restore(
         client,
         DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0),
     );
-    let producer_lowered =
-        stage_workload(&producer, r#type.clone())?.lower(CompilationOptions::new(XlaOptions::new(mesh.clone())))?;
-    producer_lowered.compile()?;
+    let producer_staged = stage_workload(&producer, mesh, r#type.clone())?;
+    let producer_lowered = producer.lower(producer_staged)?;
+    producer.compile(producer_lowered)?;
 
     let restored = XlaDomain::with_configured_disk_cache(
         client,
         DiskCache::open(directory)?.with_write_thresholds(Duration::ZERO, 0),
     );
-    let restored_lowered =
-        stage_workload(&restored, r#type.clone())?.lower(CompilationOptions::new(XlaOptions::new(mesh.clone())))?;
+    let restored_staged = stage_workload(&restored, mesh, r#type.clone())?;
+    let restored_lowered = restored.lower(restored_staged)?;
     let start = Instant::now();
-    restored_lowered.compile()?;
+    restored.compile(restored_lowered)?;
     let duration = duration_nanoseconds(start);
-    let statistics = restored.cache().expect("XLA domains always provide a compilation cache").statistics();
+    let statistics = restored.compilation_context().statistics();
     Ok(json!({
         "requested": true,
         "restored": statistics.persistent_hits == 1 && statistics.compilations == 0,
@@ -220,28 +227,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = input_array(&client, &mesh, r#type.clone(), arguments.size)?;
     input.block_until_ready()?;
     let domain = XlaDomain::new(&client);
-    let options = CompilationOptions::new(XlaOptions::new(mesh.clone()));
-
     let start = Instant::now();
-    let staged = stage_workload(&domain, r#type.clone())?;
+    let staged = stage_workload(&domain, &mesh, r#type.clone())?;
     let cold_trace_ns = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let lowered = staged.lower(options)?;
+    let lowered = domain.lower(staged)?;
     let cold_lower_ns = duration_nanoseconds(start);
 
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'_> = lowered.compile()?;
+    let compiled: BenchmarkCompiledFunction<'_> = domain.compile(lowered)?;
     let cold_compile_ns = duration_nanoseconds(start);
 
-    let warmup = compiled.call(input.clone())?;
+    let warmup = ryft_core::compilation::call_function(&domain, compiled.executable_program(), input.clone())?;
     warmup.block_until_ready()?;
 
     let mut enqueue_samples = Vec::with_capacity(arguments.iterations);
     let mut pending_outputs = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        pending_outputs.push(compiled.call(input.clone())?);
+        pending_outputs.push(ryft_core::compilation::call_function(
+            &domain,
+            compiled.executable_program(),
+            input.clone(),
+        )?);
         enqueue_samples.push(duration_nanoseconds(start));
     }
     for output in pending_outputs {
@@ -251,7 +260,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut synchronized_samples = Vec::with_capacity(arguments.iterations);
     for _ in 0..arguments.iterations {
         let start = Instant::now();
-        compiled.call(input.clone())?.block_until_ready()?;
+        ryft_core::compilation::call_function(&domain, compiled.executable_program(), input.clone())?
+            .block_until_ready()?;
         synchronized_samples.push(duration_nanoseconds(start));
     }
 

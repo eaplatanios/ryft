@@ -22,7 +22,7 @@ pub use experimental::domains::{
 };
 pub use experimental::shard_map::{reshard, sharding_constraint};
 pub use jit::{
-    CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
+    CompiledXlaFunction, ExecutableXlaProgram, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer, compile,
     compile_with_captures, compile_with_options, infer_output_types, jitted, jitted_with_options, stage,
     stage_with_captures, try_jitted_with_options,
 };

@@ -15,25 +15,30 @@ use crate::compilation::exchange::{
 };
 use crate::contexts::Domain;
 use crate::parameters::Parameterized;
-use crate::programs::{Program, ProgramError};
-use crate::types::Type;
+use crate::programs::ProgramError;
 
-/// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged [`Program`]s.
-/// Compilation is deliberately split into three semantic stages:
+use super::captures::CaptureReference;
+use super::function::{
+    CallRequest, CompileRequest, CompiledFunction, ExecutableProgram, LoweredFunction, LoweringRequest, StageRequest,
+    StagedFunction,
+};
+
+/// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
+/// Compilation is deliberately split into four semantic stages:
 ///
-///   1. Trace a closure into a backend-independent [`Program`] expressed in this domain's operation universe.
-///   2. [`Self::lower`] the traced program into [`Self::LoweredProgram`], the backend-specific compiler input.
-///   3. [`Self::compile`] the lowered program into a [`Self::CompiledProgram`], which [`Self::execute`] can invoke.
+///   1. [`Self::stage`] traces a closure using options fixed before tracing.
+///   2. [`Self::lower`] transforms the staged artifact into [`Self::LoweredProgram`].
+///   3. [`Self::compile`] transforms the lowered artifact into [`Self::CompiledProgram`].
+///   4. [`Self::call`] executes an [`ExecutableProgram`] against structured runtime inputs.
 ///
-/// Keeping lowered and compiled artifacts backend-owned lets [`CompilationDomain`] provide support for a common
-/// lifecycle without exposing StableHLO, PJRT, XLA, or any other compiler-specific representation. It also makes
-/// cache identity precise via [`Self::compilation_key`] which receives the complete lowering and must account for
-/// every option and piece of backend state that can change the executable.
-pub trait CompilationDomain: Domain + Clone {
-    /// Backend-specific lowered [`Program`] representation produced by [`Self::lower`].
+/// The domain is the active service for every transition; staged, lowered, compiled, and executable artifacts remain
+/// passive values. Each method owns its complete backend-specific transition, including any validation, caching, or
+/// runtime conversion policy the backend chooses to apply.
+pub trait CompilationDomain: Domain<Constant = CaptureReference<<Self as Domain>::Type>> + Clone {
+    /// Backend-specific lowered program representation produced by [`Self::lower`].
     type LoweredProgram;
 
-    /// Backend-specific compiled [`Program`] representation produced by [`Self::compile`].
+    /// Backend-specific compiled program representation produced by [`Self::compile`].
     type CompiledProgram;
 
     /// Backend-specific compilation options type. Meshes, sharding and layout overrides, donation declarations,
@@ -44,136 +49,55 @@ pub trait CompilationDomain: Domain + Clone {
     /// that is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Backend-specific cache key type used for caching [`Self::CompiledProgram`]s. Equality means that the
-    /// corresponding compiled artifacts are interchangeable for execution. In particular, the key must include the
-    /// complete computation represented by [`Self::LoweredProgram`] as well as every compile-relevant option, target
-    /// property, compiler version, backend setting, etc. A source location or a hash of input types is not a sufficient
-    /// computation identity. The `'static` bound ensures that a key retained by a long-lived [`CompilationContext`]
-    /// owns its identity data rather than borrowing from the lowered program, compilation options, or other transient
-    /// request state.
+    /// Traces a fallible function with explicit runtime captures and their symbolic references.
+    ///
+    /// This is the only staging primitive. Implementations apply all tracing-sensitive options to the effective input
+    /// and output signatures and retain those same options in the returned artifact.
+    fn stage<Request>(
+        &self,
+        request: Request,
+    ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
+    where
+        Self: Sized,
+        Self::Operation: Clone,
+        Request: StageRequest<Self>;
+
+    /// Performs the complete backend-specific lowering transition.
+    fn lower<Request>(
+        &self,
+        staged: Request,
+    ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
+    where
+        Self: Sized,
+        Request: LoweringRequest<Self>;
+
+    /// Performs the complete backend-specific compilation transition.
+    fn compile<Request>(
+        &self,
+        lowered: Request,
+    ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
+    where
+        Self: Sized,
+        Request: CompileRequest<Self>;
+
+    /// Performs the complete backend-specific structured execution transition.
+    fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
+    where
+        Self: Sized,
+        Request: CallRequest<Self>;
+}
+
+/// Optional capability for caching backend-compiled programs.
+pub trait CompilationCacheDomain: CompilationDomain {
+    /// Exact structural cache key for interchangeable compiled programs.
     type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Applies options that affect abstract input types before tracing.
-    ///
-    /// Most domains leave input types unchanged. A sharded backend can override this to apply explicit input sharding
-    /// or layout declarations before the closure observes its abstract arguments.
-    #[inline]
-    fn prepare_input_types<Input: Parameterized<Self::Type>>(
-        &self,
-        input_types: Input,
-        _options: &Self::Options,
-    ) -> Result<Input, Self::Error> {
-        Ok(input_types)
-    }
-
-    /// Validates that options affecting abstract inputs are already represented by a staged signature.
-    ///
-    /// This hook protects the explicit `stage(...).lower(options)` path: a backend whose input options affect tracing
-    /// must reject a staged signature that was not prepared consistently. [`Self::prepare_input_types`] remains the
-    /// mechanism used by the combined compile entry point before tracing.
-    #[inline]
-    fn validate_staged_input_types(
-        &self,
-        _input_types: &[Self::Type],
-        _options: &Self::Options,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    /// Lowers a flat source program into the backend's compiler input.
-    ///
-    /// `capture_count` identifies the leading inputs that came from a closed program's runtime capture table. Backends
-    /// use it to keep capture-only policy (for example, non-donation) separate from public input policy.
-    fn lower(
-        &self,
-        program: &Program<Self::Constant, Self::Operation, Vec<Self::Constant>, Vec<Self::Constant>>,
-        capture_count: usize,
-        options: &Self::Options,
-    ) -> Result<Self::LoweredProgram, Self::Error>;
-
-    /// Returns the effective flat output types produced by `program` after lowering-time option rewrites.
-    fn lowered_output_types<'a>(&self, program: &'a Self::LoweredProgram) -> &'a [Self::Type];
-
-    /// Constructs the exact in-memory cache key for `program` and `options`.
+    /// Constructs the exact cache key for `program` and `options`.
     fn compilation_key(
         &self,
         program: &Self::LoweredProgram,
         options: &Self::Options,
     ) -> Result<Self::CacheKey, Self::Error>;
-
-    /// Compiles one lowered program into a backend executable.
-    fn compile(
-        &self,
-        program: &Self::LoweredProgram,
-        options: &Self::Options,
-    ) -> Result<Self::CompiledProgram, Self::Error>;
-
-    /// Returns the effective flat output types produced by `program` at execution.
-    fn compiled_output_types<'a>(&self, program: &'a Self::CompiledProgram) -> &'a [Self::Type];
-
-    /// Validates one runtime input type against the declared staged type.
-    ///
-    /// The default accepts exact refinements. Backends that implement an explicit call-boundary conversion, such as
-    /// implicit resharding, may accept a broader relation here as long as [`Self::execute`] performs that conversion
-    /// before invoking the executable.
-    #[inline]
-    fn validate_input_type(&self, declared: &Self::Type, actual: &Self::Type) -> Result<(), Self::Error> {
-        if declared.is_refined_by(actual) {
-            Ok(())
-        } else {
-            Err(ProgramError::InvalidArgument {
-                message: format!("runtime input type {actual} does not refine declared type {declared}"),
-            }
-            .into())
-        }
-    }
-
-    /// Validates one runtime output type against the executable's declared output type.
-    #[inline]
-    fn validate_output_type(&self, declared: &Self::Type, actual: &Self::Type) -> Result<(), Self::Error> {
-        if declared.is_refined_by(actual) {
-            Ok(())
-        } else {
-            Err(ProgramError::InvalidArgument {
-                message: format!("output type {actual} does not refine declared type {declared}"),
-            }
-            .into())
-        }
-    }
-
-    /// Validates that `replacement` can be installed behind the same runtime call boundary as `current`.
-    ///
-    /// The default checks the output contract available to every compilation domain. Backends whose executable owns
-    /// additional invocation metadata (for example donation, capture, placement, or sharding declarations) must
-    /// override this hook and reject changes to that metadata.
-    fn validate_replacement(
-        &self,
-        current: &Self::CompiledProgram,
-        replacement: &Self::CompiledProgram,
-    ) -> Result<(), Self::Error> {
-        let current_outputs = self.compiled_output_types(current);
-        let replacement_outputs = self.compiled_output_types(replacement);
-        if current_outputs.len() != replacement_outputs.len() {
-            return Err(ProgramError::InvalidOutputCount {
-                expected: current_outputs.len(),
-                actual: replacement_outputs.len(),
-            }
-            .into());
-        }
-        for (declared, actual) in current_outputs.iter().zip(replacement_outputs) {
-            self.validate_output_type(declared, actual)?;
-        }
-        Ok(())
-    }
-
-    /// Executes `program` against flat runtime inputs and returns flat runtime outputs.
-    fn execute(
-        &self,
-        program: &Self::CompiledProgram,
-        inputs: Vec<Self::Value>,
-    ) -> Result<Vec<Self::Value>, Self::Error>;
 
     /// Returns stable canonical bytes for persistent cache identity, or `None` when this domain does not support
     /// persistent executable caching.
@@ -197,12 +121,6 @@ pub trait CompilationDomain: Domain + Clone {
     fn deserialize_program(&self, _bytes: &[u8]) -> Result<Option<Self::CompiledProgram>, Self::Error> {
         Ok(None)
     }
-
-    /// Returns the process-local compilation context used by this domain, when caching is enabled.
-    #[inline]
-    fn cache(&self) -> Option<&CompilationContext<Self>> {
-        None
-    }
 }
 
 /// Optional capability for inspecting a compiled program without recompiling it.
@@ -214,8 +132,13 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
     /// Backend-owned, typed analysis report.
     type Analysis;
 
-    /// Analyzes `program` without recompiling it.
-    fn analyze(&self, program: &Self::CompiledProgram) -> Result<Self::Analysis, Self::Error>;
+    /// Analyzes an executable program without recompiling it.
+    fn analyze<Input: Parameterized<Self::Type>, Output: Parameterized<Self::Type>>(
+        &self,
+        executable_program: &ExecutableProgram<Self, Input, Output>,
+    ) -> Result<Self::Analysis, Self::Error>
+    where
+        Self: Sized;
 }
 
 /// Default in-memory compile-cache capacity. Use [`CompilationContext::with_capacity`] when a
@@ -468,8 +391,7 @@ impl<P> InFlightCompilation<P> {
 /// [`CompilationDomain`] backend.
 ///
 /// Construct one [`CompilationContext`] per backend handle at program start and reuse it across
-/// calls to [`compile_with_options`](super::compile_with_options) and any backend-specific
-/// helpers that look up entries in the cache.
+/// compilation requests and any backend-specific helpers that look up entries in the cache.
 ///
 /// The cache is keyed by the domain's structurally-typed [`CompilationDomain::CacheKey`] — `Eq` on the key
 /// guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the cached program is returned
@@ -482,7 +404,7 @@ impl<P> InFlightCompilation<P> {
 /// disk tier is consulted between the in-memory tier and the producer closure. The cache uses
 /// [`CompilationDomain::serialize_program`] and [`CompilationDomain::deserialize_program`] to round-trip programs; any
 /// error from either method is treated as a cache miss for that entry.
-pub struct CompilationContext<D: CompilationDomain> {
+pub struct CompilationContext<D: CompilationCacheDomain> {
     /// In-memory LRU keyed by the domain's structural [`CompilationDomain::CacheKey`].
     programs: Mutex<LruCache<D::CacheKey, Arc<D::CompiledProgram>>>,
 
@@ -512,13 +434,13 @@ pub struct CompilationContext<D: CompilationDomain> {
     event_reporter: Option<Arc<dyn Fn(&CompilationEvent) + Send + Sync>>,
 }
 
-struct InFlightProducer<'a, D: CompilationDomain> {
+struct InFlightProducer<'a, D: CompilationCacheDomain> {
     context: &'a CompilationContext<D>,
     cache_key: Option<D::CacheKey>,
     in_flight: Option<Arc<InFlightCompilation<D::CompiledProgram>>>,
 }
 
-impl<'a, D: CompilationDomain> InFlightProducer<'a, D> {
+impl<'a, D: CompilationCacheDomain> InFlightProducer<'a, D> {
     fn new(
         context: &'a CompilationContext<D>,
         cache_key: D::CacheKey,
@@ -538,7 +460,7 @@ impl<'a, D: CompilationDomain> InFlightProducer<'a, D> {
     }
 }
 
-impl<D: CompilationDomain> Drop for InFlightProducer<'_, D> {
+impl<D: CompilationCacheDomain> Drop for InFlightProducer<'_, D> {
     fn drop(&mut self) {
         if let (Some(cache_key), Some(in_flight)) = (self.cache_key.take(), self.in_flight.take()) {
             self.context.finish_failure(&cache_key, in_flight);
@@ -546,7 +468,7 @@ impl<D: CompilationDomain> Drop for InFlightProducer<'_, D> {
     }
 }
 
-impl<D: CompilationDomain> CompilationContext<D> {
+impl<D: CompilationCacheDomain> CompilationContext<D> {
     /// Creates a [`CompilationContext`] with the default cache capacity and no disk-cache tier.
     #[inline]
     pub fn new() -> Self {
@@ -1250,7 +1172,7 @@ impl<D: CompilationDomain> CompilationContext<D> {
     }
 }
 
-impl<D: CompilationDomain> Default for CompilationContext<D> {
+impl<D: CompilationCacheDomain> Default for CompilationContext<D> {
     #[inline]
     fn default() -> Self {
         Self::new()
@@ -1268,9 +1190,9 @@ mod tests {
     use std::time::Duration;
 
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
     use crate::contexts::Domain;
-    use crate::operations::scalars::ScalarOperation;
-    use crate::programs::{Program, ProgramError};
+    use crate::programs::ProgramError;
     use crate::types::DataType;
 
     use super::*;
@@ -1292,7 +1214,7 @@ mod tests {
     impl Domain for TestDomain {
         type Type = DataType;
         type Value = Scalar;
-        type Constant = Scalar;
+        type Constant = CaptureReference<DataType>;
         type Operation = ScalarOperation<Scalar>;
     }
 
@@ -1301,43 +1223,52 @@ mod tests {
         type CompiledProgram = TestCompiledProgram;
         type Options = ();
         type Error = ProgramError;
+
+        fn stage<Request>(
+            &self,
+            request: Request,
+        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
+        where
+            Request: StageRequest<Self>,
+        {
+            request.trace(|_, output_types| Ok(output_types))
+        }
+
+        fn lower<Request>(
+            &self,
+            staged: Request,
+        ) -> Result<LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
+        where
+            Request: LoweringRequest<Self>,
+        {
+            let output_types = staged.staged().output_types().to_vec();
+            Ok(staged.into_lowered(output_types.clone(), output_types))
+        }
+
+        fn compile<Request>(
+            &self,
+            lowered: Request,
+        ) -> Result<CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
+        where
+            Request: CompileRequest<Self>,
+        {
+            Ok(lowered.into_compiled(Arc::new(TestCompiledProgram(0)), Vec::new()))
+        }
+
+        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
+        where
+            Request: CallRequest<Self>,
+        {
+            let executable = request.executable().clone();
+            Request::reconstruct(&executable, Vec::new())
+        }
+    }
+
+    impl CompilationCacheDomain for TestDomain {
         type CacheKey = u8;
 
-        fn lower(
-            &self,
-            _program: &Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>,
-            _capture_count: usize,
-            _options: &(),
-        ) -> Result<Self::LoweredProgram, Self::Error> {
-            Ok(Vec::new())
-        }
-
-        fn lowered_output_types<'a>(&self, program: &'a Self::LoweredProgram) -> &'a [DataType] {
-            program
-        }
-
-        fn compilation_key(
-            &self,
-            _program: &Self::LoweredProgram,
-            _options: &(),
-        ) -> Result<Self::CacheKey, Self::Error> {
+        fn compilation_key(&self, _program: &Vec<DataType>, _options: &()) -> Result<u8, ProgramError> {
             Ok(0)
-        }
-
-        fn compile(
-            &self,
-            _program: &Self::LoweredProgram,
-            _options: &(),
-        ) -> Result<Self::CompiledProgram, Self::Error> {
-            Ok(TestCompiledProgram(0))
-        }
-
-        fn compiled_output_types<'a>(&self, _program: &'a Self::CompiledProgram) -> &'a [DataType] {
-            &[]
-        }
-
-        fn execute(&self, _program: &Self::CompiledProgram, _inputs: Vec<Scalar>) -> Result<Vec<Scalar>, Self::Error> {
-            Ok(Vec::new())
         }
 
         fn persistent_cache_key(&self, key: &u8) -> Option<Vec<u8>> {

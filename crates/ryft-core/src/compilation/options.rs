@@ -6,9 +6,10 @@ use super::contexts::CompilationDomain;
 
 /// Backend-specific options passed through the common compilation lifecycle.
 ///
-/// The core pipeline keeps the payload opaque and hands it to the [`CompilationDomain`] when lowering, deriving cache
-/// identity, and compiling. This wrapper provides one consistent public boundary without requiring backend option
-/// types to implement unrelated traits. Its payload is private so callers cannot couple to the wrapper's layout;
+/// The core pipeline keeps the payload opaque and hands it to the [`CompilationDomain`] before staging. The staged
+/// artifact retains the same options for lowering, cache identity, and compilation. This wrapper provides one
+/// consistent public boundary while the domain owns any option-sensitive signature normalization. Its payload is
+/// private so callers cannot couple to the wrapper's layout;
 /// [`options`](Self::options) borrows it and [`into_options`](Self::into_options) recovers ownership.
 pub struct CompilationOptions<D: CompilationDomain> {
     /// Backend-specific options. See [`CompilationDomain::Options`] for the contract.
@@ -58,9 +59,10 @@ impl<D: CompilationDomain<Options: Default>> Default for CompilationOptions<D> {
 #[cfg(test)]
 mod tests {
     use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::ScalarOperation;
+    use crate::compilation::{CaptureReference, StagedFunction};
     use crate::contexts::Domain;
-    use crate::operations::scalars::ScalarOperation;
-    use crate::programs::{Program, ProgramError};
+    use crate::programs::ProgramError;
     use crate::types::DataType;
 
     use super::*;
@@ -76,7 +78,7 @@ mod tests {
     impl Domain for TestCompilationDomain {
         type Type = DataType;
         type Value = Scalar;
-        type Constant = Scalar;
+        type Constant = CaptureReference<DataType>;
         type Operation = ScalarOperation<Scalar>;
     }
 
@@ -85,35 +87,45 @@ mod tests {
         type CompiledProgram = Vec<DataType>;
         type Options = TestOptions;
         type Error = ProgramError;
-        type CacheKey = ();
 
-        fn lower(
+        fn stage<Request>(
             &self,
-            _program: &Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>>,
-            _capture_count: usize,
-            _options: &TestOptions,
-        ) -> Result<Vec<DataType>, ProgramError> {
-            Ok(Vec::new())
+            request: Request,
+        ) -> Result<StagedFunction<Self, Request::Input, Request::Output>, Self::Error>
+        where
+            Request: crate::compilation::function::StageRequest<Self>,
+        {
+            request.trace(|_, output_types| Ok(output_types))
         }
 
-        fn lowered_output_types<'a>(&self, program: &'a Vec<DataType>) -> &'a [DataType] {
-            program
+        fn lower<Request>(
+            &self,
+            staged: Request,
+        ) -> Result<crate::compilation::LoweredFunction<Self, Request::Input, Request::Output>, Self::Error>
+        where
+            Request: crate::compilation::function::LoweringRequest<Self>,
+        {
+            let output_types = staged.staged().output_types().to_vec();
+            Ok(staged.into_lowered(output_types.clone(), output_types))
         }
 
-        fn compilation_key(&self, _program: &Vec<DataType>, _options: &TestOptions) -> Result<(), ProgramError> {
-            Ok(())
+        fn compile<Request>(
+            &self,
+            lowered: Request,
+        ) -> Result<crate::compilation::CompiledFunction<Self, Request::Input, Request::Output>, Self::Error>
+        where
+            Request: crate::compilation::function::CompileRequest<Self>,
+        {
+            let output_types = lowered.lowered().output_types().to_vec();
+            Ok(lowered.into_compiled(std::sync::Arc::new(output_types.clone()), output_types))
         }
 
-        fn compile(&self, program: &Vec<DataType>, _options: &TestOptions) -> Result<Vec<DataType>, ProgramError> {
-            Ok(program.clone())
-        }
-
-        fn compiled_output_types<'a>(&self, program: &'a Vec<DataType>) -> &'a [DataType] {
-            program
-        }
-
-        fn execute(&self, _program: &Vec<DataType>, inputs: Vec<Scalar>) -> Result<Vec<Scalar>, ProgramError> {
-            Ok(inputs)
+        fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
+        where
+            Request: crate::compilation::function::CallRequest<Self>,
+        {
+            let executable = request.executable().clone();
+            Request::reconstruct(&executable, Vec::new())
         }
     }
 

@@ -8,15 +8,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ryft_core::compilation::CompilationDomain;
+use ryft_core::compilation::CompilationCacheDomain;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::profiler::FeedbackDirectedProfile;
 use ryft_pjrt::protos::{ProfileDeviceType, ProfileOptions};
 
 use crate::Array;
-use crate::experimental::domains::{XlaDomainError, XlaFeedbackDirectedProfile, XlaLoweredProgram, XlaOptions};
-use crate::jit::ExecutableXlaFunction;
+use crate::experimental::domains::{
+    XlaDomain, XlaDomainError, XlaFeedbackDirectedProfile, XlaLoweredProgram, XlaOptions,
+};
+use crate::jit::ExecutableXlaProgram;
 
 const ADAPTIVE_PROFILE_CACHE_NAMESPACE: &str = "xla-adaptive-profile-v1";
 
@@ -325,9 +327,7 @@ fn adaptive_profile_sidecar_key<'c>(
     compilation_options: &XlaOptions,
     options: AdaptiveProfileGuidedOptions,
 ) -> Result<Option<Vec<u8>>, XlaDomainError> {
-    let Some(cache) = domain.cache() else {
-        return Ok(None);
-    };
+    let cache = domain.compilation_context();
     if cache.disk_cache().is_none() {
         return Ok(None);
     }
@@ -368,8 +368,9 @@ pub struct AdaptiveProfileGuidedXlaFunction<'c, In: Parameterized<ArrayType>, Ou
 }
 
 struct AdaptiveProfileGuidedXlaFunctionInner<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> {
-    baseline: ExecutableXlaFunction<'c, In, Out>,
-    active: RwLock<ExecutableXlaFunction<'c, In, Out>>,
+    domain: XlaDomain<'c>,
+    baseline: ExecutableXlaProgram<'c, In, Out>,
+    active: RwLock<ExecutableXlaProgram<'c, In, Out>>,
     lowered_program: XlaLoweredProgram,
     compilation_options: XlaOptions,
     options: AdaptiveProfileGuidedOptions,
@@ -389,7 +390,8 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> Clone
 
 impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptiveProfileGuidedXlaFunction<'c, In, Out> {
     pub(crate) fn new(
-        baseline: ExecutableXlaFunction<'c, In, Out>,
+        domain: XlaDomain<'c>,
+        baseline: ExecutableXlaProgram<'c, In, Out>,
         lowered_program: XlaLoweredProgram,
         compilation_options: XlaOptions,
         options: AdaptiveProfileGuidedOptions,
@@ -399,13 +401,14 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
                 reason: "adaptive profile-guided recompilation requires an unprofiled baseline".to_string(),
             });
         }
-        let client = baseline.domain().client();
+        let client = domain.client();
         validate_adaptive_profile_guided_platform(client.platform_name()?.as_ref())?;
         client.profiler_extension()?;
         let profile_sidecar_key =
-            adaptive_profile_sidecar_key(baseline.domain(), &lowered_program, &compilation_options, options)?;
+            adaptive_profile_sidecar_key(&domain, &lowered_program, &compilation_options, options)?;
         let function = Self {
             inner: Arc::new(AdaptiveProfileGuidedXlaFunctionInner {
+                domain,
                 active: RwLock::new(baseline.clone()),
                 baseline,
                 lowered_program,
@@ -477,18 +480,18 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
             }
             AdaptiveDispatch::Baseline => {
                 self.inner.statistics.baseline_executions.fetch_add(1, Ordering::Relaxed);
-                executable.interpret(inputs)
+                self.inner.domain.interpret(&executable, inputs)
             }
             AdaptiveDispatch::Optimized => {
                 self.inner.statistics.optimized_executions.fetch_add(1, Ordering::Relaxed);
-                executable.interpret(inputs)
+                self.inner.domain.interpret(&executable, inputs)
             }
         }
     }
 
     fn profile_baseline(
         &self,
-        executable: ExecutableXlaFunction<'c, In, Out>,
+        executable: ExecutableXlaProgram<'c, In, Out>,
         inputs: In::To<Array<'c>>,
     ) -> Result<Out::To<Array<'c>>, XlaDomainError>
     where
@@ -508,20 +511,20 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
             raise_error_on_start_failure: true,
             ..ProfileOptions::default()
         };
-        let profiler = match executable.domain().client().profiler(&profiler_options) {
+        let profiler = match self.inner.domain.client().profiler(&profiler_options) {
             Ok(profiler) => profiler,
             Err(error) => {
-                let outputs = executable.interpret(inputs)?;
+                let outputs = self.inner.domain.interpret(&executable, inputs)?;
                 self.record_profile_failure(error.to_string());
                 return Ok(outputs);
             }
         };
         if let Err(error) = profiler.start() {
-            let outputs = executable.interpret(inputs)?;
+            let outputs = self.inner.domain.interpret(&executable, inputs)?;
             self.record_profile_failure(error.to_string());
             return Ok(outputs);
         }
-        let execution = match executable.interpret_async(inputs) {
+        let execution = match self.inner.domain.interpret_async(&executable, inputs) {
             Ok(execution) => execution,
             Err(error) => {
                 let reason = match profiler.stop() {
@@ -573,26 +576,23 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
             .profile_failed(reason, self.inner.options);
     }
 
-    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaFunction<'c, In, Out>, XlaDomainError> {
+    fn compile_profile(&self, profile: Vec<u8>) -> Result<ExecutableXlaProgram<'c, In, Out>, XlaDomainError> {
         let profile = XlaFeedbackDirectedProfile::new(profile).with_version(self.inner.options.profile_version);
         let lowered_program = self.inner.lowered_program.clone().with_feedback_directed_profile(profile.clone());
         let compilation_options = self.inner.compilation_options.clone().with_feedback_directed_profile(profile);
-        let domain = self.inner.baseline.domain();
+        let domain = &self.inner.domain;
         let key = domain.compilation_key(&lowered_program, &compilation_options)?;
-        let program = match domain.cache() {
-            Some(cache) => {
-                cache.get_or_compile(domain, key, || domain.compile(&lowered_program, &compilation_options))?
-            }
-            None => Arc::new(domain.compile(&lowered_program, &compilation_options)?),
-        };
-        self.inner.baseline.with_compiled_program(program)
+        let program = domain
+            .compilation_context()
+            .get_or_compile(domain, key, || domain.compile_xla_program(&lowered_program, &compilation_options))?;
+        domain.replace_executable_xla_program(&self.inner.baseline, program)
     }
 
     fn restore_persisted_profile(&self) {
         let Some(key) = self.inner.profile_sidecar_key.as_deref() else {
             return;
         };
-        let Some(disk_cache) = self.inner.baseline.domain().cache().and_then(|cache| cache.disk_cache()) else {
+        let Some(disk_cache) = self.inner.domain.compilation_context().disk_cache() else {
             return;
         };
         let profile = match disk_cache.get_auxiliary(ADAPTIVE_PROFILE_CACHE_NAMESPACE, key) {
@@ -637,7 +637,7 @@ impl<'c, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>> AdaptivePr
         let Some(key) = self.inner.profile_sidecar_key.as_deref() else {
             return;
         };
-        let Some(disk_cache) = self.inner.baseline.domain().cache().and_then(|cache| cache.disk_cache()) else {
+        let Some(disk_cache) = self.inner.domain.compilation_context().disk_cache() else {
             return;
         };
         match disk_cache.put_auxiliary(ADAPTIVE_PROFILE_CACHE_NAMESPACE, key, profile) {

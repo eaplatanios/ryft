@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 
-use ryft_core::compilation::CompilationDomain;
+use ryft_core::compilation::{CompilationDomain, CompilationOptions, StagedFunction, stage_function};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
-use ryft_core::tracing::Trace;
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
 use ryft_pjrt::{Buffer, DeviceId};
 
 use crate::arrays_v0::transfers::{cross_host_global_device_id, exact_shard_transfer_key};
-use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions, XlaTracer};
+use crate::experimental::domains::{XlaDomain, XlaDomainError, XlaOptions};
 use crate::{Array, ArrayError, Error as XlaError, ToPjrt};
 
 /// Performs the compiled-XLA resharding path for [`Array::to_placement`](crate::Array::to_placement).
@@ -139,39 +138,23 @@ fn try_same_mesh<'o>(
         feedback_directed_profile: None,
     };
 
-    let (_output_types_tree, program): (ArrayType, _) =
-        XlaDomain::<'o>::trace(|x: XlaTracer<'o>| Ok(x), bare_input_type.clone()).map_err(|error| {
-            ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") }
-        })?;
-    let program = program.into_flat_program();
-    let lowered = CompilationDomain::lower(engine, &program, 0, &xla_options).map_err(|error| match error {
+    let staged: StagedFunction<XlaDomain<'o>, ArrayType, ArrayType> =
+        stage_function(engine, |input| input, bare_input_type, CompilationOptions::new(xla_options)).map_err(
+            |error| ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") },
+        )?;
+    let lowered = engine.lower(staged).map_err(|error| match error {
         XlaDomainError::Array(array_error) => array_error,
         other => ArrayError::CompiledReshardInternalError { message: format!("lowering failed: {other}") },
     })?;
-    let cache_key =
-        CompilationDomain::compilation_key(engine, &lowered, &xla_options).map_err(|error| match error {
-            XlaDomainError::Array(array_error) => array_error,
-            other => {
-                ArrayError::CompiledReshardInternalError { message: format!("cache-key construction failed: {other}") }
-            }
-        })?;
-
-    let cache = engine.cache().expect("XlaDomain always exposes a compile cache");
-    let compiled = cache
-        .get_or_compile(engine, cache_key, || CompilationDomain::compile(engine, &lowered, &xla_options))
-        .map_err(|error| match error {
-            XlaDomainError::Array(array_error) => array_error,
-            other => ArrayError::CompiledReshardInternalError { message: format!("{other}") },
-        })?;
-
-    let inputs = vec![source.clone()];
-    let outputs = CompilationDomain::execute(engine, &compiled, inputs).map_err(|error| match error {
+    let compiled = engine.compile(lowered).map_err(|error| match error {
         XlaDomainError::Array(array_error) => array_error,
-        other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
+        other => ArrayError::CompiledReshardInternalError { message: format!("compilation failed: {other}") },
     })?;
-
-    outputs.into_iter().next().ok_or_else(|| ArrayError::CompiledReshardInternalError {
-        message: "compiled reshard produced no outputs".to_string(),
+    ryft_core::compilation::call_function(engine, compiled.executable_program(), source.clone()).map_err(|error| {
+        match error {
+            XlaDomainError::Array(array_error) => array_error,
+            other => ArrayError::CompiledReshardInternalError { message: format!("execute failed: {other}") },
+        }
     })
 }
 

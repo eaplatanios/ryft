@@ -10,7 +10,7 @@
 //!
 //! ```text
 //!                                                  Per-Jitted-Function Caches
-//!                            specialization key = static parameters + input paths + prepared abstract types
+//!                        specialization key = static parameters + input paths + runtime-derived abstract types
 //!
 //! ┌──────────────────────────────┐
 //! │         Rust Closure         │
@@ -52,7 +52,7 @@
 //! └──────────────────────────────┘                           └──────────────────────────────┘
 //!
 //! ┌──────────────────────────────┐                           ┌──────────────────────────────┐
-//! │ Compiled Program             │ ── discard metadata ────▶ │ Executable Function          │
+//! │ Compiled Program             │ ── discard metadata ────▶ │ Executable Program           │
 //! │ Compiled Function handle     │                           │                              │
 //! └──────────────────────────────┘                           └──────────────────────────────┘
 //! ```
@@ -60,12 +60,11 @@
 //! # Entry Points
 //!
 //! - Use [`jit`] or [`try_jit`] for a retained JIT dispatcher. A [`JittedFunction`] specializes on explicit static
-//!   host parameters, the dynamic parameter structure, and prepared abstract input types. Its first call for a
+//!   host parameters, the dynamic parameter structure, and runtime-derived abstract input types. Its first call for a
 //!   specialization traces, lowers, and requests compilation; warm calls dispatch directly to the executable.
-//! - Use [`compile`] or [`compile_with_options`] when the abstract input signature is already known and one compiled
-//!   specialization is sufficient. These functions perform staging, lowering, and compilation in sequence.
-//! - Use [`stage`] or [`try_stage`] when source IR must be inspected, transformed, embedded in an outer trace, or
-//!   lowered later, and continue explicitly with [`StagedFunction::lower`] and [`LoweredFunction::compile`].
+//! - Use [`stage_function`] for ordinary capture-free staging. Construct a [`CompilationStagingRequest`] and pass it to
+//!   [`CompilationDomain::stage`] when fallibility, runtime captures, or symbolic capture references are needed. Then
+//!   continue with [`CompilationDomain::lower`] and [`CompilationDomain::compile`].
 //!
 //! Backend-facing crates normally wrap these generic entry points with value- and option-specific APIs. New
 //! backend-neutral code can call them directly.
@@ -73,14 +72,14 @@
 //! # Lifecycle Handles
 //!
 //! 1. [`StagedFunction`] owns a typed [`ClosedProgram`], concrete runtime captures, public input and output
-//!    signatures, output structure, and the domain. It contains no backend lowering or executable, and its
+//!    signatures, output structure, and compilation options. It contains no backend lowering or executable, and its
 //!    [`StagedFunction::call`] method stages a nested call into an active context rather than executing at runtime.
 //! 2. [`LoweredFunction`] owns the backend's [`CompilationDomain::LoweredProgram`], the source handle, and the
 //!    options used to lower it. Compilation computes the domain's exact key and consults its [`CompilationContext`].
 //! 3. [`CompiledFunction`] combines the executable with the staged and lowered metadata required for inspection and
-//!    transformations, and [`CompiledFunction::call`] performs runtime execution.
-//! 4. [`ExecutableFunction`] retains only the executable, domain, captures, signatures, and output structure. Use
-//!    [`CompiledFunction::into_executable`] when transform metadata is no longer needed; this runtime-only handle
+//!    transformations. Runtime execution uses [`CompilationDomain::call`].
+//! 4. [`ExecutableProgram`] retains only the executable, captures, signatures, and output structure. Use
+//!    [`CompiledFunction::into_executable_program`] when transform metadata is no longer needed; this runtime-only handle
 //!    gains `Send` and `Sync` structurally whenever its backend fields do.
 //!
 //! # Captures and Nested Calls
@@ -140,7 +139,7 @@
 //! lowering, compilation, output signatures, and flat execution. Key equality must mean that compiled artifacts are
 //! interchangeable and must include every compile-relevant program, option, compiler, target, and topology property.
 //!
-//! Optional hooks support signature-affecting options, persistent keying and executable codecs, a shared
+//! Optional hooks support persistent keying and executable codecs, a shared
 //! [`CompilationContext`], broader runtime type compatibility, and safe executable replacement. Implement
 //! [`AnalyzableCompilationDomain`] to expose cost or memory analysis without recompilation, and implement
 //! [`CompiledProgramOperation`] on the operation family when staged functions must compose inside other traces.
@@ -149,7 +148,7 @@
 //!
 //! 1. Start with [`CompilationDomain`] for the core/backend ownership boundary.
 //! 2. Read [`JittedFunction`], [`StagedFunction`], [`LoweredFunction`], [`CompiledFunction`], and
-//!    [`ExecutableFunction`] for the public lifecycle.
+//!    [`ExecutableProgram`] for the public lifecycle.
 //! 3. Read [`ClosedProgram`] and [`CaptureReference`] for capture handling.
 //! 4. Read [`CompilationContext`] for single-flight compilation and cache tiers.
 //! 5. Read [`DiskCache`] and [`CompilationArtifactExchange`] only when adding persistence or distributed sharing.
@@ -164,16 +163,15 @@ pub mod options;
 
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use contexts::{
-    AnalyzableCompilationDomain, CompilationCacheLevel, CompilationCacheOutcome, CompilationCacheStatistics,
-    CompilationContext, CompilationDomain, CompilationEvent, CompilationMissReason,
+    AnalyzableCompilationDomain, CompilationCacheDomain, CompilationCacheLevel, CompilationCacheOutcome,
+    CompilationCacheStatistics, CompilationContext, CompilationDomain, CompilationEvent, CompilationMissReason,
 };
 pub use disk_cache::DiskCache;
 pub use exchange::{CompilationArtifactExchange, CompilationArtifactExchangePolicy, CompilationExchangeError};
 pub use function::{
-    CompilationTracer, CompiledFunction, CompiledProgramOperation, ExecutableFunction, FlatCompilationProgram,
-    JitCacheCapacities, JitCacheStatistics, JittedFunction, LoweredFunction, Specialization, StagedFunction, compile,
-    compile_with_options, jit, jit_with_options, stage, stage_with_capture_references, stage_with_captures, try_jit,
-    try_jit_with_options, try_jit_with_options_and_capacities, try_jit_with_options_and_capacity, try_stage,
-    try_stage_with_capture_references, try_stage_with_captures,
+    CompilationCall, CompilationStagingRequest, CompilationTracer, CompiledFunction, CompiledProgramOperation,
+    ExecutableProgram, FlatCompilationProgram, JitCacheCapacities, JitCacheStatistics, JittedFunction, LoweredFunction,
+    Specialization, StagedFunction, call_function, jit, jit_with_options, stage_function, try_jit,
+    try_jit_with_options, try_jit_with_options_and_capacities, try_jit_with_options_and_capacity,
 };
 pub use options::CompilationOptions;
