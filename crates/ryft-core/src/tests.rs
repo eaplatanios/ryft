@@ -22,9 +22,9 @@ use std::ops::{BitAnd, BitOr, BitXor, Not};
 
 use crate::backends::scalars::Scalar;
 use crate::broadcasting::Broadcastable;
-use crate::contexts::EagerContext;
 #[cfg(test)]
-use crate::contexts::{Context, Domain};
+use crate::contexts::Context;
+use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
 use crate::operations::arithmetic::Abs;
 use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
@@ -1647,7 +1647,7 @@ mod linearization_tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Program, ProgramBuilder};
-    use crate::tracing::{NestedTracingContext, Tracer};
+    use crate::tracing::{NestedTracingContext, Trace, Tracer};
     use crate::tracing_v2::unroll::unroll_concretizable_whiles;
     use crate::types::DataType;
 
@@ -4342,8 +4342,7 @@ mod array_linearization_tests {
     /// once through a `TracingContext::trace` and the staged operation is extracted from the resulting
     /// single-instruction program.
     fn rematerialize_function(inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
-        use crate::contexts::Domain;
-        use crate::tracing::DomainTracer;
+        use crate::tracing::{DomainTracer, Trace};
         use crate::tracing_v2::operations::ArrayOperation;
         use crate::tracing_v2::rematerialize;
         use crate::types::{DataType, Shape, Size};

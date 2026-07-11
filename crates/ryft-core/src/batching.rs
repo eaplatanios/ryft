@@ -1289,6 +1289,7 @@ mod tests {
     use crate::operations::arithmetic::AddOperation;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
+    use crate::tracing::Trace;
     use crate::tracing_v2::ArrayOperation;
     use crate::types::{ArrayType, DataType, Shape, Size, Typed};
 

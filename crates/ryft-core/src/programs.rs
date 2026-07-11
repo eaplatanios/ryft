@@ -26,7 +26,7 @@
 //!
 //! # Entry Points
 //!
-//! Most code obtains programs through [`Domain::trace`] or a transform rather than by manual construction, and
+//! Most code obtains programs through [`trace`](crate::trace) or a transform rather than by manual construction, and
 //! replays them with [`Program::interpret`] (eagerly) or [`Program::interpret_in_context`] (through a chosen staging
 //! or transform context). Batching, differentiation, and partial evaluation add program-level functions in their own
 //! modules, and compilation opens captures, flattens boundaries, and hands the program to a backend

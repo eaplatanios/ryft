@@ -708,14 +708,71 @@ pub type DomainTracer<D> = Tracer<DomainTracingContext<D>>;
 /// this alias at call sites that trace a closure into a nested program over an enclosing context `C`.
 pub type NestedTracer<C> = Tracer<NestedTracingContext<C>>;
 
+/// Extension trait that exposes ordinary symbolic tracing on any [`Domain`], with the tracing universe named explicitly
+/// through the implementing type and the signature supplied as abstract input types. Refer to the documentation of the
+/// [`trace`] and [`infer_output_type`] functions for information on the trace and its arguments.
+pub trait Trace: Domain {
+    /// Traces `function` into a [`Program`] for the provided input types, in this [`Domain`]'s type, staged-constant,
+    /// and operation universe. This is the explicitly named counterpart of the [`trace`] function, which recovers the
+    /// tracing universe and signature from example values instead. Refer to its documentation for more information.
+    #[inline]
+    fn trace<
+        F: FnOnce(Input::To<DomainTracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<
+                Self::Type,
+                Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<DomainTracer<Self>>,
+            >,
+        Output: Parameterized<
+                DomainTracer<Self>,
+                Family: ParameterizedFamily<Self::Type> + ParameterizedFamily<Self::Constant>,
+            >,
+    >(
+        function: F,
+        input_type: Input,
+    ) -> Result<
+        (
+            Output::To<Self::Type>,
+            Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
+        ),
+        ProgramError,
+    > {
+        DomainTracingContext::<Self>::trace(function, input_type)
+    }
+
+    /// Traces `function` for the provided input types in this [`Domain`]'s universe and returns only the inferred
+    /// output types, without retaining the traced [`Program`]. This is the explicitly named counterpart of the
+    /// [`infer_output_type`] function. Refer to its documentation for more information.
+    #[inline]
+    fn infer_output_type<
+        F: FnOnce(Input::To<DomainTracer<Self>>) -> Result<Output, ProgramError>,
+        Input: Parameterized<
+                Self::Type,
+                Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<DomainTracer<Self>>,
+            >,
+        Output: Parameterized<
+                DomainTracer<Self>,
+                Family: ParameterizedFamily<Self::Type> + ParameterizedFamily<Self::Constant>,
+            >,
+    >(
+        function: F,
+        input_type: Input,
+    ) -> Result<Output::To<Self::Type>, ProgramError> {
+        DomainTracingContext::<Self>::infer_output_type(function, input_type)
+    }
+}
+
+impl<D: Domain> Trace for D {}
+
 /// Traces `function` into a [`Program`] at the abstract signature of the provided `input` values (i.e., the analogue
 /// of [JAX's `make_jaxpr`](https://docs.jax.dev/en/latest/_autosummary/jax.make_jaxpr.html)). The provided values
 /// contribute only their abstract [`Type`]s. No runtime computation is performed on them and they are not captured by
 /// the resulting program. The trace runs in the input value type's statically known
 /// [`ExecutionDomain`](Value::ExecutionDomain), and so, unlike [`batch`](crate::batching::batch) and the
 /// differentiation entry points, no context instance needs to be recovered from the input leaves and inputs with no
-/// leaf values are still traceable. Refer to the documentation of [`Domain::trace`] for information on the trace and
-/// its arguments.
+/// leaf values are still traceable. The trace invokes `function` once over [`DomainTracer`] inputs standing in for
+/// the input types through a fresh [`DomainTracingContext`], and returns the inferred output types together with the
+/// finalized program. [`Trace::trace`] exposes the same trace with the tracing universe named explicitly and the
+/// abstract input types supplied directly.
 #[inline]
 pub fn trace<
     V: Value,
@@ -751,7 +808,8 @@ pub fn trace<
 /// Traces `function` at the abstract signature of the provided `input` values and returns only the inferred
 /// output types, without retaining the traced [`Program`] (i.e., the analogue of [JAX's `eval_shape`](
 /// https://docs.jax.dev/en/latest/_autosummary/jax.eval_shape.html)). This is the output-type-only counterpart
-/// of [`trace`]. Refer to the documentation of [`Domain::infer_output_type`] for more information.
+/// of [`trace`], and [`Trace::infer_output_type`] exposes the same trace with the tracing universe named explicitly
+/// and the abstract input types supplied directly.
 #[inline]
 pub fn infer_output_type<
     V: Value,

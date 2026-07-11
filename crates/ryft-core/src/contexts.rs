@@ -25,10 +25,11 @@
 //!
 //! # Entry Points
 //!
-//! Use [`Domain::trace`] for ordinary symbolic tracing in a named domain and [`Domain::infer_output_type`] when only
-//! abstract outputs are needed. Use [`Program::interpret`] for eager replay or [`Program::interpret_in_context`] to
-//! replay through a chosen context. Most transform modules also expose a free value-level entry point and a context
-//! capability built on this same bind protocol.
+//! Use the free [`trace`](crate::trace) function for ordinary symbolic tracing (or [`Trace::trace`](Trace::trace) to
+//! name a domain explicitly) and [`infer_output_type`](crate::tracing::infer_output_type) when only abstract outputs
+//! are needed. Use [`Program::interpret`] for eager replay or [`Program::interpret_in_context`] to replay through a
+//! chosen context. Most transform modules also expose a free value-level entry point and a context capability built
+//! on this same bind protocol.
 //!
 //! # Domains versus Contexts
 //!
@@ -115,7 +116,7 @@ use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracerState, TracingContext};
+use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
 /// Type/value universe at the core of Ryft that is used by program interpretation, tracing, and transformations like
@@ -145,55 +146,6 @@ pub trait Domain: Sized {
 
     /// [`Operation`] representation supported by this [`Domain`] for ordinary traced [`Program`]s.
     type Operation: Operation<Self::Type>;
-
-    /// Traces `function` into a [`Program`] for the provided input types, in this [`Domain`]'s type, staged-constant,
-    /// and operation universe. This is the canonical ordinary-tracing entry point named by a [`Domain`]. It invokes
-    /// `function` once over [`DomainTracer`] inputs standing in for `input_type` through a fresh
-    /// [`DomainTracingContext`], and returns the output types plus the finalized program.
-    #[inline]
-    fn trace<
-        F: FnOnce(Input::To<DomainTracer<Self>>) -> Result<Output, ProgramError>,
-        Input: Parameterized<
-                Self::Type,
-                Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<DomainTracer<Self>>,
-            >,
-        Output: Parameterized<
-                DomainTracer<Self>,
-                Family: ParameterizedFamily<Self::Type> + ParameterizedFamily<Self::Constant>,
-            >,
-    >(
-        function: F,
-        input_type: Input,
-    ) -> Result<
-        (
-            Output::To<Self::Type>,
-            Program<Self::Constant, Self::Operation, Input::To<Self::Constant>, Output::To<Self::Constant>>,
-        ),
-        ProgramError,
-    > {
-        DomainTracingContext::<Self>::trace(function, input_type)
-    }
-
-    /// Traces `function` against `input_type` in this [`Domain`]'s universe and returns only the inferred output type,
-    /// without retaining the traced [`Program`]. Use this when callers need just the output types of an ordinary
-    /// symbolic trace named by a [`Domain`].
-    #[inline]
-    fn infer_output_type<
-        F: FnOnce(Input::To<DomainTracer<Self>>) -> Result<Output, ProgramError>,
-        Input: Parameterized<
-                Self::Type,
-                Family: ParameterizedFamily<Self::Constant> + ParameterizedFamily<DomainTracer<Self>>,
-            >,
-        Output: Parameterized<
-                DomainTracer<Self>,
-                Family: ParameterizedFamily<Self::Type> + ParameterizedFamily<Self::Constant>,
-            >,
-    >(
-        function: F,
-        input_type: Input,
-    ) -> Result<Output::To<Self::Type>, ProgramError> {
-        DomainTracingContext::<Self>::infer_output_type(function, input_type)
-    }
 }
 
 /// Active context that can *apply* an [`Operation`] to values, layered on top of the passive [`Domain`] substrate.
