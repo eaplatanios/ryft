@@ -823,6 +823,7 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
         &[],
         None,
         &[],
+        None,
         &[input_values[0].r#type()?],
         location,
     )?;
@@ -1435,6 +1436,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
         &[],
         None,
         &[],
+        None,
         &[token_type],
         location,
     )?)?;
@@ -5156,6 +5158,8 @@ fn lower_element_type<'c, 't>(
         DataType::F32 => context.float32_type().as_ref(),
         DataType::F64 => context.float64_type().as_ref(),
         DataType::F4E2M1FN => context.float4e2m1fn_type().as_ref(),
+        DataType::F6E2M3FN => context.float6e2m3fn_type().as_ref(),
+        DataType::F6E3M2FN => context.float6e3m2fn_type().as_ref(),
         DataType::F8E3M4 => context.float8e3m4_type().as_ref(),
         DataType::F8E4M3 => context.float8e4m3_type().as_ref(),
         DataType::F8E4M3FN => context.float8e4m3fn_type().as_ref(),
@@ -5374,6 +5378,18 @@ fn lower_constant_elements_attribute<'c, 't>(
             .splatted_dense_attribute_elements_attribute(
                 tensor_type,
                 context.float_attribute(context.float4e2m1fn_type(), float_value),
+            )
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::F6E2M3FN => context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                context.float_attribute(context.float6e2m3fn_type(), float_value),
+            )
+            .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
+        DataType::F6E3M2FN => context
+            .splatted_dense_attribute_elements_attribute(
+                tensor_type,
+                context.float_attribute(context.float6e3m2fn_type(), float_value),
             )
             .map_err(|_| LoweringError::InvalidDenseElementsAttribute { data_type }),
         DataType::F8E3M4 => context
@@ -6341,7 +6357,8 @@ mod tests {
         let source =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&values).as_slice())
                 .unwrap();
-        let (output, lines) = with_captured_prints(|| compiled.interpret(source).unwrap());
+        let (output, lines) =
+            with_captured_prints(|| engine.interpret(&compiled.executable_program(), source).unwrap());
 
         // Both prints fire in program order, and the printed values are the forwarded operands.
         assert_eq!(lines, vec!["x: [1.5, 2.5]".to_string(), "doubled: [3.0, 5.0]".to_string()]);
@@ -6454,7 +6471,7 @@ mod tests {
                 ],
                 ..Default::default()
             };
-            let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
             let mut outputs = execution.block_until_ready().unwrap().remove(0);
             assert_eq!(outputs.outputs.len(), 1);
             let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
@@ -6549,7 +6566,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+        let execution = executable.execute(vec![inputs], Vec::new(), 0, None, None, None, None).unwrap();
         let mut outputs = execution.block_until_ready().unwrap().remove(0);
         assert_eq!(outputs.outputs.len(), 1);
         let output_bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
@@ -6583,12 +6600,12 @@ mod tests {
             .unwrap();
         let compiled: CompiledXlaFunction<'_, ArrayType, ArrayType> =
             compile(|x| (x.clone() * x).print("y"), input_type.clone(), &engine, mesh.clone()).unwrap();
-        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient().unwrap();
+        let gradient: CompiledXlaFunction<'_, ArrayType, ArrayType> = compiled.gradient(&engine).unwrap();
 
         let input =
             Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f64>(&[3.0]).as_slice())
                 .unwrap();
-        let (output, lines) = with_captured_prints(|| gradient.interpret(input).unwrap());
+        let (output, lines) = with_captured_prints(|| engine.interpret(&gradient.executable_program(), input).unwrap());
 
         // The print fires exactly once, during the forward pass of the differentiated program; transposition is the
         // identity on the cotangent and re-prints nothing.
