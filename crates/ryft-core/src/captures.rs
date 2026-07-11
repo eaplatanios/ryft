@@ -187,13 +187,17 @@ pub struct ClosedProgram<
     captures: Vec<V>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V: Value, O: Operation<V::Type>, Input: Parameterized<CaptureReference<V::Type>>, Output: Parameterized<CaptureReference<V::Type>>>
-    ClosedProgram<V, O, Input, Output>
+impl<
+    V: Value,
+    O: Operation<V::Type>,
+    Input: Parameterized<CaptureReference<V::Type>>,
+    Output: Parameterized<CaptureReference<V::Type>>,
+> ClosedProgram<V, O, Input, Output>
 {
     /// Creates a [`ClosedProgram`] from a capture-referenced `program` and its concrete `captures`, validating that
-    /// every constant atom references an existing capture whose type matches the type stored in the reference.
+    /// every [`CaptureReference`] in the program references an existing capture whose type matches the type stored
+    /// in the reference.
+    #[inline]
     pub fn new(
         program: Program<CaptureReference<V::Type>, O, Input, Output>,
         captures: Vec<V>,
@@ -202,6 +206,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<CaptureReference<V::T
         closed_program.validate_capture_references()?;
         Ok(closed_program)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Validates that every captured-constant atom references an existing capture with the same type.
     pub fn validate_capture_references(&self) -> Result<(), ProgramError> {

@@ -399,7 +399,6 @@ impl<O> Instruction<O> {
     }
 }
 
-// TODO(eaplatanios): Remove the type bounds for `V` here and wherever else we included them just because of this requirement.
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend. It
 /// consists of a sequence of [`Instruction`]s paired with [`Parameterized`] input and output types. This is the primary
 /// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like
@@ -1243,7 +1242,7 @@ impl ProgramLiveSets {
 /// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
 /// but also carries an optional [`ProgramError`] that can be used to signal a failure during program construction.
 #[derive(Clone, Debug)]
-pub struct ProgramBuilder<V: Typed + Parameter, O: Operation<V::Type>> {
+pub struct ProgramBuilder<V: Typed, O> {
     /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
     pub(crate) atoms: Vec<Atom<V>>,
 

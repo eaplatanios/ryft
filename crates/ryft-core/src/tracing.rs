@@ -831,6 +831,7 @@ mod tests {
 
     use crate::axes::NamedAxes;
     use crate::backends::scalars::{Scalar, ScalarOperation};
+    use crate::captures::{CaptureReference, CapturingContext};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
