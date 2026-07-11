@@ -796,8 +796,10 @@ impl<'c> LoadedExecutable<'c> {
 
     /// Executes this [`LoadedExecutable`] on its _addressable_ devices (or on a single _addressable_ device if `device`
     /// is provided) using the provided inputs. Note that the execution of PJRT programs is asynchronous and so the
-    /// runtime may not have completed execution by the time this function returns. You can use [`Buffer::ready`] on the
-    /// returned [`Buffer`]s of [`Event::await`] on the returned [`Event`]s to wait for the execution to complete.
+    /// runtime may not have completed execution by the time this function returns. The returned [`Execution`] pairs the
+    /// per-device output [`Buffer`]s with the whole-execution [`ExecutionFence`] that joins every device's completion
+    /// event. Use [`Execution::block_until_ready`] (or the fence directly) to wait for the launch to complete and
+    /// observe asynchronous execution errors, or [`Buffer::ready`] to wait for individual outputs.
     ///
     /// # Parameters
     ///
@@ -833,7 +835,7 @@ impl<'c> LoadedExecutable<'c> {
         call_location: Option<&str>,
         incarnation_ids: Option<HashMap<usize, usize>>,
         device: Option<&Device<'c>>,
-    ) -> Result<Vec<ExecutionDeviceOutputs<'c>>, Error> {
+    ) -> Result<Execution<Vec<ExecutionDeviceOutputs<'c>>>, Error> {
         use ffi::PJRT_LoadedExecutable_Execute_Args;
 
         let mut inputs = inputs;
@@ -996,6 +998,7 @@ impl<'c> LoadedExecutable<'c> {
 
         // Process the outputs and the completion events.
         let mut execution_outputs = Vec::with_capacity(device_count);
+        let mut completion_events = Vec::with_capacity(device_count);
         for device_index in 0..device_count {
             let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
             let send_callbacks = std::mem::take(&mut send_callbacks[device_index]);
@@ -1015,10 +1018,11 @@ impl<'c> LoadedExecutable<'c> {
                 outputs.push(unsafe { Buffer::from_c_api(output_handle, self.api(), self.client)? });
             }
 
-            execution_outputs.push(ExecutionDeviceOutputs { outputs, done: done_event })
+            execution_outputs.push(ExecutionDeviceOutputs { outputs });
+            completion_events.push(done_event);
         }
 
-        Ok(execution_outputs)
+        Ok(Execution::new(execution_outputs, ExecutionFence::new(completion_events)))
     }
 
     /// Returns `true` if and only if this [`LoadedExecutable`] has been deleted using [`LoadedExecutable::delete`].
@@ -1128,16 +1132,14 @@ impl<'o, 'l> From<&'l [ExecutionInput<'o>]> for ExecutionDeviceInputs<'o, 'l> {
     }
 }
 
-/// Represents the output [`Buffer`]s on a single [`Device`] of a call to [`LoadedExecutable::execute`], paired with
-/// an [`Event`] that can be used to track when the computation for this program ηασ completed on that [`Device`].
+/// Represents the output [`Buffer`]s on a single [`Device`] of a call to [`LoadedExecutable::execute`]. Whole-launch
+/// completion (including work with no corresponding output buffer, such as effects) is tracked by the
+/// [`ExecutionFence`] of the [`Execution`] returned by [`LoadedExecutable::execute`], which joins the per-device
+/// completion events of the launch.
 pub struct ExecutionDeviceOutputs<'o> {
     /// [`Vec`] that contains the output [`Buffer`] that corresponds to each output of the [`LoadedExecutable`]
     /// that was executed.
     pub outputs: Vec<Buffer<'o>>,
-
-    /// [`Event`] that can be used to track when all computation pending on a single [`Device`] for the execution of
-    /// a [`LoadedExecutable`] is completed.
-    pub done: Event<()>,
 }
 
 /// State of an [`ExecutionFence`], transitioning from [`ExecutionFenceState::Pending`] to
@@ -1170,37 +1172,24 @@ pub struct ExecutionFence {
     state: Arc<Mutex<ExecutionFenceState>>,
 }
 
-// TODO(eaplatanios): Review this.
 impl ExecutionFence {
-    fn await_events(events: Vec<Event<()>>) -> Result<(), Error> {
-        let mut result = Ok(());
-        for event in events {
-            if let Err(error) = event.r#await()
-                && result.is_ok()
-            {
-                result = Err(error);
-            }
-        }
-        result
-    }
-
-    /// Creates a fence from the per-device completion events returned by one PJRT launch.
+    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s.
     #[inline]
     pub fn new(events: Vec<Event<()>>) -> Self {
         Self { state: Arc::new(Mutex::new(ExecutionFenceState::Pending(events))) }
     }
 
-    /// Returns `true` once every participating device has completed, while preserving any asynchronous execution
-    /// error for [`Self::block_until_ready`]. This function only polls and never blocks: if another owner of this
+    /// Returns `true` once every participating [`Event`] is completed, while preserving any asynchronous execution
+    /// error for [`Self::block_until_ready`]. This function only polls and never blocks. If another owner of this
     /// fence is concurrently observing it (e.g., it is blocked inside [`Self::block_until_ready`]), then this
     /// function conservatively returns `false` for this poll instead of waiting for that observation to finish.
     pub fn is_ready(&self) -> Result<bool, Error> {
         let mut state = match self.state.try_lock() {
             Ok(state) => state,
             // Another owner of this fence is concurrently observing it. If it is blocked inside `block_until_ready`,
-            // then waiting for the lock would block this poll until the whole execution completes, so we
-            // conservatively report that completion has not been observed yet, mirroring how XLA future readiness
-            // queries never block on concurrent waiters of the same shared state.
+            // then waiting for the lock would block this poll until the whole execution completes, so we conservatively
+            // report that completion has not been observed yet, mirroring how XLA future readiness queries never block
+            // on concurrent waiters of the same shared state.
             Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
             Err(std::sync::TryLockError::Poisoned(_)) => panic!("execution fence state mutex poisoned"),
         };
@@ -1220,7 +1209,7 @@ impl ExecutionFence {
         }
     }
 
-    /// Blocks until every participating device has completed and returns the first execution error, if any.
+    /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
     pub fn block_until_ready(&self) -> Result<(), Error> {
         let mut state = self.state.lock().expect("execution fence state mutex poisoned");
         match &mut *state {
@@ -1232,51 +1221,68 @@ impl ExecutionFence {
             ExecutionFenceState::Complete(result) => result.clone(),
         }
     }
+
+    /// Blocks until every provided [`Event`] is ready and returns the first observed asynchronous execution [`Error`],
+    /// if any. All events are consumed (i.e., awaited) even after an error is observed, so that no completion event is
+    /// left pending when the joined result is recorded.
+    fn await_events(events: Vec<Event<()>>) -> Result<(), Error> {
+        let mut result = Ok(());
+        for event in events {
+            if let Err(error) = event.r#await()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
 }
 
-// TODO(eaplatanios): Review this.
-/// Output of an asynchronously enqueued PJRT execution together with its whole-execution completion fence.
+/// Output of an asynchronously enqueued PJRT execution together with its whole-execution completion fence,
+/// as returned by [`LoadedExecutable::execute`].
 pub struct Execution<Output> {
-    /// Pending-capable output of the execution (e.g., arrays whose underlying buffers may not be ready yet).
+    /// Output of the execution, which may still be pending (i.e., its underlying buffers may not be ready yet).
     output: Output,
 
     /// Whole-execution completion [`ExecutionFence`] shared by all consumers of this execution's outputs.
     fence: ExecutionFence,
 }
 
-// TODO(eaplatanios): Review this.
 impl<Output> Execution<Output> {
-    /// Creates an asynchronous execution result.
+    /// Creates a new [`Execution`].
     #[inline]
     pub fn new(output: Output, fence: ExecutionFence) -> Self {
         Self { output, fence }
     }
 
-    /// Returns the pending-capable output without waiting.
+    /// Returns the output of this [`Execution`] without waiting for it to complete. The returned output may still be
+    /// pending (i.e., its underlying buffers may not be ready yet), but it is immediately usable (e.g., it can be
+    /// fed into further executions, which the PJRT runtime will order after this execution on the devices).
     #[inline]
     pub fn output(&self) -> &Output {
         &self.output
     }
 
-    /// Returns the whole-execution completion fence.
+    /// Returns the whole-execution completion [`ExecutionFence`] of this [`Execution`].
     #[inline]
     pub fn fence(&self) -> &ExecutionFence {
         &self.fence
     }
 
-    /// Consumes this execution and returns its pending-capable output without waiting.
+    /// Consumes this [`Execution`] and returns its possibly still pending output without waiting.
     #[inline]
     pub fn into_output(self) -> Output {
         self.output
     }
 
-    /// Consumes this execution and returns its pending-capable output and whole-execution fence without waiting.
+    /// Consumes this [`Execution`] and returns its possibly still pending output and whole-execution fence
+    /// without waiting.
     #[inline]
     pub fn into_parts(self) -> (Output, ExecutionFence) {
         (self.output, self.fence)
     }
 
-    /// Blocks until the entire execution completes, returning the output or the first asynchronous execution error.
+    /// Blocks until this entire [`Execution`] completes, returning its output or the first execution error.
     pub fn block_until_ready(self) -> Result<Output, Error> {
         self.fence.block_until_ready()?;
         Ok(self.output)
@@ -3175,15 +3181,14 @@ mod tests {
             };
 
             // Execute the test program using our two input tensors.
-            let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+
+            // Wait for the asynchronous execution to complete through its shared fence. Clones observe the
+            // recorded completion result without attempting to consume the PJRT events a second time.
+            let cloned_fence = execution.fence().clone();
+            let mut outputs = execution.block_until_ready().unwrap();
             assert_eq!(outputs.len(), 1);
             let mut outputs = outputs.remove(0);
-
-            // Wait for the asynchronous execution to complete through a shared fence. Clones observe the
-            // recorded completion result without attempting to consume the PJRT event a second time.
-            let fence = ExecutionFence::new(vec![outputs.done]);
-            let cloned_fence = fence.clone();
-            fence.block_until_ready().unwrap();
             assert_eq!(cloned_fence.is_ready(), Ok(true));
             cloned_fence.block_until_ready().unwrap();
             let output = outputs.outputs.remove(0);
@@ -3407,12 +3412,12 @@ mod tests {
                     };
 
                     // Execute the test program using our two input tensors.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.
@@ -3509,12 +3514,12 @@ mod tests {
                     };
 
                     // Execute the test program using our input tensor.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.
@@ -3625,12 +3630,12 @@ mod tests {
                     };
 
                     // Execute the test program.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.

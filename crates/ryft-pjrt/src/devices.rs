@@ -1329,7 +1329,7 @@ mod tests {
 
         // Then, we kick off the execution of this program.
         let launch_id = 17usize;
-        let mut outputs = executable
+        let execution = executable
             .execute(
                 vec![ExecutionDeviceInputs {
                     inputs: &[
@@ -1373,8 +1373,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(outputs.len(), 1);
-        let output = outputs.remove(0);
+        assert_eq!(execution.output().len(), 1);
 
         // Finally, poison the program execution.
         let payload = HashMap::from([
@@ -1385,7 +1384,7 @@ mod tests {
             device.poison_execution_with_payload(launch_id as i32, Error::aborted("test poison error"), &payload),
             Ok(true),
         );
-        let error = output.done.r#await().unwrap_err();
+        let error = execution.fence().block_until_ready().unwrap_err();
         assert!(matches!(&error, Error::Aborted { message, .. } if message == "test poison error"));
         assert_eq!(error.payload("launch_id"), Some("17"));
         assert_eq!(error.payload("reason"), Some("unit-test"));
