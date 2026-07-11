@@ -1515,7 +1515,7 @@ where
     let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
-    let source_program = ClosedProgram::new(program, captures)?.prune_unused_captures()?;
+    let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
     Ok(StagedFunction {
         state: Rc::new(StagedFunctionState {
             source_program,
