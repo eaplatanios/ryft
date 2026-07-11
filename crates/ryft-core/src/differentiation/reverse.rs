@@ -9,8 +9,8 @@ use crate::differentiation::{
 use crate::errors::MaybeFallible;
 use crate::macros::{check_builders, check_count};
 use crate::operations::Operation;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
+use crate::operations::math::AddOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
@@ -1562,9 +1562,8 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::BooleanLike;
     use crate::operations::Operation;
-    use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::constants::ZeroOperation;
-    use crate::operations::trigonometric::Sin;
+    use crate::operations::math::{AddOperation, MulOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Value};

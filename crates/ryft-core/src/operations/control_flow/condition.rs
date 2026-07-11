@@ -754,9 +754,9 @@ mod tests {
 
     use crate::contexts::EagerContext;
     use crate::contexts::StagingContext;
-    use crate::operations::arithmetic::AddOperation;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::ZeroLikeOperation;
+    use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tests::TestArray;

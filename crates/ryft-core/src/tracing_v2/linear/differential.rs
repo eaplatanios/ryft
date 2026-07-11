@@ -14,9 +14,9 @@ use crate::differentiation::{DifferentiableOperation, DifferentiationError, Tran
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::BooleanLike;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{FillOperation, OneOperation, ZeroLikeOperation, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, Reshape, Slice, Transpose};
+use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Program, ProgramError, Value};

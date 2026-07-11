@@ -5,7 +5,7 @@ use crate::differentiation::TransposableOperation;
 use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::trigonometric::{Cos, CosOperation, Sin};
+use crate::operations::math::{Cos, CosOperation, Sin};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
@@ -61,7 +61,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::backends::scalars::ScalarOperation;
     use crate::contexts::EagerContext;
-    use crate::operations::trigonometric::Cos;
+    use crate::operations::math::Cos;
     use crate::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
 
     #[test]

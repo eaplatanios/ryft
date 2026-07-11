@@ -1286,7 +1286,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
-    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::math::AddOperation;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::tracing::Trace;

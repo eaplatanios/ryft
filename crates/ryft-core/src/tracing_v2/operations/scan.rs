@@ -681,7 +681,7 @@ mod tests {
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
     use crate::differentiation::ForwardModeDifferentiate;
-    use crate::operations::arithmetic::MulOperation;
+    use crate::operations::math::MulOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{Program, ProgramBuilder};
     use crate::tests::TestArray;

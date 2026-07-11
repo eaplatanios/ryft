@@ -6,7 +6,7 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::trigonometric::{Atan2, Atan2Operation};
+use crate::operations::math::{Atan2, Atan2Operation};
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
@@ -81,7 +81,7 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::operations::complex::{Imaginary, Real};
-    use crate::operations::trigonometric::Atan2;
+    use crate::operations::math::Atan2;
     use crate::tracing_v2::{gradient, value_and_gradient};
 
     #[test]

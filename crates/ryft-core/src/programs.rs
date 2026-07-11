@@ -1608,9 +1608,9 @@ mod tests {
     use crate::effects::{Effect, Effects};
     use crate::macros::check_count;
     use crate::operations::OperationFormatter;
-    use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::debugging::PrintOperation;
+    use crate::operations::math::{AddOperation, MulOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::types::{DataType, TypeError};
 

@@ -11,10 +11,10 @@ use crate::contexts::StagingContext;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::arithmetic::MulOperation;
 use crate::operations::compare::{CompareOperation, ComparisonDirection};
 use crate::operations::constants::FillOperation;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation};
+use crate::operations::math::MulOperation;
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
@@ -458,7 +458,7 @@ where
     O: Operation<ArrayType>
         + From<BroadcastOperation>
         + From<FillOperation<ArrayType, Scalar>>
-        + From<crate::operations::arithmetic::MulOperation>,
+        + From<crate::operations::math::MulOperation>,
 {
     fn transpose(
         &self,

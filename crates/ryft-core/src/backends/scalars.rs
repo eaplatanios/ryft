@@ -8,9 +8,6 @@ use num_complex::Complex;
 use ryft_macros::{DifferentiableOperation, Operation, Parameter, TransposableOperation};
 
 use crate::contexts::EagerContext;
-use crate::operations::arithmetic::{
-    Abs, AbsOperation, Add, AddOperation, Div, DivOperation, Mul, MulOperation, Neg, NegOperation, Sub, SubOperation,
-};
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::complex::{
     ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
@@ -26,8 +23,11 @@ use crate::operations::differentiation::{StopGradient, StopGradientOperation};
 use crate::operations::exponential::{
     Exponential, ExponentialOperation, Logarithm, LogarithmOperation, SquareRoot, SquareRootOperation,
 };
+use crate::operations::math::{
+    Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Mul,
+    MulOperation, Neg, NegOperation, Sin, SinOperation, Sub, SubOperation,
+};
 use crate::operations::tag::{MaybeTag, Tag, TagOperation};
-use crate::operations::trigonometric::{Atan2, Atan2Operation, Cos, CosOperation, Sin, SinOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
@@ -1543,8 +1543,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::C64);
         let constant = builder.add_constant(Scalar::from(Complex::new(1.5f32, -2.0f32)));
-        let output =
-            builder.add_instruction(crate::operations::arithmetic::MulOperation, vec![input, constant]).unwrap()[0];
+        let output = builder.add_instruction(crate::operations::math::MulOperation, vec![input, constant]).unwrap()[0];
         let program = builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();

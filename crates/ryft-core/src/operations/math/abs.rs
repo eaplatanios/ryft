@@ -308,7 +308,7 @@ mod tests {
 
         // |z| is a ℂ → ℝ function and so it flows through the plain gradient entry point. With d|z| = Re(z̄ · dz) / |z|,
         // the bilinear-pairing gradient is z̄ / |z| (the unit-magnitude conjugate direction), the reverse-mode
-        // counterpart of `∇|z|² = 2z̄` after the chain rule through the square root.
+        // counterpart of ∇|z|² = 2z̄ after the chain rule through the square root.
         let z = ComplexNumber::new(0.7f64, -0.3f64);
         let (value, gradient_value) = value_and_gradient(|z| z.abs().unwrap(), Scalar::from(z)).unwrap();
         assert_eq!(value, Scalar::from(z.norm()));

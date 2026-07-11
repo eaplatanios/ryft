@@ -1452,8 +1452,8 @@ mod tests {
     use crate::batching::{Batch, BatchAxis};
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{ForwardModeDifferentiate, ReverseModeDifferentiate};
-    use crate::operations::arithmetic::MulOperation;
-    use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
+    use crate::operations::math::MulOperation;
+    use crate::operations::math::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::ProgramBuilder;

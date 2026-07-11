@@ -98,8 +98,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Transfer
 }
 
 /// Value-level memory-transfer capability. [`TransferToMemory`] fills the same role for
-/// [`TransferToMemoryOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-/// [`SinOperation`](crate::operations::trigonometric::SinOperation): on concrete values it keeps the payload
+/// [`TransferToMemoryOperation`] that [`Sin`](crate::operations::math::Sin) fills for
+/// [`SinOperation`](crate::operations::math::SinOperation): on concrete values it keeps the payload
 /// unchanged (eager domains have no memory hierarchy) while re-placing the carried type in the destination when
 /// the value stores one, and on traced values it stages a transfer whose staged type carries the destination
 /// [`Memory`]. Tracers only implement this capability when their operation type implements

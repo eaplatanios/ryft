@@ -105,8 +105,7 @@ declare_exponential_operation!(
     /// operands are supported.
     ExponentialOperation, EXPONENTIAL_OPERATION_NAME, Exponential, exponential,
     /// Value-level elementwise natural-exponential capability. [`Exponential`] fills the same role for
-    /// [`ExponentialOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-    /// [`SinOperation`](crate::operations::trigonometric::SinOperation).
+    /// [`ExponentialOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 );
 
 declare_exponential_operation!(
@@ -115,8 +114,7 @@ declare_exponential_operation!(
     /// operands are supported.
     LogarithmOperation, LOGARITHM_OPERATION_NAME, Logarithm, logarithm,
     /// Value-level elementwise natural-logarithm capability. [`Logarithm`] fills the same role for
-    /// [`LogarithmOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-    /// [`SinOperation`](crate::operations::trigonometric::SinOperation).
+    /// [`LogarithmOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 );
 
 declare_exponential_operation!(
@@ -125,6 +123,5 @@ declare_exponential_operation!(
     /// supported.
     SquareRootOperation, SQUARE_ROOT_OPERATION_NAME, SquareRoot, square_root,
     /// Value-level elementwise square-root capability. [`SquareRoot`] fills the same role for
-    /// [`SquareRootOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-    /// [`SinOperation`](crate::operations::trigonometric::SinOperation).
+    /// [`SquareRootOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 );

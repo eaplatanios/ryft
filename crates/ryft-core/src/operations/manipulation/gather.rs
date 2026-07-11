@@ -1093,7 +1093,7 @@ mod tests {
     enum TestGatherOperation<V: Value<Type = ArrayType>> {
         Zero(ZeroOperation<ArrayType>),
         Constant(crate::operations::constants::ConstantOperation<V>),
-        Add(crate::operations::arithmetic::AddOperation),
+        Add(crate::operations::math::AddOperation),
         Gather(GatherOperation),
         Scatter(ScatterOperation),
     }

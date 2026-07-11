@@ -144,5 +144,5 @@ impl<V: Value, O: Operation<V::Type>> TransposableOperation<V, O> for TagOperati
 }
 
 // TODO(eaplatanios): Add unit tests mirroring the structure and style of the tests in
-//  `ryft_core::operations::arithmetic::add`, including checks for the `DifferentiableOperation` and the
+//  `ryft_core::operations::math::add`, including checks for the `DifferentiableOperation` and the
 //  `TransposableOperation` implementations.

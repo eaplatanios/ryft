@@ -1495,10 +1495,9 @@ mod tests {
     use crate::backends::scalars::{Scalar, ScalarOperation, ScalarTracingContext};
     use crate::contexts::{Context, StagingContext};
     use crate::operations::BooleanLike;
-    use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use crate::operations::constants::{ConstantOperation, Zero};
     use crate::operations::debugging::PrintOperation;
-    use crate::operations::trigonometric::SinOperation;
+    use crate::operations::math::{AddOperation, MulOperation, NegOperation, SinOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::types::DataType;

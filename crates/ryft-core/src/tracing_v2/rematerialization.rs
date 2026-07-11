@@ -32,10 +32,10 @@ use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
 use crate::operations::Operation;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{Constant as ConstantCapability, Zero, ZeroOperation};
 use crate::operations::control_flow::MaybeScan;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
+use crate::operations::math::AddOperation;
 use crate::operations::tag::MaybeTag;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
@@ -1473,8 +1473,8 @@ mod tests {
     use crate::backends::scalars::ScalarOperation;
     use crate::batching::BatchAxis;
     use crate::contexts::EagerContext;
+    use crate::operations::math::{Cos, Sin};
     use crate::operations::tag::Tag;
-    use crate::operations::trigonometric::{Cos, Sin};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -1560,8 +1560,7 @@ mod tests {
                     vec![row, row],
                 )
                 .unwrap()[0];
-            let next =
-                builder.add_instruction(crate::operations::arithmetic::MulOperation, vec![carry, dot]).unwrap()[0];
+            let next = builder.add_instruction(crate::operations::math::MulOperation, vec![carry, dot]).unwrap()[0];
             builder
                 .build::<Vec<TestArray>, Vec<TestArray>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
                 .unwrap()

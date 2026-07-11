@@ -126,8 +126,8 @@ where
 impl<C: Context> PartiallyEvaluatableOperation<C> for ComplexOperation where C::Operation: From<ComplexOperation> {}
 
 /// Value-level capability that constructs a complex value from this value as the real part and `imaginary` as the
-/// imaginary part. [`Complex`] fills the same role for [`ComplexOperation`] that [`Sin`](crate::operations::trigonometric::Sin)
-/// fills for [`SinOperation`](crate::operations::trigonometric::SinOperation).
+/// imaginary part. [`Complex`] fills the same role for [`ComplexOperation`] that [`Sin`](crate::Sin) fills for
+/// [`SinOperation`](crate::SinOperation).
 pub trait Complex: Sized {
     /// Constructs the complex value `self + imaginary·i`, returning a [`ProgramError`] if something goes wrong (e.g.,
     /// when the parts are not both `f32` or both `f64` valued).
@@ -208,8 +208,7 @@ where
 impl<C: Context> PartiallyEvaluatableOperation<C> for ConjugateOperation where C::Operation: From<ConjugateOperation> {}
 
 /// Value-level elementwise complex-conjugation capability. [`Conjugate`] fills the same role for
-/// [`ConjugateOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-/// [`SinOperation`](crate::operations::trigonometric::SinOperation).
+/// [`ConjugateOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 pub trait Conjugate: Sized {
     /// Computes the elementwise complex conjugate of this value, returning a [`ProgramError`] if something goes wrong
     /// (e.g., when the value is not complex valued).
@@ -289,7 +288,7 @@ where
 impl<C: Context> PartiallyEvaluatableOperation<C> for RealOperation where C::Operation: From<RealOperation> {}
 
 /// Value-level elementwise real-part extraction capability. [`Real`] fills the same role for [`RealOperation`] that
-/// [`Sin`](crate::operations::trigonometric::Sin) fills for [`SinOperation`](crate::operations::trigonometric::SinOperation).
+/// [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 pub trait Real: Sized {
     /// Extracts the elementwise real part of this value, returning a [`ProgramError`] if something goes wrong (e.g.,
     /// when the value is not complex valued).
@@ -369,8 +368,7 @@ where
 impl<C: Context> PartiallyEvaluatableOperation<C> for ImaginaryOperation where C::Operation: From<ImaginaryOperation> {}
 
 /// Value-level elementwise imaginary-part extraction capability. [`Imaginary`] fills the same role for
-/// [`ImaginaryOperation`] that [`Sin`](crate::operations::trigonometric::Sin) fills for
-/// [`SinOperation`](crate::operations::trigonometric::SinOperation).
+/// [`ImaginaryOperation`] that [`Sin`](crate::Sin) fills for [`SinOperation`](crate::SinOperation).
 pub trait Imaginary: Sized {
     /// Extracts the elementwise imaginary part of this value, returning a [`ProgramError`] if something goes wrong
     /// (e.g., when the value is not complex valued).

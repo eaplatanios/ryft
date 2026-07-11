@@ -4,11 +4,11 @@ use crate::differentiation::{
 };
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::NegOperation;
 use crate::operations::complex::{
     Complex, ComplexOperation, Conjugate, ConjugateOperation, Imaginary, ImaginaryOperation, Real, RealOperation,
 };
 use crate::operations::constants::{Zero, ZeroLikeOperation};
+use crate::operations::math::NegOperation;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};

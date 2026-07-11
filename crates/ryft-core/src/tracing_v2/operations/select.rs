@@ -285,10 +285,10 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::contexts::EagerContext;
-    use crate::operations::arithmetic::Add;
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::Select;
+    use crate::operations::math::Add;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
     use crate::tracing_v2::{DifferentiableDomainExtension, jacrev};
@@ -452,7 +452,7 @@ mod tests {
     enum TestSelectOperation<V: crate::programs::Value<Type = crate::types::ArrayType>> {
         Zero(crate::operations::constants::ZeroOperation<crate::types::ArrayType>),
         Constant(crate::operations::constants::ConstantOperation<V>),
-        Add(crate::operations::arithmetic::AddOperation),
+        Add(crate::operations::math::AddOperation),
         Select(crate::operations::control_flow::SelectOperation),
     }
 

@@ -1,4 +1,4 @@
-use crate::operations::arithmetic::MulOperation;
+use crate::operations::math::MulOperation;
 use crate::parameters::Placeholder;
 use crate::programs::ProgramBuilder;
 use crate::tests::TestArray;
@@ -27,11 +27,11 @@ mod tests {
     use crate::batching::BatchableOperation;
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::arithmetic::{AddOperation, MulOperation, SubOperation};
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{OneLike, OneLikeOperation, ZeroLike, ZeroLikeOperation};
     use crate::operations::control_flow::ConditionOperation;
-    use crate::operations::trigonometric::Sin;
+    use crate::operations::math::Sin;
+    use crate::operations::math::{AddOperation, MulOperation, SubOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing_v2::{

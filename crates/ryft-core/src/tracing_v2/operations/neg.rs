@@ -4,7 +4,7 @@ use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::NegOperation;
+use crate::operations::math::NegOperation;
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, Value};
 use crate::tracing::{Tracer, TracingContext};

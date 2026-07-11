@@ -22,8 +22,8 @@ pub use crate::differentiation::{
     gradient_with_aux, jvp, linearize, value_and_gradient, value_and_gradient_holomorphic,
     value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
+pub use crate::operations::math::{Cos, Sin};
 pub use crate::operations::tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
-pub use crate::operations::trigonometric::{Cos, Sin};
 pub use crate::tracing::NestedTracer;
 pub use linear::{
     CoordinateBasis, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,

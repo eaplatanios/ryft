@@ -354,7 +354,7 @@ mod tests {
     use crate::backends::scalars::ScalarOperation;
     use crate::contexts::Context;
     use crate::contexts::EagerContext;
-    use crate::operations::trigonometric::{Cos, Sin};
+    use crate::operations::math::{Cos, Sin};
     use crate::programs::Program;
 
     #[test]

@@ -324,7 +324,7 @@ mod tests {
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
-    use crate::operations::arithmetic::{AddOperation, NegOperation};
+    use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::{ParameterError, Parameterized, Placeholder};
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::tests::TestArray;

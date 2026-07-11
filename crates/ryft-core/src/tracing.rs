@@ -845,9 +845,8 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
     use crate::operations::Operation;
-    use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
-    use crate::operations::trigonometric::Sin;
+    use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::programs::{AtomId, ProgramBuilder, ProgramError};
     use crate::types::{DataType, TypeError, Typed};

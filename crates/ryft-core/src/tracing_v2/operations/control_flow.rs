@@ -10,7 +10,6 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::check_count;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{OneOperation, Zero, ZeroOperation};
 use crate::operations::control_flow::scan::stacked_scan_type;
 use crate::operations::control_flow::{ConditionOperation, ScanOperation, Select, SelectOperation, WhileOperation};
@@ -18,6 +17,7 @@ use crate::operations::logical::AndOperation;
 use crate::operations::manipulation::{
     Broadcast, BroadcastOperation, DynamicUpdateSliceOperation, Transpose, TransposeOperation,
 };
+use crate::operations::math::AddOperation;
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Placeholder;
 use crate::partial::PartialValue;
@@ -1598,11 +1598,9 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
-    use crate::operations::arithmetic::{
-        ADD_OPERATION_NAME, AddOperation, MulOperation, SUB_OPERATION_NAME, SubOperation,
-    };
     use crate::operations::compare::CompareOperation;
     use crate::operations::constants::{One, OneLike, OneLikeOperation, Zero, ZeroLike, ZeroLikeOperation};
+    use crate::operations::math::{ADD_OPERATION_NAME, AddOperation, MulOperation, SUB_OPERATION_NAME, SubOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{Program, ProgramBuilder, Value};
     use crate::tracing::DomainTracingContext;

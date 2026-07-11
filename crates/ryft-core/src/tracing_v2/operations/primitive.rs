@@ -5,9 +5,6 @@ use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, Transp
 
 use crate::backends::scalars::Scalar;
 use crate::operations::BooleanLike;
-use crate::operations::arithmetic::{
-    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
-};
 use crate::operations::compare::CompareOperation;
 use crate::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use crate::operations::constants::{
@@ -26,9 +23,10 @@ use crate::operations::manipulation::{
     GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
+use crate::operations::math::{AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use crate::operations::math::{Atan2Operation, CosOperation, SinOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::tag::{MaybeTag, TagOperation};
-use crate::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use crate::programs::Value;
 use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{

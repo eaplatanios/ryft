@@ -8,8 +8,8 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationError, TransposableOperation};
 use crate::macros::check_count;
 use crate::operations::Operation;
-use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::{Zero, ZeroOperation};
+use crate::operations::math::AddOperation;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
@@ -1348,9 +1348,8 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::operations::BooleanLike;
     use crate::operations::Operation;
-    use crate::operations::arithmetic::MulOperation;
     use crate::operations::differentiation::StopGradientOperation;
-    use crate::operations::trigonometric::{Sin, SinOperation};
+    use crate::operations::math::{MulOperation, Sin, SinOperation};
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::ProgramBuilder;
     use crate::tracing::Trace;

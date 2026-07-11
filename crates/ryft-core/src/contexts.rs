@@ -503,8 +503,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
-    use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::{MaybeZeroOperation, OneOperation, ZeroOperation};
+    use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{Atom, AtomId, ProgramBuilder, ProgramError};
     use crate::tracing::{DomainTracingContext, TracerState};

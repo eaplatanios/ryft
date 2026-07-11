@@ -132,7 +132,7 @@ where
 #[cfg(test)]
 mod tests {
 
-    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::math::AddOperation;
     use crate::tests::TestArray;
     use crate::tracing_v2::operations::ArrayOperation;
     use crate::types::DataType;

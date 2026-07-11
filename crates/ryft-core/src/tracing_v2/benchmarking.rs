@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::differentiation::DifferentiationError;
 use crate::operations::Operation;
-use crate::operations::arithmetic::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
+use crate::operations::math::{ADD_OPERATION_NAME, MUL_OPERATION_NAME};
 use crate::parameters::Parameterized;
 use crate::programs::{Atom, AtomId, Program, ProgramError, Value};
 use crate::types::Type;
@@ -522,7 +522,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::backends::scalars::ScalarOperation;
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::operations::trigonometric::Sin;
+    use crate::operations::math::Sin;
     use crate::programs::Program;
 
     use super::*;

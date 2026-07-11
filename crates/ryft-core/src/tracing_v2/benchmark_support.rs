@@ -4,7 +4,7 @@ use crate::backends::scalars::Scalar;
 use crate::backends::scalars::ScalarOperation;
 use crate::contexts::{Context, EagerContext};
 use crate::differentiation::DifferentiationError;
-use crate::operations::trigonometric::{Cos, Sin};
+use crate::operations::math::{Cos, Sin};
 use crate::programs::{Program, ProgramError, Value};
 use crate::tracing_v2::ReverseModeDifferentiate;
 use crate::tracing_v2::benchmarking::{

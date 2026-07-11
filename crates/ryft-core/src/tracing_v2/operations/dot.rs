@@ -1024,7 +1024,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::operations::Operation;
-    use crate::operations::arithmetic::AddOperation;
+    use crate::operations::math::AddOperation;
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::types::{ArrayType, DataType, Shape, Size, TypeError};
 

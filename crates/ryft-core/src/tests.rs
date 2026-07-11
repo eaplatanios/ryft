@@ -26,8 +26,6 @@ use crate::broadcasting::Broadcastable;
 use crate::contexts::Context;
 use crate::contexts::EagerContext;
 use crate::operations::BooleanLike;
-use crate::operations::arithmetic::Abs;
-use crate::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use crate::operations::complex::{Conjugate, Imaginary, Real};
 use crate::operations::constants::{Fill, One, OneLike, Zero, ZeroLike};
 use crate::operations::exponential::{Exponential, Logarithm, SquareRoot};
@@ -35,9 +33,11 @@ use crate::operations::manipulation::{
     Concatenate, DynamicSlice, DynamicUpdateSlice, Gather, GatherOperation, GatherScatterMode, Pad, Reshape, Scatter,
     ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice,
 };
+use crate::operations::math::Abs;
+use crate::operations::math::Atan2;
+use crate::operations::math::{Add, Div, Mul, Neg, Sub};
+use crate::operations::math::{Cos, Sin};
 use crate::operations::tag::Tag;
-use crate::operations::trigonometric::Atan2;
-use crate::operations::trigonometric::{Cos, Sin};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing_v2::operations::TransferToMemory;
@@ -1273,7 +1273,7 @@ mod differentiation_tests {
     fn test_linearize_scalar_straight_line_matches_jvp() {
         use crate::backends::scalars::ScalarOperation;
         use crate::contexts::EagerContext;
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Sin;
 
         // `f(x) = x * sin(x)`: the linearized map's primal output equals `jvp`'s primal output, and applying it to two
         // distinct tangents reproduces `jvp`'s tangent output each time. Linearizing once and applying many times is
@@ -1297,7 +1297,7 @@ mod differentiation_tests {
     fn test_linearize_scalar_multi_input_matches_jvp() {
         use crate::backends::scalars::ScalarOperation;
         use crate::contexts::EagerContext;
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Sin;
 
         // `f(a, b) = a * b + sin(a)`: a two-input function whose linearization is applied at two distinct tangent
         // pairs, exercising the residual-input routing for several primal inputs.
@@ -1329,7 +1329,7 @@ mod differentiation_tests {
     #[test]
     fn test_linearize_array_straight_line_matches_jvp() {
         use crate::contexts::EagerContext;
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Sin;
         use crate::tests::TestArray;
         use crate::tracing_v2::ArrayOperation;
 
@@ -1505,7 +1505,7 @@ mod differentiation_tests {
     fn test_vjp_pullback_apply_scalar_matches_raw_parts() {
         use crate::backends::scalars::ScalarOperation;
         use crate::contexts::EagerContext;
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Sin;
 
         // The `Pullback::apply` callable surface must reproduce the raw opened parts: interpreting the raw pullback manually at
         // `[cotangent ++ residuals]` and applying `Pullback::apply` to the same cotangent must agree, for two distinct
@@ -1570,8 +1570,8 @@ mod differentiation_tests {
         crate::tests::TestArray,
         crate::tracing_v2::ArrayOperation<crate::tests::TestArray>,
     > {
-        use crate::operations::arithmetic::AddOperation;
         use crate::operations::compare::{CompareOperation, ComparisonDirection};
+        use crate::operations::math::AddOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tests::TestArray;
@@ -1608,7 +1608,7 @@ mod differentiation_tests {
         crate::tests::TestArray,
         crate::tracing_v2::ArrayOperation<crate::tests::TestArray>,
     > {
-        use crate::operations::arithmetic::MulOperation;
+        use crate::operations::math::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tests::TestArray;
@@ -1642,7 +1642,7 @@ mod linearization_tests {
     use crate::operations::compare::Compare;
     use crate::operations::control_flow::{MaybeWhile, Select, WhileOperation};
     use crate::operations::differentiation::StopGradient;
-    use crate::operations::trigonometric::{Cos, Sin};
+    use crate::operations::math::{Cos, Sin};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{Program, ProgramBuilder};
@@ -1804,8 +1804,8 @@ mod linearization_tests {
     /// depends on the runtime value and the loop carries no iteration bound, so it is the kind of unbounded loop the
     /// front end rejects unless the eager unroll-then-fuse pre-pass first unrolls it at the concrete primal.
     fn scalar_squaring_while() -> WhileOperation<Scalar, ScalarOperation<Scalar>> {
-        use crate::operations::arithmetic::MulOperation;
         use crate::operations::compare::{CompareOperation, ComparisonDirection};
+        use crate::operations::math::MulOperation;
 
         let condition = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -1860,8 +1860,8 @@ mod linearization_tests {
     /// carry. Both loops are unbounded, so this exercises recursive nested-`while` unrolling: the inner loop is just
     /// another instruction encountered while the outer body is rewritten, so it is unrolled by the same pre-pass.
     fn scalar_nested_while() -> WhileOperation<Scalar, ScalarOperation<Scalar>> {
-        use crate::operations::arithmetic::AddOperation;
         use crate::operations::compare::{CompareOperation, ComparisonDirection};
+        use crate::operations::math::AddOperation;
 
         let inner = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -2172,9 +2172,9 @@ mod linearization_tests {
     #[test]
     fn test_rejects_nested_program_operations() {
         use crate::contexts::StagingContext;
-        use crate::operations::arithmetic::AddOperation;
         use crate::operations::compare::{CompareOperation, ComparisonDirection};
         use crate::operations::control_flow::WhileOperation;
+        use crate::operations::math::AddOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
@@ -2279,8 +2279,8 @@ mod linearization_tests {
 
     #[test]
     fn test_jvp_zero_tangent_flows_the_all_zero_fast_path() {
-        use crate::operations::arithmetic::Mul;
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Mul;
+        use crate::operations::math::Sin;
 
         // A zero input tangent flows through the all-zero fast path of `DifferentiationContext::bind` (the rule is skipped and
         // the primal operation binds directly): the derivative is zero and the value matches the primal evaluation.
@@ -2294,8 +2294,8 @@ mod linearization_tests {
     #[test]
     fn test_jvp_branches_on_concrete_primal() {
         use crate::operations::BooleanLike;
-        use crate::operations::arithmetic::{Mul, Neg};
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Sin;
+        use crate::operations::math::{Mul, Neg};
 
         // Over an eager receiver `jvp` runs the closure directly on concrete duals, so ordinary Rust control flow can
         // branch on the primal — impossible under a staging receiver, whose duals carry tracers.
@@ -2338,8 +2338,8 @@ mod linearization_tests {
 
     #[test]
     fn test_program_covers_constant_scaling_and_nullary_constants_directly() {
-        use crate::operations::arithmetic::{AddOperation, MulOperation};
         use crate::operations::constants::{OneLikeOperation, OneOperation, ZeroLikeOperation};
+        use crate::operations::math::{AddOperation, MulOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
@@ -2557,7 +2557,7 @@ mod linearization_tests {
 
     /// Builds the scalar primal program `x -> sin(x)`, the primal half of the deliberately wrong custom-JVP oracle.
     fn scalar_custom_jvp_sin_primal() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        use crate::operations::trigonometric::SinOperation;
+        use crate::operations::math::SinOperation;
         use crate::programs::ProgramBuilder;
 
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -2570,8 +2570,8 @@ mod linearization_tests {
     /// different from the true `cos(x) * dx`, so a passing equivalence proves the spliced rule governs both forward and
     /// reverse mode.
     fn scalar_custom_jvp_sin_doubled_rule() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
-        use crate::operations::arithmetic::MulOperation;
-        use crate::operations::trigonometric::{CosOperation, SinOperation};
+        use crate::operations::math::MulOperation;
+        use crate::operations::math::{CosOperation, SinOperation};
         use crate::programs::ProgramBuilder;
 
         let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -2638,7 +2638,7 @@ mod linearization_tests {
     /// rematerialize operation. The derivation runs once through a `TracingContext::trace`.
     fn scalar_rematerialize_function(inputs: Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError> {
         use crate::contexts::StagingContext;
-        use crate::operations::trigonometric::Sin;
+        use crate::operations::math::Sin;
         use crate::tracing::DomainTracer;
         use crate::tracing_v2::rematerialize;
 
@@ -2690,8 +2690,8 @@ mod linearization_tests {
         crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation<Scalar, ScalarOperation<Scalar>>,
         ProgramError,
     > {
-        use crate::operations::arithmetic::MulOperation;
-        use crate::operations::trigonometric::{CosOperation, SinOperation};
+        use crate::operations::math::MulOperation;
+        use crate::operations::math::{CosOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
@@ -2771,8 +2771,8 @@ mod linearization_tests {
     #[test]
     fn test_custom_vjp_backward_zero_outputs_are_recovered_as_structural_zeros() {
         use crate::operations::Operation;
-        use crate::operations::arithmetic::AddOperation;
         use crate::operations::constants::ZeroOperation;
+        use crate::operations::math::AddOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::tracing_v2::operations::custom_derivatives::CustomVjpOperation;
@@ -2783,7 +2783,7 @@ mod linearization_tests {
         // no `add` accumulation (only the `sin` branch contributes to `x`) and the gradient is `cos(x) * cotangent`.
         fn function(inputs: Vec<ScalarTracer>) -> Result<Vec<ScalarTracer>, ProgramError> {
             use crate::contexts::StagingContext;
-            use crate::operations::trigonometric::{CosOperation, SinOperation};
+            use crate::operations::math::{CosOperation, SinOperation};
 
             let mut primal_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
             let a = primal_builder.add_input(DataType::F64);
@@ -3106,7 +3106,7 @@ mod array_linearization_tests {
     use crate::operations::constants::ZeroLike;
     use crate::operations::control_flow::{Select, WhileOperation};
     use crate::operations::manipulation::{Broadcast, Reshape};
-    use crate::operations::trigonometric::Sin;
+    use crate::operations::math::Sin;
     use crate::programs::Program;
     use crate::tracing::{NestedTracingContext, Tracer};
     use crate::tracing_v2::operations::dot::{Dot, DotDimensionNumbers};
@@ -3351,7 +3351,7 @@ mod array_linearization_tests {
     /// unbounded loop the front end rejects unless the eager unroll-then-fuse pre-pass first unrolls it at the
     /// concrete primal.
     fn array_squaring_while() -> WhileOperation<TestArray, ArrayOperation<TestArray>> {
-        use crate::operations::arithmetic::MulOperation;
+        use crate::operations::math::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -3857,7 +3857,7 @@ mod array_linearization_tests {
     /// Builds the flat scalar branch `x -> x * 2 + 1`, which linearizes with no residuals (its tangent `2 * dx`
     /// holds no primal-derived coefficient). Shared by the condition equivalence tests as the true branch.
     fn affine_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::arithmetic::{AddOperation, MulOperation};
+        use crate::operations::math::{AddOperation, MulOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -3875,7 +3875,7 @@ mod array_linearization_tests {
     /// `cos(x) * dx` carries the primal-derived `cos(x)` coefficient). Shared by the condition equivalence tests as the
     /// false branch, so the two branches have asymmetric residual counts and exercise the residual join.
     fn sine_branch() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::trigonometric::SinOperation;
+        use crate::operations::math::SinOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -3967,7 +3967,7 @@ mod array_linearization_tests {
     /// `[length, ...]` residual outputs and re-keys two scan-local captures on reverse. Shared by the scan equivalence
     /// tests.
     fn scan_product_body() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::arithmetic::MulOperation;
+        use crate::operations::math::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4107,9 +4107,9 @@ mod array_linearization_tests {
         threshold: f64,
         bound: usize,
     ) -> crate::operations::control_flow::WhileOperation<TestArray, ArrayOperation<TestArray>> {
-        use crate::operations::arithmetic::MulOperation;
         use crate::operations::compare::CompareOperation;
         use crate::operations::control_flow::WhileOperation;
+        use crate::operations::math::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4188,9 +4188,9 @@ mod array_linearization_tests {
 
     #[test]
     fn test_array_unbounded_while_has_no_differentiation_rule() {
-        use crate::operations::arithmetic::MulOperation;
         use crate::operations::compare::CompareOperation;
         use crate::operations::control_flow::WhileOperation;
+        use crate::operations::math::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4236,7 +4236,7 @@ mod array_linearization_tests {
     /// custom-JVP oracle shared with the [`custom_derivatives`](crate::tracing_v2::operations::custom_derivatives)
     /// tests.
     fn custom_jvp_sin_primal() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::trigonometric::SinOperation;
+        use crate::operations::math::SinOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4251,8 +4251,8 @@ mod array_linearization_tests {
     /// different from the true `cos(x) * dx`, so a passing equivalence proves the spliced rule (and not the primal
     /// body) governs both forward and reverse mode. Shared in shape with the `custom_derivatives` tests.
     fn custom_jvp_sin_doubled_rule() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::arithmetic::MulOperation;
-        use crate::operations::trigonometric::{CosOperation, SinOperation};
+        use crate::operations::math::MulOperation;
+        use crate::operations::math::{CosOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4389,7 +4389,7 @@ mod array_linearization_tests {
     /// custom-VJP oracle shared with the [`custom_derivatives`](crate::tracing_v2::operations::custom_derivatives)
     /// tests.
     fn custom_vjp_sin_primal() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::trigonometric::SinOperation;
+        use crate::operations::math::SinOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4403,7 +4403,7 @@ mod array_linearization_tests {
     /// Builds the forward program `x -> (sin(x), cos(x))`, exposing `cos(x)` as the single residual consumed by the
     /// backward program.
     fn custom_vjp_sin_forward() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>> {
-        use crate::operations::trigonometric::{CosOperation, SinOperation};
+        use crate::operations::math::{CosOperation, SinOperation};
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4421,7 +4421,7 @@ mod array_linearization_tests {
     /// shape with the `custom_derivatives` tests.
     fn custom_vjp_sin_tripled_backward() -> Program<TestArray, ArrayOperation<TestArray>, Vec<TestArray>, Vec<TestArray>>
     {
-        use crate::operations::arithmetic::MulOperation;
+        use crate::operations::math::MulOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4522,7 +4522,7 @@ mod array_linearization_tests {
         threshold: f64,
         bound: usize,
     ) -> WhileOperation<TestArray, ArrayOperation<TestArray>> {
-        use crate::operations::arithmetic::AddOperation;
+        use crate::operations::math::AddOperation;
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
         use crate::types::DataType;
@@ -4700,11 +4700,11 @@ mod batching_tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::LinearizationTracer;
     use crate::operations::Operation;
-    use crate::operations::arithmetic::{AddOperation, NegOperation};
     use crate::operations::constants::OneLike;
     use crate::operations::control_flow::ConditionOperation;
     use crate::operations::manipulation::Transpose;
-    use crate::operations::trigonometric::Sin;
+    use crate::operations::math::Sin;
+    use crate::operations::math::{AddOperation, NegOperation};
     use crate::parameters::Placeholder;
     use crate::programs::ProgramBuilder;
     use crate::tracing::DomainTracingContext;

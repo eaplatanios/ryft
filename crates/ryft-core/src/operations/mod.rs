@@ -16,9 +16,6 @@ use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this file.
 
-/// Elementwise arithmetic operations and capability traits.
-pub mod arithmetic;
-
 /// Elementwise pairwise comparison operations and capability traits.
 pub mod compare;
 
@@ -46,6 +43,9 @@ pub mod logical;
 /// Array shape and axis manipulation operations and capability traits.
 pub mod manipulation;
 
+/// Elementwise arithmetic and trigonometric math operations and capability traits.
+pub mod math;
+
 /// Shared marker types for operations with payload-dependent interpretation.
 pub mod payloads;
 
@@ -57,13 +57,9 @@ pub mod sharding;
 /// Value tagging — attaching a string key to a value in a program (consumed by, e.g., rematerialization policies).
 pub mod tag;
 
-/// Elementwise trigonometric operations and capability traits.
-pub mod trigonometric;
-
 // TODO(eaplatanios): We should be importing specific symbols here.
 // The fallible `Add`/`Sub`/`Mul`/`Div`/`Neg` capability traits are intentionally not re-exported at this level so
-// they do not shadow their `std::ops` counterparts; reach them through `crate::operations::arithmetic` instead.
-pub use arithmetic::*;
+// they do not shadow their `std::ops` counterparts; reach them through `crate::operations::math` instead.
 pub use compare::*;
 pub use constants::*;
 pub use control_flow::*;
@@ -71,9 +67,9 @@ pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
 pub use differentiation::*;
 pub use logical::*;
 pub use manipulation::*;
+pub use math::*;
 pub use sharding::*;
 pub use tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
-pub use trigonometric::*;
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.
