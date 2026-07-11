@@ -240,49 +240,52 @@ impl<
         self.captures.as_slice()
     }
 
-    // TODO(eaplatanios): Is it worth having a consuming version of this function that avoids `O: Clone`?
     /// Removes captures that no [`Atom`] of the underlying [`Program`] references and re-indexes the survivors into
     /// a contiguous capture table. This is _dead-capture elimination_: any capture whose index never appears in an
     /// [`Atom::Constant`] is dropped, and the remaining captures are renumbered to occupy `0..captures().len()` in
     /// their original relative order. The program structure (i.e., inputs, instructions, and outputs) is preserved
-    /// and only constant atoms are rewritten to carry their new indices.
-    pub fn without_unused_captures(&self) -> Result<Self, ProgramError>
-    where
-        O: Clone,
-    {
-        // Assign each *referenced* capture a slot in the rebuilt capture table, in first-reference order.
-        // Captures whose index never appears in a constant atom get no slot and are thereby dropped.
-        let mut capture_index_map = vec![None; self.captures.len()];
-        let mut filtered_captures = Vec::new();
-        for atom in self.program.atoms() {
-            let Atom::Constant(capture_reference) = atom else {
-                continue;
-            };
-            let source_index = capture_reference.index();
-            if capture_index_map[source_index].is_none() {
-                capture_index_map[source_index] = Some(filtered_captures.len());
-                filtered_captures.push(self.captures[source_index].clone());
+    /// and only constant atoms are rewritten to carry their new indices. This function consumes `self` so that the
+    /// surviving captures, the instruction operations, and the input/output structures can all be moved into the
+    /// rebuilt program instead of being cloned.
+    pub fn without_unused_captures(self) -> Result<Self, ProgramError> {
+        let Self { program, captures } = self;
+        let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, .. } = program;
+
+        // Mark the captures that at least one constant atom references. Indexing into `is_referenced`
+        // cannot fail because `new` validated every capture reference at construction time.
+        let mut is_referenced = vec![false; captures.len()];
+        for atom in &atoms {
+            if let Atom::Constant(capture_reference) = atom {
+                is_referenced[capture_reference.index()] = true;
             }
         }
 
-        // Rebuild the underlying program with the same structure, rewriting only the constant atoms. `mapped_atoms`
-        // tracks the rebuilt `AtomId` of every source atom so that an atom shared across instructions maps to a single
-        // rebuilt atom instead of being duplicated.
-        let mut builder = ProgramBuilder::new();
-        let mut mapped_atoms = vec![None; self.program.atoms().len()];
-
-        // TODO(eaplatanios): Why does this take `builder` and `mapped_atoms` as arguments intead of capturing?
-        // The following closure materializes the rebuilt atom identifier for `atom_id`, lazily re-adding referenced
-        // capture constants with their re-indexed references. The slot lookup cannot fail because the first pass
-        // assigned a slot to every capture referenced by any constant atom in the table.
-        let map_atom = |builder: &mut ProgramBuilder<CaptureReference<V::Type>, O>,
-                        mapped_atoms: &mut [Option<AtomId>],
-                        atom_id: AtomId|
-         -> Result<AtomId, ProgramError> {
+        // Move the referenced captures into a contiguous table that preserves their original relative order,
+        // recording each survivor's new index. Captures that are never referenced are dropped here.
+        let mut capture_index_map = vec![None; captures.len()];
+        let mut filtered_captures = Vec::new();
+        for (source_index, capture) in captures.into_iter().enumerate() {
+            if is_referenced[source_index] {
+                capture_index_map[source_index] = Some(filtered_captures.len());
+                filtered_captures.push(capture);
+            }
+        }
+        
+        /// Materializes the rebuilt atom identifier for `atom_id` in `builder`, memoizing the result in `mapped_atoms`
+        /// and lazily re-adding referenced capture constants with their re-indexed references. The `capture_index_map`
+        /// slot lookup cannot fail because the marking pass in [`ClosedProgram::without_unused_captures`] assigns a
+        /// slot to every capture referenced by any constant atom.
+        fn map_atom<T: Type, O: Operation<T>>(
+            atoms: &[Atom<CaptureReference<T>>],
+            capture_index_map: &[Option<usize>],
+            builder: &mut ProgramBuilder<CaptureReference<T>, O>,
+            mapped_atoms: &mut [Option<AtomId>],
+            atom_id: AtomId,
+        ) -> Result<AtomId, ProgramError> {
             if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
                 return Ok(mapped);
             }
-            match self.program.atoms().get(atom_id.index()) {
+            match atoms.get(atom_id.index()) {
                 Some(Atom::Constant(capture_reference)) => {
                     let rebuilt_index = capture_index_map[capture_reference.index()].unwrap();
                     let mapped = builder
@@ -295,13 +298,19 @@ impl<
                 ))),
                 None => Err(ProgramError::UnboundAtomId { id: atom_id }),
             }
-        };
+        }
+
+        // Rebuild the underlying program with the same structure, rewriting only the constant atoms. `mapped_atoms`
+        // tracks the rebuilt `AtomId` of every source atom so that an atom shared across instructions maps to a single
+        // rebuilt atom instead of being duplicated.
+        let mut builder = ProgramBuilder::new();
+        let mut mapped_atoms = vec![None; atoms.len()];
 
         // Program inputs must be re-added before any instruction is replayed so that instruction operands referencing
         // them resolve through `mapped_atoms` instead of being treated as unmapped atoms.
-        for input_id in self.program.input_ids().iter().copied() {
+        for input_id in input_ids {
             let input_index = input_id.index();
-            let input = self.program.atoms().get(input_index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+            let input = atoms.get(input_index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(input_type) = input else {
                 return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
@@ -309,17 +318,24 @@ impl<
         }
 
         // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so that later
-        // instructions (and the program outputs) can resolve them.
-        for instruction in self.program.instructions() {
-            let inputs = instruction
-                .inputs()
-                .iter()
-                .copied()
-                .map(|input| map_atom(&mut builder, mapped_atoms.as_mut_slice(), input))
+        // instructions (and the program outputs) can resolve them. The operations are moved into the rebuilt program.
+        for instruction in instructions {
+            let (operation, instruction_inputs, instruction_outputs) = instruction.into_parts();
+            let inputs = instruction_inputs
+                .into_iter()
+                .map(|input| {
+                    map_atom(
+                        atoms.as_slice(),
+                        capture_index_map.as_slice(),
+                        &mut builder,
+                        mapped_atoms.as_mut_slice(),
+                        input,
+                    )
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-            for (output, rebuilt_output) in instruction.outputs().iter().copied().zip(outputs) {
+            let outputs = builder.add_instruction(operation, inputs)?.to_vec();
+            check_count!("output", outputs, instruction_outputs.len(), ProgramError);
+            for (output, rebuilt_output) in instruction_outputs.into_iter().zip(outputs) {
                 let mapped_atom =
                     mapped_atoms.get_mut(output.index()).ok_or(ProgramError::UnboundAtomId { id: output })?;
                 *mapped_atom = Some(rebuilt_output);
@@ -328,19 +344,20 @@ impl<
 
         // Program outputs may be inputs, instruction outputs, or captured constants, and so they are resolved through
         // the same atom mapping as instruction operands.
-        let output_ids = self
-            .program
-            .output_ids()
-            .iter()
-            .copied()
-            .map(|output| map_atom(&mut builder, mapped_atoms.as_mut_slice(), output))
+        let output_ids = output_ids
+            .into_iter()
+            .map(|output| {
+                map_atom(
+                    atoms.as_slice(),
+                    capture_index_map.as_slice(),
+                    &mut builder,
+                    mapped_atoms.as_mut_slice(),
+                    output,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let program = builder.build::<Input, Output>(
-            output_ids,
-            self.program.input_structure().clone(),
-            self.program.output_structure().clone(),
-        )?;
+        let program = builder.build::<Input, Output>(output_ids, input_structure, output_structure)?;
 
         // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, filtered_captures)
@@ -455,15 +472,6 @@ impl<
     }
 }
 
-impl<
-    V: Clone + Value,
-    O: Clone + Operation<V::Type>,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> ClosedProgram<V, O, Input, Output>
-{
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -570,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_unused_captures_drops_dead_capture_and_reindexes() {
+    fn test_without_unused_captures_drops_dead_capture_and_reindexes() {
         // The program references only capture #1; capture #0 (value 3.0) is dead.
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
         let input = builder.add_input(DataType::F64);
