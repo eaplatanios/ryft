@@ -20,9 +20,9 @@ impl ToMlir for LogicalMesh {
     ) -> Result<shardy::DetachedMeshOperation<'c, 't>, ryft_mlir::Error> {
         let context = location.context();
         let axes = self
-            .axes
+            .axes()
             .iter()
-            .map(|axis| context.shardy_mesh_axis(axis.name.as_str(), axis.size))
+            .map(|axis| context.shardy_mesh_axis(axis.name(), axis.size()))
             .collect::<Result<Vec<_>, _>>()?;
         let attribute = context.shardy_mesh(axes, &[])?;
         shardy::mesh(SHARDY_MESH_SYMBOL_NAME, attribute, location)
@@ -39,7 +39,7 @@ impl ToMlir for DeviceMesh {
         &self,
         location: L,
     ) -> Result<shardy::DetachedMeshOperation<'c, 't>, ryft_mlir::Error> {
-        self.logical_mesh.to_mlir(location)
+        self.logical_mesh().to_mlir(location)
     }
 }
 
@@ -55,7 +55,7 @@ impl ToMlir for Sharding {
         let context = location.context();
         let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
         let dimensions = self
-            .dimensions
+            .dimensions()
             .iter()
             .map(|dimension| match dimension {
                 ShardingDimension::Replicated => context.shardy_dimension_sharding([], true, None),
@@ -76,7 +76,7 @@ impl ToMlir for Sharding {
             .map(|axis_name| context.shardy_axis_ref(*axis_name, None))
             .collect::<Result<Vec<_>, _>>()?;
         let unreduced_axes = self
-            .unreduced_axes
+            .unreduced_axes()
             .iter()
             .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
             .collect::<Result<Vec<_>, _>>()?;
@@ -97,7 +97,7 @@ mod tests {
 
     use ryft_mlir::{Block, Context as MlirContext};
 
-    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, MeshDevice};
+    use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Device};
 
     use super::*;
 
@@ -129,7 +129,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
+        let devices = vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1), Device::new(3, 1)];
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();

@@ -33,17 +33,20 @@ pub enum ShardingError {
     #[error("mesh axis '{name}' must have type manual")]
     ExpectedManualMeshAxis { name: String },
 
+    #[error("cannot remove dimension {dimension} because it is sharded over the non-manual mesh axis '{name}'")]
+    NonManualShardedDimensionRemoval { dimension: usize, name: String },
+
     #[error("manual axis '{name}' cannot be both varying and unreduced")]
     ConflictingVaryingAndUnreducedMeshAxis { name: String },
 
     #[error("manual axis '{name}' cannot be both varying and reduced")]
     ConflictingVaryingAndReducedMeshAxis { name: String },
 
-    #[error("mesh device ID '{id}' appears more than once")]
-    DuplicateMeshDeviceId { id: MeshDeviceId },
+    #[error("device ID '{id}' appears more than once")]
+    DuplicateDeviceId { id: DeviceId },
 
     #[error("mesh has {actual} device(s), but its axis sizes imply {expected} device(s)")]
-    MeshDeviceCountMismatch { expected: usize, actual: usize },
+    DeviceCountMismatch { expected: usize, actual: usize },
 
     #[error("mesh mismatch; expected '{expected:?}' but got '{actual:?}'")]
     MeshMismatch { expected: LogicalMesh, actual: LogicalMesh },
@@ -77,7 +80,7 @@ pub enum MeshAxisType {
     Explicit,
 
     /// Used for mesh axes for which the user manages all device communication explicitly
-    /// (e.g., using an operation like [`shard_map`] which is analogous to
+    /// (e.g., using an operation like `shard_map` which is analogous to
     /// [JAX's `shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html)).
     Manual,
 }
@@ -88,13 +91,13 @@ pub enum MeshAxisType {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MeshAxis {
     /// Name of this [`MeshAxis`].
-    pub name: String,
+    name: String,
 
     /// Number of devices along this [`MeshAxis`].
-    pub size: usize,
+    size: usize,
 
     /// Type of this [`MeshAxis`], controlling sharding propagation behavior.
-    pub r#type: MeshAxisType,
+    r#type: MeshAxisType,
 }
 
 impl MeshAxis {
@@ -110,6 +113,24 @@ impl MeshAxis {
             Ok(Self { name, size, r#type })
         }
     }
+
+    /// Returns the name of this [`MeshAxis`].
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the number of devices along this [`MeshAxis`].
+    #[inline]
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Returns the type of this [`MeshAxis`], controlling sharding propagation behavior.
+    #[inline]
+    pub fn r#type(&self) -> MeshAxisType {
+        self.r#type
+    }
 }
 
 /// Key used to intern [`LogicalMesh`] instances.
@@ -123,10 +144,10 @@ struct LogicalMeshKey {
 #[derive(Debug, PartialEq, Eq)]
 pub struct LogicalMeshData {
     /// Named and sized axes that define this logical mesh topology.
-    pub axes: Vec<MeshAxis>,
+    axes: Vec<MeshAxis>,
 
     /// Mapping from [`MeshAxis`] names to their indices/positions in [`Self::axes`].
-    pub axis_indices: HashMap<String, usize>,
+    axis_indices: HashMap<String, usize>,
 }
 
 /// Returns all interned [`LogicalMesh`] instances.
@@ -179,6 +200,18 @@ impl LogicalMesh {
         self.axes.len()
     }
 
+    /// Returns the named and sized axes that define this logical mesh topology.
+    #[inline]
+    pub fn axes(&self) -> &[MeshAxis] {
+        &self.axes
+    }
+
+    /// Returns the index of the [`MeshAxis`] with the provided name, if such an axis exists.
+    #[inline]
+    pub fn axis_index<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
+        self.axis_indices.get(axis_name.as_ref()).copied()
+    }
+
     /// Returns the size of the [`MeshAxis`] in this [`LogicalMesh`] with the provided name, if such an axis exists.
     #[inline]
     pub fn axis_size<S: AsRef<str>>(&self, axis_name: S) -> Option<usize> {
@@ -199,6 +232,7 @@ impl LogicalMesh {
 }
 
 impl Debug for LogicalMesh {
+    #[inline]
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LogicalMesh")
@@ -222,67 +256,89 @@ impl Deref for LogicalMesh {
     }
 }
 
-/// Type alias used to represent [`MeshDevice`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
+/// Type alias used to represent [`Device`] IDs, which are unique among devices of the same type (e.g., CPUs, GPUs)
 /// and, on multi-host environments, are also unique across all devices and all hosts.
-pub type MeshDeviceId = usize;
+pub type DeviceId = usize;
 
 /// Type alias used to represent process indices in multi-process/multi-host environments.
-pub type MeshProcessIndex = usize;
+pub type ProcessIndex = usize;
 
 /// Device that belongs to a mesh topology. This type separates global device identity that is described by a
-/// [`MeshDeviceId`], from host/process ownership, that is described by a [`ProcessIndex`].
+/// [`DeviceId`], from host/process ownership, that is described by a [`ProcessIndex`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct MeshDevice {
-    /// Globally (i.e., across all hosts/processes) unique device ID.
-    pub id: MeshDeviceId,
+pub struct Device {
+    /// Globally (i.e., across all hosts/processes) unique [`DeviceId`].
+    id: DeviceId,
 
     /// Index of the process that owns this device. In single-host setups, this will always be set to `0`. In multi-host
     /// setups it determines _addressability_. That is, a _shard_ of an array that is located on some device `d` is
     /// _addressable_ from a process with index `p` if and only if `d.process_index == p`.
-    pub process_index: MeshProcessIndex,
+    process_index: ProcessIndex,
 }
 
-impl MeshDevice {
-    /// Creates a new [`MeshDevice`].
+impl Device {
+    /// Creates a new [`Device`].
     #[inline]
-    pub fn new(id: MeshDeviceId, process_index: MeshProcessIndex) -> Self {
+    pub fn new(id: DeviceId, process_index: ProcessIndex) -> Self {
         Self { id, process_index }
+    }
+
+    /// Returns globally (i.e., across all hosts/processes) unique [`DeviceId`] of this [`Device`].
+    #[inline]
+    pub fn id(&self) -> DeviceId {
+        self.id
+    }
+
+    /// Returns the index of the process that owns this device. In single-host setups, this will always be set to `0`.
+    /// In multi-host setups it determines _addressability_. That is, a _shard_ of an array that is located on some
+    /// device `d` is _addressable_ from a process with index `p` if and only if `d.process_index == p`.
+    #[inline]
+    pub fn process_index(&self) -> ProcessIndex {
+        self.process_index
     }
 }
 
-/// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`MeshDevice`]s into a
-/// [`LogicalMesh`]. Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g.,
-/// for a two-dimensional mesh with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has
-/// linear index `i * 2 + j`.
+/// Mesh of devices used by sharding layouts. A [`DeviceMesh`] organizes a set of [`Device`]s into a [`LogicalMesh`].
+/// Devices are stored in **row-major order** with respect to the [`MeshAxis`] list (e.g., for a two-dimensional mesh
+/// with axes `("data"=4, "model"=2)`, the device at mesh coordinate `(i, j)` has linear index `i * 2 + j`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceMesh {
     /// Logical mesh topology that defines the names, sizes, and types of the mesh axes.
-    pub logical_mesh: LogicalMesh,
+    pub(crate) logical_mesh: LogicalMesh,
 
     /// Physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
-    pub devices: Vec<MeshDevice>,
+    pub(crate) devices: Vec<Device>,
 }
 
 impl DeviceMesh {
     /// Creates a new [`DeviceMesh`].
     #[inline]
-    pub fn new(logical_mesh: LogicalMesh, devices: Vec<MeshDevice>) -> Result<Self, ShardingError> {
+    pub fn new(logical_mesh: LogicalMesh, devices: Vec<Device>) -> Result<Self, ShardingError> {
         let expected_device_count = logical_mesh.device_count();
         if devices.len() != expected_device_count {
-            return Err(ShardingError::MeshDeviceCountMismatch {
-                expected: expected_device_count,
-                actual: devices.len(),
-            });
+            return Err(ShardingError::DeviceCountMismatch { expected: expected_device_count, actual: devices.len() });
         }
 
         let mut seen_device_ids = HashSet::with_capacity(devices.len());
         for device in &devices {
             if !seen_device_ids.insert(device.id) {
-                return Err(ShardingError::DuplicateMeshDeviceId { id: device.id });
+                return Err(ShardingError::DuplicateDeviceId { id: device.id });
             }
         }
 
         Ok(Self { logical_mesh, devices })
+    }
+
+    /// Returns the logical mesh topology that defines the names, sizes, and types of the mesh axes.
+    #[inline]
+    pub fn logical_mesh(&self) -> &LogicalMesh {
+        &self.logical_mesh
+    }
+
+    /// Returns the physical devices laid out in row-major order with respect to [`Self::logical_mesh`].
+    #[inline]
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
     }
 
     /// Returns the rank (i.e., number of axes) of this [`DeviceMesh`].
@@ -309,7 +365,7 @@ impl DeviceMesh {
         self.devices.len()
     }
 
-    /// Returns the mesh coordinates of the [`MeshDevice`] at the provided index, if valid.
+    /// Returns the mesh coordinates of the [`Device`] at the provided index, if valid.
     #[inline]
     pub fn device_coordinates(&self, device_index: usize) -> Option<Vec<usize>> {
         (device_index < self.devices.len()).then(|| {
@@ -396,7 +452,7 @@ impl Display for ShardingDimension {
 ///         ShardingDimension::replicated(),
 ///     ],
 ///     unreduced_axes: std::collections::BTreeSet::from(["model".to_string()]),
-///     reduced_manual_axes: std::collections::BTreeSet::new(),
+///     reduced_axes: std::collections::BTreeSet::new(),
 ///     varying_manual_axes: std::collections::BTreeSet::new(),
 /// };
 /// ```
@@ -417,57 +473,20 @@ impl Display for ShardingDimension {
 /// - [Memories and Host Offloading](https://docs.jax.dev/en/latest/notebooks/host-offloading.html)
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct Sharding {
-    /// [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning to every
-    /// [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct. Every
-    /// axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_manual_axes`], and
-    /// [`Self::varying_manual_axes`] is resolved against this mesh.
-    pub mesh: LogicalMesh,
+    /// Refer to the documentation of [`Self::mesh`] for information on this field.
+    pub(crate) mesh: LogicalMesh,
 
-    /// Ranked per-array dimension [`Sharding`] partition assignments. This is the array-rank-indexed part of this
-    /// sharding: `dimensions[i]` describes how the logical array dimension `i` is partitioned across the mesh.
-    /// For example, on a mesh with axes `("data", "model")`, the [`dimensions`](Self::dimensions) assignment
-    /// `[ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]` means that the first array
-    /// dimension is split across `"data"` while the second array dimension is replicated on every device. This field
-    /// intentionally does not try to encode every mesh-related fact about the value. Mesh axes that matter semantically
-    /// but do not correspond to a ranked array dimension are stored separately in [`Self::unreduced_axes`],
-    /// [`Self::reduced_manual_axes`], and [`Self::varying_manual_axes`].
-    pub dimensions: Vec<ShardingDimension>,
+    /// Refer to the documentation of [`Self::dimensions`] for information on this field.
+    pub(crate) dimensions: Vec<ShardingDimension>,
 
-    /// Mesh axes along which values carry per-device partial results. This is the "a cross-device reduction still
-    /// needs to happen" marker. An axis can disappear from [`Self::dimensions`] after a local computation reduces over
-    /// the corresponding array dimension, but the value may still not be truly replicated; each shard can still hold a
-    /// different partial result that must later be combined across that mesh axis. Concretely, imagine a mesh with axes
-    /// `("data", "model")` and a value whose first tensor dimension is sharded by `"data"`. If a local computation then
-    /// sums over a `"model"`-partitioned feature dimension, the resulting value may have no ranked dimension left that
-    /// mentions `"model"`, yet each `"model"` shard still owns a different partial sum. Setting `unreduced_axes` to
-    /// `["model"]` preserves that fact. This is why this field is needed even though the mesh axis no longer appears in
-    /// [`Self::dimensions`]; without it, an axis that is absent from ranked dimensions would be indistinguishable from
-    /// ordinary replication.
-    pub unreduced_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::unreduced_axes`] for information on this field.
+    pub(crate) unreduced_axes: BTreeSet<String>,
 
-    /// [`MeshAxisType::Manual`] mesh axes across which values are known to have already been reduce. This is the dual
-    /// of [`Self::unreduced_axes`] though specific to manual axes because this property is implicit for other axis
-    /// types. It records that a manual mesh axis has already been consumed by a reduction, even though that fact no
-    /// longer has a direct ranked-dimension representation. A concrete `shard_map` example is an output that is
-    /// replicated in [`Self::dimensions`] but was produced by first summing across the active manual axis `"data"`
-    /// inside the mapped computation. In that case `reduced_manual_axes` being set to `["data"]` distinguishes "this
-    /// value is already reduced across `data`" from both "this value is still unreduced across `data`" and "this axis
-    /// was never relevant to the value". This field exists primarily for type-level `shard_map` reasoning and
-    /// validation.
-    pub reduced_manual_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::reduced_axes`] for information on this field.
+    pub(crate) reduced_axes: BTreeSet<String>,
 
-    /// [`MeshAxisType::Manual`] mesh axes for which `shard_map` values are known to vary along. Unlike
-    /// [`Self::dimensions`], this is not a placement description. It answers a typing question used while tracing
-    /// `shard_map`: if we compared two otherwise identical devices that differ only along one of these axes, could this
-    /// local value still be different? A concrete nested-`shard_map` example is an outer map that is manual over `"y"`
-    /// and an inner map whose input sharding specifications additionally shard the value over manual axis `"x"`. Inside
-    /// the inner body, the local array can still have the same rank and local shape as before, but it now semantically
-    /// varies across both manual axes, and so the trace has `varying_manual_axes` set to `["y", "x"]`. This is needed
-    /// because neither ranked sharding nor reduction-state fields can say whether a local value is uniform across the
-    /// active manual shards. For example, constants created inside `shard_map` preserve [`Self::unreduced_axes`] and
-    /// [`Self::reduced_manual_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from
-    /// shard to shard even when it is traced under manual axes.
-    pub varying_manual_axes: BTreeSet<String>,
+    /// Refer to the documentation of [`Self::varying_manual_axes`] for information on this field.
+    pub(crate) varying_manual_axes: BTreeSet<String>,
 }
 
 impl Sharding {
@@ -488,8 +507,8 @@ impl Sharding {
         Self::with_manual_axes::<_, _, &str, _, &str, _>(mesh, dimensions, unreduced_axes, [], [])
     }
 
-    /// Creates a new [`Sharding`] with full control over unreduced, reduced manual, and varying manual axes.
-    /// Prefer [`Self::new`] or [`Self::with_unreduced_axes`] when the manual-axis fields are not needed.
+    /// Creates a new [`Sharding`] with full control over unreduced, reduced, and varying manual axes. Prefer
+    /// [`Self::new`] or [`Self::with_unreduced_axes`] when the reduction-state and manual-axis fields are not needed.
     pub fn with_manual_axes<
         U: Into<String>,
         UI: IntoIterator<Item = U>,
@@ -501,13 +520,13 @@ impl Sharding {
         mesh: LogicalMesh,
         dimensions: Vec<ShardingDimension>,
         unreduced_axes: UI,
-        reduced_manual_axes: RI,
+        reduced_axes: RI,
         varying_manual_axes: VI,
     ) -> Result<Self, ShardingError> {
         let unreduced_axes = unreduced_axes.into_iter().map(Into::into).collect();
-        let reduced_manual_axes = reduced_manual_axes.into_iter().map(Into::into).collect();
+        let reduced_axes = reduced_axes.into_iter().map(Into::into).collect();
         let varying_manual_axes = varying_manual_axes.into_iter().map(Into::into).collect();
-        let sharding = Self { mesh, dimensions, unreduced_axes, reduced_manual_axes, varying_manual_axes };
+        let sharding = Self { mesh, dimensions, unreduced_axes, reduced_axes, varying_manual_axes };
 
         let mut used_axis_names = HashSet::new();
         for (dimension, partition_dimension) in sharding.dimensions.iter().enumerate() {
@@ -541,13 +560,9 @@ impl Sharding {
             used_axis_names.insert(axis_name.clone());
         }
 
-        for axis_name in &sharding.reduced_manual_axes {
+        for axis_name in &sharding.reduced_axes {
             if !sharding.mesh.axis_indices.contains_key(axis_name) {
                 return Err(ShardingError::UnknownMeshAxisName { name: axis_name.clone() });
-            }
-
-            if sharding.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual) {
-                return Err(ShardingError::ExpectedManualMeshAxis { name: axis_name.clone() });
             }
 
             if used_axis_names.contains(axis_name) {
@@ -570,7 +585,7 @@ impl Sharding {
                 return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
             }
 
-            if sharding.reduced_manual_axes.contains(axis_name) {
+            if sharding.reduced_axes.contains(axis_name) {
                 return Err(ShardingError::ConflictingVaryingAndReducedMeshAxis { name: axis_name.clone() });
             }
         }
@@ -587,9 +602,79 @@ impl Sharding {
             mesh,
             dimensions: vec![ShardingDimension::Replicated; rank],
             unreduced_axes: BTreeSet::new(),
-            reduced_manual_axes: BTreeSet::new(),
+            reduced_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         }
+    }
+
+    /// Returns the [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning
+    /// to every [`MeshAxis`] name stored in it. This is effectively the coordinate system for the rest of this struct.
+    /// Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`], [`Self::reduced_axes`], and
+    /// [`Self::varying_manual_axes`] is resolved against this mesh.
+    #[inline]
+    pub fn mesh(&self) -> &LogicalMesh {
+        &self.mesh
+    }
+
+    /// Returns the ranked per-array dimension [`Sharding`] partition assignments. This is the array-rank-indexed part
+    /// of this sharding: `dimensions[i]` describes how the logical array dimension `i` is partitioned across the mesh.
+    /// For example, on a mesh with axes `("data", "model")`, the [`dimensions`](Self::dimensions) assignment
+    /// `[ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]` means that the first array dimension
+    /// is split across `"data"` while the second array dimension is replicated on every device. This field
+    /// intentionally does not try to encode every mesh-related fact about the value. Mesh axes that matter
+    /// semantically but do not correspond to a ranked array dimension are stored separately in
+    /// [`Self::unreduced_axes`], [`Self::reduced_axes`], and [`Self::varying_manual_axes`].
+    #[inline]
+    pub fn dimensions(&self) -> &[ShardingDimension] {
+        &self.dimensions
+    }
+
+    /// Returns the mesh axes along which values carry per-device partial results. This is the "a cross-device reduction
+    /// still needs to happen" marker. An axis can disappear from [`Self::dimensions`] after a local computation
+    /// reduces over the corresponding array dimension, but the value may still not be truly replicated; each shard can
+    /// still hold a different partial result that must later be combined across that mesh axis. Concretely, imagine a
+    /// mesh with axes `("data", "model")` and a value whose first tensor dimension is sharded by `"data"`. If a local
+    /// computation then sums over a `"model"`-partitioned feature dimension, the resulting value may have no ranked
+    /// dimension left that mentions `"model"`, yet each `"model"` shard still owns a different partial sum. Setting
+    /// `unreduced_axes` to `["model"]` preserves that fact. This is why this field is needed even though the mesh axis
+    /// no longer appears in [`Self::dimensions`]; without it, an axis that is absent from ranked dimensions would be
+    /// indistinguishable from ordinary replication.
+    #[inline]
+    pub fn unreduced_axes(&self) -> &BTreeSet<String> {
+        &self.unreduced_axes
+    }
+
+    /// Returns the mesh axes across which values are known to have already been reduced. This is the dual of
+    /// [`Self::unreduced_axes`]. A reduced axis is computationally indistinguishable from a replicated one (every
+    /// device holds the same data along it), and the marker records that the value was produced by a reduction across
+    /// that axis, even though that fact no longer has a direct ranked-dimension representation. The two sets are also
+    /// duals under transposition (i.e., the cotangent of a value that is unreduced along an axis is reduced along that
+    /// axis, and vice versa), mirroring how [JAX's `PartitionSpec`](
+    /// https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec) pairs `unreduced` with `reduced`.
+    /// For [`MeshAxisType::Manual`] axes, the marker records that a manual mesh axis has already been consumed by a
+    /// reduction inside a `shard_map` body: a concrete example is an output that is replicated in [`Self::dimensions`]
+    /// but was produced by first summing across the active manual axis `"data"` inside the mapped computation, where
+    /// `reduced_axes` being set to `["data"]` distinguishes "this value is already reduced across `data`" from both
+    /// "this value is still unreduced across `data`" and "this axis was never relevant to the value".
+    #[inline]
+    pub fn reduced_axes(&self) -> &BTreeSet<String> {
+        &self.reduced_axes
+    }
+
+    /// Returns the [`MeshAxisType::Manual`] mesh axes for which `shard_map` values are known to vary along. Unlike
+    /// [`Self::dimensions`], this is not a placement description. It answers a typing question used while tracing
+    /// `shard_map`: if we compared two otherwise identical devices that differ only along one of these axes, could this
+    /// local value still be different? A concrete nested-`shard_map` example is an outer map that is manual over `"y"`
+    /// and an inner map whose input sharding specifications additionally shard the value over manual axis `"x"`. Inside
+    /// the inner body, the local array can still have the same rank and local shape as before, but it now semantically
+    /// varies across both manual axes, and so the trace has `varying_manual_axes` set to `["y", "x"]`. This is needed
+    /// because neither ranked sharding nor reduction-state fields can say whether a local value is uniform across the
+    /// active manual shards. For example, constants created inside `shard_map` preserve [`Self::unreduced_axes`] and
+    /// [`Self::reduced_axes`] but clear [`Self::varying_manual_axes`], because a constant does not vary from shard to
+    /// shard even when it is traced under manual axes.
+    #[inline]
+    pub fn varying_manual_axes(&self) -> &BTreeSet<String> {
+        &self.varying_manual_axes
     }
 
     /// Returns the rank (i.e., number of dimensions) of this [`Sharding`].
@@ -607,7 +692,7 @@ impl Sharding {
             }
         }
         used_axes.extend(self.unreduced_axes.iter().map(String::as_str));
-        used_axes.extend(self.reduced_manual_axes.iter().map(String::as_str));
+        used_axes.extend(self.reduced_axes.iter().map(String::as_str));
         self.mesh
             .axes
             .iter()
@@ -682,7 +767,95 @@ impl Sharding {
             .filter(|name| matches!(self.mesh.axis_type(name), Some(MeshAxisType::Explicit | MeshAxisType::Manual)))
             .cloned()
             .collect();
-        Self { dimensions, unreduced_axes, ..self.clone() }
+        let reduced_axes = self
+            .reduced_axes
+            .iter()
+            .filter(|name| matches!(self.mesh.axis_type(name), Some(MeshAxisType::Explicit | MeshAxisType::Manual)))
+            .cloned()
+            .collect();
+        Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
+    }
+
+    /// Returns a copy of this [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`,
+    /// shifting all subsequent dimensions one position to the right. Batching rules use this to extend an explicit
+    /// output sharding with an entry for a newly introduced batch dimension. The resulting sharding is revalidated,
+    /// and so inserting a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
+    pub fn with_inserted_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
+        if index > self.dimensions.len() {
+            return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
+        }
+        let mut dimensions = self.dimensions.clone();
+        dimensions.insert(index, dimension);
+        Self::with_manual_axes(
+            self.mesh.clone(),
+            dimensions,
+            self.unreduced_axes.clone(),
+            self.reduced_axes.clone(),
+            self.varying_manual_axes.clone(),
+        )
+    }
+
+    /// Returns a copy of this [`Sharding`] with its `index`-th dimension removed, shifting
+    /// subsequent dimensions one position to the left. This is the sharding-level analogue of
+    /// [`ArrayType::without_dimension`](crate::ArrayType::without_dimension). The reduction axis sets are unchanged,
+    /// but the removed entry's placement is reconciled with the manual-axis model. A dimension sharded over
+    /// [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the value now varies across them
+    /// rather than being placed along a ranked dimension), while a dimension sharded over a non-manual (e.g., a
+    /// [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently discard an explicit
+    /// placement that only a reduction or collective can remove), and yields a
+    /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
+    /// [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
+    pub fn without_dimension(&self, index: usize) -> Result<Self, ShardingError> {
+        if index >= self.dimensions.len() {
+            return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
+        }
+        let mut dimensions = self.dimensions.clone();
+        let removed_dimension = dimensions.remove(index);
+        let mut varying_manual_axes = self.varying_manual_axes.clone();
+        if let ShardingDimension::Sharded(axis_names) = removed_dimension {
+            for axis_name in axis_names {
+                if self.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
+                    return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: index, name: axis_name });
+                }
+                varying_manual_axes.insert(axis_name);
+            }
+        }
+        Self::with_manual_axes(
+            self.mesh.clone(),
+            dimensions,
+            self.unreduced_axes.clone(),
+            self.reduced_axes.clone(),
+            varying_manual_axes,
+        )
+    }
+
+    /// Returns `true` if this [`Sharding`] and `other`, which must share this sharding's mesh, disagree on any state
+    /// that involves an [`Explicit`](MeshAxisType::Explicit) mesh axis: a per-dimension placement entry that differs
+    /// while either side shards that dimension over an explicit axis, or an [`unreduced`](Self::unreduced_axes) /
+    /// [`reduced`](Self::reduced_axes) axis set whose symmetric difference contains an explicit axis. Differences
+    /// confined to [`Manual`](MeshAxisType::Manual) axes, [`Auto`](MeshAxisType::Auto) axes, and any
+    /// [`varying_manual_axes`](Self::varying_manual_axes) differences are ignored. This function is used by the
+    /// operations that require their operands to be **sharded identically** (e.g., concatenation and dynamic slice
+    /// updating) to determine whether to return an error or not.
+    pub fn conflicts_on_explicit_axes_with(&self, other: &Sharding) -> bool {
+        if self.dimensions.len() != other.dimensions.len() {
+            return true;
+        }
+        let dimension_has_explicit_axis = |dimension: &ShardingDimension| {
+            matches!(dimension, ShardingDimension::Sharded(axis_names)
+                if axis_names.iter().any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit)))
+        };
+        for (left, right) in self.dimensions.iter().zip(&other.dimensions) {
+            if left != right && (dimension_has_explicit_axis(left) || dimension_has_explicit_axis(right)) {
+                return true;
+            }
+        }
+        let symmetric_difference_contains_explicit = |left: &BTreeSet<String>, right: &BTreeSet<String>| {
+            left.symmetric_difference(right)
+                .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
+        };
+        symmetric_difference_contains_explicit(&self.unreduced_axes, &other.unreduced_axes)
+            || symmetric_difference_contains_explicit(&self.reduced_axes, &other.reduced_axes)
     }
 }
 
@@ -728,9 +901,9 @@ impl Display for Sharding {
             write_names(formatter, self.unreduced_axes.iter())?;
         }
 
-        if !self.reduced_manual_axes.is_empty() {
-            write!(formatter, ", reduced_manual=")?;
-            write_names(formatter, self.reduced_manual_axes.iter())?;
+        if !self.reduced_axes.is_empty() {
+            write!(formatter, ", reduced=")?;
+            write_names(formatter, self.reduced_axes.iter())?;
         }
 
         if !self.varying_manual_axes.is_empty() {
@@ -835,7 +1008,7 @@ mod tests {
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
-        let devices = vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1), MeshDevice::new(3, 1)];
+        let devices = vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1), Device::new(3, 1)];
         let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
         assert_eq!(&mesh.logical_mesh, &logical_mesh);
         assert_eq!(&mesh.devices, &devices);
@@ -854,18 +1027,15 @@ mod tests {
         assert_eq!(mesh.device_coordinates(4), None);
 
         assert!(matches!(
-            DeviceMesh::new(
-                logical_mesh.clone(),
-                vec![MeshDevice::new(0, 0), MeshDevice::new(1, 0), MeshDevice::new(2, 1)],
-            ),
-            Err(ShardingError::MeshDeviceCountMismatch { expected: 4, actual: 3 }),
+            DeviceMesh::new(logical_mesh.clone(), vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1)],),
+            Err(ShardingError::DeviceCountMismatch { expected: 4, actual: 3 }),
         ));
         assert!(matches!(
             DeviceMesh::new(
                 logical_mesh.clone(),
-                vec![MeshDevice::new(0, 0), MeshDevice::new(0, 0), MeshDevice::new(1, 1), MeshDevice::new(2, 1)],
+                vec![Device::new(0, 0), Device::new(0, 0), Device::new(1, 1), Device::new(2, 1)],
             ),
-            Err(ShardingError::DuplicateMeshDeviceId { id }) if id == 0,
+            Err(ShardingError::DuplicateDeviceId { id }) if id == 0,
         ));
     }
 
@@ -897,7 +1067,7 @@ mod tests {
         assert_eq!(sharding.mesh, mesh.clone());
         assert_eq!(sharding.dimensions, vec![ShardingDimension::sharded(["data"]), ShardingDimension::replicated()]);
         assert_eq!(sharding.unreduced_axes, BTreeSet::new());
-        assert_eq!(sharding.reduced_manual_axes, BTreeSet::from(["manual".to_string()]));
+        assert_eq!(sharding.reduced_axes, BTreeSet::from(["manual".to_string()]));
         assert_eq!(sharding.varying_manual_axes, BTreeSet::new());
         assert_eq!(sharding.rank(), 2);
         assert_eq!(sharding.partition_index(0, &[0, 0]), Ok(0));
@@ -910,7 +1080,7 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 })
         );
         assert_eq!(sharding.replicated_axes(), Vec::<&str>::new());
-        assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced_manual={'manual'}}",);
+        assert_eq!(sharding.to_string(), "{mesh<['data'=4, 'manual'=2]>, [{'data'}, {}], reduced={'manual'}}",);
 
         let replicated = Sharding::replicated(mesh.clone(), 3);
         assert_eq!(replicated.mesh, mesh);
@@ -919,7 +1089,7 @@ mod tests {
             vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::replicated(),]
         );
         assert_eq!(replicated.unreduced_axes, BTreeSet::new());
-        assert_eq!(replicated.reduced_manual_axes, BTreeSet::new());
+        assert_eq!(replicated.reduced_axes, BTreeSet::new());
         assert_eq!(replicated.varying_manual_axes, BTreeSet::new());
         assert_eq!(replicated.rank(), 3);
         assert_eq!(replicated.partition_index(0, &[0, 0]), Ok(0));
@@ -968,13 +1138,23 @@ mod tests {
         ])
         .unwrap();
 
+        let reduced = Sharding::with_manual_axes(
+            mesh.clone(),
+            vec![ShardingDimension::replicated()],
+            Vec::<&str>::new(),
+            ["y"],
+            Vec::<&str>::new(),
+        )
+        .unwrap();
+        assert_eq!(reduced.reduced_axes, BTreeSet::from(["y".to_string()]));
+
         assert!(matches!(
             Sharding::with_manual_axes(
                 mesh.clone(),
                 vec![ShardingDimension::replicated()],
                 Vec::<&str>::new(),
-                ["y"],
                 Vec::<&str>::new(),
+                ["y"],
             ),
             Err(ShardingError::ExpectedManualMeshAxis { name }) if name == "y",
         ));
@@ -1051,7 +1231,7 @@ mod tests {
             mesh.clone(),
             vec![ShardingDimension::replicated()],
             Vec::<&str>::new(),
-            BTreeSet::from(["z".to_string()]),
+            BTreeSet::from(["y".to_string(), "z".to_string()]),
             BTreeSet::from(["x".to_string()]),
         )
         .unwrap();
@@ -1060,5 +1240,128 @@ mod tests {
             Sharding::with_manual_axes(mesh, vec![ShardingDimension::replicated()], Vec::<&str>::new(), ["z"], ["x"])
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn test_sharding_with_inserted_dimension() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]).unwrap();
+
+        assert_eq!(
+            sharding.with_inserted_dimension(0, ShardingDimension::replicated()),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])],),
+        );
+        assert_eq!(
+            sharding.with_inserted_dimension(1, ShardingDimension::sharded(["model"])),
+            Sharding::new(
+                mesh.clone(),
+                vec![ShardingDimension::sharded(["data"]), ShardingDimension::sharded(["model"])],
+            ),
+        );
+        assert!(matches!(
+            sharding.with_inserted_dimension(2, ShardingDimension::replicated()),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 1 }),
+        ));
+
+        // The resulting sharding is revalidated, so reusing an already-used axis fails.
+        assert!(matches!(
+            sharding.with_inserted_dimension(0, ShardingDimension::sharded(["data"])),
+            Err(ShardingError::DuplicateMeshAxisName { name }) if name == "data",
+        ));
+    }
+
+    #[test]
+    fn test_sharding_without_dimension() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("model", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])])
+                .unwrap();
+
+        // Dropping a replicated dimension removes it cleanly and shifts the remaining dimensions one position left.
+        assert_eq!(
+            sharding.without_dimension(0),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]),
+        );
+
+        // A dimension sharded over a non-manual axis cannot be dropped structurally, since only a reduction or
+        // collective can remove that explicit placement.
+        assert!(matches!(
+            sharding.without_dimension(1),
+            Err(ShardingError::NonManualShardedDimensionRemoval { dimension: 1, name }) if name == "data",
+        ));
+        assert!(matches!(
+            sharding.without_dimension(2),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
+        ));
+
+        // Dropping a dimension sharded over a manual axis moves that axis into the varying set.
+        let manual = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["model"])]).unwrap();
+        assert_eq!(
+            manual.without_dimension(0),
+            Sharding::with_manual_axes::<&str, _, &str, _, &str, _>(mesh.clone(), vec![], [], [], ["model"]),
+        );
+    }
+
+    #[test]
+    fn test_sharding_conflicts_on_explicit_axes_with() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("manual", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("auto", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let with_first_dimension = |dimension: ShardingDimension| {
+            Sharding::new(mesh.clone(), vec![dimension, ShardingDimension::replicated()]).unwrap()
+        };
+        let with_reduction_axes = |unreduced: Vec<&str>, reduced: Vec<&str>, varying: Vec<&str>| {
+            Sharding::with_manual_axes(
+                mesh.clone(),
+                vec![ShardingDimension::replicated(), ShardingDimension::replicated()],
+                unreduced,
+                reduced,
+                varying,
+            )
+            .unwrap()
+        };
+        let replicated = with_first_dimension(ShardingDimension::replicated());
+
+        // A sharding never conflicts with itself or with an equal sharding.
+        let sharded_over_x = with_first_dimension(ShardingDimension::sharded(["x"]));
+        assert!(!sharded_over_x.conflicts_on_explicit_axes_with(&sharded_over_x));
+        assert!(!replicated.conflicts_on_explicit_axes_with(&replicated));
+
+        // A rank mismatch is always a conflict, regardless of the axis types involved.
+        let rank_one = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert!(sharded_over_x.conflicts_on_explicit_axes_with(&rank_one));
+
+        // A per-dimension placement difference that touches an explicit axis is a conflict, whether that axis is
+        // dropped or swapped for another explicit axis.
+        let sharded_over_y = with_first_dimension(ShardingDimension::sharded(["y"]));
+        assert!(sharded_over_x.conflicts_on_explicit_axes_with(&replicated));
+        assert!(sharded_over_x.conflicts_on_explicit_axes_with(&sharded_over_y));
+
+        // A per-dimension placement difference confined to manual or auto axes is tolerated.
+        let sharded_over_manual = with_first_dimension(ShardingDimension::sharded(["manual"]));
+        let sharded_over_auto = with_first_dimension(ShardingDimension::sharded(["auto"]));
+        assert!(!sharded_over_manual.conflicts_on_explicit_axes_with(&replicated));
+        assert!(!sharded_over_auto.conflicts_on_explicit_axes_with(&replicated));
+
+        // A reduction-state difference is a conflict only when its symmetric difference contains an explicit axis.
+        // Both the unreduced and reduced sets are checked, while manual/auto differences are tolerated.
+        assert!(with_reduction_axes(vec!["x"], vec![], vec![]).conflicts_on_explicit_axes_with(&replicated));
+        assert!(with_reduction_axes(vec![], vec!["y"], vec![]).conflicts_on_explicit_axes_with(&replicated));
+        assert!(!with_reduction_axes(vec!["manual"], vec![], vec![]).conflicts_on_explicit_axes_with(&replicated));
+
+        // A difference confined to the varying-manual-axis set is ignored entirely.
+        assert!(!with_reduction_axes(vec![], vec![], vec!["manual"]).conflicts_on_explicit_axes_with(&replicated));
     }
 }

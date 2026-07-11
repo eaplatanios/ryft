@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Added `Parameterized::try_map_parameters`, `Parameterized::try_map_named_parameters`, and
   `Parameterized::broadcast_to_parameter_structure`.
+- Added a type system in `ryft_core::types` that supports modeling data types, array types, layouts, memory spaces,
+  and sharding information (along with a new `ryft_core::sharding` module).
 - Added support for modeling program effects with `ryft_core::effects`.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `LayoutError`, `BroadcastingError`,
   and `ShardingError`.
