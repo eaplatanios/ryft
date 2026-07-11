@@ -511,7 +511,7 @@ impl<
         D::Operation: Clone + CompiledProgramOperation<D::Constant>,
         V: Value<Type = D::Type>,
         V::DispatchDomain: Context<Type = D::Type, Constant = D::Constant, Operation = D::Operation>
-            + CapturingContext<D::Value>
+            + CapturingContext<Capture = D::Value>
             + Constant<V, D::Constant>,
         Input: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
         Input::To<V>: Parameterized<V>,
@@ -532,7 +532,7 @@ impl<
         D::Operation: Clone + CompiledProgramOperation<D::Constant>,
         V: Value<Type = D::Type>,
         C: Context<Type = D::Type, Value = V, Constant = D::Constant, Operation = D::Operation>
-            + CapturingContext<D::Value>
+            + CapturingContext<Capture = D::Value>
             + Constant<V, D::Constant>,
         Input: Parameterized<D::Type, Family: ParameterizedFamily<V>>,
         Input::To<V>: Parameterized<V>,

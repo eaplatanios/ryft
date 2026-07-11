@@ -169,7 +169,7 @@ impl<
     where
         V: Value<Type = ArrayType>,
         V::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Array<'c>>
+            + CapturingContext<Capture = Array<'c>>
             + Constant<V, XlaConstant>,
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
         In::To<V>: Parameterized<V>,
@@ -411,7 +411,7 @@ impl<
     where
         V: Value<Type = ArrayType>,
         V::DispatchDomain: Context<Type = ArrayType, Constant = XlaConstant, Operation = XlaOperation>
-            + CapturingContext<Array<'c>>
+            + CapturingContext<Capture = Array<'c>>
             + Constant<V, XlaConstant>,
         In: Parameterized<ArrayType, Family: ParameterizedFamily<ArrayType> + ParameterizedFamily<V>>,
         In::To<V>: Parameterized<V>,

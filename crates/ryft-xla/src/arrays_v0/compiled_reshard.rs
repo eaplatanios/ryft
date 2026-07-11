@@ -139,9 +139,9 @@ fn try_same_mesh<'o>(
     };
 
     let staged: StagedFunction<XlaDomain<'o>, ArrayType, ArrayType> =
-        stage_function(engine, |input| input, bare_input_type, xla_options).map_err(
-            |error| ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") },
-        )?;
+        stage_function(engine, |input| input, bare_input_type, xla_options).map_err(|error| {
+            ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") }
+        })?;
     let lowered = engine.lower(staged).map_err(|error| match error {
         XlaDomainError::Array(array_error) => array_error,
         other => ArrayError::CompiledReshardInternalError { message: format!("lowering failed: {other}") },

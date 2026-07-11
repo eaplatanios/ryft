@@ -22,7 +22,7 @@ use crate::operations::constants::Zero;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{Atom, AtomId, Instruction, Program, ProgramBuilder, ProgramError, Value};
-use crate::tracing::NestedTracingContext;
+use crate::tracing::{NestedTracingContext, TracingContext};
 use crate::types::{ArrayType, Type, Typed};
 
 /// Reference to a value captured outside a staged [`Program`]. A program stores only this lifetime-free reference
@@ -103,53 +103,73 @@ impl<T: Type> Value for CaptureReference<T> {
 /// delegate registration to their parent so captures follow the same nesting path as ordinary staged operations.
 /// Capturing a closed-over value instead of staging it as a literal keeps the program independent of concrete data,
 /// enabling executable reuse across captured values, retaining device buffers on-device, and keeping the IR compact.
-pub trait CapturingContext<Capture: Value<Type = Self::Type>>: Context {
-    /// Appends `value` to the current captures table and returns the constant payload that refers to it.
-    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError>;
+pub trait CapturingContext: Context {
+    /// Concrete runtime value type that this [`CapturingContext`] registers in its capture table. This is deliberately
+    /// distinct from both [`Context::Value`] (i.e., the value type flowing through the context, which is typically
+    /// a [`Tracer`](crate::Tracer) while capturing) and [`Context::Constant`] (i.e., the staged payload that
+    /// [`capture`](Self::capture) returns).
+    type Capture: Value<Type = Self::Type>;
+
+    /// Appends `value` to the current captures table of this [`CapturingContext`] and returns the constant payload
+    /// that refers to it.
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError>;
 }
 
-impl<Capture: Value<Type = C::Type>, C: CapturingContext<Capture>> CapturingContext<Capture>
-    for NestedTracingContext<C>
-{
+impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext for TracingContext<CaptureReference<T>, O, C> {
+    type Capture = C;
+
     #[inline]
-    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+    fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
+        let mut captures = self.captures().borrow_mut();
+        let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
+        captures.push(value);
+        Ok(constant)
+    }
+}
+
+impl<C: CapturingContext> CapturingContext for NestedTracingContext<C> {
+    type Capture = C::Capture;
+
+    #[inline]
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
     }
 }
 
-impl<Capture, C> CapturingContext<Capture> for PartialEvaluationContext<C>
-where
-    Capture: Value<Type = C::Type>,
-    C: CapturingContext<Capture>,
-    C::Operation: PartiallyEvaluatableOperation<C>,
+impl<C: CapturingContext<Operation: PartiallyEvaluatableOperation<C>>> CapturingContext
+    for PartialEvaluationContext<C>
 {
+    type Capture = C::Capture;
+
     #[inline]
-    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
     }
 }
 
-impl<
-    Capture: Value<Type = ArrayType>,
-    C: CapturingContext<Capture, Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>,
-> CapturingContext<Capture> for BatchingContext<C>
+impl<C: CapturingContext<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>>
+    CapturingContext for BatchingContext<C>
 {
+    type Capture = C::Capture;
+
     #[inline]
-    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
     }
 }
 
-impl<
-    Capture: Value<Type = C::Type>,
-    C: CapturingContext<Capture, Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>,
-> CapturingContext<Capture> for DifferentiationContext<C>
+impl<C: CapturingContext<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>> CapturingContext
+    for DifferentiationContext<C>
 {
+    type Capture = C::Capture;
+
     #[inline]
-    fn capture(&self, value: Capture) -> Result<Self::Constant, ProgramError> {
+    fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
         self.parent().capture(value)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// A staged [`Program`] paired with the concrete runtime values referenced by its captured constants.
 ///

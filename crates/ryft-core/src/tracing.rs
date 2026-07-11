@@ -93,13 +93,12 @@ use std::rc::Rc;
 use ryft_macros::Parameter;
 
 use crate::axes::NamedAxis;
-use crate::captures::{CaptureReference, CapturingContext};
 use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
-use crate::types::{Type, Typed};
+use crate::types::Typed;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -482,16 +481,6 @@ impl<V: Value, O: Operation<V::Type>, C> StagingContext for TracingContext<V, O,
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
         &self.builder
-    }
-}
-
-impl<T: Type, O: Operation<T>, C: Value<Type = T>> CapturingContext<C> for TracingContext<CaptureReference<T>, O, C> {
-    #[inline]
-    fn capture(&self, value: C) -> Result<Self::Constant, ProgramError> {
-        let mut captures = self.captures.borrow_mut();
-        let constant = CaptureReference::new(captures.len(), value.r#type().into_owned());
-        captures.push(value);
-        Ok(constant)
     }
 }
 
