@@ -1,3 +1,53 @@
+//! Contains machinery for _interpreting_ (i.e., _replaying_) staged [`Program`]s through chosen value semantics.
+//!
+//! Interpretation walks a [`Program`] in [`Instruction`] order, lifts its stored constants into the active value
+//! domain, and sends every operation through [`Context::bind`]. The supplied context determines what replay means:
+//! an eager context computes concrete values, a staging context splices the work into another program, and a transform
+//! context applies batching, differentiation, or partial-evaluation rules.
+//!
+//! # Entry Points
+//!
+//! [`Program::interpret`] is the ordinary eager entry point. It instantiates replay with the program's
+//! [`EagerContext`], checks the structured input contract, evaluates every instruction, and reconstructs the
+//! declared output structure.
+//!
+//! [`Program::interpret_in_context`] replays the same program through an explicitly supplied [`Context`]. Use it to
+//! inline a program into an active trace or to run it through a transform context. [`Program::interpret_with`] is the
+//! lower-level fold interface for callers that need custom input feeding or result handling around the same
+//! instruction walk.
+//!
+//! # Operation Interpretation Rules
+//!
+//! [`InterpretableOperation`] defines eager semantics for one [`Operation`] over a chosen value type and interpretation
+//! context. Operand-driven operations may ignore the context. Nullary construction and captured constants request only
+//! the narrow context capabilities they actually use. The context parameter `C` is deliberately unbounded on the trait
+//! itself. Adding `C: Context` there would make [`EagerContext`]'s `Context` implementation recursively require the
+//! very [`InterpretableOperation`] implementation being proven, which can overflow the trait solver. Implementations
+//! must therefore place only their actual capability requirements on `C`, such as zero construction or constant
+//! materialization, and must not add a blanket [`Context`] bound.
+//!
+//! [`InterpretableProgramOperation`] is the recursive fixed point for operation families containing nested flat
+//! programs. It lets a higher-order operation replay its body without requiring the full wrapper operation enum's
+//! interpretation implementation while that implementation is still being established. Its separate `Constant`
+//! parameter supports nested programs whose stored capture representation differs from the flowing runtime value.
+//!
+//! # Division of Responsibilities
+//!
+//! Interpretation owns the program walk, [`Context`] owns each bind's semantics, and operation payloads own their
+//! primitive or higher-order execution rules. This division is what makes replay reusable. Replaying through an
+//! [`EagerContext`] evaluates, replaying through a [`StagingContext`](crate::StagingContext) records equivalent
+//! instructions in another builder, and replaying through a transform context invokes that transform's per-operation
+//! rules, which may evaluate, stage, or residualize different portions of the program.
+//!
+//! # Extending Interpretation
+//!
+//! Implement [`InterpretableOperation`] on operation payloads using the narrowest context capabilities required by the
+//! body. An operation family containing nested programs should implement [`InterpretableProgramOperation`] and keep the
+//! recursive replay logic with the higher-order operation that owns the program. Wrapper operation enums should
+//! dispatch to payload implementations rather than duplicate their execution loops. New replay modes normally do not
+//! require a second interpreter. Implement a new [`Context`] whose `bind` method supplies the desired semantics and
+//! call [`Program::interpret_in_context`].
+
 use std::fmt::Debug;
 
 use crate::contexts::{Context, EagerContext};

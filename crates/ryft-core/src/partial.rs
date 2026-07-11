@@ -1,3 +1,86 @@
+//! Contains machinery for _partially evaluating_ [`Program`]s into known work and residual programs.
+//!
+//! Partial evaluation runs the portions of a program whose inputs are available now and stages the remaining work for
+//! later. It is both a public program-partitioning transform and infrastructure for other transforms (most notably
+//! differentiation, where primals are known, tangents are unknown, and the residual tangent program is a reusable
+//! linearization).
+//!
+//! ```text
+//!        ┌───────────────────────────────────┐
+//!        │ Program + Known / Unknown Inputs  │
+//!        └─────────────────┬─────────────────┘
+//!                          │ bind each operation
+//!                          ▼
+//!           ┌─────────────────────────────┐
+//!           │ Partial Evaluation Context  │
+//!           └──────────────┬──────────────┘
+//!           ┌──────────────┴──────────────┐
+//!   all inputs known              any input unknown
+//!           │ evaluate now                │ apply the operation's rule
+//!           ▼                             ▼
+//!    ┌─────────────┐      ┌───────────────────────────────┐
+//!    │ Known Value │      │ Residual Instruction + Tracer │
+//!    └──────┬──────┘      └───────────────┬───────────────┘
+//!           └──────────────┬──────────────┘
+//!                          ▼
+//!     ┌─────────────────────────────────────────┐
+//!     │ Known Outputs + Residual Program Wiring │
+//!     └─────────────────────────────────────────┘
+//! ```
+//!
+//! # Entry Points
+//!
+//! [`Program::partially_evaluate`] is the eager convenience entry point for a flat program. Supply one [`PartialValue`]
+//! per input. Known values are evaluated immediately and unknown inputs are represented only by type. The result is a
+//! [`PartialEvaluation`] containing the residual program, its runtime input wiring, and output descriptors.
+//!
+//! [`Program::partially_evaluate_in_context`] performs the same transform through an explicitly supplied known-side
+//! [`Context`]. This matters when known work should itself be staged into an enclosing trace rather than executed
+//! concretely. [`Program::partition`] is the index-oriented convenience that returns a [`PartitionedProgram`] with
+//! separate known and residual programs plus the wiring between them.
+//!
+//! # Values and Materialization
+//!
+//! [`PartialValue`] carries only semantic known/unknown classification: `Known(V)` contains a value available
+//! now, while `Unknown(Type)` carries abstract metadata for a future value. [`PartialEvaluationValue`] adds the
+//! residual-boundary state needed while building the split. Its shared [`PartialValueMaterialization`] slot records
+//! whether the logical value becomes a residual input, an embedded constant, or a residual variable and remembers the
+//! assigned residual atom. Clones share this slot, so the first materialization establishes one residual identity and
+//! later consumers reuse it. [`PartialEvaluationInput`] describes how each residual input is supplied (i.e., from an
+//! original unknown input, a known value forwarded across the boundary, or other recorded boundary state).
+//! [`PartialEvaluationOutput`] distinguishes outputs already known after the first stage from outputs produced
+//! by the residual program.
+//!
+//! # Context and Tracer
+//!
+//! [`PartialEvaluationContext`] wraps the context in which known work runs and owns the residual [`ProgramBuilder`].
+//! Its bind protocol applies a [`PartiallyEvaluatableOperation`] rule, which may fold an operation when all inputs are
+//! known, residualize it when future data is required, or apply operation-specific splitting logic.
+//!
+//! [`PartialTracer`] is the flowing value exposed to interpreted or traced closures. It contains a
+//! [`PartialEvaluationValue`] while live and propagates poisoning after an error. Known values can participate in
+//! host control flow only when the parent context resolves them as concrete; symbolic or opaque knowns require a
+//! conservative residual rewrite.
+//!
+//! # Effects and Nested Programs
+//!
+//! Effectful operations follow the same placement rule as pure operations: all-known operations run on the known side,
+//! while mixed or unknown work is residualized. Probe-based rewrites of higher-order programs must not speculatively
+//! execute effectful bodies, and residual projections keep explicitly requested effectful atoms alive.
+//!
+//! [`PartiallyEvaluatableProgramOperation`] is the recursive fixed point for operation families containing nested
+//! flat programs. Higher-order operations may split their bodies more precisely than the default, but their replay
+//! and residualization logic stays with the operation that owns those programs.
+//!
+//! # Extending Partial Evaluation
+//!
+//! Implement [`PartiallyEvaluatableOperation`] for primitive operation payloads. The usual rule is to fold when every
+//! input is known and to residualize otherwise, but control flow, loops, scans, and other higher-order operations can
+//! preserve more known work with a dedicated rule. Use the supplied context's materialization and residualization APIs
+//! rather than constructing duplicate boundary atoms manually. Implement [`PartiallyEvaluatableProgramOperation`] on an
+//! operation family that recursively evaluates nested programs. Rules inspecting known payloads must first establish a
+//! concrete [`ValueResolution`] and fall back conservatively otherwise.
+
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
