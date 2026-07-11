@@ -75,6 +75,22 @@ pub enum BufferType {
     /// Unlike IEEE floating-point types, infinities and NaN values are not supported.
     F4E2M1FN,
 
+    /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
+    /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+    /// format with 3 exponent bits and 2 mantissa bits. Only finite values are supported (thus the `FN` suffix).
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported. Note that this type is not
+    /// supported by the PJRT C API yet and so it can only be used in Protobuf-backed APIs (e.g., compiled program
+    /// shapes). It is mapped to the invalid buffer type when passed to PJRT C API functions.
+    F6E3M2FN,
+
+    /// [`BufferType`] that represents 6-bit floating-point values that are represented using a
+    /// [microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf)
+    /// format with 2 exponent bits and 3 mantissa bits. Only finite values are supported (thus the `FN` suffix).
+    /// Unlike IEEE floating-point types, infinity and NaN values are not supported. Note that this type is not
+    /// supported by the PJRT C API yet and so it can only be used in Protobuf-backed APIs (e.g., compiled program
+    /// shapes). It is mapped to the invalid buffer type when passed to PJRT C API functions.
+    F6E2M3FN,
+
     /// [`BufferType`] that represents 8-bit floating-point values that are represented using the format described in
     /// [this paper](https://arxiv.org/abs/2209.05433) with 3 exponent bits and 4 mantissa bits, and with support for
     /// representing infinity and NaN values similar to existing IEEE floating-point types.
@@ -220,6 +236,9 @@ impl BufferType {
             Self::U32 => ffi::PJRT_Buffer_Type_U32,
             Self::U64 => ffi::PJRT_Buffer_Type_U64,
             Self::F4E2M1FN => ffi::PJRT_Buffer_Type_F4E2M1FN,
+            // The PJRT C API does not define constants for the 6-bit floating-point types yet (XLA itself cannot pass
+            // them through the C API layer), and so they map to the invalid type.
+            Self::F6E3M2FN | Self::F6E2M3FN => ffi::PJRT_Buffer_Type_INVALID,
             Self::F8E3M4 => ffi::PJRT_Buffer_Type_F8E3M4,
             Self::F8E4M3 => ffi::PJRT_Buffer_Type_F8E4M3,
             Self::F8E4M3FN => ffi::PJRT_Buffer_Type_F8E4M3FN,
@@ -260,6 +279,8 @@ impl BufferType {
             "u32" => Ok(Self::U32),
             "u64" => Ok(Self::U64),
             "f4e2m1fn" => Ok(Self::F4E2M1FN),
+            "f6e3m2fn" => Ok(Self::F6E3M2FN),
+            "f6e2m3fn" => Ok(Self::F6E2M3FN),
             "f8e3m4" => Ok(Self::F8E3M4),
             "f8e4m3" => Ok(Self::F8E4M3),
             "f8e4m3fn" => Ok(Self::F8E4M3FN),
@@ -299,6 +320,8 @@ impl BufferType {
             crate::protos::BufferType::U32 => Self::U32,
             crate::protos::BufferType::U64 => Self::U64,
             crate::protos::BufferType::F4E2M1FN => Self::F4E2M1FN,
+            crate::protos::BufferType::F6E3M2FN => Self::F6E3M2FN,
+            crate::protos::BufferType::F6E2M3FN => Self::F6E2M3FN,
             crate::protos::BufferType::F8E3M4 => Self::F8E3M4,
             crate::protos::BufferType::F8E4M3 => Self::F8E4M3,
             crate::protos::BufferType::F8E4M3FN => Self::F8E4M3FN,
@@ -338,6 +361,8 @@ impl BufferType {
             Self::U32 => crate::protos::BufferType::U32,
             Self::U64 => crate::protos::BufferType::U64,
             Self::F4E2M1FN => crate::protos::BufferType::F4E2M1FN,
+            Self::F6E3M2FN => crate::protos::BufferType::F6E3M2FN,
+            Self::F6E2M3FN => crate::protos::BufferType::F6E2M3FN,
             Self::F8E3M4 => crate::protos::BufferType::F8E3M4,
             Self::F8E4M3 => crate::protos::BufferType::F8E4M3,
             Self::F8E4M3FN => crate::protos::BufferType::F8E4M3FN,
@@ -369,6 +394,8 @@ impl BufferType {
             | Self::U4
             | Self::U8
             | Self::F4E2M1FN
+            | Self::F6E3M2FN
+            | Self::F6E2M3FN 
             | Self::F8E3M4
             | Self::F8E4M3
             | Self::F8E4M3FN
@@ -376,7 +403,7 @@ impl BufferType {
             | Self::F8E4M3B11FNUZ
             | Self::F8E5M2
             | Self::F8E5M2FNUZ
-            | Self::F8E8M0FNU => size_of::<u8>(),
+            | Self::F8E8M0FNU=> size_of::<u8>(),
             Self::I16 => size_of::<i16>(),
             Self::I32 => size_of::<i32>(),
             Self::I64 => size_of::<i64>(),
@@ -413,6 +440,8 @@ impl Display for BufferType {
             Self::U32 => "u32",
             Self::U64 => "u64",
             Self::F4E2M1FN => "f4e2m1fn",
+            Self::F6E3M2FN => "f6e3m2fn",
+            Self::F6E2M3FN => "f6e2m3fn",
             Self::F8E3M4 => "f8e3m4",
             Self::F8E4M3 => "f8e4m3",
             Self::F8E4M3FN => "f8e4m3fn",
@@ -3699,6 +3728,14 @@ mod tests {
         });
         assert_eq!(unsafe { BufferType::from_c_api(u32::MAX) }, BufferType::Invalid);
 
+        // The 6-bit floating-point types are not representable in the PJRT C API yet, and so they only
+        // round-trip through the Protobuf and string representations.
+        for r#type in [BufferType::F6E3M2FN, BufferType::F6E2M3FN] {
+            assert_eq!(BufferType::from_proto(r#type.proto()), r#type);
+            assert_eq!(BufferType::from_str(r#type.to_string()), Ok(r#type));
+            assert_eq!(unsafe { BufferType::from_c_api(r#type.to_c_api()) }, BufferType::Invalid);
+        }
+
         assert_eq!(BufferType::Token.element_size_in_bytes(), Ok(0));
         assert_eq!(BufferType::Predicate.element_size_in_bytes(), Ok(1));
         assert_eq!(BufferType::I1.element_size_in_bytes(), Ok(1));
@@ -3716,6 +3753,8 @@ mod tests {
         assert_eq!(BufferType::U32.element_size_in_bytes(), Ok(4));
         assert_eq!(BufferType::U64.element_size_in_bytes(), Ok(8));
         assert_eq!(BufferType::F4E2M1FN.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F6E3M2FN.element_size_in_bytes(), Ok(1));
+        assert_eq!(BufferType::F6E2M3FN.element_size_in_bytes(), Ok(1));
         assert_eq!(BufferType::F8E3M4.element_size_in_bytes(), Ok(1));
         assert_eq!(BufferType::F8E4M3.element_size_in_bytes(), Ok(1));
         assert_eq!(BufferType::F8E4M3FN.element_size_in_bytes(), Ok(1));
