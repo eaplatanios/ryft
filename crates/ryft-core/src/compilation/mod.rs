@@ -1,5 +1,3 @@
-// TODO(eaplatanios): Review this module.
-
 //! Contains backend-neutral machinery for _Just-In-Time (JIT) compilation_.
 //!
 //! This module supplies the common JIT lifecycle shared by compiler backends. Core traces typed Ryft programs, manages
@@ -102,10 +100,10 @@
 //! cache below it and is shared by every compilation using the same domain handle. A JIT call checks the dispatch
 //! cache first, then the lowering cache, and finally the trace cache; a hit resumes the lifecycle from the retained
 //! artifact shown above, while a miss produces and inserts that artifact. The shared context then resolves the
-//! domain's [`CompilationDomain::CacheKey`] through these tiers:
+//! domain's [`CompilationCacheDomain::CacheKey`] through these tiers:
 //!
 //! ```text
-//! Compilation Context lookup (keyed by CompilationDomain::CacheKey)
+//! Compilation Context lookup (keyed by CompilationCacheDomain::CacheKey)
 //!          │
 //!          ├── 1. Memory LRU hit ───────────────────────────────▶ shared Compiled Program
 //!          │      stores Arc<CompiledProgram>
@@ -128,21 +126,23 @@
 //!
 //! Same-key misses are single-flight while different keys may compile concurrently. [`DiskCache`] provides optional
 //! checksummed persistent storage, and [`CompilationArtifactExchange`] optionally shares serialized artifacts among
-//! processes according to [`CompilationArtifactExchangePolicy`]. Cache statistics and structured
-//! [`CompilationEvent`]s report activity across tracing, lowering, dispatch, persistence, exchange, compilation, and
-//! execution.
+//! processes according to [`CompilationArtifactExchangePolicy`]. [`JitCacheStatistics`] reports frontend dispatch
+//! activity, while [`CompilationCacheStatistics`] and structured [`CompilationEvent`]s report shared-context
+//! activity across the memory, persistent, exchange, and backend compilation tiers.
 //!
 //! # Extending Compilation
 //!
 //! Implement [`CompilationDomain`] after defining the backend's [`Domain`](crate::contexts::Domain). The required
-//! contract supplies backend-owned lowered and compiled program types, options, an error, a complete compilation key,
-//! lowering, compilation, output signatures, and flat execution. Key equality must mean that compiled artifacts are
-//! interchangeable and must include every compile-relevant program, option, compiler, target, and topology property.
+//! contract supplies backend-owned lowered and compiled program types, options, an error, lowering, compilation,
+//! output signatures, and flat execution. Lowering must fold every compile-relevant option, compiler, target, and
+//! topology property into the lowered artifact, which keeps that artifact self-describing for caching and
+//! persistence.
 //!
-//! Optional hooks support persistent keying and executable codecs, a shared
-//! [`CompilationContext`], broader runtime type compatibility, and safe executable replacement. Implement
-//! [`AnalyzableCompilationDomain`] to expose cost or memory analysis without recompilation, and implement
-//! [`CompiledProgramOperation`] on the operation family when staged functions must compose inside other traces.
+//! Implement [`CompilationCacheDomain`] to opt into the shared [`CompilationContext`]: it derives cache identity
+//! from the lowered program alone, and key equality must mean that compiled artifacts are interchangeable. Optional
+//! hooks add persistent keying and executable codecs. Implement [`AnalyzableCompilationDomain`] to expose cost or
+//! memory analysis without recompilation, and implement [`CompiledProgramOperation`] on the operation family when
+//! staged functions must compose inside other traces.
 //!
 //! # Reading order
 //!
@@ -159,7 +159,6 @@ pub mod contexts;
 pub mod disk_cache;
 pub mod exchange;
 pub mod function;
-pub mod options;
 
 pub use captures::{CaptureReference, CapturingContext, ClosedProgram};
 pub use contexts::{
@@ -174,4 +173,3 @@ pub use function::{
     Specialization, StagedFunction, call_function, jit, jit_with_options, stage_function, try_jit,
     try_jit_with_options, try_jit_with_options_and_capacities, try_jit_with_options_and_capacity,
 };
-pub use options::CompilationOptions;

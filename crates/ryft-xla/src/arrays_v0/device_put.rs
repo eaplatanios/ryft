@@ -40,7 +40,7 @@ impl<'c, T: DenseHostDevicePutLeaf + Parameter> DevicePutLeaf<'c> for T {
         _donate: bool,
         _may_alias: Option<bool>,
     ) -> Result<Array<'c>, ArrayError> {
-        let client = engine.client();
+        let client = engine.client()?;
         let (shape, element_type, bytes) = self.into_dense_host_array();
         let (mesh, sharding) = match device {
             Some(device) => device.resolve(shape.len())?,

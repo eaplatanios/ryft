@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use ryft_core::backends::scalars::Scalar;
+use ryft_core::batching::BatchingError;
 use ryft_core::compilation::function::{CallRequest, CompileRequest, LoweringRequest, StageRequest};
 use ryft_core::compilation::{
     AnalyzableCompilationDomain, CompilationCacheDomain, CompilationContext, CompilationDomain, DiskCache,
@@ -74,6 +75,10 @@ pub enum XlaDomainError {
     /// Error surfaced by reverse-mode differentiation (e.g. a non-scalar gradient output).
     #[error("{0}")]
     Differentiation(#[from] DifferentiationError),
+
+    /// Error surfaced by batching (e.g. an unsupported operation inside a batched `jit_call` boundary).
+    #[error("{0}")]
+    Batching(#[from] BatchingError),
 
     /// Error surfaced when [`compile_with_options`](crate::jit::compile_with_options) is given options
     /// that do not match the traced function's arity or shape — for example a
@@ -273,17 +278,18 @@ impl<'c> XlaDomain<'c> {
         }
     }
 
-    /// Returns the PJRT [`Client`] this domain was constructed with.
+    /// Returns the PJRT [`Client`] this domain was constructed with, or [`Error::MissingClient`] for token and
+    /// clientless domains.
     #[inline]
-    pub fn client(&self) -> &'c Client<'c> {
-        self.client.expect("execution XlaDomain should always carry a client")
+    pub fn client(&self) -> Result<&'c Client<'c>, Error> {
+        self.client.ok_or(Error::MissingClient)
     }
 
-    /// Returns the [`DeviceMesh`] this domain resolves shard placement against. Panics when the domain was
-    /// constructed without a mesh; eager binds derive their mesh from the inputs in that case.
+    /// Returns the [`DeviceMesh`] this domain resolves shard placement against, or [`Error::MissingMesh`] when the
+    /// domain was constructed without a mesh; eager binds derive their mesh from the inputs in that case.
     #[inline]
-    pub fn mesh(&self) -> &DeviceMesh {
-        self.mesh.as_ref().expect("XlaDomain::mesh was called on a domain constructed without a mesh")
+    pub fn mesh(&self) -> Result<&DeviceMesh, Error> {
+        self.mesh.as_ref().ok_or(Error::MissingMesh)
     }
 
     /// Returns the base [`CompilationOptions`] template that the compile path forwards to PJRT.
@@ -512,11 +518,11 @@ impl<'c> CoordinateBasis<Array<'c>> for XlaDomain<'c> {
             .lower_xla_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let cache_key = self
-            .compilation_key(&lowered, &options)
+            .compilation_key(&lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
             .cache
-            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered, &options))
+            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let mut outputs = self
             .execute_xla_program(&compiled, Vec::new())
@@ -629,11 +635,11 @@ impl<'c> XlaDomain<'c> {
             .lower_xla_program(&program, 0, &options)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let cache_key = self
-            .compilation_key(&lowered, &options)
+            .compilation_key(&lowered)
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let compiled = self
             .cache
-            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered, &options))
+            .get_or_compile(self, cache_key, || self.compile_xla_program(&lowered))
             .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         let outputs = self
             .execute_xla_program(&compiled, inputs.to_vec())
@@ -985,11 +991,7 @@ impl XlaFeedbackDirectedProfile {
 
 /// Backend-specific per-call options for the [`CompilationDomain`] implementation on
 /// [`XlaDomain`]. Carries the device mesh, optional sharding overrides for inputs/outputs,
-/// and the donation flags computed at jit time.
-///
-/// `donation_flags` is a flat `Vec<bool>` matching the flat input arity; the core jit pipeline
-/// constructs it from its universal `donate_argnums` field before invoking
-/// [`CompilationDomain::compile`].
+/// and optional per-input donation flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XlaOptions {
     /// Concrete device mesh the compiled program runs against.
@@ -1001,8 +1003,9 @@ pub struct XlaOptions {
     /// Optional override for per-output shardings.
     pub out_shardings: Option<Vec<Sharding>>,
 
-    /// Flat per-input donation flags. Length must match the program's flat input arity.
-    pub donation_flags: Vec<bool>,
+    /// Optional flat per-input donation flags. `None` donates nothing; a present vector must match the program's
+    /// flat public input arity exactly, which lowering validates.
+    pub donation_flags: Option<Vec<bool>>,
 
     /// Optional opaque feedback-directed optimization profile forwarded to XLA.
     pub feedback_directed_profile: Option<XlaFeedbackDirectedProfile>,
@@ -1016,7 +1019,7 @@ impl XlaOptions {
             mesh,
             in_shardings: None,
             out_shardings: None,
-            donation_flags: Vec::new(),
+            donation_flags: None,
             feedback_directed_profile: None,
         }
     }
@@ -1044,14 +1047,14 @@ impl XlaOptions {
     /// Each `true` leaf marks the corresponding input as donatable: the executor may reuse its
     /// device buffer for an output, leaving the caller's runtime value in a donated state after
     /// the call returns. The tree is flattened into [`Self::donation_flags`]; the resulting
-    /// vector length is validated against the function's flat input arity at compile time.
+    /// vector length is validated against the function's flat public input arity at lowering time.
     ///
     /// Typical leaf-shaped inputs lower to a single `bool` (e.g. `with_donate(true)` for a
     /// single-argument closure), while nested tuple / struct inputs accept the matching nested
     /// tuple / struct of `bool`s.
     #[inline]
     pub fn with_donate<P: Parameterized<bool>>(mut self, donate: P) -> Self {
-        self.donation_flags = donate.into_parameters().collect();
+        self.donation_flags = Some(donate.into_parameters().collect());
         self
     }
 
@@ -1784,13 +1787,9 @@ impl<'c> XlaDomain<'c> {
             });
         }
         let inputs = reshard_inputs_if_needed(self, &program.mesh, &program.expected_argument_shardings, inputs)?;
-        let donation_flags = if program.donation_flags.is_empty() {
-            vec![false; inputs.len()]
-        } else {
-            std::iter::repeat_n(false, program.capture_count)
-                .chain(program.donation_flags.iter().copied())
-                .collect::<Vec<_>>()
-        };
+        let donation_flags = std::iter::repeat_n(false, program.capture_count)
+            .chain(program.donation_flags.iter().copied())
+            .collect::<Vec<_>>();
         execute_pjrt(
             self.client,
             &program.executable,
@@ -1852,13 +1851,12 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     where
         Request: CompileRequest<Self>,
     {
-        let key = self.compilation_key(lowered.lowered().lowered_program(), lowered.lowered().options())?;
-        let program = self.cache.get_or_compile(self, key, || {
-            self.compile_xla_program(lowered.lowered().lowered_program(), lowered.lowered().options())
-        })?;
-        let output_types = program.output_types().to_vec();
-        validate_output_types(lowered.lowered().output_types(), &output_types)?;
-        Ok(lowered.into_compiled(program, output_types))
+        self.cache.compile_request(
+            self,
+            lowered,
+            |program| self.compile_xla_program(program),
+            |program| program.output_types().to_vec(),
+        )
     }
 
     fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
@@ -1900,15 +1898,19 @@ impl<'c> XlaDomain<'c> {
             });
         }
         let (capture_types, public_input_types) = input_types.split_at(capture_count);
-        if !options.donation_flags.is_empty() && options.donation_flags.len() != public_input_types.len() {
+        if let Some(donation_flags) = &options.donation_flags
+            && donation_flags.len() != public_input_types.len()
+        {
             return Err(XlaDomainError::InvalidCompilationOptions {
                 reason: format!(
                     "donation_flags has {} entries but the program has {} flat public input(s)",
-                    options.donation_flags.len(),
+                    donation_flags.len(),
                     public_input_types.len(),
                 ),
             });
         }
+        let donation_flags =
+            options.donation_flags.clone().unwrap_or_else(|| vec![false; public_input_types.len()]);
 
         let effective_input_types =
             capture_types.iter().cloned().chain(public_input_types.iter().cloned()).collect::<Vec<_>>();
@@ -1943,18 +1945,14 @@ impl<'c> XlaDomain<'c> {
             stable_hlo: stable_hlo.into(),
             compilation_options,
             output_types: output_types.into(),
-            donation_flags: options.donation_flags.clone().into(),
+            donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
             mesh: options.mesh.clone(),
         })
     }
 
-    fn xla_compilation_key(
-        &self,
-        program: &XlaLoweredProgram,
-        _options: &XlaOptions,
-    ) -> Result<XlaCompilationKey, XlaDomainError> {
+    fn xla_compilation_key(&self, program: &XlaLoweredProgram) -> Result<XlaCompilationKey, XlaDomainError> {
         let (platform_name, platform_version) = match self.client {
             Some(client) => (client.platform_name()?.into_owned(), client.platform_version()?.into_owned()),
             None => (String::new(), String::new()),
@@ -1989,14 +1987,10 @@ impl<'c> XlaDomain<'c> {
         Ok(XlaCompilationKey { canonical_bytes: canonical_bytes.into() })
     }
 
-    pub(crate) fn compile_xla_program(
-        &self,
-        program: &XlaLoweredProgram,
-        _options: &XlaOptions,
-    ) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
+    pub(crate) fn compile_xla_program(&self, program: &XlaLoweredProgram) -> Result<XlaCompiledProgram<'c>, XlaDomainError> {
         let pjrt_program = PjrtProgram::Mlir { bytecode: program.stable_hlo.as_bytes().to_vec() };
         let compilation_start = Instant::now();
-        let executable = self.client().compile(&pjrt_program, &program.compilation_options)?;
+        let executable = self.client()?.compile(&pjrt_program, &program.compilation_options)?;
         let compilation_duration = compilation_start.elapsed();
         Ok(XlaCompiledProgram {
             executable: Arc::new(executable),
@@ -2059,12 +2053,12 @@ impl<'c> XlaDomain<'c> {
                 .map(PersistentShardingV1::from)
                 .collect(),
             mesh: PersistentDeviceMeshV1::from(&program.mesh),
-            device_kinds: ordered_device_kinds(self.client(), &program.mesh)?,
+            device_kinds: ordered_device_kinds(self.client()?, &program.mesh)?,
             replica_count: device_assignment.replica_count() as u64,
             partition_count: device_assignment.computation_count() as u64,
             device_assignment: flatten_device_assignment(&device_assignment)?,
-            platform_name: self.client().platform_name()?.into_owned(),
-            platform_version: self.client().platform_version()?.into_owned(),
+            platform_name: self.client()?.platform_name()?.into_owned(),
+            platform_version: self.client()?.platform_version()?.into_owned(),
             compiler_identity: XLA_COMPILER_IDENTITY.into(),
             xla_flags: std::env::var("XLA_FLAGS").unwrap_or_default(),
             compilation_duration_nanoseconds: program
@@ -2108,8 +2102,8 @@ impl<'c> XlaDomain<'c> {
         {
             return Ok(None);
         }
-        if metadata.platform_name != self.client().platform_name()?.as_ref()
-            || metadata.platform_version != self.client().platform_version()?.as_ref()
+        if metadata.platform_name != self.client()?.platform_name()?.as_ref()
+            || metadata.platform_version != self.client()?.platform_version()?.as_ref()
             || metadata.compiler_identity != XLA_COMPILER_IDENTITY
             || metadata.xla_flags != std::env::var("XLA_FLAGS").unwrap_or_default()
         {
@@ -2117,11 +2111,11 @@ impl<'c> XlaDomain<'c> {
         }
 
         let mesh = DeviceMesh::try_from(metadata.mesh)?;
-        if metadata.device_kinds != ordered_device_kinds(self.client(), &mesh)? {
+        if metadata.device_kinds != ordered_device_kinds(self.client()?, &mesh)? {
             return Ok(None);
         }
         let live_devices =
-            self.client().devices()?.into_iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
+            self.client()?.devices()?.into_iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
         if mesh.devices().iter().any(|device| !live_devices.contains(device)) {
             return Ok(None);
         }
@@ -2155,9 +2149,16 @@ impl<'c> XlaDomain<'c> {
         {
             return Err(persistent_error("capture or donation metadata has an invalid arity"));
         }
+        // Entries persisted before donation flags were materialized at lowering time encode "no donation" as an
+        // empty vector; materialize them so execution can rely on full-length public flags.
+        let donation_flags = if metadata.donation_flags.is_empty() {
+            vec![false; expected_argument_shardings.len() - capture_count]
+        } else {
+            metadata.donation_flags
+        };
         let compilation_options = CompilationOptions::decode(metadata.compilation_options.as_slice())
             .map_err(|error| persistent_error(format!("failed to decode compilation options: {error}")))?;
-        let executable = self.client().deserialize_and_load_executable(
+        let executable = self.client()?.deserialize_and_load_executable(
             &bytes[metadata_end..],
             Some(&compilation_options),
             &LoadOptions::default(),
@@ -2173,7 +2174,7 @@ impl<'c> XlaDomain<'c> {
         Ok(Some(XlaCompiledProgram {
             executable: Arc::new(executable),
             output_types: output_types.into(),
-            donation_flags: metadata.donation_flags.into(),
+            donation_flags: donation_flags.into(),
             capture_count,
             expected_argument_shardings: expected_argument_shardings.into(),
             mesh,
@@ -2188,12 +2189,8 @@ impl<'c> CompilationCacheDomain for XlaDomain<'c> {
     type CacheKey = XlaCompilationKey;
 
     #[inline]
-    fn compilation_key(
-        &self,
-        program: &Self::LoweredProgram,
-        options: &Self::Options,
-    ) -> Result<Self::CacheKey, Self::Error> {
-        self.xla_compilation_key(program, options)
+    fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error> {
+        self.xla_compilation_key(program)
     }
 
     #[inline]
@@ -2282,7 +2279,7 @@ fn validate_output_types(declared: &[ArrayType], actual: &[ArrayType]) -> Result
     Ok(())
 }
 
-fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), XlaDomainError> {
+pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), XlaDomainError> {
     if declared.len() != outputs.len() {
         return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
     }
@@ -2407,8 +2404,7 @@ fn apply_signature_shardings(
     Ok(types)
 }
 
-/// Overlays SPMD partitioning fields on the base [`CompilationOptions`] template. Mirrors
-/// `crate::jit::jit_compilation_options`.
+/// Overlays SPMD partitioning fields on the base [`CompilationOptions`] template.
 fn jit_compilation_options(
     base: &CompilationOptions,
     partition_count: usize,
@@ -2828,14 +2824,13 @@ mod tests {
         let mesh = cpu_domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
 
-        assert_eq!(domain.mesh(), &mesh);
+        assert_eq!(domain.mesh().unwrap(), &mesh);
         assert_eq!(domain.compilation_options(), &CompilationOptions::default());
     }
 
     #[test]
     fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
         use crate::tests::{values_from_bytes, values_to_bytes};
-        use ryft_core::compilation::CompilationOptions as CoreCompilationOptions;
         use ryft_core::operations::math::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -2846,7 +2841,7 @@ mod tests {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
-        let options = CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()));
+        let options = XlaOptions::new(mesh.clone());
         let staged = stage_function(&engine, |x| x.sin().unwrap(), input_type.clone(), options).unwrap();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             engine.compile(engine.lower(staged).unwrap()).unwrap();
@@ -2885,7 +2880,7 @@ mod tests {
                 &engine,
                 |x| x.sin().unwrap(),
                 input_type.clone(),
-                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
+                XlaOptions::new(mesh.clone()),
             )
             .unwrap();
             let _: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
@@ -2900,7 +2895,6 @@ mod tests {
 
     #[test]
     fn test_xla_compilation_key_is_canonical_and_stable() {
-        use ryft_core::compilation::CompilationOptions as CoreCompilationOptions;
         use ryft_core::operations::math::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
@@ -2914,14 +2908,14 @@ mod tests {
             &domain,
             |x| x.sin().unwrap(),
             input_type,
-            CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
+            XlaOptions::new(mesh),
         )
         .unwrap();
         let compiled: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
             domain.compile(domain.lower(staged).unwrap()).unwrap();
-        let key = domain.compilation_key(compiled.lowered().lowered_program(), compiled.lowered().options()).unwrap();
+        let key = domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
         let repeated =
-            domain.compilation_key(compiled.lowered().lowered_program(), compiled.lowered().options()).unwrap();
+            domain.compilation_key(compiled.lowered().lowered_program()).unwrap();
 
         assert_eq!(key, repeated);
         assert_eq!(domain.persistent_cache_key(&key), Some(key.canonical_bytes.to_vec()));
@@ -2935,7 +2929,7 @@ mod tests {
 
     #[test]
     fn test_xla_persistent_executable_round_trip_preserves_invocation_and_analysis() {
-        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, StagedFunction};
+        use ryft_core::compilation::StagedFunction;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2963,7 +2957,7 @@ mod tests {
                 add_capture,
                 vec![capture.clone()],
                 input_type.clone(),
-                CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone()).with_donate(true)),
+                XlaOptions::new(mesh.clone()).with_donate(true),
             ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
@@ -3010,7 +3004,7 @@ mod tests {
 
     #[test]
     fn test_xla_disk_cache_restores_into_a_fresh_compilation_context() {
-        use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, DiskCache};
+        use ryft_core::compilation::DiskCache;
         use ryft_core::operations::math::Sin;
         use tempfile::tempdir;
 
@@ -3030,7 +3024,7 @@ mod tests {
             &first_domain,
             |x| x.sin().unwrap(),
             input_type.clone(),
-            CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh.clone())),
+            XlaOptions::new(mesh.clone()),
         )
         .unwrap();
         let first: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =
@@ -3047,7 +3041,7 @@ mod tests {
             &second_domain,
             |x| x.sin().unwrap(),
             input_type,
-            CoreCompilationOptions::<XlaDomain<'_>>::new(XlaOptions::new(mesh)),
+            XlaOptions::new(mesh),
         )
         .unwrap();
         let _restored: ryft_core::compilation::CompiledFunction<XlaDomain<'_>, ArrayType, ArrayType> =

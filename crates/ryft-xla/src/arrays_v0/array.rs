@@ -89,7 +89,7 @@ impl<'o> Array<'o> {
         target_sharding: Sharding,
         donate: bool,
     ) -> Result<Self, ArrayError> {
-        let client = engine.client();
+        let client = engine.client()?;
         check_sharding!(&target_mesh, &target_sharding);
 
         let global_shape = self.shape();

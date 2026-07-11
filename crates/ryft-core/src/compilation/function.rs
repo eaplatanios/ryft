@@ -22,7 +22,6 @@ use crate::types::Typed;
 
 use super::captures::{CaptureReference, ClosedProgram};
 use super::contexts::CompilationDomain;
-use super::options::CompilationOptions;
 
 /// Flat source-program representation stored by nested compiled-call operations.
 pub type FlatCompilationProgram<D> = Program<
@@ -47,7 +46,7 @@ pub struct CompilationStagingRequest<D: CompilationDomain, F, Input, Output> {
     input_types: Input,
 
     /// Options fixed before tracing begins.
-    options: CompilationOptions<D>,
+    options: D::Options,
 
     /// Staged output signature marker.
     output: PhantomData<fn() -> Output>,
@@ -56,7 +55,7 @@ pub struct CompilationStagingRequest<D: CompilationDomain, F, Input, Output> {
 impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Input, Output> {
     /// Creates a complete staging request.
     #[inline]
-    pub fn new(function: F, captures: Vec<D::Value>, input_types: Input, options: CompilationOptions<D>) -> Self {
+    pub fn new(function: F, captures: Vec<D::Value>, input_types: Input, options: D::Options) -> Self {
         Self { function, captures, input_types, options, output: PhantomData }
     }
 }
@@ -224,7 +223,7 @@ where
 
     #[inline]
     fn options(&self) -> &D::Options {
-        self.options.options()
+        &self.options
     }
 
     fn replace_input_types(&mut self, input_types: Vec<D::Type>) -> Result<(), D::Error> {
@@ -245,7 +244,7 @@ where
             self.function,
             self.captures,
             self.input_types,
-            self.options.into_options(),
+            self.options,
             normalize_output_types,
         )
     }
@@ -813,6 +812,51 @@ impl<D: CompilationDomain, Input: Parameterized<D::Type>, Output: Parameterized<
     pub fn output_structure(&self) -> &Output::ParameterStructure {
         &self.state.output_structure
     }
+
+    /// Validates that `inputs` matches the declared flat public input arity, excluding hidden captures.
+    pub fn validate_flat_input_count(&self, inputs: &[D::Value]) -> Result<(), ProgramError> {
+        if inputs.len() != self.state.input_types.len() {
+            return Err(ProgramError::InvalidInputCount {
+                expected: self.state.input_types.len(),
+                actual: inputs.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates that `outputs` matches the declared flat output arity.
+    pub fn validate_flat_output_count(&self, outputs: &[D::Value]) -> Result<(), ProgramError> {
+        if outputs.len() != self.state.output_types.len() {
+            return Err(ProgramError::InvalidOutputCount {
+                expected: self.state.output_types.len(),
+                actual: outputs.len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Prepends the retained runtime captures to the flat public `inputs`, producing the complete flat argument
+    /// list in the `[captures..., public inputs...]` order every execution expects.
+    pub fn arguments_with_captures(&self, inputs: Vec<D::Value>) -> Vec<D::Value> {
+        let mut arguments = self.state.captures.to_vec();
+        arguments.extend(inputs);
+        arguments
+    }
+}
+
+impl<D, Input, Output> ExecutableProgram<D, Input, Output>
+where
+    D: CompilationDomain,
+    Input: Parameterized<D::Type>,
+    Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Value>>,
+    Output::To<D::Value>:
+        Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
+{
+    /// Reconstructs structured runtime outputs from the executable's flat `outputs` using the retained output
+    /// parameter structure.
+    pub fn reconstruct_outputs(&self, outputs: Vec<D::Value>) -> Result<Output::To<D::Value>, ProgramError> {
+        Output::To::<D::Value>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
+    }
 }
 
 impl<D, Input, Output> CallRequest<D> for CompilationCall<D, Input, Output>
@@ -837,17 +881,14 @@ where
     }
 
     fn into_arguments(self) -> Vec<D::Value> {
-        let mut arguments = self.executable.captures().to_vec();
-        arguments.extend(self.inputs);
-        arguments
+        self.executable.arguments_with_captures(self.inputs)
     }
 
     fn reconstruct(
         executable: &ExecutableProgram<D, Input, Output>,
         outputs: Vec<D::Value>,
     ) -> Result<Self::RuntimeOutput, D::Error> {
-        Output::To::<D::Value>::from_parameters(executable.output_structure().clone(), outputs)
-            .map_err(|error| D::Error::from(error.into()))
+        executable.reconstruct_outputs(outputs).map_err(D::Error::from)
     }
 }
 
@@ -1217,7 +1258,7 @@ where
                     |_, _, traced_inputs| (self.state.function)(static_parameters, traced_inputs),
                     Vec::new(),
                     input_types,
-                    CompilationOptions::new(self.state.options.clone()),
+                    self.state.options.clone(),
                 )) {
                     Ok(staged) => {
                         let duration = tracing_start.elapsed();
@@ -1264,7 +1305,7 @@ where
 pub fn try_jit_with_options_and_capacity<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
-    options: CompilationOptions<D>,
+    options: D::Options,
     capacity: usize,
 ) -> JittedFunction<D, F, Static, Input, Output>
 where
@@ -1281,7 +1322,7 @@ where
 pub fn try_jit_with_options_and_capacities<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
-    options: CompilationOptions<D>,
+    options: D::Options,
     capacities: JitCacheCapacities,
 ) -> JittedFunction<D, F, Static, Input, Output>
 where
@@ -1291,7 +1332,7 @@ where
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 {
-    JittedFunction::new(domain, function, options.into_options(), capacities)
+    JittedFunction::new(domain, function, options, capacities)
 }
 
 /// Constructs a retained dispatcher for a fallible closure using explicit options.
@@ -1299,7 +1340,7 @@ where
 pub fn try_jit_with_options<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
-    options: CompilationOptions<D>,
+    options: D::Options,
 ) -> JittedFunction<D, F, Static, Input, Output>
 where
     D: CompilationDomain<Constant = CaptureReference<<D as Domain>::Type>>,
@@ -1321,14 +1362,14 @@ where
     Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
     Output: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant>>,
 {
-    try_jit_with_options(domain, function, CompilationOptions::default())
+    try_jit_with_options(domain, function, D::Options::default())
 }
 
 /// Constructs a retained dispatcher for an infallible closure using explicit options.
 pub fn jit_with_options<D, F, Static, Input, Output>(
     domain: &D,
     function: F,
-    options: CompilationOptions<D>,
+    options: D::Options,
 ) -> JittedFunction<
     D,
     impl Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
@@ -1369,7 +1410,7 @@ where
     Output:
         Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>,
 {
-    jit_with_options(domain, function, CompilationOptions::default())
+    jit_with_options(domain, function, D::Options::default())
 }
 
 /// Stages an infallible capture-free function through `domain`.
@@ -1377,7 +1418,7 @@ pub fn stage_function<D, F, Input, Output>(
     domain: &D,
     function: F,
     input_types: Input,
-    options: CompilationOptions<D>,
+    options: D::Options,
 ) -> Result<StagedFunction<D, Input, Output>, D::Error>
 where
     D: CompilationDomain<Operation: Clone>,
@@ -1517,6 +1558,7 @@ mod tests {
         program: FlatCompilationProgram<TestDomain>,
         capture_count: usize,
         output_types: Vec<DataType>,
+        options: TestOptions,
     }
 
     struct TestCompiledProgram {
@@ -1604,11 +1646,13 @@ mod tests {
                 }
             }
             let capture_count = staged.staged().source_program().captures().len();
+            let options = staged.staged().options().clone();
             Ok(staged.into_lowered(
                 TestLoweredProgram {
                     program: program.as_ref().clone(),
                     capture_count,
                     output_types: output_types.clone(),
+                    options,
                 },
                 output_types,
             ))
@@ -1621,29 +1665,19 @@ mod tests {
         where
             Request: CompileRequest<Self>,
         {
-            let key = self.compilation_key(lowered.lowered().lowered_program(), lowered.lowered().options())?;
-            let program = self.cache.get_or_compile(self, key, || {
-                self.compilations.fetch_add(1, Ordering::Relaxed);
-                let mut output_types = lowered.lowered().lowered_program().output_types.clone();
-                if let Some(output_type) = &lowered.lowered().options().compiled_output_type {
-                    output_types.fill(output_type.clone());
-                }
-                Ok(TestCompiledProgram { program: lowered.lowered().lowered_program().program.clone(), output_types })
-            })?;
-            if program.output_types.len() != lowered.lowered().output_types().len() {
-                return Err(ProgramError::InvalidOutputCount {
-                    expected: lowered.lowered().output_types().len(),
-                    actual: program.output_types.len(),
-                });
-            }
-            for (declared, actual) in lowered.lowered().output_types().iter().zip(&program.output_types) {
-                if !declared.is_refined_by(actual) {
-                    return Err(ProgramError::InvalidArgument {
-                        message: format!("output type {actual} does not refine declared type {declared}"),
-                    });
-                }
-            }
-            Ok(lowered.into_compiled(program.clone(), program.output_types.clone()))
+            self.cache.compile_request(
+                self,
+                lowered,
+                |program| {
+                    self.compilations.fetch_add(1, Ordering::Relaxed);
+                    let mut output_types = program.output_types.clone();
+                    if let Some(output_type) = &program.options.compiled_output_type {
+                        output_types.fill(output_type.clone());
+                    }
+                    Ok(TestCompiledProgram { program: program.program.clone(), output_types })
+                },
+                |program| program.output_types.clone(),
+            )
         }
 
         fn call<Request>(&self, request: Request) -> Result<Request::RuntimeOutput, Self::Error>
@@ -1688,17 +1722,13 @@ mod tests {
     impl CompilationCacheDomain for TestDomain {
         type CacheKey = Vec<String>;
 
-        fn compilation_key(
-            &self,
-            program: &TestLoweredProgram,
-            options: &TestOptions,
-        ) -> Result<Vec<String>, ProgramError> {
+        fn compilation_key(&self, program: &TestLoweredProgram) -> Result<Vec<String>, ProgramError> {
             let mut key = vec![
                 format!("captures:{}", program.capture_count),
                 format!("atoms:{:?}", program.program.atoms()),
                 format!("inputs:{:?}", program.program.input_ids()),
                 format!("outputs:{:?}", program.program.output_ids()),
-                format!("options:{options:?}"),
+                format!("options:{:?}", program.options),
             ];
             key.extend(program.program.instructions().iter().map(|instruction| {
                 format!("{}:{:?}:{:?}", instruction.operation().name(), instruction.inputs(), instruction.outputs(),)
@@ -1715,7 +1745,7 @@ mod tests {
             domain,
             |input| if negate { input.unary(NegateOperation) } else { input },
             DataType::F64,
-            CompilationOptions::new(TestOptions::default()),
+            TestOptions::default(),
         )
         .unwrap();
         domain.compile(domain.lower(staged).unwrap()).unwrap()
@@ -1743,7 +1773,7 @@ mod tests {
             &domain,
             |input: CompilationTracer<TestDomain>| input.unary(NegateOperation),
             DataType::F64,
-            CompilationOptions::default(),
+            TestOptions::default(),
         )
         .unwrap();
         let staged_clone = staged.clone();
@@ -1762,13 +1792,8 @@ mod tests {
     fn test_staging_options_apply_before_tracing() {
         let domain = TestDomain::new();
         let options = TestOptions { staged_input_type: Some(DataType::I64), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, DataType, DataType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            DataType::F64,
-            CompilationOptions::new(options),
-        )
-        .unwrap();
+        let staged: StagedFunction<TestDomain, DataType, DataType> =
+            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, DataType::F64, options).unwrap();
 
         assert_eq!(staged.input_types(), &[DataType::I64]);
         assert_eq!(staged.output_types(), &[DataType::I64]);
@@ -1795,7 +1820,7 @@ mod tests {
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
                 vec![Scalar::from(7.0)],
                 (),
-                CompilationOptions::default(),
+                TestOptions::default(),
             ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
@@ -1812,7 +1837,7 @@ mod tests {
                 |_, mut captures: Vec<CompilationTracer<TestDomain>>, ()| Ok(captures.remove(0)),
                 vec![Scalar::from(7.0)],
                 (),
-                CompilationOptions::default(),
+                TestOptions::default(),
             ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
@@ -1852,7 +1877,7 @@ mod tests {
                 |_, _, _| Err(ProgramError::InvalidArgument { message: "staging failed".into() }),
                 Vec::new(),
                 DataType::F64,
-                CompilationOptions::default(),
+                TestOptions::default(),
             ));
 
         assert!(matches!(result, Err(ProgramError::InvalidArgument { message }) if message == "staging failed"));
@@ -1866,7 +1891,7 @@ mod tests {
                 |_, _, input: CompilationTracer<TestDomain>| Ok(input),
                 vec![Scalar::from(7.0)],
                 DataType::F64,
-                CompilationOptions::default(),
+                TestOptions::default(),
             ))
             .unwrap();
 
@@ -1878,13 +1903,8 @@ mod tests {
         let domain = TestDomain::new();
         let options = TestOptions { lowered_output_type: Some(DataType::I64), ..TestOptions::default() };
 
-        let staged: StagedFunction<TestDomain, DataType, DataType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            DataType::F64,
-            CompilationOptions::new(options),
-        )
-        .unwrap();
+        let staged: StagedFunction<TestDomain, DataType, DataType> =
+            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, DataType::F64, options).unwrap();
         assert!(matches!(
             domain.lower(staged),
             Err(ProgramError::InvalidArgument { message })
@@ -1896,13 +1916,8 @@ mod tests {
     fn test_compile_rejects_incompatible_output_type() {
         let domain = TestDomain::new();
         let options = TestOptions { compiled_output_type: Some(DataType::I64), ..TestOptions::default() };
-        let staged: StagedFunction<TestDomain, DataType, DataType> = stage_function(
-            &domain,
-            |input: CompilationTracer<TestDomain>| input,
-            DataType::F64,
-            CompilationOptions::new(options),
-        )
-        .unwrap();
+        let staged: StagedFunction<TestDomain, DataType, DataType> =
+            stage_function(&domain, |input: CompilationTracer<TestDomain>| input, DataType::F64, options).unwrap();
         let lowered = domain.lower(staged).unwrap();
 
         assert!(matches!(
@@ -1939,11 +1954,8 @@ mod tests {
     fn test_jitted_function_applies_staging_options_before_tracing() {
         let domain = TestDomain::new();
         let options = TestOptions { staged_input_type: Some(DataType::I64), ..TestOptions::default() };
-        let function: JittedFunction<TestDomain, _, (), DataType, DataType> = jit_with_options(
-            &domain,
-            |(), input: CompilationTracer<TestDomain>| input,
-            CompilationOptions::new(options),
-        );
+        let function: JittedFunction<TestDomain, _, (), DataType, DataType> =
+            jit_with_options(&domain, |(), input: CompilationTracer<TestDomain>| input, options);
 
         assert!(matches!(
             function.call((), Scalar::from(2.0)),
@@ -2042,7 +2054,7 @@ mod tests {
             |negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegateOperation) } else { input })
             },
-            CompilationOptions::default(),
+            TestOptions::default(),
             1,
         );
 
@@ -2064,7 +2076,7 @@ mod tests {
             |negate, input: CompilationTracer<TestDomain>| {
                 Ok(if negate { input.unary(NegateOperation) } else { input })
             },
-            CompilationOptions::default(),
+            TestOptions::default(),
             JitCacheCapacities { traces: 2, lowerings: 2, dispatches: 1 },
         );
 

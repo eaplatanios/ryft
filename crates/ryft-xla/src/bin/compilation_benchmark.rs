@@ -6,7 +6,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ryft_core::compilation::{
-    CompilationDomain, CompilationOptions, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction,
+    CompilationDomain, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction,
     stage_function,
 };
 use ryft_core::operations::math::Sin;
@@ -178,7 +178,7 @@ fn stage_workload<'c>(
         domain,
         |input| (input.clone() * input.clone() + input).sin().unwrap(),
         r#type,
-        CompilationOptions::new(XlaOptions::new(mesh.clone())),
+        XlaOptions::new(mesh.clone()),
     )?)
 }
 

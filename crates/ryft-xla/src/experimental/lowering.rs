@@ -8,13 +8,22 @@ use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOperation};
 use ryft_core::operations::control_flow::{ConditionOperation, ScanOperation, WhileOperation};
-use ryft_core::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
+use ryft_core::operations::math::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use ryft_core::operations::manipulation::{
     BroadcastOperation, GatherOperation, GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation,
     ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
-use ryft_core::operations::math::{AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
-use ryft_core::operations::math::{Atan2Operation, CosOperation, SinOperation};
+use ryft_core::operations::math::{
+    AbsOperation,
+    AddOperation,
+    Atan2Operation,
+    CosOperation,
+    DivOperation,
+    MulOperation,
+    NegOperation,
+    SinOperation,
+    SubOperation,
+};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};

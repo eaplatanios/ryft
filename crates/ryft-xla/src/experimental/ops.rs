@@ -26,15 +26,24 @@ use ryft_core::operations::control_flow::{
     WhilePredicate,
 };
 use ryft_core::operations::differentiation::StopGradientOperation;
-use ryft_core::operations::exponential::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
+use ryft_core::operations::math::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::{
     Broadcast, BroadcastOperation, ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
     GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
-use ryft_core::operations::math::{AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
-use ryft_core::operations::math::{Atan2Operation, CosOperation, SinOperation};
+use ryft_core::operations::math::{
+    AbsOperation,
+    AddOperation,
+    Atan2Operation,
+    CosOperation,
+    DivOperation,
+    MulOperation,
+    NegOperation,
+    SinOperation,
+    SubOperation,
+};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
 use ryft_core::partial::{

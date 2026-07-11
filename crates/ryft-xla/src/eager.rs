@@ -572,7 +572,7 @@ mod tests {
         // Arrays with an attached client recover a client-backed domain.
         let array = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let domain = array.execution_domain();
-        assert!(std::ptr::eq(domain.client(), &client));
+        assert!(std::ptr::eq(domain.client().unwrap(), &client));
 
         // Arrays constructed without a client recover a clientless domain whose eager binds error clearly, which
         // also surfaces through the fallible value capabilities.

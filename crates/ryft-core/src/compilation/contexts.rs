@@ -16,6 +16,7 @@ use crate::compilation::exchange::{
 use crate::contexts::Domain;
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
+use crate::types::Type;
 
 use super::captures::CaptureReference;
 use super::function::{
@@ -63,6 +64,10 @@ pub trait CompilationDomain: Domain<Constant = CaptureReference<<Self as Domain>
         Request: StageRequest<Self>;
 
     /// Performs the complete backend-specific lowering transition.
+    ///
+    /// The returned lowered artifact must be self-describing: every compile-relevant option, compiler, target, and
+    /// topology property must be folded into [`Self::LoweredProgram`] during this transition, because caching
+    /// backends derive compiled-program identity from the lowered program alone.
     fn lower<Request>(
         &self,
         staged: Request,
@@ -88,16 +93,16 @@ pub trait CompilationDomain: Domain<Constant = CaptureReference<<Self as Domain>
 }
 
 /// Optional capability for caching backend-compiled programs.
+///
+/// Cache identity is derived from the lowered program alone: [`CompilationDomain::lower`] folds every
+/// compile-relevant option, compiler, target, and topology property into
+/// [`CompilationDomain::LoweredProgram`], so key equality always means that compiled programs are interchangeable.
 pub trait CompilationCacheDomain: CompilationDomain {
     /// Exact structural cache key for interchangeable compiled programs.
     type CacheKey: Clone + Eq + Hash + Send + Sync + 'static;
 
-    /// Constructs the exact cache key for `program` and `options`.
-    fn compilation_key(
-        &self,
-        program: &Self::LoweredProgram,
-        options: &Self::Options,
-    ) -> Result<Self::CacheKey, Self::Error>;
+    /// Constructs the exact cache key for `program`.
+    fn compilation_key(&self, program: &Self::LoweredProgram) -> Result<Self::CacheKey, Self::Error>;
 
     /// Returns stable canonical bytes for persistent cache identity, or `None` when this domain does not support
     /// persistent executable caching.
@@ -148,31 +153,23 @@ const DEFAULT_CACHE_CAPACITY: usize = 8192;
 /// Default number of structured compilation events retained for diagnostics.
 const DEFAULT_EVENT_CAPACITY: usize = 0;
 
-/// Lifecycle or cache tier that produced a [`CompilationEvent`].
+/// Cache tier or lifecycle stage that produced a [`CompilationEvent`].
+///
+/// Events are emitted only by [`CompilationContext`], so the variants cover exactly the tiers that the shared
+/// compiled-program cache coordinates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CompilationCacheLevel {
-    /// Flattening runtime inputs and deriving abstract input types.
-    InputAbstractification,
-    /// Retained-function dispatch lookup.
-    Dispatch,
-    /// Rust closure tracing.
-    Trace,
-    /// Backend lowering.
-    Lowering,
     /// Process-local compiled-program memory cache.
     Memory,
+
     /// Persistent serialized-program cache.
     Persistent,
+
     /// Distributed serialized-program exchange.
     Exchange,
+
     /// Backend executable compilation.
     Backend,
-    /// Runtime enqueue.
-    Enqueue,
-    /// Synchronized runtime completion.
-    Execution,
-    /// Runtime profiling or profile-guided recompilation.
-    Profiling,
 }
 
 /// Outcome of one compilation lifecycle or cache operation.
@@ -197,30 +194,25 @@ pub enum CompilationCacheOutcome {
 pub enum CompilationMissReason {
     /// No entry existed for the requested key.
     NotFound,
-    /// The runtime parameter tree differs from retained specializations.
-    InputStructure,
-    /// One or more dynamic abstract input types differ from retained specializations.
-    InputType,
-    /// The explicit host-side static parameter differs from retained specializations.
-    StaticParameter,
-    /// Compilation or lowering options differ from retained entries.
-    Options,
-    /// Backend platform, device, mesh, or topology state differs from retained entries.
-    Topology,
-    /// Profile data or profile policy differs from retained entries.
-    Profile,
+
     /// The domain or configured service does not support the requested cache tier.
     Unsupported,
+
     /// A stored artifact was incompatible with the current domain or runtime.
     Incompatible,
+
     /// The configured deadline elapsed.
     TimedOut,
+
     /// Reading or receiving an artifact failed.
     ReadFailed,
+
     /// Backend deserialization failed.
     DeserializationFailed,
+
     /// Serializing or writing an artifact failed.
     WriteFailed,
+
     /// The backend producer failed.
     ProducerFailed,
 }
@@ -393,7 +385,7 @@ impl<P> InFlightCompilation<P> {
 /// Construct one [`CompilationContext`] per backend handle at program start and reuse it across
 /// compilation requests and any backend-specific helpers that look up entries in the cache.
 ///
-/// The cache is keyed by the domain's structurally-typed [`CompilationDomain::CacheKey`] — `Eq` on the key
+/// The cache is keyed by the domain's structurally-typed [`CompilationCacheDomain::CacheKey`] — `Eq` on the key
 /// guarantees no silent collisions, in contrast to a hash-only cache. On cache hit the cached program is returned
 /// without invoking the producer closure. On miss the producer runs and the result is inserted.
 ///
@@ -402,10 +394,10 @@ impl<P> InFlightCompilation<P> {
 ///
 /// An optional [`DiskCache`] second-tier is configured via [`CompilationContext::with_disk_cache`]. When present, the
 /// disk tier is consulted between the in-memory tier and the producer closure. The cache uses
-/// [`CompilationDomain::serialize_program`] and [`CompilationDomain::deserialize_program`] to round-trip programs; any
+/// [`CompilationCacheDomain::serialize_program`] and [`CompilationCacheDomain::deserialize_program`] to round-trip programs; any
 /// error from either method is treated as a cache miss for that entry.
 pub struct CompilationContext<D: CompilationCacheDomain> {
-    /// In-memory LRU keyed by the domain's structural [`CompilationDomain::CacheKey`].
+    /// In-memory LRU keyed by the domain's structural [`CompilationCacheDomain::CacheKey`].
     programs: Mutex<LruCache<D::CacheKey, Arc<D::CompiledProgram>>>,
 
     /// Per-key producer coordination. Entries exist only while a cache miss is being restored or
@@ -524,7 +516,7 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
     /// Attaches a distributed compiled-artifact exchange using `policy`.
     ///
     /// The exchange is used only when the domain supplies stable bytes through
-    /// [`CompilationDomain::persistent_cache_key`] and can serialize and deserialize compiled programs. Process zero
+    /// [`CompilationCacheDomain::persistent_cache_key`] and can serialize and deserialize compiled programs. Process zero
     /// compiles and publishes; follower processes receive and restore. A single-process exchange is ignored.
     pub fn with_artifact_exchange(
         mut self,
@@ -615,6 +607,52 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
         self.recent_events.lock().expect("compilation event mutex should not be poisoned").clear();
     }
 
+    /// Performs the complete cached compile transition for `request`.
+    ///
+    /// This owns the orchestration shared by caching backends: it derives the exact structural key through
+    /// [`CompilationCacheDomain::compilation_key`], resolves the shared cache tiers through
+    /// [`Self::get_or_compile`] with `produce` as the backend producer, validates that the compiled output types
+    /// refine the lowered declaration, and assembles the compiled artifact. Backends that need a different policy
+    /// can keep calling [`Self::get_or_compile`] directly.
+    ///
+    /// # Parameters
+    ///
+    ///   - `domain`: Compilation domain performing the transition.
+    ///   - `request`: Lowered artifact consumed by the transition.
+    ///   - `produce`: Backend compilation of the lowered program, invoked only when every cache tier misses.
+    ///   - `output_types`: Effective flat output types of a compiled program.
+    pub fn compile_request<Request, Produce, OutputTypes>(
+        &self,
+        domain: &D,
+        request: Request,
+        produce: Produce,
+        output_types: OutputTypes,
+    ) -> Result<CompiledFunction<D, Request::Input, Request::Output>, D::Error>
+    where
+        Request: CompileRequest<D>,
+        Produce: FnOnce(&D::LoweredProgram) -> Result<D::CompiledProgram, D::Error>,
+        OutputTypes: FnOnce(&D::CompiledProgram) -> Vec<D::Type>,
+    {
+        let cache_key = domain.compilation_key(request.lowered().lowered_program())?;
+        let program = self.get_or_compile(domain, cache_key, || produce(request.lowered().lowered_program()))?;
+        let compiled_output_types = output_types(program.as_ref());
+        let declared_output_types = request.lowered().output_types();
+        if compiled_output_types.len() != declared_output_types.len() {
+            return Err(D::Error::from(ProgramError::InvalidOutputCount {
+                expected: declared_output_types.len(),
+                actual: compiled_output_types.len(),
+            }));
+        }
+        for (declared, actual) in declared_output_types.iter().zip(&compiled_output_types) {
+            if !declared.is_refined_by(actual) {
+                return Err(D::Error::from(ProgramError::InvalidArgument {
+                    message: format!("output type {actual} does not refine declared type {declared}"),
+                }));
+            }
+        }
+        Ok(request.into_compiled(program, compiled_output_types))
+    }
+
     /// Returns a shared cached program for `cache_key`, restoring or producing it when absent.
     ///
     /// On cache hit, the entry is moved to the most-recently-used position. On miss, the new
@@ -625,7 +663,7 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
     /// error is returned only to that caller; waiters retry through a new producer election.
     ///
     /// Persistent caching is consulted only when both a [`DiskCache`] is attached and
-    /// [`CompilationDomain::persistent_cache_key`] returns stable key bytes. Persistent I/O or
+    /// [`CompilationCacheDomain::persistent_cache_key`] returns stable key bytes. Persistent I/O or
     /// codec failures are counted and degraded to misses.
     pub fn get_or_compile<F: FnOnce() -> Result<D::CompiledProgram, D::Error>>(
         &self,
@@ -644,14 +682,13 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
                 .map(Arc::clone)
             {
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
-                let duration = lookup_start.elapsed();
-                Self::add_duration(&self.statistics.memory_lookup_duration_ns, duration);
-                self.record_event(CompilationEvent {
-                    level: CompilationCacheLevel::Memory,
-                    outcome: CompilationCacheOutcome::Hit,
-                    duration,
-                    miss_reason: None,
-                });
+                self.record_tier(
+                    CompilationCacheLevel::Memory,
+                    CompilationCacheOutcome::Hit,
+                    None,
+                    lookup_start.elapsed(),
+                    &self.statistics.memory_lookup_duration_ns,
+                );
                 return Ok(program);
             }
 
@@ -671,14 +708,13 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
                 self.statistics.waits.fetch_add(1, Ordering::Relaxed);
                 let wait_start = Instant::now();
                 if let Some(program) = in_flight.wait() {
-                    let duration = wait_start.elapsed();
-                    Self::add_duration(&self.statistics.memory_lookup_duration_ns, duration);
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Memory,
-                        outcome: CompilationCacheOutcome::Wait,
-                        duration,
-                        miss_reason: None,
-                    });
+                    self.record_tier(
+                        CompilationCacheLevel::Memory,
+                        CompilationCacheOutcome::Wait,
+                        None,
+                        wait_start.elapsed(),
+                        &self.statistics.memory_lookup_duration_ns,
+                    );
                     return Ok(program);
                 }
                 continue;
@@ -697,26 +733,24 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
                 self.in_flight.lock().expect("in-flight cache mutex should not be poisoned").remove(&cache_key);
                 in_flight.finish(InFlightState::Ready(Arc::clone(&program)));
                 self.statistics.memory_hits.fetch_add(1, Ordering::Relaxed);
-                let duration = lookup_start.elapsed();
-                Self::add_duration(&self.statistics.memory_lookup_duration_ns, duration);
-                self.record_event(CompilationEvent {
-                    level: CompilationCacheLevel::Memory,
-                    outcome: CompilationCacheOutcome::Hit,
-                    duration,
-                    miss_reason: None,
-                });
+                self.record_tier(
+                    CompilationCacheLevel::Memory,
+                    CompilationCacheOutcome::Hit,
+                    None,
+                    lookup_start.elapsed(),
+                    &self.statistics.memory_lookup_duration_ns,
+                );
                 return Ok(program);
             }
 
             self.statistics.misses.fetch_add(1, Ordering::Relaxed);
-            let duration = lookup_start.elapsed();
-            Self::add_duration(&self.statistics.memory_lookup_duration_ns, duration);
-            self.record_event(CompilationEvent {
-                level: CompilationCacheLevel::Memory,
-                outcome: CompilationCacheOutcome::Miss,
-                duration,
-                miss_reason: Some(CompilationMissReason::NotFound),
-            });
+            self.record_tier(
+                CompilationCacheLevel::Memory,
+                CompilationCacheOutcome::Miss,
+                Some(CompilationMissReason::NotFound),
+                lookup_start.elapsed(),
+                &self.statistics.memory_lookup_duration_ns,
+            );
             let producer = produce.take().expect("each cache lookup becomes a producer at most once");
             return self.restore_or_compile(domain, cache_key, in_flight, producer);
         }
@@ -743,8 +777,8 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
             .zip(persistent_key.as_ref())
             .map(|(cache, key)| (cache, CacheDigest::from_bytes(key.as_slice())));
 
-        let exchange = match configured_exchange {
-            Some(exchange) if persistent_key.is_none() => {
+        let exchange = match (configured_exchange, persistent_key.as_deref()) {
+            (Some(_), None) => {
                 self.record_event(CompilationEvent {
                     level: CompilationCacheLevel::Exchange,
                     outcome: CompilationCacheOutcome::Skipped,
@@ -754,226 +788,242 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
                 self.require_exchange_or_record_fallback("domain does not provide a persistent compilation key")?;
                 None
             }
-            exchange => exchange,
+            (Some(exchange), Some(key)) => self.exchange_preflight(exchange, key)?.then_some(exchange),
+            (None, _) => None,
         };
 
-        let exchange = if let Some(exchange) = exchange {
-            let key = persistent_key.as_ref().expect("active exchange has a persistent compilation key");
-            let timeout =
-                self.artifact_exchange_policy.timeout().expect("an active artifact exchange policy has a timeout");
-            let preflight_start = Instant::now();
-            match exchange.preflight(key.as_slice(), timeout) {
-                Ok(()) => Some(exchange),
-                Err(error) => {
-                    let duration = preflight_start.elapsed();
-                    Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                    match &error {
-                        CompilationExchangeError::TimedOut => {
-                            self.statistics.exchange_timeouts.fetch_add(1, Ordering::Relaxed);
-                        }
-                        CompilationExchangeError::Incompatible { .. } | CompilationExchangeError::Failed { .. } => {
-                            self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Exchange,
-                        outcome: CompilationCacheOutcome::Failed,
-                        duration,
-                        miss_reason: Some(match &error {
-                            CompilationExchangeError::TimedOut => CompilationMissReason::TimedOut,
-                            CompilationExchangeError::Incompatible { .. } => CompilationMissReason::Incompatible,
-                            CompilationExchangeError::Failed { .. } => CompilationMissReason::ReadFailed,
-                        }),
-                    });
-                    self.require_exchange_or_record_fallback(error.to_string().as_str())?;
-                    None
-                }
+        if let Some((disk_cache, digest)) = persistent.as_ref()
+            && let Some((program, bytes)) = self.restore_from_disk(domain, disk_cache, digest)
+        {
+            if let Some(exchange) = exchange
+                && exchange.process_index() == 0
+            {
+                let key =
+                    persistent_key.as_ref().expect("an active artifact exchange has a persistent compilation key");
+                self.publish_to_exchange(exchange, key.as_slice(), bytes.as_slice())?;
             }
-        } else {
-            None
-        };
-
-        if let Some((disk_cache, digest)) = persistent.as_ref() {
-            let lookup_start = Instant::now();
-            match disk_cache.get(digest) {
-                Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
-                    Ok(Some(program)) => {
-                        self.statistics.persistent_hits.fetch_add(1, Ordering::Relaxed);
-                        let duration = lookup_start.elapsed();
-                        Self::add_duration(&self.statistics.persistent_lookup_duration_ns, duration);
-                        self.record_event(CompilationEvent {
-                            level: CompilationCacheLevel::Persistent,
-                            outcome: CompilationCacheOutcome::Hit,
-                            duration,
-                            miss_reason: None,
-                        });
-                        if let Some(exchange) = exchange
-                            && exchange.process_index() == 0
-                        {
-                            let key = persistent_key
-                                .as_ref()
-                                .expect("an active artifact exchange has a persistent compilation key");
-                            let publish_start = Instant::now();
-                            match exchange.publish(key.as_slice(), bytes.as_slice()) {
-                                Ok(()) => {
-                                    self.statistics.exchange_publishes.fetch_add(1, Ordering::Relaxed);
-                                    self.record_event(CompilationEvent {
-                                        level: CompilationCacheLevel::Exchange,
-                                        outcome: CompilationCacheOutcome::Succeeded,
-                                        duration: publish_start.elapsed(),
-                                        miss_reason: None,
-                                    });
-                                }
-                                Err(error) => {
-                                    self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                                    self.record_event(CompilationEvent {
-                                        level: CompilationCacheLevel::Exchange,
-                                        outcome: CompilationCacheOutcome::Failed,
-                                        duration: publish_start.elapsed(),
-                                        miss_reason: Some(CompilationMissReason::WriteFailed),
-                                    });
-                                    self.require_exchange_or_record_fallback(error.to_string().as_str())?;
-                                }
-                            }
-                        }
-                        return Ok(in_flight_producer.finish(program));
-                    }
-                    Ok(None) => {
-                        let duration = lookup_start.elapsed();
-                        Self::add_duration(&self.statistics.persistent_lookup_duration_ns, duration);
-                        self.record_event(CompilationEvent {
-                            level: CompilationCacheLevel::Persistent,
-                            outcome: CompilationCacheOutcome::Miss,
-                            duration,
-                            miss_reason: Some(CompilationMissReason::Incompatible),
-                        });
-                    }
-                    Err(_error) => {
-                        self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
-                        let duration = lookup_start.elapsed();
-                        Self::add_duration(&self.statistics.persistent_lookup_duration_ns, duration);
-                        self.record_event(CompilationEvent {
-                            level: CompilationCacheLevel::Persistent,
-                            outcome: CompilationCacheOutcome::Failed,
-                            duration,
-                            miss_reason: Some(CompilationMissReason::DeserializationFailed),
-                        });
-                    }
-                },
-                Ok(None) => {
-                    let duration = lookup_start.elapsed();
-                    Self::add_duration(&self.statistics.persistent_lookup_duration_ns, duration);
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Persistent,
-                        outcome: CompilationCacheOutcome::Miss,
-                        duration,
-                        miss_reason: Some(CompilationMissReason::NotFound),
-                    });
-                }
-                Err(_error) => {
-                    self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
-                    let duration = lookup_start.elapsed();
-                    Self::add_duration(&self.statistics.persistent_lookup_duration_ns, duration);
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Persistent,
-                        outcome: CompilationCacheOutcome::Failed,
-                        duration,
-                        miss_reason: Some(CompilationMissReason::ReadFailed),
-                    });
-                }
-            }
+            return Ok(in_flight_producer.finish(program));
         }
 
         if let Some(exchange) = exchange
             && exchange.process_index() != 0
         {
             let key = persistent_key.as_ref().expect("active exchange has a persistent compilation key");
-            let timeout =
-                self.artifact_exchange_policy.timeout().expect("an active artifact exchange policy has a timeout");
-            self.statistics.exchange_waits.fetch_add(1, Ordering::Relaxed);
-            let exchange_start = Instant::now();
-            match exchange.receive(key.as_slice(), timeout) {
-                Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
-                    Ok(Some(program)) => {
-                        self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
-                        let duration = exchange_start.elapsed();
-                        Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                        self.record_event(CompilationEvent {
-                            level: CompilationCacheLevel::Exchange,
-                            outcome: CompilationCacheOutcome::Hit,
-                            duration,
-                            miss_reason: None,
-                        });
-                        return Ok(in_flight_producer.finish(program));
-                    }
-                    Ok(None) => {
-                        self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                        let duration = exchange_start.elapsed();
-                        Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                        self.record_event(CompilationEvent {
-                            level: CompilationCacheLevel::Exchange,
-                            outcome: CompilationCacheOutcome::Miss,
-                            duration,
-                            miss_reason: Some(CompilationMissReason::Incompatible),
-                        });
-                        self.require_exchange_or_record_fallback("received compilation artifact is incompatible")?;
-                    }
-                    Err(error) => {
-                        self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                        let duration = exchange_start.elapsed();
-                        Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                        self.record_event(CompilationEvent {
-                            level: CompilationCacheLevel::Exchange,
-                            outcome: CompilationCacheOutcome::Failed,
-                            duration,
-                            miss_reason: Some(CompilationMissReason::DeserializationFailed),
-                        });
-                        if !self.artifact_exchange_policy.permits_local_fallback() {
-                            return Err(error);
-                        }
-                        self.statistics.exchange_fallbacks.fetch_add(1, Ordering::Relaxed);
-                    }
-                },
-                Ok(None) | Err(CompilationExchangeError::TimedOut) => {
-                    self.statistics.exchange_timeouts.fetch_add(1, Ordering::Relaxed);
-                    let duration = exchange_start.elapsed();
-                    Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Exchange,
-                        outcome: CompilationCacheOutcome::Miss,
-                        duration,
-                        miss_reason: Some(CompilationMissReason::TimedOut),
-                    });
-                    self.require_exchange_or_record_fallback("timed out waiting for a compilation artifact")?;
-                }
-                Err(CompilationExchangeError::Failed { message }) => {
-                    self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                    let duration = exchange_start.elapsed();
-                    Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Exchange,
-                        outcome: CompilationCacheOutcome::Failed,
-                        duration,
-                        miss_reason: Some(CompilationMissReason::ReadFailed),
-                    });
-                    self.require_exchange_or_record_fallback(message.as_str())?;
-                }
-                Err(CompilationExchangeError::Incompatible { message }) => {
-                    self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                    let duration = exchange_start.elapsed();
-                    Self::add_duration(&self.statistics.exchange_duration_ns, duration);
-                    self.record_event(CompilationEvent {
-                        level: CompilationCacheLevel::Exchange,
-                        outcome: CompilationCacheOutcome::Failed,
-                        duration,
-                        miss_reason: Some(CompilationMissReason::Incompatible),
-                    });
-                    self.require_exchange_or_record_fallback(message.as_str())?;
-                }
+            if let Some(program) = self.receive_from_exchange(domain, exchange, key.as_slice())? {
+                return Ok(in_flight_producer.finish(program));
             }
         }
 
         self.compile_and_publish(domain, in_flight_producer, persistent, persistent_key.as_deref(), exchange, produce)
+    }
+
+    /// Preflights an active exchange for `key`, returning whether the exchange participates in this compilation.
+    ///
+    /// A preflight failure is fatal when the policy requires sharing; otherwise it is recorded and the exchange is
+    /// deactivated for this compilation.
+    fn exchange_preflight(
+        &self,
+        exchange: &Arc<dyn CompilationArtifactExchange>,
+        key: &[u8],
+    ) -> Result<bool, D::Error> {
+        let timeout =
+            self.artifact_exchange_policy.timeout().expect("an active artifact exchange policy has a timeout");
+        let preflight_start = Instant::now();
+        match exchange.preflight(key, timeout) {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                match &error {
+                    CompilationExchangeError::TimedOut => {
+                        self.statistics.exchange_timeouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    CompilationExchangeError::Incompatible { .. } | CompilationExchangeError::Failed { .. } => {
+                        self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                self.record_tier(
+                    CompilationCacheLevel::Exchange,
+                    CompilationCacheOutcome::Failed,
+                    Some(match &error {
+                        CompilationExchangeError::TimedOut => CompilationMissReason::TimedOut,
+                        CompilationExchangeError::Incompatible { .. } => CompilationMissReason::Incompatible,
+                        CompilationExchangeError::Failed { .. } => CompilationMissReason::ReadFailed,
+                    }),
+                    preflight_start.elapsed(),
+                    &self.statistics.exchange_duration_ns,
+                );
+                self.require_exchange_or_record_fallback(error.to_string().as_str())?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Restores a compiled program from the persistent disk tier, returning its serialized payload alongside it so
+    /// an exchange leader can republish without reserializing. Every outcome short of a hit is recorded and
+    /// degraded to `None`.
+    fn restore_from_disk(
+        &self,
+        domain: &D,
+        disk_cache: &DiskCache,
+        digest: &CacheDigest,
+    ) -> Option<(D::CompiledProgram, Vec<u8>)> {
+        let lookup_start = Instant::now();
+        let (outcome, miss_reason, restored) = match disk_cache.get(digest) {
+            Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
+                Ok(Some(program)) => (CompilationCacheOutcome::Hit, None, Some((program, bytes))),
+                Ok(None) => (CompilationCacheOutcome::Miss, Some(CompilationMissReason::Incompatible), None),
+                Err(_error) => {
+                    (CompilationCacheOutcome::Failed, Some(CompilationMissReason::DeserializationFailed), None)
+                }
+            },
+            Ok(None) => (CompilationCacheOutcome::Miss, Some(CompilationMissReason::NotFound), None),
+            Err(_error) => (CompilationCacheOutcome::Failed, Some(CompilationMissReason::ReadFailed), None),
+        };
+        match outcome {
+            CompilationCacheOutcome::Hit => {
+                self.statistics.persistent_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            CompilationCacheOutcome::Failed => {
+                self.statistics.persistent_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.record_tier(
+            CompilationCacheLevel::Persistent,
+            outcome,
+            miss_reason,
+            lookup_start.elapsed(),
+            &self.statistics.persistent_lookup_duration_ns,
+        );
+        restored
+    }
+
+    /// Waits for the artifact published by the exchange leader on a follower process.
+    ///
+    /// Returns the restored program on success and `None` when the policy permits falling back to local
+    /// compilation after a miss, timeout, or failure.
+    fn receive_from_exchange(
+        &self,
+        domain: &D,
+        exchange: &Arc<dyn CompilationArtifactExchange>,
+        key: &[u8],
+    ) -> Result<Option<D::CompiledProgram>, D::Error> {
+        let timeout =
+            self.artifact_exchange_policy.timeout().expect("an active artifact exchange policy has a timeout");
+        self.statistics.exchange_waits.fetch_add(1, Ordering::Relaxed);
+        let exchange_start = Instant::now();
+        match exchange.receive(key, timeout) {
+            Ok(Some(bytes)) => match domain.deserialize_program(bytes.as_slice()) {
+                Ok(Some(program)) => {
+                    self.statistics.exchange_hits.fetch_add(1, Ordering::Relaxed);
+                    self.record_tier(
+                        CompilationCacheLevel::Exchange,
+                        CompilationCacheOutcome::Hit,
+                        None,
+                        exchange_start.elapsed(),
+                        &self.statistics.exchange_duration_ns,
+                    );
+                    Ok(Some(program))
+                }
+                Ok(None) => {
+                    self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
+                    self.record_tier(
+                        CompilationCacheLevel::Exchange,
+                        CompilationCacheOutcome::Miss,
+                        Some(CompilationMissReason::Incompatible),
+                        exchange_start.elapsed(),
+                        &self.statistics.exchange_duration_ns,
+                    );
+                    self.require_exchange_or_record_fallback("received compilation artifact is incompatible")?;
+                    Ok(None)
+                }
+                Err(error) => {
+                    self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
+                    self.record_tier(
+                        CompilationCacheLevel::Exchange,
+                        CompilationCacheOutcome::Failed,
+                        Some(CompilationMissReason::DeserializationFailed),
+                        exchange_start.elapsed(),
+                        &self.statistics.exchange_duration_ns,
+                    );
+                    if !self.artifact_exchange_policy.permits_local_fallback() {
+                        return Err(error);
+                    }
+                    self.statistics.exchange_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    Ok(None)
+                }
+            },
+            Ok(None) | Err(CompilationExchangeError::TimedOut) => {
+                self.statistics.exchange_timeouts.fetch_add(1, Ordering::Relaxed);
+                self.record_tier(
+                    CompilationCacheLevel::Exchange,
+                    CompilationCacheOutcome::Miss,
+                    Some(CompilationMissReason::TimedOut),
+                    exchange_start.elapsed(),
+                    &self.statistics.exchange_duration_ns,
+                );
+                self.require_exchange_or_record_fallback("timed out waiting for a compilation artifact")?;
+                Ok(None)
+            }
+            Err(CompilationExchangeError::Failed { message }) => {
+                self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_tier(
+                    CompilationCacheLevel::Exchange,
+                    CompilationCacheOutcome::Failed,
+                    Some(CompilationMissReason::ReadFailed),
+                    exchange_start.elapsed(),
+                    &self.statistics.exchange_duration_ns,
+                );
+                self.require_exchange_or_record_fallback(message.as_str())?;
+                Ok(None)
+            }
+            Err(CompilationExchangeError::Incompatible { message }) => {
+                self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_tier(
+                    CompilationCacheLevel::Exchange,
+                    CompilationCacheOutcome::Failed,
+                    Some(CompilationMissReason::Incompatible),
+                    exchange_start.elapsed(),
+                    &self.statistics.exchange_duration_ns,
+                );
+                self.require_exchange_or_record_fallback(message.as_str())?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Publishes serialized `artifact` bytes for `key` through the exchange leader.
+    ///
+    /// Publish failures are fatal only when the policy requires sharing. Publish durations deliberately stay out of
+    /// the exchange duration counter, which tracks time spent restoring artifacts.
+    fn publish_to_exchange(
+        &self,
+        exchange: &Arc<dyn CompilationArtifactExchange>,
+        key: &[u8],
+        artifact: &[u8],
+    ) -> Result<(), D::Error> {
+        let publish_start = Instant::now();
+        match exchange.publish(key, artifact) {
+            Ok(()) => {
+                self.statistics.exchange_publishes.fetch_add(1, Ordering::Relaxed);
+                self.record_event(CompilationEvent {
+                    level: CompilationCacheLevel::Exchange,
+                    outcome: CompilationCacheOutcome::Succeeded,
+                    duration: publish_start.elapsed(),
+                    miss_reason: None,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
+                self.record_event(CompilationEvent {
+                    level: CompilationCacheLevel::Exchange,
+                    outcome: CompilationCacheOutcome::Failed,
+                    duration: publish_start.elapsed(),
+                    miss_reason: Some(CompilationMissReason::WriteFailed),
+                });
+                self.require_exchange_or_record_fallback(error.to_string().as_str())
+            }
+        }
     }
 
     fn compile_and_publish<F: FnOnce() -> Result<D::CompiledProgram, D::Error>>(
@@ -990,14 +1040,13 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
         let program = match produce() {
             Ok(program) => program,
             Err(error) => {
-                let duration = compile_start.elapsed();
-                Self::add_duration(&self.statistics.compilation_duration_ns, duration);
-                self.record_event(CompilationEvent {
-                    level: CompilationCacheLevel::Backend,
-                    outcome: CompilationCacheOutcome::Failed,
-                    duration,
-                    miss_reason: Some(CompilationMissReason::ProducerFailed),
-                });
+                self.record_tier(
+                    CompilationCacheLevel::Backend,
+                    CompilationCacheOutcome::Failed,
+                    Some(CompilationMissReason::ProducerFailed),
+                    compile_start.elapsed(),
+                    &self.statistics.compilation_duration_ns,
+                );
                 if let Some(exchange) = exchange
                     && exchange.process_index() == 0
                     && let Some(key) = persistent_key
@@ -1027,13 +1076,13 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
             }
         };
         let compile_duration = compile_start.elapsed();
-        Self::add_duration(&self.statistics.compilation_duration_ns, compile_duration);
-        self.record_event(CompilationEvent {
-            level: CompilationCacheLevel::Backend,
-            outcome: CompilationCacheOutcome::Succeeded,
-            duration: compile_duration,
-            miss_reason: None,
-        });
+        self.record_tier(
+            CompilationCacheLevel::Backend,
+            CompilationCacheOutcome::Succeeded,
+            None,
+            compile_duration,
+            &self.statistics.compilation_duration_ns,
+        );
 
         let is_exchange_leader = exchange.is_none_or(|exchange| exchange.process_index() == 0);
         let should_serialize_for_disk = is_exchange_leader
@@ -1059,27 +1108,7 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
                         && exchange.process_index() == 0
                         && let Some(key) = persistent_key
                     {
-                        match exchange.publish(key, bytes.as_slice()) {
-                            Ok(()) => {
-                                self.statistics.exchange_publishes.fetch_add(1, Ordering::Relaxed);
-                                self.record_event(CompilationEvent {
-                                    level: CompilationCacheLevel::Exchange,
-                                    outcome: CompilationCacheOutcome::Succeeded,
-                                    duration: serialization_start.elapsed(),
-                                    miss_reason: None,
-                                });
-                            }
-                            Err(error) => {
-                                self.statistics.exchange_errors.fetch_add(1, Ordering::Relaxed);
-                                self.record_event(CompilationEvent {
-                                    level: CompilationCacheLevel::Exchange,
-                                    outcome: CompilationCacheOutcome::Failed,
-                                    duration: serialization_start.elapsed(),
-                                    miss_reason: Some(CompilationMissReason::WriteFailed),
-                                });
-                                self.require_exchange_or_record_fallback(error.to_string().as_str())?;
-                            }
-                        }
+                        self.publish_to_exchange(exchange, key, bytes.as_slice())?;
                     }
                 }
                 Ok(None) => {
@@ -1135,6 +1164,19 @@ impl<D: CompilationCacheDomain> CompilationContext<D> {
         let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         let _previous =
             counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| Some(value.saturating_add(nanoseconds)));
+    }
+
+    /// Accumulates `duration` into `duration_counter` and records one structured event for the operation.
+    fn record_tier(
+        &self,
+        level: CompilationCacheLevel,
+        outcome: CompilationCacheOutcome,
+        miss_reason: Option<CompilationMissReason>,
+        duration: Duration,
+        duration_counter: &AtomicU64,
+    ) {
+        Self::add_duration(duration_counter, duration);
+        self.record_event(CompilationEvent { level, outcome, duration, miss_reason });
     }
 
     pub(crate) fn record_event(&self, event: CompilationEvent) {
@@ -1267,7 +1309,7 @@ mod tests {
     impl CompilationCacheDomain for TestDomain {
         type CacheKey = u8;
 
-        fn compilation_key(&self, _program: &Vec<DataType>, _options: &()) -> Result<u8, ProgramError> {
+        fn compilation_key(&self, _program: &Vec<DataType>) -> Result<u8, ProgramError> {
             Ok(0)
         }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use ryft_core::compilation::{CompilationDomain, CompilationOptions, StagedFunction, stage_function};
+use ryft_core::compilation::{CompilationDomain, StagedFunction, stage_function};
 use ryft_core::sharding::{DeviceMesh, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::types::ArrayType;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
@@ -80,7 +80,7 @@ pub(crate) fn reshard_with_donation<'o>(
     // Source shards on the current process must carry a local buffer (a missing one indicates a
     // real misconfiguration). Shards on other processes are normal — they're served by the
     // cross-host transfers extension when the compiled path needs them.
-    let client_process_index = engine.client().process_index().map_err(XlaError::from)?;
+    let client_process_index = engine.client()?.process_index().map_err(XlaError::from)?;
     for shard in source.shards() {
         if shard.device().process_index() == client_process_index && shard.buffer().is_none() {
             return Err(ArrayError::MissingAddressableShardForMove {
@@ -134,12 +134,12 @@ fn try_same_mesh<'o>(
         mesh: dst_mesh.clone(),
         in_shardings: Some(vec![src_sharding.clone()]),
         out_shardings: Some(vec![dst_sharding.clone()]),
-        donation_flags: vec![donate],
+        donation_flags: Some(vec![donate]),
         feedback_directed_profile: None,
     };
 
     let staged: StagedFunction<XlaDomain<'o>, ArrayType, ArrayType> =
-        stage_function(engine, |input| input, bare_input_type, CompilationOptions::new(xla_options)).map_err(
+        stage_function(engine, |input| input, bare_input_type, xla_options).map_err(
             |error| ArrayError::CompiledReshardInternalError { message: format!("tracing failed: {error}") },
         )?;
     let lowered = engine.lower(staged).map_err(|error| match error {
@@ -166,7 +166,7 @@ fn try_replicated_cross_mesh<'o>(
     dst_mesh: &DeviceMesh,
     dst_sharding: &Sharding,
 ) -> Result<Array<'o>, ArrayError> {
-    let client = engine.client();
+    let client = engine.client()?;
     let client_process_index = client.process_index().map_err(XlaError::from)?;
     let addressable_devices = client.addressable_devices().map_err(XlaError::from)?;
     let mut dst_device_by_id = HashMap::with_capacity(addressable_devices.len());
