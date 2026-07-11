@@ -23,13 +23,13 @@ use ryft_core::differentiation::DifferentiationError;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
 use ryft_core::operations::Operation;
-use ryft_core::operations::arithmetic::{AddOperation, MulOperation};
 use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
 use ryft_core::operations::constants::{
     Constant, Fill, FillOperation, Iota, IotaOperation, ONE_OPERATION_NAME, One, OneOperation, ZERO_OPERATION_NAME,
     Zero, ZeroOperation,
 };
 use ryft_core::operations::control_flow::SelectOperation;
+use ryft_core::operations::math::{AddOperation, MulOperation};
 use ryft_core::parameters::{Parameterized, Placeholder};
 use ryft_core::programs::ProgramError;
 use ryft_core::sharding::{
@@ -2634,10 +2634,10 @@ mod tests {
 
     use ryft_core::Sharding;
     use ryft_core::compilation::stage_function;
-    use ryft_core::operations::arithmetic::{AddOperation, MulOperation, NegOperation};
     use ryft_core::operations::compare::{CompareOperation, ComparisonDirection};
     use ryft_core::operations::constants::{FillOperation, OneOperation};
     use ryft_core::operations::control_flow::{ConditionOperation, WhileOperation};
+    use ryft_core::operations::math::{AddOperation, MulOperation, NegOperation};
     use ryft_core::sharding::ShardingDimension;
     use ryft_core::types::{Size, StaticShape};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -2836,7 +2836,7 @@ mod tests {
     fn test_compilation_domain_impl_round_trips_through_core_pipeline() {
         use crate::tests::{values_from_bytes, values_to_bytes};
         use ryft_core::compilation::CompilationOptions as CoreCompilationOptions;
-        use ryft_core::operations::trigonometric::Sin;
+        use ryft_core::operations::math::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2901,7 +2901,7 @@ mod tests {
     #[test]
     fn test_xla_compilation_key_is_canonical_and_stable() {
         use ryft_core::compilation::CompilationOptions as CoreCompilationOptions;
-        use ryft_core::operations::trigonometric::Sin;
+        use ryft_core::operations::math::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -3011,7 +3011,7 @@ mod tests {
     #[test]
     fn test_xla_disk_cache_restores_into_a_fresh_compilation_context() {
         use ryft_core::compilation::{CompilationOptions as CoreCompilationOptions, DiskCache};
-        use ryft_core::operations::trigonometric::Sin;
+        use ryft_core::operations::math::Sin;
         use tempfile::tempdir;
 
         let plugin = load_cpu_plugin().unwrap();

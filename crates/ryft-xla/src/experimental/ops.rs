@@ -15,9 +15,6 @@ use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, 
 use ryft_core::effects::Effects;
 use ryft_core::interpretation::InterpretableOperation;
 use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::{
-    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
-};
 use ryft_core::operations::compare::CompareOperation;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{
@@ -36,8 +33,9 @@ use ryft_core::operations::manipulation::{
     GatherOperation, PadOperation, Reshape, ReshapeOperation, ScatterOperation, Slice, SliceOperation, Transpose,
     TransposeOperation, UpdateSlice, UpdateSliceOperation,
 };
+use ryft_core::operations::math::{AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use ryft_core::operations::math::{Atan2Operation, CosOperation, SinOperation};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
-use ryft_core::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
 use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
 use ryft_core::partial::{
     PartialEvaluationContext, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation,
@@ -905,7 +903,7 @@ impl<V: Value<Type = ArrayType>> TransposableOperation<V, XlaOperation<V>> for J
 mod tests {
     use std::rc::Rc;
 
-    use ryft_core::operations::arithmetic::{AddOperation, MulOperation};
+    use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
     use ryft_core::programs::ProgramBuilder;

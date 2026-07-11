@@ -4,9 +4,6 @@ use std::rc::Rc;
 
 use ryft_core::backends::scalars::Scalar;
 use ryft_core::macros::check_count;
-use ryft_core::operations::arithmetic::{
-    AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation,
-};
 use ryft_core::operations::compare::ComparisonDirection;
 use ryft_core::operations::complex::{ComplexOperation, ConjugateOperation, ImaginaryOperation, RealOperation};
 use ryft_core::operations::constants::{ConstantOperation, FillOperation, IotaOperation};
@@ -16,7 +13,8 @@ use ryft_core::operations::manipulation::{
     BroadcastOperation, GatherOperation, GatherScatterMode, Reshape, ReshapeOperation, ScatterOperation,
     ScatterReductionKind, Slice, TransposeOperation, UpdateSlice,
 };
-use ryft_core::operations::trigonometric::{Atan2Operation, CosOperation, SinOperation};
+use ryft_core::operations::math::{AbsOperation, AddOperation, DivOperation, MulOperation, NegOperation, SubOperation};
+use ryft_core::operations::math::{Atan2Operation, CosOperation, SinOperation};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
@@ -5484,7 +5482,7 @@ mod tests {
         ConcatenateOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, PadOperation, SliceOperation,
         Transpose, UpdateSliceOperation,
     };
-    use ryft_core::operations::trigonometric::{Cos, Sin};
+    use ryft_core::operations::math::{Cos, Sin};
     use ryft_core::parameters::Placeholder;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tests::TestArray;
@@ -6631,14 +6629,14 @@ mod tests {
 
     fn scalar_bilinear_sin<T>(inputs: (T, T)) -> T
     where
-        T: Clone + ryft_core::operations::trigonometric::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::operations::math::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         inputs.0.clone() * inputs.1 + inputs.0.sin().unwrap()
     }
 
     fn scalar_quartic_plus_sin<T>(x: T) -> T
     where
-        T: Clone + ryft_core::operations::trigonometric::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
+        T: Clone + ryft_core::operations::math::Sin + std::ops::Add<Output = T> + std::ops::Mul<Output = T>,
     {
         x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
     }

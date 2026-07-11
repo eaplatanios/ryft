@@ -1985,7 +1985,7 @@ mod tests {
     use crate::mlir::ToMlir;
     use crate::tests::{values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt};
-    use ryft_core::operations::trigonometric::Sin;
+    use ryft_core::operations::math::Sin;
     use ryft_core::sharding::{Device, DeviceMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use ryft_core::tracing_v2::{Dot, DotDimensionNumbers, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;

@@ -9,7 +9,7 @@ use ryft_core::compilation::{
     CompilationDomain, CompilationOptions, CompiledFunction, DiskCache, JitCacheStatistics, StagedFunction,
     stage_function,
 };
-use ryft_core::operations::trigonometric::Sin;
+use ryft_core::operations::math::Sin;
 use ryft_core::{ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, Size};
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, FromPjrt, JittedXlaFunction, XlaCompileTracer, XlaDomain, XlaOptions, jitted};

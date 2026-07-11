@@ -1027,7 +1027,7 @@ pub fn infer_output_types<
 #[cfg(test)]
 mod tests {
     use ryft_core::operations::differentiation::StopGradient;
-    use ryft_core::operations::trigonometric::{Cos, Sin};
+    use ryft_core::operations::math::{Cos, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding};
     use ryft_core::tracing_v2::{ForwardModeDifferentiate, ReverseModeDifferentiate};
     use ryft_core::types::data_types::DataType;
@@ -1368,7 +1368,7 @@ mod tests {
     /// `jit_call` boundary in the active outer trace.
     #[test]
     fn test_compiled_function_staged_inside_compile() {
-        use ryft_core::operations::trigonometric::Cos;
+        use ryft_core::operations::math::Cos;
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();

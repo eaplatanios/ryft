@@ -1010,7 +1010,7 @@ implement_shard_map_invocation_leaf!(ryft_core::DifferentiationTracer<C>, [C], [
 mod tests {
     use ryft_core::contexts::StagingContext;
     use ryft_core::interpretation::InterpretableOperation;
-    use ryft_core::operations::arithmetic::{AddOperation, MulOperation};
+    use ryft_core::operations::math::{AddOperation, MulOperation};
     use ryft_core::parameters::Placeholder;
     use ryft_core::partial::PartialValue;
     use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding};

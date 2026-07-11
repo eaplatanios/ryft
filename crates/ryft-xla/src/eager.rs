@@ -1,12 +1,12 @@
 use ryft_core::contexts::Context;
 use ryft_core::macros::check_count;
 use ryft_core::operations::BooleanLike;
-use ryft_core::operations::arithmetic::{Add, Div, Mul, Neg, Sub};
 use ryft_core::operations::compare::{Compare, ComparisonDirection};
 use ryft_core::operations::constants::ZeroLike;
 use ryft_core::operations::control_flow::{Select, WhilePredicate};
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
 use ryft_core::operations::manipulation::Broadcast;
+use ryft_core::operations::math::{Add, Div, Mul, Neg, Sub};
 use ryft_core::programs::{ProgramError, Value};
 use ryft_core::types::{DataType, Typed};
 
@@ -232,8 +232,8 @@ mod tests {
     use ryft_core::operations::control_flow::SelectCondition;
     use ryft_core::operations::differentiation::StopGradient;
     use ryft_core::operations::manipulation::{Concatenate, Pad, Reshape, Slice, Transpose, UpdateSlice};
+    use ryft_core::operations::math::{Cos, Sin};
     use ryft_core::operations::tag::Tag;
-    use ryft_core::operations::trigonometric::{Cos, Sin};
     use ryft_core::sharding::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ShardingDimension};
     use ryft_core::tracing_v2::operations::reduce::{Reduce, ReductionKind};
     use ryft_core::tracing_v2::{

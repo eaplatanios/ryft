@@ -1,5 +1,5 @@
 use ryft_core::contexts::{Context, EagerContext};
-use ryft_core::operations::trigonometric::Sin;
+use ryft_core::operations::math::Sin;
 use ryft_core::parameters::{Parameterized, ParameterizedFamily};
 use ryft_core::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
 use ryft_core::tests::TestArray;
@@ -381,7 +381,7 @@ fn emit_nested_shard_map() -> Result<Vec<IrBenchmarkRecord>, BenchmarkError> {
 
 #[cfg(test)]
 mod tests {
-    use ryft_core::operations::arithmetic::MUL_OPERATION_NAME;
+    use ryft_core::operations::math::MUL_OPERATION_NAME;
 
     use super::*;
 
