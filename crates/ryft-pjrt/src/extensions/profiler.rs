@@ -1,4 +1,12 @@
+use std::fmt::Debug;
+
 use prost::Message;
+
+use ryft_xla_sys::profiler::{
+    RYFT_XLA_Profiler_Aggregate_Profiled_Instructions, RYFT_XLA_Profiler_Aggregate_Profiled_Instructions_Args,
+    RYFT_XLA_Profiler_Byte_Buffer_Destroy, RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions,
+    RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions_Args,
+};
 
 use crate::protos::{ProfileOptions, XSpace};
 use crate::{Api, Client, Error, Plugin, slice_from_c_api, str_from_c_api};
@@ -152,7 +160,6 @@ impl Api {
     /// Creates a new [`Profiler`] that can be used to profile PJRT operations. Refer to the documentation of
     /// [`Profiler`] for information on how to use the returned [`Profiler`].
     pub(crate) fn profiler(&self, options: &ProfileOptions) -> Result<Profiler, Error> {
-        use prost::Message;
         let extension = self.profiler_extension()?;
         let options = options.encode_to_vec();
         invoke_profiler_api_error_fn!(
@@ -260,6 +267,148 @@ impl Drop for Profiler {
     fn drop(&mut self) {
         invoke_profiler_api_error_fn!(self.extension, PLUGIN_Profiler_Destroy, { profiler = self.to_c_api() })
             .expect("failed to destroy PJRT profiler");
+    }
+}
+
+/// Backing storage for the serialized bytes of a [`FeedbackDirectedProfile`].
+enum FeedbackDirectedProfileStorage {
+    /// Profile bytes allocated by the native profiler bridge in `ryft-xla-sys` (null when the profile is empty).
+    Native {
+        /// Pointer to the profile bytes allocated by the native profiler bridge.
+        data: *mut u8,
+
+        /// Number of bytes that the profile consists of.
+        size: usize,
+    },
+
+    /// Profile bytes owned by Rust (e.g., reconstructed from previously saved profile bytes).
+    Owned(Vec<u8>),
+}
+
+/// Feedback-directed optimization profile that carries measured per-instruction costs and is consumed by XLA through
+/// [`ExecutableCompilationOptions::fdo_profile`](crate::protos::ExecutableCompilationOptions) (accessible via
+/// [`FeedbackDirectedProfile::bytes`]). This is the mechanism behind JAX's automatic Profile-Guided Latency Estimator
+/// flow: profiles are produced from XProf [`XSpace`] traces via [`FeedbackDirectedProfile::from_x_space`], aggregated
+/// across multiple executions via [`FeedbackDirectedProfile::aggregated`], and reconstructed from previously saved
+/// bytes via [`FeedbackDirectedProfile::from_bytes`].
+pub struct FeedbackDirectedProfile {
+    /// Backing storage for the serialized profile bytes.
+    storage: FeedbackDirectedProfileStorage,
+}
+
+impl FeedbackDirectedProfile {
+    /// Constructs a new [`FeedbackDirectedProfile`] from the output and error buffers populated by a native profiler
+    /// bridge invocation, taking ownership of both buffers on every path (i.e., the profile buffer is owned by the
+    /// returned profile and the error buffer is destroyed before this function returns).
+    ///
+    /// # Safety
+    ///
+    /// The provided pointer/size pairs must come from a single `ryft-xla-sys` profiler bridge invocation and must not
+    /// be used (or destroyed) again after this function is called.
+    unsafe fn from_c_api(
+        profile: *mut u8,
+        profile_size: usize,
+        error: *mut u8,
+        error_size: usize,
+    ) -> Result<Self, Error> {
+        let profile = Self { storage: FeedbackDirectedProfileStorage::Native { data: profile, size: profile_size } };
+        if !error.is_null() {
+            let message = String::from_utf8_lossy(unsafe { slice_from_c_api(error, error_size) }).into_owned();
+            unsafe { RYFT_XLA_Profiler_Byte_Buffer_Destroy(error) };
+            return Err(Error::invalid_argument(message));
+        }
+        Ok(profile)
+    }
+
+    /// Constructs a new [`FeedbackDirectedProfile`] by converting the provided XProf [`XSpace`] trace using OpenXLA's
+    /// [`ConvertXplaneToProfiledInstructionsProto`](
+    /// https://github.com/openxla/xla/blob/main/xla/python/xplane_to_profile_instructions.h). This conversion is
+    /// currently useful only for GPU traces containing HLO metadata and device activity; unsupported or malformed
+    /// traces return an explicit [`Error`].
+    pub fn from_x_space(x_space: &XSpace) -> Result<Self, Error> {
+        let bytes = x_space.encode_to_vec();
+        let mut arguments = RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions_Args::new(bytes.as_slice());
+        unsafe {
+            RYFT_XLA_Profiler_XSpace_To_Profiled_Instructions(&mut arguments);
+            Self::from_c_api(arguments.profile, arguments.profile_size, arguments.error, arguments.error_size)
+        }
+    }
+
+    /// Constructs a new [`FeedbackDirectedProfile`] from previously saved profile bytes (refer to
+    /// [`FeedbackDirectedProfile::bytes`] for obtaining the bytes to save). The provided bytes are treated as opaque
+    /// and are only validated when the profile is used (e.g., by [`FeedbackDirectedProfile::aggregated`] or by XLA
+    /// during compilation).
+    pub fn from_bytes<B: Into<Vec<u8>>>(bytes: B) -> Self {
+        Self { storage: FeedbackDirectedProfileStorage::Owned(bytes.into()) }
+    }
+
+    /// Constructs a new [`FeedbackDirectedProfile`] whose per-instruction costs are the `percentile`-th percentile of
+    /// the costs observed across the provided profiles, using OpenXLA's [`AggregateProfiledInstructionsProto`](
+    /// https://github.com/openxla/xla/blob/main/xla/python/aggregate_profile.h). At least one profile must be
+    /// provided and the provided `percentile` must be in `0..=100`.
+    pub fn aggregated(profiles: &[Self], percentile: u8) -> Result<Self, Error> {
+        if profiles.is_empty() {
+            return Err(Error::invalid_argument("at least one feedback-directed optimization profile is required"));
+        }
+        if percentile > 100 {
+            return Err(Error::invalid_argument("feedback-directed optimization percentile must be in 0..=100"));
+        }
+        let profile_pointers = profiles.iter().map(|profile| profile.bytes().as_ptr()).collect::<Vec<_>>();
+        let profile_sizes = profiles.iter().map(|profile| profile.bytes().len()).collect::<Vec<_>>();
+        let mut arguments = RYFT_XLA_Profiler_Aggregate_Profiled_Instructions_Args::new(
+            profile_pointers.as_slice(),
+            profile_sizes.as_slice(),
+            i32::from(percentile),
+        );
+        unsafe {
+            RYFT_XLA_Profiler_Aggregate_Profiled_Instructions(&mut arguments);
+            Self::from_c_api(arguments.profile, arguments.profile_size, arguments.error, arguments.error_size)
+        }
+    }
+
+    /// Returns the serialized bytes of this [`FeedbackDirectedProfile`], which can be passed to XLA through
+    /// [`ExecutableCompilationOptions::fdo_profile`](crate::protos::ExecutableCompilationOptions) or saved and later
+    /// reconstructed into a profile via [`FeedbackDirectedProfile::from_bytes`].
+    pub fn bytes(&self) -> &[u8] {
+        match &self.storage {
+            FeedbackDirectedProfileStorage::Native { data, size } => unsafe { slice_from_c_api(*data, *size) },
+            FeedbackDirectedProfileStorage::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+impl Clone for FeedbackDirectedProfile {
+    fn clone(&self) -> Self {
+        Self::from_bytes(self.bytes())
+    }
+}
+
+impl PartialEq for FeedbackDirectedProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for FeedbackDirectedProfile {}
+
+impl Debug for FeedbackDirectedProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("FeedbackDirectedProfile").field("bytes", &self.bytes()).finish()
+    }
+}
+
+// The profile bytes are immutable after construction and destruction is exclusive because it only happens
+// once all owners have been dropped, so sharing profiles across threads is safe.
+unsafe impl Send for FeedbackDirectedProfile {}
+unsafe impl Sync for FeedbackDirectedProfile {}
+
+impl Drop for FeedbackDirectedProfile {
+    fn drop(&mut self) {
+        if let FeedbackDirectedProfileStorage::Native { data, .. } = self.storage
+            && !data.is_null()
+        {
+            unsafe { RYFT_XLA_Profiler_Byte_Buffer_Destroy(data) };
+        }
     }
 }
 
@@ -535,6 +684,8 @@ mod tests {
     use crate::tests::{TestPlatform, test_for_each_platform};
     use crate::{BufferType, Error, ExecutionDeviceInputs, ExecutionInput, Program};
 
+    use super::*;
+
     #[test]
     fn test_profiler_extension() {
         test_for_each_platform!(|plugin, client, platform| {
@@ -618,10 +769,10 @@ mod tests {
                         ],
                         ..Default::default()
                     };
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
                     assert_eq!(outputs.len(), 1);
                     let mut outputs = outputs.remove(0);
-                    outputs.done.r#await().unwrap();
                     let output = outputs.outputs.remove(0);
                     let output_bytes = output.copy_to_host(None).unwrap().r#await().unwrap();
                     let mut expected_output_bytes = Vec::with_capacity(8);
@@ -656,5 +807,34 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn test_feedback_directed_profile() {
+        // Test that aggregation validates its inputs.
+        assert!(matches!(
+            FeedbackDirectedProfile::aggregated(&[], 50),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "at least one feedback-directed optimization profile is required",
+        ));
+        assert!(matches!(
+            FeedbackDirectedProfile::aggregated(&[FeedbackDirectedProfile::from_bytes(Vec::new())], 101),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "feedback-directed optimization percentile must be in 0..=100",
+        ));
+
+        // Test that converting an XSpace trace and re-aggregating the resulting profile round-trips through the
+        // native bridge, and that profiles reconstructed from saved bytes compare equal to their sources.
+        let profile = FeedbackDirectedProfile::from_x_space(&crate::protos::XSpace::default()).unwrap();
+        let aggregated = FeedbackDirectedProfile::aggregated(&[profile], 90).unwrap();
+        assert_eq!(FeedbackDirectedProfile::from_bytes(aggregated.bytes()), aggregated);
+        assert_eq!(aggregated.clone(), aggregated);
+
+        // Test that profiles reconstructed from bytes are only validated when they are used.
+        assert!(matches!(
+            FeedbackDirectedProfile::aggregated(&[FeedbackDirectedProfile::from_bytes(vec![0xff])], 90),
+            Err(Error::InvalidArgument { message, .. })
+                if message == "failed to parse feedback-directed optimization profile",
+        ));
     }
 }
