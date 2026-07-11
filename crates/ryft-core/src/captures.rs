@@ -171,9 +171,9 @@ impl<C: CapturingContext<Operation: Clone + DifferentiableOperation<C>> + Zero<C
 
 /// A [`Program`] paired with the concrete runtime values referenced by its captured constants. The [`Program`] remains
 /// independent of the concrete capture data: values of type `V` live only in [`captures`](Self::captures), while its
-/// constant atoms carry lifetime-free [`CaptureReference`]s into that table. [`new`](Self::new) validates that every
-/// reference names an existing capture with the same type, and so all public construction paths establish the capture
-/// table invariant before a [`ClosedProgram`] can be interpreted or transformed.
+/// constant atoms carry lifetime-free [`CaptureReference`]s into that table. [`new`](Self::new), the sole construction
+/// path, validates that every reference names an existing capture with the same type, and so every [`ClosedProgram`]
+/// upholds the capture-table invariant before it can be interpreted or transformed.
 pub struct ClosedProgram<
     V: Value,
     O,
@@ -196,64 +196,52 @@ impl<
 {
     /// Creates a [`ClosedProgram`] from a capture-referenced `program` and its concrete `captures`, validating that
     /// every [`CaptureReference`] in the program references an existing capture whose type matches the type stored
-    /// in the reference.
-    #[inline]
+    /// in the reference. This is the sole construction path and both the program and its capture table are immutable
+    /// after construction, and so every [`ClosedProgram`] upholds this capture-table invariant for its entire lifetime
+    /// and no separate re-validation is ever needed.
     pub fn new(
         program: Program<CaptureReference<V::Type>, O, Input, Output>,
         captures: Vec<V>,
     ) -> Result<Self, ProgramError> {
-        let closed_program = Self { program, captures };
-        closed_program.validate_capture_references()?;
-        Ok(closed_program)
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Validates that every captured-constant atom references an existing capture with the same type.
-    pub fn validate_capture_references(&self) -> Result<(), ProgramError> {
-        for (atom_index, atom) in self.program.atoms().iter().enumerate() {
-            let Atom::Constant(capture_reference) = atom else {
+        for (atom_index, atom) in program.atoms().iter().enumerate() {
+            let Atom::Constant(value) = atom else {
                 continue;
             };
-            let capture = self.captures.get(capture_reference.index()).ok_or_else(|| {
+            let capture = captures.get(value.index()).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "captured constant atom %{atom_index} references missing capture #{}",
-                    capture_reference.index(),
+                    value.index(),
                 ))
             })?;
-            let expected_type = capture_reference.r#type();
+            let expected_type = value.r#type();
             let actual_type = capture.r#type();
             if expected_type.as_ref() != actual_type.as_ref() {
                 return Err(ProgramError::MalformedProgram(format!(
                     "captured constant atom %{atom_index} references capture #{} with type {}, \
                      but the atom has type {}",
-                    capture_reference.index(),
+                    value.index(),
                     actual_type,
                     expected_type,
                 )));
             }
         }
-        Ok(())
+        Ok(Self { program, captures })
     }
 
-    /// Returns the staged program.
+    /// Returns the underlying [`Program`].
     #[inline]
     pub fn program(&self) -> &Program<CaptureReference<V::Type>, O, Input, Output> {
         &self.program
     }
 
-    /// Returns the captured runtime values.
+    /// Returns the underlying captures table.
     #[inline]
     pub fn captures(&self) -> &[V] {
         self.captures.as_slice()
     }
-
-    /// Consumes this [`ClosedProgram`] and returns its staged program and capture table, in that order.
-    #[inline]
-    pub fn into_parts(self) -> (Program<CaptureReference<V::Type>, O, Input, Output>, Vec<V>) {
-        (self.program, self.captures)
-    }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<
     V: Value,
@@ -319,7 +307,6 @@ impl<
         mut lift_capture: LiftCapture,
         interpret_instruction: InterpretInstruction,
     ) -> Result<Vec<RuntimeValue>, Error> {
-        self.validate_capture_references().map_err(Error::from)?;
         self.program.interpret_with(
             inputs,
             |_, capture_reference| {
@@ -363,7 +350,6 @@ impl<
             }
         }
 
-        self.validate_capture_references()?;
         let mut builder = ProgramBuilder::new();
         let capture_inputs = self
             .captures
@@ -433,7 +419,6 @@ impl<
         capture_index_map: &[Option<usize>],
         rebuilt_captures: Vec<V>,
     ) -> Result<Self, ProgramError> {
-        self.validate_capture_references()?;
         let mut builder = ProgramBuilder::new();
         let mut mapped_atoms = vec![None; self.program.atoms().len()];
 
@@ -525,8 +510,8 @@ impl<
     ///
     /// This is dead-capture elimination: any capture whose index never appears in an [`Atom::Constant`] is dropped, and
     /// the remaining captures are renumbered to occupy `0..captures().len()` in their original relative order. Every
-    /// surviving [`CaptureReference`] is rewritten to its new index, so the returned program satisfies
-    /// [`validate_capture_references`](Self::validate_capture_references) with a contiguous capture table. The pass is
+    /// surviving [`CaptureReference`] is rewritten to its new index, so the returned program upholds the
+    /// construction-time capture-table invariant of [`new`](Self::new) with a contiguous capture table. The pass is
     /// unconditional: it needs only `V: Clone` and `O: Clone`, never an equality comparison on capture values.
     pub fn prune_unused_captures(&self) -> Result<Self, ProgramError> {
         let mut capture_index_map = vec![None; self.captures.len()];
@@ -558,7 +543,7 @@ impl<
     /// for example, a closed-over buffer referenced by several operations — which this pass deduplicates so the
     /// compiled function carries and transfers it only once. Captures that are never referenced are also dropped (a
     /// duplicate of an unused value still collapses to its first occurrence, which itself survives only if referenced),
-    /// and the returned program satisfies [`validate_capture_references`](Self::validate_capture_references).
+    /// and the returned program upholds the construction-time capture-table invariant of [`new`](Self::new).
     ///
     /// # Capture-value equality
     ///
@@ -777,17 +762,6 @@ mod tests {
     }
 
     #[test]
-    fn test_closed_program_into_parts() {
-        let closed_program = closed_add_program();
-        let (program, captures) = closed_program.into_parts();
-
-        assert_eq!(captures, vec![Scalar::from(3.0)]);
-        assert_eq!(program.input_ids().len(), 1);
-        assert_eq!(program.output_ids().len(), 1);
-        assert_eq!(program.instructions().len(), 1);
-    }
-
-    #[test]
     fn test_prune_unused_captures_drops_dead_capture_and_reindexes() {
         // The program references only capture #1; capture #0 (value 3.0) is dead.
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
@@ -814,7 +788,6 @@ mod tests {
             .filter_map(|atom| atom.as_constant().map(|reference| reference.index()))
             .collect::<Vec<_>>();
         assert_eq!(capture_indices, vec![0]);
-        pruned.validate_capture_references().unwrap();
 
         let output = pruned
             .interpret_with_captures(
@@ -853,7 +826,6 @@ mod tests {
             .filter_map(|atom| atom.as_constant().map(|reference| reference.index()))
             .collect::<Vec<_>>();
         assert_eq!(capture_indices, vec![0, 0]);
-        deduplicated.validate_capture_references().unwrap();
 
         // Equal values of different types are not interchangeable and therefore remain separate captures.
         let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
@@ -883,6 +855,5 @@ mod tests {
             .filter_map(|atom| atom.as_constant().map(CaptureReference::index))
             .collect::<Vec<_>>();
         assert_eq!(capture_indices, vec![0, 1]);
-        deduplicated.validate_capture_references().unwrap();
     }
 }
