@@ -1,3 +1,86 @@
+//! Contains machinery for _tracing_ Rust execution into typed [`Program`]s.
+//!
+//! Tracing substitutes symbolic [`Tracer`] values for runtime inputs and executes a Rust closure once. Operations
+//! on those tracers bind through an active staging context, which appends typed instructions to a shared
+//! [`ProgramBuilder`], and finalization validates the resulting atom graph and records the closure's structured
+//! outputs as an immutable program.
+//!
+//! Tracing records the operations bound by the host execution path. It does not record arbitrary Rust. Dynamic behavior
+//! must be represented by staged operations, and host branches execute during tracing only when their conditions are
+//! concretely available.
+//!
+//! ```text
+//!               ┌─────────────┐
+//!               │ Input Types │
+//!               └──────┬──────┘
+//!                      │ create input tracers
+//!                      ▼
+//!     ┌─────────────────────────────────┐
+//!     │ Tracing Context + Input Tracers │
+//!     └────────────────┬────────────────┘
+//!                      │ execute the Rust closure once, binding operations as instructions
+//!                      ▼
+//! ┌─────────────────────────────────────────┐
+//! │ Output Tracers + Recorded Instructions  │
+//! └────────────────────┬────────────────────┘
+//!                      │ build
+//!                      ▼
+//!                 ┌─────────┐
+//!                 │ Program │
+//!                 └─────────┘
+//! ```
+//!
+//! # Entry Points
+//!
+//! [`Domain::trace`] is the usual domain-oriented entry point. It creates a fresh [`DomainTracingContext`], converts
+//! the abstract input structure into tracers, invokes the closure, and returns both output types and the finalized
+//! program, while [`Domain::infer_output_type`] runs the same trace but retains only abstract outputs.
+//!
+//! Use [`TracingContext::trace`] directly when the value, operation, and capture types are named independently rather
+//! than through a domain. [`TracingContext::trace_with_named_axes`] additionally installs named-axis bindings for the
+//! trace, and [`NestedTracingContext::trace`] creates a fresh inner builder while retaining a parent context for
+//! lifting, captures, and composition inside higher-order transforms.
+//!
+//! # Tracers and Errors
+//!
+//! A [`Tracer`] stores its context, abstract type, and [`TracerState`]. A live tracer names one [`AtomId`] in its
+//! context's builder, and tracer equality is staging identity (i.e., same builder and same atom) and not runtime value
+//! equality.
+//!
+//! Operator conveniences use poisoned tracers to defer a staging failure until the trace boundary. Once a bind fails,
+//! downstream operations propagate [`TracerState::Poison`], and finalization returns the builder's original
+//! [`ProgramError`]. Explicitly fallible staging paths may return errors immediately. Code must never use an atom ID
+//! from one builder in another builder.
+//!
+//! # Tracing Contexts
+//!
+//! [`TracingContext`] is the ordinary root staging context. It owns shared handles to a program builder, a capture
+//! table, and named-axis bindings. Its constant type may differ from the concrete captured value type, which lets
+//! compiled domains store lifetime-free capture references in IR while retaining concrete runtime arrays separately.
+//!
+//! [`DomainTracingContext`] selects those generic parameters from a [`Domain`], and [`DomainTracer`] is its common
+//! tracer alias. [`NestedTracingContext`] wraps a parent context but allocates a new builder, making it suitable for
+//! tracing loop bodies, branches, derivative rules, and other nested programs without losing access to parent
+//! capabilities. [`NestedTracer`] is the corresponding alias.
+//!
+//! # Captures and Context Composition
+//!
+//! A tracing context implementing [`CapturingContext`] registers a concrete runtime value in its capture table and
+//! returns the staged constant payload referring to it. Transform and nested contexts delegate capture registration
+//! to their parent, so a captured value follows the same context stack as ordinary operations. Compilation uses this
+//! to build [`ClosedProgram`](crate::ClosedProgram)s without embedding runtime data in source IR.
+//!
+//! # Extending Tracing
+//!
+//! Most new operations need no tracing-specific implementation: implement the operation and its type inference, add it
+//! to the domain's operation family, and stage it through [`Context::bind`]. Tracer capability implementations should
+//! pass the concrete operation payload into the context and let the operation family's [`From`] conversion select the
+//! wrapper variant.
+//!
+//! A new staging context should implement [`Context`] with `Value = Tracer<Self>` and then [`StagingContext`]. Keep
+//! mutable builder state in shared handles, use checked builder APIs, make resolution conservative for foreign or
+//! poisoned tracers, and finalize only after all context and tracer clones have been dropped.
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::fmt::{Debug, Display};

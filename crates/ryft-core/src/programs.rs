@@ -1,3 +1,79 @@
+//! Contains machinery for representing and working with typed, structured, and effect-aware programs.
+//!
+//! A [`Program`] is Ryft's backend-neutral dataflow IR. It stores typed atoms, operation instructions, structured
+//! input and output boundaries, and enough metadata for interpretation, transformation, simplification, lowering, and
+//! compilation. Programs are immutable after construction. [`ProgramBuilder`] owns the mutable construction phase.
+//!
+//! ```text
+//! ┌─────────────────────────────┐
+//! │ Abstract Inputs + Constants │
+//! └──────────────┬──────────────┘
+//!                │ add atoms and record instructions
+//!                ▼
+//!       ┌─────────────────┐
+//!       │ Program Builder │
+//!       └────────┬────────┘
+//!                │ build structured boundaries
+//!                ▼
+//!           ┌─────────┐
+//!           │ Program │
+//!           └────┬────┘
+//!                ├── interpret through a context
+//!                ├── batch, differentiate, or partially evaluate
+//!                ├── simplify, filter, or inspect liveness and effects
+//!                └── lower and compile through a backend
+//! ```
+//!
+//! # Entry Points
+//!
+//! Most code obtains programs through [`Domain::trace`] or a transform rather than by manual construction, and
+//! replays them with [`Program::interpret`] (eagerly) or [`Program::interpret_in_context`] (through a chosen staging
+//! or transform context). Batching, differentiation, and partial evaluation add program-level functions in their own
+//! modules, and compilation opens captures, flattens boundaries, and hands the program to a backend
+//! [`CompilationDomain`](crate::CompilationDomain).
+//!
+//! Direct [`ProgramBuilder`] use is appropriate for operation and transform infrastructure. Tracer operations call
+//! [`ProgramBuilder::add_instruction`], which infers output types, allocates variable atoms, validates arity, and
+//! records the instruction, and [`ProgramBuilder::build`] validates the requested boundaries and freezes the result.
+//! Keep [`AtomId`]s from one builder isolated from every other builder, use the checked instruction path, and
+//! propagate the builder's first stored error rather than continuing with invalid IDs.
+//!
+//! [`Program::to_flat_program`] converts structured boundaries to vectors without changing the dataflow. Use it at
+//! internal compiler or nested-program boundaries, and preserve the structured form in user-facing APIs.
+//!
+//! # Core Data Model
+//!
+//! [`Value`] is the common contract for leaf values that can inhabit programs or flow through Ryft contexts. Every
+//! value has one associated type descriptor through [`Typed`], plus separate dispatch and execution domains used by
+//! capabilities and transforms.
+//!
+//! [`Atom`] is either a stored constant or a typed variable, and [`AtomId`] is its stable index in the program's atom
+//! table. An [`Instruction`] owns one [`Operation`] and lists the input and output atom IDs of that application.
+//! Operations define their own type inference and effect classes and the program supplies graph structure and order.
+//!
+//! [`Program`] combines those flat tables with typed, structured input and output boundaries. The boundary
+//! types are [`Parameterized`] containers whose leaves correspond positionally to [`Program::input_ids`] and
+//! [`Program::output_ids`], so compiler and transform kernels can operate on the flat IDs while callers retain tuples,
+//! vectors, maps, or derived product types.
+//!
+//! # Effects, Liveness, and Simplification
+//!
+//! [`Program::effects`] unions the effects declared by its operations. Instruction order is semantically relevant
+//! for ordered effects even when the dataflow graph contains no dependency between them.
+//!
+//! [`Program::live_sets`] computes the atoms and instructions required by selected roots. [`Program::simplified`]
+//! removes dead pure work while retaining effectful instructions as roots. [`Program::filtered`] projects a program
+//! to selected boundaries and accepts explicit keep-alive atoms for work that must survive the projection. These APIs
+//! preserve the invariants checked by normal program construction rather than treating effects as ordinary unused
+//! values.
+//!
+//! # Extending Programs
+//!
+//! New primitive behavior normally means adding an operation payload implementing [`Operation`] and including it in the
+//! appropriate closed operation family. Keep type inference, rendering, effects, and operation-specific transform rules
+//! with that payload, and use operation-family traits for recursive nested-program behavior instead of teaching
+//! [`Program`] about individual operation variants.
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;

@@ -1,4 +1,4 @@
-//! Structured parameter trees and type-preserving reparameterization.
+//! Contains machinery for representing and working with parameterized types and type-preserving reparameterization.
 //!
 //! Ryft APIs accept nested Rust structures (i.e., tuples, arrays, vectors, maps, options, and derived enums and
 //! structs) while compiler and transform kernels operate on flat leaf sequences. This module is the lossless bridge
