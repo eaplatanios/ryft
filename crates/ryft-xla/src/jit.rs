@@ -1462,7 +1462,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(compiled.source_program().captures().len(), 1);
-        assert_eq!(compiled.source_program().open_captures_as_inputs().unwrap().input_ids().len(), 2);
+        assert_eq!(compiled.source_program().to_program_with_lifted_captures().unwrap().input_ids().len(), 2);
 
         let input = Array::from_host_buffer(
             &client,

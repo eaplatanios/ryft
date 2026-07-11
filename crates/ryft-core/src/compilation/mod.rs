@@ -85,7 +85,7 @@
 //!
 //! Runtime values closed over by a traced closure are not embedded as literal data. A
 //! [`ClosedProgram`](crate::captures::ClosedProgram) keeps them in a side table while the source IR stores typed
-//! [`CaptureReference`](crate::captures::CaptureReference) indices. Before lowering, captures are opened
+//! [`CaptureReference`](crate::captures::CaptureReference) indices. Before lowering, captures are lifted
 //! as leading flat inputs, and execution supplies arguments in the same `[captures..., public inputs...]` order. This
 //! keeps IR compact, preserves device-resident buffers, and lets compilation depend on capture types rather than
 //! data.

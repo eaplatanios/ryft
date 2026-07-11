@@ -394,8 +394,10 @@ impl<
     Output: Parameterized<CaptureReference<V::Type>>,
 > ClosedProgram<V, O, Input, Output>
 {
-    /// Returns a flat program where captures are explicit leading inputs followed by the original program inputs.
-    pub fn open_captures_as_inputs(
+    /// Returns a [`Program`] where the captures have been lifted into explicit leading inputs that are followed by the
+    /// original program inputs. The [`ClosedProgram`] itself is unchanged: the returned program is a derived view
+    /// used by compilation, which supplies arguments in `[captures..., public inputs...]` order.
+    pub fn to_program_with_lifted_captures(
         &self,
     ) -> Result<
         Program<CaptureReference<V::Type>, O, Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>,
@@ -482,8 +484,9 @@ mod tests {
     use crate::types::{DataType, TypeError};
 
     use super::*;
-    
-    // TODO(eaplatanios): `test_closed_program_without_unused_captures`.
+
+    // TODO(eaplatanios): `test_closed_program_without_unused_captures`,
+    //  `test_closed_program_to_program_with_lifted_captures`.
 
     #[derive(Clone, Debug)]
     struct TestAddOperation;
@@ -523,13 +526,13 @@ mod tests {
     }
 
     #[test]
-    fn test_closed_program_opens_captures_as_leading_inputs() {
+    fn test_closed_program_lifts_captures_as_leading_inputs() {
         let program = closed_add_program();
-        let opened = program.open_captures_as_inputs().unwrap();
+        let lifted = program.to_program_with_lifted_captures().unwrap();
 
-        assert_eq!(opened.input_ids().len(), 2);
-        assert!(opened.atoms().iter().all(|atom| !atom.is_constant()));
-        let output = opened
+        assert_eq!(lifted.input_ids().len(), 2);
+        assert!(lifted.atoms().iter().all(|atom| !atom.is_constant()));
+        let output = lifted
             .interpret_with(
                 vec![Scalar::from(3.0), Scalar::from(2.0)],
                 |_, constant| Ok::<_, ProgramError>(Scalar::from(constant.index() as f64)),

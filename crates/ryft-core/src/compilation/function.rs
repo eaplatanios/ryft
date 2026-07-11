@@ -109,7 +109,7 @@ pub trait LoweringRequest<D: CompilationDomain>: Sized {
     fn staged(&self) -> &StagedFunction<D, Self::Input, Self::Output>;
 
     /// Opens runtime captures as leading flat inputs.
-    fn opened_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
+    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
     where
         D::Operation: Clone;
 
@@ -395,7 +395,7 @@ impl Default for JitCacheCapacities {
 
 /// Operation-family capability for representing a call to a staged program.
 ///
-/// The payload owns a flat program whose captures have been opened as leading inputs. The concrete operation family
+/// The payload owns a flat program whose captures have been lifted into leading inputs. The concrete operation family
 /// decides how that boundary lowers and how batching, differentiation, partial evaluation, and other transforms rewrite
 /// it. This keeps higher-order call semantics with the operation that owns them while allowing the lifecycle and
 /// capture plumbing to remain backend-neutral.
@@ -438,8 +438,8 @@ struct StagedFunctionState<
     /// Options applied before tracing and retained for lowering and compilation.
     options: Arc<D::Options>,
 
-    /// Memoized source program with captures opened as leading flat inputs.
-    opened_program: std::cell::OnceCell<Rc<FlatCompilationProgram<D>>>,
+    /// Memoized source program with captures lifted into leading flat inputs.
+    lifted_program: std::cell::OnceCell<Rc<FlatCompilationProgram<D>>>,
 }
 
 impl<
@@ -552,7 +552,7 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
-        let outputs = context.bind(D::Operation::compiled_call(self.opened_program()?), flat_inputs.as_slice())?;
+        let outputs = context.bind(D::Operation::compiled_call(self.lifted_program()?), flat_inputs.as_slice())?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
@@ -612,20 +612,20 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        context.bind(D::Operation::compiled_call(self.opened_program()?), flat_inputs.as_slice())
+        context.bind(D::Operation::compiled_call(self.lifted_program()?), flat_inputs.as_slice())
     }
 
-    /// Returns the source program with runtime captures opened as leading flat inputs.
+    /// Returns the source program with runtime captures lifted into leading flat inputs.
     #[doc(hidden)]
-    pub fn opened_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
+    pub fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
     where
         D::Operation: Clone,
     {
-        if let Some(program) = self.state.opened_program.get() {
+        if let Some(program) = self.state.lifted_program.get() {
             return Ok(program.clone());
         }
-        let program = Rc::new(self.state.source_program.open_captures_as_inputs()?);
-        Ok(self.state.opened_program.get_or_init(|| program).clone())
+        let program = Rc::new(self.state.source_program.to_program_with_lifted_captures()?);
+        Ok(self.state.lifted_program.get_or_init(|| program).clone())
     }
 }
 
@@ -642,11 +642,11 @@ impl<
         self
     }
 
-    fn opened_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
+    fn lifted_program(&self) -> Result<Rc<FlatCompilationProgram<D>>, ProgramError>
     where
         D::Operation: Clone,
     {
-        StagedFunction::opened_program(self)
+        StagedFunction::lifted_program(self)
     }
 
     fn into_lowered(self, program: D::LoweredProgram, output_types: Vec<D::Type>) -> LoweredFunction<D, Input, Output> {
@@ -1523,7 +1523,7 @@ where
             output_types,
             output_structure,
             options: Arc::new(options),
-            opened_program: std::cell::OnceCell::new(),
+            lifted_program: std::cell::OnceCell::new(),
         }),
     })
 }
@@ -1630,7 +1630,7 @@ mod tests {
         where
             Request: LoweringRequest<Self>,
         {
-            let program = staged.opened_program()?;
+            let program = staged.lifted_program()?;
             let mut output_types: Vec<DataType> = program
                 .output_ids()
                 .iter()
@@ -1711,7 +1711,7 @@ mod tests {
                 request.into_arguments(),
                 |_, capture| {
                     Err(ProgramError::MalformedProgram(format!(
-                        "opened test program retained capture {}",
+                        "lifted test program retained capture {}",
                         capture.index(),
                     )))
                 },

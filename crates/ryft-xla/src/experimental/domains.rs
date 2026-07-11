@@ -1867,9 +1867,9 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
     where
         Request: LoweringRequest<Self>,
     {
-        let opened_program = staged.opened_program()?;
+        let lifted_program = staged.lifted_program()?;
         let program = self.lower_xla_program(
-            &opened_program,
+            &lifted_program,
             staged.staged().source_program().captures().len(),
             staged.staged().options(),
         )?;
