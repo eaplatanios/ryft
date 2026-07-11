@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use prost::Message;
 
@@ -796,8 +796,10 @@ impl<'c> LoadedExecutable<'c> {
 
     /// Executes this [`LoadedExecutable`] on its _addressable_ devices (or on a single _addressable_ device if `device`
     /// is provided) using the provided inputs. Note that the execution of PJRT programs is asynchronous and so the
-    /// runtime may not have completed execution by the time this function returns. You can use [`Buffer::ready`] on the
-    /// returned [`Buffer`]s of [`Event::await`] on the returned [`Event`]s to wait for the execution to complete.
+    /// runtime may not have completed execution by the time this function returns. The returned [`Execution`] pairs the
+    /// per-device output [`Buffer`]s with the whole-execution [`ExecutionFence`] that joins every device's completion
+    /// event. Use [`Execution::block_until_ready`] (or the fence directly) to wait for the launch to complete and
+    /// observe asynchronous execution errors, or [`Buffer::ready`] to wait for individual outputs.
     ///
     /// # Parameters
     ///
@@ -833,7 +835,7 @@ impl<'c> LoadedExecutable<'c> {
         call_location: Option<&str>,
         incarnation_ids: Option<HashMap<usize, usize>>,
         device: Option<&Device<'c>>,
-    ) -> Result<Vec<ExecutionDeviceOutputs<'c>>, Error> {
+    ) -> Result<Execution<Vec<ExecutionDeviceOutputs<'c>>>, Error> {
         use ffi::PJRT_LoadedExecutable_Execute_Args;
 
         let mut inputs = inputs;
@@ -963,7 +965,7 @@ impl<'c> LoadedExecutable<'c> {
         // dimension corresponds to devices and the inner dimension corresponds to program inputs.
         let inputs = inputs
             .iter()
-            .map(|i| i.inputs.iter().map(|i| unsafe { i.buffer.to_c_api() }).collect::<Vec<_>>())
+            .map(|inputs| inputs.inputs.iter().map(|input| unsafe { input.buffer.to_c_api() }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
         let input_pointers = inputs.iter().map(|inputs| inputs.as_ptr()).collect::<Vec<_>>();
 
@@ -996,6 +998,7 @@ impl<'c> LoadedExecutable<'c> {
 
         // Process the outputs and the completion events.
         let mut execution_outputs = Vec::with_capacity(device_count);
+        let mut completion_events = Vec::with_capacity(device_count);
         for device_index in 0..device_count {
             let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
             let send_callbacks = std::mem::take(&mut send_callbacks[device_index]);
@@ -1015,13 +1018,19 @@ impl<'c> LoadedExecutable<'c> {
                 outputs.push(unsafe { Buffer::from_c_api(output_handle, self.api(), self.client)? });
             }
 
-            execution_outputs.push(ExecutionDeviceOutputs { outputs, done: done_event })
+            execution_outputs.push(ExecutionDeviceOutputs { outputs });
+            completion_events.push(done_event);
         }
 
-        Ok(execution_outputs)
+        Ok(Execution::new(execution_outputs, ExecutionFence::new(completion_events)))
     }
 
     /// Returns `true` if and only if this [`LoadedExecutable`] has been deleted using [`LoadedExecutable::delete`].
+    ///
+    /// Note that the reference PJRT plugin implementations of this query are currently unreliable. The `StreamExecutor`
+    /// GPU implementation reports inverted results (i.e., fresh executables report `true` and deleted executables
+    /// report `false` because their `IsDeleted` returns `executable_ != nullptr`), and the CPU implementation always
+    /// reports `false` because its `Delete` is a no-op and its `IsDeleted` is hardcoded to `false`.
     pub fn is_deleted(&self) -> Result<bool, Error> {
         use ffi::PJRT_LoadedExecutable_IsDeleted_Args;
         invoke_pjrt_api_error_fn!(self.api(), PJRT_LoadedExecutable_IsDeleted, { executable = self.to_c_api() }, {
@@ -1045,6 +1054,12 @@ impl<'c> LoadedExecutable<'c> {
         invoke_pjrt_api_error_fn!(self.api(), PJRT_LoadedExecutable_Delete, { executable = self.to_c_api() })
     }
 }
+
+// PJRT loaded executables are designed to be shared across threads. The plugin is responsible for making the underlying
+// `PJRT_LoadedExecutable` thread-safe. Multiple threads can invoke `Execute` on the same loaded executable concurrently
+// per the PJRT API contract (compiled artifacts are immutable).
+unsafe impl Send for LoadedExecutable<'_> {}
+unsafe impl Sync for LoadedExecutable<'_> {}
 
 impl Drop for LoadedExecutable<'_> {
     fn drop(&mut self) {
@@ -1122,16 +1137,161 @@ impl<'o, 'l> From<&'l [ExecutionInput<'o>]> for ExecutionDeviceInputs<'o, 'l> {
     }
 }
 
-/// Represents the output [`Buffer`]s on a single [`Device`] of a call to [`LoadedExecutable::execute`], paired with
-/// an [`Event`] that can be used to track when the computation for this program ηασ completed on that [`Device`].
+/// Represents the output [`Buffer`]s on a single [`Device`] of a call to [`LoadedExecutable::execute`]. Whole-launch
+/// completion (including work with no corresponding output buffer, such as effects) is tracked by the
+/// [`ExecutionFence`] of the [`Execution`] returned by [`LoadedExecutable::execute`], which joins the per-device
+/// completion events of the launch.
 pub struct ExecutionDeviceOutputs<'o> {
     /// [`Vec`] that contains the output [`Buffer`] that corresponds to each output of the [`LoadedExecutable`]
     /// that was executed.
     pub outputs: Vec<Buffer<'o>>,
+}
 
-    /// [`Event`] that can be used to track when all computation pending on a single [`Device`] for the execution of
-    /// a [`LoadedExecutable`] is completed.
-    pub done: Event<()>,
+/// State of an [`ExecutionFence`], transitioning from [`ExecutionFenceState::Pending`] to
+/// [`ExecutionFenceState::Complete`] the first time a [`ExecutionFence`] owner observes completion.
+enum ExecutionFenceState {
+    /// The execution has not been observed as complete yet, and the per-device completion [`Event`]s
+    /// returned by the PJRT launch have not been consumed yet.
+    Pending(Vec<Event<()>>),
+
+    /// The execution has completed and its per-device completion [`Event`]s have been consumed, with the recorded
+    /// result carrying the first observed asynchronous execution [`Error`], if any.
+    Complete(Result<(), Error>),
+}
+
+/// Shared completion state for one asynchronous PJRT execution across all participating addressable devices. PJRT
+/// execution is enqueued before this value is constructed. Creating or cloning an [`ExecutionFence`] never waits.
+/// Call [`Self::block_until_ready`] only at an explicit host synchronization boundary. The first waiter owns the
+/// underlying PJRT events and records their result, while later waiters observe that same result without waiting
+/// on an event twice. This fence plays the role that [`tsl::JoinFutures`](
+/// https://github.com/openxla/xla/blob/main/xla/tsl/concurrency/future.h) plays for JAX. XLA joins the per-device
+/// completion futures returned by [`PjRtLoadedExecutable::Execute`](
+/// https://github.com/openxla/xla/blob/main/xla/pjrt/pjrt_client.h) into a single all-of/first-error future that is
+/// then shared by every output array of the launch. XLA futures are multi-consumer values backed by shared state, so
+/// that join needs no locking, whereas PJRT C API events (and the [`Event`]s wrapping them) are single-consumer, and
+/// so this fence recreates the shared observation on top of them.
+#[derive(Clone)]
+pub struct ExecutionFence {
+    /// Shared per-execution completion state. The first waiter consumes the per-device completion [`Event`]s stored
+    /// inside and records their joined result for every later (or cloned) observer.
+    state: Arc<Mutex<ExecutionFenceState>>,
+}
+
+impl ExecutionFence {
+    /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s.
+    #[inline]
+    pub fn new(events: Vec<Event<()>>) -> Self {
+        Self { state: Arc::new(Mutex::new(ExecutionFenceState::Pending(events))) }
+    }
+
+    /// Returns `true` once every participating [`Event`] is completed, while preserving any asynchronous execution
+    /// error for [`Self::block_until_ready`]. This function only polls and never blocks. If another owner of this
+    /// fence is concurrently observing it (e.g., it is blocked inside [`Self::block_until_ready`]), then this
+    /// function conservatively returns `false` for this poll instead of waiting for that observation to finish.
+    pub fn is_ready(&self) -> Result<bool, Error> {
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            // Another owner of this fence is concurrently observing it. If it is blocked inside `block_until_ready`,
+            // then waiting for the lock would block this poll until the whole execution completes, so we conservatively
+            // report that completion has not been observed yet, mirroring how XLA future readiness queries never block
+            // on concurrent waiters of the same shared state.
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => panic!("execution fence state mutex poisoned"),
+        };
+        match &mut *state {
+            ExecutionFenceState::Pending(events) => {
+                for event in events.iter() {
+                    if !event.ready()? {
+                        return Ok(false);
+                    }
+                }
+                let events = std::mem::take(events);
+                let result = Self::await_events(events);
+                *state = ExecutionFenceState::Complete(result.clone());
+                result.map(|_| true)
+            }
+            ExecutionFenceState::Complete(result) => result.clone().map(|_| true),
+        }
+    }
+
+    /// Blocks until every participating [`Event`] is completed and returns the first execution error, if any.
+    pub fn block_until_ready(&self) -> Result<(), Error> {
+        let mut state = self.state.lock().expect("execution fence state mutex poisoned");
+        match &mut *state {
+            ExecutionFenceState::Pending(events) => {
+                let result = Self::await_events(std::mem::take(events));
+                *state = ExecutionFenceState::Complete(result.clone());
+                result
+            }
+            ExecutionFenceState::Complete(result) => result.clone(),
+        }
+    }
+
+    /// Blocks until every provided [`Event`] is ready and returns the first observed asynchronous execution [`Error`],
+    /// if any. All events are consumed (i.e., awaited) even after an error is observed, so that no completion event is
+    /// left pending when the joined result is recorded.
+    fn await_events(events: Vec<Event<()>>) -> Result<(), Error> {
+        let mut result = Ok(());
+        for event in events {
+            if let Err(error) = event.r#await()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
+        }
+        result
+    }
+}
+
+/// Output of an asynchronously enqueued PJRT execution together with its whole-execution completion fence,
+/// as returned by [`LoadedExecutable::execute`].
+pub struct Execution<Output> {
+    /// Output of the execution, which may still be pending (i.e., its underlying buffers may not be ready yet).
+    output: Output,
+
+    /// Whole-execution completion [`ExecutionFence`] shared by all consumers of this execution's outputs.
+    fence: ExecutionFence,
+}
+
+impl<Output> Execution<Output> {
+    /// Creates a new [`Execution`].
+    #[inline]
+    pub fn new(output: Output, fence: ExecutionFence) -> Self {
+        Self { output, fence }
+    }
+
+    /// Returns the output of this [`Execution`] without waiting for it to complete. The returned output may still be
+    /// pending (i.e., its underlying buffers may not be ready yet), but it is immediately usable (e.g., it can be
+    /// fed into further executions, which the PJRT runtime will order after this execution on the devices).
+    #[inline]
+    pub fn output(&self) -> &Output {
+        &self.output
+    }
+
+    /// Returns the whole-execution completion [`ExecutionFence`] of this [`Execution`].
+    #[inline]
+    pub fn fence(&self) -> &ExecutionFence {
+        &self.fence
+    }
+
+    /// Consumes this [`Execution`] and returns its possibly still pending output without waiting.
+    #[inline]
+    pub fn into_output(self) -> Output {
+        self.output
+    }
+
+    /// Consumes this [`Execution`] and returns its possibly still pending output and whole-execution fence
+    /// without waiting.
+    #[inline]
+    pub fn into_parts(self) -> (Output, ExecutionFence) {
+        (self.output, self.fence)
+    }
+
+    /// Blocks until this entire [`Execution`] completes, returning its output or the first execution error.
+    pub fn block_until_ready(self) -> Result<Output, Error> {
+        self.fence.block_until_ready()?;
+        Ok(self.output)
+    }
 }
 
 /// Callback function that is invoked from the runtime when executing _send_ operations in [`Program`]s. The channel ID
@@ -1160,7 +1320,7 @@ pub struct SendCallback {
     /// If this function returns an [`Error`], then PJRT might propagate that error properly, though not all
     /// implementations will do that; there may be cases where an implementation continues executing the program with
     /// _undefined_ data being sent downstream which can be _unsafe_.
-    pub function: Box<dyn FnMut(Chunk, usize, bool) -> Result<(), Error>>,
+    pub function: Box<dyn FnMut(Chunk, usize, bool) -> Result<(), Error> + Send>,
 }
 
 impl SendCallback {
@@ -1218,7 +1378,7 @@ pub struct ReceiveCallback {
     /// is executed. This function will be invoked once for each _receive_ operation. It receives as input a
     /// [`CopyToDeviceStream`] which must be used to _stream_ data to the PJRT runtime. Specifically, the data
     /// will be sent in [`Chunk`]s.
-    pub function: Box<dyn FnMut(CopyToDeviceStream<'_>)>,
+    pub function: Box<dyn FnMut(CopyToDeviceStream<'_>) + Send>,
 
     /// Underlying PJRT [`Api`].
     api: Api,
@@ -1406,7 +1566,7 @@ impl<'s> Client<'s> {
     /// Creates a new [`SendCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _send_ operation in the
     /// [`Program`] that will be executed.
-    pub fn send_callback<F: 'static + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
+    pub fn send_callback<F: 'static + Send + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
         &self,
         channel_id: usize,
         function: F,
@@ -1417,7 +1577,7 @@ impl<'s> Client<'s> {
     /// Creates a new [`ReceiveCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _receive_ operation in the
     /// [`Program`] that will be executed.
-    pub fn receive_callback<F: 'static + FnMut(CopyToDeviceStream<'_>)>(
+    pub fn receive_callback<F: 'static + Send + FnMut(CopyToDeviceStream<'_>)>(
         &self,
         channel_id: usize,
         function: F,
@@ -1459,7 +1619,7 @@ impl Plugin {
     /// Creates a new [`SendCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _send_ operation in the
     /// [`Program`] that will be executed.
-    pub fn send_callback<F: 'static + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
+    pub fn send_callback<F: 'static + Send + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
         &self,
         channel_id: usize,
         function: F,
@@ -1470,7 +1630,7 @@ impl Plugin {
     /// Creates a new [`ReceiveCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _receive_ operation in the
     /// [`Program`] that will be executed.
-    pub fn receive_callback<F: 'static + FnMut(CopyToDeviceStream<'_>)>(
+    pub fn receive_callback<F: 'static + Send + FnMut(CopyToDeviceStream<'_>)>(
         &self,
         channel_id: usize,
         function: F,
@@ -1529,7 +1689,7 @@ impl Api {
     /// Creates a new [`SendCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _send_ operation in the
     /// [`Program`] that will be executed.
-    pub(crate) fn send_callback<F: 'static + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
+    pub(crate) fn send_callback<F: 'static + Send + FnMut(Chunk, usize, bool) -> Result<(), Error>>(
         &self,
         channel_id: usize,
         function: F,
@@ -1540,7 +1700,7 @@ impl Api {
     /// Creates a new [`ReceiveCallback`] for the provided channel ID and using the provided callback function.
     /// The channel ID provided here **must match** the corresponding channel ID in a _receive_ operation in the
     /// [`Program`] that will be executed.
-    pub(crate) fn receive_callback<F: 'static + FnMut(CopyToDeviceStream<'_>)>(
+    pub(crate) fn receive_callback<F: 'static + Send + FnMut(CopyToDeviceStream<'_>)>(
         &self,
         channel_id: usize,
         function: F,
@@ -2554,13 +2714,12 @@ mod tests {
 
     use crate::extensions::multi_slice::{self, MultiSliceConfig, MultiSliceExtension};
     use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-    use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
-    use crate::{
-        BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, Executable, ExecutionContext,
-        ExecutionDeviceInputs, ExecutionInput, LoadOptions, LoadedExecutable, Program, slice_from_c_api,
-    };
+    use crate::tests::{TestPlatform, test_cpu_client, test_cpu_plugin, test_for_each_platform};
+    use crate::{BufferType, Chunk, ClientOptions, CpuClientOptions, DeviceAssignment, Error, slice_from_c_api};
 
-    use super::ffi;
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
 
     fn test_program(include_send_operation: bool, include_receive_operation: bool) -> Program {
         let module = match (include_send_operation, include_receive_operation) {
@@ -2978,9 +3137,13 @@ mod tests {
             let options = test_compilation_options();
             let loaded_executable = client.compile(&program, &options).unwrap();
 
-            // TODO(eaplatanios): Is this just broken or are we doing something wrong here?
-
-            // [`LoadedExecutable::is_deleted`] does not appear to work correctly for the GPU plugins.
+            // The assertions below encode known upstream bugs in the reference PJRT plugin implementations
+            // of `PJRT_LoadedExecutable_IsDeleted`, rather than the intended semantics:
+            //   - The StreamExecutor GPU implementation has inverted polarity (i.e., `return executable_ != nullptr;`
+            //     in `PjRtStreamExecutorLoadedExecutable::IsDeleted`), and so fresh executables report `true` and
+            //     deleted executables report `false`.
+            //   - The CPU implementation is a stub: `PjRtCpuLoadedExecutable::Delete` is a no-op and its `IsDeleted`
+            //     always returns `false`.
             match platform {
                 TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
                     assert_eq!(loaded_executable.is_deleted(), Ok(true));
@@ -2989,8 +3152,6 @@ mod tests {
             };
 
             assert!(unsafe { loaded_executable.delete() }.is_ok());
-
-            // [`LoadedExecutable::is_deleted`] does not appear to work correctly for any plugin.
             assert_eq!(loaded_executable.is_deleted(), Ok(false));
         });
     }
@@ -3027,12 +3188,16 @@ mod tests {
             };
 
             // Execute the test program using our two input tensors.
-            let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+            let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
+
+            // Wait for the asynchronous execution to complete through its shared fence. Clones observe the
+            // recorded completion result without attempting to consume the PJRT events a second time.
+            let cloned_fence = execution.fence().clone();
+            let mut outputs = execution.block_until_ready().unwrap();
             assert_eq!(outputs.len(), 1);
             let mut outputs = outputs.remove(0);
-
-            // Wait for the asynchronous execution to complete.
-            outputs.done.r#await().unwrap();
+            assert_eq!(cloned_fence.is_ready(), Ok(true));
+            cloned_fence.block_until_ready().unwrap();
             let output = outputs.outputs.remove(0);
 
             // Copy the contents of the output buffer to the host.
@@ -3044,6 +3209,36 @@ mod tests {
             expected_output_bytes.extend_from_slice(&(-42i32).to_ne_bytes());
             assert_eq!(output_bytes, expected_output_bytes);
         });
+    }
+
+    #[test]
+    fn test_execution_fence_records_asynchronous_error() {
+        let client = test_cpu_client();
+        let expected = Error::aborted("asynchronous execution failed");
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(expected.clone())).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let cloned_fence = fence.clone();
+        let error = fence.block_until_ready().unwrap_err();
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.message(), expected.message());
+        let cloned_error = cloned_fence.block_until_ready().unwrap_err();
+        assert_eq!(cloned_error.code(), expected.code());
+        assert_eq!(cloned_error.message(), expected.message());
+    }
+
+    #[test]
+    fn test_execution_fence_waits_across_threads() {
+        assert_send_sync::<ExecutionFence>();
+        assert_send_sync::<Execution<()>>();
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let waiting_fence = fence.clone();
+        let waiter = std::thread::spawn(move || waiting_fence.block_until_ready());
+        promise.set(None).unwrap();
+        waiter.join().unwrap().unwrap();
+        assert_eq!(fence.is_ready(), Ok(true));
     }
 
     #[test]
@@ -3224,12 +3419,12 @@ mod tests {
                     };
 
                     // Execute the test program using our two input tensors.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.
@@ -3326,12 +3521,12 @@ mod tests {
                     };
 
                     // Execute the test program using our input tensor.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.
@@ -3442,12 +3637,12 @@ mod tests {
                     };
 
                     // Execute the test program.
-                    let mut outputs = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
-                    assert_eq!(outputs.len(), 1);
-                    let mut outputs = outputs.remove(0);
+                    let execution = executable.execute(vec![inputs], 0, None, None, None, None).unwrap();
 
                     // Wait for the asynchronous execution to complete.
-                    outputs.done.r#await().unwrap();
+                    let mut outputs = execution.block_until_ready().unwrap();
+                    assert_eq!(outputs.len(), 1);
+                    let mut outputs = outputs.remove(0);
                     let output = outputs.outputs.remove(0);
 
                     // Copy the contents of the output buffer to the host.

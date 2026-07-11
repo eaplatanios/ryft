@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Added native bindings for converting XProf `XSpace` traces into XLA feedback-directed optimization profiles and
+  aggregating multiple instruction profiles at a configurable percentile.
 - Added support for Linux AArch64.
 - Added C++ bindings for the `affine`, `arith`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
   `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
