@@ -33,7 +33,7 @@ impl ToPjrt for Tile {
     type Output = PjrtTile;
 
     fn to_pjrt(&self) -> PjrtTile {
-        PjrtTile { dimensions: self.dimensions.iter().map(ToPjrt::to_pjrt).collect() }
+        PjrtTile { dimensions: self.dimensions().iter().map(ToPjrt::to_pjrt).collect() }
     }
 }
 
@@ -50,7 +50,7 @@ impl ToPjrt for TiledLayout {
 
     fn to_pjrt(&self) -> Result<PjrtTiledLayout, LayoutError> {
         Ok(PjrtTiledLayout::new(
-            self.minor_to_major
+            self.minor_to_major()
                 .iter()
                 .copied()
                 .map(|dimension| {
@@ -61,7 +61,7 @@ impl ToPjrt for TiledLayout {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
-            self.tiles.iter().map(ToPjrt::to_pjrt).collect(),
+            self.tiles().iter().map(ToPjrt::to_pjrt).collect(),
         ))
     }
 }
@@ -93,7 +93,7 @@ impl ToPjrt for StridedLayout {
 
     fn to_pjrt(&self) -> Result<PjrtStridedLayout, LayoutError> {
         Ok(PjrtStridedLayout::new(
-            self.strides
+            self.strides()
                 .iter()
                 .copied()
                 .map(|stride| {
