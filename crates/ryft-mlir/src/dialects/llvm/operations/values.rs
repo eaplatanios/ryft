@@ -146,11 +146,13 @@ mod tests {
                 assert_eq!(op.output_type().unwrap(), token_type);
                 assert_eq!(op.operands().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 0);
                 assert_eq!(op.results().collect::<Result<Vec<_>, _>>().unwrap().into_iter().count(), 1);
-                let op = block.append_operation(op).unwrap();
-                block.append_operation(func::r#return(&[op.result(0).unwrap()], location).unwrap()).unwrap();
+                // Note that token values cannot cross function boundaries (i.e., `func.return` does not have the
+                // `TokenConsumerTrait`), and so the produced token is not returned from the function.
+                block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[] as &[ValueRef], location).unwrap()).unwrap();
                 func::func(
                     "llvm_none_test",
-                    func::FuncAttributes { arguments: vec![], results: vec![token_type.into()], ..Default::default() },
+                    func::FuncAttributes { arguments: vec![], results: vec![], ..Default::default() },
                     block.try_into().unwrap(),
                     location,
                 )
@@ -162,9 +164,9 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  func.func @llvm_none_test() -> token {
+                  func.func @llvm_none_test() {
                     %0 = llvm.mlir.none : token
-                    return %0 : token
+                    return
                   }
                 }
             "},

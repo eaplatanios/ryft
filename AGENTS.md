@@ -391,7 +391,15 @@ and `ffi.rs` as authoritative references. All new extensions must follow these s
 - Keep the checksum verification and artifact naming/URL logic explicit and up-to-date.
 - `src/bindings.rs` is the result of code that was generated using `bindgen` and then very slightly edited.
   If you regenerate it using `bindgen` make sure to apply the same slight edits that we have already applied,
-  after regenerating it.
+  after regenerating it. The slight edits are: (1) prepend the manual prelude at the top of the checked-in file
+  (the `#![allow(...)]` attribute, the opaque `PJRT_Api` handle with `GetPjrtApi`, and the opaque
+  `XlaCustomCallStatus` with its two functions), and (2) remove all generated `PJRT_*` and `PLUGIN_Profiler*`
+  items, the generated `XlaCustomCallStatus` items, and the `XLA_FFI_API_MAJOR`/`XLA_FFI_API_MINOR` constants,
+  because `ryft-pjrt` provides its own hand-written ffi modules for the PJRT C API.
+- When upgrading the OpenXLA pin, also sync the `rules_ml_toolchain` pin in `WORKSPACE` and the hermetic toolchain
+  `--repo_env` pins in `.bazelrc` (e.g., `ROCM_DISTRO_VERSION`) with the versions used by the new OpenXLA commit
+  (see `workspace3.bzl` and `third_party/gpus/rocm_configure.bzl` in the OpenXLA repository); mismatches fail the
+  artifact build at repository-rule evaluation time.
 - Keep the Rust and C++ distributed-runtime bridge structs and signatures synchronized.
 - Keep the Rust proto message types in `crates/ryft-xla-sys/src/protos.rs` synchronized with the corresponding `.proto`
   files in the OpenXLA repository, whenever upgrading our XLA dependency.

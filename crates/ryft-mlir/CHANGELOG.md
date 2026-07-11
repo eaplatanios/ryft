@@ -52,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Removed the LLVM dialect `TokenTypeRef` and `Context::llvm_token_type` following the upstream MLIR replacement of
   `!llvm.token` with the builtin `token` type, which is now wrapped by the builtin `TokenTypeRef` and
-  `Context::token_type`.
+  `Context::token_type`. Note that builtin token values cannot cross function boundaries (producing operations must
+  have the MLIR `TokenProducerTrait` and consuming operations must have the `TokenConsumerTrait`).
+- Removed the EmitC `apply` operation wrapper following the upstream removal of the deprecated `emitc.apply`
+  operation, whose functionality is covered by the existing `address_of` and `dereference` operation wrappers.
 
 ## [0.0.2] - 2026-03-02
 
