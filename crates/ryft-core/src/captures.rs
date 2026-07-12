@@ -489,84 +489,25 @@ impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Param
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::backends::scalars::Scalar;
+    use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_count;
-    use crate::operations::Operation;
+    use crate::operations::math::AddOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
-    use crate::types::{DataType, TypeError};
+    use crate::types::DataType;
 
     use super::*;
 
-    // TODO(eaplatanios): `test_closed_program_without_unused_captures`,
-    //  `test_closed_program_to_program_with_lifted_captures`.
-
-    #[derive(Clone, Debug)]
-    struct TestAddOperation;
-
-    impl Operation<DataType> for TestAddOperation {
-        fn name(&self) -> &'static str {
-            "test_add"
-        }
-
-        fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-            check_count!("input", input_types, 2, TypeError);
-            Ok(vec![input_types[0].clone()])
-        }
-    }
-
-    impl<C> InterpretableOperation<Scalar, C> for TestAddOperation {
-        fn interpret(&self, _context: &C, inputs: &[Scalar]) -> Result<Vec<Scalar>, ProgramError> {
-            check_count!("input", inputs, 2, ProgramError);
-            Ok(vec![inputs[0] + inputs[1]])
-        }
-    }
-
-    fn closed_add_program()
-    -> ClosedProgram<Scalar, TestAddOperation, Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>> {
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(DataType::F64);
-        let capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
-        let output = builder.add_instruction(TestAddOperation, vec![input, capture]).unwrap()[0];
-        let program = builder
-            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        ClosedProgram::new(program, vec![Scalar::from(3.0)]).unwrap()
-    }
-
     #[test]
-    fn test_closed_program_lifts_captures_as_leading_inputs() {
-        let program = closed_add_program();
-        let lifted = program.to_program_with_lifted_captures().unwrap();
-
-        assert_eq!(lifted.input_ids().len(), 2);
-        assert!(lifted.atoms().iter().all(|atom| !atom.is_constant()));
-        let output = lifted
-            .interpret_with(
-                vec![Scalar::from(3.0), Scalar::from(2.0)],
-                |_, constant| Ok::<_, ProgramError>(Scalar::from(constant.index() as f64)),
-                |instruction, inputs| instruction.operation().interpret(&EagerContext::<Scalar>::new(), inputs),
-            )
-            .unwrap();
-
-        assert_eq!(output, vec![5.0]);
-    }
-
-    #[test]
-    fn test_closed_program_rejects_invalid_capture_references() {
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
+    fn test_closed_program_without_unused_captures() {
+        // Construction rejects references to missing captures.
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
@@ -581,8 +522,8 @@ mod tests {
                 if message == "captured constant atom %0 references missing capture #1",
         ));
 
-        // A reference whose declared type differs from its capture's runtime type is rejected at the same boundary.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
+        // Construction rejects references whose declared type differs from their capture's runtime type.
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let capture = builder.add_constant(CaptureReference::new(0, DataType::I64));
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
@@ -597,15 +538,13 @@ mod tests {
                 if message
                     == "captured constant atom %0 references capture #0 with type f64, but the atom has type i64",
         ));
-    }
 
-    #[test]
-    fn test_without_unused_captures_drops_dead_capture_and_reindexes() {
-        // The program references only capture #1; capture #0 (value 3.0) is dead.
-        let mut builder = ProgramBuilder::<CaptureReference<DataType>, TestAddOperation>::new();
+        // Pruning drops the dead capture #0 and re-indexes the surviving capture #1 into a contiguous table
+        // while preserving the program structure.
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
         let input = builder.add_input(DataType::F64);
         let capture = builder.add_constant(CaptureReference::new(1, DataType::F64));
-        let output = builder.add_instruction(TestAddOperation, vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![input, capture]).unwrap()[0];
         let program = builder
             .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
                 vec![output],
@@ -614,27 +553,94 @@ mod tests {
             )
             .unwrap();
         let program = ClosedProgram::new(program, vec![Scalar::from(3.0), Scalar::from(99.0)]).unwrap();
-
         let pruned = program.without_unused_captures().unwrap();
-
-        // The dead capture is dropped and the survivor is reindexed to a contiguous table.
-        assert_eq!(pruned.captures(), &[99.0]);
+        assert_eq!(pruned.captures(), &[Scalar::from(99.0)]);
         let capture_indices = pruned
             .program()
             .atoms()
             .iter()
-            .filter_map(|atom| atom.as_constant().map(|reference| reference.index()))
+            .filter_map(|atom| atom.as_constant().map(CaptureReference::index))
             .collect::<Vec<_>>();
         assert_eq!(capture_indices, vec![0]);
+        assert_eq!(
+            pruned.program().to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = const
+                    %2:f64 = add %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
 
+        // Pruning a program whose captures are all referenced is an identity transformation.
+        let repruned = pruned.clone().without_unused_captures().unwrap();
+        assert_eq!(repruned.captures(), pruned.captures());
+        assert_eq!(repruned.program().to_string(), pruned.program().to_string());
+
+        // The pruned program interprets equivalently through the re-indexed capture table.
         let output = pruned
             .program()
             .interpret_with(
                 vec![Scalar::from(2.0)],
                 |_, reference| Ok::<_, ProgramError>(pruned.captures()[reference.index()]),
-                |instruction, inputs| instruction.operation().interpret(&EagerContext::<Scalar>::new(), inputs),
+                |instruction, inputs| {
+                    instruction.operation().interpret(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), inputs)
+                },
             )
             .unwrap();
-        assert_eq!(output, vec![101.0]);
+        assert_eq!(output, vec![Scalar::from(101.0)]);
+    }
+
+    #[test]
+    fn test_closed_program_to_program_with_lifted_captures() {
+        // The program computes `(input + capture#0) + capture#0` through one shared constant atom, and capture #1 is
+        // never referenced, so the lift covers shared references and dead captures at once.
+        let mut builder = ProgramBuilder::<CaptureReference<DataType>, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let capture = builder.add_constant(CaptureReference::new(0, DataType::F64));
+        let sum = builder.add_instruction(AddOperation, vec![input, capture]).unwrap()[0];
+        let output = builder.add_instruction(AddOperation, vec![sum, capture]).unwrap()[0];
+        let program = builder
+            .build::<Vec<CaptureReference<DataType>>, Vec<CaptureReference<DataType>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let program = ClosedProgram::new(program, vec![Scalar::from(3.0), Scalar::from(7.0)]).unwrap();
+
+        // Captures become leading inputs in capture-table order (one per capture, dead ones included), followed by
+        // the original program input, and no captured-constant atoms remain. The shared constant atom maps to a
+        // single capture input.
+        let lifted = program.to_program_with_lifted_captures().unwrap();
+        assert_eq!(lifted.input_ids().len(), 3);
+        assert!(lifted.atoms().iter().all(|atom| !atom.is_constant()));
+        assert_eq!(
+            lifted.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64, %2:f64 .
+                let %3:f64 = add %2 %0
+                    %4:f64 = add %3 %0
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // The closed program is unchanged: the lift is a derived view.
+        assert_eq!(program.captures().len(), 2);
+        assert_eq!(program.program().atoms().iter().filter(|atom| atom.is_constant()).count(), 1);
+
+        // The lifted program interprets with arguments supplied in `[captures..., public inputs...]` order.
+        let output = lifted
+            .interpret_with::<Scalar, ProgramError, _, _>(
+                vec![Scalar::from(3.0), Scalar::from(7.0), Scalar::from(2.0)],
+                |_, _| unreachable!("the lifted program contains no captured-constant atoms"),
+                |instruction, inputs| {
+                    instruction.operation().interpret(&EagerContext::<Scalar, ScalarOperation<Scalar>>::new(), inputs)
+                },
+            )
+            .unwrap();
+        assert_eq!(output, vec![Scalar::from(8.0)]);
     }
 }
