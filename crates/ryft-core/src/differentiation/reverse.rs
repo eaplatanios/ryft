@@ -320,13 +320,12 @@ impl<
         // per primal input. Recover the structured form by reattaching this program's output and input structures to
         // the flat pullback, keeping its atoms, instructions, and input/output `AtomId`s unchanged.
         let flat = self.transpose_with_respect_to(&(0..self.input_ids().len()).collect::<Vec<_>>())?;
+        let Program { regions, entry, .. } = flat;
         Ok(Program {
-            atoms: flat.atoms,
-            input_ids: flat.input_ids,
-            output_ids: flat.output_ids,
-            instructions: flat.instructions,
             input_structure: self.output_structure().clone(),
             output_structure: self.input_structure().clone(),
+            regions,
+            entry,
             marker: PhantomData,
         })
     }
@@ -615,9 +614,11 @@ impl<
         let builder = context.builder().clone();
         {
             let mut builder_borrow = builder.borrow_mut();
-            builder_borrow.atoms.reserve(self.output_ids.len() + self.instructions.len() + self.input_ids.len());
-            builder_borrow.input_ids.reserve(self.output_ids.len());
-            builder_borrow.instructions.reserve(self.instructions.len() + self.input_ids.len());
+            builder_borrow
+                .atoms
+                .reserve(self.output_ids().len() + self.instructions().len() + self.input_ids().len());
+            builder_borrow.input_ids.reserve(self.output_ids().len());
+            builder_borrow.instructions.reserve(self.instructions().len() + self.input_ids().len());
         }
 
         // Seed the reverse pass with one cotangent input for each primal output, typed with that output's cotangent
@@ -1547,14 +1548,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::marker::PhantomData;
 
     use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
-
-    use std::cell::Cell;
 
     use crate::backends::scalars::{Scalar, ScalarOperation};
     use crate::contexts::EagerContext;
@@ -1568,7 +1568,9 @@ mod tests {
     use crate::operations::math::{AddOperation, MulOperation, Sin};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+    use crate::programs::{
+        Atom, AtomId, Instruction, MaybeZero, Program, ProgramBuilder, ProgramError, Region, RegionId, Value,
+    };
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
     use crate::types::{DataType, TypeError, Typed};
 
@@ -1955,12 +1957,15 @@ mod tests {
         // Test that an unbound program input atom is reported.
         let input = AtomId::new(0);
         let program = Program::<Scalar, TestLinearOperation, Scalar, ()> {
-            atoms: Vec::new(),
-            input_ids: vec![input],
-            output_ids: Vec::new(),
-            instructions: Vec::new(),
             input_structure: Placeholder,
             output_structure: (),
+            regions: vec![Region {
+                atoms: Vec::new(),
+                input_ids: vec![input],
+                output_ids: Vec::new(),
+                instructions: Vec::new(),
+            }],
+            entry: RegionId::new(0),
             marker: PhantomData,
         };
         assert!(matches!(
@@ -1972,12 +1977,15 @@ mod tests {
         let input = AtomId::new(0);
         let missing_output = AtomId::new(1);
         let program = Program::<Scalar, TestLinearOperation, Scalar, Scalar> {
-            atoms: vec![Atom::Variable(DataType::F64)],
-            input_ids: vec![input],
-            output_ids: vec![input],
-            instructions: vec![Instruction::new(TestLinearOperation::Identity, vec![input], vec![missing_output])],
             input_structure: Placeholder,
             output_structure: Placeholder,
+            regions: vec![Region {
+                atoms: vec![Atom::Variable(DataType::F64)],
+                input_ids: vec![input],
+                output_ids: vec![input],
+                instructions: vec![Instruction::new(TestLinearOperation::Identity, vec![input], vec![missing_output])],
+            }],
+            entry: RegionId::new(0),
             marker: PhantomData,
         };
         assert!(matches!(

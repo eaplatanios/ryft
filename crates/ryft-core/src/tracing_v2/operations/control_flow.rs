@@ -167,26 +167,27 @@ where
 /// Appends one fresh variable atom to a built `program` by direct program-field extension (every appended atom is a
 /// fresh variable, so the [`Program`] invariants that [`ProgramBuilder`] would have established are preserved) and
 /// returns its id.
-fn append_program_variable<V: Value<Type = ArrayType>, O>(
+fn append_program_variable<V: Value<Type = ArrayType>, O: Operation<ArrayType>>(
     program: &mut Program<V, O, Vec<V>, Vec<V>>,
     r#type: ArrayType,
 ) -> AtomId {
-    let id = AtomId::new(program.atoms.len());
-    program.atoms.push(Atom::Variable(r#type));
+    let entry = program.entry_region_mut();
+    let id = AtomId::new(entry.atoms.len());
+    entry.atoms.push(Atom::Variable(r#type));
     id
 }
 
 /// Appends one instruction with a single fresh output atom to a built `program` by direct program-field extension
 /// (the appended instruction reads existing atoms and writes a fresh variable, so the [`Program`] invariants that
 /// [`ProgramBuilder`] would have established are preserved) and returns the output id.
-fn append_program_instruction<V: Value<Type = ArrayType>, O>(
+fn append_program_instruction<V: Value<Type = ArrayType>, O: Operation<ArrayType>>(
     program: &mut Program<V, O, Vec<V>, Vec<V>>,
     operation: O,
     inputs: Vec<AtomId>,
     output_type: ArrayType,
 ) -> AtomId {
     let output = append_program_variable(program, output_type);
-    program.instructions.push(Instruction::new(operation, inputs, vec![output]));
+    program.entry_region_mut().instructions.push(Instruction::new(operation, inputs, vec![output]));
     output
 }
 
@@ -245,19 +246,19 @@ where
     // batch index `counter` valid in the mask stack, and advance the counter.
     let mut body = primal_body.clone();
     let counter_input = append_program_variable(&mut body, counter_type.clone());
-    body.input_ids.push(counter_input);
+    body.entry_region_mut().input_ids.push(counter_input);
     let stack_inputs = stack_types
         .iter()
         .map(|stack_type| {
             let stack_input = append_program_variable(&mut body, stack_type.clone());
-            body.input_ids.push(stack_input);
+            body.entry_region_mut().input_ids.push(stack_input);
             stack_input
         })
         .collect::<Vec<_>>();
     let mask_input = append_program_variable(&mut body, mask_stack_type.clone());
-    body.input_ids.push(mask_input);
-    body.input_structure = vec![Placeholder; body.input_ids.len()];
-    let residual_outputs = body.output_ids.split_off(state_count);
+    body.entry_region_mut().input_ids.push(mask_input);
+    body.input_structure = vec![Placeholder; body.input_ids().len()];
+    let residual_outputs = body.entry_region_mut().output_ids.split_off(state_count);
     check_count!("output", residual_outputs, residual_types.len(), ProgramError);
     let zero_index = residual_types.iter().any(|residual_type| residual_type.rank() > 0).then(|| {
         append_program_instruction(
@@ -320,10 +321,11 @@ where
         vec![counter_input, one_i64],
         counter_type.clone(),
     );
-    body.output_ids.push(next_counter);
-    body.output_ids.extend(next_stacks);
-    body.output_ids.push(next_mask);
-    body.output_structure = vec![Placeholder; body.output_ids.len()];
+    let body_entry = body.entry_region_mut();
+    body_entry.output_ids.push(next_counter);
+    body_entry.output_ids.extend(next_stacks);
+    body_entry.output_ids.push(next_mask);
+    body.output_structure = vec![Placeholder; body.output_ids().len()];
 
     // Condition: the original loop condition extended with ignored extra-state inputs.
     let mut extended_condition = condition.clone();
@@ -332,9 +334,9 @@ where
         .chain(std::iter::once(mask_stack_type));
     for extra_state_type in extra_state_types {
         let extra_input = append_program_variable(&mut extended_condition, extra_state_type);
-        extended_condition.input_ids.push(extra_input);
+        extended_condition.entry_region_mut().input_ids.push(extra_input);
     }
-    extended_condition.input_structure = vec![Placeholder; extended_condition.input_ids.len()];
+    extended_condition.input_structure = vec![Placeholder; extended_condition.input_ids().len()];
     Ok((extended_condition, body, stack_types))
 }
 
@@ -597,10 +599,10 @@ where
         // The body input order `[state_tangent..., residual_slice..., mask_slice...]` keeps the leading `state_count`
         // carry tangents linear so the reverse re-key folds the residual and mask slices into scan-local captures.
         let mut scan_body = tangent_program;
-        check_count!("input", scan_body.input_ids, state_count + residual_count, ProgramError);
-        check_count!("output", scan_body.output_ids, state_count, ProgramError);
-        let carried_inputs = scan_body.input_ids[..state_count].to_vec();
-        let pushforward_outputs = scan_body.output_ids.clone();
+        check_count!("input", scan_body.input_ids(), state_count + residual_count, ProgramError);
+        check_count!("output", scan_body.output_ids(), state_count, ProgramError);
+        let carried_inputs = scan_body.input_ids()[..state_count].to_vec();
+        let pushforward_outputs = scan_body.output_ids().to_vec();
         let mut masked_outputs = Vec::with_capacity(state_count);
         for ((pushforward_output, carried_input), (state_type, &is_differentiable)) in pushforward_outputs
             .into_iter()
@@ -613,18 +615,19 @@ where
             }
             let condition_type = ArrayType::new(DataType::Boolean, state_type.shape().clone());
             let mask_item = append_program_variable(&mut scan_body, condition_type);
-            scan_body.input_ids.push(mask_item);
-            let select_output = AtomId::new(scan_body.atoms.len());
-            scan_body.atoms.push(Atom::Variable(state_type.clone()));
-            scan_body.instructions.push(Instruction::new(
+            let scan_body_entry = scan_body.entry_region_mut();
+            scan_body_entry.input_ids.push(mask_item);
+            let select_output = AtomId::new(scan_body_entry.atoms.len());
+            scan_body_entry.atoms.push(Atom::Variable(state_type.clone()));
+            scan_body_entry.instructions.push(Instruction::new(
                 C::Operation::from(SelectOperation),
                 vec![mask_item, pushforward_output, carried_input],
                 vec![select_output],
             ));
             masked_outputs.push(select_output);
         }
-        scan_body.output_ids = masked_outputs;
-        scan_body.input_structure = vec![Placeholder; scan_body.input_ids.len()];
+        scan_body.entry_region_mut().output_ids = masked_outputs;
+        scan_body.input_structure = vec![Placeholder; scan_body.input_ids().len()];
         scan_body.output_structure = vec![Placeholder; state_count];
 
         // Stage the length-`bound` tangent scan over the carry tangents followed by the stacked residuals and then the
@@ -2235,5 +2238,29 @@ mod tests {
         pullback_inputs.extend(residuals);
         let cotangents = pullback.interpret(pullback_inputs).unwrap();
         assert_eq!(cotangents[0].values, vec![8.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_unbounded_while_staged_jvp_reports_unsupported_operation() {
+        // Phase 0 boundary pin for the first-class-program-regions plan: an unbounded while loop has no staged
+        // forward-mode rule (the eager path unrolls instead), so no while-produced residual can ever reach a staged
+        // linearization boundary through this path. The lazy residual-origin design relies on this rejection.
+        fn unbounded_while<V>(x: V) -> Result<V, ProgramError>
+        where
+            V: Value<Type = ArrayType>,
+            V::DispatchDomain: Context<Type = ArrayType, Value = V, Operation = TestArrayOperation>,
+        {
+            let context = x.dispatch_domain();
+            let mut outputs = context.bind(countdown_while_operation(), &[x])?;
+            Ok(outputs.remove(0))
+        }
+        assert!(matches!(
+            StagedDispatchTestArrayDomain.jvp(unbounded_while, TestArray::scalar(4.0), TestArray::scalar(1.0)),
+            Err(crate::differentiation::DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message,
+            })) if message
+                == "operation `while` has no capture-free forward-mode linearization rule unless it carries an \
+                    iteration bound; an unbounded while loop has no forward-mode rule",
+        ));
     }
 }

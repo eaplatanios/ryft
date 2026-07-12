@@ -5673,6 +5673,253 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_dedup_does_not_traverse_shard_map_bodies() {
+        use crate::experimental::operations::ShardMapOperation;
+        use crate::experimental::shard_map::FlatTracedShardMap;
+
+        // Phase 0 boundary pin for the first-class-program-regions plan: `count_jit_calls` intentionally skips
+        // shard-map bodies, so a callee that occurs twice inside a `shard_map` body never gets a shared
+        // `func.func private @jit_call_*` and both occurrences inline into the `sdy.manual_computation` region.
+        let vector_type = test_vector_type(4);
+        let callee = xla_add_self_callee(vector_type.clone());
+        let body_program = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone());
+            let first = builder.add_instruction(xla_jit_call(callee.clone()), vec![input]).unwrap()[0];
+            let second = builder.add_instruction(xla_jit_call(callee), vec![input]).unwrap()[0];
+            let output = builder.add_instruction(AddOperation, vec![first, second]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mesh = test_manual_mesh("x", 1);
+        let sharding = Sharding::replicated(mesh.clone(), 1);
+        let body = FlatTracedShardMap::from_parts(
+            ShardMap::from_shardings(mesh, vec![sharding.clone()], vec![sharding], vec!["x".to_string()], true),
+            vec![vector_type.clone()],
+            vec![vector_type.clone()],
+            vec![vector_type.clone()],
+            vec![vector_type.clone()],
+            body_program,
+        );
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(vector_type.clone());
+        let output = builder
+            .add_instruction(XlaOperation::ShardMap(Box::new(ShardMapOperation::new(body))), vec![input])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![vector_type.clone()];
+        let output_types = vec![vector_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}], replicated={"x"}>] out_shardings=[<@mesh, [{}], replicated={"x"}>] manual_axes={"x"} (%arg1: tensor<4xf32>) {
+                      %1 = stablehlo.add %arg1, %arg1 : tensor<4xf32>
+                      %2 = stablehlo.add %arg1, %arg1 : tensor<4xf32>
+                      %3 = stablehlo.add %1, %2 : tensor<4xf32>
+                      sdy.return %3 : tensor<4xf32>
+                    } : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_custom_jvp_lowering_inlines_only_the_primal_program() {
+        use ryft_core::tracing_v2::operations::custom_derivatives::CustomJvpOperation;
+
+        // Phase 0 boundary pin for the first-class-program-regions plan: a retained `custom_jvp` call lowers only
+        // its primal program; nothing from the user-supplied JVP program (marked here by the multiply on the
+        // tangent side) reaches the emitted module.
+        let vector_type = test_vector_type(4);
+        let primal = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone());
+            let output = builder.add_instruction(AddOperation, vec![input, input]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let jvp = {
+            let mut builder = XlaProgramBuilder::new();
+            let input = builder.add_input(vector_type.clone());
+            let tangent = builder.add_input(vector_type.clone());
+            let output = builder.add_instruction(AddOperation, vec![input, input]).unwrap()[0];
+            let output_tangent = builder.add_instruction(MulOperation, vec![tangent, tangent]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output, output_tangent],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
+                .unwrap()
+        };
+        let operation = CustomJvpOperation::new(primal, jvp).unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(vector_type.clone());
+        let output = builder.add_instruction(XlaOperation::CustomJvp(Box::new(operation)), vec![input]).unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![vector_type.clone()];
+        let output_types = vec![vector_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_custom_vjp_tangent_lowering_is_rejected() {
+        use ryft_core::tracing_v2::operations::custom_derivatives::CustomVjpTangentOperation;
+
+        // Phase 0 boundary pin for the first-class-program-regions plan: the un-transposed `custom_vjp_tangent`
+        // carrier is reverse-mode-only and must be transposed away before lowering, so lowering it is rejected.
+        let vector_type = test_vector_type(4);
+        let backward = {
+            let mut builder = XlaProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone());
+            let cotangent = builder.add_input(vector_type.clone());
+            let output = builder.add_instruction(MulOperation, vec![residual, cotangent]).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let operation = CustomVjpTangentOperation::new(backward, 1, false);
+        let mut builder = XlaProgramBuilder::new();
+        let tangent = builder.add_input(vector_type.clone());
+        let residual = builder.add_input(vector_type.clone());
+        let output = builder
+            .add_instruction(XlaOperation::CustomVjpTangent(Box::new(operation)), vec![tangent, residual])
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let input_types = vec![vector_type.clone(), vector_type.clone()];
+        let output_types = vec![vector_type];
+
+        assert!(matches!(
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
+            Err(LoweringError::Tracing(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `custom_vjp_tangent` cannot be lowered to StableHLO",
+        ));
+    }
+
+    /// Builds a flat callee whose body contains a `condition` instruction (`f(p, x) = if p { -x } else { x }`),
+    /// making it ineligible for structural `jit_call` deduplication because its nested branch bodies do not render
+    /// into the callee's canonical program text.
+    fn xla_condition_callee() -> std::rc::Rc<FlatXlaProgram> {
+        let vector_type = test_vector_type(4);
+        let condition =
+            ConditionOperation::new(xla_neg_branch(vector_type.clone()), xla_identity_branch(vector_type.clone()))
+                .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(vector_type);
+        let output = builder
+            .add_instruction(XlaOperation::Condition(Box::new(condition)), vec![predicate, input])
+            .unwrap()[0];
+        std::rc::Rc::new(builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap())
+    }
+
+    #[test]
+    fn test_structurally_identical_jit_calls_with_nested_bodies_do_not_merge() {
+        // Phase 0 boundary pin for the first-class-program-regions plan: callees with hidden nested bodies (here a
+        // `condition` instruction) fall back to pointer-identity deduplication, so two structurally identical but
+        // separately constructed callees emit two shared functions with byte-identical bodies — contrast
+        // `test_structurally_identical_jit_calls_share_one_function`, which merges body-free callees structurally.
+        let first = xla_condition_callee();
+        let second = xla_condition_callee();
+        let vector_type = test_vector_type(4);
+        let mut builder = XlaProgramBuilder::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(vector_type.clone());
+        let mut accumulator: Option<AtomId> = None;
+        for callee in [first.clone(), first, second.clone(), second] {
+            let call_output = builder.add_instruction(xla_jit_call(callee), vec![predicate, input]).unwrap()[0];
+            accumulator = Some(match accumulator {
+                None => call_output,
+                Some(previous) => builder.add_instruction(AddOperation, vec![previous, call_output]).unwrap()[0],
+            });
+        }
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![accumulator.unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let input_types = vec![ArrayType::scalar(DataType::Boolean), vector_type.clone()];
+        let output_types = vec![vector_type];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func private @jit_call_0(%arg0: tensor<i1>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = "stablehlo.if"(%arg0) ({
+                      %1 = stablehlo.negate %arg1 : tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }, {
+                      stablehlo.return %arg1 : tensor<4xf32>
+                    }) : (tensor<i1>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func private @jit_call_1(%arg0: tensor<i1>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = "stablehlo.if"(%arg0) ({
+                      %1 = stablehlo.negate %arg1 : tensor<4xf32>
+                      stablehlo.return %1 : tensor<4xf32>
+                    }, {
+                      stablehlo.return %arg1 : tensor<4xf32>
+                    }) : (tensor<i1>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @jit_call_0(%arg0, %arg1) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @jit_call_0(%arg0, %arg1) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
+                    %2 = stablehlo.add %0, %1 : tensor<4xf32>
+                    %3 = call @jit_call_1(%arg0, %arg1) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
+                    %4 = stablehlo.add %2, %3 : tensor<4xf32>
+                    %5 = call @jit_call_1(%arg0, %arg1) : (tensor<i1>, tensor<4xf32>) -> tensor<4xf32>
+                    %6 = stablehlo.add %4, %5 : tensor<4xf32>
+                    return %6 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_to_mlir_module_renders_a_full_add_module() {
         let global_input_type = test_vector_type(8);
         let mesh = test_manual_mesh("x", 4);

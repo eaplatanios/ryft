@@ -1379,8 +1379,8 @@ impl<V: Value, O: Operation<V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         O: PartiallyEvaluatableOperation<C>,
     {
-        if inputs.len() != self.input_ids.len() {
-            return Err(ProgramError::InvalidInputCount { expected: self.input_ids.len(), actual: inputs.len() });
+        if inputs.len() != self.input_ids().len() {
+            return Err(ProgramError::InvalidInputCount { expected: self.input_ids().len(), actual: inputs.len() });
         }
 
         // Seed top-level inputs. Known inputs hold their value and unknown inputs lead the residual program's inputs.

@@ -164,8 +164,8 @@ impl<
 
         // Flatten the structured input and validate each input value's type.
         let inputs = input.into_parameters().collect::<Vec<_>>();
-        for (input, input_id) in inputs.iter().zip(self.input_ids.iter()) {
-            let Some(declared) = self.atoms.get(input_id.index()) else {
+        for (input, input_id) in inputs.iter().zip(self.input_ids().iter()) {
+            let Some(declared) = self.atoms().get(input_id.index()) else {
                 return Err(ProgramError::UnboundAtomId { id: *input_id });
             };
             let declared = declared.r#type();
@@ -231,12 +231,12 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         mut lift_fn: LiftFn,
         mut interpret_fn: InterpretFn,
     ) -> Result<Vec<Value>, Error> {
-        check_count!("input", inputs, self.input_ids.len(), ProgramError);
+        check_count!("input", inputs, self.input_ids().len(), ProgramError);
 
         // Count every future consumer of each atom, including final program outputs. These counts let us move each
         // value out on its last use and clone it only when a later consumer still needs it.
-        let mut remaining_uses = vec![0usize; self.atoms.len()];
-        for instruction in self.instructions.iter() {
+        let mut remaining_uses = vec![0usize; self.atoms().len()];
+        for instruction in self.instructions().iter() {
             for input_id in instruction.inputs().iter().copied() {
                 let Some(remaining_uses) = remaining_uses.get_mut(input_id.index()) else {
                     return Err(ProgramError::UnboundAtomId { id: input_id }.into());
@@ -244,7 +244,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                 *remaining_uses += 1;
             }
         }
-        for output_id in self.output_ids.iter().copied() {
+        for output_id in self.output_ids().iter().copied() {
             let Some(remaining_uses) = remaining_uses.get_mut(output_id.index()) else {
                 return Err(ProgramError::UnboundAtomId { id: output_id }.into());
             };
@@ -252,8 +252,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         // Store concrete input values in a sparse value table indexed by [`AtomId`].
-        let mut values = vec![None; self.atoms.len()];
-        for (input_id, input) in self.input_ids.iter().copied().zip(inputs) {
+        let mut values = vec![None; self.atoms().len()];
+        for (input_id, input) in self.input_ids().iter().copied().zip(inputs) {
             let Some(slot) = values.get_mut(input_id.index()) else {
                 return Err(ProgramError::UnboundAtomId { id: input_id }.into());
             };
@@ -262,7 +262,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 
         // Materialize literal constants that are live. Dead constants can remain unset because no instruction or
         // program output will read them.
-        for (atom_index, atom) in self.atoms.iter().enumerate() {
+        for (atom_index, atom) in self.atoms().iter().enumerate() {
             if remaining_uses[atom_index] == 0 {
                 continue;
             }
@@ -272,9 +272,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         // Replay instructions in program order, reusing one scratch input buffer to avoid per-instruction allocation.
-        let max_input_count = self.instructions.iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
+        let max_input_count =
+            self.instructions().iter().map(|instruction| instruction.inputs().len()).max().unwrap_or(0);
         let mut instruction_inputs = Vec::with_capacity(max_input_count);
-        for instruction in self.instructions.iter() {
+        for instruction in self.instructions().iter() {
             instruction_inputs.clear();
             for input_id in instruction.inputs().iter().copied() {
                 // Consume the appropriate input value for the current instruction. If this is the last consumer,
@@ -304,8 +305,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         // Gather the program outputs using the same last-use transfer logic that we used for the instruction inputs.
-        let mut outputs = Vec::with_capacity(self.output_ids.len());
-        for output_id in self.output_ids.iter().copied() {
+        let mut outputs = Vec::with_capacity(self.output_ids().len());
+        for output_id in self.output_ids().iter().copied() {
             let remaining_uses = remaining_uses.get_mut(output_id.index()).unwrap();
             debug_assert!(*remaining_uses > 0);
             *remaining_uses -= 1;

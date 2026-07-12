@@ -1,8 +1,10 @@
 //! Contains machinery for representing and working with typed, structured, and effect-aware programs.
 //!
-//! A [`Program`] is Ryft's backend-neutral dataflow IR. It stores typed atoms, operation instructions, structured
-//! input and output boundaries, and enough metadata for interpretation, transformation, simplification, lowering, and
-//! compilation. Programs are immutable after construction. [`ProgramBuilder`] owns the mutable construction phase.
+//! A [`Program`] is Ryft's backend-neutral dataflow IR. It owns a flat arena of [`Region`]s that consists of the public
+//! entry computation plus any lexically nested computations and shareable callee roots, where each region stores typed
+//! atoms, operation instructions, a flat boundary, and enough metadata for interpretation, transformation,
+//! simplification, lowering, and compilation. Programs are immutable after construction. [`ProgramBuilder`]
+//! owns the mutable construction phase, sealing every non-entry region before instructions can attach it.
 //!
 //! ```text
 //! ┌─────────────────────────────┐
@@ -47,14 +49,16 @@
 //! value has one associated type descriptor through [`Typed`], plus separate dispatch and execution domains used by
 //! capabilities and transforms.
 //!
-//! [`Atom`] is either a stored constant or a typed variable, and [`AtomId`] is its stable index in the program's atom
-//! table. An [`Instruction`] owns one [`Operation`] and lists the input and output atom IDs of that application.
+//! [`Atom`] is either a stored constant or a typed variable, and [`AtomId`] is its stable index in the containing
+//! [`Region`]'s atom table. An [`Instruction`] owns one [`Operation`], lists the input and output atom IDs of that
+//! application, and carries the [`RegionId`]s of its attached lexically owned regions and referenced callee roots.
 //! Operations define their own type inference and effect classes and the program supplies graph structure and order.
 //!
-//! [`Program`] combines those flat tables with typed, structured input and output boundaries. The boundary
-//! types are [`Parameterized`] containers whose leaves correspond positionally to [`Program::input_ids`] and
+//! [`Program`] combines the region arena with typed, structured input and output boundaries on its entry region. The
+//! boundary types are [`Parameterized`] containers whose leaves correspond positionally to [`Program::input_ids`] and
 //! [`Program::output_ids`], so compiler and transform kernels can operate on the flat IDs while callers retain tuples,
-//! vectors, maps, or derived product types.
+//! vectors, maps, or derived product types. [`InstructionId`] and [`ValueId`] locate instructions and values across
+//! regions, and [`InstructionRef`] resolves an instruction's attachments against the arena.
 //!
 //! # Effects, Liveness, and Simplification
 //!
@@ -71,14 +75,14 @@
 //!
 //! New primitive behavior normally means adding an operation payload implementing [`Operation`] and including it in the
 //! appropriate closed operation family. Keep type inference, rendering, effects, and operation-specific transform rules
-//! with that payload, and use operation-family traits for recursive nested-program behavior instead of teaching
-//! [`Program`] about individual operation variants.
+//! with that payload, and never teach [`Program`] about individual operation variants.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -201,20 +205,22 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     fn execution_domain(&self) -> Self::ExecutionDomain;
 }
 
-/// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`]. [`MaybeZero`] is the
-/// symbolic-zero representation shared by transforms like forward-mode and reverse-mode differentiation where it is
-/// the tangent type carried by [`DifferentiationTracer`](crate::DifferentiationTracer)s and the cotangent type that
-/// transposition rules consume and produce. A [`MaybeZero::Zero`] means that no value exists and nothing has been
-/// staged or computed for it. In the context of differentiation, it means that the corresponding derivative is zero
-/// *by construction* (e.g., a disconnected input, a severed tangent, an unused output, etc.), and is not a runtime
-/// value that happens to contain zeros. Differentiation rules branch on the variant to skip work entirely. A rule that
-/// sees a zero tangent or cotangent emits no operations for it, and "zero-ness" propagates transitively through rules
-/// without ever inspecting a program or materializing a buffer. A zero is _materialized_ into a real value only at the
-/// boundaries where one is structurally required (e.g., a nested sub-program operand, a program output, or an eagerly
-/// returned tangent), which is also where its carried [`Type`] is consumed.
+/// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`](crate::Type).
+/// [`MaybeZero`] is the symbolic-zero representation shared by transforms like forward-mode and reverse-mode
+/// differentiation where it is the tangent type carried by [`DifferentiationTracer`](crate::DifferentiationTracer)s
+/// and the cotangent type that transposition rules consume and produce. A [`MaybeZero::Zero`] means that no value
+/// exists and nothing has been staged or computed for it. In the context of differentiation, it means that the
+/// corresponding derivative is zero *by construction* (e.g., a disconnected input, a severed tangent, an unused output,
+/// etc.), and is not a runtime value that happens to contain zeros. Differentiation rules branch on the variant to skip
+/// work entirely. A rule that sees a zero tangent or cotangent emits no operations for it, and "zero-ness" propagates
+/// transitively through rules without ever inspecting a program or materializing a buffer. A zero is _materialized_
+/// into a real value only at the boundaries where one is structurally required (e.g., a nested sub-program operand,
+/// a program output, or an eagerly returned tangent), which is also where its carried [`Type`](crate::Type)
+/// is consumed.
 #[derive(Clone, Debug)]
 pub enum MaybeZero<V: Typed> {
-    /// Structural zero of the carried [`Type`] (i.e., no value exists and nothing has been staged or computed for it).
+    /// Structural zero of the carried [`Type`](crate::Type) (i.e., no value exists and nothing has been staged
+    /// or computed for it).
     Zero(V::Type),
 
     /// Value that is not known to be structurally equal to zero.
@@ -238,8 +244,8 @@ impl<V: Typed> MaybeZero<V> {
     }
 
     /// Maps the value stored in this [`MaybeZero`] using the provided function, leaving a [`MaybeZero::Zero`] and
-    /// its carried [`Type`] unchanged. If this is [`MaybeZero::Zero`], then [`MaybeZero::Zero`] will be returned
-    /// irrespective of what `function` is provided.
+    /// its carried [`Type`](crate::Type) unchanged. If this is [`MaybeZero::Zero`], then [`MaybeZero::Zero`] will be
+    /// returned irrespective of what `function` is provided.
     #[inline]
     pub fn map<W: Typed<Type = V::Type>, F: FnOnce(V) -> W>(self, function: F) -> MaybeZero<W> {
         match self {
@@ -279,13 +285,14 @@ impl<V: Typed> From<V> for MaybeZero<V> {
     }
 }
 
-/// [`Atom`]s represent nodes in [`Program`]s that represent either concrete values or variables of specific [`Type`]s.
+/// [`Atom`]s represent nodes in the [`Region`]s of [`Program`]s that represent either concrete values or variables
+/// of specific [`Type`](crate::Type)s.
 #[derive(Clone, Debug, Parameter)]
 pub enum Atom<V: Typed> {
     /// Literal constant value that appears in a [`Program`].
     Constant(V),
 
-    /// Non-constant variable of a specific [`Type`] that appears in a [`Program`].
+    /// Non-constant variable of a specific [`Type`](crate::Type) that appears in a [`Program`].
     Variable(V::Type),
 }
 
@@ -323,12 +330,13 @@ impl<V: Typed> Typed for Atom<V> {
     }
 }
 
-/// Unique identifier for an [`Atom`] within a [`Program`]. [`AtomId`]s are stable indexes into a [`Program`]'s atom
-/// table. [`Instruction`]s refer to their inputs and outputs by these IDs, which keeps the intermediate representation
-/// compact and easy to clone.
+/// Unique identifier for an [`Atom`] within one [`Region`] of a [`Program`]. [`AtomId`]s are stable indexes into the
+/// containing [`Region`]'s atom table (every region owns its own table, so an [`AtomId`] is meaningful only together
+/// with its region). [`Instruction`]s refer to their inputs and outputs by these IDs, which keeps the intermediate
+/// representation compact and easy to clone.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Parameter)]
 pub struct AtomId {
-    /// Zero-based index of the corresponding [`Atom`] inside the owning [`Program`]'s atom table.
+    /// Zero-based index of the corresponding [`Atom`] inside the containing [`Region`]'s atom table.
     index: usize,
 }
 
@@ -347,14 +355,181 @@ impl AtomId {
 }
 
 impl Display for AtomId {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "%{}", self.index)
     }
 }
 
-/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`]s. [`Program`]s execute
-/// [`Instruction`]s in sequential order, and higher-order [`Operation`]s can carry nested programs for control flow
-/// or other structured evaluation boundaries.
+/// Unique identifier for a [`Region`] within a [`Program`]. [`RegionId`]s are stable indexes into a [`Program`]'s
+/// region arena. Like [`AtomId`]s, they are meaningful only against the [`Program`] they were derived from.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionId {
+    /// Zero-based index of the corresponding [`Region`] inside the owning [`Program`]'s region arena.
+    index: usize,
+}
+
+impl RegionId {
+    /// Creates a new [`RegionId`] from the provided zero-based region-arena index.
+    #[inline]
+    pub fn new(index: usize) -> Self {
+        Self { index }
+    }
+
+    /// Returns the zero-based index of the corresponding [`Region`] inside the owning [`Program`]'s region arena.
+    #[inline]
+    pub fn index(self) -> usize {
+        self.index
+    }
+}
+
+impl Display for RegionId {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "^{}", self.index)
+    }
+}
+
+/// Location of one [`Instruction`] in a multi-region [`Program`], identified by its containing [`Region`] and its
+/// zero-based index within that region's instruction sequence.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct InstructionId {
+    /// [`Region`] containing the instruction.
+    region: RegionId,
+
+    /// Zero-based instruction index within the containing [`Region`].
+    index: usize,
+}
+
+impl InstructionId {
+    /// Creates a new [`InstructionId`] from the provided containing region and instruction index.
+    #[inline]
+    pub fn new(region: RegionId, index: usize) -> Self {
+        Self { region, index }
+    }
+
+    /// Returns the [`RegionId`] of the [`Region`] containing the instruction.
+    #[inline]
+    pub fn region(self) -> RegionId {
+        self.region
+    }
+
+    /// Returns the zero-based instruction index within the containing [`Region`].
+    #[inline]
+    pub fn index(self) -> usize {
+        self.index
+    }
+}
+
+/// Location of one Single Static Assignment (SSA) value in a multi-region [`Program`], identified by its containing
+/// [`Region`] and its region-local [`AtomId`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ValueId {
+    /// [`Region`] containing the atom.
+    region: RegionId,
+
+    /// Region-local [`AtomId`] of the value.
+    atom: AtomId,
+}
+
+impl ValueId {
+    /// Creates a new [`ValueId`] from the provided containing region and region-local atom identifier.
+    #[inline]
+    pub fn new(region: RegionId, atom: AtomId) -> Self {
+        Self { region, atom }
+    }
+
+    /// Returns the [`RegionId`] of the [`Region`] containing the atom.
+    #[inline]
+    pub fn region(self) -> RegionId {
+        self.region
+    }
+
+    /// Returns the region-local [`AtomId`] of the value.
+    #[inline]
+    pub fn atom(self) -> AtomId {
+        self.atom
+    }
+}
+
+/// Computation region inside a [`Program`]'s region arena. Every region owns its own [`Atom`] table, [`Instruction`]
+/// sequence, and input/output boundary. The public program entry point, lexically nested computations, and shared
+/// callee roots are all regions in the same arena; [`Instruction`] attachments reference them by [`RegionId`]. Regions
+/// are _sealed_ meaning that a [`ProgramBuilder`] creates them only by copying already-built (and therefore immutable
+/// and fully validated) [`Program`]s via [`ProgramBuilder::add_region`] and [`ProgramBuilder::add_callee`], and so a
+/// region referenced by an instruction can never change after that instruction is built.
+#[derive(Clone, Debug)]
+pub struct Region<V: Typed, O> {
+    /// [`Atom`]s contained in this [`Region`], in the order in which they will be evaluated.
+    pub(crate) atoms: Vec<Atom<V>>,
+
+    /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs of this [`Region`].
+    pub(crate) input_ids: Vec<AtomId>,
+
+    /// [`AtomId`]s of the [`Atom`]s that correspond to the outputs of this [`Region`].
+    pub(crate) output_ids: Vec<AtomId>,
+
+    /// Ordered sequence of [`Instruction`]s that make up the computational graph of this [`Region`].
+    pub(crate) instructions: Vec<Instruction<O>>,
+}
+
+impl<V: Typed, O> Region<V, O> {
+    /// Returns the [`Atom`]s contained in this [`Region`], in the order in which they will be evaluated.
+    #[inline]
+    pub fn atoms(&self) -> &[Atom<V>] {
+        &self.atoms
+    }
+
+    /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the inputs of this [`Region`].
+    #[inline]
+    pub fn input_ids(&self) -> &[AtomId] {
+        &self.input_ids
+    }
+
+    /// Returns the [`Type`](crate::Type)s of the inputs of this [`Region`], in boundary order.
+    #[inline]
+    pub fn input_types(&self) -> Vec<V::Type> {
+        self.input_ids.iter().map(|input| self.atoms[input.index()].r#type().into_owned()).collect()
+    }
+
+    /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs of this [`Region`].
+    #[inline]
+    pub fn output_ids(&self) -> &[AtomId] {
+        &self.output_ids
+    }
+
+    /// Returns the [`Type`](crate::Type)s of the outputs of this [`Region`], in boundary order.
+    #[inline]
+    pub fn output_types(&self) -> Vec<V::Type> {
+        self.output_ids.iter().map(|output| self.atoms[output.index()].r#type().into_owned()).collect()
+    }
+
+    /// Returns the ordered sequence of [`Instruction`]s that make up the computational graph of this [`Region`].
+    #[inline]
+    pub fn instructions(&self) -> &[Instruction<O>] {
+        &self.instructions
+    }
+}
+
+/// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`]s. Each [`Region`] executes
+/// its [`Instruction`]s in sequential order. Beyond its operation and its input and output [`Atom`]s, an instruction
+/// carries the [`RegionId`]s of the computations attached to the application, split into two kinds whose relationship
+/// to the instruction differs:
+///
+///   - **Regions** ([`regions`](Self::regions)) are part of what the instruction *means*, the way an operand is (e.g.,
+///     the `true`/`false` branches of a condition, or a scan body). Each is owned by exactly one instruction slot, is
+///     dropped or copied together with its owning instruction, and lowers inline into the enclosing computation.
+///   - **Callees** ([`callees`](Self::callees)) are independently meaningful computations that the instruction merely
+///     *references* (e.g., the shared program of a JIT call). One callee root may be referenced from many call sites,
+///     stays alive for as long as any reference remains, and lowers and compiles once as a shared function invoked from
+///     each site. Two structurally equal but independently created callees remain distinct roots, because sharing
+///     preserves callee *identity*, not structure.
+///
+/// For example, `if p { f(x) + f(2 * x) } else { x }` with a JIT-compiled `f` is one condition instruction that
+/// lexically owns a `true` and a `false` branch region, where the `true` branch contains two call instructions that
+/// both reference the single callee root holding `f`'s body. This mirrors [MLIR's split](
+/// https://mlir.llvm.org/docs/LangRef/#regions) between an operation's attached regions and [symbol references](
+/// https://mlir.llvm.org/docs/SymbolsAndSymbolTables/) to `func.func`s.
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
     /// [`Operation`] applied by this [`Instruction`].
@@ -365,13 +540,32 @@ pub struct Instruction<O> {
 
     /// [`AtomId`]s of the output [`Atom`]s produced by this [`Instruction`].
     outputs: Vec<AtomId>,
+
+    /// [`RegionId`]s of the lexically owned regions attached to this [`Instruction`], in the operation-defined order.
+    regions: Vec<RegionId>,
+
+    /// [`RegionId`]s of the shareable callee roots referenced by this [`Instruction`], in the operation-defined order.
+    callees: Vec<RegionId>,
 }
 
 impl<O> Instruction<O> {
-    /// Creates a new [`Instruction`].
+    /// Creates a new [`Instruction`] with no attached [`Region`]s.
     #[inline]
     pub fn new(operation: O, inputs: Vec<AtomId>, outputs: Vec<AtomId>) -> Self {
-        Self { operation, inputs, outputs }
+        Self { operation, inputs, outputs, regions: Vec::new(), callees: Vec::new() }
+    }
+
+    /// Creates a new [`Instruction`] with the provided lexically owned regions and callees,
+    /// each in its operation-defined order.
+    #[inline]
+    pub fn new_with_regions(
+        operation: O,
+        inputs: Vec<AtomId>,
+        outputs: Vec<AtomId>,
+        regions: Vec<RegionId>,
+        callees: Vec<RegionId>,
+    ) -> Self {
+        Self { operation, inputs, outputs, regions, callees }
     }
 
     /// Returns the [`Operation`] applied by this [`Instruction`].
@@ -392,36 +586,95 @@ impl<O> Instruction<O> {
         self.outputs.as_slice()
     }
 
-    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, and output [`AtomId`]s.
+    /// Returns the [`RegionId`]s of the lexically owned regions attached to this [`Instruction`],
+    /// in the operation-defined order.
     #[inline]
-    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>) {
-        (self.operation, self.inputs, self.outputs)
+    pub fn regions(&self) -> &[RegionId] {
+        &self.regions
+    }
+
+    /// Returns the [`RegionId`]s of the shareable callee roots referenced by this [`Instruction`],
+    /// in the operation-defined order.
+    #[inline]
+    pub fn callees(&self) -> &[RegionId] {
+        &self.callees
+    }
+
+    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, output [`AtomId`]s, lexically
+    /// owned region [`RegionId`]s, and callee [`RegionId`]s.
+    #[inline]
+    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>, Vec<RegionId>) {
+        (self.operation, self.inputs, self.outputs, self.regions, self.callees)
     }
 }
 
-/// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend. It
-/// consists of a sequence of [`Instruction`]s paired with [`Parameterized`] input and output types. This is the primary
-/// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things like
-/// automatic differentiation and just-in-time compilation).
+/// Borrowed view of one [`Instruction`] resolved against its owning [`Program`]'s [`Region`] arena. Unlike a bare
+/// [`Instruction`], this view can resolve the instruction's attached lexical regions and callee roots, so that analyses
+/// can traverse attachments without holding the owning [`Program`] separately.
+pub struct InstructionRef<'r, V: Typed, O> {
+    /// Borrowed [`Region`] arena used to resolve this instruction and its attachments.
+    regions: &'r [Region<V, O>],
+
+    /// [`InstructionId`] specifying the [`Instruction`]'s location in the owning [`Program`].
+    id: InstructionId,
+}
+
+impl<'r, V: Typed, O> InstructionRef<'r, V, O> {
+    /// Returns the [`InstructionId`] of this instruction.
+    #[inline]
+    pub fn id(&self) -> InstructionId {
+        self.id
+    }
+
+    /// Returns the underlying [`Instruction`].
+    #[inline]
+    pub fn instruction(&self) -> &'r Instruction<O> {
+        &self.regions[self.id.region().index()].instructions[self.id.index()]
+    }
+
+    /// Returns the [`Region`] attached at the provided lexically owned region index.
+    #[inline]
+    pub fn region(&self, index: usize) -> Result<&'r Region<V, O>, ProgramError> {
+        let id = self.instruction().regions().get(index).copied().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!("instruction has no lexical region index {index}"))
+        })?;
+        Ok(&self.regions[id.index()])
+    }
+
+    /// Returns the [`Region`] referenced at the provided callee index.
+    #[inline]
+    pub fn callee(&self, index: usize) -> Result<&'r Region<V, O>, ProgramError> {
+        let id = self
+            .instruction()
+            .callees()
+            .get(index)
+            .copied()
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("instruction has no callee index {index}")))?;
+        Ok(&self.regions[id.index()])
+    }
+}
+
+/// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
+/// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region
+/// is either a lexically nested computation owned by exactly one [`Instruction`] or a shareable callee root referenced
+/// by one or more call sites. Each region is a flat sequence of [`Instruction`]s over its own [`Atom`] table, and the
+/// entry region's flat boundary is paired with [`Parameterized`] input and output types. This is the primary
+/// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things
+/// like automatic differentiation and just-in-time compilation).
 #[derive(Debug)]
 pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Parameterized<V>> {
-    /// [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
-    pub(crate) atoms: Vec<Atom<V>>,
-
-    /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
-    pub(crate) input_ids: Vec<AtomId>,
-
-    /// [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values) of this [`Program`].
-    pub(crate) output_ids: Vec<AtomId>,
-
-    /// Ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`].
-    pub(crate) instructions: Vec<Instruction<O>>,
-
     /// [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
     pub(crate) input_structure: Input::ParameterStructure,
 
     /// [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
     pub(crate) output_structure: Output::ParameterStructure,
+
+    /// [`Region`] arena containing the public entry computation and every lexically nested computation and shared
+    /// callee roots. The [`Self::entry`] region's flat inputs/outputs implement this [`Program`]'s public boundary.
+    pub(crate) regions: Vec<Region<V, O>>,
+
+    /// [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
+    pub(crate) entry: RegionId,
 
     /// [`PhantomData`] marker that ties this [`Program`] to its structured `Input` and `Output` types
     /// without making it own either value family.
@@ -429,25 +682,27 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
 }
 
 impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameterized<V>> Program<V, O, Input, Output> {
-    /// Returns the [`Atom`]s contained in this [`Program`], in the order in which they will be evaluated.
+    /// Returns the [`Atom`]s contained in this [`Program`]'s entry [`Region`],
+    /// in the order in which they will be evaluated.
     #[inline]
     pub fn atoms(&self) -> &[Atom<V>] {
-        &self.atoms
+        &self.entry_region().atoms
     }
 
     /// Returns the number of input [`Atom`]s (i.e., arguments) of this [`Program`].
     #[inline]
     pub fn input_count(&self) -> usize {
-        self.input_ids.len()
+        self.entry_region().input_ids.len()
     }
 
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of this [`Program`].
     #[inline]
     pub fn input_ids(&self) -> &[AtomId] {
-        &self.input_ids
+        &self.entry_region().input_ids
     }
 
-    /// Returns the [`Type`]s of the inputs of this [`Program`], in order.
+    /// Returns the [`Type`](crate::Type)s of the inputs of this [`Program`], in order.
+    #[inline]
     pub fn input_types(&self) -> Vec<V::Type> {
         self.inputs().map(|input| input.r#type().into_owned()).collect()
     }
@@ -455,7 +710,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Returns the [`Atom`]s that correspond to the inputs of this [`Program`].
     #[inline]
     pub fn inputs(&self) -> impl Iterator<Item = &Atom<V>> {
-        self.input_ids.iter().map(|input_id| &self.atoms[input_id.index])
+        let entry = self.entry_region();
+        entry.input_ids.iter().map(|input_id| &entry.atoms[input_id.index])
     }
 
     /// Returns the structured `Input` of this [`Program`] parameterized by the corresponding [`Atom`]s.
@@ -470,17 +726,18 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Returns the number of output [`Atom`]s (i.e., return values) of this [`Program`].
     #[inline]
     pub fn output_count(&self) -> usize {
-        self.output_ids.len()
+        self.entry_region().output_ids.len()
     }
 
     /// Returns the [`AtomId`]s of the [`Atom`]s that correspond to the outputs (i.e., return values)
     /// of this [`Program`].
     #[inline]
     pub fn output_ids(&self) -> &[AtomId] {
-        &self.output_ids
+        &self.entry_region().output_ids
     }
 
-    /// Returns the [`Type`]s of the outputs of this [`Program`], in order.
+    /// Returns the [`Type`](crate::Type)s of the outputs of this [`Program`], in order.
+    #[inline]
     pub fn output_types(&self) -> Vec<V::Type> {
         self.outputs().map(|output| output.r#type().into_owned()).collect()
     }
@@ -488,7 +745,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Returns the [`Atom`]s that correspond to the outputs of this [`Program`].
     #[inline]
     pub fn outputs(&self) -> impl Iterator<Item = &Atom<V>> {
-        self.output_ids.iter().map(|output_id| &self.atoms[output_id.index])
+        let entry = self.entry_region();
+        entry.output_ids.iter().map(|output_id| &entry.atoms[output_id.index])
     }
 
     /// Returns the structured `Output` of this [`Program`] parameterized by the corresponding [`Atom`]s.
@@ -500,10 +758,11 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         Output::To::<Atom<V>>::from_parameters(self.output_structure.clone(), self.outputs().cloned())
     }
 
-    /// Returns the ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`].
+    /// Returns the ordered sequence of [`Instruction`]s that make up the computational graph of this [`Program`]'s
+    /// entry [`Region`].
     #[inline]
     pub fn instructions(&self) -> &[Instruction<O>] {
-        &self.instructions
+        &self.entry_region().instructions
     }
 
     /// Returns the [`Parameter`] structure that can be used to map flat lists of inputs to structured `Input` values.
@@ -518,11 +777,71 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         &self.output_structure
     }
 
+    /// Returns the [`Region`]s in this [`Program`].
+    #[inline]
+    pub fn regions(&self) -> &[Region<V, O>] {
+        &self.regions
+    }
+
+    /// Returns the [`Region`] that corresponds to the provided [`RegionId`].
+    #[inline]
+    pub fn region(&self, id: RegionId) -> Result<&Region<V, O>, ProgramError> {
+        self.regions
+            .get(id.index())
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("region {id} is out of range")))
+    }
+
+    /// Returns the [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
+    #[inline]
+    pub fn entry(&self) -> RegionId {
+        self.entry
+    }
+
+    /// Returns the entry [`Region`] of this [`Program`].
+    #[inline]
+    pub fn entry_region(&self) -> &Region<V, O> {
+        &self.regions[self.entry.index()]
+    }
+
+    // TODO(eaplatanios): Delete this once the first-class program regions plan implementation is complete.
+    /// Returns a mutable reference to the entry [`Region`] of this [`Program`].
+    #[inline]
+    pub(crate) fn entry_region_mut(&mut self) -> &mut Region<V, O> {
+        &mut self.regions[self.entry.index()]
+    }
+
+    /// Returns the [`InstructionId`] of the instruction producing the provided value, or [`None`] when the value is
+    /// a region input or constant. Returns an error when the locator does not resolve against this [`Program`].
+    pub fn producer(&self, value: ValueId) -> Result<Option<InstructionId>, ProgramError> {
+        let region = self.region(value.region())?;
+        if region.atoms.get(value.atom().index()).is_none() {
+            return Err(ProgramError::UnboundAtomId { id: value.atom() });
+        }
+        Ok(region.instructions.iter().enumerate().find_map(|(index, instruction)| {
+            instruction.outputs.contains(&value.atom()).then_some(InstructionId::new(value.region(), index))
+        }))
+    }
+
+    /// Returns a borrowed [`InstructionRef`] view of the [`Instruction`] at the provided [`InstructionId`], which can
+    /// resolve the instruction's attached lexical regions and callee roots against this [`Program`]'s region arena.
+    pub fn instruction(&self, id: InstructionId) -> Result<InstructionRef<'_, V, O>, ProgramError> {
+        let region = self.region(id.region())?;
+        if region.instructions.get(id.index()).is_none() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "instruction {} of region {} is out of range",
+                id.index(),
+                id.region(),
+            )));
+        }
+        Ok(InstructionRef { regions: &self.regions, id })
+    }
+
     /// Returns a boolean mask that has the same length as the number of [`Atom`]s in this [`Program`] and contains the
     /// value `true` for atoms that are inputs of the program, and `false` for other atoms.
     pub fn inputs_mask(&self) -> Vec<bool> {
-        let mut inputs_mask = vec![false; self.atoms.len()];
-        for input in self.input_ids.iter().copied() {
+        let entry = self.entry_region();
+        let mut inputs_mask = vec![false; entry.atoms.len()];
+        for input in entry.input_ids.iter().copied() {
             if let Some(slot) = inputs_mask.get_mut(input.index()) {
                 *slot = true;
             }
@@ -534,8 +853,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// contains the index of the [`Instruction`] that produces it. Note that input and constant atoms are not produced
     /// by an instruction and so the vector contains [`None`] for those atoms.
     pub fn instruction_by_output(&self) -> Vec<Option<usize>> {
-        let mut instruction_by_output = vec![None; self.atoms.len()];
-        for (instruction_index, instruction) in self.instructions.iter().enumerate() {
+        let entry = self.entry_region();
+        let mut instruction_by_output = vec![None; entry.atoms.len()];
+        for (instruction_index, instruction) in entry.instructions.iter().enumerate() {
             for output in instruction.outputs.iter().copied() {
                 if let Some(slot) = instruction_by_output.get_mut(output.index()) {
                     *slot = Some(instruction_index);
@@ -554,7 +874,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// compute liveness in a more fine-grained fashion.
     #[inline]
     pub fn live_sets(&self) -> ProgramLiveSets {
-        self.live_sets_for_atoms(self.output_ids.as_slice()).unwrap()
+        self.live_sets_for_atoms(self.output_ids()).unwrap()
     }
 
     /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the
@@ -574,7 +894,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         &self,
         propagate_liveness: F,
     ) -> Result<ProgramLiveSets, ProgramError> {
-        self.live_sets_for_atoms_with(self.output_ids.as_slice(), propagate_liveness)
+        self.live_sets_for_atoms_with(self.output_ids(), propagate_liveness)
     }
 
     /// Computes transitive liveness for the [`Atom`]s and [`Instruction`]s of this [`Program`] with respect to the
@@ -609,7 +929,8 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         output_ids: &[AtomId],
         mut propagate_liveness: F,
     ) -> Result<ProgramLiveSets, ProgramError> {
-        let mut live_sets = ProgramLiveSets::new(vec![false; self.atoms.len()], vec![false; self.instructions.len()]);
+        let entry = self.entry_region();
+        let mut live_sets = ProgramLiveSets::new(vec![false; entry.atoms.len()], vec![false; entry.instructions.len()]);
         for output in output_ids.iter().copied() {
             let Some(slot) = live_sets.atoms.get_mut(output.index()) else {
                 return Err(ProgramError::UnboundAtomId { id: output });
@@ -622,7 +943,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             self.instructions().iter().map(|instruction| instruction.outputs().len()).max().unwrap_or(0);
         let mut input_liveness = Vec::with_capacity(max_input_count);
         let mut output_liveness = Vec::with_capacity(max_output_count);
-        for (instruction_index, instruction) in self.instructions.iter().enumerate().rev() {
+        for (instruction_index, instruction) in entry.instructions.iter().enumerate().rev() {
             output_liveness.clear();
             let mut has_live_output = false;
             for output in instruction.outputs.iter().copied() {
@@ -658,8 +979,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// their own [`Operation::effects`] set so that effects remain visible through higher-order boundaries.
     #[inline]
     pub fn effects(&self) -> Effects {
-        self.instructions
+        self.regions
             .iter()
+            .flat_map(|region| region.instructions.iter())
             .map(|instruction| instruction.operation().effects())
             .fold(Effects::PURE, Effects::union)
     }
@@ -676,22 +998,33 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         mut map_fn: F,
     ) -> Result<Program<V, P, Input, Output>, ProgramError> {
         Ok(Program {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions: self
-                .instructions
-                .iter()
-                .map(|instruction| {
-                    Ok(Instruction::new(
-                        map_fn(instruction.operation())?,
-                        instruction.inputs().to_vec(),
-                        instruction.outputs().to_vec(),
-                    ))
-                })
-                .collect::<Result<Vec<_>, ProgramError>>()?,
             input_structure: self.input_structure.clone(),
             output_structure: self.output_structure.clone(),
+            regions: self
+                .regions
+                .iter()
+                .map(|region| {
+                    Ok(Region {
+                        atoms: region.atoms.clone(),
+                        input_ids: region.input_ids.clone(),
+                        output_ids: region.output_ids.clone(),
+                        instructions: region
+                            .instructions
+                            .iter()
+                            .map(|instruction| {
+                                Ok(Instruction::new_with_regions(
+                                    map_fn(instruction.operation())?,
+                                    instruction.inputs().to_vec(),
+                                    instruction.outputs().to_vec(),
+                                    instruction.regions().to_vec(),
+                                    instruction.callees().to_vec(),
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, ProgramError>>()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?,
+            entry: self.entry,
             marker: PhantomData,
         })
     }
@@ -706,12 +1039,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         O: Clone,
     {
         Program {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions: self.instructions.clone(),
-            input_structure: vec![Placeholder; self.input_ids.len()],
-            output_structure: vec![Placeholder; self.output_ids.len()],
+            input_structure: vec![Placeholder; self.input_count()],
+            output_structure: vec![Placeholder; self.output_count()],
+            regions: self.regions.clone(),
+            entry: self.entry,
             marker: PhantomData,
         }
     }
@@ -721,17 +1052,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// identifiers, and instruction sequence without cloning them, and only replaces the structured input and output
     /// metadata with [`Placeholder`] vector structures sized to the flat arities.
     pub fn into_flat_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
-        let input_structure = vec![Placeholder; self.input_ids.len()];
-        let output_structure = vec![Placeholder; self.output_ids.len()];
-        Program {
-            atoms: self.atoms,
-            input_ids: self.input_ids,
-            output_ids: self.output_ids,
-            instructions: self.instructions,
-            input_structure,
-            output_structure,
-            marker: PhantomData,
-        }
+        let input_structure = vec![Placeholder; self.input_count()];
+        let output_structure = vec![Placeholder; self.output_count()];
+        Program { input_structure, output_structure, regions: self.regions, entry: self.entry, marker: PhantomData }
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
@@ -743,11 +1066,17 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     where
         O: Clone,
     {
+        // TODO(eaplatanios): Fix this as part of phase 2.
+        if self.regions.len() != 1 {
+            return Err(ProgramError::MalformedProgram(
+                "multi-region programs are not yet supported by this transformation".to_string(),
+            ));
+        }
         let instruction_by_output = self.instruction_by_output();
         let mut program_builder = ProgramBuilder::new();
-        let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
-        for input_id in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+        let mut atom_id_mapping = HashMap::with_capacity(self.atoms().len());
+        for input_id in self.input_ids().to_vec() {
+            let input = self.atoms().get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
             let Atom::Variable(input_type) = input else {
                 return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
             };
@@ -757,7 +1086,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         // Make sure that effectful instructions and their transitive dependencies are processed in original instruction
         // order before the outputs, so that instructions with observable effects survive even when dead and ordered
         // effects keep their relative order.
-        for instruction in self.instructions.iter() {
+        for instruction in self.instructions().iter() {
             if instruction.operation().effects().is_pure() {
                 continue;
             }
@@ -773,9 +1102,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         let output_ids = self
-            .output_ids
-            .iter()
-            .copied()
+            .output_ids()
+            .to_vec()
+            .into_iter()
             .map(|output| {
                 add_atom_to_program_builder(
                     &mut program_builder,
@@ -799,12 +1128,19 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     pub fn into_simplified(self) -> Result<Self, ProgramError> {
         let instruction_by_output = self.instruction_by_output();
         let effectful_instruction_outputs = self
-            .instructions
+            .instructions()
             .iter()
             .filter(|instruction| !instruction.operation().effects().is_pure())
             .flat_map(|instruction| instruction.outputs().iter().copied())
             .collect::<Vec<_>>();
-        let Program { atoms, input_ids, output_ids, instructions, input_structure, output_structure, marker: _ } = self;
+        // TODO(eaplatanios): Fix this as part of phase 2.
+        if self.regions.len() != 1 {
+            return Err(ProgramError::MalformedProgram(
+                "multi-region programs are not yet supported by this transformation".to_string(),
+            ));
+        }
+        let Self { regions, input_structure, output_structure, .. } = self;
+        let Region { atoms, input_ids, output_ids, instructions } = regions.into_iter().next().unwrap();
 
         let expected_input_count = input_structure.parameter_count();
         check_count!("input", input_ids, expected_input_count, ProgramError);
@@ -864,12 +1200,15 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            atoms: new_atoms,
-            input_ids: new_input_ids,
-            output_ids,
-            instructions: new_instructions,
             input_structure,
             output_structure,
+            regions: vec![Region {
+                atoms: new_atoms,
+                input_ids: new_input_ids,
+                output_ids,
+                instructions: new_instructions,
+            }],
+            entry: RegionId::new(0),
             marker: PhantomData,
         })
     }
@@ -908,16 +1247,22 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     where
         O: Clone,
     {
+        // TODO(eaplatanios): Fix this as part of phase 2.
+        if self.regions.len() != 1 {
+            return Err(ProgramError::MalformedProgram(
+                "multi-region programs are not yet supported by this transformation".to_string(),
+            ));
+        }
         let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
         let mut program_builder = ProgramBuilder::new();
-        let mut atom_id_mapping = HashMap::with_capacity(self.atoms.len());
+        let mut atom_id_mapping = HashMap::with_capacity(self.atoms().len());
         let mut live_input_indices = Vec::new();
 
         for (position, id) in inputs.iter().copied().enumerate() {
             if !input_liveness[position] {
                 continue;
             }
-            let Atom::Variable(input_type) = &self.atoms[id.index()] else {
+            let Atom::Variable(input_type) = &self.atoms()[id.index()] else {
                 return Err(ProgramError::MalformedProgram(format!("filter input atom {id} is not a variable")));
             };
             atom_id_mapping.insert(id, program_builder.add_input(input_type.clone()));
@@ -972,7 +1317,13 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         keep_alive: &[AtomId],
     ) -> Result<(Program<V, O, Vec<V>, Vec<V>>, Vec<usize>), ProgramError> {
         let (instruction_by_output, input_liveness) = self.compute_live_inputs(inputs, outputs, keep_alive)?;
-        let Program { atoms, instructions, .. } = self;
+        // TODO(eaplatanios): Fix this as part of phase 2.
+        if self.regions.len() != 1 {
+            return Err(ProgramError::MalformedProgram(
+                "multi-region programs are not yet supported by this transformation".to_string(),
+            ));
+        }
+        let Region { atoms, instructions, .. } = self.regions.into_iter().next().unwrap();
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
         let mut instructions = instructions.into_iter().map(Some).collect::<Vec<_>>();
         let mut new_atoms = Vec::with_capacity(atoms.len());
@@ -1031,14 +1382,19 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let input_structure = vec![Placeholder; new_input_ids.len()];
+        let output_structure = vec![Placeholder; output_ids.len()];
         Ok((
             Program {
-                input_structure: vec![Placeholder; new_input_ids.len()],
-                output_structure: vec![Placeholder; output_ids.len()],
-                atoms: new_atoms,
-                input_ids: new_input_ids,
-                output_ids,
-                instructions: new_instructions,
+                input_structure,
+                output_structure,
+                regions: vec![Region {
+                    atoms: new_atoms,
+                    input_ids: new_input_ids,
+                    output_ids,
+                    instructions: new_instructions,
+                }],
+                entry: RegionId::new(0),
                 marker: PhantomData,
             },
             live_input_indices,
@@ -1056,9 +1412,9 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         outputs: &[AtomId],
         keep_alive: &[AtomId],
     ) -> Result<(Vec<Option<usize>>, Vec<bool>), ProgramError> {
-        let mut input_position = vec![None; self.atoms.len()];
+        let mut input_position = vec![None; self.atoms().len()];
         for (position, id) in inputs.iter().copied().enumerate() {
-            let atom = self.atoms.get(id.index()).ok_or(ProgramError::UnboundAtomId { id })?;
+            let atom = self.atoms().get(id.index()).ok_or(ProgramError::UnboundAtomId { id })?;
             if !atom.is_variable() {
                 return Err(ProgramError::MalformedProgram(format!("filter input atom {id} is not a variable")));
             }
@@ -1072,11 +1428,11 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
 
         let instruction_by_output = self.instruction_by_output();
-        let mut needed = vec![false; self.atoms.len()];
+        let mut needed = vec![false; self.atoms().len()];
         let mut input_liveness = vec![false; inputs.len()];
         let mut stack = Vec::new();
         for output in outputs.iter().copied().chain(keep_alive.iter().copied()) {
-            if output.index() >= self.atoms.len() {
+            if output.index() >= self.atoms().len() {
                 return Err(ProgramError::UnboundAtomId { id: output });
             }
             if !needed[output.index()] {
@@ -1090,7 +1446,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                 input_liveness[position] = true;
                 continue;
             }
-            match &self.atoms[atom_id.index()] {
+            match &self.atoms()[atom_id.index()] {
                 Atom::Constant(_) => {}
                 Atom::Variable(_) => {
                     let instruction_index = instruction_by_output.get(atom_id.index()).copied().flatten().ok_or(
@@ -1098,7 +1454,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                             "filter atom {atom_id} is not a selected input and has no producer",
                         )),
                     )?;
-                    for input in self.instructions[instruction_index].inputs.iter().copied() {
+                    for input in self.instructions()[instruction_index].inputs.iter().copied() {
                         if !needed[input.index()] {
                             needed[input.index()] = true;
                             stack.push(input);
@@ -1116,28 +1472,29 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     /// Renders this [`Program`] with the provided indentation level that is useful for situations where [`Program`]s
     /// are nested within other programs like with control flow [`Operation`]s.
     pub fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let entry_region = self.entry_region();
         write!(formatter, "{:indentation$}", "")?;
         write!(formatter, "lambda ")?;
-        self.input_ids.iter().enumerate().try_for_each(|(index, input_id)| {
+        entry_region.input_ids.iter().enumerate().try_for_each(|(index, input_id)| {
             if index > 0 {
-                write!(formatter, ", {input_id}:{}", self.atoms[input_id.index].r#type())
+                write!(formatter, ", {input_id}:{}", entry_region.atoms[input_id.index].r#type())
             } else {
-                write!(formatter, "{input_id}:{}", self.atoms[input_id.index].r#type())
+                write!(formatter, "{input_id}:{}", entry_region.atoms[input_id.index].r#type())
             }
         })?;
         writeln!(formatter, " .")?;
-        let mut instructions_by_first_output = vec![None; self.atoms.len()];
-        for (index, instruction) in self.instructions.iter().enumerate() {
+        let mut instructions_by_first_output = vec![None; entry_region.atoms.len()];
+        for (index, instruction) in entry_region.instructions.iter().enumerate() {
             if let Some(output_id) = instruction.outputs.first() {
                 instructions_by_first_output[output_id.index] = Some(index);
             }
         }
         let mut binding_count = 0usize;
-        let mut is_input = vec![false; self.atoms.len()];
-        for input_id in self.input_ids.iter().copied() {
+        let mut is_input = vec![false; entry_region.atoms.len()];
+        for input_id in entry_region.input_ids.iter().copied() {
             is_input[input_id.index] = true;
         }
-        for (atom_id, atom) in self.atoms.iter().enumerate() {
+        for (atom_id, atom) in entry_region.atoms.iter().enumerate() {
             match atom {
                 Atom::Constant(_) => {
                     write!(formatter, "{:indentation$}", "")?;
@@ -1146,21 +1503,21 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                         "{} {}:{} = const",
                         if binding_count == 0 { "let" } else { "   " },
                         AtomId { index: atom_id },
-                        self.atoms[atom_id].r#type()
+                        entry_region.atoms[atom_id].r#type()
                     )?;
                     binding_count += 1;
                 }
                 Atom::Variable(_) if is_input[atom_id] => {}
                 Atom::Variable(_) => {
                     if let Some(instruction_index) = instructions_by_first_output[atom_id] {
-                        let instruction = &self.instructions[instruction_index];
+                        let instruction = &entry_region.instructions[instruction_index];
                         write!(formatter, "{:indentation$}", "")?;
                         write!(formatter, "{} ", if binding_count == 0 { "let" } else { "   " })?;
                         instruction.outputs.iter().enumerate().try_for_each(|(index, output)| {
                             if index > 0 {
-                                write!(formatter, ", {output}:{}", self.atoms[output.index].r#type())
+                                write!(formatter, ", {output}:{}", entry_region.atoms[output.index].r#type())
                             } else {
-                                write!(formatter, "{output}:{}", self.atoms[output.index].r#type())
+                                write!(formatter, "{output}:{}", entry_region.atoms[output.index].r#type())
                             }
                         })?;
                         write!(formatter, " = ")?;
@@ -1176,7 +1533,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
         }
         write!(formatter, "{:indentation$}", "")?;
         write!(formatter, "in (")?;
-        self.output_ids.iter().enumerate().try_for_each(|(index, output)| {
+        entry_region.output_ids.iter().enumerate().try_for_each(|(index, output)| {
             if index > 0 { write!(formatter, ", {output}") } else { write!(formatter, "{output}") }
         })?;
         write!(formatter, ")")
@@ -1186,12 +1543,10 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
 impl<V: Value, O: Clone, Input: Parameterized<V>, Output: Parameterized<V>> Clone for Program<V, O, Input, Output> {
     fn clone(&self) -> Self {
         Self {
-            atoms: self.atoms.clone(),
-            input_ids: self.input_ids.clone(),
-            output_ids: self.output_ids.clone(),
-            instructions: self.instructions.clone(),
             input_structure: self.input_structure.clone(),
             output_structure: self.output_structure.clone(),
+            regions: self.regions.clone(),
+            entry: self.entry,
             marker: PhantomData,
         }
     }
@@ -1239,18 +1594,32 @@ impl ProgramLiveSets {
     }
 }
 
-/// Builder for [`Program`]s that carries for the most part the same information as the [`Program`] that is being built,
-/// but also carries an optional [`ProgramError`] that can be used to signal a failure during program construction.
+/// Builder for [`Program`]s. It owns the entry [`Region`] under construction (i.e., its [`Atom`]s, input [`AtomId`]s,
+/// and [`Instruction`]s), the previously added non-entry [`Region`]s together with their callee-interning state, and
+/// an optional [`ProgramError`] that can be used to signal a failure during program construction. Non-entry regions
+/// enter a builder only in sealed form: [`add_region`](Self::add_region) and [`add_callee`](Self::add_callee) copy
+/// complete reachable closures out of already-built (and therefore immutable and fully validated) [`Program`]s, so a
+/// region can never change after an instruction attaches it.
 #[derive(Clone, Debug)]
-pub struct ProgramBuilder<V: Typed, O> {
-    /// [`Atom`]s contained in the [`Program`] that is being built, in the order in which they will be evaluated.
+pub struct ProgramBuilder<V: Typed + Parameter, O> {
+    /// [`Atom`]s contained in the entry [`Region`] of the [`Program`] that is being built, in evaluation order.
     pub(crate) atoms: Vec<Atom<V>>,
 
     /// [`AtomId`]s of the [`Atom`]s that correspond to the inputs (i.e., arguments) of the [`Program`] being built.
     pub(crate) input_ids: Vec<AtomId>,
 
-    /// Ordered sequence of [`Instruction`]s that make up the computational graph of the [`Program`] being built.
+    /// Ordered sequence of [`Instruction`]s that make up the entry [`Region`] of the [`Program`] being built.
     pub(crate) instructions: Vec<Instruction<O>>,
+
+    /// Sealed non-entry [`Region`]s of the [`Program`] being built, in [`RegionId`] order. Regions are appended to
+    /// this list with [`Self::add_region`] and [`Self::add_callee`], and instructions reference them by [`RegionId`].
+    pub(crate) regions: Vec<Region<V, O>>,
+
+    /// Callee-interning table mapping each imported callee source to its destination root, keyed by [`Rc`] identity
+    /// (i.e., [`Rc::ptr_eq`]). Two imports of the same live source program reuse one callee root, while structurally
+    /// equal but independently built programs remain distinct. Storing the [`Rc`] itself both provides the identity
+    /// key and keeps the source alive, so a key can never be reused by a later allocation.
+    pub(crate) callees: Vec<(Rc<Program<V, O, Vec<V>, Vec<V>>>, RegionId)>,
 
     /// Optional [`ProgramError`] encountered during program construction that will be propagated via [`Self::build`].
     pub(crate) error: Option<ProgramError>,
@@ -1260,7 +1629,14 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     /// Creates a new [`ProgramBuilder`].
     #[inline]
     pub fn new() -> Self {
-        Self { atoms: Vec::new(), input_ids: Vec::new(), instructions: Vec::new(), error: None }
+        Self {
+            atoms: Vec::new(),
+            input_ids: Vec::new(),
+            instructions: Vec::new(),
+            regions: Vec::new(),
+            callees: Vec::new(),
+            error: None,
+        }
     }
 
     /// Returns the atoms currently owned by this builder.
@@ -1287,7 +1663,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         self.error.as_ref()
     }
 
-    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
+    /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`](crate::Type).
     #[inline]
     pub fn add_input(&mut self, r#type: V::Type) -> AtomId {
         let id = self.add_variable(r#type);
@@ -1303,7 +1679,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         id
     }
 
-    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`].
+    /// Adds an [`Atom::Variable`] to the [`Program`] that is being built with the provided [`Type`](crate::Type).
     #[inline]
     pub fn add_variable(&mut self, r#type: V::Type) -> AtomId {
         let id = AtomId { index: self.atoms.len() };
@@ -1331,7 +1707,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = operation.infer_output_types(input_types.as_slice())?;
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(Instruction { operation, inputs, outputs });
+        self.instructions.push(Instruction::new(operation, inputs, outputs));
         Ok(self.instructions.last().unwrap().outputs.as_slice())
     }
 
@@ -1360,6 +1736,12 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
+        // TODO(eaplatanios): Fix this as part of phase 2.
+        if program.regions.len() != 1 {
+            return Err(ProgramError::MalformedProgram(
+                "multi-region programs are not yet supported by this transformation".to_string(),
+            ));
+        }
         // The two closures below never run concurrently but both need `&mut` access to this builder. A `RefCell` lets
         // each take a short-lived mutable borrow without the borrow checker conservatively rejecting the second one.
         let builder = RefCell::new(self);
@@ -1372,8 +1754,72 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         )
     }
 
+    // TODO(eaplatanios): [regions] `add_region` and `add_callee` are reference-based (clone-on-add) for now,
+    //  matching the detached-trace construction idiom. Once the operation-family migrations land and
+    //  `Context::bind_with_regions` hands the builder owned programs, consider owned-move variants that splice the
+    //  source arena directly instead of cloning it. This is a Phase 2+ decision.
+    /// Imports the provided [`Program`] as a lexically owned subtree, copying the complete reachable closure of its
+    /// entry [`Region`] (i.e., lexical descendants, referenced callee roots, and their transitive closures) with all
+    /// [`RegionId`]s remapped and sharing within the imported closure preserved.
+    pub fn add_region<Input: Parameterized<V>, Output: Parameterized<V>>(
+        &mut self,
+        program: &Program<V, O, Input, Output>,
+    ) -> RegionId
+    where
+        O: Clone,
+    {
+        let mut remap = HashMap::new();
+        self.add_region_closure(&program.regions, program.entry, &mut remap)
+    }
+
+    // TODO(eaplatanios): [regions] `add_region` and `add_callee` are reference-based (clone-on-add) for now,
+    //  matching the detached-trace construction idiom. Once the operation-family migrations land and
+    //  `Context::bind_with_regions` hands the builder owned programs, consider owned-move variants that splice the
+    //  source arena directly instead of cloning it. This is a Phase 2+ decision.
+    /// Imports the provided [`Program`] as a shareable callee root, interning by [`Rc`] identity within this builder.
+    /// Two calls to this function with the same live [`Rc`] will reuse one callee root [`RegionId`], while structurally
+    /// equal but independently built programs will remain distinct.
+    pub fn add_callee(&mut self, program: &Rc<Program<V, O, Vec<V>, Vec<V>>>) -> RegionId
+    where
+        O: Clone,
+    {
+        if let Some((_, id)) = self.callees.iter().find(|(interned, _)| Rc::ptr_eq(interned, program)) {
+            return *id;
+        }
+        let id = self.add_region(program.as_ref());
+        self.callees.push((program.clone(), id));
+        id
+    }
+
+    /// Copies the reachable closure of `regions[root]` into this builder in post order (children before parents, so
+    /// attachment identifiers always reference previously appended regions), memoizing the remapping so sharing
+    /// within one imported closure is preserved.
+    fn add_region_closure(
+        &mut self,
+        regions: &[Region<V, O>],
+        root: RegionId,
+        remap: &mut HashMap<RegionId, RegionId>,
+    ) -> RegionId
+    where
+        O: Clone,
+    {
+        if let Some(mapped) = remap.get(&root) {
+            return *mapped;
+        }
+        let mut region = regions[root.index()].clone();
+        for instruction in &mut region.instructions {
+            for attachment in instruction.regions.iter_mut().chain(instruction.callees.iter_mut()) {
+                *attachment = self.add_region_closure(regions, *attachment, remap);
+            }
+        }
+        let id = RegionId::new(self.regions.len());
+        self.regions.push(region);
+        remap.insert(root, id);
+        id
+    }
+
+    // TODO(eaplatanios): Review this.
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
-    #[inline]
     pub fn build<Input: Parameterized<V>, Output: Parameterized<V>>(
         self,
         output_ids: Vec<AtomId>,
@@ -1390,66 +1836,151 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         let expected_output_count = output_structure.parameter_count();
         check_count!("output", output_ids, expected_output_count, ProgramError);
 
-        // Verify that variable dependencies are either inputs or previous instruction outputs.
-        let mut input_atoms = vec![false; self.atoms.len()];
-        let mut variable_has_provider = vec![false; self.atoms.len()];
-        for input_id in self.input_ids.iter().copied() {
-            let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-            let Atom::Variable(_) = input else {
-                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
-            };
-            if input_atoms[input_id.index] {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "program input atom {input_id} appears more than once",
-                )));
-            }
-            input_atoms[input_id.index] = true;
-            variable_has_provider[input_id.index] = true;
-        }
-        for instruction in self.instructions.iter() {
-            for input_id in instruction.inputs.iter().copied() {
-                let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-                if input.is_variable() && !variable_has_provider[input_id.index] {
-                    return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
+        validate_region_parts(&self.atoms, &self.input_ids, &self.instructions, &output_ids)?;
+        let entry = RegionId::new(self.regions.len());
+        validate_region_attachments(&self.instructions, entry)?;
+
+        // Whole-program attachment validation: every lexically owned region has exactly one owning slot, callee
+        // targets are never lexically owned, and every sealed region is reachable from the entry root. Acyclicity
+        // holds by construction and by the per-region topological attachment checks above, which only admit
+        // attachments to previously sealed regions.
+        let mut regions = self.regions;
+        regions.push(Region {
+            atoms: self.atoms,
+            input_ids: self.input_ids,
+            output_ids,
+            instructions: self.instructions,
+        });
+        let mut lexically_owned = vec![false; regions.len()];
+        for region in &regions {
+            for instruction in &region.instructions {
+                for owned in instruction.regions().iter().copied() {
+                    if owned == entry {
+                        return Err(ProgramError::MalformedProgram(
+                            "the program entry region cannot be lexically owned by an instruction".to_string(),
+                        ));
+                    }
+                    if lexically_owned[owned.index()] {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "region {owned} is lexically owned by more than one instruction slot",
+                        )));
+                    }
+                    lexically_owned[owned.index()] = true;
                 }
-            }
-            for output_id in instruction.outputs.iter().copied() {
-                let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-                let Atom::Variable(_) = output else {
-                    return Err(ProgramError::MalformedProgram(
-                        "instruction output atom was not a variable".to_string(),
-                    ));
-                };
-                if input_atoms[output_id.index] {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction output atom {output_id} is a program input",
-                    )));
-                }
-                if variable_has_provider[output_id.index] {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "instruction output atom {output_id} is produced by more than one instruction",
-                    )));
-                }
-                variable_has_provider[output_id.index] = true;
             }
         }
-        for output_id in output_ids.iter().copied() {
-            let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-            if output.is_variable() && !variable_has_provider[output_id.index] {
+        for region in &regions {
+            for instruction in &region.instructions {
+                for callee in instruction.callees().iter().copied() {
+                    if callee == entry {
+                        return Err(ProgramError::MalformedProgram(
+                            "the program entry region cannot be referenced as a callee".to_string(),
+                        ));
+                    }
+                    if lexically_owned[callee.index()] {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "region {callee} is referenced as a callee but is lexically owned by an instruction",
+                        )));
+                    }
+                }
+            }
+        }
+        let mut reachable = vec![false; regions.len()];
+        let mut pending = vec![entry];
+        while let Some(current) = pending.pop() {
+            if std::mem::replace(&mut reachable[current.index()], true) {
+                continue;
+            }
+            for instruction in &regions[current.index()].instructions {
+                pending.extend(instruction.regions.iter().copied());
+                pending.extend(instruction.callees.iter().copied());
+            }
+        }
+        if let Some(unreachable) = reachable.iter().position(|is_reachable| !is_reachable) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "region {} is not reachable from the program entry region",
+                RegionId::new(unreachable),
+            )));
+        }
+
+        Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
+    }
+}
+
+// TODO(eaplatanios): Review this.
+/// Verifies that the provided flat region parts are well-formed: inputs are unique variables, every variable
+/// dependency is an input or a previous instruction output, instruction outputs are uniquely provided variables, and
+/// region outputs are bound.
+fn validate_region_parts<V: Value, O>(
+    atoms: &[Atom<V>],
+    input_ids: &[AtomId],
+    instructions: &[Instruction<O>],
+    output_ids: &[AtomId],
+) -> Result<(), ProgramError> {
+    let mut input_atoms = vec![false; atoms.len()];
+    let mut variable_has_provider = vec![false; atoms.len()];
+    for input_id in input_ids.iter().copied() {
+        let input = atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+        let Atom::Variable(_) = input else {
+            return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
+        };
+        if input_atoms[input_id.index] {
+            return Err(ProgramError::MalformedProgram(format!(
+                "program input atom {input_id} appears more than once",
+            )));
+        }
+        input_atoms[input_id.index] = true;
+        variable_has_provider[input_id.index] = true;
+    }
+    for instruction in instructions.iter() {
+        for input_id in instruction.inputs.iter().copied() {
+            let input = atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+            if input.is_variable() && !variable_has_provider[input_id.index] {
                 return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
             }
         }
-
-        Ok(Program {
-            atoms: self.atoms,
-            input_ids: self.input_ids,
-            instructions: self.instructions,
-            output_ids,
-            input_structure,
-            output_structure,
-            marker: PhantomData,
-        })
+        for output_id in instruction.outputs.iter().copied() {
+            let output = atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
+            let Atom::Variable(_) = output else {
+                return Err(ProgramError::MalformedProgram("instruction output atom was not a variable".to_string()));
+            };
+            if input_atoms[output_id.index] {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "instruction output atom {output_id} is a program input",
+                )));
+            }
+            if variable_has_provider[output_id.index] {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "instruction output atom {output_id} is produced by more than one instruction",
+                )));
+            }
+            variable_has_provider[output_id.index] = true;
+        }
     }
+    for output_id in output_ids.iter().copied() {
+        let output = atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
+        if output.is_variable() && !variable_has_provider[output_id.index] {
+            return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
+        }
+    }
+    Ok(())
+}
+
+// TODO(eaplatanios): Review this.
+/// Verifies that every instruction attachment references a region sealed before the containing region, which keeps
+/// the attachment graph acyclic by construction. Cycle validation therefore precedes any recursive derivation over
+/// attached regions (e.g., future recursive effect inference).
+fn validate_region_attachments<O>(instructions: &[Instruction<O>], owner: RegionId) -> Result<(), ProgramError> {
+    for instruction in instructions {
+        for attachment in instruction.regions.iter().chain(instruction.callees.iter()).copied() {
+            if attachment.index() >= owner.index() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "instruction attachment {attachment} does not reference a previously sealed region",
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl<V: Value, O: Operation<V::Type>> Default for ProgramBuilder<V, O> {
@@ -1478,7 +2009,7 @@ fn add_atom_to_program_builder<
     if let Some(mapped_atom) = atom_id_mapping.get(&atom_id) {
         return Ok(*mapped_atom);
     }
-    let atom = program.atoms.get(atom_id.index).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+    let atom = program.atoms().get(atom_id.index).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
     let atom = match atom {
         Atom::Constant(value) => Ok(program_builder.add_constant(value.clone())),
         Atom::Variable(_) => {
@@ -1487,7 +2018,7 @@ fn add_atom_to_program_builder<
                 .copied()
                 .flatten()
                 .ok_or(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()))?;
-            let instruction = &program.instructions[instruction_index];
+            let instruction = &program.instructions()[instruction_index];
             let inputs = instruction
                 .inputs
                 .iter()
@@ -1587,7 +2118,7 @@ fn move_atom_to_program<V: Value, O: Operation<V::Type>>(
         atom_id_mapping.insert(output, new_output);
         outputs.push(new_output);
     }
-    new_instructions.push(Instruction { operation: instruction.operation, inputs, outputs });
+    new_instructions.push(Instruction::new(instruction.operation, inputs, outputs));
     atom_id_mapping
         .get(&atom_id)
         .copied()
@@ -2169,13 +2700,13 @@ mod tests {
 
         let simplified = program.into_simplified().unwrap();
         assert_eq!(value_clone_count.get(), 0);
-        assert_eq!(simplified.input_ids, vec![AtomId { index: 0 }]);
-        assert_eq!(simplified.output_ids, vec![AtomId { index: 2 }, AtomId { index: 2 }]);
-        assert_eq!(simplified.atoms.len(), 3);
-        assert!(matches!(simplified.atoms.get(1), Some(Atom::Constant(value)) if value.value == 3.0));
-        assert_eq!(simplified.instructions.len(), 1);
-        assert_eq!(simplified.instructions[0].inputs, vec![AtomId { index: 0 }, AtomId { index: 1 }]);
-        assert_eq!(simplified.instructions[0].outputs, vec![AtomId { index: 2 }]);
+        assert_eq!(simplified.input_ids(), vec![AtomId { index: 0 }]);
+        assert_eq!(simplified.output_ids(), vec![AtomId { index: 2 }, AtomId { index: 2 }]);
+        assert_eq!(simplified.atoms().len(), 3);
+        assert!(matches!(simplified.atoms().get(1), Some(Atom::Constant(value)) if value.value == 3.0));
+        assert_eq!(simplified.instructions().len(), 1);
+        assert_eq!(simplified.instructions()[0].inputs(), vec![AtomId { index: 0 }, AtomId { index: 1 }]);
+        assert_eq!(simplified.instructions()[0].outputs(), vec![AtomId { index: 2 }]);
         assert_eq!(
             simplified.to_string(),
             indoc! {"
@@ -2317,9 +2848,9 @@ mod tests {
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![v1], (Placeholder, Placeholder), Placeholder)
             .unwrap();
-        assert_eq!(program.input_ids, vec![i0, i1]);
-        assert_eq!(program.output_ids, vec![v1]);
-        assert_eq!(program.instructions.len(), 2);
+        assert_eq!(program.input_ids(), vec![i0, i1]);
+        assert_eq!(program.output_ids(), vec![v1]);
+        assert_eq!(program.instructions().len(), 2);
         assert_eq!(program.interpret((Scalar::from(2.0f64), Scalar::from(38.0f64))), Ok(Scalar::from(36.0f64)));
 
         // `add_program` appends the program's reachable instructions into a fresh builder, remapping its inputs to the
@@ -2426,5 +2957,229 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == format!("instruction output atom {output} is produced by more than one instruction")
         ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_multi_region_program_construction_and_locators() {
+        // Phase 1 pin for the first-class-program-regions plan: sealed regions, attachment validation, and locator
+        // resolution over the region arena. The operation-declared attachment contract arrives in Phase 2, so the
+        // attached instruction is assembled through the unchecked path.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let doubled = region_builder.add_instruction(AddOperation, vec![region_input, region_input]).unwrap()[0];
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.add_region(&region_program);
+        assert_eq!(sealed, RegionId::new(0));
+
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new_with_regions(
+            AddOperation.into(),
+            vec![input, input],
+            vec![output],
+            vec![sealed],
+            Vec::new(),
+        ));
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Locators: the arena holds the sealed region plus the entry region, and producers resolve per region.
+        assert_eq!(program.regions().len(), 2);
+        assert_eq!(program.entry(), RegionId::new(1));
+        assert_eq!(program.region(sealed).unwrap().input_ids(), &[region_input]);
+        assert!(matches!(
+            program.region(RegionId::new(7)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^7 is out of range",
+        ));
+        let instruction = &program.instructions()[0];
+        assert_eq!(instruction.regions(), &[sealed]);
+        assert!(instruction.callees().is_empty());
+        assert_eq!(
+            program.producer(ValueId::new(program.entry(), output)).unwrap(),
+            Some(InstructionId::new(program.entry(), 0)),
+        );
+        assert_eq!(program.producer(ValueId::new(program.entry(), input)).unwrap(), None);
+        assert_eq!(program.producer(ValueId::new(sealed, doubled)).unwrap(), Some(InstructionId::new(sealed, 0)),);
+
+        // Borrowed instruction views resolve attachments against the arena.
+        let view = program.instruction(InstructionId::new(program.entry(), 0)).unwrap();
+        assert_eq!(view.id(), InstructionId::new(program.entry(), 0));
+        assert_eq!(view.instruction().regions(), &[sealed]);
+        assert_eq!(view.region(0).unwrap().input_ids(), &[region_input]);
+        assert!(matches!(
+            view.callee(0),
+            Err(ProgramError::MalformedProgram(message)) if message == "instruction has no callee index 0",
+        ));
+        assert!(program.instruction(InstructionId::new(program.entry(), 9)).is_err());
+
+        // The multi-region program clones, maps, and reports effects across every region.
+        let cloned = program.clone();
+        assert_eq!(cloned.regions().len(), 2);
+        let mapped = program.map_operations(|operation| Ok(operation.clone())).unwrap();
+        assert_eq!(mapped.regions().len(), 2);
+        assert_eq!(mapped.instructions()[0].regions(), &[sealed]);
+        assert!(program.effects().is_pure());
+
+        // Legacy single-region rebuild paths reject multi-region programs instead of silently dropping regions.
+        assert!(matches!(
+            program.simplified(),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+        assert!(matches!(
+            program.filtered(&[], program.output_ids(), &[]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+        assert!(matches!(
+            ProgramBuilder::new().add_program(&program.to_flat_program(), &[]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+        assert!(matches!(
+            program.into_simplified(),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_multi_region_attachment_validation() {
+        // Attachments must reference previously sealed regions (which keeps the graph acyclic by construction).
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new_with_regions(
+            AddOperation.into(),
+            vec![input, input],
+            vec![output],
+            vec![RegionId::new(3)],
+            Vec::new(),
+        ));
+        assert!(matches!(
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "instruction attachment ^3 does not reference a previously sealed region",
+        ));
+
+        // A lexically owned region has exactly one owning slot.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.add_region(&region_program);
+        let input = builder.add_input(DataType::F64);
+        let first = builder.add_variable(DataType::F64);
+        let second = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new_with_regions(
+            AddOperation.into(),
+            vec![input, input],
+            vec![first],
+            vec![sealed],
+            Vec::new(),
+        ));
+        builder.add_instruction_unchecked(Instruction::new_with_regions(
+            AddOperation.into(),
+            vec![first, input],
+            vec![second],
+            vec![sealed],
+            Vec::new(),
+        ));
+        assert!(matches!(
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "region ^0 is lexically owned by more than one instruction slot",
+        ));
+
+        // A callee target cannot also be lexically owned.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.add_region(&region_program);
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new_with_regions(
+            AddOperation.into(),
+            vec![input, input],
+            vec![output],
+            vec![sealed],
+            vec![sealed],
+        ));
+        assert!(matches!(
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "region ^0 is referenced as a callee but is lexically owned by an instruction",
+        ));
+
+        // Every sealed region must be reachable from the entry root.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        builder.add_region(&region_program);
+        let input = builder.add_input(DataType::F64);
+        assert!(matches!(
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "region ^0 is not reachable from the program entry region",
+        ));
+    }
+
+    // TODO(eaplatanios): Review this.
+    #[test]
+    fn test_program_region_closures_and_callee_interning() {
+        // A source program with one sealed region attached to its entry instruction.
+        let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = source_builder.add_region(&region_program);
+        let input = source_builder.add_input(DataType::F64);
+        let output = source_builder.add_variable(DataType::F64);
+        source_builder.add_instruction_unchecked(Instruction::new_with_regions(
+            AddOperation.into(),
+            vec![input, input],
+            vec![output],
+            vec![sealed],
+            Vec::new(),
+        ));
+        let source = source_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Lexical imports copy the complete closure and never share: two imports produce two subtrees.
+        let mut destination = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let first = destination.add_region(&source);
+        let second = destination.add_region(&source);
+        assert_ne!(first, second);
+        let imported = destination.regions[first.index()].clone();
+        assert_eq!(imported.instructions()[0].regions().len(), 1);
+        assert_ne!(imported.instructions()[0].regions()[0], first);
+
+        // Callee imports intern by live `Rc` identity: one shared root per live source, while structurally equal
+        // but independently built programs remain distinct.
+        let flat = Rc::new(source.to_flat_program());
+        let equal_but_distinct = Rc::new(flat.as_ref().clone());
+        let mut destination = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let first = destination.add_callee(&flat);
+        let second = destination.add_callee(&flat);
+        let third = destination.add_callee(&equal_but_distinct);
+        assert_eq!(first, second);
+        assert_ne!(first, third);
     }
 }

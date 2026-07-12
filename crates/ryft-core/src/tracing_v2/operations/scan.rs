@@ -78,8 +78,11 @@ where
         // Build the fused jvp body over `[primal_body_inputs..., tangent_body_inputs...]` and permute its doubled
         // signature into scan order (carries lead scanned inputs on both sides).
         let mut fused_body = C::Operation::jvp_program(self.body())?;
-        fused_body.input_ids = permute_doubled_scan_signature(fused_body.input_ids, body_input_count, carry_count);
-        fused_body.output_ids = permute_doubled_scan_signature(fused_body.output_ids, body_output_count, carry_count);
+        let fused_entry = fused_body.entry_region_mut();
+        fused_entry.input_ids =
+            permute_doubled_scan_signature(std::mem::take(&mut fused_entry.input_ids), body_input_count, carry_count);
+        fused_entry.output_ids =
+            permute_doubled_scan_signature(std::mem::take(&mut fused_entry.output_ids), body_output_count, carry_count);
 
         // Stage the fused scan with doubled carries over
         // `[primal_carry_inits..., tangent_carry_inits..., primal_stacks..., tangent_stacks...]`.
@@ -485,11 +488,12 @@ where
     // are carried over unchanged, so the reversed body produces `[carry_cotangent..., scanned_input_cotangent...]`.
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
     if linear_carry_count != carry_count {
-        let trailing_outputs = transposed_body.output_ids.split_off(linear_carry_count);
-        let mut linear_carry_outputs = transposed_body.output_ids.split_off(0).into_iter();
+        let transposed_body_region = transposed_body.entry_region_mut();
+        let trailing_outputs = transposed_body_region.output_ids.split_off(linear_carry_count);
+        let mut linear_carry_outputs = transposed_body_region.output_ids.split_off(0).into_iter();
         for (carry_index, &carry_is_linear) in operand_linear[..carry_count].iter().enumerate() {
             if carry_is_linear {
-                transposed_body.output_ids.push(linear_carry_outputs.next().unwrap());
+                transposed_body_region.output_ids.push(linear_carry_outputs.next().unwrap());
             } else {
                 // A differentiable carry's cotangent slot carries its cotangent dual; a non-differentiable carry (the
                 // `float0` analogue) has no cotangent space, so its slot carries only structural zeros typed by the
@@ -497,18 +501,18 @@ where
                 // the scan output cotangent below.
                 let output_type = &body.output_types()[carry_index];
                 let cotangent_type = output_type.cotangent().unwrap_or_else(|| output_type.clone());
-                let zero_output = AtomId::new(transposed_body.atoms.len());
-                transposed_body.atoms.push(Atom::Variable(cotangent_type.clone()));
-                transposed_body.instructions.push(Instruction::new(
+                let zero_output = AtomId::new(transposed_body_region.atoms.len());
+                transposed_body_region.atoms.push(Atom::Variable(cotangent_type.clone()));
+                transposed_body_region.instructions.push(Instruction::new(
                     O::from(ZeroOperation::new(cotangent_type)),
                     Vec::new(),
                     vec![zero_output],
                 ));
-                transposed_body.output_ids.push(zero_output);
+                transposed_body_region.output_ids.push(zero_output);
             }
         }
-        transposed_body.output_ids.extend(trailing_outputs);
-        transposed_body.output_structure = vec![Placeholder; transposed_body.output_ids.len()];
+        transposed_body_region.output_ids.extend(trailing_outputs);
+        transposed_body.output_structure = vec![Placeholder; transposed_body.output_ids().len()];
     }
 
     let transposed = ScanOperation::<V, O, F, Payload>::new_with_payload(transposed_body, carry_count, length)?

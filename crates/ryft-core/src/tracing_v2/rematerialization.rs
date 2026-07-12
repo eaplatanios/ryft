@@ -39,6 +39,8 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
+use thiserror::Error;
+
 use crate::batching::ArrayBatch;
 use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
@@ -51,8 +53,6 @@ use crate::differentiation::{
 use crate::effects::Effects;
 use crate::interpretation::{InterpretableOperation, InterpretableProgramOperation};
 use crate::macros::{check_count, check_types};
-use thiserror::Error;
-
 use crate::operations::Operation;
 use crate::operations::constants::{Constant as ConstantCapability, Zero, ZeroOperation};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
@@ -61,7 +61,7 @@ use crate::operations::tag::TagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::Captured;
-use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{Atom, AtomId, MaybeZero, Program, ProgramBuilder, ProgramError, Region, RegionId, Value};
 use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomVjpResidual, batch_rewrapped_program, stage_rewrapped_custom_call,
@@ -2118,8 +2118,8 @@ where
         // once, in the forward program.
         let (forward, saved_types) = {
             let source = linearization.primal();
-            let mut atoms = source.atoms.clone();
-            let mut instructions = source.instructions.clone();
+            let mut atoms = source.atoms().to_vec();
+            let mut instructions = source.instructions().to_vec();
             let mut output_ids = source.output_ids()[..output_count].to_vec();
             output_ids.extend(source.input_ids().iter().copied());
             let mut saved_types = Vec::with_capacity(saved_count);
@@ -2147,12 +2147,10 @@ where
             }
             let output_structure = vec![Placeholder; output_ids.len()];
             let forward = Program {
-                atoms,
-                input_ids: source.input_ids().to_vec(),
-                output_ids,
-                instructions,
                 input_structure: vec![Placeholder; input_count],
                 output_structure,
+                regions: vec![Region { atoms, input_ids: source.input_ids().to_vec(), output_ids, instructions }],
+                entry: RegionId::new(0),
                 marker: PhantomData,
             };
             (forward.into_simplified()?, saved_types)
