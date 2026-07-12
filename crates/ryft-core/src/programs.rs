@@ -1600,7 +1600,7 @@ impl ProgramLiveSets {
 /// enter a builder only in sealed form: [`add_region`](Self::add_region) and [`add_callee`](Self::add_callee) copy
 /// complete reachable closures out of already-built (and therefore immutable and fully validated) [`Program`]s, so a
 /// region can never change after an instruction attaches it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ProgramBuilder<V: Typed + Parameter, O> {
     /// [`Atom`]s contained in the entry [`Region`] of the [`Program`] that is being built, in evaluation order.
     pub(crate) atoms: Vec<Atom<V>>,
@@ -1768,8 +1768,31 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
     where
         O: Clone,
     {
-        let mut remap = HashMap::new();
-        self.add_region_closure(&program.regions, program.entry, &mut remap)
+        /// Copies the [`Region`]s of `regions[root]` that are reachable from `root` into `builder` in post order
+        /// (i.e., children before parents) so that every copied instruction references previously appended regions,
+        /// memoizing the [`RegionId`] remapping in `remapping` so that sharing within one added program is preserved.
+        fn copy_reachable_regions<V: Value, O: Clone + Operation<V::Type>>(
+            builder: &mut ProgramBuilder<V, O>,
+            regions: &[Region<V, O>],
+            root: RegionId,
+            remapping: &mut HashMap<RegionId, RegionId>,
+        ) -> RegionId {
+            if let Some(mapped) = remapping.get(&root) {
+                return *mapped;
+            }
+            let mut region = regions[root.index()].clone();
+            for instruction in &mut region.instructions {
+                for attachment in instruction.regions.iter_mut().chain(instruction.callees.iter_mut()) {
+                    *attachment = copy_reachable_regions(builder, regions, *attachment, remapping);
+                }
+            }
+            let id = RegionId::new(builder.regions.len());
+            builder.regions.push(region);
+            remapping.insert(root, id);
+            id
+        }
+
+        copy_reachable_regions(self, &program.regions, program.entry, &mut HashMap::new())
     }
 
     // TODO(eaplatanios): [regions] `add_region` and `add_callee` are reference-based (clone-on-add) for now,
@@ -1791,33 +1814,6 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         id
     }
 
-    /// Copies the reachable closure of `regions[root]` into this builder in post order (children before parents, so
-    /// attachment identifiers always reference previously appended regions), memoizing the remapping so sharing
-    /// within one imported closure is preserved.
-    fn add_region_closure(
-        &mut self,
-        regions: &[Region<V, O>],
-        root: RegionId,
-        remap: &mut HashMap<RegionId, RegionId>,
-    ) -> RegionId
-    where
-        O: Clone,
-    {
-        if let Some(mapped) = remap.get(&root) {
-            return *mapped;
-        }
-        let mut region = regions[root.index()].clone();
-        for instruction in &mut region.instructions {
-            for attachment in instruction.regions.iter_mut().chain(instruction.callees.iter_mut()) {
-                *attachment = self.add_region_closure(regions, *attachment, remap);
-            }
-        }
-        let id = RegionId::new(self.regions.len());
-        self.regions.push(region);
-        remap.insert(root, id);
-        id
-    }
-
     // TODO(eaplatanios): Review this.
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
     pub fn build<Input: Parameterized<V>, Output: Parameterized<V>>(
@@ -1836,14 +1832,81 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         let expected_output_count = output_structure.parameter_count();
         check_count!("output", output_ids, expected_output_count, ProgramError);
 
-        validate_region_parts(&self.atoms, &self.input_ids, &self.instructions, &output_ids)?;
-        let entry = RegionId::new(self.regions.len());
-        validate_region_attachments(&self.instructions, entry)?;
+        // Check for entry-region well-formedness. Program inputs must be unique variable atoms. Every variable
+        // an instruction consumes must be provided first (i.e., it is a program input or the output of an earlier
+        // instruction, so that instruction order is a valid evaluation order). Every instruction output must be a
+        // fresh variable with exactly one provider. Finally,every program output must be bound. Constants need no
+        // provider and are usable anywhere.
+        let mut input_atoms = vec![false; self.atoms.len()];
+        let mut variable_has_provider = vec![false; self.atoms.len()];
+        for input_id in self.input_ids.iter().copied() {
+            let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+            let Atom::Variable(_) = input else {
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
+            };
+            if input_atoms[input_id.index] {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "program input atom {input_id} appears more than once",
+                )));
+            }
+            input_atoms[input_id.index] = true;
+            variable_has_provider[input_id.index] = true;
+        }
+        for instruction in self.instructions.iter() {
+            for input_id in instruction.inputs.iter().copied() {
+                let input = self.atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+                if input.is_variable() && !variable_has_provider[input_id.index] {
+                    return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
+                }
+            }
+            for output_id in instruction.outputs.iter().copied() {
+                let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
+                let Atom::Variable(_) = output else {
+                    return Err(ProgramError::MalformedProgram(
+                        "instruction output atom was not a variable".to_string(),
+                    ));
+                };
+                if input_atoms[output_id.index] {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "instruction output atom {output_id} is a program input",
+                    )));
+                }
+                if variable_has_provider[output_id.index] {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "instruction output atom {output_id} is produced by more than one instruction",
+                    )));
+                }
+                variable_has_provider[output_id.index] = true;
+            }
+        }
+        for output_id in output_ids.iter().copied() {
+            let output = self.atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
+            if output.is_variable() && !variable_has_provider[output_id.index] {
+                return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
+            }
+        }
 
-        // Whole-program attachment validation: every lexically owned region has exactly one owning slot, callee
-        // targets are never lexically owned, and every sealed region is reachable from the entry root. Acyclicity
-        // holds by construction and by the per-region topological attachment checks above, which only admit
-        // attachments to previously sealed regions.
+        // Entry instructions may only reference previously added regions (i.e., regions with identifiers strictly
+        // below the entry's own, which is assigned last). Non-entry regions uphold the same property by construction,
+        // because `add_region` copies them in post order (i.e., children before parents). Every attachment identifier
+        // is therefore in range and the attachment graph is acyclic, which is what allows the reachability walk below
+        // (and any future recursive derivation over regions, such as recursive effect inference) to recurse without
+        // cycle tracking.
+        let entry = RegionId::new(self.regions.len());
+        for instruction in &self.instructions {
+            for attachment in instruction.regions.iter().chain(instruction.callees.iter()).copied() {
+                if attachment.index() >= entry.index() {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "instruction attachment {attachment} does not reference a previously sealed region",
+                    )));
+                }
+            }
+        }
+
+        // Check for well-formedness of the regions and callees. Every lexically owned region must have exactly one
+        // owning slot, callee targets must never be lexically owned, and every sealed region must be reachable from the
+        // entry root. Acyclicity holds by construction and by the per-region topological attachment checks above, which
+        // only admit attachments to previously sealed regions.
         let mut regions = self.regions;
         regions.push(Region {
             atoms: self.atoms,
@@ -1904,88 +1967,6 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         }
 
         Ok(Program { input_structure, output_structure, regions, entry, marker: PhantomData })
-    }
-}
-
-// TODO(eaplatanios): Review this.
-/// Verifies that the provided flat region parts are well-formed: inputs are unique variables, every variable
-/// dependency is an input or a previous instruction output, instruction outputs are uniquely provided variables, and
-/// region outputs are bound.
-fn validate_region_parts<V: Value, O>(
-    atoms: &[Atom<V>],
-    input_ids: &[AtomId],
-    instructions: &[Instruction<O>],
-    output_ids: &[AtomId],
-) -> Result<(), ProgramError> {
-    let mut input_atoms = vec![false; atoms.len()];
-    let mut variable_has_provider = vec![false; atoms.len()];
-    for input_id in input_ids.iter().copied() {
-        let input = atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-        let Atom::Variable(_) = input else {
-            return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
-        };
-        if input_atoms[input_id.index] {
-            return Err(ProgramError::MalformedProgram(format!(
-                "program input atom {input_id} appears more than once",
-            )));
-        }
-        input_atoms[input_id.index] = true;
-        variable_has_provider[input_id.index] = true;
-    }
-    for instruction in instructions.iter() {
-        for input_id in instruction.inputs.iter().copied() {
-            let input = atoms.get(input_id.index).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-            if input.is_variable() && !variable_has_provider[input_id.index] {
-                return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
-            }
-        }
-        for output_id in instruction.outputs.iter().copied() {
-            let output = atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-            let Atom::Variable(_) = output else {
-                return Err(ProgramError::MalformedProgram("instruction output atom was not a variable".to_string()));
-            };
-            if input_atoms[output_id.index] {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "instruction output atom {output_id} is a program input",
-                )));
-            }
-            if variable_has_provider[output_id.index] {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "instruction output atom {output_id} is produced by more than one instruction",
-                )));
-            }
-            variable_has_provider[output_id.index] = true;
-        }
-    }
-    for output_id in output_ids.iter().copied() {
-        let output = atoms.get(output_id.index).ok_or(ProgramError::UnboundAtomId { id: output_id })?;
-        if output.is_variable() && !variable_has_provider[output_id.index] {
-            return Err(ProgramError::MalformedProgram("variable atom has no owning instruction".to_string()));
-        }
-    }
-    Ok(())
-}
-
-// TODO(eaplatanios): Review this.
-/// Verifies that every instruction attachment references a region sealed before the containing region, which keeps
-/// the attachment graph acyclic by construction. Cycle validation therefore precedes any recursive derivation over
-/// attached regions (e.g., future recursive effect inference).
-fn validate_region_attachments<O>(instructions: &[Instruction<O>], owner: RegionId) -> Result<(), ProgramError> {
-    for instruction in instructions {
-        for attachment in instruction.regions.iter().chain(instruction.callees.iter()).copied() {
-            if attachment.index() >= owner.index() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "instruction attachment {attachment} does not reference a previously sealed region",
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-impl<V: Value, O: Operation<V::Type>> Default for ProgramBuilder<V, O> {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
