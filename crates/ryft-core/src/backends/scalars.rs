@@ -27,7 +27,7 @@ use crate::operations::constants::{
     ConstantOperation, One, OneLike, OneLikeOperation, OneOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{
-    MaybeScan, MaybeWhile, Select, SelectCondition, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
+    MaybeWhile, Select, SelectCondition, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{StopGradient, StopGradientOperation};
@@ -37,17 +37,16 @@ use crate::operations::math::{
     MulOperation, Neg, NegOperation, Sin, SinOperation, Sub, SubOperation,
 };
 use crate::operations::math::{Exp, ExpOperation, Log, LogOperation, Sqrt, SqrtOperation};
-use crate::operations::tag::{MaybeTagOperation, Tag, TagOperation};
+use crate::operations::tag::{Tag, TagOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
 use crate::tracing::TracingContext;
-use crate::tracing_v2::DotDimensionNumbers;
-use crate::tracing_v2::operations::MaybeDot;
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
 use crate::tracing_v2::rematerialization::RematerializeOperation;
+use crate::tracing_v2::rematerialization::{ResidualProducers, ResidualProvenance};
 use crate::types::{DataType, TypeError, Typed};
 
 // TODO(eaplatanios): Review `ScalarOperation` and its implementations.
@@ -99,22 +98,12 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Rematerialize(Box<RematerializeOperation<V, Self>>),
 }
 
-/// Exposes the [`Tag`](TagOperation) variant's key to rematerialization policies.
-impl<V: Value<Type = DataType>> MaybeTagOperation for ScalarOperation<V> {
+/// [`ScalarOperation`] has no nested-program stacking operations (in particular, no `scan` variant), so every
+/// residual's producer is the operation itself.
+impl<V: Value<Type = DataType>> ResidualProvenance<V, ScalarOperation<V>> for ScalarOperation<V> {
     #[inline]
-    fn tag(&self) -> Option<&str> {
-        match self {
-            Self::Tag(operation) => Some(operation.key()),
-            _ => None,
-        }
-    }
-}
-
-/// [`ScalarOperation`] has no `dot` variant, so no operation ever reports contraction dimensions.
-impl<V: Value<Type = DataType>> MaybeDot for ScalarOperation<V> {
-    #[inline]
-    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
-        None
+    fn residual_provenance(&self, _output_index: usize) -> ResidualProducers<'_, V, ScalarOperation<V>> {
+        ResidualProducers::Leaf
     }
 }
 
@@ -125,14 +114,6 @@ impl<V: Value<Type = DataType>> MaybeWhile<V, ScalarOperation<V>> for ScalarOper
             Self::While(operation) => operation.as_while(),
             _ => None,
         }
-    }
-}
-
-/// [`ScalarOperation`] has no `scan` variant, so no residual ever needs scan-body provenance.
-impl<V: Value<Type = DataType>> MaybeScan<V, ScalarOperation<V>> for ScalarOperation<V> {
-    #[inline]
-    fn scan_body(&self) -> Option<&crate::programs::Program<V, ScalarOperation<V>, Vec<V>, Vec<V>>> {
-        None
     }
 }
 

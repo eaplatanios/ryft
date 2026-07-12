@@ -1,0 +1,24 @@
+error[E0277]: the trait bound `DotsSaveable: RematerializationPolicy<ryft_core::DataType, ScalarOperation<Scalar>>` is not satisfied
+  --> tests/compile_fail/dot_policy_on_scalar_domain.rs:13:18
+   |
+13 |     .with_policy(DotsSaveable);
+   |      ----------- ^^^^^^^^^^^^ the trait `RematerializationPolicy<ryft_core::DataType, ScalarOperation<Scalar>>` is not implemented for `DotsSaveable`
+   |      |
+   |      required by a bound introduced by this call
+   |
+help: the trait `RematerializationPolicy<ArrayType, O>` is implemented for `DotsSaveable`
+  --> src/tracing_v2/rematerialization.rs
+   |
+   | / impl<O> RematerializationPolicy<ArrayType, O> for DotsSaveable
+   | | where
+   | |     O: Operation<ArrayType>,
+   | |     for<'a> &'a O: TryInto<&'a DotOperation>,
+   | |_____________________________________________^
+note: required by a bound in `ryft_core::tracing_v2::Rematerialize::<D, B, IT, OT, P>::with_policy`
+  --> src/tracing_v2/rematerialization.rs
+   |
+   |     pub fn with_policy<P2>(self, policy: P2) -> Rematerialize<D, B, IT, OT, P2>
+   |            ----------- required by a bound in this associated function
+   |     where
+   |         P2: RematerializationPolicy<D::Type, D::Operation>,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Rematerialize::<D, B, IT, OT, P>::with_policy`

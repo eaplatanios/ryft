@@ -11,8 +11,7 @@ use crate::operations::constants::{
     ConstantOperation, FillOperation, IotaOperation, OneLikeOperation, OneOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::operations::control_flow::{
-    ConditionOperation, MaybeScan, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts,
-    WhilePredicate,
+    ConditionOperation, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::StopGradientOperation;
@@ -28,17 +27,18 @@ use crate::operations::math::{
 };
 use crate::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
-use crate::operations::tag::{MaybeTagOperation, TagOperation};
+use crate::operations::tag::TagOperation;
 use crate::programs::Value;
 use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
     CustomJvpOperation, CustomVjpOperation, CustomVjpTangentOperation,
 };
-use crate::tracing_v2::operations::dot::MaybeDot;
 use crate::tracing_v2::operations::memory::TransferToMemoryOperation;
 use crate::tracing_v2::operations::reduce::ReduceOperation;
-use crate::tracing_v2::operations::{DotDimensionNumbers, DotOperation, Reduce};
-use crate::tracing_v2::rematerialization::RematerializeOperation;
+use crate::tracing_v2::operations::{DotOperation, Reduce};
+use crate::tracing_v2::rematerialization::{
+    NestedResidualSource, RematerializeOperation, ResidualProducers, ResidualProvenance,
+};
 use crate::types::ArrayType;
 
 /// Reusable operation enum for ordinary staged programs.
@@ -120,30 +120,20 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Rematerialize(Box<RematerializeOperation<V, Self>>),
 }
 
-// TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeTagOperation for ArrayOperation<V>
+/// Residual provenance for [`ArrayOperation`]: `scan` outputs `[final_carries..., stacked...]` align index-wise with
+/// the body outputs `[next_carries..., slices...]`, so a stacked residual is produced per iteration by the body
+/// instruction defining the same-index body output; every other operation is its own producer.
+impl<V> ResidualProvenance<V, ArrayOperation<V>> for ArrayOperation<V>
 where
     V: Value<Type = ArrayType>,
 {
-    #[inline]
-    fn tag(&self) -> Option<&str> {
+    fn residual_provenance(&self, output_index: usize) -> ResidualProducers<'_, V, ArrayOperation<V>> {
         match self {
-            Self::Tag(operation) => Some(operation.key()),
-            _ => None,
-        }
-    }
-}
-
-// TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeDot for ArrayOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    #[inline]
-    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
-        match self {
-            Self::Dot(operation) => Some(operation.dimensions()),
-            _ => None,
+            Self::Scan(operation) => {
+                let body = operation.body();
+                ResidualProducers::Nested(vec![NestedResidualSource::new(body, output_index)])
+            }
+            _ => ResidualProducers::Leaf,
         }
     }
 }
@@ -157,20 +147,6 @@ where
     fn as_while(&self) -> Option<WhileParts<'_, V, ArrayOperation<V>>> {
         match self {
             Self::While(operation) => operation.as_while(),
-            _ => None,
-        }
-    }
-}
-
-// TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeScan<V, ArrayOperation<V>> for ArrayOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    #[inline]
-    fn scan_body(&self) -> Option<&crate::programs::Program<V, ArrayOperation<V>, Vec<V>, Vec<V>>> {
-        match self {
-            Self::Scan(operation) => Some(operation.body()),
             _ => None,
         }
     }

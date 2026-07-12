@@ -66,7 +66,7 @@ pub use logical::*;
 pub use manipulation::*;
 pub use math::*;
 pub use sharding::*;
-pub use tag::{MaybeTagOperation, TAG_OPERATION_NAME, Tag, TagOperation};
+pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.

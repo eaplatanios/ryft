@@ -82,17 +82,11 @@ impl<C: Context<Operation: From<TagOperation>>> PartiallyEvaluatableOperation<C>
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
 /// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
 /// differentiation (the [`DifferentiableOperation`] rule re-tags the primal value and passes the tangent value
-/// through), so that it marks the instructions that define linearization residuals. [`MaybeTagOperation`] enables
-/// transforms to classify staged instructions by key without knowing the concrete operation type.
+/// through), so that it marks the instructions that define linearization residuals, which rematerialization
+/// policies classify by key through the producing [`TagOperation`].
 pub trait Tag: Sized {
     /// Returns this value unchanged while tagging it with `key`.
     fn tag(self, key: &str) -> Self;
-}
-
-/// Trait that enables checking if an operation is a [`TagOperation`] and, if so, extract the underlying key.
-pub trait MaybeTagOperation {
-    /// Returns the underlying key if this operation is a [`TagOperation`], and [`None`] otherwise.
-    fn tag(&self) -> Option<&str>;
 }
 
 impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V {

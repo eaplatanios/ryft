@@ -118,23 +118,6 @@ impl Display for DotDimensionNumbers {
     }
 }
 
-/// Query trait classifying operations as dot-like contractions. Backend-owned closed operation enums implement this
-/// trait so that generic transform code — most notably the dot-based members of
-/// [`RematerializationPolicy`](crate::tracing_v2::rematerialization::RematerializationPolicy) — can classify staged
-/// instructions without knowing the concrete operation enum. Higher-order operations whose bodies may contain dots
-/// (jit calls, custom-derivative calls) are not themselves dot-like, mirroring how JAX's `dots_saveable` rematerialization
-/// policy matches only dot primitives.
-pub trait MaybeDot {
-    /// Returns the dot dimension numbers when this operation is a dot-like contraction, and [`None`] otherwise.
-    fn dot_dimensions(&self) -> Option<&DotDimensionNumbers>;
-
-    /// Returns whether this operation is a dot-like contraction.
-    #[inline]
-    fn is_dot(&self) -> bool {
-        self.dot_dimensions().is_some()
-    }
-}
-
 /// Value-level generalized dot capability.
 ///
 /// [`Dot`] is the receiver-style entry point for staging or executing [`DotOperation`]. It

@@ -23,7 +23,7 @@ pub use crate::differentiation::{
     value_and_gradient_holomorphic_with_aux, value_and_gradient_with_aux, vjp,
 };
 pub use crate::operations::math::{Cos, Sin};
-pub use crate::operations::tag::{MaybeTagOperation, TAG_OPERATION_NAME, Tag, TagOperation};
+pub use crate::operations::tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 pub use crate::tracing::NestedTracer;
 pub use linear::{
     CoordinateBasis, DifferentiableDomainExtension, Differential, DifferentialBlock, DifferentialRow, Hessian,
@@ -40,6 +40,10 @@ pub use operations::reshape::{ReshapeOps, ReshapeValue};
 pub use operations::scan::transpose_primal_scan;
 pub use operations::{ArrayOperation, RecomputeOperation};
 pub use rematerialization::{
-    OffloadingRematerializationPolicy, RematerializationPolicy, RematerializationVerdict, Rematerialize,
-    RematerializeCallOperation, RematerializeOperation, ResidualHandling, rematerialize,
+    DotsSaveable, DotsWithNoBatchDimsSaveable, EitherStorage, EverythingSaveable, MemoryTransferStorage,
+    NestedResidualSource, NoStorage, NothingSaveable, OffloadDotsWithNoBatchDims, PolicyFn, RematerializationCandidate,
+    RematerializationDecision, RematerializationError, RematerializationPolicy, RematerializationRejection,
+    RematerializationRejectionKind, Rematerialize, RematerializeCallOperation, RematerializeOperation,
+    ResidualProducers, ResidualProvenance, ResidualStorage, SaveAndOffloadOnlyTheseNames, SaveAnyNamesButThese,
+    SaveAnythingExceptTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames, rematerialize,
 };

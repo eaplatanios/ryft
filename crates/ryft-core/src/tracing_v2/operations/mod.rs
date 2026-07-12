@@ -105,8 +105,8 @@ pub use custom_derivatives::{
     custom_jvp, custom_vjp, transpose_primal_custom_vjp,
 };
 pub use dot::{
-    Dot, DotDimensionNumbers, DotOperation, DotOps, MaybeDot, adjoint_dimensions_for_left_dot,
-    adjoint_dimensions_for_right_dot, dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, rhs_result_axes,
+    Dot, DotDimensionNumbers, DotOperation, DotOps, adjoint_dimensions_for_left_dot, adjoint_dimensions_for_right_dot,
+    dot_general_evaluate, lhs_result_axes, lift_dot_dimensions, rhs_result_axes,
 };
 pub use memory::{TRANSFER_TO_MEMORY_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation};
 pub use primitive::ArrayOperation;

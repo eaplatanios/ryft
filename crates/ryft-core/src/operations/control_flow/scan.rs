@@ -627,17 +627,6 @@ where
     }
 }
 
-/// Trait that enables transforms to look through a `scan` boundary at the nested body value producing one scan
-/// output. Scan outputs and body outputs are index-aligned (`[final_carries..., stacked_outputs...]` versus
-/// `[next_carries..., output_slices...]`), so one index addresses both. Residual classification uses this to
-/// classify a stacked per-iteration residual by the body instruction that actually produces it — for example, a
-/// rematerialization policy such as `DotsSaveable` recognizing a dot inside a loop body — instead of by the `scan`
-/// boundary itself.
-pub trait MaybeScan<V: Value, O> {
-    /// Returns the nested body [`Program`] when this operation is a `scan`, and [`None`] otherwise.
-    fn scan_body(&self) -> Option<&Program<V, O, Vec<V>, Vec<V>>>;
-}
-
 /// Extracts slice `iteration` of a stacked value along its leading axis and drops that axis.
 ///
 /// The slice bounds and the squeezed shape are derived from the stacked value's own type, which must be fully static

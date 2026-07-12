@@ -23,8 +23,7 @@ use ryft_core::operations::constants::{
     ZeroOperation,
 };
 use ryft_core::operations::control_flow::{
-    ConditionOperation, MaybeScan, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts,
-    WhilePredicate,
+    ConditionOperation, MaybeWhile, ScanOperation, Select, SelectOperation, WhileOperation, WhileParts, WhilePredicate,
 };
 use ryft_core::operations::differentiation::StopGradientOperation;
 use ryft_core::operations::logical::{AndOperation, NotOperation, OrOperation, XorOperation};
@@ -343,28 +342,24 @@ where
     }
 }
 
-impl<V> ryft_core::tracing_v2::operations::MaybeDot for XlaOperation<V>
+/// Residual provenance for [`XlaOperation`]: `scan` outputs align index-wise with the body outputs, so a stacked
+/// residual is produced per iteration by the body instruction defining the same-index body output; every other
+/// operation is its own producer.
+impl<V> ryft_core::tracing_v2::rematerialization::ResidualProvenance<V, XlaOperation<V>> for XlaOperation<V>
 where
     V: Value<Type = ArrayType>,
 {
-    #[inline]
-    fn dot_dimensions(&self) -> Option<&ryft_core::tracing_v2::DotDimensionNumbers> {
+    fn residual_provenance(
+        &self,
+        output_index: usize,
+    ) -> ryft_core::tracing_v2::rematerialization::ResidualProducers<'_, V, XlaOperation<V>> {
+        use ryft_core::tracing_v2::rematerialization::{NestedResidualSource, ResidualProducers};
         match self {
-            Self::Dot(operation) => Some(operation.dimensions()),
-            _ => None,
-        }
-    }
-}
-
-impl<V> ryft_core::operations::tag::MaybeTagOperation for XlaOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    #[inline]
-    fn tag(&self) -> Option<&str> {
-        match self {
-            Self::Tag(operation) => Some(operation.key()),
-            _ => None,
+            Self::Scan(operation) => {
+                let body = operation.body();
+                ResidualProducers::Nested(vec![NestedResidualSource::new(body, output_index)])
+            }
+            _ => ResidualProducers::Leaf,
         }
     }
 }
@@ -377,19 +372,6 @@ where
     fn as_while(&self) -> Option<WhileParts<'_, V, XlaOperation<V>>> {
         match self {
             Self::While(operation) => operation.as_while(),
-            _ => None,
-        }
-    }
-}
-
-impl<V> MaybeScan<V, XlaOperation<V>> for XlaOperation<V>
-where
-    V: Value<Type = ArrayType>,
-{
-    #[inline]
-    fn scan_body(&self) -> Option<&Program<V, XlaOperation<V>, Vec<V>, Vec<V>>> {
-        match self {
-            Self::Scan(operation) => Some(operation.body()),
             _ => None,
         }
     }
@@ -929,5 +911,28 @@ mod tests {
         assert!(matches!(&evaluation.outputs()[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
         assert!(matches!(&evaluation.outputs()[1], PartialEvaluationOutput::Unknown(0)));
         assert!(matches!(&evaluation.outputs()[2], PartialEvaluationOutput::Unknown(1)));
+    }
+
+    #[test]
+    fn test_rematerialization_policies_are_available_for_the_xla_operation_family() {
+        use ryft_core::tracing_v2::{
+            DotsSaveable, DotsWithNoBatchDimsSaveable, EverythingSaveable, NothingSaveable, OffloadDotsWithNoBatchDims,
+            RematerializationPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
+        };
+        use ryft_core::types::Memory;
+
+        // The built-in rematerialization policies — including the projection-bounded dot and tag policies and the
+        // transfer-bounded offloading policies — are available for `XlaOperation` through the derive-generated
+        // variant projections and its `TransferToMemoryOperation` conversion. This is a compile-time capability
+        // check: the assertions below fail to compile if any projection or conversion bound is unsatisfied.
+        fn assert_policy<P: RematerializationPolicy<ArrayType, XlaOperation>>(_policy: P) {}
+        assert_policy(NothingSaveable);
+        assert_policy(EverythingSaveable);
+        assert_policy(DotsSaveable);
+        assert_policy(DotsWithNoBatchDimsSaveable);
+        assert_policy(SaveOnlyTheseNames::new(["u"]));
+        assert_policy(SaveAndOffloadOnlyTheseNames::new(["u"], ["v"], Memory::Host { pinned: true }));
+        assert_policy(OffloadDotsWithNoBatchDims::new(Memory::Host { pinned: true }));
+        assert_policy(SaveFromBothPolicies::new(DotsSaveable, SaveOnlyTheseNames::new(["u"])));
     }
 }
