@@ -1,3 +1,13 @@
+//! Contains the reference scalar backend: concrete [`Scalar`] values, the [`ScalarOperation`] family, and the
+//! [`ScalarTracingContext`] used to stage scalar programs.
+//!
+//! This backend serves programs whose values are rank-0 scalars typed by [`DataType`] alone. It is meant primarily
+//! for exercising the Ryft tracing, transformation, and interpretation machinery without involving multidimensional
+//! arrays or an optimized array backend such as `ryft-xla`: unit tests, doctests, and gradient checks can stage,
+//! transform, and interpret complete scalar programs eagerly. [`Scalar`] carries one payload variant per supported
+//! [`DataType`] and implements every value-level capability that [`ScalarOperation`] interpretation requires, and
+//! [`ScalarOperation`] is the closed operation family over those scalars.
+
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt::Display;
@@ -5,6 +15,7 @@ use std::fmt::Display;
 use approx::AbsDiffEq;
 use half::{bf16, f16};
 use num_complex::Complex;
+
 use ryft_macros::{DifferentiableOperation, Operation, Parameter, TransposableOperation};
 
 use crate::contexts::EagerContext;
@@ -45,7 +56,9 @@ use crate::types::{DataType, TypeError, Typed};
 ///
 /// [`ScalarOperation`] is intentionally limited to operations that are valid for scalar [`DataType`] metadata.
 /// Array-only primitives such as reshaping and matrix multiplication remain available as standalone operations and
-/// through array-based backends, but they are not variants of this enum.
+/// through array-based backends, but they are not variants of this enum. Each variant simply wraps the same-named
+/// operation payload, and the program-valued payloads (e.g., `while` loops and the custom-derivative calls) are boxed
+/// because they are recursively parameterized by this enum itself.
 #[derive(Clone, Debug, Operation, DifferentiableOperation, TransposableOperation)]
 #[ryft(bounds(interpretation(BooleanLike + WhilePredicate)))]
 pub enum ScalarOperation<V: Value<Type = DataType>> {
@@ -86,6 +99,7 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Rematerialize(Box<RematerializeOperation<V, Self>>),
 }
 
+/// Exposes the [`Tag`](TagOperation) variant's key to rematerialization policies.
 impl<V: Value<Type = DataType>> MaybeTag for ScalarOperation<V> {
     #[inline]
     fn key(&self) -> Option<&str> {
@@ -96,6 +110,7 @@ impl<V: Value<Type = DataType>> MaybeTag for ScalarOperation<V> {
     }
 }
 
+/// [`ScalarOperation`] has no `dot` variant, so no operation ever reports contraction dimensions.
 impl<V: Value<Type = DataType>> MaybeDot for ScalarOperation<V> {
     #[inline]
     fn dot_dimensions(&self) -> Option<&DotDimensionNumbers> {
@@ -128,9 +143,12 @@ pub type ScalarTracingContext = TracingContext<Scalar, ScalarOperation<Scalar>>;
 /// Scalar [`Value`] whose [`Type`](crate::Type) is a [`DataType`] and which is meant to be used primarily for testing
 /// the Ryft infrastructure and machinery with programs that do not involve multidimensional arrays.
 ///
-/// The `F4*` and `F8*` variants carry their exact encoded bits in a `u8`, preserving signed zeros and NaN payloads.
-/// Prefer [`Scalar::from_low_precision_float_bits`] when constructing them dynamically because it validates the
-/// four-bit format, and use [`Scalar::low_precision_float_bits`] to recover the encoding.
+/// Each variant carries the payload of the corresponding [`DataType`]. The [`Token`](Scalar::Token) variant is the
+/// payload-free effect-ordering token value of [`DataType::Token`]: it supports no arithmetic, comparisons, or
+/// Boolean conversion, and its `zero_like`/`one_like` are the identity. The `F4*` and `F8*` variants carry their
+/// exact encoded bits in a `u8`, preserving signed zeros and NaN payloads. Prefer
+/// [`Scalar::from_low_precision_float_bits`] when constructing them dynamically because it validates the four-bit
+/// format, and use [`Scalar::low_precision_float_bits`] to recover the encoding.
 ///
 /// # Examples
 ///
@@ -171,6 +189,10 @@ pub enum Scalar {
     C128(Complex<f64>),
 }
 
+// `PartialEq` is implemented manually rather than derived because the low-precision floating-point variants must
+// compare their *decoded* values rather than their raw bits, so that signed zeros compare equal (`+0 == -0`) and NaN
+// payloads compare unequal to themselves, exactly like the wider IEEE variants. Scalars of different data types never
+// compare equal.
 impl PartialEq for Scalar {
     fn eq(&self, other: &Self) -> bool {
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
@@ -242,6 +264,10 @@ impl Scalar {
         }
     }
 
+    /// Returns this scalar's low-precision floating-point [`DataType`] together with its raw bit representation,
+    /// or `None` for any other variant. This is the branch guard that lets every capability implementation below
+    /// handle all low-precision variants uniformly through [`Self::decode_low_precision_float`] and
+    /// [`Self::encode_low_precision_float`] before matching on the remaining variants.
     fn low_precision_float_parts(&self) -> Option<(DataType, u8)> {
         Some(match self {
             Scalar::F4E2M1FN(bits) => (DataType::F4E2M1FN, *bits),
@@ -257,6 +283,10 @@ impl Scalar {
         })
     }
 
+    /// Decodes the raw bit representation of a low-precision floating-point scalar into the exact `f64` value it
+    /// denotes, driven by a per-format table of exponent/mantissa widths, biases, NaN encodings, and infinity
+    /// support. `f8e8m0fnu` is handled separately because it is a bias-127 power-of-two exponent with no sign or
+    /// mantissa bits.
     fn decode_low_precision_float(r#type: DataType, bits: u8) -> f64 {
         if r#type == DataType::F8E8M0FNU {
             return 2.0f64.powi(i32::from(bits) - 127);
@@ -291,6 +321,36 @@ impl Scalar {
         }
     }
 
+    /// Returns the exactly widened floating-point payload backing this scalar's [`approx::AbsDiffEq`]
+    /// implementations, or `None` for a variant that carries no real floating-point payload (Booleans, integers,
+    /// and complex values).
+    fn floating_point_payload(self) -> Option<f64> {
+        if let Some((r#type, bits)) = self.low_precision_float_parts() {
+            return Some(Self::decode_low_precision_float(r#type, bits));
+        }
+        match self {
+            Scalar::BF16(value) => Some(value.to_f64()),
+            Scalar::F16(value) => Some(value.to_f64()),
+            Scalar::F32(value) => Some(f64::from(value)),
+            Scalar::F64(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the exactly widened complex payload backing this scalar's [`approx::AbsDiffEq`] implementations, or
+    /// `None` for a non-complex variant.
+    fn complex_payload(self) -> Option<Complex<f64>> {
+        match self {
+            Scalar::C64(value) => Some(Complex::new(f64::from(value.re), f64::from(value.im))),
+            Scalar::C128(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Encodes `value` into the nearest representable low-precision floating-point scalar of the provided
+    /// [`DataType`], rounding ties toward even bit patterns by exhaustively scanning the format's tiny value space.
+    /// NaNs map to the format's canonical NaN encoding (or fail for formats without one), and zeros preserve their
+    /// sign where the format distinguishes it.
     fn encode_low_precision_float(r#type: DataType, value: f64) -> Result<Self, ProgramError> {
         let (maximum_bits, canonical_nan) = match r#type {
             DataType::F4E2M1FN => (0x0f, None),
@@ -301,7 +361,9 @@ impl Scalar {
             DataType::F8E5M2 => (0xff, Some(0x7d)),
             DataType::F8E5M2FNUZ => (0xff, Some(0x80)),
             DataType::F8E8M0FNU => (0xff, None),
-            // TODO(eaplatanios): Shouldn't this return a `ProgramError`?
+            // This is a private helper whose callers only ever pass a low-precision floating-point data type
+            // (they branch on `low_precision_float_parts` first), so reaching another data type is an internal
+            // invariant violation rather than a recoverable error.
             other => unreachable!("{} is not a low-precision floating-point data type", other),
         };
         if value.is_nan() {
@@ -396,6 +458,8 @@ impl Display for Scalar {
             Scalar::U16(value) => Display::fmt(value, formatter),
             Scalar::U32(value) => Display::fmt(value, formatter),
             Scalar::U64(value) => Display::fmt(value, formatter),
+            // The low-precision variants were already handled through `low_precision_float_parts` before this
+            // match, which must nevertheless remain exhaustive.
             Scalar::F4E2M1FN(_)
             | Scalar::F8E3M4(_)
             | Scalar::F8E4M3(_)
@@ -468,8 +532,8 @@ impl Value for Scalar {
     }
 }
 
-// Conversions from each supported Rust primitive into the corresponding [`Scalar`] variant. These let later stages
-// and numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
+/// Implements the conversion from a supported Rust primitive into the corresponding [`Scalar`] variant. These let
+/// later stages and numeric-literal tests write `Scalar::from(0.0)` without naming the variant explicitly.
 macro_rules! impl_from_primitive_for_scalar {
     ($ty:ty, $variant:ident) => {
         impl From<$ty> for Scalar {
@@ -496,9 +560,9 @@ impl_from_primitive_for_scalar!(f64, F64);
 impl_from_primitive_for_scalar!(Complex<f32>, C64);
 impl_from_primitive_for_scalar!(Complex<f64>, C128);
 
-// Equality against each supported Rust primitive, comparing only within the matching variant so that a [`Scalar`] of a
-// different [`DataType`] never compares equal to a primitive (e.g., a `Scalar::F32` is never equal to an `f64`). These
-// let later stages and numeric-literal tests write `scalar == 0.0` directly.
+/// Implements equality against a supported Rust primitive, comparing only within the matching variant so that a
+/// [`Scalar`] of a different [`DataType`] never compares equal to a primitive (e.g., a `Scalar::F32` is never equal
+/// to an `f64`). These let later stages and numeric-literal tests write `scalar == 0.0` directly.
 macro_rules! impl_partial_eq_primitive_for_scalar {
     ($ty:ty, $variant:ident) => {
         impl PartialEq<$ty> for Scalar {
@@ -530,34 +594,6 @@ impl_partial_eq_primitive_for_scalar!(f32, F32);
 impl_partial_eq_primitive_for_scalar!(f64, F64);
 impl_partial_eq_primitive_for_scalar!(Complex<f32>, C64);
 impl_partial_eq_primitive_for_scalar!(Complex<f64>, C128);
-
-// TODO(eaplatanios): Move to the earlier `impl Scalar` block.
-impl Scalar {
-    /// Returns the exactly widened floating-point payload backing the [`approx::AbsDiffEq`] implementations below,
-    /// or `None` for a variant that carries no real floating-point payload (Booleans, integers, and complex values).
-    fn floating_point_payload(self) -> Option<f64> {
-        if let Some((r#type, bits)) = self.low_precision_float_parts() {
-            return Some(Self::decode_low_precision_float(r#type, bits));
-        }
-        match self {
-            Scalar::BF16(value) => Some(value.to_f64()),
-            Scalar::F16(value) => Some(value.to_f64()),
-            Scalar::F32(value) => Some(f64::from(value)),
-            Scalar::F64(value) => Some(value),
-            _ => None,
-        }
-    }
-
-    /// Returns the exactly widened complex payload backing the [`approx::AbsDiffEq`] implementations below, or
-    /// `None` for a non-complex variant.
-    fn complex_payload(self) -> Option<Complex<f64>> {
-        match self {
-            Scalar::C64(value) => Some(Complex::new(f64::from(value.re), f64::from(value.im))),
-            Scalar::C128(value) => Some(value),
-            _ => None,
-        }
-    }
-}
 
 /// Approximate equality against a bare `f64`, serving the [`approx`] assertion macros in tests (e.g.,
 /// `assert_abs_diff_eq!(gradient, expected, epsilon = 1e-9)` where `gradient` is a [`Scalar`]). A floating-point
@@ -630,7 +666,8 @@ impl BooleanLike for Scalar {
             Scalar::U16(value) => *value != 0,
             Scalar::U32(value) => *value != 0,
             Scalar::U64(value) => *value != 0,
-            // TODO(eaplatanios): What's the deal with the `unreachable!` here?
+            // The low-precision variants were already handled through `low_precision_float_parts` before this
+            // match, which must nevertheless remain exhaustive.
             Scalar::F4E2M1FN(_)
             | Scalar::F8E3M4(_)
             | Scalar::F8E4M3(_)
@@ -803,7 +840,8 @@ impl Neg for Scalar {
             Scalar::I16(value) => Scalar::I16(-value),
             Scalar::I32(value) => Scalar::I32(-value),
             Scalar::I64(value) => Scalar::I64(-value),
-            // TODO(eaplatanios): What's the deal with the `unreachable!` here?
+            // The low-precision variants were already handled through `low_precision_float_parts` before this
+            // match, which must nevertheless remain exhaustive.
             Scalar::F4E2M1FN(_)
             | Scalar::F8E3M4(_)
             | Scalar::F8E4M3(_)
@@ -838,6 +876,10 @@ impl std::ops::Neg for Scalar {
 }
 
 // TODO(eaplatanios): Support data type promotion / broadcasting.
+/// Implements a fallible binary arithmetic capability (e.g., [`Add`]) together with its panicking [`std::ops`]
+/// counterpart for [`Scalar`]. Same-variant numeric operands compute in their payload type (with the low-precision
+/// floating-point variants computing through their decoded `f64` values and re-encoding the result); any other
+/// combination returns a [`TypeError`].
 macro_rules! impl_binary_arithmetic_for_scalar {
     ($trait:ident, $method:ident, $operator:tt) => {
         impl $trait for Scalar {
@@ -1268,6 +1310,21 @@ impl Compare for Scalar {
     /// [`Scalar::Bool`], never a numeric variant. Mismatched variants return a [`TypeError`]. Complex scalars are
     /// unordered, so they support only the equality directions and return a [`TypeError`] for ordered ones.
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self::Output, ProgramError> {
+        /// Evaluates a comparison `direction` against an optional `ordering`, where `None` (an unordered pair, e.g.,
+        /// one involving a NaN) satisfies only the `NotEqual` direction.
+        fn evaluate(ordering: Option<Ordering>, direction: ComparisonDirection) -> bool {
+            match direction {
+                ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
+                ComparisonDirection::NotEqual => ordering != Some(Ordering::Equal),
+                ComparisonDirection::LessThan => ordering == Some(Ordering::Less),
+                ComparisonDirection::LessThanOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
+                ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
+                ComparisonDirection::GreaterThanOrEqual => {
+                    matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
+                }
+            }
+        }
+
         if let (Some((left_type, left_bits)), Some((right_type, right_bits))) =
             (self.low_precision_float_parts(), rhs.low_precision_float_parts())
         {
@@ -1279,17 +1336,7 @@ impl Compare for Scalar {
             }
             let ordering = Self::decode_low_precision_float(left_type, left_bits)
                 .partial_cmp(&Self::decode_low_precision_float(right_type, right_bits));
-            let result = match direction {
-                ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
-                ComparisonDirection::NotEqual => ordering != Some(Ordering::Equal),
-                ComparisonDirection::LessThan => ordering == Some(Ordering::Less),
-                ComparisonDirection::LessThanOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
-                ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
-                ComparisonDirection::GreaterThanOrEqual => {
-                    matches!(ordering, Some(Ordering::Greater | Ordering::Equal))
-                }
-            };
-            return Ok(Scalar::Bool(result));
+            return Ok(Scalar::Bool(evaluate(ordering, direction)));
         }
         if matches!(self, Scalar::Token) || matches!(rhs, Scalar::Token) {
             return Err(TypeError { message: "cannot compare token scalars".to_string() }.into());
@@ -1328,15 +1375,7 @@ impl Compare for Scalar {
                 .into());
             }
         };
-        let result = match direction {
-            ComparisonDirection::Equal => ordering == Some(Ordering::Equal),
-            ComparisonDirection::NotEqual => ordering != Some(Ordering::Equal),
-            ComparisonDirection::LessThan => ordering == Some(Ordering::Less),
-            ComparisonDirection::LessThanOrEqual => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
-            ComparisonDirection::GreaterThan => ordering == Some(Ordering::Greater),
-            ComparisonDirection::GreaterThanOrEqual => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
-        };
-        Ok(Scalar::Bool(result))
+        Ok(Scalar::Bool(evaluate(ordering, direction)))
     }
 }
 
@@ -1450,6 +1489,7 @@ impl SelectCondition for Scalar {
 
 #[cfg(test)]
 mod tests {
+    use approx::assert_abs_diff_eq;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1461,230 +1501,6 @@ mod tests {
     use crate::tracing_v2::ForwardModeDifferentiate;
 
     use super::*;
-
-    #[test]
-    fn test_scalar_token() {
-        let token = Scalar::Token;
-
-        assert_eq!(token.r#type().into_owned(), DataType::Token);
-        assert_eq!(token.to_string(), "token");
-        assert_eq!(token.as_boolean(), token);
-        assert!(token.boolean().is_err());
-        assert!(token.compare(&token, ComparisonDirection::Equal).is_err());
-        assert!(Neg::neg(&token).is_err());
-        assert!(Add::add(&token, &token).is_err());
-        assert_eq!(token.zero_like(), token);
-        assert_eq!(token.one_like(), token);
-
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        assert!(context.zero(&DataType::Token).is_err());
-        assert!(context.one(&DataType::Token).is_err());
-        assert_eq!(token.cast(DataType::Token), Ok(token));
-    }
-
-    #[test]
-    fn test_scalar_low_precision_float_types_and_bits() {
-        let values = [
-            (DataType::F4E2M1FN, 0x02),
-            (DataType::F8E3M4, 0x30),
-            (DataType::F8E4M3, 0x38),
-            (DataType::F8E4M3FN, 0x38),
-            (DataType::F8E4M3FNUZ, 0x40),
-            (DataType::F8E4M3B11FNUZ, 0x58),
-            (DataType::F8E5M2, 0x3c),
-            (DataType::F8E5M2FNUZ, 0x40),
-            (DataType::F8E8M0FNU, 0x7f),
-        ];
-
-        for (r#type, bits) in values {
-            let scalar = Scalar::from_low_precision_float_bits(r#type, bits).unwrap();
-            assert_eq!(scalar.r#type().into_owned(), r#type);
-            assert_eq!(scalar.low_precision_float_bits(), Some(bits));
-            assert_eq!(scalar.to_string(), "1");
-            assert_eq!(scalar.boolean(), Ok(true));
-            assert_eq!(scalar.one_like(), scalar);
-            assert_eq!(scalar.cast(r#type), Ok(scalar));
-        }
-
-        assert!(Scalar::from_low_precision_float_bits(DataType::F4E2M1FN, 0x10).is_err());
-        assert!(Scalar::from_low_precision_float_bits(DataType::F32, 0).is_err());
-        assert_eq!(Scalar::F8E4M3(0), Scalar::F8E4M3(0x80));
-        assert_ne!(Scalar::F8E4M3(0x79), Scalar::F8E4M3(0x79));
-    }
-
-    #[test]
-    fn test_scalar_low_precision_float_arithmetic() {
-        let one = Scalar::F8E4M3(0x38);
-        let two = Scalar::F8E4M3(0x40);
-        let negative_one = Scalar::F8E4M3(0xb8);
-
-        assert_eq!(Add::add(&one, &one), Ok(two));
-        assert_eq!(Mul::mul(&two, &negative_one), Ok(Scalar::F8E4M3(0xc0)));
-        assert_eq!(Neg::neg(&one), Ok(negative_one));
-        assert_eq!(Abs::abs(&negative_one), Ok(one));
-        assert_eq!(one.compare(&two, ComparisonDirection::LessThan), Ok(Scalar::Bool(true)));
-        assert!(Add::add(&one, &Scalar::F8E5M2(0x3c)).is_err());
-        assert!(Neg::neg(&Scalar::F8E8M0FNU(0x7f)).is_err());
-
-        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        assert_eq!(context.zero(&DataType::F8E4M3), Ok(Scalar::F8E4M3(0)));
-        assert_eq!(context.one(&DataType::F8E4M3), Ok(one));
-        assert!(context.zero(&DataType::F8E8M0FNU).is_err());
-    }
-
-    #[test]
-    fn test_scalar_complex_display() {
-        // Complex scalars render as `<real>+<imaginary>i`, folding a negative imaginary part's sign into the
-        // separator.
-        assert_eq!(Scalar::from(Complex::new(1.5f32, 2.0f32)).to_string(), "1.5+2i");
-        assert_eq!(Scalar::from(Complex::new(1.5f32, -2.0f32)).to_string(), "1.5-2i");
-        assert_eq!(Scalar::from(Complex::new(-0.5f64, 0.25f64)).to_string(), "-0.5+0.25i");
-        assert_eq!(Scalar::from(Complex::new(0.0f64, -1.0f64)).to_string(), "0-1i");
-    }
-
-    #[test]
-    fn test_scalar_complex_arithmetic() {
-        let left = Scalar::from(Complex::new(1.0f64, 2.0f64));
-        let right = Scalar::from(Complex::new(3.0f64, -1.0f64));
-
-        // The complex variants support the full fallible arithmetic surface, computing in the complex field.
-        assert_eq!(left + right, Scalar::from(Complex::new(4.0f64, 1.0f64)));
-        assert_eq!(left - right, Scalar::from(Complex::new(-2.0f64, 3.0f64)));
-        assert_eq!(left * right, Scalar::from(Complex::new(5.0f64, 5.0f64)));
-        assert_eq!(-left, Scalar::from(Complex::new(-1.0f64, -2.0f64)));
-        assert_eq!(
-            (left / right) * right,
-            Scalar::from(Complex::new(1.0f64, 2.0f64) / Complex::new(3.0f64, -1.0f64) * Complex::new(3.0f64, -1.0f64)),
-        );
-
-        // The complex sine and cosine are the analytic continuations computed by `num_complex`.
-        assert_eq!(left.sin(), Ok(Scalar::from(Complex::new(1.0f64, 2.0f64).sin())));
-        assert_eq!(left.cos(), Ok(Scalar::from(Complex::new(1.0f64, 2.0f64).cos())));
-
-        // Constants and Boolean-ness: zero/one carry a zero imaginary part, and a complex scalar is truthy exactly
-        // when it is not the complex zero.
-        assert_eq!(left.zero_like(), Scalar::from(Complex::new(0.0f64, 0.0f64)));
-        assert_eq!(left.one_like(), Scalar::from(Complex::new(1.0f64, 0.0f64)));
-        assert_eq!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::C64), &[]),
-            Ok(vec![Scalar::from(Complex::new(0.0f32, 0.0f32))]),
-        );
-        assert_eq!(left.boolean(), Ok(true));
-        assert_eq!(left.zero_like().boolean(), Ok(false));
-        assert_eq!(Scalar::from(Complex::new(0.0f64, 0.5f64)).boolean(), Ok(true));
-
-        // Complex scalars are unordered.
-        assert_eq!(left.partial_cmp(&right), None);
-
-        // Mixed-variant arithmetic is rejected like every other unequal-variant pair.
-        assert!(Add::add(&left, &Scalar::from(1.0f64)).is_err());
-    }
-
-    #[test]
-    fn test_scalar_complex_compare() {
-        let left = Scalar::from(Complex::new(1.0f64, 2.0f64));
-        let right = Scalar::from(Complex::new(3.0f64, -1.0f64));
-
-        // Only the equality directions are defined for the unordered complex scalars.
-        assert_eq!(left.compare(&left, ComparisonDirection::Equal), Ok(Scalar::Bool(true)));
-        assert_eq!(left.compare(&right, ComparisonDirection::Equal), Ok(Scalar::Bool(false)));
-        assert_eq!(left.compare(&right, ComparisonDirection::NotEqual), Ok(Scalar::Bool(true)));
-        assert_eq!(
-            left.compare(&right, ComparisonDirection::LessThan),
-            Err(TypeError {
-                message: "cannot apply an ordered comparison to unordered complex scalars of data type c128"
-                    .to_string(),
-            }
-            .into()),
-        );
-    }
-
-    #[test]
-    fn test_scalar_complex_cast() {
-        // Real sources promote to complex targets with a zero imaginary part, and complex sources widen per
-        // component.
-        assert_eq!(Scalar::from(1.5f32).cast(DataType::C64), Ok(Scalar::from(Complex::new(1.5f32, 0.0f32))));
-        assert_eq!(Scalar::from(3i16).cast(DataType::C128), Ok(Scalar::from(Complex::new(3.0f64, 0.0f64))));
-        assert_eq!(
-            Scalar::from(Complex::new(1.5f32, -2.0f32)).cast(DataType::C128),
-            Ok(Scalar::from(Complex::new(1.5f64, -2.0f64))),
-        );
-
-        // Narrowing complex casts and complex-to-real casts are rejected.
-        assert_eq!(
-            Scalar::from(Complex::new(1.5f64, 0.0f64)).cast(DataType::C64),
-            Err(TypeError { message: "cannot promote scalar of data type c128 to c64".to_string() }.into()),
-        );
-        assert_eq!(
-            Scalar::from(Complex::new(1.5f32, 0.0f32)).cast(DataType::F64),
-            Err(TypeError { message: "cannot promote scalar of data type c64 to f64".to_string() }.into()),
-        );
-    }
-
-    #[test]
-    fn test_scalar_complex_program_constant_rendering() {
-        // A complex constant is staged and rendered like any other constant (a `const` binding typed `c64`; the
-        // value-literal syntax itself is covered by the `Display` test above), and interpretation recovers the
-        // carried complex value.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::C64);
-        let constant = builder.add_constant(Scalar::from(Complex::new(1.5f32, -2.0f32)));
-        let output = builder.add_instruction(crate::operations::math::MulOperation, vec![input, constant]).unwrap()[0];
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:c64 .
-                let %1:c64 = const
-                    %2:c64 = mul %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-
-        // Interpreting the program multiplies in the complex field.
-        let outputs = program.interpret(vec![Scalar::from(Complex::new(2.0f32, 1.0f32))]).unwrap();
-        assert_eq!(outputs, vec![Scalar::from(Complex::new(2.0f32, 1.0f32) * Complex::new(1.5f32, -2.0f32))]);
-    }
-
-    #[test]
-    fn test_scalar_domain() {
-        // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is a zero-sized token.
-        assert_eq!(size_of::<EagerContext<Scalar, ScalarOperation<Scalar>>>(), 0);
-
-        // It is an eager `Context`. Binding a nullary zero/one operation interprets it directly over concrete
-        // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
-        assert_eq!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::F64), &[]),
-            Ok(vec![Scalar::from(0.0)]),
-        );
-        assert_eq!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(OneOperation::new(DataType::F64), &[]),
-            Ok(vec![Scalar::from(1.0)]),
-        );
-    }
-
-    #[test]
-    fn test_scalar_cast_promotes_widening_and_rejects_narrowing() {
-        // A cast to the same data type is the identity.
-        assert_eq!(Scalar::from(2.5f32).cast(DataType::F32), Ok(Scalar::from(2.5f32)));
-
-        // Widening promotions convert the carried value exactly: float widening, integer-to-float, integer widening,
-        // and Boolean-to-numeric.
-        assert_eq!(Scalar::from(2.5f32).cast(DataType::F64), Ok(Scalar::from(2.5f64)));
-        assert_eq!(Scalar::from(3i32).cast(DataType::F64), Ok(Scalar::from(3.0f64)));
-        assert_eq!(Scalar::from(3i16).cast(DataType::I32), Ok(Scalar::from(3i32)));
-        assert_eq!(Scalar::from(true).cast(DataType::U16), Ok(Scalar::from(1u16)));
-        assert_eq!(Scalar::from(f16::from_f32(1.5)).cast(DataType::F32), Ok(Scalar::from(1.5f32)));
-
-        // Narrowing (non-promotable) casts are rejected rather than silently truncating.
-        assert_eq!(
-            Scalar::from(2.5f64).cast(DataType::I32),
-            Err(TypeError { message: "cannot promote scalar of data type f64 to i32".to_string() }.into()),
-        );
-    }
 
     /// Builds a carry-only scalar body program that maps `[carry]` to `[carry + carry]`.
     fn scalar_doubling_body() -> Program<Scalar, ScalarOperation<Scalar>, Vec<Scalar>, Vec<Scalar>> {
@@ -1706,7 +1522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_compare_and_select_program() {
+    fn test_scalar_operation_program() {
         // `f(x, y) = select(x > y, x + x, y)` staged through `ScalarOperation` tracers.
         let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
             |(x, y)| {
@@ -1732,6 +1548,267 @@ mod tests {
         // Interpreting the staged program exercises the in-band Boolean condition encoding of scalar values.
         assert_eq!(program.interpret((Scalar::from(3.0), Scalar::from(2.0))), Ok(Scalar::from(6.0)));
         assert_eq!(program.interpret((Scalar::from(1.0), Scalar::from(2.0))), Ok(Scalar::from(2.0)));
+    }
+
+    #[test]
+    fn test_scalar_while() {
+        let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
+            scalar_less_than_eight_condition(),
+            scalar_doubling_body(),
+        )
+        .unwrap();
+
+        // Operation identity, type inference, and direct interpretation.
+        assert_eq!(operation.name(), crate::operations::control_flow::WHILE_OPERATION_NAME);
+        assert_eq!(operation.state_types(), vec![DataType::F64]);
+        assert_eq!(operation.iteration_bound(), None);
+        assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
+        assert_eq!(
+            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(1.0)]),
+            Ok(vec![Scalar::from(8.0)])
+        );
+
+        // Staging renders the nested condition and body programs, and interpretation runs the loop to completion.
+        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+            |carry| {
+                let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
+                    scalar_less_than_eight_condition(),
+                    scalar_doubling_body(),
+                )
+                .unwrap();
+                let mut outputs = carry.context().stage_operation(operation, &[&carry])?;
+                Ok(outputs.remove(0))
+            },
+            DataType::F64,
+        )
+        .unwrap();
+        assert_eq!(output_type, DataType::F64);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64 .
+                let %1:f64 = while [
+                    condition={
+                        lambda %0:f64 .
+                        let %1:f64 = const
+                            %2:bool = compare [direction=LessThan] %0 %1
+                        in (%2)
+                    },
+                    body={
+                        lambda %0:f64 .
+                        let %1:f64 = add %0 %0
+                        in (%1)
+                    },
+                ] %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(program.interpret(Scalar::from(1.0)), Ok(Scalar::from(8.0)));
+
+        // The eager while JVP rule unrolls the loop, so forward-mode duals flow through the doubling body.
+        let (primal, tangent): (Scalar, Scalar) = domain
+            .jvp(
+                |carry| {
+                    let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
+                        scalar_less_than_eight_condition(),
+                        scalar_doubling_body(),
+                    )
+                    .unwrap();
+                    Ok(carry.context().bind(operation, &[carry.clone()])?.remove(0))
+                },
+                Scalar::from(1.0),
+                Scalar::from(1.0),
+            )
+            .unwrap();
+        assert_eq!(primal, 8.0);
+        assert_eq!(tangent, 8.0);
+    }
+
+    #[test]
+    fn test_scalar_while_rejects_non_boolean_condition() {
+        assert_eq!(
+            WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(scalar_doubling_body(), scalar_doubling_body())
+                .map(|_| ()),
+            Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_scalar_token() {
+        let token = Scalar::Token;
+
+        // The token scalar carries no payload: it renders as `token`, supports no arithmetic, comparisons, or
+        // Boolean conversion, and its `zero_like`/`one_like` are the identity.
+        assert_eq!(token.r#type().into_owned(), DataType::Token);
+        assert_eq!(token.to_string(), "token");
+        assert_eq!(token.as_boolean(), token);
+        assert!(token.boolean().is_err());
+        assert!(token.compare(&token, ComparisonDirection::Equal).is_err());
+        assert!(Neg::neg(&token).is_err());
+        assert!(Add::add(&token, &token).is_err());
+        assert_eq!(token.zero_like(), token);
+        assert_eq!(token.one_like(), token);
+
+        // The token data type has no zero or one constant, and a same-type cast is the identity.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert!(context.zero(&DataType::Token).is_err());
+        assert!(context.one(&DataType::Token).is_err());
+        assert_eq!(token.cast(DataType::Token), Ok(token));
+    }
+
+    #[test]
+    fn test_scalar_equality_and_ordering() {
+        // Same-variant payloads compare by value, and scalars of different data types never compare equal.
+        assert_eq!(Scalar::from(1.5f64), Scalar::from(1.5f64));
+        assert_ne!(Scalar::from(1.5f64), Scalar::from(2.5f64));
+        assert_ne!(Scalar::from(1.5f32), Scalar::from(1.5f64));
+        assert_ne!(Scalar::from(1i32), Scalar::from(1i64));
+
+        // Equality against bare primitives works in both directions and only within the matching variant.
+        assert_eq!(Scalar::from(1.5f32), 1.5f32);
+        assert_eq!(1.5f64, Scalar::from(1.5f64));
+        assert_ne!(Scalar::from(1.5f32), 1.5f64);
+
+        // Ordering is defined within a variant and undefined across variants (and for complex scalars, which the
+        // complex tests cover).
+        assert!(Scalar::from(1i32) < Scalar::from(2i32));
+        assert!(Scalar::from(2.5f64) > Scalar::from(1.5f64));
+        assert_eq!(Scalar::from(1i32).partial_cmp(&Scalar::from(1i64)), None);
+
+        // Approximate equality compares exactly widened floating-point payloads, including across variants, and
+        // against bare `f64` values.
+        assert_abs_diff_eq!(Scalar::from(1.5f32), Scalar::from(1.5f64 + 1e-12), epsilon = 1e-9);
+        assert_abs_diff_eq!(Scalar::from(2.0f32), 2.0f64, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_scalar_low_precision_float_types_and_bits() {
+        // For every low-precision format, the listed bit pattern encodes the value one.
+        let values = [
+            (DataType::F4E2M1FN, 0x02),
+            (DataType::F8E3M4, 0x30),
+            (DataType::F8E4M3, 0x38),
+            (DataType::F8E4M3FN, 0x38),
+            (DataType::F8E4M3FNUZ, 0x40),
+            (DataType::F8E4M3B11FNUZ, 0x58),
+            (DataType::F8E5M2, 0x3c),
+            (DataType::F8E5M2FNUZ, 0x40),
+            (DataType::F8E8M0FNU, 0x7f),
+        ];
+        for (r#type, bits) in values {
+            let scalar = Scalar::from_low_precision_float_bits(r#type, bits).unwrap();
+            assert_eq!(scalar.r#type().into_owned(), r#type);
+            assert_eq!(scalar.low_precision_float_bits(), Some(bits));
+            assert_eq!(scalar.to_string(), "1");
+            assert_eq!(scalar.boolean(), Ok(true));
+            assert_eq!(scalar.one_like(), scalar);
+            assert_eq!(scalar.cast(r#type), Ok(scalar));
+        }
+
+        // Construction validates the four-bit format and rejects non-low-precision data types, while equality
+        // compares decoded values: signed zeros are equal and NaN payloads are unequal to themselves.
+        assert!(Scalar::from_low_precision_float_bits(DataType::F4E2M1FN, 0x10).is_err());
+        assert!(Scalar::from_low_precision_float_bits(DataType::F32, 0).is_err());
+        assert_eq!(Scalar::F8E4M3(0), Scalar::F8E4M3(0x80));
+        assert_ne!(Scalar::F8E4M3(0x79), Scalar::F8E4M3(0x79));
+    }
+
+    #[test]
+    fn test_scalar_low_precision_float_arithmetic() {
+        let one = Scalar::F8E4M3(0x38);
+        let two = Scalar::F8E4M3(0x40);
+        let negative_one = Scalar::F8E4M3(0xb8);
+
+        // Low-precision arithmetic computes through the decoded `f64` values and re-encodes the results.
+        assert_eq!(Add::add(&one, &one), Ok(two));
+        assert_eq!(Mul::mul(&two, &negative_one), Ok(Scalar::F8E4M3(0xc0)));
+        assert_eq!(Neg::neg(&one), Ok(negative_one));
+        assert_eq!(Abs::abs(&negative_one), Ok(one));
+        assert_eq!(one.compare(&two, ComparisonDirection::LessThan), Ok(Scalar::Bool(true)));
+        assert!(Add::add(&one, &Scalar::F8E5M2(0x3c)).is_err());
+        assert!(Neg::neg(&Scalar::F8E8M0FNU(0x7f)).is_err());
+
+        // The zero and one constants use the formats' canonical encodings, and the unsigned power-of-two format
+        // `f8e8m0fnu` cannot represent zero.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert_eq!(context.zero(&DataType::F8E4M3), Ok(Scalar::F8E4M3(0)));
+        assert_eq!(context.one(&DataType::F8E4M3), Ok(one));
+        assert!(context.zero(&DataType::F8E8M0FNU).is_err());
+    }
+
+    #[test]
+    fn test_scalar_display() {
+        // Numeric scalars render their payloads directly.
+        assert_eq!(Scalar::from(true).to_string(), "true");
+        assert_eq!(Scalar::from(-3i32).to_string(), "-3");
+        assert_eq!(Scalar::from(1.5f64).to_string(), "1.5");
+
+        // Complex scalars render as `<real>+<imaginary>i`, folding a negative imaginary part's sign into the
+        // separator.
+        assert_eq!(Scalar::from(Complex::new(1.5f32, 2.0f32)).to_string(), "1.5+2i");
+        assert_eq!(Scalar::from(Complex::new(1.5f32, -2.0f32)).to_string(), "1.5-2i");
+        assert_eq!(Scalar::from(Complex::new(-0.5f64, 0.25f64)).to_string(), "-0.5+0.25i");
+        assert_eq!(Scalar::from(Complex::new(0.0f64, -1.0f64)).to_string(), "0-1i");
+    }
+
+    #[test]
+    fn test_scalar_domain() {
+        // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is a zero-sized token.
+        assert_eq!(size_of::<EagerContext<Scalar, ScalarOperation<Scalar>>>(), 0);
+
+        // It is an eager `Context`. Binding a nullary zero/one operation interprets it directly over concrete
+        // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
+        assert_eq!(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::F64), &[]),
+            Ok(vec![Scalar::from(0.0)]),
+        );
+        assert_eq!(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(OneOperation::new(DataType::F64), &[]),
+            Ok(vec![Scalar::from(1.0)]),
+        );
+    }
+
+    #[test]
+    fn test_scalar_boolean_like() {
+        // Boolean conversion treats any nonzero payload as true, decoding Booleans, integers, and floating-point
+        // scalars alike, and `as_boolean` re-wraps that truth value as a `Scalar::Bool`.
+        assert_eq!(Scalar::from(true).boolean(), Ok(true));
+        assert_eq!(Scalar::from(0i32).boolean(), Ok(false));
+        assert_eq!(Scalar::from(-2i64).boolean(), Ok(true));
+        assert_eq!(Scalar::from(0.0f64).boolean(), Ok(false));
+        assert_eq!(Scalar::from(0.5f32).boolean(), Ok(true));
+        assert_eq!(Scalar::from(2.5f64).as_boolean(), Scalar::from(true));
+    }
+
+    #[test]
+    fn test_scalar_constants() {
+        // The zero and one constants exist for every numeric data type.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert_eq!(context.zero(&DataType::I32), Ok(Scalar::from(0i32)));
+        assert_eq!(context.one(&DataType::Boolean), Ok(Scalar::from(true)));
+        assert_eq!(context.zero(&DataType::F32), Ok(Scalar::from(0.0f32)));
+
+        // The like-typed constants adopt the source scalar's variant.
+        assert_eq!(Scalar::from(5i16).zero_like(), Scalar::from(0i16));
+        assert_eq!(Scalar::from(2.5f64).one_like(), Scalar::from(1.0f64));
+    }
+
+    #[test]
+    fn test_scalar_arithmetic() {
+        // Same-variant arithmetic computes in the payload type, through both the fallible capabilities and the
+        // `std::ops` operator sugar layered on top of them.
+        assert_eq!(Add::add(&Scalar::from(2i32), &Scalar::from(3i32)), Ok(Scalar::from(5i32)));
+        assert_eq!(Scalar::from(2.0) + Scalar::from(3.0), Scalar::from(5.0));
+        assert_eq!(Scalar::from(2.0) - Scalar::from(3.0), Scalar::from(-1.0));
+        assert_eq!(Scalar::from(2.0) * Scalar::from(3.0), Scalar::from(6.0));
+        assert_eq!(Scalar::from(7i64) / Scalar::from(2i64), Scalar::from(3i64));
+        assert_eq!(-Scalar::from(2.0), Scalar::from(-2.0));
+
+        // Mismatched variants, and negation of unsigned integers, surface `TypeError`s.
+        assert!(Add::add(&Scalar::from(1.5f32), &Scalar::from(1.5f64)).is_err());
+        assert!(Neg::neg(&Scalar::from(2u8)).is_err());
     }
 
     #[test]
@@ -1786,84 +1863,197 @@ mod tests {
     }
 
     #[test]
-    fn test_scalar_while() {
-        let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
-            scalar_less_than_eight_condition(),
-            scalar_doubling_body(),
-        )
-        .unwrap();
-
-        assert_eq!(operation.name(), crate::operations::control_flow::WHILE_OPERATION_NAME);
-        assert_eq!(operation.state_types(), vec![DataType::F64]);
-        assert_eq!(operation.iteration_bound(), None);
-        assert_eq!(operation.infer_output_types(&[DataType::F64]), Ok(vec![DataType::F64]));
-        assert_eq!(
-            operation.interpret(&crate::EagerContext::<Scalar>::new(), &[Scalar::from(1.0)]),
-            Ok(vec![Scalar::from(8.0)])
+    fn test_scalar_math() {
+        // The elementwise math capabilities compute in the payload type for the floating-point variants.
+        assert_eq!(Scalar::from(0.0).sin(), Ok(Scalar::from(0.0)));
+        assert_eq!(Scalar::from(0.0).cos(), Ok(Scalar::from(1.0)));
+        assert_eq!(Scalar::from(0.0).exp(), Ok(Scalar::from(1.0)));
+        assert_eq!(Scalar::from(1.0).log(), Ok(Scalar::from(0.0)));
+        assert_eq!(Scalar::from(4.0).sqrt(), Ok(Scalar::from(2.0)));
+        assert_abs_diff_eq!(
+            Scalar::from(1.0).atan2(&Scalar::from(1.0)).unwrap(),
+            std::f64::consts::FRAC_PI_4,
+            epsilon = 1e-12,
         );
 
-        let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
-            |carry| {
-                let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
-                    scalar_less_than_eight_condition(),
-                    scalar_doubling_body(),
-                )
-                .unwrap();
-                let mut outputs = carry.context().stage_operation(operation, &[&carry])?;
-                Ok(outputs.remove(0))
-            },
-            DataType::F64,
-        )
-        .unwrap();
-        assert_eq!(output_type, DataType::F64);
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = while [
-                    condition={
-                        lambda %0:f64 .
-                        let %1:f64 = const
-                            %2:bool = compare [direction=LessThan] %0 %1
-                        in (%2)
-                    },
-                    body={
-                        lambda %0:f64 .
-                        let %1:f64 = add %0 %0
-                        in (%1)
-                    },
-                ] %0
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(program.interpret(Scalar::from(1.0)), Ok(Scalar::from(8.0)));
+        // The absolute value covers signed integers, floating-point values, and complex magnitudes (with a real
+        // result).
+        assert_eq!(Scalar::from(-2i32).abs(), Ok(Scalar::from(2i32)));
+        assert_eq!(Scalar::from(-2.5f64).abs(), Ok(Scalar::from(2.5f64)));
+        assert_eq!(Scalar::from(Complex::new(3.0f32, 4.0f32)).abs(), Ok(Scalar::from(5.0f32)));
 
-        let (primal, tangent): (Scalar, Scalar) = domain
-            .jvp(
-                |carry| {
-                    let operation = WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(
-                        scalar_less_than_eight_condition(),
-                        scalar_doubling_body(),
-                    )
-                    .unwrap();
-                    Ok(carry.context().bind(operation, &[carry.clone()])?.remove(0))
-                },
-                Scalar::from(1.0),
-                Scalar::from(1.0),
-            )
-            .unwrap();
-        assert_eq!(primal, 8.0);
-        assert_eq!(tangent, 8.0);
+        // Unsupported data types surface `TypeError`s.
+        assert!(Scalar::from(true).sin().is_err());
+        assert!(Scalar::from(1i32).exp().is_err());
+        assert!(Scalar::from(true).abs().is_err());
+        assert!(Scalar::from(1.0f32).atan2(&Scalar::from(1.0f64)).is_err());
     }
 
     #[test]
-    fn test_scalar_while_rejects_non_boolean_condition() {
+    fn test_scalar_complex_parts() {
+        // Complex construction pairs same-precision real parts, and the part extractions invert it.
+        let complex = crate::operations::complex::Complex::complex(&Scalar::from(1.5f32), &Scalar::from(-2.0f32));
+        assert_eq!(complex, Ok(Scalar::from(Complex::new(1.5f32, -2.0f32))));
+        let complex = complex.unwrap();
+        assert_eq!(complex.conjugate(), Ok(Scalar::from(Complex::new(1.5f32, 2.0f32))));
+        assert_eq!(complex.real(), Ok(Scalar::from(1.5f32)));
+        assert_eq!(complex.imaginary(), Ok(Scalar::from(-2.0f32)));
+
+        // Mixed-precision construction and part extraction from non-complex scalars surface `TypeError`s.
+        assert!(crate::operations::complex::Complex::complex(&Scalar::from(1.5f32), &Scalar::from(1.5f64)).is_err());
+        assert!(Scalar::from(1.5f64).conjugate().is_err());
+        assert!(Scalar::from(1.5f64).real().is_err());
+        assert!(Scalar::from(1.5f64).imaginary().is_err());
+    }
+
+    #[test]
+    fn test_scalar_complex_arithmetic() {
+        let left = Scalar::from(Complex::new(1.0f64, 2.0f64));
+        let right = Scalar::from(Complex::new(3.0f64, -1.0f64));
+
+        // The complex variants support the full fallible arithmetic surface, computing in the complex field.
+        assert_eq!(left + right, Scalar::from(Complex::new(4.0f64, 1.0f64)));
+        assert_eq!(left - right, Scalar::from(Complex::new(-2.0f64, 3.0f64)));
+        assert_eq!(left * right, Scalar::from(Complex::new(5.0f64, 5.0f64)));
+        assert_eq!(-left, Scalar::from(Complex::new(-1.0f64, -2.0f64)));
         assert_eq!(
-            WhileOperation::<Scalar, ScalarOperation<Scalar>>::new(scalar_doubling_body(), scalar_doubling_body())
-                .map(|_| ()),
-            Err(TypeError { message: "'while' condition output type must be bool, but got f64".to_string() }),
+            (left / right) * right,
+            Scalar::from(Complex::new(1.0f64, 2.0f64) / Complex::new(3.0f64, -1.0f64) * Complex::new(3.0f64, -1.0f64)),
         );
+
+        // The complex sine and cosine are the analytic continuations computed by `num_complex`.
+        assert_eq!(left.sin(), Ok(Scalar::from(Complex::new(1.0f64, 2.0f64).sin())));
+        assert_eq!(left.cos(), Ok(Scalar::from(Complex::new(1.0f64, 2.0f64).cos())));
+
+        // Constants and Boolean-ness: zero/one carry a zero imaginary part, and a complex scalar is truthy exactly
+        // when it is not the complex zero.
+        assert_eq!(left.zero_like(), Scalar::from(Complex::new(0.0f64, 0.0f64)));
+        assert_eq!(left.one_like(), Scalar::from(Complex::new(1.0f64, 0.0f64)));
+        assert_eq!(
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::C64), &[]),
+            Ok(vec![Scalar::from(Complex::new(0.0f32, 0.0f32))]),
+        );
+        assert_eq!(left.boolean(), Ok(true));
+        assert_eq!(left.zero_like().boolean(), Ok(false));
+        assert_eq!(Scalar::from(Complex::new(0.0f64, 0.5f64)).boolean(), Ok(true));
+
+        // Complex scalars are unordered.
+        assert_eq!(left.partial_cmp(&right), None);
+
+        // Mixed-variant arithmetic is rejected like every other unequal-variant pair.
+        assert!(Add::add(&left, &Scalar::from(1.0f64)).is_err());
+    }
+
+    #[test]
+    fn test_scalar_complex_program_constant_rendering() {
+        // A complex constant is staged and rendered like any other constant (a `const` binding typed `c64`; the
+        // value-literal syntax itself is covered by the `Display` test above), and interpretation recovers the
+        // carried complex value.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::C64);
+        let constant = builder.add_constant(Scalar::from(Complex::new(1.5f32, -2.0f32)));
+        let output = builder.add_instruction(crate::operations::math::MulOperation, vec![input, constant]).unwrap()[0];
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:c64 .
+                let %1:c64 = const
+                    %2:c64 = mul %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Interpreting the program multiplies in the complex field.
+        let outputs = program.interpret(vec![Scalar::from(Complex::new(2.0f32, 1.0f32))]).unwrap();
+        assert_eq!(outputs, vec![Scalar::from(Complex::new(2.0f32, 1.0f32) * Complex::new(1.5f32, -2.0f32))]);
+    }
+
+    #[test]
+    fn test_scalar_compare() {
+        // Comparisons return honestly Boolean-typed scalars for every ordered direction.
+        let one = Scalar::from(1.0);
+        let two = Scalar::from(2.0);
+        assert_eq!(one.compare(&two, ComparisonDirection::LessThan), Ok(Scalar::Bool(true)));
+        assert_eq!(one.compare(&two, ComparisonDirection::LessThanOrEqual), Ok(Scalar::Bool(true)));
+        assert_eq!(one.compare(&two, ComparisonDirection::GreaterThan), Ok(Scalar::Bool(false)));
+        assert_eq!(one.compare(&one, ComparisonDirection::GreaterThanOrEqual), Ok(Scalar::Bool(true)));
+        assert_eq!(one.compare(&two, ComparisonDirection::Equal), Ok(Scalar::Bool(false)));
+        assert_eq!(one.compare(&two, ComparisonDirection::NotEqual), Ok(Scalar::Bool(true)));
+
+        // An unordered pair (one involving a NaN) satisfies only the `NotEqual` direction.
+        let nan = Scalar::from(f64::NAN);
+        assert_eq!(one.compare(&nan, ComparisonDirection::LessThan), Ok(Scalar::Bool(false)));
+        assert_eq!(one.compare(&nan, ComparisonDirection::NotEqual), Ok(Scalar::Bool(true)));
+
+        // Mismatched variants are rejected.
+        assert!(Scalar::from(1.0f32).compare(&Scalar::from(1.0f64), ComparisonDirection::Equal).is_err());
+
+        // Only the equality directions are defined for the unordered complex scalars.
+        let left = Scalar::from(Complex::new(1.0f64, 2.0f64));
+        let right = Scalar::from(Complex::new(3.0f64, -1.0f64));
+        assert_eq!(left.compare(&left, ComparisonDirection::Equal), Ok(Scalar::Bool(true)));
+        assert_eq!(left.compare(&right, ComparisonDirection::Equal), Ok(Scalar::Bool(false)));
+        assert_eq!(left.compare(&right, ComparisonDirection::NotEqual), Ok(Scalar::Bool(true)));
+        assert_eq!(
+            left.compare(&right, ComparisonDirection::LessThan),
+            Err(TypeError {
+                message: "cannot apply an ordered comparison to unordered complex scalars of data type c128"
+                    .to_string(),
+            }
+            .into()),
+        );
+    }
+
+    #[test]
+    fn test_scalar_cast_promotes_widening_and_rejects_narrowing() {
+        // A cast to the same data type is the identity.
+        assert_eq!(Scalar::from(2.5f32).cast(DataType::F32), Ok(Scalar::from(2.5f32)));
+
+        // Widening promotions convert the carried value exactly: float widening, integer-to-float, integer widening,
+        // and Boolean-to-numeric.
+        assert_eq!(Scalar::from(2.5f32).cast(DataType::F64), Ok(Scalar::from(2.5f64)));
+        assert_eq!(Scalar::from(3i32).cast(DataType::F64), Ok(Scalar::from(3.0f64)));
+        assert_eq!(Scalar::from(3i16).cast(DataType::I32), Ok(Scalar::from(3i32)));
+        assert_eq!(Scalar::from(true).cast(DataType::U16), Ok(Scalar::from(1u16)));
+        assert_eq!(Scalar::from(f16::from_f32(1.5)).cast(DataType::F32), Ok(Scalar::from(1.5f32)));
+
+        // Real sources promote to complex targets with a zero imaginary part, and complex sources widen per
+        // component.
+        assert_eq!(Scalar::from(1.5f32).cast(DataType::C64), Ok(Scalar::from(Complex::new(1.5f32, 0.0f32))));
+        assert_eq!(Scalar::from(3i16).cast(DataType::C128), Ok(Scalar::from(Complex::new(3.0f64, 0.0f64))));
+        assert_eq!(
+            Scalar::from(Complex::new(1.5f32, -2.0f32)).cast(DataType::C128),
+            Ok(Scalar::from(Complex::new(1.5f64, -2.0f64))),
+        );
+
+        // Narrowing (non-promotable) casts are rejected rather than silently truncating.
+        assert_eq!(
+            Scalar::from(2.5f64).cast(DataType::I32),
+            Err(TypeError { message: "cannot promote scalar of data type f64 to i32".to_string() }.into()),
+        );
+        assert_eq!(
+            Scalar::from(Complex::new(1.5f64, 0.0f64)).cast(DataType::C64),
+            Err(TypeError { message: "cannot promote scalar of data type c128 to c64".to_string() }.into()),
+        );
+        assert_eq!(
+            Scalar::from(Complex::new(1.5f32, 0.0f32)).cast(DataType::F64),
+            Err(TypeError { message: "cannot promote scalar of data type c64 to f64".to_string() }.into()),
+        );
+    }
+
+    #[test]
+    fn test_scalar_select() {
+        // Selection promotes the selected branch to the promotion of the two branch data types, like `jnp.where`.
+        assert_eq!(Select::select(&true, &Scalar::from(1.5f32), &Scalar::from(2.5f64)), Ok(Scalar::from(1.5f64)));
+        assert_eq!(Select::select(&false, &Scalar::from(1.5f32), &Scalar::from(2.5f64)), Ok(Scalar::from(2.5f64)));
+
+        // Selection conditions decode the in-band Boolean payloads of scalar values.
+        assert_eq!(Scalar::from(true).select_condition(), Ok(true));
+        assert_eq!(Scalar::from(0.0).select_condition(), Ok(false));
+        assert!(Scalar::Token.select_condition().is_err());
     }
 }
