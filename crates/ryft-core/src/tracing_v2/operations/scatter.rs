@@ -10,6 +10,7 @@
 use crate::batching::ArrayBatch;
 use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
@@ -175,12 +176,16 @@ where
 /// leading batch axis. This stages `O(axis_size)` scatters but is correct for every combiner and dimension-number
 /// configuration; dimension-number lifting is a performance optimization left as a follow-up. When no input is mapped
 /// the scatter applies once, unbatched.
-impl<V, C> BatchableOperation<V, C> for ScatterOperation
+impl<C> BatchableOperation<C> for ScatterOperation
 where
-    V: Value<Type = ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    ScatterOperation: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
+    ScatterOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 3, ProgramError);
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);

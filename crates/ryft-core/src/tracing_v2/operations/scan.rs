@@ -5,7 +5,7 @@ use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
 use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiationDual;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationError,
@@ -279,44 +279,19 @@ where
     Ok(outputs)
 }
 
-impl<V, O> BatchableOperation<V, EagerContext<V, O>> for ScanOperation<V, O>
-where
-    V: Value<Type = ArrayType> + Slice + UpdateSlice + Reshape,
-    EagerContext<V, O>: Zero<V>,
-    O: BatchableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let y_slice_types = self.body().output_types().split_off(self.carry_count());
-        batch_scan_with_interpreter(
-            self.carry_count(),
-            self.length(),
-            self.reverse(),
-            y_slice_types.as_slice(),
-            inputs,
-            |stacked_type| context.zero(stacked_type),
-            |_, iteration_inputs| {
-                self.body().interpret_with(
-                    iteration_inputs,
-                    |_, constant| Ok(ArrayBatch::replicated(constant.clone())),
-                    |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-                )
-            },
-        )
-    }
-}
-
-impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for ScanOperation<C::Constant, O>
+/// Batching rule for [`ScanOperation`]: the scan loop is replayed per iteration through
+/// `batch_scan_with_interpreter`, with each body instruction re-entering this operation family's batching rules
+/// against the same active context. Constants lift and stacked-output accumulators seed (via the parent's [`Zero`])
+/// through `context.parent()`, so an eager parent runs the batched scan operationally while a staging parent stages
+/// the per-iteration work into the enclosing trace.
+impl<C, O> BatchableOperation<C> for ScanOperation<C::Constant, O>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     C::Constant: Value<Type = ArrayType>,
     <C as Domain>::Value: Slice + UpdateSlice + Reshape,
     C::Operation:
         From<ZeroOperation<ArrayType>> + From<SliceOperation> + From<UpdateSliceOperation> + From<ReshapeOperation>,
-    O: BatchableOperation<<C as Domain>::Value, BatchingContext<C>>,
+    O: BatchableOperation<C>,
 {
     fn batch(
         &self,
@@ -877,7 +852,7 @@ mod tests {
         // batch item runs its own cumulative product over the shared `xs = [2, 3, 4]`, and the stacked outputs
         // gain the scan axis in front of the batch axis.
         let scan = product_scan();
-        let context = TestEagerContext::new();
+        let context = BatchingContext::new(TestEagerContext::new(), 3, None);
         let carries = {
             let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -898,7 +873,7 @@ mod tests {
         // Batching a scan whose stacked input is mapped at axis 0 reads each iteration's slice along the logical
         // leading axis (physical axis 1 when the batch axis sits at 0), so every batch item scans its own row.
         let scan = product_scan();
-        let context = TestEagerContext::new();
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
             let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -915,7 +890,7 @@ mod tests {
         // A trailing batch axis (physical `[3, 2]` with the batch axis at 1) reads the same logical iterations, so the
         // outputs are identical.
         let scan = product_scan();
-        let context = TestEagerContext::new();
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
             let value = TestArray::matrix(3, 2, vec![2.0, 5.0, 3.0, 6.0, 4.0, 7.0]);
@@ -933,7 +908,7 @@ mod tests {
     fn test_scan_batching_threads_batched_carries_and_inputs() {
         // Batching both operands pairs batch item `i` of the carries with batch item `i` of the stacked inputs.
         let scan = product_scan();
-        let context = TestEagerContext::new();
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = {
             let value = TestArray::vector(vec![1.0, 10.0]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
@@ -957,7 +932,7 @@ mod tests {
         // aligned with input iteration `i`: the reversed cumulative product over `[2, 3, 4]` is `[24, 12, 4]` per
         // batch item.
         let scan = product_scan().with_reverse(true);
-        let context = TestEagerContext::new();
+        let context = BatchingContext::new(TestEagerContext::new(), 2, None);
         let carries = ArrayBatch::replicated(TestArray::scalar(1.0));
         let stacked_inputs = {
             let value = TestArray::matrix(2, 3, vec![2.0, 3.0, 4.0, 2.0, 3.0, 4.0]);

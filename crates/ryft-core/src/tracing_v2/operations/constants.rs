@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::contexts::Context;
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
@@ -20,29 +21,37 @@ use crate::types::{ArrayType, Type, Typed};
 
 /// [`ZeroOperation`] takes no inputs and produces a constant of its captured type. The same
 /// constant is the right value for every batch item, so the rule interprets the operation once
-/// under the active context — constructing the constant eagerly under an eager context and
-/// staging a nullary operation under a staging context — and wraps each output as a replicated
+/// under the parent context — constructing the constant eagerly under an eager parent and
+/// staging a nullary operation under a staging parent — and wraps each output as a replicated
 /// [`ArrayBatch`] (`batch_axis = None`). Downstream elementwise consumers that need the constant
 /// materialized at the batched physical shape will broadcast it through the internal elementwise
 /// batching rule.
-impl<V: Value<Type = ArrayType>, C> BatchableOperation<V, C> for ZeroOperation<ArrayType>
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<ArrayType>
 where
-    ZeroOperation<ArrayType>: InterpretableOperation<V, C>,
+    ZeroOperation<ArrayType>: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let outputs = <Self as InterpretableOperation<V, C>>::interpret(self, context, &[])?;
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let outputs = self.interpret(context.parent(), &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`OneOperation`] is replicated by the
 /// same argument.
-impl<V: Value<Type = ArrayType>, C> BatchableOperation<V, C> for OneOperation<ArrayType>
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for OneOperation<ArrayType>
 where
-    OneOperation<ArrayType>: InterpretableOperation<V, C>,
+    OneOperation<ArrayType>: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let outputs = <Self as InterpretableOperation<V, C>>::interpret(self, context, &[])?;
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let outputs = self.interpret(context.parent(), &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
@@ -50,26 +59,34 @@ where
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`ConstantOperation`] is also replicated because it has no
 /// data inputs. The stored constant type is decoupled from the flowing value type so the same rule serves both eager
 /// batching (where the two coincide) and staged batching (where the stored constant lifts into a tracer).
-impl<Stored, V, C> BatchableOperation<V, C> for ConstantOperation<Stored>
+impl<Stored, C> BatchableOperation<C> for ConstantOperation<Stored>
 where
     Stored: Clone + Display + Typed<Type = ArrayType>,
-    V: Value<Type = ArrayType>,
-    ConstantOperation<Stored>: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType>,
+    ConstantOperation<Stored>: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let outputs = <Self as InterpretableOperation<V, C>>::interpret(self, context, &[])?;
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let outputs = self.interpret(context.parent(), &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
 
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`FillOperation`] is also replicated because it has no
 /// data inputs.
-impl<V: Value<Type = ArrayType>, F: Clone + Display, C> BatchableOperation<V, C> for FillOperation<ArrayType, F>
+impl<F: Clone + Display, C: Context<Type = ArrayType>> BatchableOperation<C> for FillOperation<ArrayType, F>
 where
-    FillOperation<ArrayType, F>: InterpretableOperation<V, C>,
+    FillOperation<ArrayType, F>: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let outputs = <Self as InterpretableOperation<V, C>>::interpret(self, context, &[])?;
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let outputs = self.interpret(context.parent(), &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }
@@ -77,12 +94,16 @@ where
 /// See [`ZeroOperation`]'s impl above for the reasoning — [`IotaOperation`] is also replicated because it has no data
 /// inputs; a raw iota of a fixed type is the same value for every batch item. (The per-item batch index produced by
 /// `axis_index` is materialized directly against the mapped axis instead of relying on this replicated rule.)
-impl<V: Value<Type = ArrayType>, C> BatchableOperation<V, C> for IotaOperation<ArrayType>
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for IotaOperation<ArrayType>
 where
-    IotaOperation<ArrayType>: InterpretableOperation<V, C>,
+    IotaOperation<ArrayType>: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        let outputs = <Self as InterpretableOperation<V, C>>::interpret(self, context, &[])?;
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let outputs = self.interpret(context.parent(), &[])?;
         Ok(outputs.into_iter().map(ArrayBatch::replicated).collect())
     }
 }

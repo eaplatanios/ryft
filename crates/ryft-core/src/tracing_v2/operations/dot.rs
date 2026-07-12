@@ -621,16 +621,16 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotOpera
 {
 }
 
-impl<V: Value<Type = ArrayType> + crate::operations::manipulation::Broadcast, C>
-    crate::batching::BatchableOperation<V, C> for DotOperation
+impl<C: Context<Type = ArrayType, Value: crate::operations::manipulation::Broadcast>>
+    crate::batching::BatchableOperation<C> for DotOperation
 where
-    DotOperation: InterpretableOperation<V, C>,
+    DotOperation: InterpretableOperation<C::Value, C>,
 {
     fn batch(
         &self,
-        context: &C,
-        inputs: &[crate::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, BatchingError> {
+        context: &crate::batching::BatchingContext<C>,
+        inputs: &[crate::batching::ArrayBatch<C::Value>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         // Validate the common batch size across both operands (catching mismatched batched operands) before the
@@ -640,7 +640,7 @@ where
         // axis at position 0 (JAX's `matchaxis(0)` convention), then fall through to the
         // both-batched arm of `lift_dot_dimensions`.
         let mixed_axis_size = || axis_size.expect("a mapped input pins the batch size");
-        let aligned_inputs: Vec<crate::batching::ArrayBatch<V>> = match (batch_axes[0], batch_axes[1]) {
+        let aligned_inputs: Vec<crate::batching::ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
             (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
             (Some(_), None) => vec![inputs[0].clone(), inputs[1].broadcast(0, mixed_axis_size())?],
             (None, Some(_)) => vec![inputs[0].broadcast(0, mixed_axis_size())?, inputs[1].clone()],
@@ -1490,7 +1490,7 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs = operation.batch(batching_context.parent(), &[lhs, rhs]).unwrap();
+        let outputs = operation.batch(&batching_context, &[lhs, rhs]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         let output_atom = outputs[0].value().atom_id().unwrap();
         drop(outputs);

@@ -130,8 +130,8 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<ZeroOperation
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Zero<C::Value>>
-    Zero<BatchingTracer<C>> for BatchingContext<C>
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Zero<C::Value>> Zero<BatchingTracer<C>>
+    for BatchingContext<C>
 {
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {

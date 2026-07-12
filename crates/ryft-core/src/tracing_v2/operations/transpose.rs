@@ -74,15 +74,15 @@ pub fn lift_permutation(permutation: &[usize], batch_axis: usize) -> Vec<usize> 
     lifted
 }
 
-impl<V: Value<Type = ArrayType>, C> crate::batching::BatchableOperation<V, C> for TransposeOperation
+impl<C: Context<Type = ArrayType>> crate::batching::BatchableOperation<C> for TransposeOperation
 where
-    TransposeOperation: InterpretableOperation<V, C>,
+    TransposeOperation: InterpretableOperation<C::Value, C>,
 {
     fn batch(
         &self,
-        context: &C,
-        inputs: &[crate::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
+        context: &crate::batching::BatchingContext<C>,
+        inputs: &[crate::batching::ArrayBatch<C::Value>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         crate::batching::ArrayBatch::common_batch_size(inputs)?;

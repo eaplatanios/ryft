@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::{ArrayBatch, BatchableOperation};
 use crate::contexts::Context;
@@ -146,8 +147,12 @@ where
 /// preserves the operand's batch axis. On traced values this stages the transfer on the batched physical value; on
 /// concrete values it keeps the payload unchanged while re-placing the carried type in the destination, exactly like
 /// interpretation.
-impl<V: Value<Type = ArrayType> + TransferToMemory, C> BatchableOperation<V, C> for TransferToMemoryOperation {
-    fn batch(&self, _context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+impl<C: Context<Type = ArrayType, Value: TransferToMemory>> BatchableOperation<C> for TransferToMemoryOperation {
+    fn batch(
+        &self,
+        _context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let value = inputs[0].value().transfer_to_memory(self.destination);
         let physical_type = value.r#type().into_owned();
@@ -330,15 +335,15 @@ mod tests {
 
     #[test]
     fn test_transfer_to_memory_batching_preserves_the_operation_and_the_memory() {
-        // Value-level batching keeps the payload unchanged while re-placing the carried type in the destination —
-        // exactly like interpretation — and preserves the batch axis.
+        // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
+        // destination — exactly like interpretation — and preserves the batch axis.
         let input = {
             let value = TestArray::matrix(2, 3, vec![1.0; 6]);
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
         let operation = ArrayOperation::<TestArray>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
         let outputs = operation.batch(&context, std::slice::from_ref(&input)).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -346,7 +351,8 @@ mod tests {
         assert_eq!(outputs[0].r#type().memory(), PINNED_HOST);
         assert_eq!(outputs[0].value().values, vec![1.0; 6]);
 
-        // Traced batching stages the same transfer on the physical batched value with its batch axis preserved.
+        // Batching under a staging parent stages the same transfer on the physical batched value with its batch
+        // axis preserved.
         let (output_type, program) = EagerContext::<TestArray, ArrayOperation<TestArray>>::trace(
             |x| {
                 let context = x.context().clone();

@@ -17,6 +17,7 @@
 use crate::batching::ArrayBatch;
 use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
@@ -86,11 +87,15 @@ where
 
 /// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
 /// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
-impl<V: Value<Type = ArrayType>, C> BatchableOperation<V, C> for ReshardOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ReshardOperation
 where
-    ReshardOperation: InterpretableOperation<V, C>,
+    ReshardOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
@@ -159,11 +164,15 @@ where
 /// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
 /// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
 /// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
-impl<V: Value<Type = ArrayType>, C> BatchableOperation<V, C> for ShardingConstraintOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ShardingConstraintOperation
 where
-    ShardingConstraintOperation: InterpretableOperation<V, C>,
+    ShardingConstraintOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;

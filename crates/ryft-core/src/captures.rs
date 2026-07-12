@@ -147,9 +147,7 @@ impl<C: CapturingContext<Operation: PartiallyEvaluatableOperation<C>>> Capturing
     }
 }
 
-impl<C: CapturingContext<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>>
-    CapturingContext for BatchingContext<C>
-{
+impl<C: CapturingContext<Type = ArrayType, Operation: BatchableOperation<C>>> CapturingContext for BatchingContext<C> {
     type Capture = C::Capture;
 
     #[inline]

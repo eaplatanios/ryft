@@ -3,7 +3,7 @@ use crate::batching::BatchingError;
 use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchableProgramOperation, ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableProgramOperation, DifferentiableType, DifferentiationError,
     LinearizableProgramOperation, TransposableOperation, TransposableProgramOperation,
@@ -809,15 +809,17 @@ where
     }
 }
 
-/// Batches a condition over `true_branch` and `false_branch` by reading the predicate from the first input.
-///
-/// A replicated predicate is concretized via [`BooleanLike::boolean`] and selects one branch to interpret over the
-/// remaining operand inputs. A batch-varying predicate interprets both branches over the operand inputs and merges
-/// their outputs per batch item via [`Select`](crate::operations::control_flow::Select).
+/// Batches a condition whose predicate is *batch-varying* by interpreting both branches over the operand inputs via
+/// `interpret_program` and merging their outputs per batch item via
+/// [`Select`](crate::operations::control_flow::Select). Each output's batch axis is joined across the branches
+/// (erroring when the branches disagree on a mapped position and defaulting to the predicate's axis when both branch
+/// outputs are replicated). The predicate must carry a mapped batch axis; the replicated case is the caller's
+/// structural staging path.
 pub(crate) fn batch_condition_with_interpreter<VOperation, V, O, F>(
     true_branch: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
     false_branch: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    inputs: &[ArrayBatch<V>],
+    predicate_batch: &ArrayBatch<V>,
+    operand_inputs: &[ArrayBatch<V>],
     mut interpret_program: F,
 ) -> Result<Vec<ArrayBatch<V>>, BatchingError>
 where
@@ -829,89 +831,56 @@ where
         Vec<ArrayBatch<V>>,
     ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
 {
-    let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "cannot batch a condition operation with no predicate input".to_string(),
-        });
-    };
-    match predicate_batch.batch_axis_position() {
-        None => {
-            let predicate = predicate_batch.value().boolean()?;
-            let branch = if predicate { true_branch } else { false_branch };
-            interpret_program(branch, operand_inputs.to_vec())
-        }
-        Some(predicate_axis) => {
-            let true_outputs = interpret_program(true_branch, operand_inputs.to_vec())?;
-            let false_outputs = interpret_program(false_branch, operand_inputs.to_vec())?;
-            check_count!("output", true_outputs, false_outputs.len(), ProgramError);
-            true_outputs
-                .into_iter()
-                .zip(false_outputs)
-                .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, BatchingError> {
-                    let output_axis = match (true_output.batch_axis_position(), false_output.batch_axis_position()) {
-                        (Some(left), Some(right)) if left != right => {
-                            return Err(BatchingError::MisalignedBatchAxes {
-                                message: format!(
-                                    "condition branches produced batch-varying outputs at mismatched axes \
-                                    ({left} vs {right})",
-                                ),
-                            });
-                        }
-                        (Some(axis), _) | (_, Some(axis)) => axis,
-                        (None, None) => predicate_axis,
-                    };
-                    let selected = V::select(predicate_batch.value(), true_output.value(), false_output.value())?;
-                    let output_type = selected.r#type().into_owned();
-                    ArrayBatch::new(output_type, selected, BatchAxis::from_position(output_axis))
-                })
-                .collect()
-        }
-    }
-}
-
-impl<V, O> BatchableOperation<V, EagerContext<V, O>> for ConditionOperation<V, O>
-where
-    V: Value<Type = ArrayType> + BooleanLike + crate::operations::control_flow::Select<Condition = V>,
-    O: BatchableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        batch_condition_with_interpreter(self.true_branch(), self.false_branch(), inputs, |program, program_inputs| {
-            program.interpret_with(
-                program_inputs,
-                |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
-                |instruction: &Instruction<O>, instruction_inputs| {
-                    instruction.operation().batch(context, instruction_inputs)
-                },
-            )
+    let predicate_axis = predicate_batch.batch_axis_position().unwrap();
+    let true_outputs = interpret_program(true_branch, operand_inputs.to_vec())?;
+    let false_outputs = interpret_program(false_branch, operand_inputs.to_vec())?;
+    check_count!("output", true_outputs, false_outputs.len(), ProgramError);
+    true_outputs
+        .into_iter()
+        .zip(false_outputs)
+        .map(|(true_output, false_output)| -> Result<ArrayBatch<V>, BatchingError> {
+            let output_axis = match (true_output.batch_axis_position(), false_output.batch_axis_position()) {
+                (Some(left), Some(right)) if left != right => {
+                    return Err(BatchingError::MisalignedBatchAxes {
+                        message: format!(
+                            "condition branches produced batch-varying outputs at mismatched axes \
+                            ({left} vs {right})",
+                        ),
+                    });
+                }
+                (Some(axis), _) | (_, Some(axis)) => axis,
+                (None, None) => predicate_axis,
+            };
+            let selected = V::select(predicate_batch.value(), true_output.value(), false_output.value())?;
+            let output_type = selected.r#type().into_owned();
+            ArrayBatch::new(output_type, selected, BatchAxis::from_position(output_axis))
         })
-    }
+        .collect()
 }
 
-/// Staged batching for [`ConditionOperation`] under tracing contexts. Primal values in a [`BatchingContext`] over a
-/// staging context are always tracers, so a replicated predicate can never be concretized to pick one branch the
-/// way the value-level rule above does. Instead of erroring, this rule *stages batched condition structure*:
+/// Batching rule for [`ConditionOperation`]. The rule builds batched condition *structure* and binds it into the
+/// parent context — interpreted eagerly under an eager parent and staged into the enclosing trace under a staging
+/// parent:
 ///
 ///   - **Replicated predicate.** Both branch programs are batched at the operand batch axes via
 ///     [`Program::batched`](crate::Program::batched) (the batching analog of symbolic program
 ///     linearization), their per-output batch axes are
 ///     normalized to a common layout by appending staged axis-moving operations at the branch tails when they
 ///     disagree (a transpose for a mismatched axis, a broadcast for a replicated output paired with a batched
-///     one), and one [`ConditionOperation`] over the batched branches is staged into the parent context with the
-///     unbatched predicate passed through as its scalar Boolean operand. The staged trace therefore keeps one
-///     `condition` operation whose branches run whole batches per batch item.
+///     one), and one [`ConditionOperation`] over the batched branches is bound into the parent context with the
+///     unbatched predicate passed through as its scalar Boolean operand. A staging parent therefore keeps one
+///     `condition` operation whose branches run whole batches per batch item, while an eager parent concretizes the
+///     predicate and interprets the chosen batched branch.
 ///   - **Batch-varying predicate.** Both branches are interpreted over the operand inputs and merged per batch item
-///     via [`Select`](crate::operations::control_flow::Select), exactly like the value-level rule: every per-item
-///     primitive stages through the tracers, so the multi-operation rewrite composes under tracing already.
-impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for ConditionOperation<C::Constant, O>
+///     via [`Select`](crate::operations::control_flow::Select): every per-item primitive re-enters this operation
+///     family's batching rules against the same active context, so the multi-operation rewrite composes for eager
+///     and staging parents alike.
+impl<C, O> BatchableOperation<C> for ConditionOperation<C::Constant, O>
 where
     C: Context<Type = ArrayType, Operation = O>,
     C::Constant: Value<Type = ArrayType>,
     <C as Domain>::Value: BooleanLike + Select<Condition = <C as Domain>::Value>,
-    O: BatchableOperation<<C as Domain>::Value, BatchingContext<C>>
+    O: BatchableOperation<C>
         + BatchableProgramOperation<C::Constant>
         + From<TransposeOperation>
         + From<BroadcastOperation>
@@ -933,7 +902,8 @@ where
             return batch_condition_with_interpreter(
                 self.true_branch(),
                 self.false_branch(),
-                inputs,
+                predicate_batch,
+                operand_inputs,
                 |program, program_inputs| {
                     program.interpret_with(
                         program_inputs,
@@ -1000,89 +970,9 @@ where
     }
 }
 
-pub(crate) fn batch_while_with_interpreter<VOperation, V, O, Payload, F>(
-    while_operation: &WhileOperation<VOperation, O, Payload>,
-    inputs: &[ArrayBatch<V>],
-    mut interpret_program: F,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
-where
-    VOperation: Value<Type = ArrayType>,
-    V: Value<Type = ArrayType>
-        + BooleanLike
-        + crate::tracing_v2::operations::reduce::Reduce
-        + std::ops::BitAnd<Output = V>
-        + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast,
-    O: Operation<ArrayType>,
-    F: FnMut(
-        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-        Vec<ArrayBatch<V>>,
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
-{
-    // Run the condition once on the initial state to discover whether the predicate is
-    // replicated or batch-varying. The two cases diverge from here: replicated takes the
-    // original eager-loop path; batch-varying threads a per-item mask through every iteration
-    // and runs the body until no batch item is still active. Both loops respect the semantic
-    // iteration bound: a bounded while runs at most `bound` body applications by definition.
-    let mut state = inputs.to_vec();
-    let initial_condition_outputs = interpret_program(while_operation.condition(), state.clone())?;
-    check_count!("output", initial_condition_outputs, 1, ProgramError);
-    let initial_predicate = initial_condition_outputs.into_iter().next().unwrap();
-    if initial_predicate.batch_axis().is_replicated() {
-        if !initial_predicate.value().boolean()? {
-            return Ok(state);
-        }
-        state = interpret_program(while_operation.body(), state)?;
-        return run_replicated_while_loop::<VOperation, V, O, F>(
-            while_operation.condition(),
-            while_operation.body(),
-            state,
-            // One body application already ran above, so the loop helper receives the remaining budget.
-            while_operation.iteration_bound().map(|bound| bound - 1),
-            &mut interpret_program,
-        );
-    }
-    // Batch-varying path: the predicate carries a batch axis. Track a per-item mask, mask
-    // state updates per batch item via `Select`, and exit once `any(mask)` is false.
-    run_batch_varying_while_loop::<VOperation, V, O, F>(
-        while_operation.condition(),
-        while_operation.body(),
-        state,
-        initial_predicate,
-        while_operation.iteration_bound(),
-        &mut interpret_program,
-    )
-}
-
-impl<V, O, Payload> BatchableOperation<V, EagerContext<V, O>> for WhileOperation<V, O, Payload>
-where
-    V: Value<Type = ArrayType>
-        + BooleanLike
-        + crate::tracing_v2::operations::reduce::Reduce
-        + std::ops::BitAnd<Output = V>
-        + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast,
-    O: BatchableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        batch_while_with_interpreter(self, inputs, |program, program_inputs| {
-            program.interpret_with(
-                program_inputs,
-                |_, constant| Ok(ArrayBatch::replicated(constant.clone())),
-                |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-            )
-        })
-    }
-}
-
-/// Staged batching for [`WhileOperation`] under tracing contexts. Primal values in a [`BatchingContext`] over a
-/// staging context are always tracers, so the loop cannot be driven operationally the way the value-level rule above
-/// drives it (per-iteration predicate extraction would concretize tracers). Instead, this rule *stages batched loop
-/// structure*:
+/// Batching rule for [`WhileOperation`]. The rule builds batched loop *structure* and binds it into the parent
+/// context — interpreted eagerly under an eager parent (whose relaxed-predicate interpretation owns the per-item
+/// masked semantics) and staged into the enclosing trace under a staging parent:
 ///
 ///   1. Every batched state input is realigned to batch axis `0` in the parent context, and the body is batched at
 ///      the state batch axes via [`Program::batched`](crate::Program::batched),
@@ -1094,19 +984,19 @@ where
 ///      `instantiate=carry_bat`), so the converged body is already aligned to the loop-invariant state layout, and
 ///      widened parent inputs gain their batch axis through staged broadcasts.
 ///   2. The condition is batched at the stabilized axes. When its predicate output stays *replicated*, one
-///      [`WhileOperation`] over the batched condition and body is staged directly, preserving any semantic
-///      [`iteration_bound`](WhileOperation::with_iteration_bound) (so bounded loops stay reverse-capable under
-///      `batch`).
+///      [`WhileOperation`] over the batched condition and body is bound into the parent directly, preserving any
+///      semantic [`iteration_bound`](WhileOperation::with_iteration_bound) (so bounded loops stay reverse-capable
+///      under `batch`).
 ///   3. When the predicate output is *batched* (per-item termination), every state element is widened to a batched
-///      element and the masked loop the value-level rule runs operationally is traced as ordinary tracer-valued
-///      functions over the augmented state `[state..., active_mask]`: the masked condition reduces the mask with a
-///      batch-axis `any`, and the masked body splices the batched body (via
-///      [`StagingContext::stage_program`]), selects per state element between the candidate update and the carried
-///      state under the (broadcast) mask, recomputes the per-item predicate on the new state, and ANDs it into the
-///      mask. The initial mask is the batched condition staged once over the initial state in the parent context,
-///      and the iteration bound is preserved (batch items share masked iterations, so capping the staged loop
-///      matches per-item truncation exactly, like the operational rule).
-impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for WhileOperation<C::Constant, O>
+///      element, the condition is re-batched with its predicate output instantiated at axis `0`, and one
+///      [`WhileOperation`] is bound directly with that batched predicate (mirroring JAX's
+///      `_while_loop_batching_rule`). The predicate's `[axis_size]` shape is a prefix of every widened state shape,
+///      so the bound loop satisfies the relaxed predicate contract and its consumers own the masked semantics:
+///      eager interpretation continues while any per-item predicate is true and freezes finished items, and the XLA
+///      lowering reduces the predicate with `or` and masks carry updates with a broadcast select. The iteration
+///      bound is preserved (batch items share masked iterations, so capping the loop matches per-item truncation
+///      exactly).
+impl<C, O> BatchableOperation<C> for WhileOperation<C::Constant, O>
 where
     C: Context<Type = ArrayType, Operation = O>,
     C::Constant: Value<Type = ArrayType>,
@@ -1317,187 +1207,6 @@ where
         masked_state_types,
     )?;
     Ok((masked_condition, masked_body))
-}
-
-/// Eager loop that drives a [`WhileOperation`] whose condition program produces a replicated
-/// scalar Boolean predicate. Each iteration runs the body when the predicate is `true` and exits
-/// when it becomes `false` or once the remaining iteration budget (the semantic iteration bound
-/// minus any body applications the caller already performed) is exhausted. This is the original
-/// simple loop preserved for the replicated case.
-fn run_replicated_while_loop<VOperation, V, O, F>(
-    condition: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    body: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    mut state: Vec<ArrayBatch<V>>,
-    mut remaining_iterations: Option<usize>,
-    interpret_program: &mut F,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
-where
-    VOperation: Value<Type = ArrayType>,
-    V: Value<Type = ArrayType> + BooleanLike,
-    F: FnMut(
-        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-        Vec<ArrayBatch<V>>,
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
-{
-    loop {
-        if remaining_iterations == Some(0) {
-            return Ok(state);
-        }
-        let condition_outputs = interpret_program(condition, state.clone())?;
-        check_count!("output", condition_outputs, 1, ProgramError);
-        let predicate_batch = &condition_outputs[0];
-        if !predicate_batch.batch_axis().is_replicated() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "while loop condition produced a batch-varying predicate mid-iteration after starting \
-                    replicated; this is not yet supported"
-                    .to_string(),
-            });
-        }
-        if !predicate_batch.value().boolean()? {
-            return Ok(state);
-        }
-        state = interpret_program(body, state)?;
-        remaining_iterations = remaining_iterations.map(|remaining| remaining - 1);
-    }
-}
-
-/// Eager loop that drives a [`WhileOperation`] whose condition program produces a batch-varying
-/// predicate (one Boolean per mapped batch item). Each iteration:
-///
-///   1. Updates the per-item active mask by AND-ing with the current per-item predicate.
-///   2. Stops when no batch item is still active (`any(mask) == false`).
-///   3. Runs the body to produce candidate updated state.
-///   4. Masks state updates per batch item via [`Select`](crate::operations::control_flow::Select)
-///      so inactive batch items retain their prior state forever.
-///
-/// This implementation requires a value type that supports [`Reduce`](
-/// crate::tracing_v2::operations::reduce::Reduce) (for the `any` aggregation),
-/// [`BitAnd`](std::ops::BitAnd) (for `mask & current`),
-/// [`Select`](crate::operations::control_flow::Select), and
-/// [`Broadcast`](crate::operations::manipulation::Broadcast) — the same
-/// primitives every staged value type already needs for the rest of the operation enum.
-fn run_batch_varying_while_loop<VOperation, V, O, F>(
-    condition: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    body: &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-    mut state: Vec<ArrayBatch<V>>,
-    initial_predicate: ArrayBatch<V>,
-    iteration_bound: Option<usize>,
-    interpret_program: &mut F,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
-where
-    VOperation: Value<Type = ArrayType>,
-    V: Value<Type = ArrayType>
-        + BooleanLike
-        + crate::tracing_v2::operations::reduce::Reduce
-        + std::ops::BitAnd<Output = V>
-        + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast,
-    F: FnMut(
-        &Program<VOperation, O, Vec<VOperation>, Vec<VOperation>>,
-        Vec<ArrayBatch<V>>,
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError>,
-{
-    let predicate_axis = initial_predicate.batch_axis_position().ok_or_else(|| BatchingError::MisalignedBatchAxes {
-        message: "batch-varying while batching requires a batched initial predicate".to_string(),
-    })?;
-    let mut active_mask = initial_predicate;
-    let mut remaining_iterations = iteration_bound;
-    loop {
-        // The semantic iteration bound applies per batch item, and every batch item shares the same masked
-        // iterations, so capping the shared loop at `bound` body applications matches the per-item truncation
-        // semantics exactly.
-        if remaining_iterations == Some(0) || !batch_varying_any_active(&active_mask, predicate_axis)? {
-            return Ok(state);
-        }
-        let body_outputs = interpret_program(body, state.clone())?;
-        check_count!("output", body_outputs, state.len(), ProgramError);
-        state = state
-            .into_iter()
-            .zip(body_outputs)
-            .map(|(prior, candidate)| mask_state_element(&active_mask, predicate_axis, candidate, prior))
-            .collect::<Result<Vec<_>, _>>()?;
-        let next_condition_outputs = interpret_program(condition, state.clone())?;
-        check_count!("output", next_condition_outputs, 1, ProgramError);
-        let next_predicate = next_condition_outputs.into_iter().next().unwrap();
-        if next_predicate.batch_axis().is_replicated() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "while loop predicate became replicated mid-iteration after starting batch-varying; \
-                    this is not yet supported"
-                    .to_string(),
-            });
-        }
-        active_mask = combine_active_mask(active_mask, next_predicate)?;
-        remaining_iterations = remaining_iterations.map(|remaining| remaining - 1);
-    }
-}
-
-/// Returns `true` when at least one batch item of `mask` is active by reducing along `predicate_axis`
-/// and extracting the resulting scalar Boolean.
-fn batch_varying_any_active<
-    V: Value<Type = ArrayType> + BooleanLike + crate::tracing_v2::operations::reduce::Reduce,
->(
-    mask: &ArrayBatch<V>,
-    predicate_axis: usize,
-) -> Result<bool, ProgramError> {
-    let reduced = mask
-        .value()
-        .clone()
-        .reduce(&[predicate_axis], crate::tracing_v2::operations::reduce::ReductionKind::Any);
-    reduced.boolean()
-}
-
-/// Combines the prior `active_mask` with the current `next_predicate` via logical AND. Both must
-/// be batched on the same physical axis; the result inherits that axis.
-fn combine_active_mask<V: Value<Type = ArrayType> + std::ops::BitAnd<Output = V>>(
-    active_mask: ArrayBatch<V>,
-    next_predicate: ArrayBatch<V>,
-) -> Result<ArrayBatch<V>, BatchingError> {
-    let axis = active_mask.batch_axis();
-    let combined = active_mask.into_value() & next_predicate.into_value();
-    let combined_type = combined.r#type().into_owned();
-    ArrayBatch::new(combined_type, combined, axis)
-}
-
-/// Builds the masked update for one state element by broadcasting the per-item mask to the
-/// element's physical shape and selecting between the candidate body output and the prior state
-/// per batch item.
-fn mask_state_element<V>(
-    active_mask: &ArrayBatch<V>,
-    predicate_axis: usize,
-    candidate: ArrayBatch<V>,
-    prior: ArrayBatch<V>,
-) -> Result<ArrayBatch<V>, BatchingError>
-where
-    V: Value<Type = ArrayType>
-        + crate::operations::control_flow::Select<Condition = V>
-        + crate::operations::manipulation::Broadcast,
-{
-    let candidate_axis = candidate.batch_axis_position().or(prior.batch_axis_position()).ok_or_else(|| {
-        BatchingError::UnsupportedOperation {
-            message: "batch-varying while body produced a replicated state element; this is not yet supported"
-                .to_string(),
-        }
-    })?;
-    let candidate_type = candidate.r#type().into_owned();
-    let mask_type = active_mask.r#type().into_owned();
-    let mask_output_axes: Vec<usize> = (0..mask_type.rank())
-        .map(|i| {
-            if i == predicate_axis {
-                candidate_axis
-            } else if i < predicate_axis {
-                // mask axes left of the predicate axis carry over to the candidate left of `candidate_axis`.
-                i
-            } else {
-                // mask axes right of the predicate axis carry over to the candidate right of `candidate_axis`.
-                i + (candidate_type.rank() - mask_type.rank())
-            }
-        })
-        .collect();
-    let mask_output_type = ArrayType::new(mask_type.data_type(), candidate_type.shape().clone());
-    let broadcasted_mask = active_mask.value().broadcast(mask_output_type, mask_output_axes.as_slice())?;
-    let selected = V::select(&broadcasted_mask, &candidate.into_value(), &prior.into_value())?;
-    let selected_type = selected.r#type().into_owned();
-    ArrayBatch::new(selected_type, selected, BatchAxis::from_position(candidate_axis))
 }
 
 impl<V, F, O, C> InterpretableOperation<V, C> for ConditionOperation<V, O, F, Captured>
@@ -2470,7 +2179,7 @@ mod tests {
 
     #[test]
     fn test_jvp_of_batched_bounded_while_under_tracing_composes_with_masked_scan() {
-        use crate::batching::{Batch, BatchableOperation, BatchingContext, BatchingTracer};
+        use crate::batching::{Batch, BatchableOperation, BatchingTracer};
 
         // F5 x F6 composition: jvp of a *vmapped bounded* while under the non-concretizing staged dispatch domain.
         // Batching stages one masked bounded while (the predicate `x < 8` is per batch item and the iteration bound 5
@@ -2481,7 +2190,7 @@ mod tests {
         where
             V: Value<Type = ArrayType> + crate::operations::manipulation::Transpose,
             V::DispatchDomain: Context<Type = ArrayType, Value = V, Operation = TestArrayOperation>,
-            TestArrayOperation: BatchableOperation<V, BatchingContext<V::DispatchDomain>>,
+            TestArrayOperation: BatchableOperation<V::DispatchDomain>,
         {
             let context = x.dispatch_domain();
             let mapped = Batch::batch(

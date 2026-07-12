@@ -1,6 +1,7 @@
 use crate::batching::ArrayBatch;
 use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
@@ -170,12 +171,16 @@ where
 /// restacked along a fresh leading batch axis (`O(batch)` staged operations, the same trade the batch-varying
 /// dynamic-slice start-index rules make). This keeps the direct batched JVP path (dense forward Jacobians and
 /// batched pullbacks) total even though the padding-value tangent is represented as a per-item batch there.
-impl<V, C> BatchableOperation<V, C> for PadOperation
+impl<C> BatchableOperation<C> for PadOperation
 where
-    V: Value<Type = ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    PadOperation: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
+    PadOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
@@ -277,8 +282,12 @@ mod tests {
         .unwrap();
         let padding_value = ArrayBatch::replicated(TestArray::scalar(0.0));
         let operation = PadOperation::new(vec![1], vec![0], vec![0]).unwrap();
-        let outputs =
-            operation.batch(&crate::EagerContext::<TestArray>::new(), &[input.clone(), padding_value]).unwrap();
+        let outputs = operation
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[input.clone(), padding_value],
+            )
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0, 0.0, 3.0, 4.0]);
@@ -286,7 +295,10 @@ mod tests {
         // Replicated operands pass through the unlifted rule.
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
         let outputs = operation
-            .batch(&crate::EagerContext::<TestArray>::new(), &[uniform, ArrayBatch::replicated(TestArray::scalar(0.0))])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[uniform, ArrayBatch::replicated(TestArray::scalar(0.0))],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 2.0]);
@@ -297,16 +309,24 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let outputs =
-            operation.batch(&crate::EagerContext::<TestArray>::new(), &[input, batch_varying.clone()]).unwrap();
+        let outputs = operation
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[input, batch_varying.clone()],
+            )
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 3.0, 4.0]);
 
         // A replicated input is broadcast to gain the batch axis when only the padding value is batched.
         let uniform_input = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
-        let outputs =
-            operation.batch(&crate::EagerContext::<TestArray>::new(), &[uniform_input, batch_varying]).unwrap();
+        let outputs = operation
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[uniform_input, batch_varying],
+            )
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![8.0, 1.0, 2.0, 9.0, 1.0, 2.0]);
     }

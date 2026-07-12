@@ -4,12 +4,11 @@ use std::ops::Mul;
 use crate::axes::{AxisError, NamedAxes};
 use crate::backends::scalars::Scalar;
 use crate::batching::BatchingError;
-use crate::contexts::Domain;
-use crate::contexts::{Context, EagerContext};
+use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
-use crate::operations::constants::{Fill, FillOperation, IotaOperation};
+use crate::operations::constants::{FillOperation, IotaOperation};
 use crate::operations::{Operation, OperationFormatter};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{MaybeZero, ProgramError, Value};
@@ -112,11 +111,9 @@ where
 /// per-item semantics) and collapses the mapped axis when invoked inside a
 /// [`BatchingContext`](crate::batching::BatchingContext) whose
 /// [`axis_name`](crate::batching::BatchingContext::axis_name) matches this collective's axis name. Under
-/// nested `batch` levels, the traced batching rule below owns that decision: a matching level consumes the mapped
+/// nested `batch` levels, the batching rule below owns that decision: a matching level consumes the mapped
 /// batch axis, while a non-matching level forwards the collective untouched to its parent context via
-/// [`forward_collective_to_parent`], where the next level repeats the same name resolution. The value-level rule has
-/// no level metadata to match against and always reduces the mapped axis, which corresponds to eager batching with a
-/// single level.
+/// [`forward_collective_to_parent`], where the next level repeats the same name resolution.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CollectiveOperation {
     /// Axis name referenced by this collective. Matches the `axis_name` argument of an enclosing
@@ -286,40 +283,15 @@ where
     }
 }
 
-/// Value-level batching rule for eager backends, where the reduced value already carries its concrete data and a
-/// `PMean`'s `1 / N` factor can be synthesized directly through the eager context's [`Fill`] capability.
+/// Batching rule for [`CollectiveOperation`]. This rule owns named-axis resolution: when the active context's
+/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches this collective's axis name, the mapped batch
+/// axis is consumed; otherwise the collective targets an outer `batch` level (or a device mesh axis) and is forwarded
+/// untouched to the parent context via [`forward_collective_to_parent`].
 ///
-/// Both this and the traced [`BatchingContext`](crate::batching::BatchingContext) rule below share
-/// `collective_reduce_batch`; they differ only in which context produces the `PMean` factor.
-impl<V, O> crate::batching::BatchableOperation<V, EagerContext<V, O>> for CollectiveOperation
-where
-    V: Value<Type = ArrayType> + Reduce + Mul<Output = V>,
-    EagerContext<V, O>: Fill<Scalar, V>,
-    O: Operation<ArrayType>,
-    CollectiveOperation: InterpretableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[crate::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
-        collective_reduce_batch(self.kind, inputs, |factor_type, inverse_axis_size| {
-            context.fill(&factor_type, Scalar::from(inverse_axis_size))
-        })
-    }
-}
-
-/// Traced batching rule for [`Tracer`] values inside a [`BatchingContext`](
-/// crate::batching::BatchingContext). This rule owns named-axis resolution: when the context's
-/// [`axis_name`](crate::batching::BatchingContext::axis_name) matches this collective's axis name, the
-/// mapped batch axis is consumed; otherwise the collective targets an outer `batch` level and is forwarded untouched
-/// to the parent context via [`forward_collective_to_parent`].
-///
-/// The consuming arm shares `collective_reduce_batch` with the eager rule above but stages a `PMean`'s `1 / N`
-/// rank-0 fill into the reduced value's own parent context (via [`StagingContext::stage_operation`]) instead of
-/// synthesizing it through the [`Type`](crate::types::Type)-driven [`Fill`], which a [`Tracer`] cannot implement.
-impl<C> crate::batching::BatchableOperation<<C as Domain>::Value, crate::batching::BatchingContext<C>>
-    for CollectiveOperation
+/// The consuming arm collapses the mapped axis through `collective_reduce_batch` and binds a `PMean`'s `1 / N`
+/// rank-0 fill into the parent context — interpreted eagerly under an eager parent and staged into the enclosing
+/// trace under a staging parent — so one rule serves eager and staged batching alike.
+impl<C> crate::batching::BatchableOperation<C> for CollectiveOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<CollectiveOperation> + From<FillOperation<ArrayType, Scalar>>,
@@ -377,12 +349,10 @@ where
         .collect()
 }
 
-/// Shared reduce-and-optionally-mean skeleton for [`CollectiveOperation`] batching, used by both the eager and traced
-/// rules above. It collapses the mapped batch axis with the kind's [`ReductionKind`] and, for `PMean`, scales the
-/// replicated result by `1 / N` using a `make_pmean_factor`-produced rank-0 factor (relying on implicit rank-0
-/// broadcasting in the multiplication). Outside a matching batching context (no mapped axis), it is an identity
-/// pass-through. The two callers differ only in `make_pmean_factor`: eager backends synthesize the factor directly,
-/// while traced contexts stage it into their owning program.
+/// Shared reduce-and-optionally-mean skeleton for [`CollectiveOperation`] batching. It collapses the mapped batch
+/// axis with the kind's [`ReductionKind`] and, for `PMean`, scales the replicated result by `1 / N` using a
+/// `make_pmean_factor`-produced rank-0 factor (relying on implicit rank-0 broadcasting in the multiplication).
+/// Outside a matching batching context (no mapped axis), it is an identity pass-through.
 fn collective_reduce_batch<V, MakePMeanFactor>(
     kind: CollectiveKind,
     inputs: &[crate::batching::ArrayBatch<V>],
@@ -552,42 +522,17 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<
     }
 }
 
-/// Eager batching rule for [`AxisIndexOperation`]. A batched axis index needs the batch size to materialize its
-/// [`iota`](crate::operations::constants::Iota), but a nullary operation receives no batched operand to read that size
-/// from, and eager batching carries no named-axis binder to consult. A batched axis index is therefore only defined
-/// under staged batching (see the rule below); this eager rule exists to satisfy the operation family's eager batching
-/// witness.
-impl<V, O> crate::batching::BatchableOperation<V, EagerContext<V, O>> for AxisIndexOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType>,
-{
-    fn batch(
-        &self,
-        _context: &EagerContext<V, O>,
-        _inputs: &[crate::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
-        Err(crate::batching::BatchingError::UnsupportedOperation {
-            message: format!(
-                "axis_index for axis '{}' is not defined under eager batching; it requires a staged batch or mesh \
-                binder",
-                self.axis_name,
-            ),
-        })
-    }
-}
-
-/// Staged batching rule for [`AxisIndexOperation`], mirroring the collective rule above and, like it, deciding purely
-/// from the context's [`axis_name`](crate::batching::BatchingContext::axis_name). When this level's axis
+/// Batching rule for [`AxisIndexOperation`], mirroring the collective rule above and, like it, deciding purely
+/// from the active context's [`axis_name`](crate::batching::BatchingContext::axis_name). When this level's axis
 /// name matches, this level binds the axis, so the per-item index is materialized as the length-`size`
 /// [`iota`](crate::operations::constants::Iota)`(0)` mapped on the level's batch axis (the size is this level's
-/// [`axis_size`](crate::batching::BatchingContext::axis_size)). Otherwise the axis is bound elsewhere — an
-/// outer `batch` level or a device mesh — so the operation is re-staged into the parent context (which repeats the same
-/// resolution, ultimately materializing at the binding `batch` level or surviving into the staged body for a mesh axis)
-/// and presented as replicated across this level's batch items. The name is validated by the
+/// [`axis_size`](crate::batching::BatchingContext::axis_size)); the iota binds into the parent context, so it
+/// materializes eagerly under an eager parent and stages under a staging parent. Otherwise the axis is bound
+/// elsewhere — an outer `batch` level or a device mesh — so the operation is re-staged into the parent context (which
+/// repeats the same resolution, ultimately materializing at the binding `batch` level or surviving into the staged
+/// body for a mesh axis) and presented as replicated across this level's batch items. The name is validated by the
 /// [`AxisIndex`](crate::axes::AxisIndex) reader before staging, so no name lookup is needed here.
-impl<C> crate::batching::BatchableOperation<<C as Domain>::Value, crate::batching::BatchingContext<C>>
-    for AxisIndexOperation
+impl<C> crate::batching::BatchableOperation<C> for AxisIndexOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>,
@@ -624,10 +569,18 @@ mod tests {
     use crate::batching::ArrayBatch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
+    use crate::batching::BatchingContext;
     use crate::contexts::EagerContext;
     use crate::tests::TestArray;
+    use crate::tracing_v2::ArrayOperation;
 
     use super::*;
+
+    /// Creates an active batching frame binding the named axis `"i"` over an eager parent whose operation family
+    /// contains every operation the collective batching rule may bind (notably `FillOperation` for `PMean`).
+    fn batching_context(axis_size: usize) -> BatchingContext<EagerContext<TestArray, ArrayOperation<TestArray>>> {
+        BatchingContext::new(EagerContext::new(), axis_size, Some("i".to_string()))
+    }
 
     #[test]
     fn test_collective_psum_reduces_along_the_batch_axis() {
@@ -638,9 +591,9 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let context = EagerContext::<TestArray, CollectiveOperation>::new();
-        let outputs =
-            CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&context, &[input]).unwrap();
+        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
+            .batch(&batching_context(3), &[input])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values(), &[6.0]);
@@ -653,9 +606,9 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let context = EagerContext::<TestArray, CollectiveOperation>::new();
-        let outputs =
-            CollectiveOperation::new("i".to_string(), CollectiveKind::PMax).batch(&context, &[input]).unwrap();
+        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PMax)
+            .batch(&batching_context(3), &[input])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values(), &[4.0]);
@@ -664,9 +617,9 @@ mod tests {
     #[test]
     fn test_collective_passes_through_replicated_input() {
         let input = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0, 3.0]));
-        let context = EagerContext::<TestArray, CollectiveOperation>::new();
-        let outputs =
-            CollectiveOperation::new("i".to_string(), CollectiveKind::PSum).batch(&context, &[input]).unwrap();
+        let outputs = CollectiveOperation::new("i".to_string(), CollectiveKind::PSum)
+            .batch(&batching_context(3), &[input])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values(), &[1.0, 2.0, 3.0]);

@@ -133,8 +133,8 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<IotaOperation
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Iota<C::Value>>
-    Iota<BatchingTracer<C>> for BatchingContext<C>
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Iota<C::Value>> Iota<BatchingTracer<C>>
+    for BatchingContext<C>
 {
     #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C>, ProgramError> {

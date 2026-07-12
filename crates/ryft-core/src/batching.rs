@@ -86,7 +86,7 @@ use crate::operations::{ElementwiseOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{Program, ProgramError, Value};
 use crate::sharding::ShardingDimension;
-use crate::tracing::{Tracer, TracingContext};
+use crate::tracing::TracingContext;
 use crate::types::{ArrayType, Size, TypeError, Typed};
 
 /// Represents batching-related errors.
@@ -592,35 +592,38 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
 
 /// Represents [`Operation`]s that can be batched (i.e., vectorized).
 ///
+/// The trait is parameterized by the parent [`Context`] `C` that owns the physical values flowing through the batching
+/// transform, and every rule receives the active [`BatchingContext`] wrapping that parent. Ordinary rules lift their
+/// operation to its batch-carrying inputs and then execute or stage the lifted work through `context.parent()`
+/// (typically via [`InterpretableBatchableOperation::interpret_with_batch_axes`]), so an eager parent interprets it
+/// immediately while a staging parent stages it into the enclosing trace. Rules whose semantics depend on the active
+/// transform frame (e.g., named-axis collectives) inspect [`BatchingContext::axis_name`] and
+/// [`BatchingContext::axis_size`] directly, and recursive higher-order rules replay their nested programs through the
+/// same contract. Consequently, invoking a batching rule always requires an active [`BatchingContext`].
+///
 /// # Deriving Batchable Operation Enums
 ///
 /// Ryft provides a `#[derive(BatchableOperation)]` procedural macro via the `ryft-macros` crate for
 /// [`BatchableOperation`] sum types whose variants already own their batching rules. It follows the same enum-shape
 /// and type-inference rules as `#[derive(Operation)]` and generates:
 ///
-///   - A staged tracer-level dispatcher at `BatchableOperation<V, BatchingContext<C>>` where `V` is the parent
-///     staging context's flowing value. Primitive (non-recursive, unmarked) variants dispatch at the *parent*
-///     staging context, because the flowing physical values are parent-trace values and their rules do not depend
-///     on batching metadata. Variants marked with the variant-level `#[ryft(batching(active))]` attribute, and all
-///     recursive payloads (i.e., those mentioning `Self`), dispatch at the [`BatchingContext`] itself, because their
-///     rules are keyed on its axis metadata (e.g., named-axis collectives). Marking a recursive payload is reported
-///     as a redundancy error.
-///   - An eager value-level dispatcher at `BatchableOperation<Constant, EagerContext<Constant, Enum>>` where every
-///     variant dispatches at the eager context.
+///   - A dispatcher at `BatchableOperation<C>`, generic over the parent [`Context`] `C`, that forwards the active
+///     [`BatchingContext`] to every variant's own rule. One dispatcher covers eager and staging parents alike, because
+///     the parent/active distinction lives in each rule's body rather than in dispatch.
 ///   - A [`BatchableProgramOperation`] witness whose fixed body calls [`Program::batched`], naming the operation-family
 ///     fixed point that recursive higher-order payload rules (e.g., control flow) batch their nested programs through
 ///     without re-entering the enum's own batching obligation.
 ///
-/// Non-recursive payloads carry per-variant `Payload: BatchableOperation<...>` predicates (at the context their arm
-/// dispatches at) that transport each rule's own capability requirements to the use site. Recursive payloads are
-/// skipped (such a predicate would overflow the trait solver) and their rules are discharged as definition-time body
-/// obligations against the witness and the author-supplied leaf capabilities: `#[ryft(bounds(batching(Bound1 +
-/// Bound2 + ...)))]` adds those leaves to the eager dispatcher's constant value type and, with the flowing value
-/// substituted, to the staged dispatcher's flowing value type. The derivation macro also supports the same
-/// `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
-pub trait BatchableOperation<V: Value<Type = ArrayType>, C>: Operation<ArrayType> {
-    /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes,
-    /// using `context` for rules that need active transform state.
+/// Non-recursive payloads carry per-variant `Payload: BatchableOperation<C>` predicates that transport each rule's own
+/// capability requirements to the use site. Recursive payloads are skipped (such a predicate would overflow the trait
+/// solver) and their rules are discharged as definition-time body obligations against the witness and the provided
+/// leaf capabilities: `#[ryft(bounds(batching(Bound1 + Bound2 + ...)))]` adds those leaves to the parent context's
+/// value type. The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the
+/// `#[derive(Operation)]` macro.
+pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
+    /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes.
+    /// `context` is the active [`BatchingContext`] for the transform level being applied, while the packed physical
+    /// values in `inputs` (and in the returned outputs) are owned by `context.parent()`.
     ///
     /// # Contract
     ///
@@ -635,12 +638,19 @@ pub trait BatchableOperation<V: Value<Type = ArrayType>, C>: Operation<ArrayType
     ///     arguments.
     ///   - **Zero Propagation:** Linear batching rules preserve zero tangent payloads through their operation-specific
     ///     semantics. Canonical staged zeros are handled before batching reaches concrete value-level interpretation.
+    ///   - **Parent-Owned Physical Work:** Ordinary rules must execute or stage lifted physical work through
+    ///     `context.parent()` and return parent-owned values; only rules keyed on the active frame's axis metadata
+    ///     inspect the [`BatchingContext`] itself.
     ///
     /// Note that in order to be able to provide [`BatchableOperation`] implementations for operation families that are
     /// derived using our `#[derive(BatchableOperation)]` macro, it is a common convention for operations that can be
     /// part of such operation families to implement this trait even if they do not support batching and to have this
     /// function simply return a [`BatchingError::UnsupportedOperation`] error.
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError>;
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
 
 // Blanket `BatchableOperation` implementation for any `ElementwiseOperation`, so per-operation `BatchableOperation`
@@ -657,12 +667,15 @@ pub trait BatchableOperation<V: Value<Type = ArrayType>, C>: Operation<ArrayType
 // with the batch axis inserted at that position. Operands whose per-item shapes are not broadcast-compatible are left
 // at their batch-axis-inserted shapes so the operation surfaces its own shape error.
 impl<
-    V: Value<Type = ArrayType> + Broadcast + Transpose,
-    C,
-    O: Clone + ElementwiseOperation + InterpretableOperation<V, C>,
-> BatchableOperation<V, C> for O
+    C: Context<Type = ArrayType, Value: Broadcast + Transpose>,
+    O: Clone + ElementwiseOperation + InterpretableOperation<C::Value, C>,
+> BatchableOperation<C> for O
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let input_axes = inputs.iter().map(ArrayBatch::batch_axis).collect::<Vec<_>>();
 
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
@@ -691,7 +704,7 @@ impl<
             .iter()
             .zip(input_axes.iter())
             .zip(unbatched_types.iter())
-            .map(|((input, input_axis), unbatched_type)| -> Result<ArrayBatch<V>, BatchingError> {
+            .map(|((input, input_axis), unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
                 // The target physical type is the common per-item shape (falling back to this input's own when
                 // incompatible) carrying this input's own data type (e.g. a Boolean select condition stays Boolean
                 // against numeric branches), with the batch axis inserted at `batch_axis`.
@@ -785,41 +798,46 @@ pub trait BatchableProgramOperation<V: Value<Type = ArrayType>>: Operation<Array
 
 /// Capability to interpret an [`Operation`] on batch-carrying inputs and repackage its outputs as [`ArrayBatch`]es.
 /// This is the shared application path the per-operation [`BatchableOperation`] rules use once they have lifted an
-/// operation to its batch-carrying inputs. Every [`InterpretableOperation`] over [`ArrayType`] values gets it for
-/// free through the blanket implementation below, so an operation earns it directly from its interpretation rule.
-pub trait InterpretableBatchableOperation<V: Value<Type = ArrayType>, C> {
-    /// Interprets this operation on the *unpacked* values of batched `inputs` and repackages each output as an
-    /// [`ArrayBatch`] carrying the corresponding `output_batch_axes` entry.
+/// operation to its batch-carrying inputs. It centralizes the physical-value ownership invariant of the batching
+/// transform: the lifted operation is always interpreted against `context.parent()`, which owns the packed physical
+/// values, and never against the [`BatchingContext`] itself. Every [`InterpretableOperation`] over the parent's
+/// values gets it for free through the blanket implementation below, so an operation earns it directly from its
+/// interpretation rule.
+pub trait InterpretableBatchableOperation<C: Context<Type = ArrayType>> {
+    /// Interprets this operation on the *unpacked* values of batched `inputs` against `context.parent()` and
+    /// repackages each output as an [`ArrayBatch`] carrying the corresponding `output_batch_axes` entry.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Interpretation context, as in [`InterpretableOperation::interpret`].
+    ///   - `context`: Active [`BatchingContext`] whose parent interprets the lifted operation,
+    ///     as in [`InterpretableOperation::interpret`].
     ///   - `inputs`: Batch-carrying inputs the lifted operation is interpreted over.
-    ///   - `output_batch_axes`: [`BatchAxis`] to attach to each produced output. This slice must have one entry per
-    ///     output that this [`Operation`] produces on these inputs.
+    ///   - `output_batch_axes`: [`BatchAxis`] to attach to each produced output. This slice must have one entry
+    ///     per output that this [`Operation`] produces on these inputs.
     fn interpret_with_batch_axes(
         &self,
-        context: &C,
-        inputs: &[ArrayBatch<V>],
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
         output_batch_axes: &[BatchAxis],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError>;
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
 
-impl<O: InterpretableOperation<V, C>, V: Value<Type = ArrayType>, C> InterpretableBatchableOperation<V, C> for O {
+impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C::Value, C>> InterpretableBatchableOperation<C> for O {
     fn interpret_with_batch_axes(
         &self,
-        context: &C,
-        inputs: &[ArrayBatch<V>],
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
         output_batch_axes: &[BatchAxis],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        // Every `InterpretableOperation` over `ArrayType` values is an `InterpretableBatchableOperation`. The batched
-        // interpretation unpacks the input values, interprets the operation once through `interpret`, and repackages
-        // each output with its requested `BatchAxis`.
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Every `InterpretableOperation` over the parent context's values is an `InterpretableBatchableOperation`.
+        // The batched interpretation unpacks the input values, interprets the operation once through `interpret`
+        // against the parent context (which owns those physical values), and repackages each output with its
+        // requested `BatchAxis`.
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
-        let input_values: Vec<V> = inputs.iter().map(|input| input.value().clone()).collect();
-        let output_values = self.interpret(context, input_values.as_slice())?;
+        let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        let output_values = self.interpret(context.parent(), input_values.as_slice())?;
         check_count!("output", output_values, output_batch_axes.len(), ProgramError);
         output_values
             .into_iter()
@@ -875,14 +893,14 @@ impl<C> BatchingContext<C> {
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>> Domain for BatchingContext<C> {
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Domain for BatchingContext<C> {
     type Type = ArrayType;
     type Value = BatchingTracer<C>;
     type Constant = C::Constant;
     type Operation = C::Operation;
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>>> Context for BatchingContext<C> {
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for BatchingContext<C> {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {
         // Lifts a constant by lifting it in the parent context and replicating it across the batch.
@@ -1002,9 +1020,7 @@ impl<C: Context<Type = ArrayType>> Typed for BatchingTracer<C> {
 }
 
 /// A batching value flows through the [`BatchingContext`] stamped on it.
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>> Value
-    for BatchingTracer<C>
-{
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Value for BatchingTracer<C> {
     type DispatchDomain = BatchingContext<C>;
     type ExecutionDomain = BatchingContext<C>;
 
@@ -1021,9 +1037,7 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Batchi
 
 impl<
     V: Value<Type = ArrayType>,
-    O: BatchableOperation<Tracer<TracingContext<V, O>>, BatchingContext<TracingContext<V, O>>>
-        + From<TransposeOperation>
-        + From<BroadcastOperation>,
+    O: BatchableOperation<TracingContext<V, O>> + From<TransposeOperation> + From<BroadcastOperation>,
 > Program<V, O, Vec<V>, Vec<V>>
 {
     /// Batches this [`Program`] so that the resulting program operates over batched inputs along the specified
@@ -1578,39 +1592,35 @@ mod tests {
             ArrayBatch::new(r#type.clone(), TestArray::new(r#type.clone(), values), axis).unwrap()
         };
 
+        // Batching rules always receive the active `BatchingContext`, with the physical work running
+        // through its parent context.
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
+
         // Two operands mapped on the same axis add per item, and the output stays mapped on that axis.
         let left = make_batch(&matrix_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], Some(0));
         let right = make_batch(&matrix_type, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], Some(0));
-        let outputs = AddOperation
-            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left.clone(), right])
-            .unwrap();
+        let outputs = AddOperation.batch(&context, &[left.clone(), right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // A replicated operand is broadcast across the mapped operand's batch before adding.
         let replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation
-            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left.clone(), replicated])
-            .unwrap();
+        let outputs = AddOperation.batch(&context, &[left.clone(), replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
 
         // Operands mapped on different axes are realigned onto the first mapped operand's axis before adding.
         let transposed_type = ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(3), Size::Static(2)]));
         let right_axis_one = make_batch(&transposed_type, vec![10.0, 40.0, 20.0, 50.0, 30.0, 60.0], Some(1));
-        let outputs = AddOperation
-            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left, right_axis_one])
-            .unwrap();
+        let outputs = AddOperation.batch(&context, &[left, right_axis_one]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &TestArray::matrix(2, 3, vec![11.0, 22.0, 33.0, 44.0, 55.0, 66.0]));
 
         // With no operand mapped, the operands are interpreted as given and the output is replicated.
         let left_replicated = make_batch(&vector_type, vec![1.0, 2.0, 3.0], None);
         let right_replicated = make_batch(&vector_type, vec![10.0, 20.0, 30.0], None);
-        let outputs = AddOperation
-            .batch(&EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), &[left_replicated, right_replicated])
-            .unwrap();
+        let outputs = AddOperation.batch(&context, &[left_replicated, right_replicated]).unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value(), &TestArray::vector(vec![11.0, 22.0, 33.0]));
     }
@@ -1624,13 +1634,8 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
 
-        let outputs = AddOperation
-            .interpret_with_batch_axes(
-                &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-                &[left, right],
-                &[BatchAxis::new(0)],
-            )
-            .unwrap();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
+        let outputs = AddOperation.interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(*outputs[0].r#type(), vector_type);
@@ -1640,11 +1645,7 @@ mod tests {
         let left = ArrayBatch::new(vector_type.clone(), TestArray::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(vector_type, TestArray::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
         assert!(matches!(
-            AddOperation.interpret_with_batch_axes(
-                &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
-                &[left, right],
-                &[]
-            ),
+            AddOperation.interpret_with_batch_axes(&context, &[left, right], &[]),
             Err(BatchingError::Program(_)),
         ));
     }

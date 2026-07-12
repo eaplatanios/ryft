@@ -1,4 +1,5 @@
 use crate::batching::BatchAxis;
+use crate::batching::BatchingContext;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
 use crate::differentiation::TransposableOperation;
@@ -138,11 +139,15 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for ReshapeOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for ReshapeOperation
 where
-    ReshapeOperation: InterpretableOperation<V, C>,
+    ReshapeOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let Some(k_in) = inputs[0].batch_axis_position() else {
             // Replicated input: there is no batch axis to thread through the reshape, so interpret it as given and

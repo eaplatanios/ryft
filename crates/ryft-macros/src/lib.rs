@@ -31,19 +31,16 @@ pub fn derive_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_operation_impl(input)
 }
 
-/// Generates the batching (vectorization) dispatchers for an operation enum: the staged tracer-level and eager
-/// value-level `BatchableOperation` impls plus the `BatchableProgramOperation` witness for nested-program batching.
+/// Generates the batching (vectorization) dispatchers for an operation enum: one `BatchableOperation<C>` impl that
+/// is generic over the parent context `C` plus the `BatchableProgramOperation` witness for nested-program batching.
 ///
-/// Each non-recursive payload's batching obligation is transported as a per-variant `BatchableOperation` predicate,
-/// while recursive payloads (those mentioning `Self`) are discharged against the leaf bounds the enum declares via
-/// `#[ryft(bounds(batching(...)))]` — the value capabilities the recursive *eager* batching rules use directly,
-/// bound to the eager impl's flowing value. That is the only position needing author-supplied leaves: the staged
-/// flowing value is the unified tracer, whose capability impls are staging sugar conditioned only on
-/// operation-shaped `From<XOperation>` conversions (the staged recursive rules spell those `From` bounds and the
-/// closed enum discharges them structurally), and the program-constant space carries no batching capabilities at
-/// all. In the staged impl, non-recursive arms dispatch at the parent staging context, while recursive arms — and
-/// non-recursive variants marked with `#[ryft(batching(active))]`, such as named-axis collectives — dispatch at the
-/// active batching context to reach its axis metadata.
+/// The dispatcher forwards the active `BatchingContext<C>` to every variant's own rule, so the parent/active
+/// distinction lives in each rule's body rather than in dispatch: ordinary rules run their lifted physical work
+/// through `context.parent()` (eagerly under an eager parent, staged under a staging parent), while rules keyed on
+/// the active frame's axis metadata (e.g., named-axis collectives) inspect the batching context directly. Each
+/// non-recursive payload's batching obligation is transported as a per-variant `BatchableOperation<C>` predicate,
+/// while recursive payloads (those mentioning `Self`) are discharged against the witness and the leaf bounds the
+/// enum declares via `#[ryft(bounds(batching(...)))]`, which attach to the parent context's value type.
 #[proc_macro_derive(BatchableOperation, attributes(ryft))]
 pub fn derive_batchable_operation(input: TokenStream) -> TokenStream {
     OperationCodeGenerator::generate_batchable_operation_impl(input)

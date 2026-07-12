@@ -108,9 +108,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     And(AndOperation),
     Or(OrOperation),
     Xor(XorOperation),
-    #[ryft(batching(active))]
     Collective(CollectiveOperation),
-    #[ryft(batching(active))]
     AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
     Condition(Box<ConditionOperation<V, Self>>),

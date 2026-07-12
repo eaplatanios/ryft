@@ -147,8 +147,7 @@ impl<C: StagingContext> Constant<Tracer<C>, Tracer<C>, Input> for C {
 }
 
 impl<
-    C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>>
-        + Constant<C::Value, Stored, Payload>,
+    C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Constant<C::Value, Stored, Payload>,
     Stored,
     Payload,
 > Constant<BatchingTracer<C>, Stored, Payload> for BatchingContext<C>

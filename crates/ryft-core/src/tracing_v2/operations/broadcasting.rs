@@ -135,12 +135,12 @@ pub fn lift_broadcast(
     Ok((lifted_dimensions, lifted_target, target_batch_axis))
 }
 
-impl<V: Value<Type = ArrayType> + Broadcast, C> crate::batching::BatchableOperation<V, C> for BroadcastOperation {
+impl<C: Context<Type = ArrayType, Value: Broadcast>> crate::batching::BatchableOperation<C> for BroadcastOperation {
     fn batch(
         &self,
-        _context: &C,
-        inputs: &[crate::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
+        _context: &crate::batching::BatchingContext<C>,
+        inputs: &[crate::batching::ArrayBatch<C::Value>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         match batch_axes[0] {

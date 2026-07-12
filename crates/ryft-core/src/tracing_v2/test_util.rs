@@ -25,6 +25,7 @@ mod tests {
     use crate::batching::ArrayBatch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
+    use crate::batching::BatchingContext;
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::compare::CompareOperation;
@@ -55,7 +56,9 @@ mod tests {
         .unwrap();
         let rhs = ArrayBatch::replicated(TestArray::vector(vec![10.0, 100.0, 1000.0]));
         let dimensions = DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]);
-        let outputs = DotOperation::new(dimensions).batch(&EagerContext::<TestArray>::new(), &[lhs, rhs]).unwrap();
+        let outputs = DotOperation::new(dimensions)
+            .batch(&BatchingContext::new(EagerContext::<TestArray>::new(), 2, None), &[lhs, rhs])
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         // Batch item 0: 1*10 + 2*100 + 3*1000 = 3210; batch item 1: 4*10 + 5*100 + 6*1000 = 6540.
@@ -123,7 +126,7 @@ mod tests {
             .unwrap();
 
         let while_op = WhileOperation::<TestArray, TestOp>::new(condition, body).unwrap();
-        let context = EagerContext::<TestArray, TestOp>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, TestOp>::new(), 3, None);
 
         let initial_state = {
             let value = TestArray::vector(vec![3.0, 1.0, 2.0]);
@@ -315,7 +318,7 @@ mod tests {
         // verify each batch item is independently scaled by 2.
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
 
         let batched_input = {
             let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
@@ -337,7 +340,7 @@ mod tests {
 
         let condition = ConditionOperation::new(scalar_scale_branch(2.0), scalar_scale_branch(3.0)).unwrap();
         let operation = ArrayOperation::Condition(Box::new(condition));
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
 
         let batched_input = {
             let value = TestArray::vector(vec![1.0, 4.0, 9.0]);
@@ -460,7 +463,7 @@ mod tests {
         let operand_batch =
             ArrayBatch::new(operand_type, TestArray::vector(vec![1.0, 2.0, 3.0, 4.0]), Some(0)).unwrap();
 
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 4, None);
         let outputs = operation.batch(&context, &[predicate_batch, operand_batch]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -525,7 +528,10 @@ mod tests {
         let on_false_batch = ArrayBatch::new(operand_type, TestArray::vector(vec![4.0, 5.0, 6.0]), Some(0)).unwrap();
 
         let outputs = SelectOperation
-            .batch(&EagerContext::<TestArray>::new(), &[pred_batch, on_true_batch, on_false_batch])
+            .batch(
+                &BatchingContext::new(EagerContext::<TestArray>::new(), 3, None),
+                &[pred_batch, on_true_batch, on_false_batch],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -541,7 +547,14 @@ mod tests {
         let operation = crate::operations::constants::ZeroOperation::new(scalar.clone());
 
         let outputs: Vec<ArrayBatch<TestArray>> = operation
-            .batch(&EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(), &[])
+            .batch(
+                &BatchingContext::new(
+                    EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(),
+                    2,
+                    None,
+                ),
+                &[],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
@@ -556,7 +569,14 @@ mod tests {
         let operation = crate::operations::constants::OneOperation::new(scalar.clone());
 
         let outputs: Vec<ArrayBatch<TestArray>> = operation
-            .batch(&EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(), &[])
+            .batch(
+                &BatchingContext::new(
+                    EagerContext::<TestArray, crate::operations::constants::ConstantOperation<TestArray>>::new(),
+                    2,
+                    None,
+                ),
+                &[],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
@@ -571,7 +591,7 @@ mod tests {
         // `Zero`/`Fill` instruction takes when `BatchingContext::interpret_program` dispatches it through the enum's
         // `batch` with no inputs.
         let scalar = ArrayType::scalar(DataType::F64);
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 2, None);
 
         let zero = ArrayOperation::<TestArray>::Zero(crate::operations::constants::ZeroOperation::new(scalar.clone()));
         let outputs: Vec<ArrayBatch<TestArray>> = zero.batch(&context, &[]).unwrap();
@@ -706,7 +726,7 @@ mod tests {
     fn test_jacfwd_through_while_batches_basis_tangents() {
         // `jacfwd` linearizes the loop once into a pushforward containing a staged linear while, then replays
         // the batched basis tangents through it: the pushforward is instantiated into a direct linear program and
-        // interpreted over the value-level batching rules, so the linear while runs once over the stacked
+        // interpreted over the batching rules with concrete values, so the linear while runs once over the stacked
         // basis tangents. The derivative of the doubling loop at `x = 1` is `2^3 = 8`.
         let while_operation = doubling_while_operation();
         let jacobian = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()

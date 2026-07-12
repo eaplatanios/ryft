@@ -1350,26 +1350,51 @@ impl<V> ArrayBatch<V> {
     }
 }
 
-/// Stand-in for `ryft_core::BatchableOperation`.
-trait BatchableOperation<V, C>: Operation<ArrayType> {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError>;
+/// Stand-in for `ryft_core::BatchableOperation`. Every rule receives the active [`BatchingContext`] while the
+/// packed physical values remain values owned by the parent context `C`.
+trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
 
-/// Stand-in for `ryft_core::EagerContext`.
+/// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
+/// eager batch can be represented as `BatchingContext<EagerContext<...>>`.
 struct EagerContext<V: Value, O: Operation<V::Type>> {
     marker: PhantomData<(V, O)>,
 }
 
+impl<V: Value, O: Operation<V::Type>> Domain for EagerContext<V, O> {
+    type Type = V::Type;
+    type Value = V;
+    type Constant = V;
+    type Operation = O;
+}
+
+impl<V: Value, O: Operation<V::Type>> Context for EagerContext<V, O> {
+    fn lift(&self, constant: Self::Constant) -> Result<Self::Value, ProgramError> {
+        Ok(constant)
+    }
+}
+
 impl<V: Value, O: Operation<V::Type>> Zero<V> for EagerContext<V, O> {}
 
-/// Stand-in for `ryft_core::BatchingContext`.
+/// Stand-in for `ryft_core::BatchingContext`. Mirrors the real context's parent accessor and observable axis
+/// metadata, which active rules (e.g., named-axis collectives) inspect.
 struct BatchingContext<C> {
     parent: C,
+    axis_name: Option<&'static str>,
 }
 
 impl<C> BatchingContext<C> {
     fn parent(&self) -> &C {
         &self.parent
+    }
+
+    fn axis_name(&self) -> Option<&'static str> {
+        self.axis_name
     }
 }
 
@@ -1417,22 +1442,37 @@ impl SpecialBatchValue for Factor {}
 
 impl<C, Meta> SpecialBatchValue for Tracer<C, Meta> {}
 
-impl<V, C> BatchableOperation<V, C> for ZeroOperation<ArrayType> {
-    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+/// Ordinary leaf rule: it neither needs the active frame nor any value capability, and its physical work runs
+/// through the parent context (observed here through the parent-lifted constant in its output label).
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for ZeroOperation<ArrayType> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // Ordinary rules execute their lifted work through the parent context.
+        let _ = context.parent();
         Ok(vec![ArrayBatch::labeled("zero")])
     }
 }
 
 /// Batching rule requiring a value capability that the generated per-variant predicate transports to the owning
 /// enum's use sites without the enum spelling it.
-impl<V: SpecialBatchValue, C> BatchableOperation<V, C> for DotOperation {
-    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for DotOperation
+where
+    C::Value: SpecialBatchValue,
+{
+    fn batch(
+        &self,
+        _context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Ok(vec![ArrayBatch::labeled("dot")])
     }
 }
 
-/// Stand-in for a named-axis collective: a non-recursive payload whose staged rule is keyed at the batching context
-/// (for its axis metadata), exercised through the `#[ryft(batching(active))]` variant marker.
+/// Stand-in for a named-axis collective: a rule whose semantics depend on the active frame's axis metadata, which
+/// the fixed-context contract exposes to every rule without any variant-level marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CollectiveLikeOperation;
 
@@ -1457,35 +1497,25 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 {
 }
 
-impl<C: Context<Type = ArrayType>> BatchableOperation<<C as Domain>::Value, BatchingContext<C>>
-    for CollectiveLikeOperation
-{
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for CollectiveLikeOperation {
     fn batch(
         &self,
-        _context: &BatchingContext<C>,
-        _inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("collective_like_staged")])
+        context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        // The rule observes the active frame's axis metadata directly.
+        Ok(vec![ArrayBatch::labeled(if context.axis_name().is_some() {
+            "collective_like_named"
+        } else {
+            "collective_like_unnamed"
+        })])
     }
 }
 
-impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> BatchableOperation<V, EagerContext<V, O>>
-    for CollectiveLikeOperation
-{
-    fn batch(
-        &self,
-        _context: &EagerContext<V, O>,
-        _inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("collective_like_eager")])
-    }
-}
-
-/// Stand-in recursive higher-order payload whose eager and staged batching rules mirror the leaf obligations the
-/// real control-flow rules carry: the staged rule requires an operation-shaped `From` conversion (discharged
-/// structurally from the closed enum, like the real rules' staged structural operations) and the
-/// `BatchableProgramOperation` fixed-point witness, while the eager rule requires the eager leaf capabilities and
-/// the context's `Zero`.
+/// Stand-in recursive higher-order payload whose batching rule mirrors the leaf obligations the real control-flow
+/// rules carry: an operation-shaped `From` conversion (discharged structurally from the closed enum), the
+/// `BatchableProgramOperation` fixed-point witness, the parent context's `Zero`, and the author-declared value
+/// leaves supplied through `#[ryft(bounds(batching(...)))]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BatchRecursiveOperation<V, O> {
     marker: PhantomData<(V, O)>,
@@ -1514,33 +1544,18 @@ where
 {
 }
 
-impl<C> BatchableOperation<<C as Domain>::Value, BatchingContext<C>>
-    for BatchRecursiveOperation<C::Constant, C::Operation>
+impl<C> BatchableOperation<C> for BatchRecursiveOperation<C::Constant, C::Operation>
 where
-    C: Context<Type = ArrayType>,
+    C: Context<Type = ArrayType> + Zero<C::Value>,
+    C::Value: BooleanLike + SpecialBatchValue,
     C::Operation: BatchableProgramOperation<C::Constant> + From<ZeroOperation<ArrayType>>,
 {
     fn batch(
         &self,
         _context: &BatchingContext<C>,
-        _inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("batch_recursive_staged")])
-    }
-}
-
-impl<V, O> BatchableOperation<V, EagerContext<V, O>> for BatchRecursiveOperation<V, O>
-where
-    V: Value<Type = ArrayType> + BooleanLike + SpecialBatchValue,
-    O: Operation<ArrayType>,
-    EagerContext<V, O>: Zero<V>,
-{
-    fn batch(
-        &self,
-        _context: &EagerContext<V, O>,
-        _inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        Ok(vec![ArrayBatch::labeled("batch_recursive_eager")])
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        Ok(vec![ArrayBatch::labeled("batch_recursive")])
     }
 }
 
@@ -1550,16 +1565,18 @@ where
 enum BatchableArrayOperation<V: Value<Type = ArrayType>> {
     Zero(ZeroOperation<ArrayType>),
     Dot(DotOperation),
-    #[ryft(batching(active))]
     Collective(CollectiveLikeOperation),
     Recursive(Box<BatchRecursiveOperation<V, Self>>),
 }
 
 #[test]
-fn test_batchable_operation_dispatches_eager_batching_to_payloads() {
+fn test_batchable_operation_dispatches_batching_to_payloads() {
     type Operation = BatchableArrayOperation<Factor>;
+    type Staging = TestContext<Factor, Operation>;
 
-    let context = EagerContext::<Factor, Operation> { marker: PhantomData };
+    // Every arm receives the active batching context and flows the parent context's own value (`<Staging as
+    // Domain>::Value`, here `Factor`).
+    let context = BatchingContext::<Staging> { parent: TestContext { marker: PhantomData }, axis_name: Some("batch") };
 
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
     assert_eq!(zero.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
@@ -1569,34 +1586,33 @@ fn test_batchable_operation_dispatches_eager_batching_to_payloads() {
     let dot = Operation::from(DotOperation);
     assert_eq!(dot.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("dot")]);
 
+    // The collective-like rule observes the active frame's axis metadata without any variant-level marker.
     let collective = Operation::from(CollectiveLikeOperation);
-    assert_eq!(collective.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("collective_like_eager")]);
+    assert_eq!(collective.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("collective_like_named")]);
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
-    assert_eq!(recursive.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("batch_recursive_eager")]);
+    assert_eq!(recursive.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("batch_recursive")]);
 }
 
 #[test]
-fn test_batchable_operation_dispatches_staged_batching_to_payloads() {
+fn test_batchable_operation_dispatches_batching_over_eager_parents() {
     type Operation = BatchableArrayOperation<Factor>;
-    type Staging = TestContext<Factor, Operation>;
 
-    let context = BatchingContext::<Staging> { parent: TestContext { marker: PhantomData } };
+    // A top-level eager batch is represented by a `BatchingContext` over an eager parent, not by a separate eager
+    // dispatch mechanism, and unnamed frames are observable to rules that inspect the axis metadata.
+    let context = BatchingContext::<EagerContext<Factor, Operation>> {
+        parent: EagerContext { marker: PhantomData },
+        axis_name: None,
+    };
 
-    // Primitive arms dispatch at the parent context; the `active`-marked collective and the recursive payload dispatch
-    // at the batching context itself. Every arm flows the parent context's own value (`<Staging as Domain>::Value`,
-    // here `Factor`) rather than always a staged `Tracer`.
     let zero = Operation::from(ZeroOperation { r#type: ArrayType });
-    let outputs: Vec<ArrayBatch<Factor>> = zero.batch(&context, &[]).unwrap();
-    assert_eq!(outputs.iter().map(|output| output.label).collect::<Vec<_>>(), vec!["zero"]);
+    assert_eq!(zero.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("zero")]);
 
     let collective = Operation::from(CollectiveLikeOperation);
-    let outputs: Vec<ArrayBatch<Factor>> = collective.batch(&context, &[]).unwrap();
-    assert_eq!(outputs.iter().map(|output| output.label).collect::<Vec<_>>(), vec!["collective_like_staged"]);
+    assert_eq!(collective.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("collective_like_unnamed")]);
 
     let recursive = Operation::from(BatchRecursiveOperation::<Factor, Operation> { marker: PhantomData });
-    let outputs: Vec<ArrayBatch<Factor>> = recursive.batch(&context, &[]).unwrap();
-    assert_eq!(outputs.iter().map(|output| output.label).collect::<Vec<_>>(), vec!["batch_recursive_staged"]);
+    assert_eq!(recursive.batch(&context, &[]).unwrap(), vec![ArrayBatch::labeled("batch_recursive")]);
 }
 
 #[test]
@@ -1619,457 +1635,6 @@ fn test_batchable_operation_generates_program_batching_witness() {
 
     assert_eq!(batched.label, "batchable");
     assert_eq!(output_axes, vec![BatchAxis(Some(0))]);
-}
-
-/// Stand-in value capability required by one payload's forward-mode rule, verifying that the generated per-variant
-/// `DifferentiableOperation` predicates transport payload capability requirements to the use site.
-trait SpecialCombine {
-    type Output;
-}
-
-impl SpecialCombine for Factor {
-    type Output = Factor;
-}
-
-impl SpecialCombine for ScalarFactor {
-    type Output = ScalarFactor;
-}
-
-impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for ZeroOperation<DataType> {
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Ok(vec![DifferentiationDual { label: "zero", marker: PhantomData }])
-    }
-}
-
-impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for AddOperation {
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Ok(vec![DifferentiationDual { label: "add", marker: PhantomData }])
-    }
-}
-
-/// Forward-mode rule requiring a value capability that the generated per-variant predicate transports to the
-/// owning enum's use sites without the enum spelling it.
-impl<C, F> DifferentiableOperation<C> for FactorOperation<DataType, F>
-where
-    C: StagingContext<Type = DataType>,
-    C::Value: SpecialCombine<Output = C::Value>,
-{
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Ok(vec![DifferentiationDual { label: "factor", marker: PhantomData }])
-    }
-}
-
-/// Stand-in payload without a capture-free forward-mode rule, mirroring payload-level erroring
-/// `DifferentiableOperation` implementations such as the scalar `while` rule: the generated dispatcher still
-/// delegates uniformly and the payload's own rule reports the error.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NonDifferentiableOperation;
-
-impl Operation<DataType> for NonDifferentiableOperation {
-    fn name(&self) -> &'static str {
-        "non_differentiable"
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = DataType>, C> InterpretableOperation<V, C> for NonDifferentiableOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for NonDifferentiableOperation where
-    C::Operation: From<NonDifferentiableOperation>
-{
-}
-
-impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V, O> for NonDifferentiableOperation {
-    fn transpose(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("non_differentiable")])
-    }
-}
-
-impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for NonDifferentiableOperation {
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(DifferentiationError)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation, ryft::DifferentiableOperation)]
-#[ryft(crate = "crate")]
-#[ryft(bounds(differentiation(SpecialTransposableValue)))]
-enum DifferentiableScalarOperation<V: Value<Type = DataType>> {
-    Zero(ZeroOperation<DataType>),
-    Add(AddOperation),
-    Factor(FactorOperation<DataType, V>),
-    NonDifferentiable(NonDifferentiableOperation),
-}
-
-#[test]
-fn test_differentiable_operation_dispatches_jvp_to_payloads() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
-
-    let zero = Operation::from(ZeroOperation { r#type: DataType });
-    let outputs = zero.jvp(&context, &[]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].label, "zero");
-
-    let add = Operation::from(AddOperation);
-    let outputs = add.jvp(&context, &[]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].label, "add");
-
-    // The `ScalarFactor` rule requires `SpecialCombine<Output = C::Value>` on the flowing value, transported to this use
-    // site by the generated per-variant `DifferentiableOperation` predicate.
-    let factor = Operation::from(FactorOperation { factor: ScalarFactor(3), marker: PhantomData });
-    let outputs = factor.jvp(&context, &[]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].label, "factor");
-}
-
-#[test]
-fn test_differentiable_operation_delegates_unsupported_payloads() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    // The generated dispatcher delegates uniformly, so the unsupported payload's own erroring rule reports the
-    // failure rather than an enum-level dispatch arm.
-    let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
-    let operation = Operation::from(NonDifferentiableOperation);
-    assert_eq!(operation.jvp(&context, &[]).unwrap_err(), DifferentiationError);
-}
-
-#[test]
-fn test_differentiable_operation_generates_program_differentiation_witness() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    // The witness's fixed bodies forward to the program's own `linearize` / `jvp`; the stand-in `linearize`
-    // requires `SpecialTransposableValue` on the value type, supplied to the generated impl by
-    // `#[ryft(bounds(differentiation(...)))]`.
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "differentiable",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let linearization =
-        <Operation as LinearizableProgramOperation<ScalarFactor, Operation>>::linearize_program(&program).unwrap();
-    assert_eq!(linearization.label, "program_linearize");
-
-    let jvp_program =
-        <Operation as DifferentiableProgramOperation<ScalarFactor, Operation>>::jvp_program(&program).unwrap();
-    assert_eq!(jvp_program.label, "program_jvp");
-}
-
-#[test]
-fn test_differentiable_operation_generates_transposition_dispatchers() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    // The transposition dispatchers come from the separate `TransposableOperation` derive: `DifferentiableOperation`
-    // only adds forward-mode support, and deriving both enables reverse mode too.
-    let mut context = TracingContext::<ScalarFactor, Operation> { marker: PhantomData };
-    let add = Operation::from(AddOperation);
-    assert_eq!(
-        add.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Operation>("add")],
-    );
-
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "differentiable",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let transposed_program =
-        <Operation as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
-    assert_eq!(transposed_program.label, "program_transpose_with_respect_to");
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RecursiveOperation<V, O> {
-    marker: PhantomData<(V, O)>,
-}
-
-impl<V, O> Operation<ArrayType> for RecursiveOperation<V, O> {
-    fn name(&self) -> &'static str {
-        "recursive"
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for RecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
-    for RecursiveOperation<W, O>
-where
-    C::Operation: From<RecursiveOperation<W, O>>,
-{
-}
-
-impl<StoredValue, TranspositionValue, O> TransposableOperation<TranspositionValue, O>
-    for RecursiveOperation<StoredValue, O>
-where
-    TranspositionValue: Value<Type = ArrayType>,
-    O: RecursiveOperationTransposable<TranspositionValue>,
-{
-    fn transpose(
-        &self,
-        _context: &mut TracingContext<TranspositionValue, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("recursive")])
-    }
-}
-
-trait RecursiveOperationTransposable<V: Value<Type = ArrayType>>: Operation<ArrayType> {}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
-#[ryft(crate = "crate")]
-enum RecursiveLinearOperation<V: Value<Type = ArrayType>> {
-    Zero(ZeroOperation<ArrayType>),
-    Recursive(RecursiveOperation<V, Self>),
-}
-
-impl<StoredValue: Value<Type = ArrayType>, TranspositionValue: Value<Type = ArrayType>>
-    RecursiveOperationTransposable<TranspositionValue> for RecursiveLinearOperation<StoredValue>
-{
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProgramRecursiveOperation<V, O> {
-    marker: PhantomData<(V, O)>,
-}
-
-impl<V, O> Operation<DataType> for ProgramRecursiveOperation<V, O> {
-    fn name(&self) -> &'static str {
-        "program_recursive"
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = DataType>, W, O, C> InterpretableOperation<V, C> for ProgramRecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<W: Clone, O: Clone + Operation<DataType>, C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C>
-    for ProgramRecursiveOperation<W, O>
-where
-    C::Operation: From<ProgramRecursiveOperation<W, O>>,
-{
-}
-
-impl<StoredValue, TranspositionValue, O> TransposableOperation<TranspositionValue, O>
-    for ProgramRecursiveOperation<StoredValue, O>
-where
-    TranspositionValue: Value<Type = DataType> + SpecialTransposableValue,
-    O: TransposableProgramOperation<TranspositionValue>,
-{
-    fn transpose(
-        &self,
-        _context: &mut TracingContext<TranspositionValue, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("program_recursive")])
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
-#[ryft(crate = "crate")]
-enum RecursiveProgramLinearOperation<V: Value<Type = DataType> + SpecialTransposableValue> {
-    Zero(ZeroOperation<DataType>),
-    Add(AddOperation),
-    Recursive(ProgramRecursiveOperation<V, Self>),
-}
-
-#[test]
-fn test_transposable_operation_infers_value_type() {
-    type Linear = LinearScalarOperation<ScalarFactor>;
-
-    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
-    let add = Linear::from(AddOperation);
-
-    assert_eq!(
-        add.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Linear>("add")],
-    );
-}
-
-#[test]
-fn test_transposable_operation_forwards_to_variant_payloads() {
-    type Linear = LinearArrayOperation<Factor, Factor>;
-
-    let mut context = TracingContext::<Factor, Linear> { marker: PhantomData };
-
-    let zero = Linear::from(ZeroOperation { r#type: ArrayType });
-    let factor = Linear::from(FactorOperation { factor: Factor(13), marker: PhantomData });
-    let recompute = Linear::from(RecomputeOperation { operation: ArrayOperation::<Factor>::from(DotOperation) });
-    let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
-    let custom_vjp_call =
-        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, BackendPayload>, Factor> {
-            marker: PhantomData,
-        });
-
-    assert_eq!(
-        zero.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("zero")],
-    );
-    assert_eq!(
-        factor.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("factor")],
-    );
-    assert_eq!(
-        recompute.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("recompute")],
-    );
-    assert_eq!(
-        while_operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("while")],
-    );
-    assert_eq!(
-        custom_vjp_call.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("custom_vjp_call")],
-    );
-}
-
-#[test]
-fn test_transposable_operation_generates_program_transposition_witness() {
-    type Linear = LinearScalarOperation<ScalarFactor>;
-
-    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "linear",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let transposed =
-        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
-
-    assert_eq!(transposed.label, "program_transpose_with_respect_to");
-}
-
-#[test]
-fn test_transposable_operation_generates_concrete_payload_bounds() {
-    type Linear = SpecialLinearOperation<Factor>;
-
-    let mut context = TracingContext::<TranspositionFactor, Linear> { marker: PhantomData };
-    let operation = Linear::from(SpecialOperation);
-
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, TranspositionFactor, Linear>("special")],
-    );
-}
-
-#[test]
-fn test_transposable_operation_supports_recursive_payload_helpers() {
-    type Linear = RecursiveLinearOperation<Factor>;
-
-    let mut context = TracingContext::<Factor, Linear> { marker: PhantomData };
-    let operation = Linear::from(RecursiveOperation::<Factor, Linear> { marker: PhantomData });
-
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("recursive")],
-    );
-}
-
-#[test]
-fn test_transposable_operation_inherits_enum_bounds_for_recursive_program_witness() {
-    type Linear = RecursiveProgramLinearOperation<ScalarFactor>;
-
-    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
-    let operation = Linear::from(ProgramRecursiveOperation::<ScalarFactor, Linear> { marker: PhantomData });
-
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Linear>("program_recursive")],
-    );
-
-    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "linear",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let transposed =
-        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
-
-    assert_eq!(transposed.label, "program_transpose_with_respect_to");
-}
-
-/// Mirrors [`RecursiveProgramLinearOperation`], but with the recursive payload's transposition value leaf supplied
-/// through `#[ryft(bounds(transposition(...)))]` instead of through the enum's value parameter bounds, so that the
-/// enum's stored constant type is not forced to carry the transposition-only capability.
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
-#[ryft(crate = "crate")]
-#[ryft(bounds(transposition(SpecialTransposableValue)))]
-enum TranspositionBoundOperation<V: Value<Type = DataType>> {
-    Zero(ZeroOperation<DataType>),
-    Add(AddOperation),
-    Recursive(ProgramRecursiveOperation<V, Self>),
-}
-
-#[test]
-fn test_transposable_operation_generates_transposition_value_bounds() {
-    type Linear = TranspositionBoundOperation<ScalarFactor>;
-
-    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
-    let operation = Linear::from(ProgramRecursiveOperation::<ScalarFactor, Linear> { marker: PhantomData });
-
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Linear>("program_recursive")],
-    );
-
-    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "linear",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let transposed_program =
-        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
-
-    assert_eq!(transposed_program.label, "program_transpose_with_respect_to");
 }
 
 #[test]

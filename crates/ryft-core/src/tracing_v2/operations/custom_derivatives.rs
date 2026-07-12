@@ -7,7 +7,7 @@ use crate::batching::{
     ArrayBatch, BatchAxis, BatchableOperation, BatchableProgramOperation, BatchingError,
     ProgramBatchingOutputAxesPolicy,
 };
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::TransposableOperation;
 use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::effects::Effects;
@@ -35,10 +35,9 @@ use crate::types::{ArrayType, TypeError, Typed};
 /// reverse mode (reverse mode transposes the linearization of the JVP program, which therefore must be linear in
 /// its tangent arguments).
 ///
-/// Traced batching (`batch`) re-wraps the call around batched primal/JVP programs — mirroring JAX's
+/// Batching (`batch`) re-wraps the call around batched primal/JVP programs — mirroring JAX's
 /// `custom_jvp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
-/// differentiation. Value-level batching (used by dense Jacobian materialization, where the custom rule has already
-/// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
+/// differentiation, under eager and staging parents alike.
 #[derive(Clone, Debug)]
 pub struct CustomJvpOperation<V: Value, O> {
     /// Program computing the primal outputs from the primal inputs. The program is shared behind an [`Arc`] so
@@ -204,36 +203,14 @@ where
     }
 }
 
-/// Value-level batching for [`CustomJvpOperation`]: inlines the primal program through the per-operation batching
-/// rules. The custom derivative does not survive this inlining; see the type-level documentation.
-impl<V, O> BatchableOperation<V, EagerContext<V, O>> for CustomJvpOperation<V, O>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        // Replay the primal program over the packed batch values, dispatching every instruction through its
-        // value-level batching rule. Eager constants are the flowing values themselves, so they replicate as-is
-        // across the batch.
-        self.primal.interpret_with(
-            inputs.to_vec(),
-            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
-            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-        )
-    }
-}
-
-/// Stages a re-wrapped custom-derivative call into the batching context's parent trace.
+/// Binds a re-wrapped custom-derivative call into the batching context's parent.
 ///
-/// This is the shared body of the traced `batch` rules for [`CustomJvpOperation`] and [`CustomVjpOperation`],
+/// This is the shared body of the `batch` rules for [`CustomJvpOperation`] and [`CustomVjpOperation`],
 /// mirroring JAX's `custom_jvp_call_jaxpr` / `custom_vjp_call_jaxpr` batching rules: instead of inlining the primal
-/// program (which would lose the custom derivative and any rematerialization structure), the rule stages one new
-/// custom-derivative call whose captured programs have been batched. When no input carries the mapped batch axis the
-/// original operation is staged unchanged and the outputs stay replicated. Otherwise every input is aligned to
+/// program (which would lose the custom derivative and any rematerialization structure), the rule binds one new
+/// custom-derivative call whose captured programs have been batched — interpreted eagerly under an eager parent and
+/// staged into the enclosing trace under a staging parent. When no input carries the mapped batch axis the
+/// original operation is bound unchanged and the outputs stay replicated. Otherwise every input is aligned to
 /// carry the batch axis at axis `0` (replicated inputs are broadcast, matching the convention that every
 /// custom-call input is mapped at axis `0`) and every output carries the batch axis at axis `0`.
 pub(crate) fn stage_rewrapped_custom_call<C, MakeOperationFn>(
@@ -293,9 +270,9 @@ pub(crate) fn batch_rewrapped_program<V: Value<Type = ArrayType>, O: BatchablePr
     Ok(program)
 }
 
-/// Traced batching for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
+/// Batching rule for [`CustomJvpOperation`]: re-wraps the call around batched primal/JVP programs so the custom
 /// derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for CustomJvpOperation<C::Constant, O>
+impl<C, O> BatchableOperation<C> for CustomJvpOperation<C::Constant, O>
 where
     C: Context<Type = ArrayType, Operation = O>,
     C::Constant: Value<Type = ArrayType>,
@@ -334,10 +311,9 @@ where
 /// backward program — so reverse mode uses exactly the user-supplied gradient. Forward-mode differentiation
 /// (interpreting the staged linear call) is rejected, matching JAX's `custom_vjp` semantics.
 ///
-/// Traced batching (`batch`) re-wraps the call around batched primal/forward/backward programs — mirroring JAX's
+/// Batching (`batch`) re-wraps the call around batched primal/forward/backward programs — mirroring JAX's
 /// `custom_vjp_call_jaxpr` batching rule — so the custom derivative survives a `batch` applied *before*
-/// differentiation. Value-level batching (used by dense Jacobian materialization, where the custom rule has already
-/// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
+/// differentiation, under eager and staging parents alike.
 #[derive(Clone, Debug)]
 pub struct CustomVjpOperation<V: Value, O> {
     /// Program computing the primal outputs from the primal inputs. The program is shared behind an [`Arc`] so
@@ -463,32 +439,9 @@ where
 {
 }
 
-/// Value-level batching for [`CustomVjpOperation`]: inlines the primal program; see [`CustomJvpOperation`]'s
-/// batching documentation for the custom-derivative caveat.
-impl<V, O> BatchableOperation<V, EagerContext<V, O>> for CustomVjpOperation<V, O>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        // Replay the primal program over the packed batch values, dispatching every instruction through its
-        // value-level batching rule. Eager constants are the flowing values themselves, so they replicate as-is
-        // across the batch.
-        self.primal.interpret_with(
-            inputs.to_vec(),
-            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
-            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-        )
-    }
-}
-
-/// Traced batching for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
+/// Batching rule for [`CustomVjpOperation`]: re-wraps the call around batched primal/forward/backward programs so
 /// the custom derivative survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for CustomVjpOperation<C::Constant, O>
+impl<C, O> BatchableOperation<C> for CustomVjpOperation<C::Constant, O>
 where
     C: Context<Type = ArrayType, Operation = O>,
     C::Constant: Value<Type = ArrayType>,
@@ -771,21 +724,23 @@ where
     }
 }
 
-/// Value-level batching for the transposed [`CustomVjpCallOperation`]: replays the backward program through the
-/// per-operation batching rules with the captured residuals as replicated values. Used when a pullback containing
+/// Batching rule for the transposed [`CustomVjpCallOperation`]: replays the backward program through the
+/// per-operation batching rules with the captured residuals lifted through `context.parent()` (the identity under an
+/// eager parent, a lifted constant under a staging parent) as replicated values. Used when a pullback containing
 /// custom-VJP calls is interpreted with batched cotangents (e.g., by `jacrev`). The un-transposed form rejects
 /// batching just as it rejects interpretation.
-impl<V, O, F> BatchableOperation<V, EagerContext<V, O>> for CustomVjpCallOperation<V, O, F>
+impl<C, O, F> BatchableOperation<C> for CustomVjpCallOperation<C::Constant, O, F>
 where
-    V: Value<Type = ArrayType>,
-    F: CustomVjpResidual<V>,
-    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<V, O>>,
+    C: Context<Type = ArrayType>,
+    C::Constant: Value<Type = ArrayType>,
+    F: CustomVjpResidual<C::Constant>,
+    O: Operation<ArrayType> + BatchableOperation<C>,
 {
     fn batch(
         &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         if !self.transposed {
             return Err(TypeError {
                 message: "custom_vjp does not support forward-mode differentiation; use reverse mode (vjp, \
@@ -797,12 +752,12 @@ where
         let mut values = self
             .residuals
             .iter()
-            .map(|residual| Ok(ArrayBatch::replicated(residual.residual_value()?)))
+            .map(|residual| Ok(ArrayBatch::replicated(context.parent().lift(residual.residual_value()?)?)))
             .collect::<Result<Vec<_>, ProgramError>>()?;
         values.extend(inputs.iter().cloned());
         self.backward.interpret_with(
             values,
-            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
+            |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
             |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
         )
     }
@@ -1031,14 +986,18 @@ where
 
 /// Batching rule for [`CustomVjpTangentOperation`]: the opaque custom-VJP tangent carrier is a forward-mode tangent
 /// map that never appears in a batched primal program — reverse mode consumes it during transposition rather than
-/// batching it — so batching is rejected for every value and context.
-impl<Constant, O, V, C> BatchableOperation<V, C> for CustomVjpTangentOperation<Constant, O>
+/// batching it — so batching is rejected for every context.
+impl<Constant, O, C> BatchableOperation<C> for CustomVjpTangentOperation<Constant, O>
 where
     Constant: Value<Type = ArrayType>,
     O: Operation<ArrayType>,
-    V: Value<Type = ArrayType>,
+    C: Context<Type = ArrayType>,
 {
-    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        _context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Err(BatchingError::UnsupportedOperation { message: format!("operation `{}` cannot be batched", self.name()) })
     }
 }
@@ -1986,7 +1945,7 @@ mod tests {
         use crate::tracing_v2::operations::reduce::{Reduce, ReductionKind};
 
         // Differentiating *through* a batch of the custom call must still use the (deliberately doubled) custom
-        // rule: traced batching re-wraps the call around batched programs instead of inlining the primal, so the
+        // rule: batching re-wraps the call around batched programs instead of inlining the primal, so the
         // custom derivative survives `batch` — mirroring JAX's `vmap`-of-`custom_jvp` semantics.
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(

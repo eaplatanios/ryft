@@ -1,6 +1,7 @@
 use crate::batching::ArrayBatch;
 use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
@@ -382,16 +383,16 @@ where
 /// along structurally — batch-varying dynamic-slice start indices and batch-varying pad padding values — and it stages
 /// `O(axis_size)` operations because everything goes through the value capability traits (which also makes it work
 /// identically in eager and tracing contexts, since capabilities stage on tracers).
-pub(crate) fn batch_by_item_expansion<V, C, O>(
-    context: &C,
+pub(crate) fn batch_by_item_expansion<C, O>(
+    context: &BatchingContext<C>,
     operation_name: &'static str,
     operation: &O,
-    inputs: &[ArrayBatch<V>],
+    inputs: &[ArrayBatch<C::Value>],
     axis_size: usize,
-) -> Result<Vec<ArrayBatch<V>>, BatchingError>
+) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
-    V: Value<Type = ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    O: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
+    O: InterpretableOperation<C::Value, C>,
 {
     if inputs.is_empty() {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
@@ -402,7 +403,7 @@ where
             .iter()
             .map(|input| expansion_item(operation_name, input, item))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut outputs = operation.interpret(context, item_inputs.as_slice())?;
+        let mut outputs = operation.interpret(context.parent(), item_inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     })?;
@@ -411,11 +412,15 @@ where
 
 /// Batching rule for [`SliceOperation`]: a batched operand keeps its batch axis by slicing it fully, so the lifted
 /// operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
-impl<V: Value<Type = ArrayType>, C> BatchableOperation<V, C> for SliceOperation
+impl<C: Context<Type = ArrayType>> BatchableOperation<C> for SliceOperation
 where
-    SliceOperation: InterpretableOperation<V, C>,
+    SliceOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         match batch_axes[0] {
@@ -438,11 +443,15 @@ where
 /// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
 /// (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 /// so each batch item updates its own block.
-impl<V: Value<Type = ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for UpdateSliceOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for UpdateSliceOperation
 where
-    UpdateSliceOperation: InterpretableOperation<V, C>,
+    UpdateSliceOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         let Some(batch_axis) = batch_axes.iter().copied().flatten().next() else {
@@ -476,12 +485,16 @@ where
 /// batch axis is `0` even when the operand carried its batch axis elsewhere). The expansion stages `O(batch_size)`
 /// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
 /// because it only goes through the value capability traits.
-impl<V, C> BatchableOperation<V, C> for DynamicSliceOperation
+impl<C> BatchableOperation<C> for DynamicSliceOperation
 where
-    V: Value<Type = ArrayType> + ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    DynamicSliceOperation: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType, Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
+    DynamicSliceOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 }.into());
         }
@@ -531,12 +544,16 @@ where
 /// even when the operands carried their batch axes elsewhere). The expansion stages `O(batch_size)` operations — a
 /// scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
 /// only goes through the value capability traits.
-impl<V, C> BatchableOperation<V, C> for DynamicUpdateSliceOperation
+impl<C> BatchableOperation<C> for DynamicUpdateSliceOperation
 where
-    V: Value<Type = ArrayType> + ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    DynamicUpdateSliceOperation: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType, Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
+    DynamicUpdateSliceOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -727,7 +744,7 @@ mod tests {
         }
         .unwrap();
         let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[input])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -736,7 +753,7 @@ mod tests {
         // Replicated operands pass through the unlifted rule.
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = SliceOperation::new(vec![1], vec![3])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[uniform])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[uniform])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0]);
@@ -749,7 +766,9 @@ mod tests {
         }
         .unwrap();
         let strided = SliceOperation::new(vec![0], vec![4]).with_strides(vec![2]).unwrap();
-        let outputs = strided.batch(&crate::EagerContext::<TestArray>::new(), &[input]).unwrap();
+        let outputs = strided
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input])
+            .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 2.0, 4.0, 6.0]);
     }
@@ -803,7 +822,7 @@ mod tests {
         .unwrap();
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[input, update])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input, update])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -817,7 +836,7 @@ mod tests {
         }
         .unwrap();
         let outputs = UpdateSliceOperation::new(vec![1])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[input, update])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[input, update])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 8.0, 8.0, 3.0, 0.0, 9.0, 9.0, 3.0]);
@@ -839,7 +858,10 @@ mod tests {
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[input, ArrayBatch::replicated(index(1.0))])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[input, ArrayBatch::replicated(index(1.0))],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -852,7 +874,10 @@ mod tests {
         // reads `x[2..4]` of the shared operand, restacked along a fresh leading batch axis.
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![0.0, 1.0, 2.0, 3.0]));
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[uniform, batch_varying_indices(vec![0.0, 2.0])])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[uniform, batch_varying_indices(vec![0.0, 2.0])],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -867,7 +892,10 @@ mod tests {
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[input, batch_varying_indices(vec![1.0, 3.0])])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[input, batch_varying_indices(vec![1.0, 3.0])],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 6.0, 7.0]);
@@ -880,7 +908,10 @@ mod tests {
         }
         .unwrap();
         let outputs = DynamicSliceOperation::new(vec![2])
-            .batch(&crate::EagerContext::<TestArray>::new(), &[trailing, batch_varying_indices(vec![1.0, 2.0])])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[trailing, batch_varying_indices(vec![1.0, 2.0])],
+            )
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 6.0, 7.0]);
@@ -895,7 +926,10 @@ mod tests {
         .unwrap();
         let update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
-            .batch(&crate::EagerContext::<TestArray>::new(), &[input, update, ArrayBatch::replicated(index(1.0))])
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                &[input, update, ArrayBatch::replicated(index(1.0))],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -914,7 +948,7 @@ mod tests {
         .unwrap();
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &crate::EagerContext::<TestArray>::new(),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
                 &[uniform_input, update, batch_varying_indices(vec![0.0, 2.0])],
             )
             .unwrap();
@@ -932,7 +966,7 @@ mod tests {
         let uniform_update = ArrayBatch::replicated(TestArray::vector(vec![9.0, 9.0]));
         let outputs = DynamicUpdateSliceOperation
             .batch(
-                &crate::EagerContext::<TestArray>::new(),
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
                 &[input, uniform_update, batch_varying_indices(vec![1.0, 0.0])],
             )
             .unwrap();

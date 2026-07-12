@@ -7,6 +7,7 @@
 use crate::batching::ArrayBatch;
 use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::Context;
@@ -15,7 +16,7 @@ use crate::macros::check_count;
 use crate::operations::manipulation::{
     Broadcast, GATHER_OPERATION_NAME, Gather, GatherOperation, Reshape, Slice, Transpose, UpdateSlice,
 };
-use crate::programs::{MaybeZero, Value};
+use crate::programs::MaybeZero;
 
 use crate::differentiation::{DifferentiableOperation, DifferentiationDual, DifferentiationError};
 use crate::tracing_v2::operations::slicing::batch_by_item_expansion;
@@ -51,12 +52,16 @@ where
 /// restack along a fresh leading batch axis. This stages `O(axis_size)` gathers but is correct for every
 /// dimension-number configuration; dimension-number lifting (one lifted gather, no expansion) is a performance
 /// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
-impl<V, C> BatchableOperation<V, C> for GatherOperation
+impl<C> BatchableOperation<C> for GatherOperation
 where
-    V: Value<Type = ArrayType> + Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    GatherOperation: InterpretableOperation<V, C>,
+    C: Context<Type = ArrayType, Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape>,
+    GatherOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()]);

@@ -6,6 +6,7 @@ use ryft_macros::{BatchableOperation, DifferentiableOperation, Operation, Transp
 use ryft_core::batching::ArrayBatch;
 use ryft_core::batching::BatchAxis;
 use ryft_core::batching::BatchableOperation;
+use ryft_core::batching::BatchingContext;
 use ryft_core::batching::BatchingError;
 use ryft_core::batching::ProgramBatchingOutputAxesPolicy;
 use ryft_core::captures::CaptureReference;
@@ -127,9 +128,7 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     And(AndOperation),
     Or(OrOperation),
     Xor(XorOperation),
-    #[ryft(batching(active))]
     Collective(CollectiveOperation),
-    #[ryft(batching(active))]
     AxisIndex(AxisIndexOperation),
     Select(SelectOperation),
     /// Backend-owned condition whose branch bodies can contain XLA operations.
@@ -462,10 +461,6 @@ impl CompiledProgramOperation<XlaConstant> for XlaOperation {
     }
 }
 
-fn missing_traced_input() -> ProgramError {
-    ProgramError::InvalidInputCount { expected: 1, actual: 0 }
-}
-
 /// Bridges canonical internal physical positions to the signed public batching declaration without reintroducing a
 /// public `usize` conversion on [`BatchAxis`].
 fn batch_axis_from_position(axis: Option<usize>) -> BatchAxis {
@@ -609,87 +604,23 @@ impl JitCallOperation {
     }
 }
 
-impl<C> BatchableOperation<ArrayType, C> for JitCallOperation {
-    fn batch(
-        &self,
-        _context: &C,
-        inputs: &[ArrayBatch<ArrayType>],
-    ) -> Result<Vec<ArrayBatch<ArrayType>>, BatchingError> {
-        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = operation.infer_output_types(physical_inputs.as_slice())?;
-        outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
-            .collect()
-    }
-}
-
-/// Eager batching rule for [`JitCallOperation`] over concrete runtime [`Array`](crate::Array)s: the callee program
-/// is rebatched over the mapped input axes (exactly like the type-level and staged rules above) and the batched
-/// call is then bound — compiled and executed — through the eager context.
-impl<'c, C> BatchableOperation<crate::Array<'c>, C> for JitCallOperation
+/// Batching rule for [`JitCallOperation`]: the callee program is rebatched over the mapped input axes (via
+/// [`JitCallOperation::batched_call_operation`]) and the batched call is bound through `context.parent()`. An eager
+/// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
+/// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
+/// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
+impl<C> BatchableOperation<C> for JitCallOperation
 where
-    C: Context<Type = ArrayType, Value = crate::Array<'c>, Operation = XlaOperation>,
+    C: Context<Type = ArrayType, Operation: From<JitCallOperation>>,
 {
     fn batch(
         &self,
-        context: &C,
-        inputs: &[ArrayBatch<crate::Array<'c>>],
-    ) -> Result<Vec<ArrayBatch<crate::Array<'c>>>, BatchingError> {
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = context.bind(operation, &physical_inputs)?;
-        outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
-            .collect()
-    }
-}
-
-impl<S, C> BatchableOperation<Tracer<S>, C> for JitCallOperation
-where
-    S: StagingContext<Type = ArrayType, Operation = XlaOperation>,
-{
-    fn batch(
-        &self,
-        _context: &C,
-        inputs: &[ArrayBatch<Tracer<S>>],
-    ) -> Result<Vec<ArrayBatch<Tracer<S>>>, BatchingError> {
-        let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
-        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = context.stage_operation(operation, physical_inputs.as_slice())?;
-        outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output.r#type().into_owned(), output, batch_axis_from_position(axis)))
-            .collect()
-    }
-}
-
-/// Batching rule for [`JitCallOperation`] over differentiation duals, mirroring the staged [`Tracer`] rule above:
-/// the callee program is rebatched over the mapped input axes and the batched call is bound through the duals' own
-/// differentiation context, whose `jit_call` JVP rule then differentiates the batched callee. This is what serves
-/// `vmap` nested inside `gradient`/`linearize` closures.
-impl<S, C> BatchableOperation<ryft_core::DifferentiationTracer<S>, C> for JitCallOperation
-where
-    S: Context,
-    ryft_core::DifferentiationTracer<S>: Value<Type = ArrayType>,
-    ryft_core::DifferentiationContext<S>:
-        Context<Type = ArrayType, Value = ryft_core::DifferentiationTracer<S>, Operation = XlaOperation>,
-{
-    fn batch(
-        &self,
-        _context: &C,
-        inputs: &[ArrayBatch<ryft_core::DifferentiationTracer<S>>],
-    ) -> Result<Vec<ArrayBatch<ryft_core::DifferentiationTracer<S>>>, BatchingError> {
-        let context = inputs.first().ok_or_else(missing_traced_input)?.value().context().clone();
-        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = context.bind(operation, physical_inputs.as_slice())?;
+        let outputs = context.parent().bind(operation, &physical_inputs)?;
         outputs
             .into_iter()
             .zip(output_axes)

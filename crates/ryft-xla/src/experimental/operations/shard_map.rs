@@ -1,7 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 
-use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingError};
+use ryft_core::batching::{ArrayBatch, BatchableOperation, BatchingContext, BatchingError};
 use ryft_core::contexts::{Context, StagingContext};
 use ryft_core::differentiation::{DifferentiableOperation, DifferentiationError, TransposableOperation};
 use ryft_core::effects::Effects;
@@ -193,13 +193,17 @@ impl<V: Value<Type = ArrayType>> Operation<ArrayType> for ShardMapOperation<V> {
 
 /// Batching rule for [`ShardMapOperation`]: batching through a staged `shard_map` boundary has no rule yet — the
 /// mapped batch axis would need to compose with the boundary's global-to-local sharding on both sides — so batching
-/// is rejected for every value and context.
-impl<Constant, V, C> BatchableOperation<V, C> for ShardMapOperation<Constant>
+/// is rejected for every context.
+impl<Constant, C> BatchableOperation<C> for ShardMapOperation<Constant>
 where
     Constant: Value<Type = ArrayType>,
-    V: Value<Type = ArrayType>,
+    C: Context<Type = ArrayType>,
 {
-    fn batch(&self, _context: &C, _inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        _context: &BatchingContext<C>,
+        _inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         Err(BatchingError::UnsupportedOperation {
             message: format!("missing batching rule for operation '{}'", self.name()),
         }

@@ -100,9 +100,7 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>> + NamedAxes> NamedA
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, Self>> + NamedAxes> NamedAxes
-    for BatchingContext<C>
-{
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + NamedAxes> NamedAxes for BatchingContext<C> {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to

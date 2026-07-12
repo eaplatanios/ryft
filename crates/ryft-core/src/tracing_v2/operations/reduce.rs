@@ -594,15 +594,15 @@ fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<us
     (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
-impl<V: Value<Type = ArrayType>, C> crate::batching::BatchableOperation<V, C> for ReduceOperation
+impl<C: Context<Type = ArrayType>> crate::batching::BatchableOperation<C> for ReduceOperation
 where
-    ReduceOperation: InterpretableOperation<V, C>,
+    ReduceOperation: InterpretableOperation<C::Value, C>,
 {
     fn batch(
         &self,
-        context: &C,
-        inputs: &[crate::batching::ArrayBatch<V>],
-    ) -> Result<Vec<crate::batching::ArrayBatch<V>>, crate::batching::BatchingError> {
+        context: &crate::batching::BatchingContext<C>,
+        inputs: &[crate::batching::ArrayBatch<C::Value>],
+    ) -> Result<Vec<crate::batching::ArrayBatch<C::Value>>, crate::batching::BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         crate::batching::ArrayBatch::common_batch_size(inputs)?;
@@ -720,6 +720,7 @@ mod tests {
     use crate::batching::ArrayBatch;
     use crate::batching::BatchAxis;
     use crate::batching::BatchableOperation;
+    use crate::batching::BatchingContext;
     use crate::batching::BatchingError;
     use crate::tests::TestArray;
     use crate::tracing_v2::ArrayOperation;
@@ -956,7 +957,10 @@ mod tests {
     fn test_reduce_operation_batches_replicated_input_as_pass_through() {
         let input = ArrayBatch::replicated(TestArray::matrix(2, 3, vec![1.0; 6]));
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .batch(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input))
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None),
+                std::slice::from_ref(&input),
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
@@ -975,7 +979,10 @@ mod tests {
         }
         .unwrap();
         let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .batch(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input))
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None),
+                std::slice::from_ref(&input),
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -992,7 +999,10 @@ mod tests {
         .unwrap();
         // Per-item axis 0 collides with the mapped batch axis once lifted.
         let error = ReduceOperation::new(vec![0], ReductionKind::Sum)
-            .batch(&crate::EagerContext::<TestArray>::new(), std::slice::from_ref(&input))
+            .batch(
+                &BatchingContext::new(crate::EagerContext::<TestArray>::new(), 3, None),
+                std::slice::from_ref(&input),
+            )
             .unwrap_err();
         assert!(matches!(
             error,
@@ -1092,7 +1102,11 @@ mod tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(0))
         }
         .unwrap();
-        let context = EagerContext::<TestArray, CollectiveOperation>::new();
+        let context = BatchingContext::new(
+            EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
+            3,
+            Some("data".to_string()),
+        );
         let outputs = CollectiveOperation::new("data".to_string(), CollectiveKind::PMean)
             .batch(&context, &[input])
             .unwrap();

@@ -121,7 +121,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             + PartiallyEvaluatableOperation<Self>
             + From<ZeroOperation<ArrayType>>
             + DifferentiableOperation<PartialEvaluationContext<Self>>
-            + BatchableOperation<DomainValue<Self>, BatchingContext<Self>>,
+            + BatchableOperation<Self>,
     {
         let input_structure = primal.parameter_structure();
         let input_parameters = primal.into_parameters().collect::<Vec<_>>();
@@ -184,7 +184,7 @@ pub trait DifferentiableDomainExtension: Context<Type = ArrayType> {
             + DifferentiableOperation<
                 PartialEvaluationContext<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>,
             > + PartiallyEvaluatableOperation<TracingContext<<Self as Domain>::Constant, <Self as Domain>::Operation>>
-            + BatchableOperation<DomainValue<Self>, BatchingContext<Self>>
+            + BatchableOperation<Self>
             + From<FillOperation<ArrayType, Scalar>>
             + From<ZeroOperation<ArrayType>>
             + From<OneOperation<ArrayType>>
@@ -483,7 +483,7 @@ where
         Output::Family: ParameterizedFamily<DifferentialRow<Partials, V>>,
         Partials: Parameterized<DifferentialBlock<V>, ParameterStructure = Input::ParameterStructure>,
         Rows: Parameterized<DifferentialRow<Partials, V>, ParameterStructure = Output::ParameterStructure>,
-        <C as Domain>::Operation: Clone + InterpretableOperation<V, C> + BatchableOperation<V, BatchingContext<C>>,
+        <C as Domain>::Operation: Clone + InterpretableOperation<V, C> + BatchableOperation<C>,
     {
         let input_types = input_parameters.iter().map(|parameter| parameter.r#type().into_owned()).collect::<Vec<_>>();
         let input_shapes = input_types
@@ -715,7 +715,7 @@ fn batch_linear_program_instruction<C, V>(
 where
     C: Context<Type = ArrayType, Value = V>,
     V: Value<Type = ArrayType>,
-    <C as Domain>::Operation: BatchableOperation<V, BatchingContext<C>> + InterpretableOperation<V, C>,
+    <C as Domain>::Operation: BatchableOperation<C> + InterpretableOperation<V, C>,
 {
     if inputs.is_empty() {
         // A zero-input operation has no operand batch axis to lift through and is replicated by construction, so
@@ -726,7 +726,7 @@ where
             .map(|value| Ok(ArrayBatch::replicated(value)))
             .collect();
     }
-    BatchableOperation::<V, BatchingContext<C>>::batch(operation, context, inputs)
+    operation.batch(context, inputs)
 }
 
 /// Materializes a structured [`Differential`] using reverse-mode differentiation.
@@ -764,7 +764,7 @@ where
     F: FnOnce(Input::To<LinearizationTracer<C>>) -> Result<TracedOutput, ProgramError>,
     <C as Domain>::Operation: Clone
         + InterpretableOperation<DomainValue<C>, C>
-        + BatchableOperation<DomainValue<C>, BatchingContext<C>>
+        + BatchableOperation<C>
         + TransposableOperation<<C as Domain>::Constant, <C as Domain>::Operation>
         + PartiallyEvaluatableOperation<C>
         + From<ZeroOperation<ArrayType>>

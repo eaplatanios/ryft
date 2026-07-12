@@ -127,8 +127,8 @@ impl<S: Clone + Display, C: Context<Operation: PartiallyEvaluatableOperation<C> 
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + Fill<S, C::Value>, S>
-    Fill<S, BatchingTracer<C>> for BatchingContext<C>
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + Fill<S, C::Value>, S> Fill<S, BatchingTracer<C>>
+    for BatchingContext<C>
 {
     #[inline]
     fn fill(&self, r#type: &ArrayType, value: S) -> Result<BatchingTracer<C>, ProgramError> {

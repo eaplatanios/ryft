@@ -108,8 +108,8 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<OneOperation<
     }
 }
 
-impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C::Value, BatchingContext<C>>> + One<C::Value>>
-    One<BatchingTracer<C>> for BatchingContext<C>
+impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>> + One<C::Value>> One<BatchingTracer<C>>
+    for BatchingContext<C>
 {
     #[inline]
     fn one(&self, r#type: &ArrayType) -> Result<BatchingTracer<C>, ProgramError> {

@@ -4716,7 +4716,8 @@ mod batching_tests {
 
     use crate::axes::AxisIndex;
     use crate::batching::{
-        ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingError, BatchingTracer,
+        ArrayBatch, Batch, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchingContext, BatchingError,
+        BatchingTracer,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::LinearizationTracer;
@@ -5071,7 +5072,7 @@ mod batching_tests {
             ArrayBatch::new(value.r#type().into_owned(), value, Some(1))
         }
         .unwrap();
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 4, None);
         let outputs = ArrayOperation::<TestArray>::Add(AddOperation).batch(&context, &[left, right]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -5085,7 +5086,7 @@ mod batching_tests {
         // blanket elementwise `BatchableOperation` impl.
         let value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(value.r#type().into_owned(), value, Some(0)).unwrap();
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
         let outputs = NegOperation.batch(&context, &[batched]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -5099,7 +5100,7 @@ mod batching_tests {
         let batched_value = TestArray::vector(vec![1.0, 2.0, 3.0]);
         let batched = ArrayBatch::new(batched_value.r#type().into_owned(), batched_value, Some(0)).unwrap();
         let replicated = ArrayBatch::replicated(TestArray::scalar(10.0));
-        let context = EagerContext::<TestArray, ArrayOperation<TestArray>>::new();
+        let context = BatchingContext::new(EagerContext::<TestArray, ArrayOperation<TestArray>>::new(), 3, None);
         let outputs = AddOperation.batch(&context, &[batched, replicated]).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));

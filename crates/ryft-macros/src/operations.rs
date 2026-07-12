@@ -18,7 +18,6 @@ const PARTIAL_EVALUATION_ATTRIBUTE: Symbol = Symbol::new("partial_evaluation");
 const BATCHING_ATTRIBUTE: Symbol = Symbol::new("batching");
 const DIFFERENTIATION_ATTRIBUTE: Symbol = Symbol::new("differentiation");
 const TRANSPOSITION_ATTRIBUTE: Symbol = Symbol::new("transposition");
-const BATCHING_ACTIVE_ATTRIBUTE: Symbol = Symbol::new("active");
 const VALID_CONTAINER_ATTRIBUTES: [Symbol; 2] = [CRATE_ATTRIBUTE, BOUNDS_ATTRIBUTE];
 
 const DEFAULT_RYFT_CRATE: Symbol = Symbol::new("ryft");
@@ -80,8 +79,8 @@ pub(crate) struct CodeGenerator {
 
     /// [`DeriveKind`] identifying which operation derive this [`CodeGenerator`] serves. The four operation derives
     /// share the same `#[ryft(...)]` attribute namespace so combined derives compile: each `#[ryft(bounds(...))]`
-    /// kind and the variant-level `#[ryft(batching(active))]` marker is *owned* (documented and consumed) by exactly
-    /// one derive and *tolerated* (parsed and discarded) by the others, and this field selects the owned kinds.
+    /// kind is *owned* (documented and consumed) by exactly one derive and *tolerated* (parsed and discarded) by
+    /// the others, and this field selects the owned kinds.
     kind: DeriveKind,
 
     /// Errors accumulated in this [`CodeGenerator`]. The way error handling works in this code generator is that we
@@ -100,8 +99,7 @@ enum DeriveKind {
     /// `#[ryft(bounds(partial_evaluation(...)))]` bound kinds.
     Operation,
 
-    /// The `#[derive(BatchableOperation)]` macro, which owns the `#[ryft(bounds(batching(...)))]` bound kind and
-    /// the variant-level `#[ryft(batching(active))]` marker.
+    /// The `#[derive(BatchableOperation)]` macro, which owns the `#[ryft(bounds(batching(...)))]` bound kind.
     BatchableOperation,
 
     /// The `#[derive(DifferentiableOperation)]` macro, which owns the `#[ryft(bounds(differentiation(...)))]`
@@ -352,7 +350,7 @@ impl CodeGenerator {
         generics: &syn::Generics,
         variant: &syn::Variant,
     ) -> Option<OperationVariant> {
-        let batching_active = self.extract_variant_attributes(&variant.attrs);
+        self.reject_nested_attributes(&variant.attrs);
         let syn::Fields::Unnamed(fields) = &variant.fields else {
             self.add_error(&variant.ident, "operation enum variants must be tuple variants with one payload field");
             return None;
@@ -377,36 +375,11 @@ impl CodeGenerator {
             is_boxed,
             skip_conversions,
             is_recursive_payload,
-            batching_active,
         })
     }
 
-    /// Extracts supported variant-level `#[ryft(...)]` attributes, returning whether the variant carries
-    /// `#[ryft(batching(active))]`. The marker is owned (documented and consumed) by `#[derive(BatchableOperation)]`
-    /// and tolerated by the sibling operation derives so combined derives compile.
-    fn extract_variant_attributes(&mut self, attributes: &[syn::Attribute]) -> bool {
-        let mut batching_active = false;
-        attributes.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
-            attr.parse_nested_meta(|meta| match &meta.path {
-                path if path == &BATCHING_ATTRIBUTE => meta.parse_nested_meta(|meta| match &meta.path {
-                    path if path == &BATCHING_ACTIVE_ATTRIBUTE => {
-                        batching_active = true;
-                        Ok(())
-                    }
-                    _ => Err(meta.error(format_args!(
-                        "invalid '#[ryft(batching(...))]' variant attribute: '{}'; only 'active' is supported here",
-                        meta.path.to_token_stream().to_string().replace(' ', ""),
-                    ))),
-                }),
-                _ => Err(meta.error(NESTED_ATTRIBUTE_ERROR)),
-            })
-            .unwrap_or_else(|error| self.errors.push(error));
-        });
-        batching_active
-    }
-
     /// Rejects nested `#[ryft(...)]` attributes, which are only supported at the top level for operation enums and
-    /// at the variant level for the `#[ryft(batching(active))]` marker, but never on payload fields.
+    /// never on variants or payload fields.
     fn reject_nested_attributes(&mut self, attributes: &[syn::Attribute]) {
         attributes
             .iter()
@@ -786,29 +759,23 @@ impl CodeGenerator {
         })
     }
 
-    /// Generates the `BatchableOperation` derive output: the staged tracer-level and eager value-level
-    /// `BatchableOperation` dispatchers plus the `BatchableProgramOperation` witness for nested-program batching.
+    /// Generates the `BatchableOperation` derive output: one fixed-active-context `BatchableOperation` dispatcher
+    /// plus the `BatchableProgramOperation` witness for nested-program batching.
     ///
-    /// The generated where clauses follow the same structure as the differentiation derive: each non-recursive
-    /// payload carries its batching obligation as a per-variant `BatchableOperation` predicate (at the context its
-    /// arm dispatches at), recursive payloads (those mentioning `Self`) are discharged as definition-time body
-    /// checks against the author-supplied leaf capability bounds (`#[ryft(bounds(batching(...)))]`) and the
-    /// `BatchableProgramOperation` fixed-point witness, and the witness impl itself spells only the constant-side
-    /// leaves because its replay runs over a concrete tracing context where everything else resolves concretely.
+    /// The generated dispatcher is generic over a `__ParentContext` parent context pinned to the enum's primary
+    /// type, program constant type, and the enum itself as its operation family. Every variant forwards the active
+    /// `BatchingContext<__ParentContext>` to its payload's own rule: ordinary rules execute their lifted work
+    /// through `context.parent()`, while rules keyed on the active frame (e.g., named-axis collectives) inspect its
+    /// axis metadata directly. The generated where clauses follow the same structure as the differentiation derive:
+    /// each non-recursive payload carries its batching obligation as a per-variant
+    /// `BatchableOperation<__ParentContext>` predicate that transports the rule's own capability requirements to
+    /// the use site, while recursive payloads (those mentioning `Self`) are discharged as definition-time body
+    /// checks against the author-supplied leaf capability bounds (`#[ryft(bounds(batching(...)))]`), the parent
+    /// `Zero` leaf that backs accumulator seeding, and the `BatchableProgramOperation` fixed-point witness. The
+    /// witness impl itself spells only the per-variant leaves that its concrete tracing-context replay cannot
+    /// resolve concretely.
     fn generate_batchable_operation(&mut self, input: &syn::DeriveInput) -> TokenStream {
         let variants = self.extract_variants(input);
-        if self.compile_error().is_some() {
-            return TokenStream::new();
-        }
-        for variant in &variants {
-            if variant.batching_active && variant.is_recursive_payload {
-                self.add_error(
-                    &variant.ident,
-                    "'#[ryft(batching(active))]' is redundant on recursive payloads, which always dispatch at the \
-                     active batching context; remove the marker",
-                );
-            }
-        }
         if self.compile_error().is_some() {
             return TokenStream::new();
         }
@@ -830,150 +797,63 @@ impl CodeGenerator {
         };
         let program_value_substitutions = program_value_substitutions(&value_type_parameters, &program_constant_type);
         let batching_self_type = substitute_type_idents(&conversion_self_type, program_value_substitutions.as_slice());
-        let constant_type: syn::Type = syn::parse_quote!(#program_constant_type);
 
-        // Staged tracer-level dispatcher. Primitive (non-recursive, unmarked) arms dispatch at the parent staging
-        // context — the flowing physical values are parent-trace values — while recursive and `active`-marked arms
-        // dispatch at the batching context itself for its axis metadata. No tracer capability leaves are spelled:
-        // the recursive staged rules carry operation-shaped `From<XOperation>` bounds that the `Operation = Self`
-        // projection discharges structurally, and the tracer capability blankets bridge them back to the value
-        // capabilities the shared rule bodies call.
-        let tracer_type: syn::Type = syn::parse_quote! {
-            <__ParentContext as #ryft::Domain>::Value
-        };
-        let mut staged_generics = substitute_generics(
+        // Fixed-active-context dispatcher: every arm receives the active `BatchingContext<__ParentContext>` and
+        // flows the parent context's own value.
+        let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
+        let mut batching_generics = substitute_generics(
             &self.operation_generics(&input.generics, &variants),
             program_value_substitutions.as_slice(),
         );
-        staged_generics.params.push(syn::parse_quote!(__ParentContext));
-        let staged_where_clause = staged_generics.make_where_clause();
-        staged_where_clause.predicates.push(syn::parse_quote! {
+        batching_generics.params.push(syn::parse_quote!(__ParentContext));
+        let batching_where_clause = batching_generics.make_where_clause();
+        batching_where_clause.predicates.push(syn::parse_quote! {
             __ParentContext: #ryft::Context<
                 Type = #primary_type,
                 Constant = #program_constant_type,
                 Operation = #batching_self_type,
             >
         });
-        staged_where_clause
+        batching_where_clause
             .predicates
             .extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
                 let operation_type =
                     substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate = if variant.batching_active {
-                    syn::parse_quote! {
-                        #operation_type:
-                            #ryft::BatchableOperation<#tracer_type, #ryft::BatchingContext<__ParentContext>>
-                    }
-                } else {
-                    syn::parse_quote!(#operation_type: #ryft::BatchableOperation<#tracer_type, __ParentContext>)
-                };
+                let predicate: syn::WherePredicate =
+                    syn::parse_quote!(#operation_type: #ryft::BatchableOperation<__ParentContext>);
                 predicate
             }));
-        staged_where_clause
+        batching_where_clause
             .predicates
             .push(syn::parse_quote!(#batching_self_type: #ryft::BatchableProgramOperation<#program_constant_type>));
-        // Recursive higher-order rules (scan/condition/while/custom derivatives) dispatch at this batching context and
-        // compute over the flowing parent value, so they need the author-declared batching value capabilities on that
-        // value plus the parent context's `Zero` leaf for accumulator seeding — mirroring the eager dispatcher below.
-        // The declared bounds are written against the enum's value parameter, but the staged dispatcher flows the
-        // parent context's value, so substitute that value into their associated-type constraints (e.g.
+        // Recursive higher-order rules compute over the flowing parent value, so they need the author-declared
+        // batching value capabilities on that value plus the parent context's `Zero` leaf for accumulator seeding.
+        // The declared bounds are written against the enum's value parameter, but the dispatcher flows the parent
+        // context's value, so substitute that value into their associated-type constraints (e.g.,
         // `Select<Condition = V>` becomes `Select<Condition = <__ParentContext as Domain>::Value>`).
-        let staged_value_substitutions = [(program_constant_type.clone(), tracer_type.clone())];
-        let mut staged_value_substituter = TypeIdentSubstituter { substitutions: &staged_value_substitutions };
-        let staged_value_bounds = self
+        let batching_value_substitutions = [(program_constant_type.clone(), parent_value_type.clone())];
+        let mut batching_value_substituter = TypeIdentSubstituter { substitutions: &batching_value_substitutions };
+        let batching_value_bounds = self
             .batching_value_bounds
             .iter()
             .map(|bound| {
                 let mut bound = bound.clone();
-                staged_value_substituter.visit_type_param_bound_mut(&mut bound);
+                batching_value_substituter.visit_type_param_bound_mut(&mut bound);
                 bound
             })
             .collect::<Vec<_>>();
-        add_value_bounds(staged_where_clause, &tracer_type, staged_value_bounds.as_slice());
-        staged_where_clause.predicates.push(syn::parse_quote!(__ParentContext: #ryft::Zero<#tracer_type>));
-        let staged_needs_parent_context =
-            variants.iter().any(|variant| !variant.is_recursive_payload && !variant.batching_active);
-        let staged_parent_context_binding =
-            if staged_needs_parent_context { quote!(let parent = context.parent();) } else { TokenStream::new() };
-        let staged_arms = variants.iter().map(|variant| {
-            let variant_ident = &variant.ident;
-            let operation_type =
-                substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-            let receiver = variant.receiver();
-            if variant.is_recursive_payload || variant.batching_active {
-                quote! {
-                    Self::#variant_ident(operation) => {
-                        <#operation_type as #ryft::BatchableOperation<
-                            #tracer_type,
-                            #ryft::BatchingContext<__ParentContext>,
-                        >>::batch(#receiver, context, inputs)
-                    },
-                }
-            } else {
-                quote! {
-                    Self::#variant_ident(operation) => {
-                        <#operation_type as #ryft::BatchableOperation<#tracer_type, __ParentContext>>::batch(
-                            #receiver,
-                            parent,
-                            inputs,
-                        )
-                    },
-                }
-            }
-        });
-        let (staged_impl_generics, _, staged_where_clause) = staged_generics.split_for_impl();
-        let staged_impl = quote! {
-            #[automatically_derived]
-            impl #staged_impl_generics
-                #ryft::BatchableOperation<#tracer_type, #ryft::BatchingContext<__ParentContext>>
-                for #batching_self_type
-            #staged_where_clause
-            {
-                fn batch(
-                    &self,
-                    context: &#ryft::BatchingContext<__ParentContext>,
-                    inputs: &[#ryft::ArrayBatch<#tracer_type>],
-                ) -> ::std::result::Result<::std::vec::Vec<#ryft::ArrayBatch<#tracer_type>>, #ryft::BatchingError> {
-                    #staged_parent_context_binding
-                    match self {
-                        #(#staged_arms)*
-                    }
-                }
-            }
-        };
-
-        // Eager value-level dispatcher: every arm dispatches at the eager context. The hardcoded context `Zero`
-        // leaf backs recursive scan rules' accumulator seeding, mirroring the differentiation derive's hardcoded
-        // context `Zero` bound.
-        let eager_context: syn::Type =
-            syn::parse_quote!(#ryft::EagerContext<#program_constant_type, #batching_self_type>);
-        let mut eager_generics = substitute_generics(
-            &self.operation_generics(&input.generics, &variants),
-            program_value_substitutions.as_slice(),
-        );
-        let eager_where_clause = eager_generics.make_where_clause();
-        add_value_bounds(eager_where_clause, &constant_type, self.batching_value_bounds.as_slice());
-        eager_where_clause
+        add_value_bounds(batching_where_clause, &parent_value_type, batching_value_bounds.as_slice());
+        batching_where_clause
             .predicates
-            .push(syn::parse_quote!(#eager_context: #ryft::Zero<#program_constant_type>));
-        eager_where_clause
-            .predicates
-            .extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
-                let operation_type =
-                    substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate = syn::parse_quote! {
-                    #operation_type: #ryft::BatchableOperation<#program_constant_type, #eager_context>
-                };
-                predicate
-            }));
-        let eager_arms = variants.iter().map(|variant| {
+            .push(syn::parse_quote!(__ParentContext: #ryft::Zero<#parent_value_type>));
+        let batching_arms = variants.iter().map(|variant| {
             let variant_ident = &variant.ident;
             let operation_type =
                 substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
             let receiver = variant.receiver();
             quote! {
                 Self::#variant_ident(operation) => {
-                    <#operation_type as #ryft::BatchableOperation<#program_constant_type, #eager_context>>::batch(
+                    <#operation_type as #ryft::BatchableOperation<__ParentContext>>::batch(
                         #receiver,
                         context,
                         inputs,
@@ -981,40 +861,36 @@ impl CodeGenerator {
                 },
             }
         });
-        let (eager_impl_generics, _, eager_where_clause) = eager_generics.split_for_impl();
-        let eager_impl = quote! {
+        let (batching_impl_generics, _, batching_where_clause) = batching_generics.split_for_impl();
+        let batching_impl = quote! {
             #[automatically_derived]
-            impl #eager_impl_generics #ryft::BatchableOperation<#program_constant_type, #eager_context>
-                for #batching_self_type
-            #eager_where_clause
+            impl #batching_impl_generics #ryft::BatchableOperation<__ParentContext> for #batching_self_type
+            #batching_where_clause
             {
                 fn batch(
                     &self,
-                    context: &#eager_context,
-                    inputs: &[#ryft::ArrayBatch<#program_constant_type>],
+                    context: &#ryft::BatchingContext<__ParentContext>,
+                    inputs: &[#ryft::ArrayBatch<#parent_value_type>],
                 ) -> ::std::result::Result<
-                    ::std::vec::Vec<#ryft::ArrayBatch<#program_constant_type>>,
+                    ::std::vec::Vec<#ryft::ArrayBatch<#parent_value_type>>,
                     #ryft::BatchingError,
                 > {
                     match self {
-                        #(#eager_arms)*
+                        #(#batching_arms)*
                     }
                 }
             }
         };
 
         // Program-level witness: the `batch_program` replay runs over the concrete tracing context
-        // `TracingContext<Constant, Self, Constant>`, so the staged dispatcher's obligations are spelled here
-        // instantiated at that context — per-variant predicates that a payload rule pinned to a concrete constant
-        // type (e.g. a backend `jit_call`) cannot resolve at a generic constant parameter stay transported, while
-        // everything context-shaped resolves concretely. Keeping the enum's own batching obligation out of the
-        // where clause is what lets the staged dispatcher require `Self: BatchableProgramOperation<..>` without
-        // unbounded recursion.
+        // `TracingContext<Constant, Self, Constant>`, so the dispatcher's obligations are spelled here instantiated
+        // at that context — per-variant predicates that a payload rule pinned to a concrete constant type (e.g., a
+        // backend `jit_call`) cannot resolve at a generic constant parameter stay transported, while everything
+        // context-shaped (the author-declared leaves at the staged tracer value and the staging `Zero` blanket)
+        // resolves concretely. Keeping the enum's own batching obligation out of the where clause is what lets the
+        // dispatcher require `Self: BatchableProgramOperation<..>` without unbounded recursion.
         let program_trace_context: syn::Type = syn::parse_quote! {
             #ryft::TracingContext<#program_constant_type, #batching_self_type, #program_constant_type>
-        };
-        let program_tracer_type: syn::Type = syn::parse_quote! {
-            #ryft::Tracer<#program_trace_context>
         };
         let mut program_generics = substitute_generics(
             &self.operation_generics(&input.generics, &variants),
@@ -1027,18 +903,8 @@ impl CodeGenerator {
             .extend(variants.iter().filter(|variant| !variant.is_recursive_payload).map(|variant| {
                 let operation_type =
                     substitute_type_idents(&variant.operation_type, program_value_substitutions.as_slice());
-                let predicate: syn::WherePredicate = if variant.batching_active {
-                    syn::parse_quote! {
-                        #operation_type: #ryft::BatchableOperation<
-                            #program_tracer_type,
-                            #ryft::BatchingContext<#program_trace_context>,
-                        >
-                    }
-                } else {
-                    syn::parse_quote! {
-                        #operation_type: #ryft::BatchableOperation<#program_tracer_type, #program_trace_context>
-                    }
-                };
+                let predicate: syn::WherePredicate =
+                    syn::parse_quote!(#operation_type: #ryft::BatchableOperation<#program_trace_context>);
                 predicate
             }));
         let (program_impl_generics, _, program_where_clause) = program_generics.split_for_impl();
@@ -1076,8 +942,7 @@ impl CodeGenerator {
         };
 
         const_block(quote! {
-            #staged_impl
-            #eager_impl
+            #batching_impl
             #program_impl
         })
     }
@@ -1685,11 +1550,6 @@ struct OperationVariant {
 
     /// Whether this payload recursively contains the enum type being derived.
     is_recursive_payload: bool,
-
-    /// Whether the variant carries `#[ryft(batching(active))]`, marking a non-recursive payload whose staged
-    /// batching rule dispatches at the active batching context (for its axis metadata) instead of the parent
-    /// staging context.
-    batching_active: bool,
 }
 
 impl OperationVariant {

@@ -2,6 +2,7 @@ use std::fmt::Display;
 
 use crate::batching::ArrayBatch;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::contexts::Context;
 use crate::differentiation::DifferentiationError;
@@ -118,13 +119,13 @@ where
     }
 }
 
-impl<V, O, C> BatchableOperation<V, C> for RecomputeOperation<O>
-where
-    V: Value<Type = ArrayType>,
-    O: BatchableOperation<V, C>,
-{
+impl<O: BatchableOperation<C>, C: Context<Type = ArrayType>> BatchableOperation<C> for RecomputeOperation<O> {
     #[inline]
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         self.operation.batch(context, inputs)
     }
 }

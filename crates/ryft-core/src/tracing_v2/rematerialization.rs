@@ -23,7 +23,7 @@ use crate::batching::ArrayBatch;
 use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::{BatchableOperation, BatchableProgramOperation};
-use crate::contexts::{Context, Domain, EagerContext, StagingContext};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiationDual;
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationError, TransposableOperation,
@@ -310,31 +310,10 @@ where
     }
 }
 
-/// Value-level batching for [`RematerializeOperation`]: inlines the primal program.
-impl<V, O> BatchableOperation<V, EagerContext<V, O>> for RematerializeOperation<V, O>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<V, O>>,
-{
-    fn batch(
-        &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
-        // Replay the primal program over the packed batch values, dispatching every instruction through its
-        // value-level batching rule. Eager constants are the flowing values themselves, so they replicate as-is
-        // across the batch.
-        self.primal.interpret_with(
-            inputs.to_vec(),
-            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
-            |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
-        )
-    }
-}
-
-/// Traced batching for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
-/// programs so the rematerialization boundary survives `batch`; see `stage_rewrapped_custom_call`.
-impl<C, O> BatchableOperation<<C as Domain>::Value, BatchingContext<C>> for RematerializeOperation<C::Constant, O>
+/// Batching rule for [`RematerializeOperation`]: re-wraps the call around batched primal/forward/backward/tangent
+/// programs so the rematerialization boundary survives `batch` under eager and staging parents alike; see
+/// `stage_rewrapped_custom_call`.
+impl<C, O> BatchableOperation<C> for RematerializeOperation<C::Constant, O>
 where
     C: Context<Type = ArrayType, Operation = O>,
     C::Constant: Value<Type = ArrayType>,
@@ -568,28 +547,31 @@ where
     }
 }
 
-/// Value-level batching for [`RematerializeCallOperation`]: replays the selected tangent or backward program.
-impl<V, O, F> BatchableOperation<V, EagerContext<V, O>> for RematerializeCallOperation<V, O, F>
+/// Batching rule for [`RematerializeCallOperation`]: replays the selected tangent or backward program through the
+/// per-operation batching rules with the captured residuals lifted through `context.parent()` (the identity under an
+/// eager parent, a lifted constant under a staging parent) as replicated values.
+impl<C, O, F> BatchableOperation<C> for RematerializeCallOperation<C::Constant, O, F>
 where
-    V: Value<Type = ArrayType>,
-    F: CustomVjpResidual<V>,
-    O: Operation<ArrayType> + BatchableOperation<V, EagerContext<V, O>>,
+    C: Context<Type = ArrayType>,
+    C::Constant: Value<Type = ArrayType>,
+    F: CustomVjpResidual<C::Constant>,
+    O: Operation<ArrayType> + BatchableOperation<C>,
 {
     fn batch(
         &self,
-        context: &EagerContext<V, O>,
-        inputs: &[ArrayBatch<V>],
-    ) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError> {
         let program = if self.transposed { &self.backward } else { &self.tangent };
         let mut values = self
             .residuals
             .iter()
-            .map(|residual| Ok(ArrayBatch::replicated(residual.residual_value()?)))
+            .map(|residual| Ok(ArrayBatch::replicated(context.parent().lift(residual.residual_value()?)?)))
             .collect::<Result<Vec<_>, ProgramError>>()?;
         values.extend(inputs.iter().cloned());
         program.interpret_with(
             values,
-            |_, constant: &V| Ok(ArrayBatch::replicated(constant.clone())),
+            |_, constant| Ok(ArrayBatch::replicated(context.parent().lift(constant.clone())?)),
             |instruction, instruction_inputs| instruction.operation().batch(context, instruction_inputs),
         )
     }

@@ -1,6 +1,7 @@
 use crate::batching::ArrayBatch;
 use crate::batching::BatchAxis;
 use crate::batching::BatchableOperation;
+use crate::batching::BatchingContext;
 use crate::batching::BatchingError;
 use crate::batching::InterpretableBatchableOperation;
 use crate::contexts::{Context, StagingContext};
@@ -128,11 +129,15 @@ where
 /// concatenates its own operands), and the concatenated axis is
 /// shifted past the inserted batch axis when the batch axis sits at or before it. When no operand is batched, the
 /// operation passes through unchanged.
-impl<V: Value<Type = ArrayType> + Broadcast + Transpose, C> BatchableOperation<V, C> for ConcatenateOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchableOperation<C> for ConcatenateOperation
 where
-    ConcatenateOperation: InterpretableOperation<V, C>,
+    ConcatenateOperation: InterpretableOperation<C::Value, C>,
 {
-    fn batch(&self, context: &C, inputs: &[ArrayBatch<V>]) -> Result<Vec<ArrayBatch<V>>, BatchingError> {
+    fn batch(
+        &self,
+        context: &BatchingContext<C>,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         if inputs.is_empty() {
             return Err(
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
@@ -228,7 +233,7 @@ mod tests {
         }
         .unwrap();
         let outputs = ConcatenateOperation::new(0)
-            .batch(&crate::EagerContext::<TestArray>::new(), &[first, second])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[first, second])
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
@@ -243,7 +248,7 @@ mod tests {
         .unwrap();
         let uniform = ArrayBatch::replicated(TestArray::vector(vec![8.0, 9.0]));
         let outputs = ConcatenateOperation::new(0)
-            .batch(&crate::EagerContext::<TestArray>::new(), &[batched, uniform])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[batched, uniform])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().values, vec![0.0, 1.0, 8.0, 9.0, 2.0, 3.0, 8.0, 9.0]);
@@ -252,7 +257,7 @@ mod tests {
         let left = ArrayBatch::replicated(TestArray::vector(vec![1.0, 2.0]));
         let right = ArrayBatch::replicated(TestArray::vector(vec![3.0]));
         let outputs = ConcatenateOperation::new(0)
-            .batch(&crate::EagerContext::<TestArray>::new(), &[left, right])
+            .batch(&BatchingContext::new(crate::EagerContext::<TestArray>::new(), 2, None), &[left, right])
             .unwrap();
         assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
         assert_eq!(outputs[0].value().values, vec![1.0, 2.0, 3.0]);
