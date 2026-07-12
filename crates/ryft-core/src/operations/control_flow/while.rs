@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::batching::BatchingTracer;
 use crate::contexts::Context;
@@ -178,11 +179,13 @@ impl<C: Context> WhilePredicate for DifferentiationTracer<C> where C::Value: Boo
 #[derive(Clone)]
 pub struct WhileOperation<V: Value, O, Payload = Captured> {
     /// Condition [`Program`] of this [`WhileOperation`] that maps the current loop state to one scalar Boolean
-    /// predicate.
-    pub(crate) condition: Program<V, O, Vec<V>, Vec<V>>,
+    /// predicate. The program is shared behind an [`Arc`] so that cloning the operation (e.g., while rebuilding or
+    /// transforming a surrounding program) does not deep-clone the nested program.
+    pub(crate) condition: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
-    /// Body [`Program`] of this [`WhileOperation`] that maps the current loop state to the next loop state.
-    pub(crate) body: Program<V, O, Vec<V>, Vec<V>>,
+    /// Body [`Program`] of this [`WhileOperation`] that maps the current loop state to the next loop state. The
+    /// program is shared behind an [`Arc`] for the same reason as [`Self::condition`].
+    pub(crate) body: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Optional semantic iteration bound: when present, the loop runs at most this many iterations by definition,
     /// truncating even while the condition still produces true.
@@ -233,7 +236,7 @@ where
                     .to_string(),
             });
         }
-        Ok(Self { condition, body, iteration_bound: None, marker: PhantomData })
+        Ok(Self { condition: Arc::new(condition), body: Arc::new(body), iteration_bound: None, marker: PhantomData })
     }
 }
 

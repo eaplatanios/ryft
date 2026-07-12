@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::contexts::{Context, StagingContext};
 use crate::effects::Effects;
@@ -60,7 +61,7 @@ pub const SCAN_OPERATION_NAME: &'static str = "scan";
 #[derive(Clone, Debug)]
 pub struct ScanOperation<V: Value, O, C = V, Payload = Captured> {
     /// Body [`Program`] of this [`ScanOperation`] that maps `[carry..., x_slice...]` to `[carry..., y_slice...]`.
-    pub(crate) body: Program<V, O, Vec<V>, Vec<V>>,
+    pub(crate) body: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Captured values used by the body operation payloads.
     ///
@@ -452,7 +453,15 @@ where
         let input_types = body.input_types();
         let output_types = body.output_types();
         <V::Type>::validate_scan_body(input_types.as_slice(), output_types.as_slice(), carry_count, length)?;
-        Ok(Self { body, captures: Vec::new(), carry_count, length, reverse: false, unroll: 1, marker: PhantomData })
+        Ok(Self {
+            body: Arc::new(body),
+            captures: Vec::new(),
+            carry_count,
+            length,
+            reverse: false,
+            unroll: 1,
+            marker: PhantomData,
+        })
     }
 }
 

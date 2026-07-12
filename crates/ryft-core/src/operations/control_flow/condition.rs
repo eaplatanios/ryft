@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::contexts::{Context, StagingContext};
 use crate::effects::Effects;
@@ -41,11 +42,14 @@ pub const CONDITION_OPERATION_NAME: &'static str = "condition";
 /// transposition, and other transforms.
 #[derive(Clone)]
 pub struct ConditionOperation<V: Value, O, F: Value<Type = V::Type> = V, PredicatePayload = Input> {
-    /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true.
-    pub(crate) true_branch: Program<V, O, Vec<V>, Vec<V>>,
+    /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is true. The program
+    /// is shared behind an [`Arc`] so that cloning the operation (e.g., while rebuilding or transforming a
+    /// surrounding program) does not deep-clone the nested program.
+    pub(crate) true_branch: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
-    /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is false.
-    pub(crate) false_branch: Program<V, O, Vec<V>, Vec<V>>,
+    /// Branch [`Program`] of this [`ConditionOperation`] that is evaluated when the predicate is false. The program
+    /// is shared behind an [`Arc`] for the same reason as [`Self::true_branch`].
+    pub(crate) false_branch: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Captured predicate for captured-predicate conditions, or `None` for input-predicate conditions.
     pub(crate) predicate: Option<F>,
@@ -86,7 +90,12 @@ impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> ConditionOperation<V, 
         check_types!("condition branch input", &input_types, &false_branch.input_types());
         let output_types = true_branch.output_types();
         check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self { true_branch, false_branch, predicate: None, predicate_payload: PhantomData })
+        Ok(Self {
+            true_branch: Arc::new(true_branch),
+            false_branch: Arc::new(false_branch),
+            predicate: None,
+            predicate_payload: PhantomData,
+        })
     }
 }
 
@@ -109,7 +118,12 @@ impl<V: Value, O: Operation<V::Type>, F: Value<Type = V::Type>> ConditionOperati
         check_types!("condition branch input", &input_types, &false_branch.input_types());
         let output_types = true_branch.output_types();
         check_types!("condition branch output", &output_types, &false_branch.output_types());
-        Ok(Self { true_branch, false_branch, predicate: Some(predicate), predicate_payload: PhantomData })
+        Ok(Self {
+            true_branch: Arc::new(true_branch),
+            false_branch: Arc::new(false_branch),
+            predicate: Some(predicate),
+            predicate_payload: PhantomData,
+        })
     }
 
     /// Returns the captured Boolean predicate that selects the branch to run.

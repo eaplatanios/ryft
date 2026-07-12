@@ -358,6 +358,110 @@ impl<
         // Constructing through `new` re-validates the rewritten references against the pruned capture table.
         Self::new(program, filtered_captures)
     }
+
+    /// Returns a [`Program`] where the captures have been lifted into explicit leading inputs that are followed by
+    /// the original program inputs. The [`ClosedProgram`] itself is unchanged. The returned program is a derived
+    /// view used by compilation, which supplies arguments in `[captures..., public inputs...]` order.
+    pub fn to_program_with_lifted_captures(
+        &self,
+    ) -> Result<
+        Program<CaptureReference<V::Type>, O, Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>,
+        ProgramError,
+    >
+    where
+        O: Clone,
+    {
+        /// Materializes the rebuilt atom identifiers for `atom_ids`, resolving each atom either through `mapped_atoms`
+        /// (which memoizes the rebuilt identifiers of program inputs and instruction outputs) or, for a captured
+        /// constant, to the leading capture input that `capture_inputs` records for the capture the constant
+        /// references. The `capture_inputs` lookup cannot fail because [`ClosedProgram::new`] validated that
+        /// every [`CaptureReference`] names an existing capture, and one leading input exists per capture.
+        fn map_atoms<T: Type>(
+            atoms: &[Atom<CaptureReference<T>>],
+            mapped_atoms: &[Option<AtomId>],
+            capture_inputs: &[AtomId],
+            atom_ids: &[AtomId],
+        ) -> Result<Vec<AtomId>, ProgramError> {
+            atom_ids
+                .iter()
+                .copied()
+                .map(|atom_id| {
+                    if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
+                        return Ok(mapped);
+                    }
+                    match atoms.get(atom_id.index()) {
+                        Some(Atom::Constant(capture_reference)) => Ok(capture_inputs[capture_reference.index()]),
+                        Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
+                            "variable atom {atom_id} has no mapped input or instruction output",
+                        ))),
+                        None => Err(ProgramError::UnboundAtomId { id: atom_id }),
+                    }
+                })
+                .collect()
+        }
+
+        // Add one leading input per capture, in capture-table order and unconditionally (a capture that no atom
+        // references still occupies its input slot), because execution supplies arguments positionally in
+        // `[captures..., public inputs...]` order. A constant atom referencing capture `k` resolves to
+        // `capture_inputs[k]` during the replay below.
+        let mut builder = ProgramBuilder::new();
+        let capture_inputs = self
+            .captures
+            .iter()
+            .map(|capture| builder.add_input(capture.r#type().into_owned()))
+            .collect::<Vec<_>>();
+
+        // The original program inputs follow the capture inputs and must be re-added before any instruction is replayed
+        // so that instruction operands referencing them resolve through `mapped_atoms` instead of being treated as
+        // unmapped atoms. `mapped_atoms` tracks the rebuilt `AtomId` of every source atom so that an atom shared across
+        // instructions maps to a single rebuilt atom instead of being duplicated.
+        let mut mapped_atoms = vec![None; self.program.atoms().len()];
+        for input_id in self.program.input_ids().iter().copied() {
+            let input =
+                self.program.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
+            let Atom::Variable(input_type) = input else {
+                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
+            };
+            mapped_atoms[input_id.index()] = Some(builder.add_input(input_type.clone()));
+        }
+
+        // Replay the instructions in order, mapping their operands and recording their rebuilt outputs so that later
+        // instructions (and the program outputs) can resolve them. This borrows `self`, and so the operations are
+        // cloned into the rebuilt program (cheaply, since operations share their nested programs).
+        for instruction in self.program.instructions() {
+            let inputs = map_atoms(
+                self.program.atoms(),
+                mapped_atoms.as_slice(),
+                capture_inputs.as_slice(),
+                instruction.inputs(),
+            )?;
+            let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
+            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
+            for (source_output, rebuilt_output) in instruction.outputs().iter().copied().zip(outputs) {
+                let mapped = mapped_atoms
+                    .get_mut(source_output.index())
+                    .ok_or(ProgramError::UnboundAtomId { id: source_output })?;
+                *mapped = Some(rebuilt_output);
+            }
+        }
+
+        // Program outputs may be original inputs, instruction outputs, or captured constants,
+        // and so they are resolved through the same atom mapping as instruction operands.
+        let output_ids = map_atoms(
+            self.program.atoms(),
+            mapped_atoms.as_slice(),
+            capture_inputs.as_slice(),
+            self.program.output_ids(),
+        )?;
+
+        // The lifted program is flat. Its input and output boundaries are placeholder vectors sized to the
+        // `[captures..., public inputs...]` argument convention and the original outputs, respectively.
+        builder.build::<Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>(
+            output_ids,
+            vec![Placeholder; self.captures.len() + self.program.input_ids().len()],
+            vec![Placeholder; self.program.output_ids().len()],
+        )
+    }
 }
 
 impl<
@@ -386,89 +490,6 @@ impl<V: Value, O, Input: Parameterized<CaptureReference<V::Type>>, Output: Param
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-impl<
-    V: Value,
-    O: Clone + Operation<V::Type>,
-    Input: Parameterized<CaptureReference<V::Type>>,
-    Output: Parameterized<CaptureReference<V::Type>>,
-> ClosedProgram<V, O, Input, Output>
-{
-    /// Returns a [`Program`] where the captures have been lifted into explicit leading inputs that are followed by the
-    /// original program inputs. The [`ClosedProgram`] itself is unchanged: the returned program is a derived view
-    /// used by compilation, which supplies arguments in `[captures..., public inputs...]` order.
-    pub fn to_program_with_lifted_captures(
-        &self,
-    ) -> Result<
-        Program<CaptureReference<V::Type>, O, Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>,
-        ProgramError,
-    > {
-        fn map_atom<T: Type>(
-            atoms: &[Atom<CaptureReference<T>>],
-            mapped_atoms: &[Option<AtomId>],
-            capture_inputs: &[AtomId],
-            atom_id: AtomId,
-        ) -> Result<AtomId, ProgramError> {
-            if let Some(mapped) = mapped_atoms.get(atom_id.index()).copied().flatten() {
-                return Ok(mapped);
-            }
-            match atoms.get(atom_id.index()) {
-                Some(Atom::Constant(capture_reference)) => Ok(capture_inputs[capture_reference.index()]),
-                Some(Atom::Variable(_)) => Err(ProgramError::MalformedProgram(format!(
-                    "variable atom {atom_id} has no mapped input or instruction output",
-                ))),
-                None => Err(ProgramError::UnboundAtomId { id: atom_id }),
-            }
-        }
-
-        let mut builder = ProgramBuilder::new();
-        let capture_inputs = self
-            .captures
-            .iter()
-            .map(|capture| builder.add_input(capture.r#type().into_owned()))
-            .collect::<Vec<_>>();
-        let mut mapped_atoms = vec![None; self.program.atoms().len()];
-
-        for input_id in self.program.input_ids().iter().copied() {
-            let input =
-                self.program.atoms().get(input_id.index()).ok_or(ProgramError::UnboundAtomId { id: input_id })?;
-            let Atom::Variable(input_type) = input else {
-                return Err(ProgramError::MalformedProgram("program input atom was not a variable".to_string()));
-            };
-            mapped_atoms[input_id.index()] = Some(builder.add_input(input_type.clone()));
-        }
-
-        for instruction in self.program.instructions() {
-            let inputs = instruction
-                .inputs()
-                .iter()
-                .copied()
-                .map(|input| map_atom(self.program.atoms(), mapped_atoms.as_slice(), capture_inputs.as_slice(), input))
-                .collect::<Result<Vec<_>, _>>()?;
-            let outputs = builder.add_instruction(instruction.operation().clone(), inputs)?.to_vec();
-            check_count!("output", outputs, instruction.outputs().len(), ProgramError);
-            for (source_output, rebuilt_output) in instruction.outputs().iter().copied().zip(outputs) {
-                let mapped = mapped_atoms
-                    .get_mut(source_output.index())
-                    .ok_or(ProgramError::UnboundAtomId { id: source_output })?;
-                *mapped = Some(rebuilt_output);
-            }
-        }
-
-        let output_ids = self
-            .program
-            .output_ids()
-            .iter()
-            .copied()
-            .map(|output| map_atom(self.program.atoms(), mapped_atoms.as_slice(), capture_inputs.as_slice(), output))
-            .collect::<Result<Vec<_>, _>>()?;
-        builder.build::<Vec<CaptureReference<V::Type>>, Vec<CaptureReference<V::Type>>>(
-            output_ids,
-            vec![Placeholder; self.captures.len() + self.program.input_ids().len()],
-            vec![Placeholder; self.program.output_ids().len()],
-        )
-    }
-}
 
 #[cfg(test)]
 mod tests {

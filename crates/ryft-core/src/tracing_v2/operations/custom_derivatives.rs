@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::batching::BatchingContext;
 use crate::batching::{
@@ -40,11 +41,13 @@ use crate::types::{ArrayType, TypeError, Typed};
 /// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
 pub struct CustomJvpOperation<V: Value, O> {
-    /// Program computing the primal outputs from the primal inputs.
-    primal: Program<V, O, Vec<V>, Vec<V>>,
+    /// Program computing the primal outputs from the primal inputs. The program is shared behind an [`Arc`] so
+    /// that cloning the operation does not deep-clone the nested program.
+    primal: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
-    /// Program computing `(outputs..., output_tangents...)` from `(inputs..., input_tangents...)`.
-    jvp: Program<V, O, Vec<V>, Vec<V>>,
+    /// Program computing `(outputs..., output_tangents...)` from `(inputs..., input_tangents...)`. The program is
+    /// shared behind an [`Arc`] for the same reason as [`Self::primal`].
+    jvp: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 }
 
 impl<V: Value, O: Operation<V::Type>> CustomJvpOperation<V, O> {
@@ -58,7 +61,7 @@ impl<V: Value, O: Operation<V::Type>> CustomJvpOperation<V, O> {
         check_types!("custom_jvp rule input", &expected_jvp_input_types, &jvp.input_types());
         let expected_jvp_output_types: Vec<V::Type> = output_types.iter().chain(output_types.iter()).cloned().collect();
         check_types!("custom_jvp rule output", &expected_jvp_output_types, &jvp.output_types());
-        Ok(Self { primal, jvp })
+        Ok(Self { primal: Arc::new(primal), jvp: Arc::new(jvp) })
     }
 
     /// Returns the primal program.
@@ -337,14 +340,17 @@ where
 /// been consumed by linearization) inlines the primal program through the standard per-operation batching rules.
 #[derive(Clone, Debug)]
 pub struct CustomVjpOperation<V: Value, O> {
-    /// Program computing the primal outputs from the primal inputs.
-    primal: Program<V, O, Vec<V>, Vec<V>>,
+    /// Program computing the primal outputs from the primal inputs. The program is shared behind an [`Arc`] so
+    /// that cloning the operation does not deep-clone the nested program.
+    primal: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
-    /// Program computing `(outputs..., residuals...)` from the primal inputs.
-    forward: Program<V, O, Vec<V>, Vec<V>>,
+    /// Program computing `(outputs..., residuals...)` from the primal inputs. The program is shared behind an
+    /// [`Arc`] for the same reason as [`Self::primal`].
+    forward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
-    /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`.
-    backward: Program<V, O, Vec<V>, Vec<V>>,
+    /// Program computing one input cotangent per primal input from `(residuals..., output_cotangents...)`. The
+    /// program is shared behind an [`Arc`] for the same reason as [`Self::primal`].
+    backward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 }
 
 impl<V: Value, O: Operation<V::Type>> CustomVjpOperation<V, O> {
@@ -376,7 +382,7 @@ impl<V: Value, O: Operation<V::Type>> CustomVjpOperation<V, O> {
             residual_types.iter().chain(output_types.iter()).cloned().collect();
         check_types!("custom_vjp backward input", &expected_backward_input_types, &backward.input_types(),);
         check_types!("custom_vjp backward output", &input_types, &backward.output_types());
-        Ok(Self { primal, forward, backward })
+        Ok(Self { primal: Arc::new(primal), forward: Arc::new(forward), backward: Arc::new(backward) })
     }
 
     /// Returns the primal program.
@@ -534,8 +540,9 @@ impl<V: Value> CustomVjpResidual<V> for V {
 /// incoming output cotangents.
 #[derive(Clone, Debug)]
 pub struct CustomVjpCallOperation<V: Value, O, F: Value<Type = V::Type>> {
-    /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
-    backward: Program<V, O, Vec<V>, Vec<V>>,
+    /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents. The
+    /// program is shared behind an [`Arc`] so that cloning the operation does not deep-clone the nested program.
+    backward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Captured residual factors consumed by the backward program.
     residuals: Vec<F>,
@@ -548,7 +555,7 @@ impl<V: Value, F: Value<Type = V::Type>, O> CustomVjpCallOperation<V, O, F> {
     /// Creates a custom-VJP call. Use `transposed = false` for the opaque pushforward form and `transposed = true` for
     /// the executable pullback form.
     pub fn new(backward: Program<V, O, Vec<V>, Vec<V>>, residuals: Vec<F>, transposed: bool) -> Self {
-        Self { backward, residuals, transposed }
+        Self { backward: Arc::new(backward), residuals, transposed }
     }
 
     /// Returns the user's backward program.
@@ -853,7 +860,7 @@ where
             .map(|input| input.tangent().clone().materialize(context))
             .collect::<Result<Vec<_>, _>>()?;
         carrier_operands.extend(residuals);
-        let carrier = CustomVjpTangentOperation::new(self.backward.clone(), residual_count, false);
+        let carrier = CustomVjpTangentOperation { backward: self.backward.clone(), residual_count, transposed: false };
         let output_tangents = context.bind(carrier, &carrier_operands)?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
@@ -904,8 +911,9 @@ where
 /// output cotangents, producing the input cotangents — so reverse mode uses exactly the user-supplied gradient.
 #[derive(Clone, Debug)]
 pub struct CustomVjpTangentOperation<V: Value, O> {
-    /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents.
-    backward: Program<V, O, Vec<V>, Vec<V>>,
+    /// The user's backward program, mapping `(residuals..., output_cotangents...)` to input cotangents. The
+    /// program is shared behind an [`Arc`] so that cloning the operation does not deep-clone the nested program.
+    backward: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Number of residual operands, used to split the backward program's inputs into the residual prefix and the
     /// output-cotangent suffix.
@@ -925,7 +933,7 @@ impl<V: Value, O> CustomVjpTangentOperation<V, O> {
     ///   - `residual_count`: Number of trailing residual operands carried alongside the tangents.
     ///   - `transposed`: Whether this carrier is in its transposed (pullback) form.
     pub fn new(backward: Program<V, O, Vec<V>, Vec<V>>, residual_count: usize, transposed: bool) -> Self {
-        Self { backward, residual_count, transposed }
+        Self { backward: Arc::new(backward), residual_count, transposed }
     }
 
     /// Returns the user's backward program.
