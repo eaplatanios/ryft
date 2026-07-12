@@ -16,7 +16,7 @@ use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
     SubOperation,
 };
-use ryft_core::operations::math::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
+use ryft_core::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use ryft_core::operations::{BooleanLike, Operation};
 use ryft_core::parameters::Parameterized;
 use ryft_core::programs::{AtomId, Instruction, Program, ProgramError, Value};
@@ -416,7 +416,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Atan2Oper
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ExponentialOperation {
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for ExpOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -433,7 +433,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Exponenti
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogarithmOperation {
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for LogOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -449,7 +449,7 @@ impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for Logarithm
     }
 }
 
-impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SquareRootOperation {
+impl<V: MlirLowerableValue + BooleanLike> LowerableXlaOperation<V> for SqrtOperation {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
         input_values: &[ValueRef<'b, 'c, 't>],
@@ -945,21 +945,21 @@ where
                 mode,
                 lowerer,
             ),
-            Self::Exponential(operation) => <ExponentialOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Exp(operation) => <ExpOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::Logarithm(operation) => <LogarithmOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Log(operation) => <LogOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            Self::SquareRoot(operation) => <SquareRootOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            Self::Sqrt(operation) => <SqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -1541,23 +1541,21 @@ where
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Exponential(operation) => {
-                <ExponentialOperation as LowerableXlaOperation<V>>::lower_to_mlir(
-                    operation,
-                    input_values,
-                    output_types,
-                    mode,
-                    lowerer,
-                )
-            }
-            ArrayOperation::Logarithm(operation) => <LogarithmOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Exp(operation) => <ExpOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
                 mode,
                 lowerer,
             ),
-            ArrayOperation::SquareRoot(operation) => <SquareRootOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+            ArrayOperation::Log(operation) => <LogOperation as LowerableXlaOperation<V>>::lower_to_mlir(
+                operation,
+                input_values,
+                output_types,
+                mode,
+                lowerer,
+            ),
+            ArrayOperation::Sqrt(operation) => <SqrtOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
                 output_types,
@@ -4168,7 +4166,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.atan2 should return one result").as_ref()])
         }
-        XlaOperation::Exponential(_) => {
+        XlaOperation::Exp(_) => {
             let result = lowerer.block.append_operation(stable_hlo::exponential(
                 input_values[0],
                 Accuracy::Default,
@@ -4176,7 +4174,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.exponential should return one result").as_ref()])
         }
-        XlaOperation::Logarithm(_) => {
+        XlaOperation::Log(_) => {
             let result = lowerer.block.append_operation(stable_hlo::log(
                 input_values[0],
                 Accuracy::Default,
@@ -4184,7 +4182,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             )?)?;
             Ok(vec![result.result(0).expect("stablehlo.log should return one result").as_ref()])
         }
-        XlaOperation::SquareRoot(_) => {
+        XlaOperation::Sqrt(_) => {
             let result = lowerer.block.append_operation(stable_hlo::sqrt(
                 input_values[0],
                 Accuracy::Default,

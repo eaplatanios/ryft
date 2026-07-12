@@ -26,7 +26,7 @@ use crate::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
     SubOperation,
 };
-use crate::operations::math::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
+use crate::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use crate::operations::tag::{MaybeTag, TagOperation};
 use crate::programs::Value;
@@ -76,9 +76,9 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Sin(SinOperation),
     Cos(CosOperation),
     Atan2(Atan2Operation),
-    Exponential(ExponentialOperation),
-    Logarithm(LogarithmOperation),
-    SquareRoot(SquareRootOperation),
+    Exp(ExpOperation),
+    Log(LogOperation),
+    Sqrt(SqrtOperation),
     Abs(AbsOperation),
     Complex(ComplexOperation),
     Conjugate(ConjugateOperation),

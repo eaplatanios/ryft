@@ -35,7 +35,7 @@ use crate::operations::manipulation::{
 use crate::operations::math::Abs;
 use crate::operations::math::Atan2;
 use crate::operations::math::{Add, Cos, Div, Mul, Neg, Sin, Sub};
-use crate::operations::math::{Exponential, Logarithm, SquareRoot};
+use crate::operations::math::{Exp, Log, Sqrt};
 use crate::operations::tag::Tag;
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
@@ -501,20 +501,20 @@ impl Cos for TestArray {
     }
 }
 
-impl Exponential for TestArray {
-    fn exponential(&self) -> Result<Self, ProgramError> {
+impl Exp for TestArray {
+    fn exp(&self) -> Result<Self, ProgramError> {
         Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::exp).collect() })
     }
 }
 
-impl Logarithm for TestArray {
-    fn logarithm(&self) -> Result<Self, ProgramError> {
+impl Log for TestArray {
+    fn log(&self) -> Result<Self, ProgramError> {
         Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::ln).collect() })
     }
 }
 
-impl SquareRoot for TestArray {
-    fn square_root(&self) -> Result<Self, ProgramError> {
+impl Sqrt for TestArray {
+    fn sqrt(&self) -> Result<Self, ProgramError> {
         Ok(Self { r#type: self.r#type.clone(), values: self.values.iter().copied().map(f64::sqrt).collect() })
     }
 }

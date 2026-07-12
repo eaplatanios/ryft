@@ -36,7 +36,7 @@ use ryft_core::operations::math::{
     AbsOperation, AddOperation, Atan2Operation, CosOperation, DivOperation, MulOperation, NegOperation, SinOperation,
     SubOperation,
 };
-use ryft_core::operations::math::{ExponentialOperation, LogarithmOperation, SquareRootOperation};
+use ryft_core::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use ryft_core::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
 use ryft_core::operations::{BooleanLike, Operation, OperationFormatter};
 use ryft_core::partial::{
@@ -95,9 +95,9 @@ pub enum XlaOperation<V: Value<Type = ArrayType> = XlaConstant> {
     Sin(SinOperation),
     Cos(CosOperation),
     Atan2(Atan2Operation),
-    Exponential(ExponentialOperation),
-    Logarithm(LogarithmOperation),
-    SquareRoot(SquareRootOperation),
+    Exp(ExpOperation),
+    Log(LogOperation),
+    Sqrt(SqrtOperation),
     Abs(AbsOperation),
     Complex(ComplexOperation),
     Conjugate(ConjugateOperation),
@@ -191,9 +191,9 @@ where
             ArrayOperation::Sin(operation) => Self::Sin(operation),
             ArrayOperation::Cos(operation) => Self::Cos(operation),
             ArrayOperation::Atan2(operation) => Self::Atan2(operation),
-            ArrayOperation::Exponential(operation) => Self::Exponential(operation),
-            ArrayOperation::Logarithm(operation) => Self::Logarithm(operation),
-            ArrayOperation::SquareRoot(operation) => Self::SquareRoot(operation),
+            ArrayOperation::Exp(operation) => Self::Exp(operation),
+            ArrayOperation::Log(operation) => Self::Log(operation),
+            ArrayOperation::Sqrt(operation) => Self::Sqrt(operation),
             ArrayOperation::Abs(operation) => Self::Abs(operation),
             ArrayOperation::Complex(operation) => Self::Complex(operation),
             ArrayOperation::Conjugate(operation) => Self::Conjugate(operation),

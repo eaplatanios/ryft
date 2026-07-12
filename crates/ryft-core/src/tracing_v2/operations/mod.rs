@@ -22,7 +22,7 @@ pub mod complex;
 /// Elementwise cosine differentiation rules.
 pub mod cos;
 
-/// Elementwise exponential, logarithm, and square-root differentiation rules.
+/// Elementwise exponential, log, and square-root differentiation rules.
 pub mod exponential;
 
 /// Value-level identity helpers and built-in scalar constant traits.

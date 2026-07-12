@@ -20,13 +20,12 @@ use crate::operations::control_flow::{
 };
 use crate::operations::debugging::PrintOperation;
 use crate::operations::differentiation::{StopGradient, StopGradientOperation};
+use crate::operations::logical::{And, AndOperation, Not, NotOperation, Or, OrOperation, Xor, XorOperation};
 use crate::operations::math::{
     Abs, AbsOperation, Add, AddOperation, Atan2, Atan2Operation, Cos, CosOperation, Div, DivOperation, Mul,
     MulOperation, Neg, NegOperation, Sin, SinOperation, Sub, SubOperation,
 };
-use crate::operations::math::{
-    Exponential, ExponentialOperation, Logarithm, LogarithmOperation, SquareRoot, SquareRootOperation,
-};
+use crate::operations::math::{Exp, ExpOperation, Log, LogOperation, Sqrt, SqrtOperation};
 use crate::operations::tag::{MaybeTag, Tag, TagOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
@@ -64,14 +63,18 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
     Sin(SinOperation),
     Cos(CosOperation),
     Atan2(Atan2Operation),
-    Exponential(ExponentialOperation),
-    Logarithm(LogarithmOperation),
-    SquareRoot(SquareRootOperation),
+    Exp(ExpOperation),
+    Log(LogOperation),
+    Sqrt(SqrtOperation),
     Complex(ComplexOperation),
     Conjugate(ConjugateOperation),
     Real(RealOperation),
     Imaginary(ImaginaryOperation),
     Compare(CompareOperation),
+    And(AndOperation),
+    Or(OrOperation),
+    Xor(XorOperation),
+    Not(NotOperation),
     Select(SelectOperation),
     While(Box<WhileOperation<V, Self>>),
     StopGradient(StopGradientOperation),
@@ -897,6 +900,89 @@ impl_binary_arithmetic_for_scalar!(Sub, sub, -);
 impl_binary_arithmetic_for_scalar!(Mul, mul, *);
 impl_binary_arithmetic_for_scalar!(Div, div, /);
 
+/// Implements a fallible binary logical capability (e.g., [`And`]) together with its panicking [`std::ops`]
+/// counterpart (e.g., [`std::ops::BitAnd`]) for [`Scalar`]. Boolean operands combine logically and same-variant
+/// integer operands combine bitwise (the two semantics that StableHLO's logical operations also serve); any other
+/// combination returns a [`TypeError`].
+macro_rules! impl_binary_logical_for_scalar {
+    ($trait:ident, $std_trait:ident, $method:ident, $std_method:ident, $operator:tt) => {
+        impl $trait for Scalar {
+            #[inline]
+            fn $method(&self, rhs: &Scalar) -> Result<Scalar, ProgramError> {
+                Ok(match (*self, *rhs) {
+                    (Scalar::Bool(left), Scalar::Bool(right)) => Scalar::Bool(left $operator right),
+                    (Scalar::I8(left), Scalar::I8(right)) => Scalar::I8(left $operator right),
+                    (Scalar::I16(left), Scalar::I16(right)) => Scalar::I16(left $operator right),
+                    (Scalar::I32(left), Scalar::I32(right)) => Scalar::I32(left $operator right),
+                    (Scalar::I64(left), Scalar::I64(right)) => Scalar::I64(left $operator right),
+                    (Scalar::U8(left), Scalar::U8(right)) => Scalar::U8(left $operator right),
+                    (Scalar::U16(left), Scalar::U16(right)) => Scalar::U16(left $operator right),
+                    (Scalar::U32(left), Scalar::U32(right)) => Scalar::U32(left $operator right),
+                    (Scalar::U64(left), Scalar::U64(right)) => Scalar::U64(left $operator right),
+                    (left, right) => {
+                        return Err(TypeError {
+                            message: format!(
+                                "cannot apply `{}` to scalars of data types {} and {}",
+                                stringify!($method),
+                                left.r#type(),
+                                right.r#type(),
+                            ),
+                        }
+                        .into());
+                    }
+                })
+            }
+        }
+
+        impl std::ops::$std_trait for Scalar {
+            type Output = Scalar;
+
+            #[inline]
+            fn $std_method(self, rhs: Scalar) -> Scalar {
+                $trait::$method(&self, &rhs).unwrap_or_else(|error| panic!("{error}"))
+            }
+        }
+    };
+}
+
+impl_binary_logical_for_scalar!(And, BitAnd, and, bitand, &);
+impl_binary_logical_for_scalar!(Or, BitOr, or, bitor, |);
+impl_binary_logical_for_scalar!(Xor, BitXor, xor, bitxor, ^);
+
+impl Not for Scalar {
+    /// Computes the elementwise negation of this [`Scalar`]. A Boolean scalar negates logically and an integer scalar
+    /// negates bitwise (the two semantics that StableHLO's `not` operation also serves); any other variant returns a
+    /// [`TypeError`].
+    fn not(&self) -> Result<Self, ProgramError> {
+        Ok(match self {
+            Scalar::Bool(value) => Scalar::Bool(!value),
+            Scalar::I8(value) => Scalar::I8(!value),
+            Scalar::I16(value) => Scalar::I16(!value),
+            Scalar::I32(value) => Scalar::I32(!value),
+            Scalar::I64(value) => Scalar::I64(!value),
+            Scalar::U8(value) => Scalar::U8(!value),
+            Scalar::U16(value) => Scalar::U16(!value),
+            Scalar::U32(value) => Scalar::U32(!value),
+            Scalar::U64(value) => Scalar::U64(!value),
+            other => {
+                return Err(TypeError {
+                    message: format!("cannot apply `not` to a scalar of data type {}", other.r#type()),
+                }
+                .into());
+            }
+        })
+    }
+}
+
+impl std::ops::Not for Scalar {
+    type Output = Scalar;
+
+    #[inline]
+    fn not(self) -> Scalar {
+        Not::not(&self).unwrap_or_else(|error| panic!("{error}"))
+    }
+}
+
 // TODO(eaplatanios): Review from here onwards.
 
 impl Sin for Scalar {
@@ -1021,11 +1107,11 @@ impl Imaginary for Scalar {
     }
 }
 
-impl Exponential for Scalar {
+impl Exp for Scalar {
     /// Computes the elementwise natural exponential of this [`Scalar`]. Only the floating-point and complex variants
     /// support the exponential (the complex exponential being the analytic continuation `e^z`); any other variant
     /// returns a [`TypeError`].
-    fn exponential(&self) -> Result<Self, ProgramError> {
+    fn exp(&self) -> Result<Self, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).exp());
         }
@@ -1046,11 +1132,11 @@ impl Exponential for Scalar {
     }
 }
 
-impl Logarithm for Scalar {
+impl Log for Scalar {
     /// Computes the elementwise natural logarithm of this [`Scalar`]. Only the floating-point and complex variants
     /// support the logarithm (the complex logarithm being the principal branch `ln(z)`); any other variant returns a
     /// [`TypeError`].
-    fn logarithm(&self) -> Result<Self, ProgramError> {
+    fn log(&self) -> Result<Self, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).ln());
         }
@@ -1071,11 +1157,11 @@ impl Logarithm for Scalar {
     }
 }
 
-impl SquareRoot for Scalar {
+impl Sqrt for Scalar {
     /// Computes the elementwise square root of this [`Scalar`]. Only the floating-point and complex variants support
     /// the square root (the complex square root being the principal branch `√z`); any other variant returns a
     /// [`TypeError`].
-    fn square_root(&self) -> Result<Self, ProgramError> {
+    fn sqrt(&self) -> Result<Self, ProgramError> {
         if let Some((r#type, bits)) = self.low_precision_float_parts() {
             return Self::encode_low_precision_float(r#type, Self::decode_low_precision_float(r#type, bits).sqrt());
         }
@@ -1646,6 +1732,57 @@ mod tests {
         // Interpreting the staged program exercises the in-band Boolean condition encoding of scalar values.
         assert_eq!(program.interpret((Scalar::from(3.0), Scalar::from(2.0))), Ok(Scalar::from(6.0)));
         assert_eq!(program.interpret((Scalar::from(1.0), Scalar::from(2.0))), Ok(Scalar::from(2.0)));
+    }
+
+    #[test]
+    fn test_scalar_logical_operations() {
+        // Boolean scalars combine logically and integer scalars combine bitwise, through both the fallible
+        // capabilities and the `std::ops` operator sugar layered on top of them.
+        assert_eq!(Scalar::from(true) & Scalar::from(false), Scalar::from(false));
+        assert_eq!(Scalar::from(true) | Scalar::from(false), Scalar::from(true));
+        assert_eq!(Scalar::from(true) ^ Scalar::from(true), Scalar::from(false));
+        assert_eq!(!Scalar::from(true), Scalar::from(false));
+        assert_eq!(Scalar::from(0b1100_u8) & Scalar::from(0b1010_u8), Scalar::from(0b1000_u8));
+        assert_eq!(Scalar::from(0b1100_u8) | Scalar::from(0b1010_u8), Scalar::from(0b1110_u8));
+        assert_eq!(Scalar::from(0b1100_u8) ^ Scalar::from(0b1010_u8), Scalar::from(0b0110_u8));
+        assert_eq!(!Scalar::from(0b1100_u8), Scalar::from(!0b1100_u8));
+
+        // Mismatched and unsupported data types surface `TypeError`s through the fallible capabilities.
+        assert!(And::and(&Scalar::from(true), &Scalar::from(1.0)).is_err());
+        assert!(Or::or(&Scalar::from(1.0), &Scalar::from(2.0)).is_err());
+        assert!(Xor::xor(&Scalar::from(0b1100_u8), &Scalar::from(0b1010_u16)).is_err());
+        assert!(Not::not(&Scalar::from(1.0)).is_err());
+
+        // `f(x, y) = not((x > y or x < y) xor (x > y and x < y))`, which reduces to `x == y`, staged through
+        // `ScalarOperation` tracers so that all four logical operations appear in one scalar program.
+        let (output_type, program) = EagerContext::<Scalar, ScalarOperation<Scalar>>::trace(
+            |(x, y)| {
+                let greater = x.clone().greater_than(&y)?;
+                let less = x.less_than(&y)?;
+                Ok(!((greater.clone() | less.clone()) ^ (greater & less)))
+            },
+            (DataType::F64, DataType::F64),
+        )
+        .unwrap();
+        assert_eq!(output_type, DataType::Boolean);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64, %1:f64 .
+                let %2:bool = compare [direction=GreaterThan] %0 %1
+                    %3:bool = compare [direction=LessThan] %0 %1
+                    %4:bool = or %2 %3
+                    %5:bool = and %2 %3
+                    %6:bool = xor %4 %5
+                    %7:bool = not %6
+                in (%7)
+            "}
+            .trim_end(),
+        );
+
+        // Interpreting the staged program replays the logical operations on concrete scalars.
+        assert_eq!(program.interpret((Scalar::from(3.0), Scalar::from(2.0))), Ok(Scalar::from(false)));
+        assert_eq!(program.interpret((Scalar::from(2.0), Scalar::from(2.0))), Ok(Scalar::from(true)));
     }
 
     #[test]

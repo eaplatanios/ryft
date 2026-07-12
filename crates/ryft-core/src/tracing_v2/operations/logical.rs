@@ -6,7 +6,7 @@ use crate::operations::logical::{AndOperation, NotOperation, OrOperation, XorOpe
 use crate::partial::PartialValue;
 use crate::programs::{MaybeZero, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
-use crate::types::ArrayType;
+use crate::types::Type;
 
 /// Implements the erroring [`TransposableOperation`] rule for Boolean-codomain logical operations: they are not
 /// linear maps, so a tangent program never contains them on a linear operand (their forwards pair the replayed
@@ -14,7 +14,10 @@ use crate::types::ArrayType;
 /// [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
 macro_rules! logical_unsupported_transpose {
     ($operation:ty) => {
-        impl<V: Value<Type = ArrayType>, O: Operation<ArrayType>> TransposableOperation<V, O> for $operation {
+        impl<T: Type, V: Value<Type = T>, O: Operation<T>> TransposableOperation<V, O> for $operation
+        where
+            $operation: Operation<T>,
+        {
             fn transpose(
                 &self,
                 _context: &mut TracingContext<V, O>,
@@ -26,7 +29,7 @@ macro_rules! logical_unsupported_transpose {
                     // both the `DataType` and the `ArrayType` type universes.
                     message: format!(
                         "operation `{}` has no partition-aware transpose rule",
-                        Operation::<ArrayType>::name(self),
+                        Operation::<T>::name(self),
                     ),
                 }
                 .into())
@@ -42,10 +45,10 @@ logical_unsupported_transpose!(XorOperation);
 
 /// Forward-mode rule for [`NotOperation`]: a Boolean output has no tangent, so the primal operation is replayed
 /// on the input primals and paired with a canonical typed zero tangent.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for NotOperation
+impl<C: Context> DifferentiableOperation<C> for NotOperation
 where
     C::Operation: Clone + From<NotOperation>,
-    NotOperation: Operation<ArrayType>,
+    NotOperation: Operation<C::Type>,
 {
     fn jvp(
         &self,
@@ -65,10 +68,10 @@ where
 
 /// Forward-mode rule for [`AndOperation`]: a Boolean output has no tangent, so the primal operation is replayed
 /// on the input primals and paired with a canonical typed zero tangent.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for AndOperation
+impl<C: Context> DifferentiableOperation<C> for AndOperation
 where
     C::Operation: Clone + From<AndOperation>,
-    AndOperation: Operation<ArrayType>,
+    AndOperation: Operation<C::Type>,
 {
     fn jvp(
         &self,
@@ -88,10 +91,10 @@ where
 
 /// Forward-mode rule for [`OrOperation`]: a Boolean output has no tangent, so the primal operation is replayed on
 /// the input primals and paired with a canonical typed zero tangent.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for OrOperation
+impl<C: Context> DifferentiableOperation<C> for OrOperation
 where
     C::Operation: Clone + From<OrOperation>,
-    OrOperation: Operation<ArrayType>,
+    OrOperation: Operation<C::Type>,
 {
     fn jvp(
         &self,
@@ -111,10 +114,10 @@ where
 
 /// Forward-mode rule for [`XorOperation`]: a Boolean output has no tangent, so the primal operation is replayed
 /// on the input primals and paired with a canonical typed zero tangent.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for XorOperation
+impl<C: Context> DifferentiableOperation<C> for XorOperation
 where
     C::Operation: Clone + From<XorOperation>,
-    XorOperation: Operation<ArrayType>,
+    XorOperation: Operation<C::Type>,
 {
     fn jvp(
         &self,
