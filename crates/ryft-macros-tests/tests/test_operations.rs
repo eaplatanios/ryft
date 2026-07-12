@@ -1,9 +1,11 @@
-// TODO(eaplatanios): Review this module.
-
-//! Tests for the `#[derive(Operation)]` procedural macro.
+//! Tests for the `#[derive(Operation)]`, `#[derive(BatchableOperation)]`, `#[derive(DifferentiableOperation)]`, and
+//! `#[derive(TransposableOperation)]` procedural macros.
 //!
-//! These tests define local stand-in traits and types that mirror the shapes the derive emits against. That keeps the
-//! macro test focused on generated code rather than on the current `ryft-core` implementation details.
+//! These tests define local stand-in traits and types that mirror the shapes the derives emit against. That keeps the
+//! macro tests focused on generated code rather than on the current `ryft-core` implementation details. The fixtures
+//! and tests are grouped and ordered by the traits the derives generate: [`Operation`] together with its
+//! [`InterpretableOperation`] and [`PartiallyEvaluatableOperation`](partial::PartiallyEvaluatableOperation)
+//! companions, then [`BatchableOperation`], [`DifferentiableOperation`], and [`TransposableOperation`].
 
 #![allow(private_interfaces, dead_code)]
 
@@ -793,120 +795,6 @@ fn test_operation_generates_effects_forwarding() {
     assert_eq!(print.effects(), Effects::Ordered);
 }
 
-#[test]
-fn test_operation_generates_interpretation_forwarding() {
-    let context = TestContext::<ScalarFactor> { marker: PhantomData };
-    let operation = ScalarOperation::<ScalarFactor>::from(AddOperation);
-
-    assert_eq!(
-        operation.interpret(&context, &[ScalarFactor(1), ScalarFactor(2)]),
-        Ok(vec![ScalarFactor(1), ScalarFactor(2)]),
-    );
-}
-
-#[test]
-fn test_operation_generates_captured_program_interpretation_witness() {
-    type Operation = ScalarOperation<ScalarFactor>;
-
-    let context = TestContext::<ScalarFactor> { marker: PhantomData };
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "scalar",
-        constant: Some(ScalarFactor(3)),
-        operation: Some(Operation::from(AddOperation)),
-        marker: PhantomData,
-    };
-    let outputs = <Operation as InterpretableProgramOperation<
-        ScalarFactor,
-        TestContext<ScalarFactor>,
-        ScalarFactor,
-    >>::interpret_program(&context, &program, vec![ScalarFactor(1)])
-    .unwrap();
-
-    assert_eq!(outputs, vec![ScalarFactor(1), ScalarFactor(3)]);
-}
-
-#[test]
-fn test_operation_generates_direct_program_interpretation_witness() {
-    type Operation = LinearScalarOperation<ScalarFactor>;
-
-    let context = TestContext::<ScalarFactor> { marker: PhantomData };
-    let operation = Operation::from(FactorOperation { factor: ScalarFactor(5), marker: PhantomData });
-
-    assert_eq!(operation.interpret(&context, &[ScalarFactor(8)]), Ok(vec![ScalarFactor(8)]));
-
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "linear",
-        constant: Some(ScalarFactor(13)),
-        operation: Some(Operation::from(AddOperation)),
-        marker: PhantomData,
-    };
-    let outputs =
-        <Operation as InterpretableProgramOperation<ScalarFactor, TestContext<ScalarFactor>>>::interpret_program(
-            &context,
-            &program,
-            vec![ScalarFactor(8)],
-        )
-        .unwrap();
-
-    assert_eq!(outputs, vec![ScalarFactor(8), ScalarFactor(13)]);
-}
-
-#[test]
-fn test_operation_generates_partial_evaluation_witness() {
-    fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
-
-    // The derive now forwards partial evaluation for every variant, so each enum must satisfy the per-operation
-    // partial-evaluation trait at any known-side context pinned to its program-constant value type and to itself as
-    // the residual operation family. This covers leaf payloads, the generic `Backend` payload, and the boxed
-    // nested-program payloads.
-    assert_partially_evaluatable::<
-        TestContext<ScalarFactor, ScalarOperation<ScalarFactor>>,
-        ScalarOperation<ScalarFactor>,
-    >();
-    assert_partially_evaluatable::<
-        TestContext<ScalarFactor, LinearScalarOperation<ScalarFactor>>,
-        LinearScalarOperation<ScalarFactor>,
-    >();
-    assert_partially_evaluatable::<TestContext<Factor, ArrayOperation<Factor>>, ArrayOperation<Factor>>();
-    assert_partially_evaluatable::<
-        TestContext<Factor, LinearArrayOperation<Factor, Factor>>,
-        LinearArrayOperation<Factor, Factor>,
-    >();
-}
-
-#[test]
-fn test_operation_generates_partial_evaluation_value_bounds() {
-    // The `Recursive` payload's partial-evaluation rule requires `SpecialPartiallyEvaluatableValue`, supplied to the
-    // generated implementation by `#[ryft(bounds(partial_evaluation(...)))]`. Proving the witness for the enum
-    // discharges that recursive arm's body obligation, which only resolves when the extra bound is injected.
-    use partial::PartiallyEvaluatableOperation as _;
-
-    fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
-    assert_partially_evaluatable::<
-        TestContext<Factor, PartialEvaluationBoundOperation<Factor>>,
-        PartialEvaluationBoundOperation<Factor>,
-    >();
-
-    let context = TestContext::<Factor, PartialEvaluationBoundOperation<Factor>> { marker: PhantomData };
-    let context = partial::PartialEvaluationContext::new(context);
-    let operation = PartialEvaluationBoundOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
-    let evaluation = operation.partially_evaluate(&context, &[]).unwrap();
-    assert!(evaluation.is_empty());
-}
-
-#[test]
-fn test_transposable_operation_infers_value_type() {
-    type Linear = LinearScalarOperation<ScalarFactor>;
-
-    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
-    let add = Linear::from(AddOperation);
-
-    assert_eq!(
-        add.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Linear>("add")],
-    );
-}
-
 #[derive(Clone, Debug, ryft::Operation)]
 enum DefaultPathOperation<V: ryft::Value<Type = ryft::DataType>> {
     Zero(ryft::ZeroOperation<ryft::DataType>),
@@ -1067,31 +955,6 @@ fn test_array_operation_type_inference() {
     );
 }
 
-#[test]
-fn test_operation_generates_interpretation_value_bounds() {
-    type Operation = InterpretationBoundOperation<Factor>;
-
-    let context = TestContext::<Factor> { marker: PhantomData };
-    let operation = Operation::from(ZeroOperation { r#type: ArrayType });
-
-    assert_eq!(operation.interpret(&context, &[Factor(1)]), Ok(vec![Factor(1)]));
-
-    let program = Program::<Factor, Operation, Vec<Factor>, Vec<Factor>> {
-        label: "array",
-        constant: Some(Factor(3)),
-        operation: Some(Operation::from(ConstantOperation { value: Factor(5), marker: PhantomData })),
-        marker: PhantomData,
-    };
-    let outputs = <Operation as InterpretableProgramOperation<Factor, TestContext<Factor>, Factor>>::interpret_program(
-        &context,
-        &program,
-        vec![Factor(1)],
-    )
-    .unwrap();
-
-    assert_eq!(outputs, vec![Factor(1), Factor(3)]);
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
 #[ryft(crate = "crate")]
 enum ArrayOperation<V: Value<Type = ArrayType>, Backend = BackendPayload> {
@@ -1140,345 +1003,6 @@ impl<T: Clone + Type, V: Value<Type = T>, O: Operation<T>, W, P> TransposableOpe
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         Ok(vec![transposed("while")])
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RecursiveOperation<V, O> {
-    marker: PhantomData<(V, O)>,
-}
-
-impl<V, O> Operation<ArrayType> for RecursiveOperation<V, O> {
-    fn name(&self) -> &'static str {
-        "recursive"
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for RecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
-    for RecursiveOperation<W, O>
-where
-    C::Operation: From<RecursiveOperation<W, O>>,
-{
-}
-
-impl<StoredValue, TranspositionValue, O> TransposableOperation<TranspositionValue, O>
-    for RecursiveOperation<StoredValue, O>
-where
-    TranspositionValue: Value<Type = ArrayType>,
-    O: RecursiveOperationTransposable<TranspositionValue>,
-{
-    fn transpose(
-        &self,
-        _context: &mut TracingContext<TranspositionValue, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("recursive")])
-    }
-}
-
-trait RecursiveOperationTransposable<V: Value<Type = ArrayType>>: Operation<ArrayType> {}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
-#[ryft(crate = "crate")]
-enum RecursiveLinearOperation<V: Value<Type = ArrayType>> {
-    Zero(ZeroOperation<ArrayType>),
-    Recursive(RecursiveOperation<V, Self>),
-}
-
-impl<StoredValue: Value<Type = ArrayType>, TranspositionValue: Value<Type = ArrayType>>
-    RecursiveOperationTransposable<TranspositionValue> for RecursiveLinearOperation<StoredValue>
-{
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ProgramRecursiveOperation<V, O> {
-    marker: PhantomData<(V, O)>,
-}
-
-impl<V, O> Operation<DataType> for ProgramRecursiveOperation<V, O> {
-    fn name(&self) -> &'static str {
-        "program_recursive"
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = DataType>, W, O, C> InterpretableOperation<V, C> for ProgramRecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<W: Clone, O: Clone + Operation<DataType>, C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C>
-    for ProgramRecursiveOperation<W, O>
-where
-    C::Operation: From<ProgramRecursiveOperation<W, O>>,
-{
-}
-
-impl<StoredValue, TranspositionValue, O> TransposableOperation<TranspositionValue, O>
-    for ProgramRecursiveOperation<StoredValue, O>
-where
-    TranspositionValue: Value<Type = DataType> + SpecialTransposableValue,
-    O: TransposableProgramOperation<TranspositionValue>,
-{
-    fn transpose(
-        &self,
-        _context: &mut TracingContext<TranspositionValue, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("program_recursive")])
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
-#[ryft(crate = "crate")]
-enum RecursiveProgramLinearOperation<V: Value<Type = DataType> + SpecialTransposableValue> {
-    Zero(ZeroOperation<DataType>),
-    Add(AddOperation),
-    Recursive(ProgramRecursiveOperation<V, Self>),
-}
-
-/// Recursive payload whose partial-evaluation rule requires an extra [`SpecialPartiallyEvaluatableValue`] bound on the
-/// value type, mirroring how the array scan's carry-folding rule requires `PartialEq`. The owning enum supplies that
-/// bound to the generated partial-evaluation implementation through `#[ryft(bounds(partial_evaluation(...)))]`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PartialEvaluationRecursiveOperation<V, O> {
-    marker: PhantomData<(V, O)>,
-}
-
-impl<V, O> Operation<ArrayType> for PartialEvaluationRecursiveOperation<V, O> {
-    fn name(&self) -> &'static str {
-        "partial_evaluation_recursive"
-    }
-
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for PartialEvaluationRecursiveOperation<W, O> {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
-    for PartialEvaluationRecursiveOperation<W, O>
-where
-    C::Value: SpecialPartiallyEvaluatableValue,
-    C::Operation: From<PartialEvaluationRecursiveOperation<W, O>>,
-{
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
-#[ryft(crate = "crate")]
-#[ryft(bounds(partial_evaluation(SpecialPartiallyEvaluatableValue)))]
-enum PartialEvaluationBoundOperation<V: Value<Type = ArrayType>> {
-    Zero(ZeroOperation<ArrayType>),
-    Recursive(PartialEvaluationRecursiveOperation<V, Self>),
-}
-
-/// Stand-in value capability required by one payload's forward-mode rule, verifying that the generated per-variant
-/// `DifferentiableOperation` predicates transport payload capability requirements to the use site.
-trait SpecialCombine {
-    type Output;
-}
-
-impl SpecialCombine for Factor {
-    type Output = Factor;
-}
-
-impl SpecialCombine for ScalarFactor {
-    type Output = ScalarFactor;
-}
-
-impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for ZeroOperation<DataType> {
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Ok(vec![DifferentiationDual { label: "zero", marker: PhantomData }])
-    }
-}
-
-impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for AddOperation {
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Ok(vec![DifferentiationDual { label: "add", marker: PhantomData }])
-    }
-}
-
-/// Forward-mode rule requiring a value capability that the generated per-variant predicate transports to the
-/// owning enum's use sites without the enum spelling it.
-impl<C, F> DifferentiableOperation<C> for FactorOperation<DataType, F>
-where
-    C: StagingContext<Type = DataType>,
-    C::Value: SpecialCombine<Output = C::Value>,
-{
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Ok(vec![DifferentiationDual { label: "factor", marker: PhantomData }])
-    }
-}
-
-/// Stand-in payload without a capture-free forward-mode rule, mirroring payload-level erroring
-/// `DifferentiableOperation` implementations such as the scalar `while` rule: the generated dispatcher still
-/// delegates uniformly and the payload's own rule reports the error.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct NonDifferentiableOperation;
-
-impl Operation<DataType> for NonDifferentiableOperation {
-    fn name(&self) -> &'static str {
-        "non_differentiable"
-    }
-
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
-        Ok(input_types.to_vec())
-    }
-}
-
-impl<V: Value<Type = DataType>, C> InterpretableOperation<V, C> for NonDifferentiableOperation {
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        Ok(inputs.to_vec())
-    }
-}
-
-impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for NonDifferentiableOperation where
-    C::Operation: From<NonDifferentiableOperation>
-{
-}
-
-impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V, O> for NonDifferentiableOperation {
-    fn transpose(
-        &self,
-        _context: &mut TracingContext<V, O>,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("non_differentiable")])
-    }
-}
-
-impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for NonDifferentiableOperation {
-    fn jvp(
-        &self,
-        _context: &C,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(DifferentiationError)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation, ryft::DifferentiableOperation)]
-#[ryft(crate = "crate")]
-#[ryft(bounds(differentiation(SpecialTransposableValue)))]
-enum DifferentiableScalarOperation<V: Value<Type = DataType>> {
-    Zero(ZeroOperation<DataType>),
-    Add(AddOperation),
-    Factor(FactorOperation<DataType, V>),
-    NonDifferentiable(NonDifferentiableOperation),
-}
-
-#[test]
-fn test_differentiable_operation_dispatches_jvp_to_payloads() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
-
-    let zero = Operation::from(ZeroOperation { r#type: DataType });
-    let outputs = zero.jvp(&context, &[]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].label, "zero");
-
-    let add = Operation::from(AddOperation);
-    let outputs = add.jvp(&context, &[]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].label, "add");
-
-    // The `ScalarFactor` rule requires `SpecialCombine<Output = C::Value>` on the flowing value, transported to this use
-    // site by the generated per-variant `DifferentiableOperation` predicate.
-    let factor = Operation::from(FactorOperation { factor: ScalarFactor(3), marker: PhantomData });
-    let outputs = factor.jvp(&context, &[]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].label, "factor");
-}
-
-#[test]
-fn test_differentiable_operation_delegates_unsupported_payloads() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    // The generated dispatcher delegates uniformly, so the unsupported payload's own erroring rule reports the
-    // failure rather than an enum-level dispatch arm.
-    let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
-    let operation = Operation::from(NonDifferentiableOperation);
-    assert_eq!(operation.jvp(&context, &[]).unwrap_err(), DifferentiationError);
-}
-
-#[test]
-fn test_differentiable_operation_generates_program_differentiation_witness() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    // The witness's fixed bodies forward to the program's own `linearize` / `jvp`; the stand-in `linearize`
-    // requires `SpecialTransposableValue` on the value type, supplied to the generated impl by
-    // `#[ryft(bounds(differentiation(...)))]`.
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "differentiable",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let linearization =
-        <Operation as LinearizableProgramOperation<ScalarFactor, Operation>>::linearize_program(&program).unwrap();
-    assert_eq!(linearization.label, "program_linearize");
-
-    let jvp_program =
-        <Operation as DifferentiableProgramOperation<ScalarFactor, Operation>>::jvp_program(&program).unwrap();
-    assert_eq!(jvp_program.label, "program_jvp");
-}
-
-#[test]
-fn test_differentiable_operation_generates_transposition_dispatchers() {
-    type Operation = DifferentiableScalarOperation<ScalarFactor>;
-
-    // The transposition dispatchers come from the separate `TransposableOperation` derive: `DifferentiableOperation`
-    // only adds forward-mode support, and deriving both enables reverse mode too.
-    let mut context = TracingContext::<ScalarFactor, Operation> { marker: PhantomData };
-    let add = Operation::from(AddOperation);
-    assert_eq!(
-        add.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Operation>("add")],
-    );
-
-    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "differentiable",
-        constant: None,
-        operation: None,
-        marker: PhantomData,
-    };
-    let transposed_program =
-        <Operation as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
-    assert_eq!(transposed_program.label, "program_transpose_with_respect_to");
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1648,106 +1172,169 @@ fn test_linear_array_operation_shape() {
 }
 
 #[test]
-fn test_transposable_operation_forwards_to_variant_payloads() {
-    type Linear = LinearArrayOperation<Factor, Factor>;
-
-    let mut context = TracingContext::<Factor, Linear> { marker: PhantomData };
-
-    let zero = Linear::from(ZeroOperation { r#type: ArrayType });
-    let factor = Linear::from(FactorOperation { factor: Factor(13), marker: PhantomData });
-    let recompute = Linear::from(RecomputeOperation { operation: ArrayOperation::<Factor>::from(DotOperation) });
-    let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
-    let custom_vjp_call =
-        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, BackendPayload>, Factor> {
-            marker: PhantomData,
-        });
+fn test_operation_generates_interpretation_forwarding() {
+    let context = TestContext::<ScalarFactor> { marker: PhantomData };
+    let operation = ScalarOperation::<ScalarFactor>::from(AddOperation);
 
     assert_eq!(
-        zero.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("zero")],
-    );
-    assert_eq!(
-        factor.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("factor")],
-    );
-    assert_eq!(
-        recompute.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("recompute")],
-    );
-    assert_eq!(
-        while_operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("while")],
-    );
-    assert_eq!(
-        custom_vjp_call.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("custom_vjp_call")],
+        operation.interpret(&context, &[ScalarFactor(1), ScalarFactor(2)]),
+        Ok(vec![ScalarFactor(1), ScalarFactor(2)]),
     );
 }
 
 #[test]
-fn test_transposable_operation_generates_program_transposition_witness() {
-    type Linear = LinearScalarOperation<ScalarFactor>;
+fn test_operation_generates_captured_program_interpretation_witness() {
+    type Operation = ScalarOperation<ScalarFactor>;
 
-    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
-        label: "linear",
-        constant: None,
-        operation: None,
+    let context = TestContext::<ScalarFactor> { marker: PhantomData };
+    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+        label: "scalar",
+        constant: Some(ScalarFactor(3)),
+        operation: Some(Operation::from(AddOperation)),
         marker: PhantomData,
     };
-    let transposed =
-        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
+    let outputs = <Operation as InterpretableProgramOperation<
+        ScalarFactor,
+        TestContext<ScalarFactor>,
+        ScalarFactor,
+    >>::interpret_program(&context, &program, vec![ScalarFactor(1)])
+    .unwrap();
 
-    assert_eq!(transposed.label, "program_transpose_with_respect_to");
+    assert_eq!(outputs, vec![ScalarFactor(1), ScalarFactor(3)]);
 }
 
 #[test]
-fn test_transposable_operation_generates_concrete_payload_bounds() {
-    type Linear = SpecialLinearOperation<Factor>;
+fn test_operation_generates_direct_program_interpretation_witness() {
+    type Operation = LinearScalarOperation<ScalarFactor>;
 
-    let mut context = TracingContext::<TranspositionFactor, Linear> { marker: PhantomData };
-    let operation = Linear::from(SpecialOperation);
+    let context = TestContext::<ScalarFactor> { marker: PhantomData };
+    let operation = Operation::from(FactorOperation { factor: ScalarFactor(5), marker: PhantomData });
 
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, TranspositionFactor, Linear>("special")],
-    );
-}
+    assert_eq!(operation.interpret(&context, &[ScalarFactor(8)]), Ok(vec![ScalarFactor(8)]));
 
-#[test]
-fn test_transposable_operation_supports_recursive_payload_helpers() {
-    type Linear = RecursiveLinearOperation<Factor>;
-
-    let mut context = TracingContext::<Factor, Linear> { marker: PhantomData };
-    let operation = Linear::from(RecursiveOperation::<Factor, Linear> { marker: PhantomData });
-
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
-        vec![transposed::<ArrayType, Factor, Linear>("recursive")],
-    );
-}
-
-#[test]
-fn test_transposable_operation_inherits_enum_bounds_for_recursive_program_witness() {
-    type Linear = RecursiveProgramLinearOperation<ScalarFactor>;
-
-    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
-    let operation = Linear::from(ProgramRecursiveOperation::<ScalarFactor, Linear> { marker: PhantomData });
-
-    assert_eq!(
-        operation.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
-        vec![transposed::<DataType, ScalarFactor, Linear>("program_recursive")],
-    );
-
-    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
         label: "linear",
-        constant: None,
-        operation: None,
+        constant: Some(ScalarFactor(13)),
+        operation: Some(Operation::from(AddOperation)),
         marker: PhantomData,
     };
-    let transposed =
-        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
+    let outputs =
+        <Operation as InterpretableProgramOperation<ScalarFactor, TestContext<ScalarFactor>>>::interpret_program(
+            &context,
+            &program,
+            vec![ScalarFactor(8)],
+        )
+        .unwrap();
 
-    assert_eq!(transposed.label, "program_transpose_with_respect_to");
+    assert_eq!(outputs, vec![ScalarFactor(8), ScalarFactor(13)]);
+}
+
+#[test]
+fn test_operation_generates_interpretation_value_bounds() {
+    type Operation = InterpretationBoundOperation<Factor>;
+
+    let context = TestContext::<Factor> { marker: PhantomData };
+    let operation = Operation::from(ZeroOperation { r#type: ArrayType });
+
+    assert_eq!(operation.interpret(&context, &[Factor(1)]), Ok(vec![Factor(1)]));
+
+    let program = Program::<Factor, Operation, Vec<Factor>, Vec<Factor>> {
+        label: "array",
+        constant: Some(Factor(3)),
+        operation: Some(Operation::from(ConstantOperation { value: Factor(5), marker: PhantomData })),
+        marker: PhantomData,
+    };
+    let outputs = <Operation as InterpretableProgramOperation<Factor, TestContext<Factor>, Factor>>::interpret_program(
+        &context,
+        &program,
+        vec![Factor(1)],
+    )
+    .unwrap();
+
+    assert_eq!(outputs, vec![Factor(1), Factor(3)]);
+}
+
+/// Recursive payload whose partial-evaluation rule requires an extra [`SpecialPartiallyEvaluatableValue`] bound on the
+/// value type, mirroring how the array scan's carry-folding rule requires `PartialEq`. The owning enum supplies that
+/// bound to the generated partial-evaluation implementation through `#[ryft(bounds(partial_evaluation(...)))]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PartialEvaluationRecursiveOperation<V, O> {
+    marker: PhantomData<(V, O)>,
+}
+
+impl<V, O> Operation<ArrayType> for PartialEvaluationRecursiveOperation<V, O> {
+    fn name(&self) -> &'static str {
+        "partial_evaluation_recursive"
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for PartialEvaluationRecursiveOperation<W, O> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
+impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+    for PartialEvaluationRecursiveOperation<W, O>
+where
+    C::Value: SpecialPartiallyEvaluatableValue,
+    C::Operation: From<PartialEvaluationRecursiveOperation<W, O>>,
+{
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation)]
+#[ryft(crate = "crate")]
+#[ryft(bounds(partial_evaluation(SpecialPartiallyEvaluatableValue)))]
+enum PartialEvaluationBoundOperation<V: Value<Type = ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    Recursive(PartialEvaluationRecursiveOperation<V, Self>),
+}
+
+#[test]
+fn test_operation_generates_partial_evaluation_witness() {
+    fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
+
+    // The derive now forwards partial evaluation for every variant, so each enum must satisfy the per-operation
+    // partial-evaluation trait at any known-side context pinned to its program-constant value type and to itself as
+    // the residual operation family. This covers leaf payloads, the generic `Backend` payload, and the boxed
+    // nested-program payloads.
+    assert_partially_evaluatable::<
+        TestContext<ScalarFactor, ScalarOperation<ScalarFactor>>,
+        ScalarOperation<ScalarFactor>,
+    >();
+    assert_partially_evaluatable::<
+        TestContext<ScalarFactor, LinearScalarOperation<ScalarFactor>>,
+        LinearScalarOperation<ScalarFactor>,
+    >();
+    assert_partially_evaluatable::<TestContext<Factor, ArrayOperation<Factor>>, ArrayOperation<Factor>>();
+    assert_partially_evaluatable::<
+        TestContext<Factor, LinearArrayOperation<Factor, Factor>>,
+        LinearArrayOperation<Factor, Factor>,
+    >();
+}
+
+#[test]
+fn test_operation_generates_partial_evaluation_value_bounds() {
+    // The `Recursive` payload's partial-evaluation rule requires `SpecialPartiallyEvaluatableValue`, supplied to the
+    // generated implementation by `#[ryft(bounds(partial_evaluation(...)))]`. Proving the witness for the enum
+    // discharges that recursive arm's body obligation, which only resolves when the extra bound is injected.
+    use partial::PartiallyEvaluatableOperation as _;
+
+    fn assert_partially_evaluatable<C: Context, O: partial::PartiallyEvaluatableOperation<C>>() {}
+    assert_partially_evaluatable::<
+        TestContext<Factor, PartialEvaluationBoundOperation<Factor>>,
+        PartialEvaluationBoundOperation<Factor>,
+    >();
+
+    let context = TestContext::<Factor, PartialEvaluationBoundOperation<Factor>> { marker: PhantomData };
+    let context = partial::PartialEvaluationContext::new(context);
+    let operation = PartialEvaluationBoundOperation::<Factor>::from(ZeroOperation { r#type: ArrayType });
+    let evaluation = operation.partially_evaluate(&context, &[]).unwrap();
+    assert!(evaluation.is_empty());
 }
 
 /// Stand-in for `ryft_core::ArrayBatch`. A label suffices to observe payload dispatch.
@@ -2034,14 +1621,465 @@ fn test_batchable_operation_generates_program_batching_witness() {
     assert_eq!(output_axes, vec![BatchAxis(Some(0))]);
 }
 
+/// Stand-in value capability required by one payload's forward-mode rule, verifying that the generated per-variant
+/// `DifferentiableOperation` predicates transport payload capability requirements to the use site.
+trait SpecialCombine {
+    type Output;
+}
+
+impl SpecialCombine for Factor {
+    type Output = Factor;
+}
+
+impl SpecialCombine for ScalarFactor {
+    type Output = ScalarFactor;
+}
+
+impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for ZeroOperation<DataType> {
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "zero", marker: PhantomData }])
+    }
+}
+
+impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for AddOperation {
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "add", marker: PhantomData }])
+    }
+}
+
+/// Forward-mode rule requiring a value capability that the generated per-variant predicate transports to the
+/// owning enum's use sites without the enum spelling it.
+impl<C, F> DifferentiableOperation<C> for FactorOperation<DataType, F>
+where
+    C: StagingContext<Type = DataType>,
+    C::Value: SpecialCombine<Output = C::Value>,
+{
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Ok(vec![DifferentiationDual { label: "factor", marker: PhantomData }])
+    }
+}
+
+/// Stand-in payload without a capture-free forward-mode rule, mirroring payload-level erroring
+/// `DifferentiableOperation` implementations such as the scalar `while` rule: the generated dispatcher still
+/// delegates uniformly and the payload's own rule reports the error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NonDifferentiableOperation;
+
+impl Operation<DataType> for NonDifferentiableOperation {
+    fn name(&self) -> &'static str {
+        "non_differentiable"
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<Type = DataType>, C> InterpretableOperation<V, C> for NonDifferentiableOperation {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
+impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for NonDifferentiableOperation where
+    C::Operation: From<NonDifferentiableOperation>
+{
+}
+
+impl<V: Value<Type = DataType>, O: Operation<DataType>> TransposableOperation<V, O> for NonDifferentiableOperation {
+    fn transpose(
+        &self,
+        _context: &mut TracingContext<V, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        Ok(vec![transposed("non_differentiable")])
+    }
+}
+
+impl<C: StagingContext<Type = DataType>> DifferentiableOperation<C> for NonDifferentiableOperation {
+    fn jvp(
+        &self,
+        _context: &C,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(DifferentiationError)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation, ryft::DifferentiableOperation)]
+#[ryft(crate = "crate")]
+#[ryft(bounds(differentiation(SpecialTransposableValue)))]
+enum DifferentiableScalarOperation<V: Value<Type = DataType>> {
+    Zero(ZeroOperation<DataType>),
+    Add(AddOperation),
+    Factor(FactorOperation<DataType, V>),
+    NonDifferentiable(NonDifferentiableOperation),
+}
+
+#[test]
+fn test_differentiable_operation_dispatches_jvp_to_payloads() {
+    type Operation = DifferentiableScalarOperation<ScalarFactor>;
+
+    let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
+
+    let zero = Operation::from(ZeroOperation { r#type: DataType });
+    let outputs = zero.jvp(&context, &[]).unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].label, "zero");
+
+    let add = Operation::from(AddOperation);
+    let outputs = add.jvp(&context, &[]).unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].label, "add");
+
+    // The `ScalarFactor` rule requires `SpecialCombine<Output = C::Value>` on the flowing value, transported to this use
+    // site by the generated per-variant `DifferentiableOperation` predicate.
+    let factor = Operation::from(FactorOperation { factor: ScalarFactor(3), marker: PhantomData });
+    let outputs = factor.jvp(&context, &[]).unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].label, "factor");
+}
+
+#[test]
+fn test_differentiable_operation_delegates_unsupported_payloads() {
+    type Operation = DifferentiableScalarOperation<ScalarFactor>;
+
+    // The generated dispatcher delegates uniformly, so the unsupported payload's own erroring rule reports the
+    // failure rather than an enum-level dispatch arm.
+    let context = TestContext::<ScalarFactor, Operation> { marker: PhantomData };
+    let operation = Operation::from(NonDifferentiableOperation);
+    assert_eq!(operation.jvp(&context, &[]).unwrap_err(), DifferentiationError);
+}
+
+#[test]
+fn test_differentiable_operation_generates_program_differentiation_witness() {
+    type Operation = DifferentiableScalarOperation<ScalarFactor>;
+
+    // The witness's fixed bodies forward to the program's own `linearize` / `jvp`; the stand-in `linearize`
+    // requires `SpecialTransposableValue` on the value type, supplied to the generated impl by
+    // `#[ryft(bounds(differentiation(...)))]`.
+    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+        label: "differentiable",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
+    let linearization =
+        <Operation as LinearizableProgramOperation<ScalarFactor, Operation>>::linearize_program(&program).unwrap();
+    assert_eq!(linearization.label, "program_linearize");
+
+    let jvp_program =
+        <Operation as DifferentiableProgramOperation<ScalarFactor, Operation>>::jvp_program(&program).unwrap();
+    assert_eq!(jvp_program.label, "program_jvp");
+}
+
+#[test]
+fn test_differentiable_operation_generates_transposition_dispatchers() {
+    type Operation = DifferentiableScalarOperation<ScalarFactor>;
+
+    // The transposition dispatchers come from the separate `TransposableOperation` derive: `DifferentiableOperation`
+    // only adds forward-mode support, and deriving both enables reverse mode too.
+    let mut context = TracingContext::<ScalarFactor, Operation> { marker: PhantomData };
+    let add = Operation::from(AddOperation);
+    assert_eq!(
+        add.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
+        vec![transposed::<DataType, ScalarFactor, Operation>("add")],
+    );
+
+    let program = Program::<ScalarFactor, Operation, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+        label: "differentiable",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
+    let transposed_program =
+        <Operation as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
+    assert_eq!(transposed_program.label, "program_transpose_with_respect_to");
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecursiveOperation<V, O> {
+    marker: PhantomData<(V, O)>,
+}
+
+impl<V, O> Operation<ArrayType> for RecursiveOperation<V, O> {
+    fn name(&self) -> &'static str {
+        "recursive"
+    }
+
+    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<Type = ArrayType>, W, O, C> InterpretableOperation<V, C> for RecursiveOperation<W, O> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
+impl<W: Clone, O: Clone + Operation<ArrayType>, C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C>
+    for RecursiveOperation<W, O>
+where
+    C::Operation: From<RecursiveOperation<W, O>>,
+{
+}
+
+impl<StoredValue, TranspositionValue, O> TransposableOperation<TranspositionValue, O>
+    for RecursiveOperation<StoredValue, O>
+where
+    TranspositionValue: Value<Type = ArrayType>,
+    O: RecursiveOperationTransposable<TranspositionValue>,
+{
+    fn transpose(
+        &self,
+        _context: &mut TracingContext<TranspositionValue, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
+        Ok(vec![transposed("recursive")])
+    }
+}
+
+trait RecursiveOperationTransposable<V: Value<Type = ArrayType>>: Operation<ArrayType> {}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
+enum RecursiveLinearOperation<V: Value<Type = ArrayType>> {
+    Zero(ZeroOperation<ArrayType>),
+    Recursive(RecursiveOperation<V, Self>),
+}
+
+impl<StoredValue: Value<Type = ArrayType>, TranspositionValue: Value<Type = ArrayType>>
+    RecursiveOperationTransposable<TranspositionValue> for RecursiveLinearOperation<StoredValue>
+{
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProgramRecursiveOperation<V, O> {
+    marker: PhantomData<(V, O)>,
+}
+
+impl<V, O> Operation<DataType> for ProgramRecursiveOperation<V, O> {
+    fn name(&self) -> &'static str {
+        "program_recursive"
+    }
+
+    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+        Ok(input_types.to_vec())
+    }
+}
+
+impl<V: Value<Type = DataType>, W, O, C> InterpretableOperation<V, C> for ProgramRecursiveOperation<W, O> {
+    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+        Ok(inputs.to_vec())
+    }
+}
+
+impl<W: Clone, O: Clone + Operation<DataType>, C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C>
+    for ProgramRecursiveOperation<W, O>
+where
+    C::Operation: From<ProgramRecursiveOperation<W, O>>,
+{
+}
+
+impl<StoredValue, TranspositionValue, O> TransposableOperation<TranspositionValue, O>
+    for ProgramRecursiveOperation<StoredValue, O>
+where
+    TranspositionValue: Value<Type = DataType> + SpecialTransposableValue,
+    O: TransposableProgramOperation<TranspositionValue>,
+{
+    fn transpose(
+        &self,
+        _context: &mut TracingContext<TranspositionValue, O>,
+        _inputs: &[PartialValue<Tracer<TracingContext<TranspositionValue, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<TranspositionValue, O>>>>, DifferentiationError> {
+        Ok(vec![transposed("program_recursive")])
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
+enum RecursiveProgramLinearOperation<V: Value<Type = DataType> + SpecialTransposableValue> {
+    Zero(ZeroOperation<DataType>),
+    Add(AddOperation),
+    Recursive(ProgramRecursiveOperation<V, Self>),
+}
+
+#[test]
+fn test_transposable_operation_infers_value_type() {
+    type Linear = LinearScalarOperation<ScalarFactor>;
+
+    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
+    let add = Linear::from(AddOperation);
+
+    assert_eq!(
+        add.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
+        vec![transposed::<DataType, ScalarFactor, Linear>("add")],
+    );
+}
+
+#[test]
+fn test_transposable_operation_forwards_to_variant_payloads() {
+    type Linear = LinearArrayOperation<Factor, Factor>;
+
+    let mut context = TracingContext::<Factor, Linear> { marker: PhantomData };
+
+    let zero = Linear::from(ZeroOperation { r#type: ArrayType });
+    let factor = Linear::from(FactorOperation { factor: Factor(13), marker: PhantomData });
+    let recompute = Linear::from(RecomputeOperation { operation: ArrayOperation::<Factor>::from(DotOperation) });
+    let while_operation = Linear::from(WhileOperation::<ArrayType, Factor, Linear> { marker: PhantomData });
+    let custom_vjp_call =
+        Linear::from(CustomVjpCallOperation::<ArrayType, Factor, ArrayOperation<Factor, BackendPayload>, Factor> {
+            marker: PhantomData,
+        });
+
+    assert_eq!(
+        zero.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("zero")],
+    );
+    assert_eq!(
+        factor.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("factor")],
+    );
+    assert_eq!(
+        recompute.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("recompute")],
+    );
+    assert_eq!(
+        while_operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("while")],
+    );
+    assert_eq!(
+        custom_vjp_call.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("custom_vjp_call")],
+    );
+}
+
+#[test]
+fn test_transposable_operation_generates_program_transposition_witness() {
+    type Linear = LinearScalarOperation<ScalarFactor>;
+
+    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+        label: "linear",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
+    let transposed =
+        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
+
+    assert_eq!(transposed.label, "program_transpose_with_respect_to");
+}
+
+#[test]
+fn test_transposable_operation_generates_concrete_payload_bounds() {
+    type Linear = SpecialLinearOperation<Factor>;
+
+    let mut context = TracingContext::<TranspositionFactor, Linear> { marker: PhantomData };
+    let operation = Linear::from(SpecialOperation);
+
+    assert_eq!(
+        operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, TranspositionFactor, Linear>("special")],
+    );
+}
+
+#[test]
+fn test_transposable_operation_supports_recursive_payload_helpers() {
+    type Linear = RecursiveLinearOperation<Factor>;
+
+    let mut context = TracingContext::<Factor, Linear> { marker: PhantomData };
+    let operation = Linear::from(RecursiveOperation::<Factor, Linear> { marker: PhantomData });
+
+    assert_eq!(
+        operation.transpose(&mut context, &[PartialValue::Unknown(ArrayType)], &[]).unwrap(),
+        vec![transposed::<ArrayType, Factor, Linear>("recursive")],
+    );
+}
+
+#[test]
+fn test_transposable_operation_inherits_enum_bounds_for_recursive_program_witness() {
+    type Linear = RecursiveProgramLinearOperation<ScalarFactor>;
+
+    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
+    let operation = Linear::from(ProgramRecursiveOperation::<ScalarFactor, Linear> { marker: PhantomData });
+
+    assert_eq!(
+        operation.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
+        vec![transposed::<DataType, ScalarFactor, Linear>("program_recursive")],
+    );
+
+    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+        label: "linear",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
+    let transposed =
+        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
+
+    assert_eq!(transposed.label, "program_transpose_with_respect_to");
+}
+
+/// Mirrors [`RecursiveProgramLinearOperation`], but with the recursive payload's transposition value leaf supplied
+/// through `#[ryft(bounds(transposition(...)))]` instead of through the enum's value parameter bounds, so that the
+/// enum's stored constant type is not forced to carry the transposition-only capability.
+#[derive(Clone, Debug, PartialEq, Eq, ryft::Operation, ryft::TransposableOperation)]
+#[ryft(crate = "crate")]
+#[ryft(bounds(transposition(SpecialTransposableValue)))]
+enum TranspositionBoundOperation<V: Value<Type = DataType>> {
+    Zero(ZeroOperation<DataType>),
+    Add(AddOperation),
+    Recursive(ProgramRecursiveOperation<V, Self>),
+}
+
+#[test]
+fn test_transposable_operation_generates_transposition_value_bounds() {
+    type Linear = TranspositionBoundOperation<ScalarFactor>;
+
+    let mut context = TracingContext::<ScalarFactor, Linear> { marker: PhantomData };
+    let operation = Linear::from(ProgramRecursiveOperation::<ScalarFactor, Linear> { marker: PhantomData });
+
+    assert_eq!(
+        operation.transpose(&mut context, &[PartialValue::Unknown(DataType)], &[]).unwrap(),
+        vec![transposed::<DataType, ScalarFactor, Linear>("program_recursive")],
+    );
+
+    let program = Program::<ScalarFactor, Linear, Vec<ScalarFactor>, Vec<ScalarFactor>> {
+        label: "linear",
+        constant: None,
+        operation: None,
+        marker: PhantomData,
+    };
+    let transposed_program =
+        <Linear as TransposableProgramOperation<ScalarFactor>>::transpose_program(&program, &[true]).unwrap();
+
+    assert_eq!(transposed_program.label, "program_transpose_with_respect_to");
+}
+
 #[test]
 fn test_errors() {
     let test_cases = trybuild::TestCases::new();
-    test_cases.compile_fail("tests/operations/error_missing_type.rs");
     test_cases.compile_fail("tests/operations/error_ambiguous_type.rs");
     test_cases.compile_fail("tests/operations/error_bad_variant.rs");
     test_cases.compile_fail("tests/operations/error_bounds_attribute.rs");
+    test_cases.compile_fail("tests/operations/error_missing_type.rs");
+    test_cases.compile_fail("tests/operations/error_type_attribute.rs");
     test_cases.compile_fail("tests/operations/error_unknown_bounds_attribute.rs");
     test_cases.compile_fail("tests/operations/error_unknown_transposition_bounds_attribute.rs");
-    test_cases.compile_fail("tests/operations/error_type_attribute.rs");
 }

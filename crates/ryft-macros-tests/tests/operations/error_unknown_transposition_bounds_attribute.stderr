@@ -1,5 +1,5 @@
-error: invalid '#[ryft(bounds(...))]' attribute: 'transposition'; only 'interpretation(...)', 'partial_evaluation(...)', 'differentiation(...)', and 'batching(...)' are supported here
+error: invalid '#[ryft(bounds(...))]' attribute: 'unknown'; only 'interpretation(...)', 'partial_evaluation(...)', 'batching(...)', 'differentiation(...)', and 'transposition(...)' are supported here
   --> tests/operations/error_unknown_transposition_bounds_attribute.rs:10:15
    |
-10 | #[ryft(bounds(transposition(Clone)))]
-   |               ^^^^^^^^^^^^^
+10 | #[ryft(bounds(unknown(Clone)))]
+   |               ^^^^^^^

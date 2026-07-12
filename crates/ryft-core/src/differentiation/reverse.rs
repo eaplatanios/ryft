@@ -198,7 +198,9 @@ impl<
 /// [`TransposableProgramOperation`] instead of restating a direct `Enum: TransposableOperation<V, Enum>` bound.
 /// When those recursive payload rules need value capabilities, express those requirements on the enum's generic
 /// parameters or on the payload implementations themselves, so the generated dispatcher and program-transposition
-/// witness inherit them through normal Rust bounds.
+/// witness inherit them through normal Rust bounds, or supply them with `#[ryft(bounds(transposition(Bound + ...)))]`,
+/// which adds them to the generated dispatcher's and witness's transposition value type without forcing the enum's
+/// stored constant type to carry transposition-only capabilities.
 ///
 /// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 /// The default path is `ryft`, so downstream crates that depend on the `ryft` crate normally do not need this

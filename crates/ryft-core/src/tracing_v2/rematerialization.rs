@@ -36,7 +36,7 @@ use crate::operations::constants::{Constant as ConstantCapability, Zero, ZeroOpe
 use crate::operations::control_flow::MaybeScan;
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::math::AddOperation;
-use crate::operations::tag::MaybeTag;
+use crate::operations::tag::MaybeTagOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::payloads::Captured;
@@ -669,7 +669,7 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
     ) -> Option<RematerializationCandidate<'a, T>>
     where
         V: Value<Type = T>,
-        O: Operation<T> + MaybeDot + MaybeTag + MaybeScan<V, O>,
+        O: Operation<T> + MaybeDot + MaybeTagOperation + MaybeScan<V, O>,
     {
         let mut program = program;
         let mut atom = residual_atom;
@@ -695,7 +695,7 @@ impl<'a, T: Type> RematerializationCandidate<'a, T> {
         Some(RematerializationCandidate {
             operation_name: operation.name(),
             dot_dimensions: operation.dot_dimensions(),
-            key: operation.key(),
+            key: operation.tag(),
             residual_type,
         })
     }
@@ -1051,7 +1051,7 @@ pub trait ResidualHandling<D: Domain> {
 
 impl<D> ResidualHandling<D> for RematerializationPolicy<<D as Domain>::Type>
 where
-    D: Domain<Operation: MaybeDot + MaybeTag>,
+    D: Domain<Operation: MaybeDot + MaybeTagOperation>,
 {
     fn saves_residual(&self, candidate: &RematerializationCandidate<'_, <D as Domain>::Type>) -> bool {
         self.saves_candidate(candidate)
@@ -1077,8 +1077,8 @@ where
     }
 }
 
-impl<D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeTag + From<TransferToMemoryOperation>>> ResidualHandling<D>
-    for OffloadingRematerializationPolicy
+impl<D: Domain<Type = ArrayType, Operation: MaybeDot + MaybeTagOperation + From<TransferToMemoryOperation>>>
+    ResidualHandling<D> for OffloadingRematerializationPolicy
 {
     fn saves_residual(&self, candidate: &RematerializationCandidate<'_, ArrayType>) -> bool {
         !matches!(self.classify_candidate(candidate), RematerializationVerdict::Recompute)
@@ -1255,7 +1255,7 @@ where
         >,
     <D as Domain>::Operation: Clone
         + MaybeDot
-        + MaybeTag
+        + MaybeTagOperation
         + MaybeScan<<D as Domain>::Constant, <D as Domain>::Operation>
         + From<RematerializeOperation<<D as Domain>::Constant, <D as Domain>::Operation>>
         + From<ZeroOperation<D::Type>>

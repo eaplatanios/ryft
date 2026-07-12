@@ -591,6 +591,33 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
 }
 
 /// Represents [`Operation`]s that can be batched (i.e., vectorized).
+///
+/// # Deriving Batchable Operation Enums
+///
+/// Ryft provides a `#[derive(BatchableOperation)]` procedural macro via the `ryft-macros` crate for
+/// [`BatchableOperation`] sum types whose variants already own their batching rules. It follows the same enum-shape
+/// and type-inference rules as `#[derive(Operation)]` and generates:
+///
+///   - A staged tracer-level dispatcher at `BatchableOperation<V, BatchingContext<C>>` where `V` is the parent
+///     staging context's flowing value. Primitive (non-recursive, unmarked) variants dispatch at the *parent*
+///     staging context, because the flowing physical values are parent-trace values and their rules do not depend
+///     on batching metadata. Variants marked with the variant-level `#[ryft(batching(active))]` attribute, and all
+///     recursive payloads (i.e., those mentioning `Self`), dispatch at the [`BatchingContext`] itself, because their
+///     rules are keyed on its axis metadata (e.g., named-axis collectives). Marking a recursive payload is reported
+///     as a redundancy error.
+///   - An eager value-level dispatcher at `BatchableOperation<Constant, EagerContext<Constant, Enum>>` where every
+///     variant dispatches at the eager context.
+///   - A [`BatchableProgramOperation`] witness whose fixed body calls [`Program::batched`], naming the operation-family
+///     fixed point that recursive higher-order payload rules (e.g., control flow) batch their nested programs through
+///     without re-entering the enum's own batching obligation.
+///
+/// Non-recursive payloads carry per-variant `Payload: BatchableOperation<...>` predicates (at the context their arm
+/// dispatches at) that transport each rule's own capability requirements to the use site. Recursive payloads are
+/// skipped (such a predicate would overflow the trait solver) and their rules are discharged as definition-time body
+/// obligations against the witness and the author-supplied leaf capabilities: `#[ryft(bounds(batching(Bound1 +
+/// Bound2 + ...)))]` adds those leaves to the eager dispatcher's constant value type and, with the flowing value
+/// substituted, to the staged dispatcher's flowing value type. The derivation macro also supports the same
+/// `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 pub trait BatchableOperation<V: Value<Type = ArrayType>, C>: Operation<ArrayType> {
     /// Applies this operation to packed batched inputs, returning batched outputs with the resulting batch axes,
     /// using `context` for rules that need active transform state.

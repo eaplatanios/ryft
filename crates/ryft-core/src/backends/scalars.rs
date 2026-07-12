@@ -37,7 +37,7 @@ use crate::operations::math::{
     MulOperation, Neg, NegOperation, Sin, SinOperation, Sub, SubOperation,
 };
 use crate::operations::math::{Exp, ExpOperation, Log, LogOperation, Sqrt, SqrtOperation};
-use crate::operations::tag::{MaybeTag, Tag, TagOperation};
+use crate::operations::tag::{MaybeTagOperation, Tag, TagOperation};
 use crate::operations::{BooleanLike, Operation};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Value};
@@ -100,9 +100,9 @@ pub enum ScalarOperation<V: Value<Type = DataType>> {
 }
 
 /// Exposes the [`Tag`](TagOperation) variant's key to rematerialization policies.
-impl<V: Value<Type = DataType>> MaybeTag for ScalarOperation<V> {
+impl<V: Value<Type = DataType>> MaybeTagOperation for ScalarOperation<V> {
     #[inline]
-    fn key(&self) -> Option<&str> {
+    fn tag(&self) -> Option<&str> {
         match self {
             Self::Tag(operation) => Some(operation.key()),
             _ => None,

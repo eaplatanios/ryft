@@ -357,12 +357,12 @@ where
     }
 }
 
-impl<V> ryft_core::operations::tag::MaybeTag for XlaOperation<V>
+impl<V> ryft_core::operations::tag::MaybeTagOperation for XlaOperation<V>
 where
     V: Value<Type = ArrayType>,
 {
     #[inline]
-    fn key(&self) -> Option<&str> {
+    fn tag(&self) -> Option<&str> {
         match self {
             Self::Tag(operation) => Some(operation.key()),
             _ => None,

@@ -7,7 +7,7 @@ trait Value {
 }
 
 #[derive(ryft::TransposableOperation)]
-#[ryft(bounds(transposition(Clone)))]
+#[ryft(bounds(unknown(Clone)))]
 enum BadOperation<V: Value<Type = ArrayType>> {
     Operation(PhantomData<V>),
 }

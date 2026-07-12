@@ -28,7 +28,7 @@ use crate::operations::math::{
 };
 use crate::operations::math::{ExpOperation, LogOperation, SqrtOperation};
 use crate::operations::sharding::{ReshardOperation, ShardingConstraintOperation};
-use crate::operations::tag::{MaybeTag, TagOperation};
+use crate::operations::tag::{MaybeTagOperation, TagOperation};
 use crate::programs::Value;
 use crate::tracing_v2::operations::collective::{AxisIndexOperation, CollectiveOperation};
 use crate::tracing_v2::operations::custom_derivatives::{
@@ -123,12 +123,12 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
 }
 
 // TODO(eaplatanios): Should this be derived as part of one of our macros?
-impl<V> MaybeTag for ArrayOperation<V>
+impl<V> MaybeTagOperation for ArrayOperation<V>
 where
     V: Value<Type = ArrayType>,
 {
     #[inline]
-    fn key(&self) -> Option<&str> {
+    fn tag(&self) -> Option<&str> {
         match self {
             Self::Tag(operation) => Some(operation.key()),
             _ => None,

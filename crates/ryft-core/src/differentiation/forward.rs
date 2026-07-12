@@ -374,14 +374,20 @@ impl<
 ///     which transports each rule's own capability requirements (e.g., `C::Value: Sin` for the sine rule) to the use
 ///     site, so that the enum does not spell them, plus a `Self: From<Payload>` conversion for every concrete payload
 ///     (the rules stage ordinary primal-enum operations for both the primal and the tangent side) and the `Self:
-///     MaybeZeroOperation<T> + From<ZeroOperation<T>> + DifferentiableProgramOperation<C::Constant, Self> +
+///     From<ZeroOperation<T>> + DifferentiableProgramOperation<C::Constant, Self> +
 ///     LinearizableProgramOperation<C::Constant, Self>` fixed-point witnesses that higher-order payload rules like
 ///     those for `condition`, `while`, and `scan` use to forward-differentiate and linearize their nested programs.
+///     Rules that additionally need `Self: MaybeZeroOperation<T>` get it through that trait's blanket implementation
+///     over the borrowed `TryFrom` conversion that `#[derive(Operation)]` generates.
 ///     *Recursive* payloads (i.e., those mentioning `Self`) are skipped (such a predicate would re-enter the enum's
 ///     own obligation and overflow the trait solver) and their rules are discharged as definition-time body obligations
-///     against the witnesses instead. The enum must therefore supply its own [`DifferentiableProgramOperation`] and
-///     [`LinearizableProgramOperation`] implementations, spelling only the leaf capabilities that [`Program::jvp`]
-///     and [`Program::linearize`] need.
+///     against the witnesses instead.
+///   - The [`DifferentiableProgramOperation`] and [`LinearizableProgramOperation`] witnesses themselves, whose fixed
+///     bodies call [`Program::jvp`] and [`Program::linearize`] and whose `where` clauses spell only the leaf value
+///     capabilities those bodies need on the program constant type, supplied with
+///     `#[ryft(bounds(differentiation(Bound1 + Bound2 + ...)))]`.
+///
+/// The derivation macro also supports the same `#[ryft(crate = "...")]` attribute as the `#[derive(Operation)]` macro.
 pub trait DifferentiableOperation<C: Context<Operation: Clone>>: Operation<C::Type> {
     /// Applies this operation's capture-free forward-mode rule, mapping the input duals `(xᵢ, ẋᵢ)` to the output duals
     /// `(y, ẏ) = (f(x), Σᵢ (∂f/∂xᵢ)(x) · ẋᵢ)` where `f` is the function this operation computes. The returned vector

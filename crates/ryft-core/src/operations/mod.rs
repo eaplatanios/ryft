@@ -66,7 +66,7 @@ pub use logical::*;
 pub use manipulation::*;
 pub use math::*;
 pub use sharding::*;
-pub use tag::{MaybeTag, TAG_OPERATION_NAME, Tag, TagOperation};
+pub use tag::{MaybeTagOperation, TAG_OPERATION_NAME, Tag, TagOperation};
 
 /// Maximum length for the contents of a bracketed section in an [`OperationFormatter`] that should be rendered inline.
 /// If the length exceeds this value, then the section contents will be rendered over multiple lines.
@@ -219,6 +219,12 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     For example, an array operation enum that owns condition, while, and scan payloads can write
 ///     `#[ryft(bounds(interpretation(BooleanLike + Slice + UpdateSlice + Reshape)))]` while keeping its enum parameter
 ///     declaration at `V: Value<Type = ArrayType>`.
+///   - `#[ryft(bounds(partial_evaluation(Bound1 + Bound2 + ...)))]` likewise adds extra trait bounds to the generated
+///     [`PartiallyEvaluatableOperation`](crate::PartiallyEvaluatableOperation) implementation, applied to both
+///     partial-evaluation value spaces, because a recursive payload's rule may need them on either side: the known
+///     values that flow through the known-side context (e.g., `PartialEq` for the scan and while invariance fixed
+///     points) and the program-constant space (e.g., [`BooleanLike`] for concretized condition predicates). Under an
+///     eager known-side context the two spaces coincide anyway.
 ///
 /// The operation type `T` is selected as follows:
 ///
@@ -235,11 +241,10 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 ///   - For enums with one `Value<Type = T>` parameter, the payload parameter is treated as the nested program's
 ///     captured constant type `C`, and the derived [`InterpretableOperation`](crate::InterpretableOperation)
-///     implementation is generic over a runtime value `V`. The generated
-///     [`InterpretableProgramOperation`](crate::InterpretableProgramOperation) implementation requires
-///     `V::InterpretationContext` to be a [`Context`] that can lift constants from `C` into `V`. Interpretation-only
-///     capabilities should be provided with `#[ryft(bounds(interpretation(...)))]` instead of being placed on the
-///     enum's stored constant type.
+///     implementation is generic over a runtime value `V` and an interpretation context. The generated implementations
+///     require that context to be a [`Constant`] provider that can lift captured constants from `C` into `V`.
+///     Interpretation-only capabilities should be provided with `#[ryft(bounds(interpretation(...)))]` instead
+///     of being placed on the enum's stored constant type.
 ///   - For enums with two or more `Value<Type = T>` parameters, the first value parameter is treated as both the
 ///     runtime value type and the nested program constant type for direct program interpretation. Later value
 ///     parameters remain payload-specific metadata unless the generated program witness needs to instantiate a
@@ -257,8 +262,9 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///
 /// The derivation macro supports the `#[ryft(crate = "...")]` attribute to override the path used to reference Ryft
 /// traits and error types from generated code. The default path is `ryft`, so downstream crates that depend on the
-/// `ryft` crate normally do not need this attribute. It also supports `#[ryft(bounds(interpretation(...)))]` for the
-/// interpretation value bounds described above.
+/// `ryft` crate normally do not need this attribute. It also supports `#[ryft(bounds(interpretation(...)))]` and
+/// `#[ryft(bounds(partial_evaluation(...)))]` for the interpretation and partial-evaluation value bounds described
+/// above.
 ///
 /// ## Example
 ///
