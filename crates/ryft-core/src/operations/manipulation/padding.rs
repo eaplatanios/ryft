@@ -267,6 +267,8 @@ where
     ) -> Result<Self, ProgramError> {
         let mut outputs = self.dispatch_domain().bind(
             PadOperation::new(edge_padding_low.to_vec(), edge_padding_high.to_vec(), interior_padding.to_vec())?,
+            &[],
+            &[],
             &[self.clone(), padding_value.clone()],
         )?;
         check_count!("output", outputs, 1, ProgramError);

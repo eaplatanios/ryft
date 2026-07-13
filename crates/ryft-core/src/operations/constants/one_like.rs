@@ -63,7 +63,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<OneLikeOperation>>>> OneLi
     #[inline]
     fn one_like(&self) -> Self {
         self.dispatch_domain()
-            .bind(OneLikeOperation, &[self.clone()])
+            .bind(OneLikeOperation, &[], &[], &[self.clone()])
             .expect("`one_like` operation failed")
             .remove(0)
     }

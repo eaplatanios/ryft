@@ -424,7 +424,7 @@ where
     fn slice(&self, start_indices: &[usize], limit_indices: &[usize], strides: &[usize]) -> Result<Self, ProgramError> {
         let operation =
             SliceOperation::new(start_indices.to_vec(), limit_indices.to_vec()).with_strides(strides.to_vec())?;
-        Ok(self.dispatch_domain().bind(operation, &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(operation, &[], &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -610,9 +610,12 @@ where
     <V::DispatchDomain as Domain>::Operation: From<UpdateSliceOperation>,
 {
     fn update_slice(&self, update: &Self, start_indices: &[usize]) -> Result<Self, ProgramError> {
-        let mut outputs = self
-            .dispatch_domain()
-            .bind(UpdateSliceOperation::new(start_indices.to_vec()), &[self.clone(), update.clone()])?;
+        let mut outputs = self.dispatch_domain().bind(
+            UpdateSliceOperation::new(start_indices.to_vec()),
+            &[],
+            &[],
+            &[self.clone(), update.clone()],
+        )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -792,7 +795,10 @@ where
         let mut inputs = Vec::with_capacity(1 + start_indices.len());
         inputs.push(self.clone());
         inputs.extend(start_indices.iter().cloned());
-        Ok(self.dispatch_domain().bind(DynamicSliceOperation::new(sizes.to_vec()), &inputs)?.remove(0))
+        Ok(self
+            .dispatch_domain()
+            .bind(DynamicSliceOperation::new(sizes.to_vec()), &[], &[], &inputs)?
+            .remove(0))
     }
 }
 
@@ -980,7 +986,7 @@ where
     fn dynamic_update_slice(&self, update: &Self, start_indices: &[Self]) -> Result<Self, ProgramError> {
         let mut inputs = vec![self.clone(), update.clone()];
         inputs.extend(start_indices.iter().cloned());
-        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, &inputs)?;
+        let mut outputs = self.dispatch_domain().bind(DynamicUpdateSliceOperation, &[], &[], &inputs)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

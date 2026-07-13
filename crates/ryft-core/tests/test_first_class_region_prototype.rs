@@ -14,7 +14,7 @@
 //!      stays deliberately unbounded.
 //!   3. Immutable instruction/region views coexist with recursive driver work and with a `&mut` destination
 //!      context (transposition) without cloning programs.
-//!   4. The attachment-aware binding hook (`Context::bind_with_regions`) covers freshly authored regional
+//!   4. The region-carrying `Context::bind` protocol covers freshly authored regional
 //!      operations in eager and staging contexts, delegating to `bind` when attachment-free.
 //!   5. Builder imports copy the complete reachable closure with sharing preserved, and callee imports intern by
 //!      live `Rc` identity.
@@ -75,7 +75,6 @@ mod model {
         pub inputs: Vec<usize>,
         pub outputs: Vec<usize>,
         pub regions: Vec<RegionId>,
-        pub callees: Vec<RegionId>,
     }
 
     /// One sealed flat computation region. Only [`ProgramBuilder`] creates these (via a consumed
@@ -143,7 +142,6 @@ mod model {
             inputs: Vec<usize>,
             output_count: usize,
             regions: Vec<RegionId>,
-            callees: Vec<RegionId>,
         ) -> Vec<usize> {
             let outputs = (0..output_count)
                 .map(|_| {
@@ -152,13 +150,7 @@ mod model {
                     id
                 })
                 .collect::<Vec<_>>();
-            self.region.instructions.push(Instruction {
-                operation,
-                inputs,
-                outputs: outputs.clone(),
-                regions,
-                callees,
-            });
+            self.region.instructions.push(Instruction { operation, inputs, outputs: outputs.clone(), regions });
             outputs
         }
 
@@ -218,7 +210,7 @@ mod model {
             remap.insert(root, id);
             let mut region = source.regions[root.0].clone();
             for instruction in &mut region.instructions {
-                for attached in instruction.regions.iter_mut().chain(instruction.callees.iter_mut()) {
+                for attached in &mut instruction.regions {
                     *attached = self.add_region_closure(source, *attached, remap);
                 }
             }
@@ -351,23 +343,15 @@ mod model {
         type Value: Clone;
         type Operation: Operation;
 
-        fn bind(&self, operation: Self::Operation, inputs: &[Self::Value]) -> R<Vec<Self::Value>>;
-
-        /// Attachment-aware binding hook. The default delegates to `bind` for attachment-free operations and
-        /// rejects attachments, so only contexts that can consume attachments override it.
-        fn bind_with_regions(
+        /// Binds `operation` over `inputs`, together with any freshly authored nested computations (`regions` and
+        /// `callees`, in the operation-defined order); most operations carry neither and pass `&[]` for both.
+        fn bind(
             &self,
             operation: Self::Operation,
-            attachments: Vec<Program<Stored, Self::Operation>>,
-            callees: Vec<Rc<Program<Stored, Self::Operation>>>,
+            regions: &[Program<Stored, Self::Operation>],
+            callees: &[Rc<Program<Stored, Self::Operation>>],
             inputs: &[Self::Value],
-        ) -> R<Vec<Self::Value>> {
-            if attachments.is_empty() && callees.is_empty() {
-                self.bind(operation, inputs)
-            } else {
-                Err(format!("context cannot bind `{}` with attachments", operation.name()))
-            }
-        }
+        ) -> R<Vec<Self::Value>>;
     }
 
     /// Eager context: runtime values are `f64` (distinct from `Stored`), captures substituted from a table.
@@ -391,21 +375,21 @@ mod model {
         type Value = f64;
         type Operation = Op;
 
-        fn bind(&self, operation: Op, inputs: &[f64]) -> R<Vec<f64>> {
-            // Context-free binding: no attached regions, so the rule receives empty region access.
-            operation.interpret(self, InterpretRegions::empty(), inputs)
-        }
-
-        fn bind_with_regions(
+        fn bind(
             &self,
             operation: Op,
-            attachments: Vec<Program<Stored, Op>>,
-            callees: Vec<Rc<Program<Stored, Op>>>,
+            regions: &[Program<Stored, Op>],
+            callees: &[Rc<Program<Stored, Op>>],
             inputs: &[f64],
         ) -> R<Vec<f64>> {
-            // Eager contexts interpret freshly authored attachments directly through the detached access path.
-            let detached = DetachedInterpret { context: self, attachments: &attachments, callees: &callees };
-            operation.interpret(self, InterpretRegions { nested: Some(&detached) }, inputs)
+            // Eager contexts interpret freshly authored nested computations through the detached access path;
+            // region-free operations receive empty access.
+            if regions.is_empty() && callees.is_empty() {
+                operation.interpret(self, InterpretRegions::empty(), inputs)
+            } else {
+                let detached = DetachedInterpret { context: self, regions, callees };
+                operation.interpret(self, InterpretRegions { nested: Some(&detached) }, inputs)
+            }
         }
     }
 
@@ -439,24 +423,21 @@ mod model {
         type Value = usize;
         type Operation = Op;
 
-        fn bind(&self, operation: Op, inputs: &[usize]) -> R<Vec<usize>> {
-            let count = operation.output_count();
-            Ok(self.builder.borrow_mut().add_instruction(operation, inputs.to_vec(), count, Vec::new(), Vec::new()))
-        }
-
-        fn bind_with_regions(
+        fn bind(
             &self,
             operation: Op,
-            attachments: Vec<Program<Stored, Op>>,
-            callees: Vec<Rc<Program<Stored, Op>>>,
+            regions: &[Program<Stored, Op>],
+            callees: &[Rc<Program<Stored, Op>>],
             inputs: &[usize],
         ) -> R<Vec<usize>> {
-            // Staging contexts import the attachment closures and attach destination region ids.
+            // Staging contexts add the nested computations to the destination program and attach their ids. Owned
+            // regions import through the copying policy and callees through the interning policy, but the resulting
+            // instruction carries one slot-ordered region list (owned slots first, callee slots after).
             let mut program = self.program.borrow_mut();
-            let regions = attachments.iter().map(|attachment| program.add_region(attachment)).collect();
-            let callees = callees.iter().map(|callee| program.add_callee(callee)).collect();
+            let mut attached = regions.iter().map(|region| program.add_region(region)).collect::<Vec<_>>();
+            attached.extend(callees.iter().map(|callee| program.add_callee(callee)));
             let count = operation.output_count();
-            Ok(self.builder.borrow_mut().add_instruction(operation, inputs.to_vec(), count, regions, callees))
+            Ok(self.builder.borrow_mut().add_instruction(operation, inputs.to_vec(), count, attached))
         }
     }
     // ------------------------------------------------------------------------------------------------------------
@@ -490,24 +471,21 @@ mod model {
         }
     }
 
-    /// Detached-attachment access used by [`EagerContext::bind_with_regions`].
+    /// Detached access to freshly authored nested computations, used by [`EagerContext::bind`].
     struct DetachedInterpret<'a> {
         context: &'a EagerContext,
-        attachments: &'a [Program<Stored, Op>],
+        regions: &'a [Program<Stored, Op>],
         callees: &'a [Rc<Program<Stored, Op>>],
     }
 
     impl NestedInterpret<f64> for DetachedInterpret<'_> {
         fn slot_count(&self) -> usize {
-            self.attachments.len() + self.callees.len()
+            self.regions.len() + self.callees.len()
         }
 
         fn interpret_slot(&self, slot: usize, inputs: Vec<f64>) -> R<Vec<f64>> {
-            let program = if slot < self.attachments.len() {
-                &self.attachments[slot]
-            } else {
-                &*self.callees[slot - self.attachments.len()]
-            };
+            let program =
+                if slot < self.regions.len() { &self.regions[slot] } else { &*self.callees[slot - self.regions.len()] };
             program.interpret_in_context(self.context, &|constant| self.context.lift(constant), inputs)
         }
     }
@@ -526,15 +504,11 @@ mod model {
         O: InterpretableOperation<V, Ctx>,
     {
         fn slot_count(&self) -> usize {
-            self.instruction.regions.len() + self.instruction.callees.len()
+            self.instruction.regions.len()
         }
 
         fn interpret_slot(&self, slot: usize, inputs: Vec<V>) -> R<Vec<V>> {
-            let region = if slot < self.instruction.regions.len() {
-                self.instruction.regions[slot]
-            } else {
-                self.instruction.callees[slot - self.instruction.regions.len()]
-            };
+            let region = self.instruction.regions[slot];
             self.program.interpret_region_in_context(region, self.context, self.lift, inputs)
         }
     }
@@ -688,7 +662,7 @@ mod model {
         ) -> R<Vec<PartialValue<C::Value>>> {
             if inputs.iter().all(|input| input.known().is_some()) {
                 let operands = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
-                Ok(context.bind(Op::Prim(*self), &operands)?.into_iter().map(PartialValue::Known).collect())
+                Ok(context.bind(Op::Prim(*self), &[], &[], &operands)?.into_iter().map(PartialValue::Known).collect())
             } else {
                 Ok(vec![PartialValue::Unknown; self.output_count()])
             }
@@ -818,18 +792,14 @@ mod model {
         type Value = P::Value;
         type Operation = P::Operation;
 
-        fn bind(&self, operation: P::Operation, inputs: &[P::Value]) -> R<Vec<P::Value>> {
-            self.parent.bind(operation, inputs)
-        }
-
-        fn bind_with_regions(
+        fn bind(
             &self,
             operation: P::Operation,
-            attachments: Vec<Program<Stored, P::Operation>>,
-            callees: Vec<Rc<Program<Stored, P::Operation>>>,
+            regions: &[Program<Stored, P::Operation>],
+            callees: &[Rc<Program<Stored, P::Operation>>],
             inputs: &[P::Value],
         ) -> R<Vec<P::Value>> {
-            self.parent.bind_with_regions(operation, attachments, callees, inputs)
+            self.parent.bind(operation, regions, callees, inputs)
         }
     }
 
@@ -841,18 +811,14 @@ mod model {
         type Value = P::Value;
         type Operation = P::Operation;
 
-        fn bind(&self, operation: P::Operation, inputs: &[P::Value]) -> R<Vec<P::Value>> {
-            self.parent.bind(operation, inputs)
-        }
-
-        fn bind_with_regions(
+        fn bind(
             &self,
             operation: P::Operation,
-            attachments: Vec<Program<Stored, P::Operation>>,
-            callees: Vec<Rc<Program<Stored, P::Operation>>>,
+            regions: &[Program<Stored, P::Operation>],
+            callees: &[Rc<Program<Stored, P::Operation>>],
             inputs: &[P::Value],
         ) -> R<Vec<P::Value>> {
-            self.parent.bind_with_regions(operation, attachments, callees, inputs)
+            self.parent.bind(operation, regions, callees, inputs)
         }
     }
 
@@ -867,25 +833,16 @@ mod model {
         type Value = PartialValue<P::Value>;
         type Operation = P::Operation;
 
-        fn bind(&self, operation: P::Operation, inputs: &[PartialValue<P::Value>]) -> R<Vec<PartialValue<P::Value>>> {
-            if inputs.iter().all(|input| input.known().is_some()) {
-                let operands = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
-                Ok(self.parent.bind(operation, &operands)?.into_iter().map(PartialValue::Known).collect())
-            } else {
-                Ok(vec![PartialValue::Unknown; operation.output_count()])
-            }
-        }
-
-        fn bind_with_regions(
+        fn bind(
             &self,
             operation: P::Operation,
-            attachments: Vec<Program<Stored, P::Operation>>,
-            callees: Vec<Rc<Program<Stored, P::Operation>>>,
+            regions: &[Program<Stored, P::Operation>],
+            callees: &[Rc<Program<Stored, P::Operation>>],
             inputs: &[PartialValue<P::Value>],
         ) -> R<Vec<PartialValue<P::Value>>> {
             if inputs.iter().all(|input| input.known().is_some()) {
                 let operands = inputs.iter().map(|input| input.known().unwrap().clone()).collect::<Vec<_>>();
-                let outputs = self.parent.bind_with_regions(operation, attachments, callees, &operands)?;
+                let outputs = self.parent.bind(operation, regions, callees, &operands)?;
                 Ok(outputs.into_iter().map(PartialValue::Known).collect())
             } else {
                 Ok(vec![PartialValue::Unknown; operation.output_count()])
@@ -928,7 +885,7 @@ mod model {
             _regions: BatchRegions<'_, C::Operation>,
             inputs: &[C::Value],
         ) -> R<Vec<C::Value>> {
-            context.bind((*self).into(), inputs)
+            context.bind((*self).into(), &[], &[], inputs)
         }
     }
 
@@ -941,7 +898,7 @@ mod model {
             // destination application with attachments; it never restates a bound on the operation enum.
             let true_region = regions.batch_slot(0)?;
             let false_region = regions.batch_slot(1)?;
-            context.bind_with_regions((*self).into(), vec![true_region, false_region], Vec::new(), inputs)
+            context.bind((*self).into(), &[true_region, false_region], &[], inputs)
         }
     }
 
@@ -1070,15 +1027,17 @@ mod model {
         ) -> R<Vec<Dual<C::Value>>> {
             let primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
             let tangents = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-            let primal = context.bind((*self).into(), &primals)?.remove(0);
+            let primal = context.bind((*self).into(), &[], &[], &primals)?.remove(0);
             let tangent = match self {
                 // d(a + b) = da + db
-                Prim::Add => context.bind(Prim::Add.into(), &tangents)?.remove(0),
+                Prim::Add => context.bind(Prim::Add.into(), &[], &[], &tangents)?.remove(0),
                 // d(a * b) = da * b + a * db
                 Prim::Mul => {
-                    let left = context.bind(Prim::Mul.into(), &[tangents[0].clone(), primals[1].clone()])?.remove(0);
-                    let right = context.bind(Prim::Mul.into(), &[primals[0].clone(), tangents[1].clone()])?.remove(0);
-                    context.bind(Prim::Add.into(), &[left, right])?.remove(0)
+                    let left =
+                        context.bind(Prim::Mul.into(), &[], &[], &[tangents[0].clone(), primals[1].clone()])?.remove(0);
+                    let right =
+                        context.bind(Prim::Mul.into(), &[], &[], &[primals[0].clone(), tangents[1].clone()])?.remove(0);
+                    context.bind(Prim::Add.into(), &[], &[], &[left, right])?.remove(0)
                 }
             };
             Ok(vec![Dual { primal, tangent }])
@@ -1102,17 +1061,9 @@ mod model {
             let false_region = regions.jvp_slot(1)?;
             let primals = inputs.iter().map(|input| input.primal.clone()).collect::<Vec<_>>();
             let tangents = inputs.iter().map(|input| input.tangent.clone()).collect::<Vec<_>>();
-            let primal = context
-                .bind_with_regions(
-                    (*self).into(),
-                    vec![true_region.clone(), false_region.clone()],
-                    Vec::new(),
-                    &primals,
-                )?
-                .remove(0);
-            let tangent = context
-                .bind_with_regions((*self).into(), vec![true_region, false_region], Vec::new(), &tangents)?
-                .remove(0);
+            let primal =
+                context.bind((*self).into(), &[true_region.clone(), false_region.clone()], &[], &primals)?.remove(0);
+            let tangent = context.bind((*self).into(), &[true_region, false_region], &[], &tangents)?.remove(0);
             Ok(vec![Dual { primal, tangent }])
         }
     }
@@ -1321,7 +1272,7 @@ mod model {
             cotangents: &[usize],
         ) -> R<Vec<usize>> {
             // Semantics stub: re-stage the operation on the cotangents.
-            context.bind(Op::Prim(*self), cotangents)
+            context.bind(Op::Prim(*self), &[], &[], cotangents)
         }
     }
 
@@ -1334,7 +1285,7 @@ mod model {
         ) -> R<Vec<usize>> {
             let true_region = regions.transpose_slot(0)?;
             let false_region = regions.transpose_slot(1)?;
-            context.bind_with_regions(Op::Cond(*self), vec![true_region, false_region], Vec::new(), cotangents)
+            context.bind(Op::Cond(*self), &[true_region, false_region], &[], cotangents)
         }
     }
 
@@ -1476,7 +1427,7 @@ fn nested_condition_program(depth: usize) -> Program<Stored, Op> {
     fn branches(builder: &mut ProgramBuilder<Stored, Op>, depth: usize) -> (RegionId, RegionId) {
         let mut false_branch = RegionBuilder::new();
         let x = false_branch.add_input();
-        let product = false_branch.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new(), Vec::new())[0];
+        let product = false_branch.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new())[0];
         false_branch.set_outputs(vec![product]);
         let false_id = builder.seal(false_branch);
 
@@ -1484,17 +1435,11 @@ fn nested_condition_program(depth: usize) -> Program<Stored, Op> {
         let x = true_branch.add_input();
         let output = if depth == 0 {
             let capture = true_branch.add_constant(Stored::Capture(0));
-            true_branch.add_instruction(Op::Prim(Prim::Add), vec![x, capture], 1, Vec::new(), Vec::new())[0]
+            true_branch.add_instruction(Op::Prim(Prim::Add), vec![x, capture], 1, Vec::new())[0]
         } else {
             let (nested_true, nested_false) = branches(builder, depth - 1);
             let predicate = true_branch.add_constant(Stored::Literal(1.0));
-            true_branch.add_instruction(
-                Op::Cond(Cond),
-                vec![predicate, x],
-                1,
-                vec![nested_true, nested_false],
-                Vec::new(),
-            )[0]
+            true_branch.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![nested_true, nested_false])[0]
         };
         true_branch.set_outputs(vec![output]);
         (builder.seal(true_branch), false_id)
@@ -1505,7 +1450,7 @@ fn nested_condition_program(depth: usize) -> Program<Stored, Op> {
     let mut entry = RegionBuilder::new();
     let predicate = entry.add_input();
     let x = entry.add_input();
-    let output = entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![true_id, false_id], Vec::new())[0];
+    let output = entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![true_id, false_id])[0];
     entry.set_outputs(vec![output]);
     let entry_id = builder.seal(entry);
     builder.build(entry_id)
@@ -1543,46 +1488,32 @@ fn test_witness_free_nested_interpretation_substitutes_captures() {
 fn test_attachment_aware_hook_binds_fresh_regional_operations() {
     let true_program = single_region_program(|region, x| {
         let one = region.add_constant(Stored::Literal(1.0));
-        region.add_instruction(Op::Prim(Prim::Add), vec![x, one], 1, Vec::new(), Vec::new())[0]
+        region.add_instruction(Op::Prim(Prim::Add), vec![x, one], 1, Vec::new())[0]
     });
-    let false_program = single_region_program(|region, x| {
-        region.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new(), Vec::new())[0]
-    });
+    let false_program =
+        single_region_program(|region, x| region.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new())[0]);
 
-    // Eager contexts interpret freshly authored attachments through the detached access path.
+    // Eager contexts interpret freshly authored nested computations through the detached access path.
     let context = EagerContext { captures: Rc::new(Vec::new()) };
     assert_eq!(
-        context.bind_with_regions(
-            Op::Cond(Cond),
-            vec![true_program.clone(), false_program.clone()],
-            Vec::new(),
-            &[1.0, 3.0],
-        ),
+        context.bind(Op::Cond(Cond), &[true_program.clone(), false_program.clone()], &[], &[1.0, 3.0]),
         Ok(vec![4.0]),
     );
     assert_eq!(
-        context.bind_with_regions(
-            Op::Cond(Cond),
-            vec![true_program.clone(), false_program.clone()],
-            Vec::new(),
-            &[0.0, 3.0],
-        ),
+        context.bind(Op::Cond(Cond), &[true_program.clone(), false_program.clone()], &[], &[0.0, 3.0]),
         Ok(vec![9.0]),
     );
-    // Attachment-free binding still routes through the ordinary `bind` protocol.
-    assert_eq!(context.bind(Op::Prim(Prim::Add), &[1.0, 2.0]), Ok(vec![3.0]));
+    // Region-free binding uses the same protocol with empty lists.
+    assert_eq!(context.bind(Op::Prim(Prim::Add), &[], &[], &[1.0, 2.0]), Ok(vec![3.0]));
 
-    // Staging contexts import the attachment closures and attach destination region ids.
+    // Staging contexts add the nested computations to the destination program and attach their ids.
     let tracing = TracingContext::new();
     let predicate = tracing.builder.borrow_mut().add_input();
     let x = tracing.builder.borrow_mut().add_input();
-    let outputs = tracing
-        .bind_with_regions(Op::Cond(Cond), vec![true_program, false_program], Vec::new(), &[predicate, x])
-        .unwrap();
+    let outputs = tracing.bind(Op::Cond(Cond), &[true_program, false_program], &[], &[predicate, x]).unwrap();
     let staged = tracing.finish(outputs);
     let instruction = &staged.entry_region().instructions[0];
     assert_eq!(instruction.regions.len(), 2);
-    assert!(instruction.callees.is_empty());
     // Entry plus two imported attachment regions.
     assert_eq!(staged.regions.len(), 3);
     // The staged program interprets like the eagerly bound one.
@@ -1646,11 +1577,11 @@ fn test_fresh_stack_transform_drivers_run_without_witnesses() {
 fn test_callee_interning_and_full_closure_import() {
     let callee = Rc::new(single_region_program(|region, x| {
         let one = region.add_constant(Stored::Literal(1.0));
-        region.add_instruction(Op::Prim(Prim::Add), vec![x, one], 1, Vec::new(), Vec::new())[0]
+        region.add_instruction(Op::Prim(Prim::Add), vec![x, one], 1, Vec::new())[0]
     }));
     let equal_but_distinct = Rc::new(single_region_program(|region, x| {
         let one = region.add_constant(Stored::Literal(1.0));
-        region.add_instruction(Op::Prim(Prim::Add), vec![x, one], 1, Vec::new(), Vec::new())[0]
+        region.add_instruction(Op::Prim(Prim::Add), vec![x, one], 1, Vec::new())[0]
     }));
 
     // Interning: one live `Rc` imports once; a structurally equal but distinct program stays distinct.
@@ -1669,9 +1600,8 @@ fn test_callee_interning_and_full_closure_import() {
     let x = entry.add_input();
     // The mini-model does not validate operation-declared attachment counts, so a primitive carrying a callee edge
     // stands in for a call operation.
-    let first_call = entry.add_instruction(Op::Prim(Prim::Add), vec![x, x], 1, Vec::new(), vec![callee_root]);
-    let second_call =
-        entry.add_instruction(Op::Prim(Prim::Mul), vec![first_call[0], x], 1, Vec::new(), vec![callee_root]);
+    let first_call = entry.add_instruction(Op::Prim(Prim::Add), vec![x, x], 1, vec![callee_root]);
+    let second_call = entry.add_instruction(Op::Prim(Prim::Mul), vec![first_call[0], x], 1, vec![callee_root]);
     entry.set_outputs(vec![second_call[0]]);
     let source_entry = source_builder.seal(entry);
     let source = source_builder.build(source_entry);
@@ -1682,7 +1612,7 @@ fn test_callee_interning_and_full_closure_import() {
     let imported = destination.build(imported_entry);
     assert_eq!(imported.regions.len(), 2);
     let imported_instructions = &imported.entry_region().instructions;
-    assert_eq!(imported_instructions[0].callees, imported_instructions[1].callees);
+    assert_eq!(imported_instructions[0].regions, imported_instructions[1].regions);
 
     // Two lexical imports of one program produce two owned subtrees.
     let mut duplicating = ProgramBuilder::<Stored, Op>::new();
@@ -1698,7 +1628,7 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let mut builder = ProgramBuilder::<Stored, Op>::new();
     let mut true_branch = RegionBuilder::new();
     let x = true_branch.add_input();
-    let product = true_branch.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new(), Vec::new())[0];
+    let product = true_branch.add_instruction(Op::Prim(Prim::Mul), vec![x, x], 1, Vec::new())[0];
     true_branch.set_outputs(vec![product]);
     let true_id = builder.seal(true_branch);
     let mut false_branch = RegionBuilder::new();
@@ -1709,7 +1639,7 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let mut entry = RegionBuilder::new();
     let predicate = entry.add_input();
     let x = entry.add_input();
-    let output = entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![true_id, false_id], Vec::new())[0];
+    let output = entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![true_id, false_id])[0];
     entry.set_outputs(vec![output]);
     let entry_id = builder.seal(entry);
     let program = builder.build(entry_id);
@@ -1729,14 +1659,13 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let mut shared_builder = ProgramBuilder::<Stored, Op>::new();
     let mut shared = RegionBuilder::new();
     let x = shared.add_input();
-    let doubled = shared.add_instruction(Op::Prim(Prim::Add), vec![x, x], 1, Vec::new(), Vec::new())[0];
+    let doubled = shared.add_instruction(Op::Prim(Prim::Add), vec![x, x], 1, Vec::new())[0];
     shared.set_outputs(vec![doubled]);
     let shared_id = shared_builder.seal(shared);
     let mut shared_entry = RegionBuilder::new();
     let predicate = shared_entry.add_input();
     let x = shared_entry.add_input();
-    let output =
-        shared_entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![shared_id, shared_id], Vec::new())[0];
+    let output = shared_entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, vec![shared_id, shared_id])[0];
     shared_entry.set_outputs(vec![output]);
     let shared_entry_id = shared_builder.seal(shared_entry);
     let shared_program = shared_builder.build(shared_entry_id);
@@ -1750,7 +1679,7 @@ fn test_lazy_origin_resolution_through_region_attachments() {
     let mut malformed_entry = RegionBuilder::new();
     let predicate = malformed_entry.add_input();
     let x = malformed_entry.add_input();
-    let output = malformed_entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, Vec::new(), Vec::new())[0];
+    let output = malformed_entry.add_instruction(Op::Cond(Cond), vec![predicate, x], 1, Vec::new())[0];
     malformed_entry.set_outputs(vec![output]);
     let malformed_id = malformed_builder.seal(malformed_entry);
     let malformed = malformed_builder.build(malformed_id);
@@ -1762,13 +1691,19 @@ fn test_lazy_origin_resolution_through_region_attachments() {
 
 #[test]
 fn test_instruction_layout_measurements() {
-    // Phase 0 layout measurement: today's instruction shape versus the two-attachment-vector shape versus one
-    // partitioned attachment vector with a split count. Production adopted the two-vector shape for representation
-    // clarity; the numbers remain recorded here for any future layout revisit.
+    // Phase 0 layout measurement: today's instruction shape versus the candidate region-carrying shapes considered
+    // during the migration. Production adopted the folded single-vector shape (one region list; edge-kind policies
+    // live at the binding boundary); the alternatives remain recorded here for any future layout revisit.
     struct Legacy<O> {
         _operation: O,
         _inputs: Vec<usize>,
         _outputs: Vec<usize>,
+    }
+    struct Folded<O> {
+        _operation: O,
+        _inputs: Vec<usize>,
+        _outputs: Vec<usize>,
+        _regions: Vec<RegionId>,
     }
     struct TwoVectors<O> {
         _operation: O,
@@ -1777,18 +1712,11 @@ fn test_instruction_layout_measurements() {
         _regions: Vec<RegionId>,
         _callees: Vec<RegionId>,
     }
-    struct Partitioned<O> {
-        _operation: O,
-        _inputs: Vec<usize>,
-        _outputs: Vec<usize>,
-        _attachments: Vec<RegionId>,
-        _lexical_count: usize,
-    }
     let vector = size_of::<Vec<usize>>();
     let legacy = size_of::<Legacy<Op>>();
+    let folded = size_of::<Folded<Op>>();
     let two_vectors = size_of::<TwoVectors<Op>>();
-    let partitioned = size_of::<Partitioned<Op>>();
-    println!("legacy: {legacy} bytes, two-vector: {two_vectors} bytes, partitioned: {partitioned} bytes");
+    println!("legacy: {legacy} bytes, folded: {folded} bytes, two-vector: {two_vectors} bytes");
+    assert_eq!(folded, legacy + vector);
     assert_eq!(two_vectors, legacy + 2 * vector);
-    assert_eq!(partitioned, legacy + vector + size_of::<usize>());
 }

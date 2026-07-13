@@ -179,7 +179,7 @@ where
 {
     fn reshard(&self, sharding: &Sharding) -> Self {
         self.dispatch_domain()
-            .bind(ReshardOperation::new(sharding.clone()), &[self.clone()])
+            .bind(ReshardOperation::new(sharding.clone()), &[], &[], &[self.clone()])
             .expect("`reshard` operation failed")
             .remove(0)
     }
@@ -301,7 +301,7 @@ where
 {
     fn constrain_sharding(&self, sharding: &Sharding) -> Self {
         self.dispatch_domain()
-            .bind(ShardingConstraintOperation::new(sharding.clone()), &[self.clone()])
+            .bind(ShardingConstraintOperation::new(sharding.clone()), &[], &[], &[self.clone()])
             .expect("`constrain_sharding` operation failed")
             .remove(0)
     }

@@ -124,7 +124,7 @@ where
     #[inline]
     fn print(self, label: &str) -> Self {
         self.dispatch_domain()
-            .bind(PrintOperation::new(label), std::slice::from_ref(&self))
+            .bind(PrintOperation::new(label), &[], &[], std::slice::from_ref(&self))
             .expect("`print` operation failed")
             .remove(0)
     }
@@ -142,7 +142,8 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<PrintOper
         // through unchanged (printing tangents would change the observable output of the differentiated program).
         // The print binds through the context so the rule works uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
-        let mut primal = context.bind(PrintOperation::new(self.label()), std::slice::from_ref(inputs[0].primal()))?;
+        let mut primal =
+            context.bind(PrintOperation::new(self.label()), &[], &[], std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }

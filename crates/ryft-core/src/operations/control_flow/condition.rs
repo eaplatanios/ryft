@@ -512,7 +512,7 @@ where
         }
         let mut zero_atoms = Vec::with_capacity(other.edge_types.len());
         for edge_type in other.edge_types.iter() {
-            let zeros = own.fresh.bind(ZeroOperation::new(edge_type.clone()), &[])?;
+            let zeros = own.fresh.bind(ZeroOperation::new(edge_type.clone()), &[], &[], &[])?;
             check_count!("output", zeros, 1, ProgramError);
             zero_atoms.push(zeros[0].atom_id()?);
         }

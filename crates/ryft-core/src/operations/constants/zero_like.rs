@@ -63,7 +63,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<ZeroLikeOperation>>>> Zero
     #[inline]
     fn zero_like(&self) -> Self {
         self.dispatch_domain()
-            .bind(ZeroLikeOperation, &[self.clone()])
+            .bind(ZeroLikeOperation, &[], &[], &[self.clone()])
             .expect("`zero_like` operation failed")
             .remove(0)
     }

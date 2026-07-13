@@ -137,7 +137,10 @@ pub trait Complex: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ComplexOperation>>>> Complex for V {
     #[inline]
     fn complex(&self, imaginary: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ComplexOperation, &[self.clone(), imaginary.clone()])?.remove(0))
+        Ok(self
+            .dispatch_domain()
+            .bind(ComplexOperation, &[], &[], &[self.clone(), imaginary.clone()])?
+            .remove(0))
     }
 }
 
@@ -218,7 +221,7 @@ pub trait Conjugate: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ConjugateOperation>>>> Conjugate for V {
     #[inline]
     fn conjugate(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ConjugateOperation, &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(ConjugateOperation, &[], &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -298,7 +301,7 @@ pub trait Real: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<RealOperation>>>> Real for V {
     #[inline]
     fn real(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(RealOperation, &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(RealOperation, &[], &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -378,7 +381,7 @@ pub trait Imaginary: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<ImaginaryOperation>>>> Imaginary for V {
     #[inline]
     fn imaginary(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(ImaginaryOperation, &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(ImaginaryOperation, &[], &[], &[self.clone()])?.remove(0))
     }
 }
 

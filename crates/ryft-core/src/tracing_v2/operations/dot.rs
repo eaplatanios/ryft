@@ -155,7 +155,7 @@ where
 {
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Self {
         self.dispatch_domain()
-            .bind(DotOperation::new(dimensions.clone()), &[self.clone(), rhs.clone()])
+            .bind(DotOperation::new(dimensions.clone()), &[], &[], &[self.clone(), rhs.clone()])
             .expect("`dot` operation failed")
             .remove(0)
     }
@@ -169,6 +169,8 @@ where
         self.dispatch_domain()
             .bind(
                 DotOperation::new(dimensions.clone()).with_output_sharding(output_sharding.clone()),
+                &[],
+                &[],
                 &[self.clone(), rhs.clone()],
             )
             .expect("`dot` operation failed")

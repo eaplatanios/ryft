@@ -121,7 +121,7 @@ impl<S: Clone + Display, C: Context<Operation: PartiallyEvaluatableOperation<C> 
 {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: S) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), &[])?;
+        let mut outputs = self.bind(FillOperation::new(r#type.clone(), value), &[], &[], &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

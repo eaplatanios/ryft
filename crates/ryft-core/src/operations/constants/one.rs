@@ -102,7 +102,7 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<OneOperation<
 {
     #[inline]
     fn one(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(OneOperation::new(r#type.clone()), &[])?;
+        let mut outputs = self.bind(OneOperation::new(r#type.clone()), &[], &[], &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

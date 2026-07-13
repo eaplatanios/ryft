@@ -199,9 +199,12 @@ where
 
     #[inline]
     fn select(condition: &Self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        let mut outputs = condition
-            .dispatch_domain()
-            .bind(SelectOperation, &[condition.clone(), on_true.clone(), on_false.clone()])?;
+        let mut outputs = condition.dispatch_domain().bind(
+            SelectOperation,
+            &[],
+            &[],
+            &[condition.clone(), on_true.clone(), on_false.clone()],
+        )?;
         Ok(outputs.remove(0))
     }
 }

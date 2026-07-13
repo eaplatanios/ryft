@@ -158,7 +158,7 @@ pub trait Abs: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<AbsOperation>>>> Abs for V {
     #[inline]
     fn abs(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(AbsOperation, &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(AbsOperation, &[], &[], &[self.clone()])?.remove(0))
     }
 }
 

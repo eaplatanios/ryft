@@ -1176,7 +1176,7 @@ pub trait ReverseModeDifferentiate: ForwardModeDifferentiate {
         let output_cotangent_type = output_type.cotangent().ok_or_else(|| {
             DifferentiationError::NonDifferentiableGradientOutput { output_type: output_type.to_string() }
         })?;
-        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), &[])?;
+        let mut seeds = self.bind(OneOperation::new(output_cotangent_type), &[], &[], &[])?;
         check_count!("output", seeds, 1, ProgramError);
         Ok(seeds.pop().unwrap())
     }
@@ -1983,7 +1983,12 @@ mod tests {
                 atoms: vec![Atom::Variable(DataType::F64)],
                 input_ids: vec![input],
                 output_ids: vec![input],
-                instructions: vec![Instruction::new(TestLinearOperation::Identity, vec![input], vec![missing_output])],
+                instructions: vec![Instruction::new(
+                    TestLinearOperation::Identity,
+                    vec![input],
+                    vec![missing_output],
+                    Vec::new(),
+                )],
             }],
             entry: RegionId::new(0),
             marker: PhantomData,

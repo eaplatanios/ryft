@@ -277,7 +277,7 @@ where
                 TypeError { message: "'concatenate' expects at least one operand but got none".to_string() }.into()
             );
         };
-        let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), operands)?;
+        let mut outputs = first.dispatch_domain().bind(ConcatenateOperation::new(axis), &[], &[], operands)?;
         crate::macros::check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

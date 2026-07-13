@@ -103,7 +103,7 @@ pub trait Atan2: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<Atan2Operation>>>> Atan2 for V {
     #[inline]
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(Atan2Operation, &[self.clone(), x.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(Atan2Operation, &[], &[], &[self.clone(), x.clone()])?.remove(0))
     }
 }
 

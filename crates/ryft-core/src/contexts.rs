@@ -115,7 +115,7 @@ use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
@@ -173,10 +173,19 @@ pub trait Context: Domain + Clone {
 
     /// Binds the provided [`Operation`] to the provided input [`Value`]s in this [`Context`] and returns the resulting
     /// output values. Eager contexts bind by interpreting the operation over concrete values. [`StagingContext`]s bind
-    /// by recording an [`Instruction`](crate::Instruction) in their underling [`ProgramBuilder`].
+    /// by recording an [`Instruction`](crate::Instruction) in their underling [`ProgramBuilder`]. Operations that carry
+    /// nested computations additionally provide them at construction time as the freshly authored lexically owned
+    /// computations (via the `regions` argument) and shareable callee computations (via the `callees` argument), each
+    /// in the operation-defined order. Once an operation family stores its nested computations as instruction
+    /// [`Region`](crate::Region)s instead of payload fields, this is how a freshly authored application reaches a
+    /// context: eager contexts interpret the provided computations, staging contexts add them to the destination
+    /// program and attach them to the staged instruction, and transform contexts transform them before emitting the
+    /// destination application.
     fn bind<O: Into<Self::Operation>>(
         &self,
         operation: O,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError>;
 
@@ -248,12 +257,10 @@ pub trait Context: Domain + Clone {
         let output_values = flat_program.interpret_in_context(self, input_values)?;
         let output = Output::To::<Self::Value>::from_parameters(output_structure.clone(), output_values)?;
         let program = Program {
-            atoms: flat_program.atoms,
-            input_ids: flat_program.input_ids,
-            output_ids: flat_program.output_ids,
-            instructions: flat_program.instructions,
             input_structure,
             output_structure,
+            regions: flat_program.regions,
+            entry: flat_program.entry,
             marker: PhantomData,
         };
         Ok((output, program))
@@ -320,8 +327,33 @@ impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O
     }
 
     #[inline]
-    fn bind<P: Into<O>>(&self, operation: P, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
-        operation.into().interpret(self, inputs)
+    fn bind<P: Into<O>>(
+        &self,
+        operation: P,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
+        inputs: &[V],
+    ) -> Result<Vec<V>, ProgramError> {
+        let operation = operation.into();
+        // TODO(eaplatanios): [regions] Transitional guard: no operation family stages region-carrying binds yet,
+        //  and so every `Context::bind` implementation rejects non-empty `regions`/`callees` instead of silently
+        //  dropping them. Each guard is replaced by real region-binding behavior as its context migrates in phases
+        //  2-6 of `.tasks/plan_first_class_program_regions.md` (eager contexts interpret the nested programs, staging
+        //  contexts import them and attach destination region ids, and transform contexts transform them before
+        //  emitting the destination instruction). Deletion inventory: `EagerContext` (here), `TracingContext` and
+        //  `NestedTracingContext` in `tracing.rs`, `BatchingContext` in `batching.rs`, `DifferentiationContext` in
+        //  `differentiation/forward.rs`, `PartialEvaluationContext` in `partial.rs`,
+        //  `StagedDispatchTestArrayDomain` in `tracing_v2/operations/control_flow.rs`, and `XlaDomain` in
+        //  `ryft-xla`'s `experimental/domains.rs`.
+        if !regions.is_empty() || !callees.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{}` carries nested regions which this context cannot bind yet",
+                    operation.name(),
+                ),
+            });
+        }
+        operation.interpret(self, inputs)
     }
 
     #[inline]
@@ -517,14 +549,14 @@ mod tests {
         // [`EagerContext<Scalar, ScalarOperation<Scalar>>`] is an eager `Context` over the self-describing [`Scalar`] value type, so binding a nullary
         // zero/one `Operation` interprets it directly to the [`Scalar`] variant matching the requested [`DataType`].
         let domain = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::BF16), &[]), Ok(vec![Scalar::BF16(bf16::ZERO)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::BF16), &[]), Ok(vec![Scalar::BF16(bf16::ONE)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F16), &[]), Ok(vec![Scalar::F16(f16::ZERO)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F16), &[]), Ok(vec![Scalar::F16(f16::ONE)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F32), &[]), Ok(vec![Scalar::F32(0.0)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F32), &[]), Ok(vec![Scalar::F32(1.0)]));
-        assert_eq!(domain.bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![Scalar::F64(0.0)]));
-        assert_eq!(domain.bind(OneOperation::new(DataType::F64), &[]), Ok(vec![Scalar::F64(1.0)]));
+        assert_eq!(domain.bind(ZeroOperation::new(DataType::BF16), &[], &[], &[]), Ok(vec![Scalar::BF16(bf16::ZERO)]));
+        assert_eq!(domain.bind(OneOperation::new(DataType::BF16), &[], &[], &[]), Ok(vec![Scalar::BF16(bf16::ONE)]));
+        assert_eq!(domain.bind(ZeroOperation::new(DataType::F16), &[], &[], &[]), Ok(vec![Scalar::F16(f16::ZERO)]));
+        assert_eq!(domain.bind(OneOperation::new(DataType::F16), &[], &[], &[]), Ok(vec![Scalar::F16(f16::ONE)]));
+        assert_eq!(domain.bind(ZeroOperation::new(DataType::F32), &[], &[], &[]), Ok(vec![Scalar::F32(0.0)]));
+        assert_eq!(domain.bind(OneOperation::new(DataType::F32), &[], &[], &[]), Ok(vec![Scalar::F32(1.0)]));
+        assert_eq!(domain.bind(ZeroOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::F64(0.0)]));
+        assert_eq!(domain.bind(OneOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::F64(1.0)]));
     }
 
     #[test]
@@ -538,9 +570,12 @@ mod tests {
         assert_eq!(format!("{default_context:?}"), "EagerContext");
         assert_eq!(format!("{cloned_context:?}"), "EagerContext");
         assert_eq!(context.lift(Scalar::from(2.5)), Ok(Scalar::from(2.5)));
-        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(0.0)]));
-        assert_eq!(context.bind(OneOperation::new(DataType::F64), &[]), Ok(vec![Scalar::from(1.0)]));
-        assert_eq!(context.bind(AddOperation, &[Scalar::from(2.0), Scalar::from(3.5)]), Ok(vec![Scalar::from(5.5)]));
+        assert_eq!(context.bind(ZeroOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::from(0.0)]));
+        assert_eq!(context.bind(OneOperation::new(DataType::F64), &[], &[], &[]), Ok(vec![Scalar::from(1.0)]));
+        assert_eq!(
+            context.bind(AddOperation, &[], &[], &[Scalar::from(2.0), Scalar::from(3.5)]),
+            Ok(vec![Scalar::from(5.5)]),
+        );
     }
 
     #[test]
@@ -700,5 +735,29 @@ mod tests {
         let poisoned = poisoned_outputs.remove(0);
         assert_eq!(poisoned.state(), &TracerState::Poison);
         assert_eq!(foreign_context.resolve(&poisoned), ValueResolution::Opaque);
+    }
+
+    // TODO(eaplatanios): Review this test.
+    #[test]
+    fn test_bind_rejects_nested_regions() {
+        // Phase 1 pin for the first-class-program-regions plan: the region-aware binding hook is the extension
+        // point through which freshly authored regional operations will reach contexts; until contexts become
+        // region-aware (with the operation families' migrations), the default delegates region-free calls to `bind`
+        // and rejects nested regions explicitly.
+        let context = EagerContext::<Scalar, ScalarOperation<Scalar>>::new();
+        assert_eq!(
+            context.bind(AddOperation, &[], &[], &[Scalar::from(2.0), Scalar::from(3.0)]),
+            Ok(vec![Scalar::from(5.0)]),
+        );
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let region = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            context.bind(AddOperation, &[region], &[], &[Scalar::from(2.0), Scalar::from(3.0)]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "operation `add` carries nested regions which this context cannot bind yet",
+        ));
     }
 }

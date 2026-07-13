@@ -149,7 +149,7 @@ where
                 input_atoms.push(*atom);
             }
             let output_atoms = builder.borrow_mut().add_instruction(operation.clone(), input_atoms)?.to_vec();
-            let output_values = context.bind(operation.clone(), &input_values)?;
+            let output_values = context.bind(operation.clone(), &[], &[], &input_values)?;
             check_count!("output", output_values, output_atoms.len(), ProgramError);
             Ok(output_values.into_iter().zip(output_atoms).collect())
         },

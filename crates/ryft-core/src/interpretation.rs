@@ -186,7 +186,7 @@ impl<
         let outputs = self.interpret_with(
             inputs,
             |_, constant| context.lift(constant.clone()),
-            |instruction, inputs| context.bind(instruction.operation().clone(), inputs),
+            |instruction, inputs| context.bind(instruction.operation().clone(), &[], &[], inputs),
         )?;
 
         Ok(Output::To::<C::Value>::from_parameters(self.output_structure.clone(), outputs)?)

@@ -99,7 +99,7 @@ where
     #[inline]
     fn stop_gradient(&self) -> Self {
         self.dispatch_domain()
-            .bind(StopGradientOperation, &[self.clone()])
+            .bind(StopGradientOperation, &[], &[], &[self.clone()])
             .expect("`stop_gradient` operation failed")
             .remove(0)
     }

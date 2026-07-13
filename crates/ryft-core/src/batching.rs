@@ -84,7 +84,7 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::manipulation::{Broadcast, BroadcastOperation, Transpose, TransposeOperation};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{Program, ProgramError, Value};
+use crate::programs::{FlatProgram, Program, ProgramError, Value};
 use crate::sharding::ShardingDimension;
 use crate::tracing::TracingContext;
 use crate::types::{ArrayType, Size, TypeError, Typed};
@@ -911,6 +911,8 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for
     fn bind<P: Into<Self::Operation>>(
         &self,
         operation: P,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[BatchingTracer<C>],
     ) -> Result<Vec<BatchingTracer<C>>, ProgramError> {
         // Binding routes the operation through its `BatchableOperation` implementation against the batch-carrying
@@ -919,6 +921,17 @@ impl<C: Context<Type = ArrayType, Operation: BatchableOperation<C>>> Context for
         // collectives) through this batching context, and so multi-operation lowering (e.g., a batch-varying
         // `Instruction` becoming two branches plus a per-item select instruction) emerges automatically.
         let operation = operation.into();
+        // TODO(eaplatanios): [regions] Transitional guard until `BatchingContext` binds regions (phases 2-6);
+        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
+        if !regions.is_empty() || !callees.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{}` carries nested regions which this context cannot bind yet",
+                    operation.name(),
+                ),
+            });
+        }
+
         let input_batches = inputs.iter().map(|input| input.batch().clone()).collect::<Vec<_>>();
         let output_batches = operation.batch(self, input_batches.as_slice())?;
         Ok(output_batches.into_iter().map(|batch| BatchingTracer::new(self.clone(), batch)).collect())

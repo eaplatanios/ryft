@@ -53,8 +53,8 @@ pub use partial::{
     PartiallyEvaluatableProgramOperation, PartitionedProgram,
 };
 pub use programs::{
-    Atom, AtomId, Instruction, InstructionId, InstructionRef, MaybeZero, Program, ProgramBuilder, ProgramError,
-    ProgramLiveSets, Region, RegionId, Value, ValueId,
+    Atom, AtomId, FlatProgram, Instruction, InstructionId, InstructionRef, MaybeZero, Program, ProgramBuilder,
+    ProgramError, ProgramLiveSets, Region, RegionId, Value, ValueId,
 };
 pub use sharding::*;
 pub use tracing::{

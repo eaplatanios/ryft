@@ -268,7 +268,12 @@ fn rebuild_xla_program_with_builder<Input: Parameterized<XlaConstant>, Output: P
             .copied()
             .map(|output| remap_atom_id(atom_id_mapping.as_slice(), output))
             .collect::<Result<Vec<_>, _>>()?;
-        builder.add_instruction_unchecked(Instruction::new(instruction.operation().clone(), inputs, outputs));
+        builder.add_instruction_unchecked(Instruction::new(
+            instruction.operation().clone(),
+            inputs,
+            outputs,
+            Vec::new(),
+        ));
     }
 
     let output_ids = output_ids

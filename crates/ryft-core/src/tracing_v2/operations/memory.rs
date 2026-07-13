@@ -136,7 +136,7 @@ where
 {
     fn transfer_to_memory(&self, destination: Memory) -> Self {
         self.dispatch_domain()
-            .bind(TransferToMemoryOperation::new(destination), &[self.clone()])
+            .bind(TransferToMemoryOperation::new(destination), &[], &[], &[self.clone()])
             .expect("`transfer_to_memory` operation failed")
             .remove(0)
     }

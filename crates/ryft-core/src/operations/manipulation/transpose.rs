@@ -278,7 +278,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
         }
         Ok(self
             .dispatch_domain()
-            .bind(TransposeOperation::new(permutation.to_vec()), &[self.clone()])?
+            .bind(TransposeOperation::new(permutation.to_vec()), &[], &[], &[self.clone()])?
             .remove(0))
     }
 }

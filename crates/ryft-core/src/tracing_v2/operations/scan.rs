@@ -100,7 +100,7 @@ where
         for input in &inputs[carry_count..] {
             operands.push(input.tangent().clone().materialize(context)?);
         }
-        let outputs = context.bind(C::Operation::from(fused_scan), &operands)?;
+        let outputs = context.bind(C::Operation::from(fused_scan), &[], &[], &operands)?;
         check_count!("output", outputs, 2 * body_output_count, ProgramError);
 
         // The fused scan's outputs are `[primal_final_carries..., tangent_final_carries..., primal_stacked...,
@@ -507,6 +507,7 @@ where
                     O::from(ZeroOperation::new(cotangent_type)),
                     Vec::new(),
                     vec![zero_output],
+                    Vec::new(),
                 ));
                 transposed_body_region.output_ids.push(zero_output);
             }
@@ -768,8 +769,12 @@ mod tests {
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
-                    let mut outputs =
-                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
+                    let mut outputs = init.context().bind(
+                        TestOperation::Scan(Box::new(scan)),
+                        &[],
+                        &[],
+                        &[init.clone(), xs.clone()],
+                    )?;
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
@@ -788,8 +793,12 @@ mod tests {
         let ((carry, _), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
-                    let mut outputs =
-                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
+                    let mut outputs = init.context().bind(
+                        TestOperation::Scan(Box::new(scan)),
+                        &[],
+                        &[],
+                        &[init.clone(), xs.clone()],
+                    )?;
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
@@ -811,8 +820,12 @@ mod tests {
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
-                    let mut outputs =
-                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
+                    let mut outputs = init.context().bind(
+                        TestOperation::Scan(Box::new(scan)),
+                        &[],
+                        &[],
+                        &[init.clone(), xs.clone()],
+                    )?;
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },
@@ -835,8 +848,12 @@ mod tests {
         let ((carry, ys), (carry_tangent, ys_tangent)) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .jvp(
                 move |(init, xs)| {
-                    let mut outputs =
-                        init.context().bind(TestOperation::Scan(Box::new(scan)), &[init.clone(), xs.clone()])?;
+                    let mut outputs = init.context().bind(
+                        TestOperation::Scan(Box::new(scan)),
+                        &[],
+                        &[],
+                        &[init.clone(), xs.clone()],
+                    )?;
                     let ys = outputs.remove(1);
                     Ok((outputs.remove(0), ys))
                 },

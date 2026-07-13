@@ -602,7 +602,7 @@ where
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         let (operation, output_axes) = self.batched_call_operation(inputs)?;
-        let outputs = context.parent().bind(operation, &physical_inputs)?;
+        let outputs = context.parent().bind(operation, &[], &[], &physical_inputs)?;
         outputs
             .into_iter()
             .zip(output_axes)
@@ -659,7 +659,7 @@ where
         // primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(primal_program))));
-        let mut primal_call_outputs = context.bind(primal_call, &primal_operands)?;
+        let mut primal_call_outputs = context.bind(primal_call, &[], &[], &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -681,7 +681,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_call = XlaOperation::JitCall(Box::new(JitCallOperation::new(Rc::new(tangent_program))));
-        let tangent_outputs = context.bind(tangent_call, &tangent_operands)?;
+        let tangent_outputs = context.bind(tangent_call, &[], &[], &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs

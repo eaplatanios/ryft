@@ -275,8 +275,12 @@ where
         if input_type == output_type {
             return Ok(self.clone());
         }
-        let mut outputs =
-            self.dispatch_domain().bind(ReshapeOperation::new(output_type.shape().clone()), &[self.clone()])?;
+        let mut outputs = self.dispatch_domain().bind(
+            ReshapeOperation::new(output_type.shape().clone()),
+            &[],
+            &[],
+            &[self.clone()],
+        )?;
         Ok(outputs.remove(0))
     }
 }

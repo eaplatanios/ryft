@@ -552,7 +552,8 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs.into_parameters());
-        let outputs = context.bind(D::Operation::compiled_call(self.lifted_program()?), flat_inputs.as_slice())?;
+        let outputs =
+            context.bind(D::Operation::compiled_call(self.lifted_program()?), &[], &[], flat_inputs.as_slice())?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
     }
 
@@ -612,7 +613,7 @@ impl<
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        context.bind(D::Operation::compiled_call(self.lifted_program()?), flat_inputs.as_slice())
+        context.bind(D::Operation::compiled_call(self.lifted_program()?), &[], &[], flat_inputs.as_slice())
     }
 
     /// Returns the source program with runtime captures lifted into leading flat inputs.
@@ -1511,11 +1512,18 @@ where
     let output_types = outputs.parameters().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
     let output_types = normalize_output_types(&options, output_types)?;
     drop(outputs);
+    // Temporary conservative capture-pruning guard for the first-class-program-regions migration: a capture
+    // registered through a nested trace is referenced only inside a nested payload program, which top-level-only
+    // pruning cannot see, so pruning (and its index renumbering) is skipped entirely for such traces.
+    // TODO(eaplatanios): [regions] Delete this skip together with `CapturingContext::capture_in_nested_trace` once
+    //  the phase 4-6 operation-family migrations make capture discovery recursively region-aware.
+    let has_nested_captures = context.has_nested_captures();
     drop(context);
     let captures = Rc::try_unwrap(capture_table).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
     let program = builder.build(output_ids, input_structure, output_structure.clone())?.into_simplified()?;
-    let source_program = ClosedProgram::new(program, captures)?.without_unused_captures()?;
+    let source_program = ClosedProgram::new(program, captures)?;
+    let source_program = if has_nested_captures { source_program } else { source_program.without_unused_captures()? };
     Ok(StagedFunction {
         state: Rc::new(StagedFunctionState {
             source_program,

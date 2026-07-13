@@ -392,6 +392,7 @@ where
         O::from(ZeroOperation::new(output_type.clone())),
         vec![],
         vec![output],
+        Vec::new(),
     ));
     drop(builder_borrow);
     context.tracer(output, None)
@@ -540,7 +541,7 @@ where
         // Bind the primal `shard_map`, recovering the primal outputs followed by the residual values.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(primal_body)));
-        let mut primal_outputs = context.bind(primal_operation, &primal_operands)?;
+        let mut primal_outputs = context.bind(primal_operation, &[], &[], &primal_operands)?;
         if primal_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "shard_map primal body produced {} outputs which is fewer than its {output_count} primal \
@@ -570,7 +571,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residuals);
         let tangent_operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::new(tangent_body)));
-        let tangent_outputs = context.bind(tangent_operation, &tangent_operands)?;
+        let tangent_outputs = context.bind(tangent_operation, &[], &[], &tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -829,8 +830,12 @@ where
     C: Context<Type = ArrayType, Operation = XlaOperation>,
     Output: Parameterized<C::Value>,
 {
-    let staged_outputs = context
-        .bind(XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))), traced_inputs.as_slice())?;
+    let staged_outputs = context.bind(
+        XlaOperation::ShardMap(Box::new(ShardMapOperation::new(traced.clone()))),
+        &[],
+        &[],
+        traced_inputs.as_slice(),
+    )?;
     Ok(Output::from_parameters(output_structure, staged_outputs)?)
 }
 

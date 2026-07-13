@@ -15,7 +15,7 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer,
     PartialValue, PartiallyEvaluatableOperation,
 };
-use crate::programs::{Atom, MaybeZero, Program, ProgramError, Value};
+use crate::programs::{Atom, FlatProgram, MaybeZero, Program, ProgramError, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::Typed;
 
@@ -638,9 +638,21 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
     fn bind<O: Into<C::Operation>>(
         &self,
         operation: O,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[DifferentiationTracer<C>],
     ) -> Result<Vec<DifferentiationTracer<C>>, ProgramError> {
         let operation = operation.into();
+        // TODO(eaplatanios): [regions] Transitional guard until `DifferentiationContext` binds regions (phases 2-6);
+        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
+        if !regions.is_empty() || !callees.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{}` carries nested regions which this context cannot bind yet",
+                    operation.name(),
+                ),
+            });
+        }
 
         // Unwrap the input tracers into context-free duals, run the rule against those, and rewrap the produced duals
         // with this context, mirroring how `BatchingContext::bind` unwraps to `ArrayBatch`es and rewraps.
@@ -653,7 +665,7 @@ impl<C: Context<Operation: Clone + DifferentiableOperation<C>> + Zero<C::Value>>
         let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero()) {
             let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
             self.parent
-                .bind(operation, &primal_inputs)?
+                .bind(operation, &[], &[], &primal_inputs)?
                 .into_iter()
                 .map(DifferentiationDual::new_with_zero_tangent)
                 .collect()
@@ -908,7 +920,7 @@ impl<
         let output_duals = self.interpret_with(
             input_duals,
             |_, constant| differentiation_context.lift(constant.clone()),
-            |instruction, inputs| differentiation_context.bind(instruction.operation().clone(), inputs),
+            |instruction, inputs| differentiation_context.bind(instruction.operation().clone(), &[], &[], inputs),
         )?;
 
         // Split the direct output duals. Primal halves must be known tracers in the primal builder. Structural-zero

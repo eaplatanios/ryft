@@ -97,7 +97,7 @@ use crate::contexts::{Context, Domain, StagingContext, ValueResolution};
 use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
 use crate::types::Typed;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -299,6 +299,15 @@ pub struct TracingContext<V: Value, O: Operation<V::Type>, C = V> {
     /// to push through a shared `&self`.
     captures: Rc<RefCell<Vec<C>>>,
 
+    // TODO(eaplatanios): [regions] Delete this flag together with `CapturingContext::capture_in_nested_trace` once
+    //  the phase 4-6 operation-family migrations make capture discovery recursively region-aware.
+    /// Temporary conservative capture-pruning guard for the first-class-program-regions migration (deleted once
+    /// capture discovery is recursively region-aware for every operation family): set when any capture was
+    /// registered through a nested trace, in which case the resulting [`CaptureReference`] constant lives only in a
+    /// nested payload program that top-level-only capture pruning cannot see. Shared across cloned contexts like the
+    /// [`builder`](Self::builder).
+    nested_captures: Rc<std::cell::Cell<bool>>,
+
     /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
     /// trace binds no named axes and this stays empty. Traces that run inside a manual-parallelism region (e.g., a
     /// `shard_map` body) are seeded with that region's device mesh axes so that named-axis readers (e.g., collectives)
@@ -319,8 +328,27 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         Self {
             builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
             captures: Rc::new(RefCell::new(Vec::new())),
+            nested_captures: Rc::new(std::cell::Cell::new(false)),
             named_axes: Rc::new(Vec::new()),
         }
+    }
+
+    // TODO(eaplatanios): [regions] Delete this method together with `CapturingContext::capture_in_nested_trace`;
+    //  refer to the deletion inventory on that method.
+    /// Marks that a capture was registered through a nested trace, so its reference constant may live only inside a
+    /// nested payload program. Part of the temporary conservative capture-pruning guard.
+    #[inline]
+    pub(crate) fn note_nested_capture(&self) {
+        self.nested_captures.set(true);
+    }
+
+    // TODO(eaplatanios): [regions] Delete this method together with `CapturingContext::capture_in_nested_trace`;
+    //  refer to the deletion inventory on that method.
+    /// Returns `true` if any capture was registered through a nested trace. Part of the temporary conservative
+    /// capture-pruning guard.
+    #[inline]
+    pub(crate) fn has_nested_captures(&self) -> bool {
+        self.nested_captures.get()
     }
 
     /// Returns the [`ProgramBuilder`] that this [`TracingContext`] stages into.
@@ -381,6 +409,7 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
             let context = Self {
                 builder: builder.clone(),
                 captures: Rc::new(RefCell::new(Vec::new())),
+                nested_captures: Rc::new(std::cell::Cell::new(false)),
                 named_axes: Rc::new(named_axes),
             };
             let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
@@ -420,7 +449,12 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
 
 impl<V: Value, O: Operation<V::Type>, C> Clone for TracingContext<V, O, C> {
     fn clone(&self) -> Self {
-        Self { builder: self.builder.clone(), captures: self.captures.clone(), named_axes: self.named_axes.clone() }
+        Self {
+            builder: self.builder.clone(),
+            captures: self.captures.clone(),
+            nested_captures: self.nested_captures.clone(),
+            named_axes: self.named_axes.clone(),
+        }
     }
 }
 
@@ -452,8 +486,25 @@ impl<V: Value, O: Operation<V::Type>, C> Context for TracingContext<V, O, C> {
     }
 
     #[inline]
-    fn bind<P: Into<O>>(&self, operation: P, inputs: &[Tracer<Self>]) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        self.stage_operation(operation.into(), inputs)
+    fn bind<P: Into<O>>(
+        &self,
+        operation: P,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
+        inputs: &[Tracer<Self>],
+    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
+        let operation = operation.into();
+        // TODO(eaplatanios): [regions] Transitional guard until `TracingContext`/`NestedTracingContext` binds regions (phases 2-6);
+        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
+        if !regions.is_empty() || !callees.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{}` carries nested regions which this context cannot bind yet",
+                    operation.name(),
+                ),
+            });
+        }
+        self.stage_operation(operation, inputs)
     }
 
     #[inline]
@@ -638,9 +689,22 @@ impl<C: Context> Context for NestedTracingContext<C> {
     fn bind<P: Into<Self::Operation>>(
         &self,
         operation: P,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[Self::Value],
     ) -> Result<Vec<Self::Value>, ProgramError> {
-        self.stage_operation(operation.into(), inputs)
+        let operation = operation.into();
+        // TODO(eaplatanios): [regions] Transitional guard until `TracingContext`/`NestedTracingContext` binds regions (phases 2-6);
+        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
+        if !regions.is_empty() || !callees.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{}` carries nested regions which this context cannot bind yet",
+                    operation.name(),
+                ),
+            });
+        }
+        self.stage_operation(operation, inputs)
     }
 
     #[inline]
@@ -1170,10 +1234,12 @@ mod tests {
         // Test staging concrete constants through the context without requiring the context itself to be a domain.
         let tracing_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
         let builder = tracing_context.builder().clone();
-        let zero = tracing_context
-            .constant(domain.bind(ZeroOperation::new(DataType::F64), &[]).unwrap().into_iter().next().unwrap());
-        let one = tracing_context
-            .constant(domain.bind(OneOperation::new(DataType::F64), &[]).unwrap().into_iter().next().unwrap());
+        let zero = tracing_context.constant(
+            domain.bind(ZeroOperation::new(DataType::F64), &[], &[], &[]).unwrap().into_iter().next().unwrap(),
+        );
+        let one = tracing_context.constant(
+            domain.bind(OneOperation::new(DataType::F64), &[], &[], &[]).unwrap().into_iter().next().unwrap(),
+        );
         assert_eq!(zero.r#type().into_owned(), DataType::F64);
         assert_eq!(one.r#type().into_owned(), DataType::F64);
         let zero_atom = zero.atom_id().expect("zero tracer should remain live");

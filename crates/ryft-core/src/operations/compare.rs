@@ -185,7 +185,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<CompareOperation>>>> Compa
     fn compare(&self, rhs: &Self, direction: ComparisonDirection) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(CompareOperation::new(direction), &[self.clone(), rhs.clone()])?
+            .bind(CompareOperation::new(direction), &[], &[], &[self.clone(), rhs.clone()])?
             .remove(0))
     }
 }

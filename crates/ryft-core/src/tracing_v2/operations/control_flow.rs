@@ -187,7 +187,10 @@ fn append_program_instruction<V: Value<Type = ArrayType>, O: Operation<ArrayType
     output_type: ArrayType,
 ) -> AtomId {
     let output = append_program_variable(program, output_type);
-    program.entry_region_mut().instructions.push(Instruction::new(operation, inputs, vec![output]));
+    program
+        .entry_region_mut()
+        .instructions
+        .push(Instruction::new(operation, inputs, vec![output], Vec::new()));
     output
 }
 
@@ -387,7 +390,7 @@ where
         for operand in operands {
             condition_operands.push(operand.tangent().clone().materialize(context)?);
         }
-        let outputs = context.bind(fused_condition, &condition_operands)?;
+        let outputs = context.bind(fused_condition, &[], &[], &condition_operands)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
 
         // The fused conditional's outputs are the primal outputs followed by the tangent outputs; zip the halves
@@ -549,11 +552,11 @@ where
         let zero_state_types =
             std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type));
         for zero_state_type in zero_state_types {
-            let mut zeros = context.bind(ZeroOperation::new(zero_state_type.clone()), &[])?;
+            let mut zeros = context.bind(ZeroOperation::new(zero_state_type.clone()), &[], &[], &[])?;
             check_count!("output", zeros, 1, ProgramError);
             primal_operands.push(zeros.remove(0));
         }
-        let mut while_outputs = context.bind(C::Operation::from(augmented_while), &primal_operands)?;
+        let mut while_outputs = context.bind(C::Operation::from(augmented_while), &[], &[], &primal_operands)?;
         check_count!("output", while_outputs, state_count + 2 + stack_types.len(), ProgramError);
         let mask_stack = while_outputs.pop().unwrap();
         let residual_stacks = while_outputs.split_off(state_count + 1);
@@ -587,6 +590,8 @@ where
             let stacked_condition_type = stacked_scan_type(&condition_type, bound);
             let mut broadcasted = context.bind(
                 C::Operation::from(BroadcastOperation::new(stacked_condition_type, vec![0])),
+                &[],
+                &[],
                 std::slice::from_ref(&mask_stack),
             )?;
             check_count!("output", broadcasted, 1, ProgramError);
@@ -623,6 +628,7 @@ where
                 C::Operation::from(SelectOperation),
                 vec![mask_item, pushforward_output, carried_input],
                 vec![select_output],
+                Vec::new(),
             ));
             masked_outputs.push(select_output);
         }
@@ -641,7 +647,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         tangent_operands.extend(residual_stacks);
         tangent_operands.extend(mask_stacks);
-        let tangent_outputs = context.bind(C::Operation::from(tangent_scan), &tangent_operands)?;
+        let tangent_outputs = context.bind(C::Operation::from(tangent_scan), &[], &[], &tangent_operands)?;
         check_count!("output", tangent_outputs, state_count, ProgramError);
 
         Ok(primal_outputs
@@ -960,7 +966,7 @@ where
         let mut staged_inputs = Vec::with_capacity(inputs.len());
         staged_inputs.push(predicate_batch.value().clone());
         staged_inputs.extend(operand_inputs.iter().map(|input| input.value().clone()));
-        let outputs = context.parent().bind(batched_condition, &staged_inputs)?;
+        let outputs = context.parent().bind(batched_condition, &[], &[], &staged_inputs)?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
         outputs
             .into_iter()
@@ -1106,7 +1112,7 @@ where
         if !batch_varying {
             let batched_while =
                 WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
-            let outputs = context.parent().bind(batched_while, &state_values)?;
+            let outputs = context.parent().bind(batched_while, &[], &[], &state_values)?;
             check_count!("output", outputs, state_count, ProgramError);
             return outputs
                 .into_iter()
@@ -1135,7 +1141,7 @@ where
         check_count!("output", condition_axes, 1, ProgramError);
         let batched_while =
             WhileOperation::new(batched_condition, batched_body)?.with_iteration_bound(self.iteration_bound())?;
-        let outputs = context.parent().bind(batched_while, &state_values)?;
+        let outputs = context.parent().bind(batched_while, &[], &[], &state_values)?;
         check_count!("output", outputs, state_count, ProgramError);
         outputs
             .into_iter()
@@ -1707,9 +1713,21 @@ mod tests {
         fn bind<P: Into<Self::Operation>>(
             &self,
             operation: P,
+            regions: &[crate::FlatProgram<Self>],
+            callees: &[std::rc::Rc<crate::FlatProgram<Self>>],
             inputs: &[Self::Value],
         ) -> Result<Vec<Self::Value>, ProgramError> {
             let operation = operation.into();
+            // TODO(eaplatanios): [regions] Transitional guard until `StagedDispatchTestArrayDomain` binds regions (phases 2-6);
+            //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
+            if !regions.is_empty() || !callees.is_empty() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "operation `{}` carries nested regions which this context cannot bind yet",
+                        operation.name(),
+                    ),
+                });
+            }
             operation.interpret(&crate::EagerContext::<TestArray, Self::Operation>::new(), inputs)
         }
 
@@ -1811,8 +1829,12 @@ mod tests {
         let (output, pullback) = StagedDispatchTestArrayDomain
             .vjp(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
+                    let mut outputs = x.context().bind(
+                        TestArrayOperation::While(Box::new(while_operation)),
+                        &[],
+                        &[],
+                        &[x.clone()],
+                    )?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(1.0),
@@ -1850,8 +1872,10 @@ mod tests {
         let (value, gradient) = StagedDispatchTestArrayDomain
             .value_and_gradient(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
+                    let mut outputs = x
+                        .context()
+                        .bind(TestArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(1.0),
@@ -1872,8 +1896,12 @@ mod tests {
         let (output, pullback) = StagedDispatchTestArrayDomain
             .vjp(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()])?;
+                    let mut outputs = x.context().bind(
+                        TestArrayOperation::While(Box::new(while_operation)),
+                        &[],
+                        &[],
+                        &[x.clone()],
+                    )?;
                     Ok(outputs.remove(0))
                 },
                 TestArray::scalar(2.0),
@@ -1895,8 +1923,10 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
+                    let mut outputs = x
+                        .context()
+                        .bind(TestArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(2.0),
@@ -1940,12 +1970,14 @@ mod tests {
         let (value, gradient) = StagedDispatchTestArrayDomain
             .value_and_gradient(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
+                    let mut outputs = x
+                        .context()
+                        .bind(TestArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .unwrap();
                     let state = outputs.remove(0);
                     let mut outputs = state
                         .context()
-                        .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), &[state.clone()])
+                        .bind(ReduceOperation::new(vec![0], ReductionKind::Sum), &[], &[], &[state.clone()])
                         .unwrap();
                     outputs.remove(0)
                 },
@@ -1964,8 +1996,10 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
+                    let mut outputs = x
+                        .context()
+                        .bind(TestArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(1.0),
@@ -1991,8 +2025,10 @@ mod tests {
         let (value, gradient) = EagerContext::<TestArray, ArrayOperation<TestArray>>::new()
             .value_and_gradient(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
+                    let mut outputs = x
+                        .context()
+                        .bind(TestArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(2.0),
@@ -2005,8 +2041,10 @@ mod tests {
         let (value, gradient) = StagedDispatchTestArrayDomain
             .value_and_gradient(
                 move |x| {
-                    let mut outputs =
-                        x.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[x.clone()]).unwrap();
+                    let mut outputs = x
+                        .context()
+                        .bind(TestArrayOperation::While(Box::new(while_operation)), &[], &[], &[x.clone()])
+                        .unwrap();
                     outputs.remove(0)
                 },
                 TestArray::scalar(2.0),
@@ -2053,8 +2091,12 @@ mod tests {
         let output = Batch::batch(
             &parent,
             |item| {
-                let mut outputs =
-                    item.context().bind(TestArrayOperation::While(Box::new(while_operation)), &[item.clone()])?;
+                let mut outputs = item.context().bind(
+                    TestArrayOperation::While(Box::new(while_operation)),
+                    &[],
+                    &[],
+                    &[item.clone()],
+                )?;
                 Ok(outputs.remove(0))
             },
             input_tracer,
@@ -2148,9 +2190,12 @@ mod tests {
             &parent,
             |(counter, value)| {
                 let while_operation = counter_doubling_while_operation();
-                let mut outputs = counter
-                    .context()
-                    .bind(TestArrayOperation::While(Box::new(while_operation)), &[counter.clone(), value.clone()])?;
+                let mut outputs = counter.context().bind(
+                    TestArrayOperation::While(Box::new(while_operation)),
+                    &[],
+                    &[],
+                    &[counter.clone(), value.clone()],
+                )?;
                 let value_output = outputs.remove(1);
                 Ok((outputs.remove(0), value_output))
             },
@@ -2200,7 +2245,8 @@ mod tests {
                 &context,
                 |item: BatchingTracer<V::DispatchDomain>| {
                     let batching_context = item.context().clone();
-                    let mut outputs = batching_context.bind(bounded_doubling_while_operation(8.0, 5), &[item])?;
+                    let mut outputs =
+                        batching_context.bind(bounded_doubling_while_operation(8.0, 5), &[], &[], &[item])?;
                     Ok(outputs.remove(0))
                 },
                 x,
@@ -2251,7 +2297,7 @@ mod tests {
             V::DispatchDomain: Context<Type = ArrayType, Value = V, Operation = TestArrayOperation>,
         {
             let context = x.dispatch_domain();
-            let mut outputs = context.bind(countdown_while_operation(), &[x])?;
+            let mut outputs = context.bind(countdown_while_operation(), &[], &[], &[x])?;
             Ok(outputs.remove(0))
         }
         assert!(matches!(

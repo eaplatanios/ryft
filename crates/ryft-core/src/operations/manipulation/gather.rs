@@ -675,7 +675,7 @@ where
     <V::DispatchDomain as Domain>::Operation: From<GatherOperation>,
 {
     fn gather(&self, indices: &Self, operation: &GatherOperation) -> Result<Self, ProgramError> {
-        let mut outputs = self.dispatch_domain().bind(operation.clone(), &[self.clone(), indices.clone()])?;
+        let mut outputs = self.dispatch_domain().bind(operation.clone(), &[], &[], &[self.clone(), indices.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

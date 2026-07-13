@@ -260,6 +260,8 @@ where
         // condition representations (for example, `Scalar` selects over `bool`).
         let mut primal = context.bind(
             SelectOperation,
+            &[],
+            &[],
             &[condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone()],
         )?;
         check_count!("output", primal, 1, ProgramError);
@@ -270,8 +272,12 @@ where
             // A select needs both branch tangents as real values, so materialize the structurally zero side.
             let on_true_tangent = on_true.tangent().clone().materialize(context)?;
             let on_false_tangent = on_false.tangent().clone().materialize(context)?;
-            let mut tangents =
-                context.bind(SelectOperation, &[condition.primal().clone(), on_true_tangent, on_false_tangent])?;
+            let mut tangents = context.bind(
+                SelectOperation,
+                &[],
+                &[],
+                &[condition.primal().clone(), on_true_tangent, on_false_tangent],
+            )?;
             check_count!("output", tangents, 1, ProgramError);
             MaybeZero::Value(tangents.remove(0))
         };

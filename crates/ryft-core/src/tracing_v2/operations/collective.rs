@@ -99,7 +99,8 @@ where
         if context.named_axis(axis_name).is_none() {
             return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into());
         }
-        let mut outputs = context.bind(CollectiveOperation::new(axis_name.to_string(), kind), &[self.clone()])?;
+        let mut outputs =
+            context.bind(CollectiveOperation::new(axis_name.to_string(), kind), &[], &[], &[self.clone()])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -207,7 +208,7 @@ where
     C::Operation: From<CollectiveOperation>,
 {
     let mut outputs =
-        context.bind(CollectiveOperation::new(axis_name.to_string(), kind), std::slice::from_ref(operand))?;
+        context.bind(CollectiveOperation::new(axis_name.to_string(), kind), &[], &[], std::slice::from_ref(operand))?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
@@ -311,7 +312,7 @@ where
             // parent, staged into the enclosing trace under a staging parent.
             context
                 .parent()
-                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), &[])?
+                .bind(FillOperation::new(factor_type, Scalar::from(inverse_axis_size)), &[], &[], &[])?
                 .into_iter()
                 .next()
                 .ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })
@@ -337,7 +338,7 @@ where
     C: Context<Type = ArrayType>,
 {
     let parent_input_values: Vec<<C as Domain>::Value> = inputs.iter().map(|batch| batch.value().clone()).collect();
-    let parent_outputs = context.parent().bind(parent_operation, &parent_input_values)?;
+    let parent_outputs = context.parent().bind(parent_operation, &[], &[], &parent_input_values)?;
     check_count!("output", parent_outputs, inputs.len(), ProgramError);
     parent_outputs
         .into_iter()
@@ -502,7 +503,7 @@ where
         // with a structural zero tangent, which stays symbolic and stages nothing.
         let primal_inputs = inputs.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
         Ok(context
-            .bind(self.clone(), &primal_inputs)?
+            .bind(self.clone(), &[], &[], &primal_inputs)?
             .into_iter()
             .map(DifferentiationDual::new_with_zero_tangent)
             .collect())
@@ -549,13 +550,14 @@ where
             let size = context.axis_size();
             let physical_type =
                 ArrayType::new(DataType::U64, crate::types::Shape::new(vec![crate::types::Size::Static(size)]));
-            let mut index_vector = context.parent().bind(IotaOperation::new(physical_type.clone(), 0), &[])?;
+            let mut index_vector =
+                context.parent().bind(IotaOperation::new(physical_type.clone(), 0), &[], &[], &[])?;
             check_count!("output", index_vector, 1, ProgramError);
             Ok(vec![crate::batching::ArrayBatch::new(physical_type, index_vector.remove(0), Some(0))?])
         } else {
             // The axis is bound by an outer `batch` level or a device mesh: re-bind into the parent, which repeats the
             // resolution, and present the forwarded index as replicated across this level.
-            let mut outputs = context.parent().bind(AxisIndexOperation::new(self.axis_name.clone()), &[])?;
+            let mut outputs = context.parent().bind(AxisIndexOperation::new(self.axis_name.clone()), &[], &[], &[])?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(vec![crate::batching::ArrayBatch::replicated(outputs.remove(0))])
         }

@@ -226,7 +226,7 @@ where
     if inputs.iter().all(|input| input.batch_axis().is_replicated()) {
         let operation = make_operation(None)?;
         let parent_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        let outputs = context.parent().bind(operation, &parent_inputs)?;
+        let outputs = context.parent().bind(operation, &[], &[], &parent_inputs)?;
         return outputs
             .into_iter()
             .map(|tracer| {
@@ -245,7 +245,7 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let operation = make_operation(Some(axis_size))?;
     let parent_inputs = aligned_inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-    let outputs = context.parent().bind(operation, &parent_inputs)?;
+    let outputs = context.parent().bind(operation, &[], &[], &parent_inputs)?;
     outputs
         .into_iter()
         .map(|tracer| {
@@ -816,7 +816,7 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         carrier_operands.extend(residuals);
         let carrier = CustomVjpTangentOperation { backward: self.backward.clone(), residual_count, transposed: false };
-        let output_tangents = context.bind(carrier, &carrier_operands)?;
+        let output_tangents = context.bind(carrier, &[], &[], &carrier_operands)?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -1269,7 +1269,7 @@ where
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
         // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, &input_values)?;
+        let outputs = context.bind(operation, &[], &[], &input_values)?;
         let output_structure = output_types.0.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -1404,7 +1404,7 @@ where
         )?);
         // Bind through whatever context the inputs flow, so `custom_vjp` composes under `vmap`/`jvp`.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, &input_values)?;
+        let outputs = context.bind(operation, &[], &[], &input_values)?;
         let output_structure = output_types.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
@@ -1586,7 +1586,7 @@ mod tests {
             .jvp(
                 |x| {
                     let operation = custom_jvp_sin(&test_type(&[]));
-                    Ok(x.context().bind(operation, &[x.clone()])?.into_iter().next().unwrap())
+                    Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
                 },
                 TestArray::scalar(2.0),
                 TestArray::scalar(1.0),
@@ -1604,7 +1604,7 @@ mod tests {
             .value_and_gradient(
                 |x| {
                     let operation = custom_jvp_sin(&test_type(&[]));
-                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    x.context().bind(operation, &[], &[], &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
                 TestArray::scalar(3.0),
             )
@@ -1620,7 +1620,7 @@ mod tests {
             .value_and_gradient(
                 |x| {
                     let operation = custom_vjp_sin(&test_type(&[]));
-                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    x.context().bind(operation, &[], &[], &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
                 TestArray::scalar(2.0),
             )
@@ -1659,7 +1659,7 @@ mod tests {
             &EagerContext::<TestArray, ArrayOperation<TestArray>>::new(),
             |x| {
                 let operation = custom_vjp_sin(&test_type(&[2]));
-                Ok(x.context().bind(operation, &[x.clone()])?.into_iter().next().unwrap())
+                Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
             },
             TestArray::new(vector, vec![0.5, 1.0]),
         )
@@ -1735,7 +1735,7 @@ mod tests {
                     let operation = ScalarOperation::CustomJvp(Box::new(
                         CustomJvpOperation::new(scalar_sin_program(), scalar_doubled_sin_jvp_program()).unwrap(),
                     ));
-                    Ok(x.context().bind(operation, &[x.clone()])?.into_iter().next().unwrap())
+                    Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
                 },
                 Scalar::from(2.0),
                 Scalar::from(1.0),
@@ -1770,7 +1770,7 @@ mod tests {
         // Value-level direct linearization enforces the same rule contract before exposing a reusable pushforward.
         let result = EagerContext::<Scalar, ScalarOperation<Scalar>>::new().linearize(
             |input| {
-                let mut outputs = input.context().bind(operation, &[input.clone()])?;
+                let mut outputs = input.context().bind(operation, &[], &[], &[input.clone()])?;
                 Ok(outputs.remove(0))
             },
             Scalar::from(2.0),
@@ -1794,7 +1794,7 @@ mod tests {
                         )
                         .unwrap(),
                     ));
-                    x.context().bind(operation, &[x.clone()]).unwrap().into_iter().next().unwrap()
+                    x.context().bind(operation, &[], &[], &[x.clone()]).unwrap().into_iter().next().unwrap()
                 },
                 Scalar::from(2.0),
             )
@@ -1925,7 +1925,7 @@ mod tests {
             .batch(
                 |x| {
                     let operation = custom_jvp_sin(&scalar);
-                    Ok(x.context().bind(operation, &[x.clone()])?.into_iter().next().unwrap())
+                    Ok(x.context().bind(operation, &[], &[], &[x.clone()])?.into_iter().next().unwrap())
                 },
                 TestArray::vector(vec![0.5, 1.0, 1.5]),
                 BatchAxis::new(0),
@@ -1955,7 +1955,7 @@ mod tests {
                         &context,
                         |item| {
                             let operation = custom_jvp_sin(&test_type(&[]));
-                            Ok(item.context().bind(operation, &[item.clone()])?.into_iter().next().unwrap())
+                            Ok(item.context().bind(operation, &[], &[], &[item.clone()])?.into_iter().next().unwrap())
                         },
                         x,
                         BatchAxis::new(0),
@@ -1989,7 +1989,7 @@ mod tests {
                         &context,
                         |item| {
                             let operation = custom_vjp_sin(&test_type(&[]));
-                            Ok(item.context().bind(operation, &[item.clone()])?.into_iter().next().unwrap())
+                            Ok(item.context().bind(operation, &[], &[], &[item.clone()])?.into_iter().next().unwrap())
                         },
                         x,
                         BatchAxis::new(0),

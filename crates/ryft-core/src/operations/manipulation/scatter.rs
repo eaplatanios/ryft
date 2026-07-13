@@ -640,8 +640,12 @@ where
     <V::DispatchDomain as Domain>::Operation: From<ScatterOperation>,
 {
     fn scatter(&self, indices: &Self, updates: &Self, operation: &ScatterOperation) -> Result<Self, ProgramError> {
-        let mut outputs =
-            self.dispatch_domain().bind(operation.clone(), &[self.clone(), indices.clone(), updates.clone()])?;
+        let mut outputs = self.dispatch_domain().bind(
+            operation.clone(),
+            &[],
+            &[],
+            &[self.clone(), indices.clone(), updates.clone()],
+        )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

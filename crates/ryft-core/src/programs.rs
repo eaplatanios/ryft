@@ -1,7 +1,7 @@
 //! Contains machinery for representing and working with typed, structured, and effect-aware programs.
 //!
 //! A [`Program`] is Ryft's backend-neutral dataflow IR. It owns a flat arena of [`Region`]s that consists of the public
-//! entry computation plus any lexically nested computations and shareable callee roots, where each region stores typed
+//! entry computation plus any nested computations referenced by its instructions, where each region stores typed
 //! atoms, operation instructions, a flat boundary, and enough metadata for interpretation, transformation,
 //! simplification, lowering, and compilation. Programs are immutable after construction. [`ProgramBuilder`]
 //! owns the mutable construction phase, sealing every non-entry region before instructions can attach it.
@@ -51,14 +51,14 @@
 //!
 //! [`Atom`] is either a stored constant or a typed variable, and [`AtomId`] is its stable index in the containing
 //! [`Region`]'s atom table. An [`Instruction`] owns one [`Operation`], lists the input and output atom IDs of that
-//! application, and carries the [`RegionId`]s of its attached lexically owned regions and referenced callee roots.
+//! application, and carries the [`RegionId`]s of its attached nested regions, in the operation-defined order.
 //! Operations define their own type inference and effect classes and the program supplies graph structure and order.
 //!
 //! [`Program`] combines the region arena with typed, structured input and output boundaries on its entry region. The
 //! boundary types are [`Parameterized`] containers whose leaves correspond positionally to [`Program::input_ids`] and
 //! [`Program::output_ids`], so compiler and transform kernels can operate on the flat IDs while callers retain tuples,
 //! vectors, maps, or derived product types. [`InstructionId`] and [`ValueId`] locate instructions and values across
-//! regions, and [`InstructionRef`] resolves an instruction's attachments against the arena.
+//! regions, and [`InstructionRef`] resolves an instruction's attached regions against the arena.
 //!
 //! # Effects, Liveness, and Simplification
 //!
@@ -453,11 +453,11 @@ impl ValueId {
 }
 
 /// Computation region inside a [`Program`]'s region arena. Every region owns its own [`Atom`] table, [`Instruction`]
-/// sequence, and input/output boundary. The public program entry point, lexically nested computations, and shared
-/// callee roots are all regions in the same arena; [`Instruction`] attachments reference them by [`RegionId`]. Regions
-/// are _sealed_ meaning that a [`ProgramBuilder`] creates them only by copying already-built (and therefore immutable
-/// and fully validated) [`Program`]s via [`ProgramBuilder::add_region`] and [`ProgramBuilder::add_callee`], and so a
-/// region referenced by an instruction can never change after that instruction is built.
+/// sequence, and input/output boundary. The public program entry point and every nested computation are [`Region`]s in
+/// the same arena. [`Instruction`]s reference them by [`RegionId`], and one region may be shared. Regions are _sealed_
+/// meaning that a [`ProgramBuilder`] creates them only by copying already-built (and therefore immutable and fully
+/// validated) [`Program`]s via [`ProgramBuilder::add_region`] and [`ProgramBuilder::add_callee`], and so a region
+/// referenced by an instruction can never change after that instruction is built.
 #[derive(Clone, Debug)]
 pub struct Region<V: Typed, O> {
     /// [`Atom`]s contained in this [`Region`], in the order in which they will be evaluated.
@@ -513,23 +513,20 @@ impl<V: Typed, O> Region<V, O> {
 
 /// [`Instruction`]s represent applications of [`Operation`]s to input values in [`Program`]s. Each [`Region`] executes
 /// its [`Instruction`]s in sequential order. Beyond its operation and its input and output [`Atom`]s, an instruction
-/// carries the [`RegionId`]s of the computations attached to the application, split into two kinds whose relationship
-/// to the instruction differs:
+/// carries the [`RegionId`]s of the nested computations attached to the application (e.g., the `true`/`false`
+/// branches of a condition, a scan body, or the shared program of a JIT call), in the operation-defined order.
 ///
-///   - **Regions** ([`regions`](Self::regions)) are part of what the instruction *means*, the way an operand is (e.g.,
-///     the `true`/`false` branches of a condition, or a scan body). Each is owned by exactly one instruction slot, is
-///     dropped or copied together with its owning instruction, and lowers inline into the enclosing computation.
-///   - **Callees** ([`callees`](Self::callees)) are independently meaningful computations that the instruction merely
-///     *references* (e.g., the shared program of a JIT call). One callee root may be referenced from many call sites,
-///     stays alive for as long as any reference remains, and lowers and compiles once as a shared function invoked from
-///     each site. Two structurally equal but independently created callees remain distinct roots, because sharing
-///     preserves callee *identity*, not structure.
-///
-/// For example, `if p { f(x) + f(2 * x) } else { x }` with a JIT-compiled `f` is one condition instruction that
-/// lexically owns a `true` and a `false` branch region, where the `true` branch contains two call instructions that
-/// both reference the single callee root holding `f`'s body. This mirrors [MLIR's split](
-/// https://mlir.llvm.org/docs/LangRef/#regions) between an operation's attached regions and [symbol references](
-/// https://mlir.llvm.org/docs/SymbolsAndSymbolTables/) to `func.func`s.
+/// There is one region edge kind, and sharing is expressed directly in the graph. Several instructions may reference
+/// the same [`RegionId`], and a region stays alive for as long as it is reachable from the entry region. What a slot
+/// *means* (i.e., a branch-like computation that lowers inline versus a call-like computation that lowers and
+/// compiles once as a shared function) is defined by the operation and not by the edge. For example, `if p { f(x) +
+/// f(2 * x) } else { x }` with a JIT-compiled `f` is one condition instruction attaching a `true` and a `false` branch
+/// [`Region`], where the `true` branch contains two call instructions that both reference the single region holding
+/// `f`'s body (i.e., one shared region, three region edges, and the inline-versus-shared lowering decision carried by
+/// the condition and call operations, respectively). Two structurally equal but independently created computations
+/// remain distinct regions, because [`ProgramBuilder`] adds regions by *identity* (i.e.,
+/// [`add_region`](ProgramBuilder::add_region) always copies and [`add_callee`](ProgramBuilder::add_callee)
+/// interns by [`Rc`] identity), never by structure.
 #[derive(Clone, Debug)]
 pub struct Instruction<O> {
     /// [`Operation`] applied by this [`Instruction`].
@@ -541,31 +538,15 @@ pub struct Instruction<O> {
     /// [`AtomId`]s of the output [`Atom`]s produced by this [`Instruction`].
     outputs: Vec<AtomId>,
 
-    /// [`RegionId`]s of the lexically owned regions attached to this [`Instruction`], in the operation-defined order.
+    /// [`RegionId`]s of the nested computations attached to this [`Instruction`], in the operation-defined order.
     regions: Vec<RegionId>,
-
-    /// [`RegionId`]s of the shareable callee roots referenced by this [`Instruction`], in the operation-defined order.
-    callees: Vec<RegionId>,
 }
 
 impl<O> Instruction<O> {
-    /// Creates a new [`Instruction`] with no attached [`Region`]s.
+    /// Creates a new [`Instruction`].
     #[inline]
-    pub fn new(operation: O, inputs: Vec<AtomId>, outputs: Vec<AtomId>) -> Self {
-        Self { operation, inputs, outputs, regions: Vec::new(), callees: Vec::new() }
-    }
-
-    /// Creates a new [`Instruction`] with the provided lexically owned regions and callees,
-    /// each in its operation-defined order.
-    #[inline]
-    pub fn new_with_regions(
-        operation: O,
-        inputs: Vec<AtomId>,
-        outputs: Vec<AtomId>,
-        regions: Vec<RegionId>,
-        callees: Vec<RegionId>,
-    ) -> Self {
-        Self { operation, inputs, outputs, regions, callees }
+    pub fn new(operation: O, inputs: Vec<AtomId>, outputs: Vec<AtomId>, regions: Vec<RegionId>) -> Self {
+        Self { operation, inputs, outputs, regions }
     }
 
     /// Returns the [`Operation`] applied by this [`Instruction`].
@@ -586,33 +567,26 @@ impl<O> Instruction<O> {
         self.outputs.as_slice()
     }
 
-    /// Returns the [`RegionId`]s of the lexically owned regions attached to this [`Instruction`],
+    /// Returns the [`RegionId`]s of the nested computations attached to this [`Instruction`],
     /// in the operation-defined order.
     #[inline]
     pub fn regions(&self) -> &[RegionId] {
         &self.regions
     }
 
-    /// Returns the [`RegionId`]s of the shareable callee roots referenced by this [`Instruction`],
-    /// in the operation-defined order.
+    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, output [`AtomId`]s,
+    /// and attached region [`RegionId`]s.
     #[inline]
-    pub fn callees(&self) -> &[RegionId] {
-        &self.callees
-    }
-
-    /// Consumes this [`Instruction`] and returns its [`Operation`], input [`AtomId`]s, output [`AtomId`]s, lexically
-    /// owned region [`RegionId`]s, and callee [`RegionId`]s.
-    #[inline]
-    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>, Vec<RegionId>) {
-        (self.operation, self.inputs, self.outputs, self.regions, self.callees)
+    pub fn into_parts(self) -> (O, Vec<AtomId>, Vec<AtomId>, Vec<RegionId>) {
+        (self.operation, self.inputs, self.outputs, self.regions)
     }
 }
 
 /// Borrowed view of one [`Instruction`] resolved against its owning [`Program`]'s [`Region`] arena. Unlike a bare
-/// [`Instruction`], this view can resolve the instruction's attached lexical regions and callee roots, so that analyses
-/// can traverse attachments without holding the owning [`Program`] separately.
+/// [`Instruction`], this view can resolve the instruction's attached regions, so that analyses can traverse them
+/// without holding the owning [`Program`] separately.
 pub struct InstructionRef<'r, V: Typed, O> {
-    /// Borrowed [`Region`] arena used to resolve this instruction and its attachments.
+    /// Borrowed [`Region`] arena used to resolve this instruction and its attached regions.
     regions: &'r [Region<V, O>],
 
     /// [`InstructionId`] specifying the [`Instruction`]'s location in the owning [`Program`].
@@ -632,32 +606,25 @@ impl<'r, V: Typed, O> InstructionRef<'r, V, O> {
         &self.regions[self.id.region().index()].instructions[self.id.index()]
     }
 
-    /// Returns the [`Region`] attached at the provided lexically owned region index.
+    // TODO(eaplatanios): Do we really need this function?
+    //  And if not, should `InstructionRef` be replaced by simply `&Instruction`?
+    /// Returns the [`Region`] attached at the provided index.
     #[inline]
     pub fn region(&self, index: usize) -> Result<&'r Region<V, O>, ProgramError> {
-        let id = self.instruction().regions().get(index).copied().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!("instruction has no lexical region index {index}"))
-        })?;
-        Ok(&self.regions[id.index()])
-    }
-
-    /// Returns the [`Region`] referenced at the provided callee index.
-    #[inline]
-    pub fn callee(&self, index: usize) -> Result<&'r Region<V, O>, ProgramError> {
         let id = self
             .instruction()
-            .callees()
+            .regions()
             .get(index)
             .copied()
-            .ok_or_else(|| ProgramError::MalformedProgram(format!("instruction has no callee index {index}")))?;
+            .ok_or_else(|| ProgramError::MalformedProgram(format!("instruction has no region index {index}")))?;
         Ok(&self.regions[id.index()])
     }
 }
 
 /// [`Program`] that is produced by tracing and which can be interpreted or compiled and executed by a backend.
 /// A program owns a flat arena of [`Region`]s. One region implements its public entry point, and every other region
-/// is either a lexically nested computation owned by exactly one [`Instruction`] or a shareable callee root referenced
-/// by one or more call sites. Each region is a flat sequence of [`Instruction`]s over its own [`Atom`] table, and the
+/// is a nested computation referenced by one or more [`Instruction`]s (e.g., the branches of a condition, or the
+/// shared program of a JIT call). Each region is a flat sequence of [`Instruction`]s over its own [`Atom`] table, and the
 /// entry region's flat boundary is paired with [`Parameterized`] input and output types. This is the primary
 /// intermediate representation (IR) used by the Ryft tracing and transformation system (e.g., to support things
 /// like automatic differentiation and just-in-time compilation).
@@ -669,8 +636,7 @@ pub struct Program<V: Typed + Parameter, O, Input: Parameterized<V>, Output: Par
     /// [`Parameter`] structure that can be used to map flat lists of outputs to structured `Output` values.
     pub(crate) output_structure: Output::ParameterStructure,
 
-    /// [`Region`] arena containing the public entry computation and every lexically nested computation and shared
-    /// callee roots. The [`Self::entry`] region's flat inputs/outputs implement this [`Program`]'s public boundary.
+    /// [`Region`] arena containing the public entry computation and every nested computation.
     pub(crate) regions: Vec<Region<V, O>>,
 
     /// [`RegionId`] of the [`Region`] implementing this [`Program`]'s public entry point.
@@ -823,7 +789,7 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     }
 
     /// Returns a borrowed [`InstructionRef`] view of the [`Instruction`] at the provided [`InstructionId`], which can
-    /// resolve the instruction's attached lexical regions and callee roots against this [`Program`]'s region arena.
+    /// resolve the instruction's attached regions against this [`Program`]'s region arena.
     pub fn instruction(&self, id: InstructionId) -> Result<InstructionRef<'_, V, O>, ProgramError> {
         let region = self.region(id.region())?;
         if region.instructions.get(id.index()).is_none() {
@@ -1012,12 +978,11 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
                             .instructions
                             .iter()
                             .map(|instruction| {
-                                Ok(Instruction::new_with_regions(
+                                Ok(Instruction::new(
                                     map_fn(instruction.operation())?,
                                     instruction.inputs().to_vec(),
                                     instruction.outputs().to_vec(),
                                     instruction.regions().to_vec(),
-                                    instruction.callees().to_vec(),
                                 ))
                             })
                             .collect::<Result<Vec<_>, ProgramError>>()?,
@@ -1560,6 +1525,16 @@ impl<V: Value, O: Operation<V::Type>, Input: Parameterized<V>, Output: Parameter
     }
 }
 
+/// _Flat_ [`Program`] (i.e., with flat `Vec`-valued inputs and outputs) over a [`Domain`]'s constant and operation
+/// universe. This is the canonical shape for nested computations that are constructed standalone and are replayed
+/// positionally, such as the `regions` and `callees` arguments of [`Context::bind`].
+pub type FlatProgram<D> = Program<
+    <D as Domain>::Constant,
+    <D as Domain>::Operation,
+    Vec<<D as Domain>::Constant>,
+    Vec<<D as Domain>::Constant>,
+>;
+
 /// Liveness masks for a [`Program`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProgramLiveSets {
@@ -1707,7 +1682,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = operation.infer_output_types(input_types.as_slice())?;
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
-        self.instructions.push(Instruction::new(operation, inputs, outputs));
+        self.instructions.push(Instruction::new(operation, inputs, outputs, Vec::new()));
         Ok(self.instructions.last().unwrap().outputs.as_slice())
     }
 
@@ -1756,7 +1731,7 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 
     // TODO(eaplatanios): [regions] `add_region` and `add_callee` are reference-based (clone-on-add) for now,
     //  matching the detached-trace construction idiom. Once the operation-family migrations land and
-    //  `Context::bind_with_regions` hands the builder owned programs, consider owned-move variants that splice the
+    //  `Context::bind` hands the builder owned programs, consider owned-move variants that splice the
     //  source arena directly instead of cloning it. This is a Phase 2+ decision.
     /// Imports the provided [`Program`] as a lexically owned subtree, copying the complete reachable closure of its
     /// entry [`Region`] (i.e., lexical descendants, referenced callee roots, and their transitive closures) with all
@@ -1782,8 +1757,8 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             }
             let mut region = regions[root.index()].clone();
             for instruction in &mut region.instructions {
-                for attachment in instruction.regions.iter_mut().chain(instruction.callees.iter_mut()) {
-                    *attachment = copy_reachable_regions(builder, regions, *attachment, remapping);
+                for region in &mut instruction.regions {
+                    *region = copy_reachable_regions(builder, regions, *region, remapping);
                 }
             }
             let id = RegionId::new(builder.regions.len());
@@ -1797,8 +1772,9 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 
     // TODO(eaplatanios): [regions] `add_region` and `add_callee` are reference-based (clone-on-add) for now,
     //  matching the detached-trace construction idiom. Once the operation-family migrations land and
-    //  `Context::bind_with_regions` hands the builder owned programs, consider owned-move variants that splice the
+    //  `Context::bind` hands the builder owned programs, consider owned-move variants that splice the
     //  source arena directly instead of cloning it. This is a Phase 2+ decision.
+    // TODO(eaplatanios): Explain why this is separate from `add_region` in its docstring and why it uses `Rc`.
     /// Imports the provided [`Program`] as a shareable callee root, interning by [`Rc`] identity within this builder.
     /// Two calls to this function with the same live [`Rc`] will reuse one callee root [`RegionId`], while structurally
     /// equal but independently built programs will remain distinct.
@@ -1814,7 +1790,6 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
         id
     }
 
-    // TODO(eaplatanios): Review this.
     /// Finalizes this [`ProgramBuilder`] into a [`Program`] with the provided input and output structures.
     pub fn build<Input: Parameterized<V>, Output: Parameterized<V>>(
         self,
@@ -1888,25 +1863,26 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
 
         // Entry instructions may only reference previously added regions (i.e., regions with identifiers strictly
         // below the entry's own, which is assigned last). Non-entry regions uphold the same property by construction,
-        // because `add_region` copies them in post order (i.e., children before parents). Every attachment identifier
-        // is therefore in range and the attachment graph is acyclic, which is what allows the reachability walk below
+        // because `add_region` copies them in post order (i.e., children before parents). Every referenced region
+        // identifier is therefore in range and the region graph is acyclic, which is what allows the reachability walk
         // (and any future recursive derivation over regions, such as recursive effect inference) to recurse without
         // cycle tracking.
         let entry = RegionId::new(self.regions.len());
         for instruction in &self.instructions {
-            for attachment in instruction.regions.iter().chain(instruction.callees.iter()).copied() {
-                if attachment.index() >= entry.index() {
+            for region in instruction.regions.iter().copied() {
+                if region.index() >= entry.index() {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "instruction attachment {attachment} does not reference a previously sealed region",
+                        "instruction references region {region} which has not been sealed yet",
                     )));
                 }
             }
         }
 
-        // Check for well-formedness of the regions and callees. Every lexically owned region must have exactly one
-        // owning slot, callee targets must never be lexically owned, and every sealed region must be reachable from the
-        // entry root. Acyclicity holds by construction and by the per-region topological attachment checks above, which
-        // only admit attachments to previously sealed regions.
+        // Check for well-formedness of the region graph. Every region must be reachable from the entry root. Sharing
+        // is legal (i.e., several instructions may reference one region), so no ownership uniqueness is enforced.
+        // Acyclicity holds by construction and by the per-region topological checks above, which only admit references
+        // to previously sealed regions. The same checks keep the entry region unreferenced, since its identifier is
+        // assigned last.
         let mut regions = self.regions;
         regions.push(Region {
             atoms: self.atoms,
@@ -1914,40 +1890,6 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             output_ids,
             instructions: self.instructions,
         });
-        let mut lexically_owned = vec![false; regions.len()];
-        for region in &regions {
-            for instruction in &region.instructions {
-                for owned in instruction.regions().iter().copied() {
-                    if owned == entry {
-                        return Err(ProgramError::MalformedProgram(
-                            "the program entry region cannot be lexically owned by an instruction".to_string(),
-                        ));
-                    }
-                    if lexically_owned[owned.index()] {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "region {owned} is lexically owned by more than one instruction slot",
-                        )));
-                    }
-                    lexically_owned[owned.index()] = true;
-                }
-            }
-        }
-        for region in &regions {
-            for instruction in &region.instructions {
-                for callee in instruction.callees().iter().copied() {
-                    if callee == entry {
-                        return Err(ProgramError::MalformedProgram(
-                            "the program entry region cannot be referenced as a callee".to_string(),
-                        ));
-                    }
-                    if lexically_owned[callee.index()] {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "region {callee} is referenced as a callee but is lexically owned by an instruction",
-                        )));
-                    }
-                }
-            }
-        }
         let mut reachable = vec![false; regions.len()];
         let mut pending = vec![entry];
         while let Some(current) = pending.pop() {
@@ -1956,7 +1898,6 @@ impl<V: Value, O: Operation<V::Type>> ProgramBuilder<V, O> {
             }
             for instruction in &regions[current.index()].instructions {
                 pending.extend(instruction.regions.iter().copied());
-                pending.extend(instruction.callees.iter().copied());
             }
         }
         if let Some(unreachable) = reachable.iter().position(|is_reachable| !is_reachable) {
@@ -2099,7 +2040,7 @@ fn move_atom_to_program<V: Value, O: Operation<V::Type>>(
         atom_id_mapping.insert(output, new_output);
         outputs.push(new_output);
     }
-    new_instructions.push(Instruction::new(instruction.operation, inputs, outputs));
+    new_instructions.push(Instruction::new(instruction.operation, inputs, outputs, Vec::new()));
     atom_id_mapping
         .get(&atom_id)
         .copied()
@@ -2905,6 +2846,7 @@ mod tests {
             ScalarOperation::Neg(NegOperation),
             vec![input],
             vec![input],
+            Vec::new(),
         ));
         assert!(matches!(
             input_output_overlap_builder.build::<Vec<Scalar>, Vec<Scalar>>(
@@ -2923,11 +2865,13 @@ mod tests {
             ScalarOperation::Neg(NegOperation),
             vec![input],
             vec![output],
+            Vec::new(),
         ));
         duplicate_output_builder.add_instruction_unchecked(Instruction::new(
             ScalarOperation::Neg(NegOperation),
             vec![input],
             vec![output],
+            Vec::new(),
         ));
         assert!(matches!(
             duplicate_output_builder.build::<Vec<Scalar>, Vec<Scalar>>(
@@ -2942,186 +2886,7 @@ mod tests {
 
     // TODO(eaplatanios): Review this.
     #[test]
-    fn test_multi_region_program_construction_and_locators() {
-        // Phase 1 pin for the first-class-program-regions plan: sealed regions, attachment validation, and locator
-        // resolution over the region arena. The operation-declared attachment contract arrives in Phase 2, so the
-        // attached instruction is assembled through the unchecked path.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let region_input = region_builder.add_input(DataType::F64);
-        let doubled = region_builder.add_instruction(AddOperation, vec![region_input, region_input]).unwrap()[0];
-        let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let sealed = builder.add_region(&region_program);
-        assert_eq!(sealed, RegionId::new(0));
-
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_variable(DataType::F64);
-        builder.add_instruction_unchecked(Instruction::new_with_regions(
-            AddOperation.into(),
-            vec![input, input],
-            vec![output],
-            vec![sealed],
-            Vec::new(),
-        ));
-        let program = builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // Locators: the arena holds the sealed region plus the entry region, and producers resolve per region.
-        assert_eq!(program.regions().len(), 2);
-        assert_eq!(program.entry(), RegionId::new(1));
-        assert_eq!(program.region(sealed).unwrap().input_ids(), &[region_input]);
-        assert!(matches!(
-            program.region(RegionId::new(7)),
-            Err(ProgramError::MalformedProgram(message)) if message == "region ^7 is out of range",
-        ));
-        let instruction = &program.instructions()[0];
-        assert_eq!(instruction.regions(), &[sealed]);
-        assert!(instruction.callees().is_empty());
-        assert_eq!(
-            program.producer(ValueId::new(program.entry(), output)).unwrap(),
-            Some(InstructionId::new(program.entry(), 0)),
-        );
-        assert_eq!(program.producer(ValueId::new(program.entry(), input)).unwrap(), None);
-        assert_eq!(program.producer(ValueId::new(sealed, doubled)).unwrap(), Some(InstructionId::new(sealed, 0)),);
-
-        // Borrowed instruction views resolve attachments against the arena.
-        let view = program.instruction(InstructionId::new(program.entry(), 0)).unwrap();
-        assert_eq!(view.id(), InstructionId::new(program.entry(), 0));
-        assert_eq!(view.instruction().regions(), &[sealed]);
-        assert_eq!(view.region(0).unwrap().input_ids(), &[region_input]);
-        assert!(matches!(
-            view.callee(0),
-            Err(ProgramError::MalformedProgram(message)) if message == "instruction has no callee index 0",
-        ));
-        assert!(program.instruction(InstructionId::new(program.entry(), 9)).is_err());
-
-        // The multi-region program clones, maps, and reports effects across every region.
-        let cloned = program.clone();
-        assert_eq!(cloned.regions().len(), 2);
-        let mapped = program.map_operations(|operation| Ok(operation.clone())).unwrap();
-        assert_eq!(mapped.regions().len(), 2);
-        assert_eq!(mapped.instructions()[0].regions(), &[sealed]);
-        assert!(program.effects().is_pure());
-
-        // Legacy single-region rebuild paths reject multi-region programs instead of silently dropping regions.
-        assert!(matches!(
-            program.simplified(),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "multi-region programs are not yet supported by this transformation",
-        ));
-        assert!(matches!(
-            program.filtered(&[], program.output_ids(), &[]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "multi-region programs are not yet supported by this transformation",
-        ));
-        assert!(matches!(
-            ProgramBuilder::new().add_program(&program.to_flat_program(), &[]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "multi-region programs are not yet supported by this transformation",
-        ));
-        assert!(matches!(
-            program.into_simplified(),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "multi-region programs are not yet supported by this transformation",
-        ));
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[test]
-    fn test_multi_region_attachment_validation() {
-        // Attachments must reference previously sealed regions (which keeps the graph acyclic by construction).
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_variable(DataType::F64);
-        builder.add_instruction_unchecked(Instruction::new_with_regions(
-            AddOperation.into(),
-            vec![input, input],
-            vec![output],
-            vec![RegionId::new(3)],
-            Vec::new(),
-        ));
-        assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "instruction attachment ^3 does not reference a previously sealed region",
-        ));
-
-        // A lexically owned region has exactly one owning slot.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let region_input = region_builder.add_input(DataType::F64);
-        let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let sealed = builder.add_region(&region_program);
-        let input = builder.add_input(DataType::F64);
-        let first = builder.add_variable(DataType::F64);
-        let second = builder.add_variable(DataType::F64);
-        builder.add_instruction_unchecked(Instruction::new_with_regions(
-            AddOperation.into(),
-            vec![input, input],
-            vec![first],
-            vec![sealed],
-            Vec::new(),
-        ));
-        builder.add_instruction_unchecked(Instruction::new_with_regions(
-            AddOperation.into(),
-            vec![first, input],
-            vec![second],
-            vec![sealed],
-            Vec::new(),
-        ));
-        assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "region ^0 is lexically owned by more than one instruction slot",
-        ));
-
-        // A callee target cannot also be lexically owned.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let region_input = region_builder.add_input(DataType::F64);
-        let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let sealed = builder.add_region(&region_program);
-        let input = builder.add_input(DataType::F64);
-        let output = builder.add_variable(DataType::F64);
-        builder.add_instruction_unchecked(Instruction::new_with_regions(
-            AddOperation.into(),
-            vec![input, input],
-            vec![output],
-            vec![sealed],
-            vec![sealed],
-        ));
-        assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "region ^0 is referenced as a callee but is lexically owned by an instruction",
-        ));
-
-        // Every sealed region must be reachable from the entry root.
-        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let region_input = region_builder.add_input(DataType::F64);
-        let region_program = region_builder
-            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        builder.add_region(&region_program);
-        let input = builder.add_input(DataType::F64);
-        assert!(matches!(
-            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "region ^0 is not reachable from the program entry region",
-        ));
-    }
-
-    // TODO(eaplatanios): Review this.
-    #[test]
-    fn test_program_region_closures_and_callee_interning() {
+    fn test_program_builder_add_region_and_add_callee() {
         // A source program with one sealed region attached to its entry instruction.
         let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
         let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
@@ -3132,12 +2897,11 @@ mod tests {
         let sealed = source_builder.add_region(&region_program);
         let input = source_builder.add_input(DataType::F64);
         let output = source_builder.add_variable(DataType::F64);
-        source_builder.add_instruction_unchecked(Instruction::new_with_regions(
+        source_builder.add_instruction_unchecked(Instruction::new(
             AddOperation.into(),
             vec![input, input],
             vec![output],
             vec![sealed],
-            Vec::new(),
         ));
         let source = source_builder
             .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -3162,5 +2926,155 @@ mod tests {
         let third = destination.add_callee(&equal_but_distinct);
         assert_eq!(first, second);
         assert_ne!(first, third);
+    }
+
+    #[test]
+    fn test_program_builder_build_multi_region_program() {
+        // TODO(eaplatanios): The operation-declared region contract arrives in Phase 2, and so the region-carrying
+        //  instruction is assembled through the unchecked path.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let doubled = region_builder.add_instruction(AddOperation, vec![region_input, region_input]).unwrap()[0];
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![doubled], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.add_region(&region_program);
+        assert_eq!(sealed, RegionId::new(0));
+
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new(
+            AddOperation.into(),
+            vec![input, input],
+            vec![output],
+            vec![sealed],
+        ));
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The regions arena holds the sealed region plus the entry region, and producers resolve per region.
+        assert_eq!(program.regions().len(), 2);
+        assert_eq!(program.entry(), RegionId::new(1));
+        assert_eq!(program.region(sealed).unwrap().input_ids(), &[region_input]);
+        assert!(matches!(
+            program.region(RegionId::new(7)),
+            Err(ProgramError::MalformedProgram(message)) if message == "region ^7 is out of range",
+        ));
+        let instruction = &program.instructions()[0];
+        assert_eq!(instruction.regions(), &[sealed]);
+        assert_eq!(
+            program.producer(ValueId::new(program.entry(), output)).unwrap(),
+            Some(InstructionId::new(program.entry(), 0)),
+        );
+        assert_eq!(program.producer(ValueId::new(program.entry(), input)).unwrap(), None);
+        assert_eq!(program.producer(ValueId::new(sealed, doubled)).unwrap(), Some(InstructionId::new(sealed, 0)),);
+
+        // Borrowed instruction views resolve attached regions against the arena.
+        let view = program.instruction(InstructionId::new(program.entry(), 0)).unwrap();
+        assert_eq!(view.id(), InstructionId::new(program.entry(), 0));
+        assert_eq!(view.instruction().regions(), &[sealed]);
+        assert_eq!(view.region(0).unwrap().input_ids(), &[region_input]);
+        assert!(program.instruction(InstructionId::new(program.entry(), 9)).is_err());
+
+        // The multi-region program clones, maps, and reports effects across every region.
+        let cloned = program.clone();
+        assert_eq!(cloned.regions().len(), 2);
+        let mapped = program.map_operations(|operation| Ok(operation.clone())).unwrap();
+        assert_eq!(mapped.regions().len(), 2);
+        assert_eq!(mapped.instructions()[0].regions(), &[sealed]);
+        assert!(program.effects().is_pure());
+
+        // TODO(eaplatanios): Fix this as part of later phase of the first-class program regions plan.
+        // Legacy single-region rebuild paths reject multi-region programs instead of silently dropping regions.
+        assert!(matches!(
+            program.simplified(),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+        assert!(matches!(
+            program.filtered(&[], program.output_ids(), &[]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+        assert!(matches!(
+            ProgramBuilder::new().add_program(&program.to_flat_program(), &[]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+        assert!(matches!(
+            program.into_simplified(),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "multi-region programs are not yet supported by this transformation",
+        ));
+    }
+
+    #[test]
+    fn test_program_builder_build_shares_region_across_instructions() {
+        // Sharing is legal: several instructions (and several slots of one instruction) may reference one region.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let sealed = builder.add_region(&region_program);
+        let input = builder.add_input(DataType::F64);
+        let first = builder.add_variable(DataType::F64);
+        let second = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new(
+            AddOperation.into(),
+            vec![input, input],
+            vec![first],
+            vec![sealed, sealed],
+        ));
+        builder.add_instruction_unchecked(Instruction::new(
+            AddOperation.into(),
+            vec![first, input],
+            vec![second],
+            vec![sealed],
+        ));
+        let program = builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![second], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(program.regions().len(), 2);
+        assert_eq!(program.instructions()[0].regions(), &[sealed, sealed]);
+        assert_eq!(program.instructions()[1].regions(), &[sealed]);
+    }
+
+    #[test]
+    fn test_program_builder_build_rejects_malformed_regions() {
+        // Instruction regions must reference previously sealed regions (which keeps the graph acyclic by
+        // construction).
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let input = builder.add_input(DataType::F64);
+        let output = builder.add_variable(DataType::F64);
+        builder.add_instruction_unchecked(Instruction::new(
+            AddOperation.into(),
+            vec![input, input],
+            vec![output],
+            vec![RegionId::new(3)],
+        ));
+        assert!(matches!(
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![output], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "instruction references region ^3 which has not been sealed yet",
+        ));
+
+        // Every sealed region must be reachable from the entry root.
+        let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let mut region_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
+        let region_input = region_builder.add_input(DataType::F64);
+        let region_program = region_builder
+            .build::<Vec<Scalar>, Vec<Scalar>>(vec![region_input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        builder.add_region(&region_program);
+        let input = builder.add_input(DataType::F64);
+        assert!(matches!(
+            builder.build::<Vec<Scalar>, Vec<Scalar>>(vec![input], vec![Placeholder], vec![Placeholder]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "region ^0 is not reachable from the program entry region",
+        ));
     }
 }

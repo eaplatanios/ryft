@@ -356,7 +356,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
     fn broadcast(&self, output_type: ArrayType, output_axes: &[usize]) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), &[self.clone()])?
+            .bind(BroadcastOperation::new(output_type, output_axes.to_vec()), &[], &[], &[self.clone()])?
             .remove(0))
     }
 }

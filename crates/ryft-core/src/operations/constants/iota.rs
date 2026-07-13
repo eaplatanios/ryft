@@ -127,7 +127,7 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C> + From<IotaOperation
 {
     #[inline]
     fn iota(&self, r#type: &C::Type, dimension: usize) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), &[])?;
+        let mut outputs = self.bind(IotaOperation::new(r#type.clone(), dimension), &[], &[], &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

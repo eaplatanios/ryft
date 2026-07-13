@@ -92,7 +92,7 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::check_count;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Placeholder};
-use crate::programs::{AtomId, Program, ProgramBuilder, ProgramError, Value};
+use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::TracingContext;
 use crate::types::Typed;
 
@@ -751,7 +751,12 @@ impl<C: Context> PartialEvaluationContext<C> {
         let operation = operation.into();
         if inputs.iter().all(PartialEvaluationValue::is_known) {
             let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
-            Ok(self.parent.bind(operation, &known)?.into_iter().map(PartialEvaluationValue::known).collect())
+            Ok(self
+                .parent
+                .bind(operation, &[], &[], &known)?
+                .into_iter()
+                .map(PartialEvaluationValue::known)
+                .collect())
         } else {
             self.residualize(operation, inputs)
         }
@@ -1101,12 +1106,25 @@ impl<C: Context<Operation: PartiallyEvaluatableOperation<C>>> Context for Partia
     fn bind<O: Into<C::Operation>>(
         &self,
         operation: O,
+        regions: &[FlatProgram<Self>],
+        callees: &[Rc<FlatProgram<Self>>],
         inputs: &[PartialTracer<C>],
     ) -> Result<Vec<PartialTracer<C>>, ProgramError> {
         // Unwrap the input tracers into context-free partial-evaluation values, dispatch the operation's partial
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
         let operation = operation.into();
+        // TODO(eaplatanios): [regions] Transitional guard until `PartialEvaluationContext` binds regions (phases 2-6);
+        //  see the deletion inventory on `EagerContext::bind` in `contexts.rs`.
+        if !regions.is_empty() || !callees.is_empty() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "operation `{}` carries nested regions which this context cannot bind yet",
+                    operation.name(),
+                ),
+            });
+        }
+
         let input_values = inputs.iter().map(|input| input.value()).collect::<Result<Vec<_>, _>>();
         let error = match input_values {
             Ok(input_values) => {
@@ -1603,7 +1621,7 @@ mod tests {
     fn test_partial_evaluation_context() {
         let context = PartialEvaluationContext::new(EagerContext::<Scalar, ScalarOperation<Scalar>>::new());
         assert_eq!(
-            context.parent().bind(AddOperation, &[Scalar::from(1.0), Scalar::from(2.0)]),
+            context.parent().bind(AddOperation, &[], &[], &[Scalar::from(1.0), Scalar::from(2.0)]),
             Ok(vec![Scalar::from(3.0)]),
         );
 
@@ -1786,7 +1804,7 @@ mod tests {
             PartialValueMaterialization::Constant { residual_atom: None },
         ));
         assert!(matches!(context.resolve(&lifted), ValueResolution::Concrete(value) if value == Scalar::from(2.0)));
-        let folded = context.bind(AddOperation, &[lifted.clone(), lifted.clone()]).unwrap();
+        let folded = context.bind(AddOperation, &[], &[], &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Scalar::from(4.0)));
         assert_eq!(folded[0].boolean(), Ok(true));
@@ -1805,7 +1823,7 @@ mod tests {
         context.inputs.borrow_mut().push(PartialEvaluationInput::Unknown(0));
         let unknown =
             PartialTracer::new(context.clone(), PartialEvaluationValue::variable(DataType::F64, unknown_atom));
-        let mixed = context.bind(MulOperation, &[folded[0].clone(), unknown.clone()]).unwrap();
+        let mixed = context.bind(MulOperation, &[], &[], &[folded[0].clone(), unknown.clone()]).unwrap();
         assert!(mixed[0].value().unwrap().is_unknown());
         assert!(matches!(context.resolve(&mixed[0]), ValueResolution::Opaque));
         assert!(matches!(mixed[0].boolean(), Err(ProgramError::Concretization { .. })));
@@ -1844,7 +1862,7 @@ mod tests {
         let context = PartialEvaluationContext::new(outer_a.clone());
         let known_a = PartialTracer::new(context.clone(), PartialEvaluationValue::known(outer_a.input(DataType::F64)));
         let known_b = PartialTracer::new(context.clone(), PartialEvaluationValue::known(outer_b.input(DataType::F64)));
-        let poisoned = context.bind(AddOperation, &[known_a.clone(), known_b]).unwrap();
+        let poisoned = context.bind(AddOperation, &[], &[], &[known_a.clone(), known_b]).unwrap();
         assert_eq!(poisoned.len(), 1);
         assert_eq!(format!("{}", poisoned[0]), "<poison:f64>");
         assert_eq!(poisoned[0].r#type().into_owned(), DataType::F64);
@@ -1853,7 +1871,7 @@ mod tests {
 
         // Poison propagates from inputs to outputs of later binds, and unwrapping at a boundary reports the original
         // deferred error rather than a generic poison error.
-        let propagated = context.bind(MulOperation, &[known_a, poisoned[0].clone()]).unwrap();
+        let propagated = context.bind(MulOperation, &[], &[], &[known_a, poisoned[0].clone()]).unwrap();
         assert!(matches!(propagated[0].value(), Err(ProgramError::MismatchedProgramBuilders)));
         assert!(matches!(propagated[0].clone().into_value(), Err(ProgramError::MismatchedProgramBuilders)));
     }

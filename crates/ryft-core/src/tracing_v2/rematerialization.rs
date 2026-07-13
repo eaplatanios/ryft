@@ -2027,7 +2027,7 @@ where
         if let Some((operation, output_structure)) = cached {
             let operation = <D as Domain>::Operation::from(operation);
             let context = first.dispatch_domain();
-            let outputs = context.bind(operation, &input_tracers)?;
+            let outputs = context.bind(operation, &[], &[], &input_tracers)?;
             return Ok(Parameterized::from_parameters(output_structure, outputs)?);
         }
 
@@ -2139,6 +2139,7 @@ where
                             operation,
                             vec![residual_atoms[index]],
                             vec![stored],
+                            Vec::new(),
                         ));
                         saved_types.push(stored_type);
                         output_ids.push(stored);
@@ -2193,7 +2194,7 @@ where
         let output_structure = structured_output_types.parameter_structure();
         self.cache.borrow_mut().push((input_types, operation.clone(), output_structure.clone()));
         let context = first.dispatch_domain();
-        let outputs = context.bind(<D as Domain>::Operation::from(operation), &input_tracers)?;
+        let outputs = context.bind(<D as Domain>::Operation::from(operation), &[], &[], &input_tracers)?;
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
 }
@@ -3957,7 +3958,7 @@ mod tests {
                     let context = x.context().clone();
                     let operation =
                         WhileOperation::new(condition.clone(), body.clone()).unwrap().with_iteration_bound(3).unwrap();
-                    let outputs = context.bind(ArrayOperation::While(Box::new(operation)), &[x]).unwrap();
+                    let outputs = context.bind(ArrayOperation::While(Box::new(operation)), &[], &[], &[x]).unwrap();
                     outputs.into_iter().next().unwrap()
                 },
                 TestArray::scalar(1.1),

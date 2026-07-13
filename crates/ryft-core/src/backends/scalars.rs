@@ -1597,7 +1597,7 @@ mod tests {
                         scalar_doubling_body(),
                     )
                     .unwrap();
-                    Ok(carry.context().bind(operation, &[carry.clone()])?.remove(0))
+                    Ok(carry.context().bind(operation, &[], &[], &[carry.clone()])?.remove(0))
                 },
                 Scalar::from(1.0),
                 Scalar::from(1.0),
@@ -1742,11 +1742,21 @@ mod tests {
         // It is an eager `Context`. Binding a nullary zero/one operation interprets it directly over concrete
         // [`Scalar`] values, yielding the corresponding scalar identity for the requested [`DataType`].
         assert_eq!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::F64), &[]),
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
+                ZeroOperation::new(DataType::F64),
+                &[],
+                &[],
+                &[]
+            ),
             Ok(vec![Scalar::from(0.0)]),
         );
         assert_eq!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(OneOperation::new(DataType::F64), &[]),
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(
+                OneOperation::new(DataType::F64),
+                &[],
+                &[],
+                &[]
+            ),
             Ok(vec![Scalar::from(1.0)]),
         );
     }
@@ -1911,7 +1921,12 @@ mod tests {
         assert_eq!(left.zero_like(), Scalar::from(Complex::new(0.0f64, 0.0f64)));
         assert_eq!(left.one_like(), Scalar::from(Complex::new(1.0f64, 0.0f64)));
         assert_eq!(
-            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(ZeroOperation::new(DataType::C64), &[]),
+            EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
+                ZeroOperation::new(DataType::C64),
+                &[],
+                &[],
+                &[]
+            ),
             Ok(vec![Scalar::from(Complex::new(0.0f32, 0.0f32))]),
         );
         assert_eq!(left.boolean(), Ok(true));

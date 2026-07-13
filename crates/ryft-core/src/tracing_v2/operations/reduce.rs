@@ -113,7 +113,7 @@ where
             return self.clone();
         }
         self.dispatch_domain()
-            .bind(ReduceOperation::new(axes.to_vec(), kind), &[self.clone()])
+            .bind(ReduceOperation::new(axes.to_vec(), kind), &[], &[], &[self.clone()])
             .expect("`reduce` operation failed")
             .remove(0)
     }
@@ -123,6 +123,8 @@ where
         self.dispatch_domain()
             .bind(
                 ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone()),
+                &[],
+                &[],
                 &[self.clone()],
             )
             .expect("`reduce` operation failed")

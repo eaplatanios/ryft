@@ -93,7 +93,7 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation>>>> Tag for V
     #[inline]
     fn tag(self, key: &str) -> Self {
         self.dispatch_domain()
-            .bind(TagOperation::new(key), std::slice::from_ref(&self))
+            .bind(TagOperation::new(key), &[], &[], std::slice::from_ref(&self))
             .expect("`tag` operation failed")
             .remove(0)
     }
@@ -111,7 +111,8 @@ impl<C: Context<Operation: Clone + From<ZeroOperation<C::Type>> + From<TagOperat
         // unchanged, matching the identity tangent of the tag. The tag binds through the context so the rule works
         // uniformly under staging and eager contexts.
         check_count!("input", inputs, 1, ProgramError);
-        let mut primal = context.bind(TagOperation::new(self.key()), std::slice::from_ref(inputs[0].primal()))?;
+        let mut primal =
+            context.bind(TagOperation::new(self.key()), &[], &[], std::slice::from_ref(inputs[0].primal()))?;
         check_count!("output", primal, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primal.remove(0), inputs[0].tangent().clone())])
     }

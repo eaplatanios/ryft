@@ -224,7 +224,7 @@ macro_rules! define_elementwise_operation {
                 // Fully qualified calls are required here because the `Value` and `Context` traits are not
                 // necessarily imported at the macro expansion site.
                 let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, &[self.clone()])?.remove(0))
+                Ok($crate::Context::bind(&domain, $operation, &[], &[], &[self.clone()])?.remove(0))
             }
         }
     };
@@ -320,7 +320,7 @@ macro_rules! define_elementwise_operation {
                 // Fully qualified calls are required here because the `Value` and `Context` traits are not
                 // necessarily imported at the macro expansion site.
                 let domain = $crate::Value::dispatch_domain(self);
-                Ok($crate::Context::bind(&domain, $operation, &[self.clone(), rhs.clone()])?.remove(0))
+                Ok($crate::Context::bind(&domain, $operation, &[], &[], &[self.clone(), rhs.clone()])?.remove(0))
             }
         }
     };
@@ -372,7 +372,9 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[self.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone()])
+                    .expect($message)
+                    .remove(0)
             }
         }
 
@@ -385,7 +387,9 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[self.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone()])
+                    .expect($message)
+                    .remove(0)
             }
         }
 
@@ -398,7 +402,9 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[self.clone()]).expect($message).remove(0)
+                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone()])
+                    .expect($message)
+                    .remove(0)
             }
         }
     };
@@ -421,7 +427,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[self.clone(), rhs.clone()])
+                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone(), rhs.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -436,7 +442,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[self.clone(), rhs.clone()])
+                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone(), rhs.clone()])
                     .expect($message)
                     .remove(0)
             }
@@ -451,7 +457,7 @@ macro_rules! define_tracer_operator {
 
             #[inline]
             fn $method(self, rhs: Self) -> Self {
-                $crate::Context::bind(self.context(), $operation, &[self.clone(), rhs.clone()])
+                $crate::Context::bind(self.context(), $operation, &[], &[], &[self.clone(), rhs.clone()])
                     .expect($message)
                     .remove(0)
             }

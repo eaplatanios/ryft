@@ -166,7 +166,7 @@ pub trait Mul: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<MulOperation>>>> Mul for V {
     #[inline]
     fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(MulOperation, &[self.clone(), rhs.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(MulOperation, &[], &[], &[self.clone(), rhs.clone()])?.remove(0))
     }
 }
 
