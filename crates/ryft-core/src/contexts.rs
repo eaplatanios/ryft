@@ -112,8 +112,8 @@ use std::rc::Rc;
 
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_builders;
-use crate::operations::Operation;
 use crate::operations::constants::ConstantOperation;
+use crate::operations::{Operation, RegionDriver};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, RegionInterface, Value};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
@@ -181,8 +181,9 @@ pub trait Context: Domain + Clone {
     /// while independently shared computations are passed as `callees`. Both are exposed to the operation in one
     /// ordered [`Region`](crate::Region) namespace, with the owned regions preceding the callees. Eager and transform
     /// contexts make those regions available to the operation's application-scoped driver. Staging contexts import them
-    /// into the destination program and attach their [`RegionId`]s to the recorded instruction. The combined `regions`
-    /// and `callees` sequence must match the number and order of slots returned by [`Operation::region_names`].
+    /// into the destination program and attach their [`RegionId`](crate::RegionId)s to the recorded instruction. The
+    /// combined `regions` and `callees` sequence must match the number and order of slots returned by
+    /// [`Operation::region_names`].
     ///
     /// # Parameters
     ///
@@ -342,11 +343,10 @@ impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O
         callees: &[Rc<FlatProgram<Self>>],
         inputs: &[V],
     ) -> Result<Vec<V>, ProgramError> {
-        // Eager context binds interpret their owned nested programs through detached access. Shared callee programs
-        // slot in after the owned regions, mirroring the staged region ordering.
+        // Eager context binds interpret their owned nested programs through the eager interpretation driver.
+        // Shared callee programs slot in after the owned regions, mirroring the staged region ordering.
         let operation = operation.into();
-        let driver = EagerInterpretationDriver { regions: regions.as_ref(), callees };
-        operation.interpret(self, &driver, inputs)
+        operation.interpret(self, &EagerInterpretationDriver { regions: regions.as_ref(), callees }, inputs)
     }
 
     #[inline]
@@ -360,9 +360,10 @@ impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O
     }
 }
 
-/// [`InterpretationDriver`] that is used for eager interpretation of nested programs (i.e., that is used for
-/// interpretation by [`EagerContext`]s). [`EagerInterpretationDriver::interpret_region`] replays programs through
-/// the [`EagerContext`] itself, and so region-carrying operations interpret their branches without owning them.
+/// [`InterpretationDriver`] scoped to one eager [`Context::bind`] operation application. Its owned
+/// regions and shared callees are exactly the nested computations attached to that application.
+/// [`EagerInterpretationDriver::interpret_region`] replays them through the [`EagerContext`] itself,
+/// so region-carrying operations interpret their branches without owning them.
 struct EagerInterpretationDriver<'r, V: Value, O: Operation<V::Type>> {
     /// Owned nested [`Program`]s, in the operation-defined region order.
     regions: &'r [FlatProgram<EagerContext<V, O>>],
@@ -371,24 +372,28 @@ struct EagerInterpretationDriver<'r, V: Value, O: Operation<V::Type>> {
     callees: &'r [Rc<FlatProgram<EagerContext<V, O>>>],
 }
 
-impl<V: Value, O: Operation<V::Type>> EagerInterpretationDriver<'_, V, O> {
-    /// Returns the `index`-th [`Program`] in the concatenated owned-region and shared-callee program list.
-    fn program(&self, index: usize) -> Option<&FlatProgram<EagerContext<V, O>>> {
+impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EagerInterpretationDriver<'_, V, O> {
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = crate::RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
         self.regions
-            .get(index)
-            .or_else(|| index.checked_sub(self.regions.len()).and_then(|index| self.callees.get(index)).map(Rc::as_ref))
+            .iter()
+            .map(Program::entry_region_ref)
+            .chain(self.callees.iter().map(|program| program.entry_region_ref()))
     }
 }
 
 impl<V: Value, O: InterpretableOperation<V, EagerContext<V, O>>> InterpretationDriver<V, EagerContext<V, O>>
     for EagerInterpretationDriver<'_, V, O>
 {
+    type Operation = O;
+
     #[inline]
     fn region_interface(&self, index: usize) -> Result<RegionInterface<V::Type>, ProgramError> {
-        let program = self
-            .program(index)
-            .ok_or_else(|| ProgramError::MalformedProgram(format!("region index {index} is out of range")))?;
-        Ok(program.interface())
+        Ok(self.region(index)?.interface())
     }
 
     #[inline]
@@ -398,10 +403,7 @@ impl<V: Value, O: InterpretableOperation<V, EagerContext<V, O>>> InterpretationD
         index: usize,
         inputs: Vec<V>,
     ) -> Result<Vec<V>, ProgramError> {
-        let program = self
-            .program(index)
-            .ok_or_else(|| ProgramError::MalformedProgram(format!("region index {index} is out of range")))?;
-        program.interpret_in_context(context, inputs)
+        self.region(index)?.interpret_in_context(context, inputs)
     }
 }
 
@@ -749,8 +751,8 @@ mod tests {
 
     #[test]
     fn test_staging_context_bind_interprets_shared_callee_programs() {
-        // Shared callee programs bind through the same detached-interpretation channel as owned regions, slotted in
-        // after the owned regions. The while loop below receives its condition and body as interned shared callees and
+        // Shared callee programs bind through the same eager interpretation driver as owned regions, slotted in after
+        // the owned regions. The while loop below receives its condition and body as interned shared callees and
         // still runs the loop to completion.
         let condition = {
             let mut builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
