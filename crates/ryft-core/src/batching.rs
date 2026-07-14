@@ -652,33 +652,24 @@ struct BindingBatchingDriver<'r, C: Context<Type = ArrayType>> {
 
 impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for BindingBatchingDriver<'_, C> {
     #[inline]
-    fn region_count(&self) -> usize {
-        self.regions.len() + self.callees.len()
-    }
-
-    #[inline]
-    fn region(&self, index: usize) -> Result<RegionRef<'_, C::Constant, C::Operation>, ProgramError> {
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, C::Constant, C::Operation>>
+    where
+        C::Constant: 'r,
+        C::Operation: 'r,
+    {
         self.regions
-            .get(index)
-            .or_else(|| index.checked_sub(self.regions.len()).and_then(|index| self.callees.get(index)).map(Rc::as_ref))
+            .iter()
             .map(Program::entry_region_ref)
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "region index {index} is out of range for the operation application",
-                ))
-            })
+            .chain(self.callees.iter().map(|program| program.entry_region_ref()))
     }
 }
 
-impl<
-    C: Context<
-            Type = ArrayType,
-            Operation: BatchableOperation<C>
-                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<TransposeOperation>
-                           + From<BroadcastOperation>,
-        >,
-> BatchingDriver<C> for BindingBatchingDriver<'_, C>
+impl<C: Context<Type = ArrayType>> BatchingDriver<C> for BindingBatchingDriver<'_, C>
+where
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
 {
     #[inline]
     fn batch_region(
@@ -711,27 +702,21 @@ struct ReplayBatchingDriver<'r, C: Context<Type = ArrayType>> {
 
 impl<C: Context<Type = ArrayType>> RegionDriver<C::Constant, C::Operation> for ReplayBatchingDriver<'_, C> {
     #[inline]
-    fn region_count(&self) -> usize {
-        self.regions.len()
-    }
-
-    #[inline]
-    fn region(&self, index: usize) -> Result<RegionRef<'_, C::Constant, C::Operation>, ProgramError> {
-        self.regions.get(index).copied().ok_or_else(|| {
-            ProgramError::MalformedProgram(format!("region index {index} is out of range"))
-        })
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, C::Constant, C::Operation>>
+    where
+        C::Constant: 'r,
+        C::Operation: 'r,
+    {
+        self.regions.iter().copied()
     }
 }
 
-impl<
-    C: Context<
-            Type = ArrayType,
-            Operation: BatchableOperation<C>
-                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<TransposeOperation>
-                           + From<BroadcastOperation>,
-        >,
-> BatchingDriver<C> for ReplayBatchingDriver<'_, C>
+impl<C: Context<Type = ArrayType>> BatchingDriver<C> for ReplayBatchingDriver<'_, C>
+where
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
 {
     #[inline]
     fn batch_region(
@@ -1067,15 +1052,12 @@ impl<C: Context<Type = ArrayType>> Domain for BatchingContext<C> {
     type Operation = C::Operation;
 }
 
-impl<
-    C: Context<
-            Type = ArrayType,
-            Operation: BatchableOperation<C>
-                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<TransposeOperation>
-                           + From<BroadcastOperation>,
-        >,
-> Context for BatchingContext<C>
+impl<C: Context<Type = ArrayType>> Context for BatchingContext<C>
+where
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<BatchingTracer<C>, ProgramError> {

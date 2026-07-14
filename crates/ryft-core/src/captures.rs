@@ -137,12 +137,10 @@ impl<C: CapturingContext> CapturingContext for NestedTracingContext<C> {
     }
 }
 
-impl<
-    C: CapturingContext<
-        Operation: PartiallyEvaluatableOperation<C>
-                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-    >,
-> CapturingContext for PartialEvaluationContext<C>
+impl<C: CapturingContext> CapturingContext for PartialEvaluationContext<C>
+where
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
 {
     type Capture = C::Capture;
 
@@ -152,15 +150,12 @@ impl<
     }
 }
 
-impl<
-    C: CapturingContext<
-            Type = ArrayType,
-            Operation: BatchableOperation<C>
-                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<TransposeOperation>
-                           + From<BroadcastOperation>,
-        >,
-> CapturingContext for BatchingContext<C>
+impl<C: CapturingContext<Type = ArrayType>> CapturingContext for BatchingContext<C>
+where
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
 {
     type Capture = C::Capture;
 
@@ -170,15 +165,13 @@ impl<
     }
 }
 
-impl<
-    C: CapturingContext<
-        Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                       + DifferentiableOperation<C>
-                       + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-                       + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-                       + From<ZeroOperation<C::Type>>,
-    >,
-> CapturingContext for DifferentiationContext<C>
+impl<C: CapturingContext> CapturingContext for DifferentiationContext<C>
+where
+    C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<C>
+        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+        + From<ZeroOperation<C::Type>>,
 {
     type Capture = C::Capture;
 

@@ -1987,7 +1987,7 @@ mod linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = scalar_squaring_while();
-                vec![inputs[0].clone().unary_with_regions(while_operation, while_regions)]
+                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()]).unwrap()
             },
             vec![Scalar::from(1.5)],
             vec![Scalar::from(1.0)],
@@ -2072,7 +2072,7 @@ mod linearization_tests {
             domain.clone(),
             |inputs| {
                 let (while_operation, while_regions) = scalar_nested_while();
-                Ok(vec![inputs[0].clone().unary_with_regions(while_operation, while_regions)])
+                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
             },
             vec![DataType::F64],
         )
@@ -2108,7 +2108,7 @@ mod linearization_tests {
             domain.clone(),
             |inputs| {
                 let (while_operation, while_regions) = scalar_nested_while();
-                Ok(vec![inputs[0].clone().unary_with_regions(while_operation, while_regions)])
+                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
             },
             vec![DataType::F64],
         )
@@ -2161,7 +2161,7 @@ mod linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = scalar_squaring_while();
-                Ok(vec![inputs[0].clone().unary_with_regions(while_operation, while_regions)])
+                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
             },
             vec![Scalar::from(1.5)],
         )
@@ -3612,7 +3612,7 @@ mod array_linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = array_squaring_while();
-                vec![inputs[0].clone().unary_with_regions(while_operation, while_regions)]
+                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()]).unwrap()
             },
             vec![TestArray::scalar(1.5)],
             vec![TestArray::scalar(1.0)],
@@ -3649,7 +3649,7 @@ mod array_linearization_tests {
             &domain,
             |inputs| {
                 let (while_operation, while_regions) = array_squaring_while();
-                Ok(vec![inputs[0].clone().unary_with_regions(while_operation, while_regions)])
+                inputs[0].context().bind(while_operation, while_regions, &[], &[inputs[0].clone()])
             },
             vec![TestArray::scalar(1.5)],
         )

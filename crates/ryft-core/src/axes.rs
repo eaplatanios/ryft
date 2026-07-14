@@ -93,12 +93,10 @@ impl<C: NamedAxes> NamedAxes for NestedTracingContext<C> {
     }
 }
 
-impl<
-    C: NamedAxes<
-        Operation: PartiallyEvaluatableOperation<C>
-                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-    >,
-> NamedAxes for PartialEvaluationContext<C>
+impl<C: NamedAxes> NamedAxes for PartialEvaluationContext<C>
+where
+    C::Operation:
+        PartiallyEvaluatableOperation<C> + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
@@ -108,15 +106,12 @@ impl<
     }
 }
 
-impl<
-    C: NamedAxes<
-            Type = ArrayType,
-            Operation: BatchableOperation<C>
-                           + BatchableOperation<TracingContext<C::Constant, C::Operation>>
-                           + From<TransposeOperation>
-                           + From<BroadcastOperation>,
-        >,
-> NamedAxes for BatchingContext<C>
+impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C>
+where
+    C::Operation: BatchableOperation<C>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>>
+        + From<TransposeOperation>
+        + From<BroadcastOperation>,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
@@ -132,15 +127,13 @@ impl<
     }
 }
 
-impl<
-    C: NamedAxes<
-        Operation: DifferentiableOperation<C>
-                       + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
-                       + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                       + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-                       + From<ZeroOperation<C::Type>>,
-    >,
-> NamedAxes for DifferentiationContext<C>
+impl<C: NamedAxes> NamedAxes for DifferentiationContext<C>
+where
+    C::Operation: DifferentiableOperation<C>
+        + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
+        + From<ZeroOperation<C::Type>>,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
