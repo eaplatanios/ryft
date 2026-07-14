@@ -1,21 +1,22 @@
 use std::fmt::Display;
 use std::ops::{Div, Mul};
 
-use crate::contexts::Context;
+use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation,
+    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionDriver,
 };
-use crate::interpretation::InterpretableOperation;
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::complex::{Conjugate, Real};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{MaybeZero, ProgramError, Value};
+use crate::programs::{MaybeZero, ProgramError, RegionInterface, Value};
 use crate::tracing::{Tracer, TracingContext};
 use crate::types::{ArrayType, DataType, Type, TypeError, Typed};
 
 /// Canonical operation name for [`AbsOperation`].
-pub const ABS_OPERATION_NAME: &'static str = "abs";
+pub const ABS_OPERATION_NAME: &str = "abs";
 
 /// [`Operation`] that computes the elementwise absolute value of one value (i.e., `x ↦ |x|`, the magnitude `|z|` on
 /// complex operands with a real result) while preserving all other type metadata. This is the analogue of
@@ -37,7 +38,11 @@ impl Operation<DataType> for AbsOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![match &input_types[0] {
             DataType::C64 => DataType::F32,
@@ -54,7 +59,11 @@ impl Operation<ArrayType> for AbsOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![ArrayType {
             data_type: match input_types[0].data_type() {
@@ -75,16 +84,21 @@ impl ElementwiseOperation for AbsOperation {
 
     #[inline]
     fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-        Operation::<ArrayType>::infer_output_types(self, input_types)
+        Operation::<ArrayType>::infer_output_types(self, input_types, &[])
     }
 }
 
-impl<V: Clone + Value + Abs, C> InterpretableOperation<V, C> for AbsOperation
+impl<C: Domain<Value: Abs>> InterpretableOperation<C> for AbsOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].abs()?])
     }
@@ -93,14 +107,15 @@ where
 impl<C: Context> PartiallyEvaluatableOperation<C> for AbsOperation where C::Operation: From<AbsOperation> {}
 
 // TODO(eaplatanios): Review this implementation.
-impl<C: Context<Value: Abs + Conjugate + Real + Mul<Output = C::Value> + Div<Output = C::Value>, Operation: Clone>>
-    DifferentiableOperation<C> for AbsOperation
+impl<C: Context> DifferentiableOperation<C> for AbsOperation
 where
+    C::Value: Abs + Conjugate + Real + Mul<Output = C::Value> + Div<Output = C::Value>,
     AbsOperation: Operation<C::Type>,
 {
-    fn jvp(
+    fn jvp<D: DifferentiationDriver<C>>(
         &self,
         _context: &C,
+        _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         // The real derivative is `d|x| = (x / |x|) · dx` (i.e., `sign(x) · dx` and undefined at zero), and the complex
@@ -130,9 +145,10 @@ where
     AbsOperation: Operation<V::Type>,
 {
     #[inline]
-    fn transpose(
+    fn transpose<D: TranspositionDriver<V, O>>(
         &self,
         _context: &mut TracingContext<V, O>,
+        _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
@@ -158,7 +174,7 @@ pub trait Abs: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<AbsOperation>>>> Abs for V {
     #[inline]
     fn abs(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(AbsOperation, &[], &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(AbsOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -172,6 +188,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::differentiation::{gradient, value_and_gradient};
+    use crate::operations::RegionlessDriver;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -188,29 +205,41 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), ABS_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "AbsOperation");
         assert_eq!(format!("{operation}"), ABS_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]));
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::C64]), Ok(vec![DataType::F32]));
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::C128]), Ok(vec![DataType::F64]));
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Ok(vec![DataType::F32]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64], &[]),
+            Ok(vec![DataType::F32]),
+        );
+        assert_eq!(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C128], &[]),
+            Ok(vec![DataType::F64]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(-2.0)],
             ),
             Ok(vec![Scalar::from(2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(ComplexNumber::new(3.0f64, -4.0f64))],
             ),
             Ok(vec![Scalar::from(5.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(-2.0)],
             ),
             Ok(vec![TestArray::scalar(2.0)]),
@@ -236,7 +265,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            <AbsOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input)),
+            <AbsOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
             Ok(vec![input]),
         );
 
@@ -245,35 +274,43 @@ mod tests {
             Operation::<ArrayType>::infer_output_types(
                 &operation,
                 &[ArrayType::new(DataType::C128, Shape::new(vec![Size::Static(2)]))],
+                &[],
             ),
             Ok(vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2)]))]),
         );
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(&operation, &EagerContext::new(), &[],),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
+                &[],
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(true)],
             ),
             Err(ProgramError::Type(TypeError {
@@ -284,7 +321,7 @@ mod tests {
         // Program rendering uses the canonical operation name, with the complex magnitude typed by its real part.
         let mut builder = ProgramBuilder::<Scalar, AbsOperation>::new();
         let input = builder.add_input(DataType::C128);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![input], Vec::new()).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

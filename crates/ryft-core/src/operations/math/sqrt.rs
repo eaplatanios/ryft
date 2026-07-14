@@ -1,7 +1,7 @@
 use crate::macros::define_elementwise_operation;
 
 /// Canonical operation name for [`SqrtOperation`].
-pub const SQRT_OPERATION_NAME: &'static str = "sqrt";
+pub const SQRT_OPERATION_NAME: &str = "sqrt";
 
 // TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(

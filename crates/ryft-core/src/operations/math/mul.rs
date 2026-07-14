@@ -2,17 +2,17 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::broadcasting::Broadcastable;
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, RegionInterface, Value};
 use crate::sharding::Sharding;
 use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`MulOperation`].
-pub const MUL_OPERATION_NAME: &'static str = "mul";
+pub const MUL_OPERATION_NAME: &str = "mul";
 
 /// [`Operation`] that multiplies two values and typically supports broadcasting semantics for arrays.
 #[derive(Clone, Debug, Default)]
@@ -32,7 +32,11 @@ impl Operation<DataType> for MulOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         input_types[0].broadcast(&input_types[1]).map(|output| vec![output]).map_err(|_| TypeError {
             message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible"),
@@ -47,7 +51,11 @@ impl Operation<ArrayType> for MulOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         ElementwiseOperation::infer_output_types(self, input_types)
     }
 }
@@ -141,12 +149,17 @@ impl ElementwiseOperation for MulOperation {
     }
 }
 
-impl<V: Clone + Value + Mul, C> InterpretableOperation<V, C> for MulOperation
+impl<C: Domain<Value: Mul>> InterpretableOperation<C> for MulOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].mul(&inputs[1])?])
     }
@@ -166,7 +179,7 @@ pub trait Mul: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<MulOperation>>>> Mul for V {
     #[inline]
     fn mul(&self, rhs: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(MulOperation, &[], &[], &[self.clone(), rhs.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(MulOperation, Vec::new(), &[], &[self.clone(), rhs.clone()])?.remove(0))
     }
 }
 
@@ -181,6 +194,7 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::operations::RegionlessDriver;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -198,21 +212,23 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "MulOperation");
         assert_eq!(format!("{operation}"), MUL_OPERATION_NAME);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(2.0), Scalar::from(3.5)],
             ),
             Ok(vec![Scalar::from(7.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
             ),
             Ok(vec![TestArray::scalar(7.0)]),
@@ -225,6 +241,7 @@ mod tests {
                 ArrayType::scalar(DataType::F32),
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
             ],
+            &[],
         )
         .unwrap();
         assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))]);
@@ -236,6 +253,7 @@ mod tests {
                 ArrayType::new(DataType::F32, Shape::scalar()).with_layout(Layout::Strided(StridedLayout::new(vec![]))),
                 ArrayType::scalar(DataType::F32),
             ],
+            &[],
         )
         .unwrap();
         assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
@@ -270,7 +288,8 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
+        let output =
+            <MulOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right], &[]).unwrap();
         assert_eq!(
             output[0].sharding().as_ref().unwrap().varying_manual_axes(),
             &BTreeSet::from(["x".to_string(), "y".to_string()]),
@@ -278,31 +297,33 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)], &[]),
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(2.0)],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(2.0)]
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
             Err(TypeError { message: format!("'{MUL_OPERATION_NAME}' input types are not broadcast-compatible") }),
         );
         let error = <MulOperation as Operation<ArrayType>>::infer_output_types(
@@ -311,6 +332,7 @@ mod tests {
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
             ],
+            &[],
         )
         .unwrap_err();
         assert_eq!(
@@ -322,7 +344,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, MulOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![left, right], Vec::new()).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();
@@ -369,9 +391,12 @@ mod tests {
 
         // Unreduced over `x` times reduced over `x` is the partial-sum-times-replicated case: the product stays
         // unreduced over `x`, and the reduced marker is cleared.
-        let output =
-            <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[unreduced("x"), reduced("x")])
-                .unwrap();
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
+            &MulOperation,
+            &[unreduced("x"), reduced("x")],
+            &[],
+        )
+        .unwrap();
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::new());
 
@@ -380,6 +405,7 @@ mod tests {
             <MulOperation as Operation<ArrayType>>::infer_output_types(
                 &MulOperation,
                 &[unreduced("x"), unreduced("x")],
+                &[],
             ),
             Err(TypeError {
                 message: format!("'{MUL_OPERATION_NAME}' cannot multiply two operands that are both unreduced")
@@ -388,7 +414,11 @@ mod tests {
 
         // Unreduced over `x` requires the other operand to be reduced over exactly `x`, not a different axis.
         assert_eq!(
-            <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[unreduced("x"), reduced("y")]),
+            <MulOperation as Operation<ArrayType>>::infer_output_types(
+                &MulOperation,
+                &[unreduced("x"), reduced("y")],
+                &[]
+            ),
             Err(TypeError {
                 message: format!(
                     "'{MUL_OPERATION_NAME}' requires the second operand to be reduced over the axes the first is \
@@ -398,9 +428,12 @@ mod tests {
         );
 
         // Two operands reduced over the same axis multiply to a value reduced over that axis.
-        let output =
-            <MulOperation as Operation<ArrayType>>::infer_output_types(&MulOperation, &[reduced("x"), reduced("x")])
-                .unwrap();
+        let output = <MulOperation as Operation<ArrayType>>::infer_output_types(
+            &MulOperation,
+            &[reduced("x"), reduced("x")],
+            &[],
+        )
+        .unwrap();
         assert_eq!(output[0].sharding().unwrap().reduced_axes(), &BTreeSet::from(["x".to_string()]));
         assert_eq!(output[0].sharding().unwrap().unreduced_axes(), &BTreeSet::new());
     }

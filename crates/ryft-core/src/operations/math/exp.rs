@@ -1,7 +1,7 @@
 use crate::macros::define_elementwise_operation;
 
 /// Canonical operation name for [`ExpOperation`].
-pub const EXP_OPERATION_NAME: &'static str = "exp";
+pub const EXP_OPERATION_NAME: &str = "exp";
 
 // TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(

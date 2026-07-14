@@ -1,15 +1,15 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, RegionInterface, Value};
 use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`StopGradientOperation`].
-pub const STOP_GRADIENT_OPERATION_NAME: &'static str = "stop_gradient";
+pub const STOP_GRADIENT_OPERATION_NAME: &str = "stop_gradient";
 
 // TODO(eaplatanios): Review this module.
 
@@ -36,7 +36,11 @@ impl Operation<DataType> for StopGradientOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
@@ -49,7 +53,11 @@ impl Operation<ArrayType> for StopGradientOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         ElementwiseOperation::infer_output_types(self, input_types)
     }
 }
@@ -61,12 +69,17 @@ impl ElementwiseOperation for StopGradientOperation {
     }
 }
 
-impl<V: Clone + Value, C> InterpretableOperation<V, C> for StopGradientOperation
+impl<C: Domain> InterpretableOperation<C> for StopGradientOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].clone()])
     }
@@ -94,12 +107,12 @@ pub trait StopGradient: Sized {
 impl<V: Value> StopGradient for V
 where
     V::DispatchDomain: Context,
-    <V::DispatchDomain as crate::Domain>::Operation: From<StopGradientOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<StopGradientOperation>,
 {
     #[inline]
     fn stop_gradient(&self) -> Self {
         self.dispatch_domain()
-            .bind(StopGradientOperation, &[], &[], &[self.clone()])
+            .bind(StopGradientOperation, Vec::new(), &[], &[self.clone()])
             .expect("`stop_gradient` operation failed")
             .remove(0)
     }

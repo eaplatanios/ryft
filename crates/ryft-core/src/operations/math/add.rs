@@ -1,7 +1,7 @@
 use crate::macros::{define_elementwise_operation, define_tracer_operator};
 
 /// Canonical operation name for [`AddOperation`].
-pub const ADD_OPERATION_NAME: &'static str = "add";
+pub const ADD_OPERATION_NAME: &str = "add";
 
 // TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
@@ -25,14 +25,13 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::interpretation::InterpretableOperation;
+    use crate::operations::{Operation, RegionlessDriver};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
     use crate::tests::TestArray;
     use crate::types::{ArrayType, Layout, Shape, Size, StridedLayout};
-
-    use crate::interpretation::InterpretableOperation;
-    use crate::operations::Operation;
     use crate::types::{DataType, TypeError};
 
     use super::*;
@@ -46,21 +45,23 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "AddOperation");
         assert_eq!(format!("{operation}"), ADD_OPERATION_NAME);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
             Ok(vec![DataType::F64]),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(2.0), Scalar::from(3.5)],
             ),
             Ok(vec![Scalar::from(5.5)])
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(2.0), TestArray::scalar(3.5)],
             ),
             Ok(vec![TestArray::scalar(5.5)]),
@@ -73,6 +74,7 @@ mod tests {
                 ArrayType::scalar(DataType::F32),
                 ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)])),
             ],
+            &[],
         )
         .unwrap();
         assert_eq!(output, vec![ArrayType::new(DataType::F64, Shape::new(vec![Size::Static(2), Size::Static(3)]))]);
@@ -84,6 +86,7 @@ mod tests {
                 ArrayType::new(DataType::F32, Shape::scalar()).with_layout(Layout::Strided(StridedLayout::new(vec![]))),
                 ArrayType::scalar(DataType::F32),
             ],
+            &[],
         )
         .unwrap();
         assert_eq!(output, vec![ArrayType::scalar(DataType::F32)]);
@@ -118,7 +121,8 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let output = <AddOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right]).unwrap();
+        let output =
+            <AddOperation as Operation<ArrayType>>::infer_output_types(&operation, &[left, right], &[]).unwrap();
         assert_eq!(
             output[0].sharding().as_ref().unwrap().varying_manual_axes(),
             &BTreeSet::from(["x".to_string(), "y".to_string()]),
@@ -126,31 +130,33 @@ mod tests {
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F64], &[]),
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[ArrayType::scalar(DataType::F64)], &[]),
             Err(TypeError { message: "expected 2 inputs but got 1".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(2.0)],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(2.0)]
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F8E3M4, DataType::F32], &[]),
             Err(TypeError { message: format!("'{ADD_OPERATION_NAME}' input types are not broadcast-compatible") }),
         );
         let error = <AddOperation as Operation<ArrayType>>::infer_output_types(
@@ -159,6 +165,7 @@ mod tests {
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(2)])),
                 ArrayType::new(DataType::F32, Shape::new(vec![Size::Static(3)])),
             ],
+            &[],
         )
         .unwrap_err();
         assert_eq!(
@@ -170,7 +177,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, AddOperation>::new();
         let left = builder.add_input(DataType::F64);
         let right = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![left, right]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![left, right], Vec::new()).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

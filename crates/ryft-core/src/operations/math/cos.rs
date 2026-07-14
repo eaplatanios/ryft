@@ -1,7 +1,7 @@
 use crate::macros::define_elementwise_operation;
 
 /// Canonical operation name for [`CosOperation`].
-pub const COS_OPERATION_NAME: &'static str = "cos";
+pub const COS_OPERATION_NAME: &str = "cos";
 
 // TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
@@ -23,7 +23,7 @@ mod tests {
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
     use crate::interpretation::InterpretableOperation;
-    use crate::operations::Operation;
+    use crate::operations::{Operation, RegionlessDriver};
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -45,19 +45,24 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), COS_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "CosOperation");
         assert_eq!(format!("{operation}"), COS_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Ok(vec![DataType::F32]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(0.5)],
             ),
             Ok(vec![Scalar::from(0.5f64.cos())]),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(0.5)],
             ),
             Ok(vec![TestArray::scalar(0.5f64.cos())]),
@@ -83,27 +88,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            <CosOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input)),
+            <CosOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
             Ok(vec![input]),
         );
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(&operation, &EagerContext::new(), &[],),
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &RegionlessDriver,
+                &[],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -112,7 +123,7 @@ mod tests {
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Scalar, CosOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![input], Vec::new()).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

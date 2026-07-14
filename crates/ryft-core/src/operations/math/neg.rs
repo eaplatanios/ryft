@@ -1,15 +1,15 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, define_tracer_operator};
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, RegionInterface, Value};
 use crate::types::{ArrayType, DataType, TypeError};
 
 /// Canonical operation name for [`NegOperation`].
-pub const NEG_OPERATION_NAME: &'static str = "neg";
+pub const NEG_OPERATION_NAME: &str = "neg";
 
 /// [`Operation`] that negates one value while preserving its type metadata.
 #[derive(Clone, Debug, Default)]
@@ -29,7 +29,11 @@ impl Operation<DataType> for NegOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 1, TypeError);
         Ok(vec![input_types[0].clone()])
     }
@@ -42,7 +46,11 @@ impl Operation<ArrayType> for NegOperation {
     }
 
     #[inline]
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         ElementwiseOperation::infer_output_types(self, input_types)
     }
 }
@@ -54,12 +62,17 @@ impl ElementwiseOperation for NegOperation {
     }
 }
 
-impl<V: Clone + Value + Neg, C> InterpretableOperation<V, C> for NegOperation
+impl<C: Domain<Value: Neg>> InterpretableOperation<C> for NegOperation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
         Ok(vec![inputs[0].neg()?])
     }
@@ -79,7 +92,7 @@ pub trait Neg: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<NegOperation>>>> Neg for V {
     #[inline]
     fn neg(&self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(NegOperation, &[], &[], &[self.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(NegOperation, Vec::new(), &[], &[self.clone()])?.remove(0))
     }
 }
 
@@ -92,6 +105,7 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::operations::RegionlessDriver;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -108,19 +122,24 @@ mod tests {
         assert_eq!(Operation::<DataType>::name(&operation), NEG_OPERATION_NAME);
         assert_eq!(format!("{operation:?}"), "NegOperation");
         assert_eq!(format!("{operation}"), NEG_OPERATION_NAME);
-        assert_eq!(Operation::<DataType>::infer_output_types(&operation, &[DataType::F32]), Ok(vec![DataType::F32]),);
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32], &[]),
+            Ok(vec![DataType::F32]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(2.0)],
             ),
             Ok(vec![Scalar::from(-2.0)]),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(2.0)],
             ),
             Ok(vec![TestArray::scalar(-2.0)]),
@@ -146,27 +165,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            <NegOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input)),
+            <NegOperation as Operation<ArrayType>>::infer_output_types(&operation, std::slice::from_ref(&input), &[]),
             Ok(vec![input]),
         );
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 1 input but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(&operation, &EagerContext::new(), &[],),
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &RegionlessDriver,
+                &[],
+            ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
@@ -175,7 +200,7 @@ mod tests {
         // Program rendering uses the canonical operation name.
         let mut builder = ProgramBuilder::<Scalar, NegOperation>::new();
         let input = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![input]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![input], Vec::new()).unwrap()[0];
         let program = builder.build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder).unwrap();
         assert_eq!(
             program.to_string(),

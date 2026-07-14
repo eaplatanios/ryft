@@ -1,15 +1,15 @@
 use std::fmt::Display;
 
-use crate::contexts::Context;
-use crate::interpretation::InterpretableOperation;
+use crate::contexts::{Context, Domain};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::{ElementwiseOperation, Operation};
 use crate::partial::PartiallyEvaluatableOperation;
-use crate::programs::{ProgramError, Value};
+use crate::programs::{ProgramError, RegionInterface, Value};
 use crate::types::{ArrayType, DataType, Type, TypeError};
 
 /// Canonical operation name for [`Atan2Operation`].
-pub const ATAN2_OPERATION_NAME: &'static str = "atan2";
+pub const ATAN2_OPERATION_NAME: &str = "atan2";
 
 /// [`Operation`] that computes the elementwise two-argument arc tangent of its operands (i.e., `(y, x) ↦ atan2(y, x)`,
 /// the angle of the point `(x, y)` in the correct quadrant) while preserving their type metadata. This is the analogue
@@ -32,7 +32,11 @@ impl Operation<DataType> for Atan2Operation {
         ATAN2_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[DataType]) -> Result<Vec<DataType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[DataType],
+        _region_interfaces: &[RegionInterface<DataType>],
+    ) -> Result<Vec<DataType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         if input_types[0] != input_types[1] {
             return Err(TypeError {
@@ -57,7 +61,11 @@ impl Operation<ArrayType> for Atan2Operation {
         ATAN2_OPERATION_NAME
     }
 
-    fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        _region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
         if input_types[0].data_type().is_complex() || input_types[1].data_type().is_complex() {
             return Err(TypeError {
@@ -78,12 +86,17 @@ impl ElementwiseOperation for Atan2Operation {
     }
 }
 
-impl<V: Clone + Value + Atan2, C> InterpretableOperation<V, C> for Atan2Operation
+impl<C: Domain<Value: Atan2>> InterpretableOperation<C> for Atan2Operation
 where
-    Self: Operation<V::Type>,
+    Self: Operation<C::Type>,
 {
     #[inline]
-    fn interpret(&self, _context: &C, inputs: &[V]) -> Result<Vec<V>, ProgramError> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![inputs[0].atan2(&inputs[1])?])
     }
@@ -103,7 +116,7 @@ pub trait Atan2: Sized {
 impl<V: Value<DispatchDomain: Context<Operation: From<Atan2Operation>>>> Atan2 for V {
     #[inline]
     fn atan2(&self, x: &Self) -> Result<Self, ProgramError> {
-        Ok(self.dispatch_domain().bind(Atan2Operation, &[], &[], &[self.clone(), x.clone()])?.remove(0))
+        Ok(self.dispatch_domain().bind(Atan2Operation, Vec::new(), &[], &[self.clone(), x.clone()])?.remove(0))
     }
 }
 
@@ -115,6 +128,7 @@ mod tests {
 
     use crate::backends::scalars::Scalar;
     use crate::contexts::EagerContext;
+    use crate::operations::RegionlessDriver;
     use crate::parameters::Placeholder;
     use crate::programs::{ProgramBuilder, ProgramError};
     use crate::sharding::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
@@ -143,21 +157,23 @@ mod tests {
         assert_eq!(format!("{operation:?}"), "Atan2Operation");
         assert_eq!(format!("{operation}"), ATAN2_OPERATION_NAME);
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F32]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F32], &[]),
             Ok(vec![DataType::F32]),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(0.5), Scalar::from(-0.25)],
             ),
             Ok(vec![Scalar::from(0.5f64.atan2(-0.25f64))]),
         );
         assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[TestArray::scalar(0.5), TestArray::scalar(-0.25)],
             ),
             Ok(vec![TestArray::scalar(0.5f64.atan2(-0.25f64))]),
@@ -183,50 +199,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            <Atan2Operation as Operation<ArrayType>>::infer_output_types(&operation, &[input.clone(), input.clone()],),
+            <Atan2Operation as Operation<ArrayType>>::infer_output_types(
+                &operation,
+                &[input.clone(), input.clone()],
+                &[],
+            ),
             Ok(vec![input]),
         );
 
         // Mismatched and complex operand types report precise inference errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::F32, DataType::F64], &[]),
             Err(TypeError { message: "'atan2' requires identical operand types but got f32 and f64".to_string() }),
         );
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64]),
+            Operation::<DataType>::infer_output_types(&operation, &[DataType::C64, DataType::C64], &[]),
             Err(TypeError { message: "'atan2' requires real operands but got c64".to_string() }),
         );
         let complex_type = ArrayType::new(DataType::C64, Shape::new(vec![Size::Static(2)]));
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[complex_type.clone(), complex_type]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[complex_type.clone(), complex_type], &[]),
             Err(TypeError { message: "'atan2' requires real operands but got c64[2] and c64[2]".to_string() }),
         );
 
         // Invalid inputs report precise operation and interpreter errors.
         assert_eq!(
-            Operation::<DataType>::infer_output_types(&operation, &[]),
+            Operation::<DataType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
         );
         assert_eq!(
-            Operation::<ArrayType>::infer_output_types(&operation, &[]),
+            Operation::<ArrayType>::infer_output_types(&operation, &[], &[]),
             Err(TypeError { message: "expected 2 inputs but got 0".to_string() }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(&operation, &EagerContext::new(), &[],),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
-        );
-        assert_eq!(
-            InterpretableOperation::<TestArray, EagerContext<TestArray>>::interpret(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
                 &[],
             ),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
         );
         assert_eq!(
-            InterpretableOperation::<Scalar, EagerContext<Scalar>>::interpret(
+            InterpretableOperation::<EagerContext<TestArray>>::interpret(
                 &operation,
                 &EagerContext::new(),
+                &RegionlessDriver,
+                &[],
+            ),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Scalar>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &RegionlessDriver,
                 &[Scalar::from(0.5f32), Scalar::from(-0.25f64)],
             ),
             Err(ProgramError::Type(TypeError {
@@ -238,7 +265,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Scalar, Atan2Operation>::new();
         let y = builder.add_input(DataType::F64);
         let x = builder.add_input(DataType::F64);
-        let output = builder.add_instruction(operation, vec![y, x]).unwrap()[0];
+        let output = builder.add_instruction(operation, vec![y, x], Vec::new()).unwrap()[0];
         let program = builder
             .build::<(Scalar, Scalar), Scalar>(vec![output], (Placeholder, Placeholder), Placeholder)
             .unwrap();

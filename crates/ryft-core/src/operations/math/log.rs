@@ -1,7 +1,7 @@
 use crate::macros::define_elementwise_operation;
 
 /// Canonical operation name for [`LogOperation`].
-pub const LOG_OPERATION_NAME: &'static str = "log";
+pub const LOG_OPERATION_NAME: &str = "log";
 
 // TODO(eaplatanios): Review this macro invocation.
 define_elementwise_operation!(
