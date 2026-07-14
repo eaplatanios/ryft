@@ -13,17 +13,18 @@ use lru::LruCache;
 use crate::captures::{CaptureReference, CapturingContext, ClosedProgram};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::{check_builders, check_count};
-use crate::operations::constants::Constant;
 use crate::operations::Operation;
+use crate::operations::constants::Constant;
 use crate::parameters::{ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::programs::{Program, ProgramError, Value};
+use crate::regions::{RegionAttachments, RegionlessDriver};
 use crate::tracing::{DomainTracingContext, Tracer};
 use crate::types::Typed;
 
 use super::contexts::CompilationDomain;
 
-/// Flat source-program representation of a compiled call's callee, supplied to [`Context::bind`]'s `callees`
-/// argument and interned as a shared callee root region on the staged instruction.
+/// Flat source-program representation of a compiled call's callee, composed into the operation's region attachments
+/// and interned as a shared callee root region on the staged instruction.
 pub type FlatCompilationProgram<D> = Program<
     <D as Domain>::Constant,
     <D as Domain>::Operation,
@@ -66,21 +67,18 @@ impl<D: CompilationDomain, F, Input, Output> CompilationStagingRequest<D, F, Inp
 /// the trait method's requirements. Construct requests with [`CompilationStagingRequest::new`].
 pub trait StageRequest<D: CompilationDomain>: Sized {
     /// Structured abstract input type.
-    type Input: Parameterized<
-        D::Type,
-        Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-    >;
+    type Input: Parameterized<D::Type, Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>>;
 
     /// Structured abstract output type.
     type Output: Parameterized<
-        D::Type,
-        Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
-        To<CompilationTracer<D>>: Parameterized<
-            CompilationTracer<D>,
-            To<D::Type> = Self::Output,
-            To<D::Constant> = <Self::Output as Parameterized<D::Type>>::To<D::Constant>,
-        >,
-    >;
+            D::Type,
+            Family: ParameterizedFamily<D::Constant> + ParameterizedFamily<CompilationTracer<D>>,
+            To<CompilationTracer<D>>: Parameterized<
+                CompilationTracer<D>,
+                To<D::Type> = Self::Output,
+                To<D::Constant> = <Self::Output as Parameterized<D::Type>>::To<D::Constant>,
+            >,
+        >;
 
     /// Returns the structured abstract input signature.
     fn input_types(&self) -> &Self::Input;
@@ -393,14 +391,13 @@ impl Default for JitCacheCapacities {
 /// Operation-family capability for representing a call to a staged program.
 ///
 /// The call operation is metadata-only: the callee is a flat program (whose captures have been lifted into leading
-/// inputs) supplied separately through the `callees` argument of [`Context::bind`], which
-/// interns it as a shared callee root region by [`Rc`] identity. The concrete operation family decides how that
-/// boundary lowers and how batching, differentiation, partial evaluation, and other transforms rewrite it. This
-/// keeps higher-order call semantics with the operation that owns them while allowing the lifecycle and capture
-/// plumbing to remain backend-neutral.
+/// inputs) composed into the region attachments passed to [`Context::bind`], which interns it as a shared callee root
+/// region by [`Rc`] identity. The concrete operation family decides how that boundary lowers and how batching,
+/// differentiation, partial evaluation, and other transforms rewrite it. This keeps higher-order call semantics with
+/// the operation that owns them while allowing the lifecycle and capture plumbing to remain backend-neutral.
 pub trait CompiledCallOperation<Constant: Value>: Operation<Constant::Type> + Sized {
-    /// Constructs a call operation. The callee program rides through the `callees` argument of the accompanying
-    /// [`Context::bind`].
+    /// Constructs a call operation. The accompanying [`Context::bind`] supplies its callee as a shared region
+    /// attachment.
     fn compiled_call() -> Self;
 }
 
@@ -558,8 +555,7 @@ where
         flat_inputs.extend(inputs.into_parameters());
         let outputs = context.bind(
             D::Operation::compiled_call(),
-            Vec::new(),
-            &[self.lifted_program()?],
+            RegionlessDriver.with_callees(&[self.lifted_program()?]),
             flat_inputs.as_slice(),
         )?;
         Output::To::<V>::from_parameters(self.state.output_structure.clone(), outputs).map_err(Into::into)
@@ -621,7 +617,11 @@ where
             .map(|capture| context.constant(capture))
             .collect::<Result<Vec<_>, _>>()?;
         flat_inputs.extend(inputs);
-        context.bind(D::Operation::compiled_call(), Vec::new(), &[self.lifted_program()?], flat_inputs.as_slice())
+        context.bind(
+            D::Operation::compiled_call(),
+            RegionlessDriver.with_callees(&[self.lifted_program()?]),
+            flat_inputs.as_slice(),
+        )
     }
 
     /// Returns the source program with runtime captures lifted into leading flat inputs.
@@ -1211,11 +1211,11 @@ where
         F: Fn(Static, Input::To<CompilationTracer<D>>) -> Result<Output::To<CompilationTracer<D>>, D::Error>,
         Input::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
         Input::To<D::Value>: Parameterized<
-            D::Value,
-            Family = Input::Family,
-            ParameterStructure = Input::ParameterStructure,
-            To<D::Type> = Input,
-        >,
+                D::Value,
+                Family = Input::Family,
+                ParameterStructure = Input::ParameterStructure,
+                To<D::Type> = Input,
+            >,
         Output::Family: ParameterizedFamily<D::Value> + ParameterizedFamily<CompilationTracer<D>>,
         Output::To<D::Value>:
             Parameterized<D::Value, Family = Output::Family, ParameterStructure = Output::ParameterStructure>,
@@ -1535,7 +1535,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::programs::RegionInterface;
+    use crate::regions::RegionInterface;
     use std::hash::{Hash, Hasher};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1950,11 +1950,7 @@ mod tests {
         let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate {
-                    input.unary(NegateOperation)
-                } else {
-                    input
-                }
+                if negate { input.unary(NegateOperation) } else { input }
             },
         );
 
@@ -2001,11 +1997,7 @@ mod tests {
         let function: JittedFunction<TestDomain, _, CollidingStatic, DataType, DataType> = jit(
             &domain,
             |static_parameters: CollidingStatic, input: CompilationTracer<TestDomain>| {
-                if static_parameters.0 {
-                    input.unary(NegateOperation)
-                } else {
-                    input
-                }
+                if static_parameters.0 { input.unary(NegateOperation) } else { input }
             },
         );
 
@@ -2034,11 +2026,7 @@ mod tests {
         let function: JittedFunction<TestDomain, _, bool, DataType, DataType> = jit(
             &domain,
             |negate, input: CompilationTracer<TestDomain>| {
-                if negate {
-                    input.unary(NegateOperation)
-                } else {
-                    input
-                }
+                if negate { input.unary(NegateOperation) } else { input }
             },
         );
         function.call(true, Scalar::from(2.0)).unwrap();

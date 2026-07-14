@@ -1523,7 +1523,6 @@ mod tests {
             crate::EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
                 ScalarOperation::While(operation),
                 vec![condition.clone(), body.clone()],
-                &[],
                 &[Scalar::from(1.0)],
             ),
             Ok(vec![Scalar::from(8.0)])
@@ -1537,7 +1536,6 @@ mod tests {
                 let mut outputs = carry.context().stage_operation(
                     operation,
                     vec![scalar_less_than_eight_condition(), scalar_doubling_body()],
-                    &[],
                     &[&carry],
                 )?;
                 Ok(outputs.remove(0))
@@ -1575,7 +1573,7 @@ mod tests {
                 |carry| {
                     let operation = WhileOperation::new();
                     let regions = vec![scalar_less_than_eight_condition(), scalar_doubling_body()];
-                    Ok(carry.context().bind(operation, regions, &[], &[carry.clone()])?.remove(0))
+                    Ok(carry.context().bind(operation, regions, &[carry.clone()])?.remove(0))
                 },
                 Scalar::from(1.0),
                 Scalar::from(1.0),
@@ -1724,7 +1722,6 @@ mod tests {
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
                 ZeroOperation::new(DataType::F64),
                 Vec::new(),
-                &[],
                 &[]
             ),
             Ok(vec![Scalar::from(0.0)]),
@@ -1733,7 +1730,6 @@ mod tests {
             EagerContext::<Scalar, ScalarOperation<Scalar>>::default().bind(
                 OneOperation::new(DataType::F64),
                 Vec::new(),
-                &[],
                 &[]
             ),
             Ok(vec![Scalar::from(1.0)]),
@@ -1903,7 +1899,6 @@ mod tests {
             EagerContext::<Scalar, ScalarOperation<Scalar>>::new().bind(
                 ZeroOperation::new(DataType::C64),
                 Vec::new(),
-                &[],
                 &[]
             ),
             Ok(vec![Scalar::from(Complex::new(0.0f32, 0.0f32))]),
