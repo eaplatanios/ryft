@@ -98,7 +98,7 @@ use crate::macros::check_builders;
 use crate::operations::Operation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
-use crate::types::{Type, TypeError, Typed};
+use crate::types::Typed;
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
 /// [`Atom`](crate::Atom) or _poisoned_, meaning that it corresponds to an error.
@@ -418,58 +418,6 @@ impl<V: Value, O: Operation<V::Type>, C> TracingContext<V, O, C> {
         input_type: Input,
     ) -> Result<Output::To<V::Type>, ProgramError> {
         Ok(Self::trace(function, input_type)?.0)
-    }
-
-    /// Structurally splices the provided [`Program`] into this [`TracingContext`], replacing its inputs positionally
-    /// with `inputs` and returning [`Tracer`]s for its outputs. The source operations are relocated verbatim rather
-    /// than rebound, and one source-to-destination [`Region`](crate::Region) remapping preserves sharing across the
-    /// program's complete reachable region graph. This function is meant to be used by program rewrites that compose
-    /// existing programs with newly traced operations.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Source [`Program`] whose entry instructions and reachable regions are relocated into this trace.
-    ///   - `inputs`: [`Tracer`]s belonging to this context, in source-program input order and with types refining the
-    ///     corresponding source program's input types.
-    pub fn splice_program<Input: Parameterized<V>, Output: Parameterized<V>>(
-        &self,
-        program: &Program<V, O, Input, Output>,
-        inputs: Vec<Tracer<Self>>,
-    ) -> Result<Vec<Tracer<Self>>, ProgramError> {
-        if let Some(error) = self.builder.borrow().error().cloned() {
-            return Err(error);
-        }
-        check_builders!(&self.builder, [inputs.iter().map(Tracer::builder)]).map_err(|error| self.error(error))?;
-
-        let expected_input_count = program.input_count();
-        if inputs.len() != expected_input_count {
-            let error = ProgramError::InvalidInputCount { expected: expected_input_count, actual: inputs.len() };
-            return Err(self.error(error));
-        }
-
-        for (input, declared_type) in inputs.iter().zip(program.input_types()) {
-            let actual_type = input.r#type();
-            if !declared_type.is_refined_by(actual_type.as_ref()) {
-                return Err(self.error(
-                    TypeError {
-                        message: format!(
-                            "encountered input type {actual_type} which is incompatible with the program's declared \
-                             input type {declared_type}",
-                        ),
-                    }
-                    .into(),
-                ));
-            }
-        }
-
-        let inputs = inputs
-            .iter()
-            .map(Tracer::atom_id)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| self.error(error))?;
-        let outputs = self.builder.borrow_mut().splice_program(program, inputs.as_slice());
-        let outputs = outputs.map_err(|error| self.error(error))?;
-        Ok(outputs.into_iter().map(|atom| self.tracer(atom, None)).collect())
     }
 }
 
@@ -902,8 +850,7 @@ mod tests {
     use crate::operations::constants::{OneLike, OneOperation, ZeroLike, ZeroOperation};
     use crate::operations::math::{AddOperation, NegOperation, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::RegionInterface;
-    use crate::programs::{AtomId, ProgramBuilder, ProgramError};
+    use crate::programs::{AtomId, ProgramError, RegionInterface};
     use crate::types::{DataType, TypeError, Typed};
 
     use super::*;
@@ -1087,9 +1034,9 @@ mod tests {
             }
         }
 
-        impl<C> InterpretableOperation<Scalar, C> for NoOutputOperation {
+        impl<C: Domain<Type = DataType, Value = Scalar>> InterpretableOperation<C> for NoOutputOperation {
             #[inline]
-            fn interpret<D: InterpretationDriver<Scalar, C>>(
+            fn interpret<D: InterpretationDriver<C>>(
                 &self,
                 _context: &C,
                 _driver: &D,
@@ -1402,80 +1349,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_tracing_context_splice_program() {
-        // Build a source program with an embedded constant so that the successful path exercises both input remapping
-        // and constant relocation.
-        let mut source_builder = ProgramBuilder::<Scalar, ScalarOperation<Scalar>>::new();
-        let source_input = source_builder.add_input(DataType::F64);
-        let source_constant = source_builder.add_constant(Scalar::from(4.0));
-        let source_output = source_builder
-            .add_instruction(AddOperation, vec![source_input, source_constant], Vec::new())
-            .unwrap()[0];
-        let source_program =
-            source_builder.build::<Scalar, Scalar>(vec![source_output], Placeholder, Placeholder).unwrap();
-
-        // Splicing relocates the source instructions and maps the source input to the supplied tracer.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let input = context.input(DataType::F64);
-        let outputs = context.splice_program(&source_program, vec![input]).unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].r#type().into_owned(), DataType::F64);
-        let output = outputs[0].atom_id().expect("spliced output should remain live");
-        let program = context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Scalar, Scalar>(vec![output], Placeholder, Placeholder)
-            .unwrap();
-        assert_eq!(program.interpret(Scalar::from(3.0)), Ok(Scalar::from(7.0)));
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64 .
-                let %1:f64 = const
-                    %2:f64 = add %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-
-        // The input count must match the source program's boundary.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        assert!(matches!(
-            context.splice_program(&source_program, Vec::new()),
-            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
-        assert_eq!(
-            context.builder().borrow().error().cloned(),
-            Some(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        );
-
-        // Every supplied tracer must belong to the destination context's builder.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let foreign_context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let foreign_input = foreign_context.input(DataType::F64);
-        assert_eq!(
-            context.splice_program(&source_program, vec![foreign_input]),
-            Err(ProgramError::MismatchedProgramBuilders),
-        );
-        assert_eq!(context.builder().borrow().error().cloned(), Some(ProgramError::MismatchedProgramBuilders));
-
-        // Supplied tracer types must refine the corresponding source input types.
-        let context = DomainTracingContext::<EagerContext<Scalar, ScalarOperation<Scalar>>>::new();
-        let input = context.input(DataType::I64);
-        assert!(matches!(
-            context.splice_program(&source_program, vec![input]),
-            Err(ProgramError::Type(TypeError { message }))
-                if message == "encountered input type i64 which is incompatible with the program's declared type f64",
-        ));
-        assert!(matches!(
-            context.builder().borrow().error(),
-            Some(ProgramError::Type(TypeError { message }))
-                if message == "encountered input type i64 which is incompatible with the program's declared type f64",
-        ));
     }
 
     #[test]

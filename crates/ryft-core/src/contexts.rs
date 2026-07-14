@@ -115,7 +115,7 @@ use crate::macros::check_builders;
 use crate::operations::constants::ConstantOperation;
 use crate::operations::{Operation, RegionDriver};
 use crate::parameters::{Parameterized, ParameterizedFamily};
-use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, RegionInterface, Value};
+use crate::programs::{AtomId, FlatProgram, Program, ProgramBuilder, ProgramError, Value};
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 use crate::types::{Type, Typed};
 
@@ -329,7 +329,7 @@ impl<V: Value, O: Operation<V::Type>> Domain for EagerContext<V, O> {
     type Operation = O;
 }
 
-impl<V: Value, O: InterpretableOperation<V, Self>> Context for EagerContext<V, O> {
+impl<V: Value, O: Operation<V::Type> + InterpretableOperation<Self>> Context for EagerContext<V, O> {
     #[inline]
     fn lift(&self, constant: V) -> Result<V, ProgramError> {
         Ok(constant)
@@ -386,16 +386,9 @@ impl<V: Value, O: Operation<V::Type>> RegionDriver<V, O> for EagerInterpretation
     }
 }
 
-impl<V: Value, O: InterpretableOperation<V, EagerContext<V, O>>> InterpretationDriver<V, EagerContext<V, O>>
-    for EagerInterpretationDriver<'_, V, O>
+impl<V: Value, O: Operation<V::Type> + InterpretableOperation<EagerContext<V, O>>>
+    InterpretationDriver<EagerContext<V, O>> for EagerInterpretationDriver<'_, V, O>
 {
-    type Operation = O;
-
-    #[inline]
-    fn region_interface(&self, index: usize) -> Result<RegionInterface<V::Type>, ProgramError> {
-        Ok(self.region(index)?.interface())
-    }
-
     #[inline]
     fn interpret_region(
         &self,

@@ -193,18 +193,17 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<V: $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
-            for $operation
+        impl<C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<C> for $operation
         where
-            Self: $crate::Operation<V::Type>,
+            Self: $crate::Operation<C::Type>,
         {
             #[inline]
-            fn interpret<D: $crate::InterpretationDriver<V, C>>(
+            fn interpret<D: $crate::InterpretationDriver<C>>(
                 &self,
                 _context: &C,
                 _driver: &D,
-                inputs: &[V],
-            ) -> Result<Vec<V>, $crate::ProgramError> {
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 Ok(vec![inputs[0].$method()?])
             }
@@ -296,18 +295,17 @@ macro_rules! define_elementwise_operation {
             }
         }
 
-        impl<V: $crate::Value + $capability, C> $crate::InterpretableOperation<V, C>
-            for $operation
+        impl<C: $crate::Domain<Value: $capability>> $crate::InterpretableOperation<C> for $operation
         where
-            Self: $crate::Operation<V::Type>,
+            Self: $crate::Operation<C::Type>,
         {
             #[inline]
-            fn interpret<D: $crate::InterpretationDriver<V, C>>(
+            fn interpret<D: $crate::InterpretationDriver<C>>(
                 &self,
                 _context: &C,
                 _driver: &D,
-                inputs: &[V],
-            ) -> Result<Vec<V>, $crate::ProgramError> {
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, $crate::ProgramError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 Ok(vec![inputs[0].$method(&inputs[1])?])
             }

@@ -817,10 +817,8 @@ pub trait BatchableOperation<C: Context<Type = ArrayType>>: Operation<ArrayType>
 // realigned to it with a staged `TransposeOperation`, and every input is then broadcast to the common per-item shape
 // with the batch axis inserted at that position. Operands whose per-item shapes are not broadcast-compatible are left
 // at their batch-axis-inserted shapes so the operation surfaces its own shape error.
-impl<
-    C: Context<Type = ArrayType, Value: Broadcast + Transpose>,
-    O: ElementwiseOperation + InterpretableOperation<C::Value, C>,
-> BatchableOperation<C> for O
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, O: ElementwiseOperation + InterpretableOperation<C>>
+    BatchableOperation<C> for O
 {
     fn batch<D: BatchingDriver<C>>(
         &self,
@@ -944,7 +942,7 @@ pub trait InterpretableBatchableOperation<C: Context<Type = ArrayType>> {
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>;
 }
 
-impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C::Value, C>> InterpretableBatchableOperation<C> for O {
+impl<C: Context<Type = ArrayType>, O: InterpretableOperation<C>> InterpretableBatchableOperation<C> for O {
     fn interpret_with_batch_axes(
         &self,
         context: &BatchingContext<C>,

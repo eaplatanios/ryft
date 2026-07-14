@@ -60,7 +60,7 @@ pub trait NamedAxes: Context {
     fn named_axis(&self, name: &str) -> Option<NamedAxis>;
 }
 
-impl<V: Value, O: InterpretableOperation<V, Self>> NamedAxes for EagerContext<V, O> {
+impl<V: Value, O: Operation<V::Type> + InterpretableOperation<EagerContext<V, O>>> NamedAxes for EagerContext<V, O> {
     #[inline]
     fn named_axis(&self, _name: &str) -> Option<NamedAxis> {
         // An eager context binds no named axes as it is a leaf of the resolution stack. So every lookup returns `None`.
